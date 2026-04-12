@@ -396,7 +396,11 @@ def log_call(
                         extra={"operation": op},
                     )
                     if span is not None:
-                        span.record_exception(e)
+                        try:
+                            if hasattr(span, "record_exception"):
+                                span.record_exception(e)
+                        except Exception:  # pragma: no cover - defensive
+                            pass
                     raise
                 finally:
                     _record(op, time.perf_counter() - start, err)
