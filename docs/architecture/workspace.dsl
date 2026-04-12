@@ -38,7 +38,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 requireScope = component "require_scope (legacy)" "JWT scope check returning raw payload dict (ADR-022, ADR-023)" "auth.py"
 
                 // Memory layers (inject mode + shared by tools mode handlers)
-                contextBuilder = component "ContextBuilderService" "Aggregates all 4 memory layers (inject mode) + build_ambient_context (tools mode)" "ABC + DefaultContextBuilder"
+                contextBuilder = component "ContextBuilderService" "Aggregates all 4 memory layers (inject mode). In tools mode: build_ambient_context with intent-based selection rules guiding the LLM to pick ONE tool per question (ADR-025 Accepted)" "ABC + DefaultContextBuilder"
                 episodicSvc = component "EpisodicService" "Layer 1 — ADR markdown loading" "ABC + FileEpisodicService"
                 proceduralSvc = component "ProceduralService" "Layer 2 — SKILL file loading" "ABC + FileProceduralService"
                 conversationalSvc = component "ConversationalService" "Layer 3 — PostgreSQL sessions (ADR-020)" "ABC + PostgresConversationalService"
@@ -48,7 +48,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 memoryToolRegistry = component "MemoryToolRegistry" "Decorator-based registry (@register_memory_tool). tools_visible_to(user) scope filter. invoke_tool cache-aware dispatch. Optional TOML overlay (ADR-025)" "tools/__init__.py"
                 memoryHandlers = component "Memory Tool Handlers" "recall_decisions, recall_skills, recall_recent_sessions, recall_semantic — thin adapters to the 4 services, canonical {matches, total, truncated} result schema" "tools/memory_handlers.py"
                 toolResultCache = component "ToolResultCache" "sha256(session|tool|args) → result dict, TTL eviction, Redis-backed, namespace sovereign:tool-result:, disjoint from TokenCache (ADR-025 §Decision.8)" "tools/cache.py"
-                memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute memory tools → repeat. Bounded by SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 §Decision.2)" "routes/_memory_tool_loop.py"
+                memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute selected memory tool → repeat. LLM selects ONE tool per question via ambient context selection rules. Bounded by SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 Accepted)" "routes/_memory_tool_loop.py"
 
                 // Plumbing
                 diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"

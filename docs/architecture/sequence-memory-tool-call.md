@@ -4,9 +4,11 @@
 > covers the `SOVEREIGN_MEMORY_MODE=tools` code path. For the default
 > inject-mode path see `sequence-chat-completions.md`.
 >
-> Status: ADR-025 is **Proposed**. The flow below matches the code
-> landed in Phase 4a + 4b and should be verified against live traces
-> in Phase 5 before the ADR graduates to Accepted.
+> Status: ADR-025 is **Accepted** (2026-04-12). The flow below matches
+> the deployed code. Live-verified: Qwen3.5-35B-A3B selectively calls
+> individual memory tools based on the question intent — the ambient
+> context includes selection rules that guide the LLM to pick the most
+> relevant tool instead of blast-calling all four.
 
 ## What makes tools-mode different
 
@@ -18,11 +20,15 @@ whether the model actually needs the context.
 
 Tools-mode inverts the relationship:
 
-- **The LLM decides** which memory layers it needs by calling
-  `recall_decisions`, `recall_skills`, `recall_recent_sessions`, or
-  `recall_semantic` as tools.
-- The proxy injects only a minimal **ambient context** (~200 words:
-  identity + project + date + tool hints).
+- **The LLM decides** which memory layer it needs by calling the
+  most relevant tool — `recall_decisions`, `recall_skills`,
+  `recall_recent_sessions`, or `recall_semantic`.
+- The proxy injects a minimal **ambient context** (~280 words:
+  identity + project + date + **selection rules** + tool hints).
+  The selection rules guide the LLM to pick ONE tool per question:
+  architectural decisions → `recall_decisions`, methodology →
+  `recall_skills`, session continuity → `recall_recent_sessions`,
+  everything else → `recall_semantic`.
 - Memory tool invocations are **handled inside the proxy** (Pattern A
   from the brainstorm) via the tool-call loop — OpenCode never sees
   memory tool calls, only the final answer.
@@ -317,7 +323,7 @@ with the error populated. The loop continues.
 - **Seed** (`docs/architecture/BRAINSTORM-memory-as-tools.md`) — the
   exploration that preceded the ADR.
 - **Inject-mode sequence** (`sequence-chat-completions.md`) — the
-  legacy path that is still the default. Gets retired after Phase 7.
+  legacy path, retained as a feature flag (`SOVEREIGN_MEMORY_MODE=inject`).
 - **Multi-user identity** (`ADR-026` §15) —
   how `UserContext` reaches the loop; Phase 2 of that design shipped
   in the preceding commits.

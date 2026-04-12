@@ -208,9 +208,8 @@ All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQ
 
 | Priority | Item | Description |
 |---|---|---|
-| 🔴 Next | **Intelligent Memory Tool Routing** | The current memory-as-tools implementation exposes all 4 tools statically — the LLM must guess which to call, leading to "blast and scan" behaviour. Needed: an intent-aware router that parses the user's question, routes to the most relevant memory layer, avoids redundant calls, and is context-aware across the session. This is a prerequisite for promoting ADR-025 to Accepted. |
+| ✅ Done | **Intelligent Memory Tool Routing** | Solved via system prompt guidance — the ambient context now instructs the LLM to select ONLY the most relevant tool per question. Validated: Qwen3.5-35B-A3B selectively calls individual tools instead of blast-calling all 4. ADR-025 promoted to Accepted. |
 | 🔴 Next | **Observability Aggregation Stack** | Prometheus scraper for llama-server `/metrics`, Grafana dashboards (P50/P95 latency, token budgets, tool-call iteration distribution), Loki log aggregation. Sibling compose stack mirroring the Langfuse pattern. |
-| 🟠 Soon | **Memory-as-Tools Promotion** | Canary week dogfooding tools mode, then ADR-025 status flip from Proposed to Accepted. Requires intelligent routing + aggregate metrics to prove token-budget reduction. |
 | 🟡 Planned | **Full Package Rename** | Rename Python package from `sovereign_memory` to `audittrace`, env prefix from `SOVEREIGN_` to `AUDITTRACE_`, all container/service/network names. Dedicated PR. |
 | 🟡 Planned | **OAuth2 Device Flow** | Human authentication beyond the current `client_credentials` dev client. Dedicated Keycloak public client. |
 | 🔵 Future | **Async Persistence** | Non-blocking audit row writes for `_persist_interaction` and `_flush_pending_tool_calls`. |

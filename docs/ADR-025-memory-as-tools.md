@@ -1,7 +1,7 @@
 # ADR-025: Memory Layers as LLM-Callable Tools
 
-**Status:** Proposed
-**Date:** 2026-04-11
+**Status:** Accepted
+**Date:** 2026-04-11 (Proposed) · 2026-04-12 (Accepted)
 **Deciders:** Luis Filipe de Sousa
 **Related:** ADR-010 (async server), ADR-012 (transparent proxy augmentation),
 ADR-014 (full agentic trace capture), ADR-018 (four-layer memory port),
@@ -458,19 +458,23 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
   memory layer services.
 - Export static site for review.
 
-### Phase 7 — Cutover (0.5 days + canary week)
+### Phase 7 — Cutover ✅ (2026-04-12)
 
-- Flip `SOVEREIGN_MEMORY_MODE=tools` in `.env` for dev.
-- Dogfood via OpenCode for one week.
-- After one week, decide whether to delete the `inject` path entirely or
-  keep it as a feature flag for model swapping.
+- `SOVEREIGN_MEMORY_MODE=tools` is the default in the deployed stack.
+- Dogfooding via OpenCode confirmed: Qwen3.5-35B-A3B selectively calls
+  only the relevant memory tool per question (e.g. `recall_decisions`
+  for ADR queries) instead of blast-calling all 4 tools.
+- Selective routing achieved via system prompt guidance in the ambient
+  context (`build_ambient_context` in `context_builder.py`) — no
+  proxy-side classifier needed. The LLM reads the selection rules and
+  makes its own routing decision.
+- The `inject` path is retained as a feature flag for model swapping
+  and fallback (`SOVEREIGN_MEMORY_MODE=inject`).
 
-### Phase 8 — ADR status flip (0.1 days)
+### Phase 8 — ADR status flip ✅ (2026-04-12)
 
-- After Phase 7 canary period passes success metrics, flip this ADR from
-  `Proposed` to `Accepted`.
-- Promote the brainstorm doc from `docs/architecture/` to an archive
-  location (or delete — it's seed material, not authoritative).
+- ADR status flipped from `Proposed` to `Accepted`.
+- Brainstorm doc retained in `docs/architecture/` as historical seed material.
 
 ## Related documents
 

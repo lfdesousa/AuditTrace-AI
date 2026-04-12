@@ -88,3 +88,45 @@ sequenceDiagram
 
     Note over Builder: Return context from<br/>3 working layers
 ```
+
+## Tools-mode: build_ambient_context() (ADR-025, Accepted)
+
+When `SOVEREIGN_MEMORY_MODE=tools`, the full 4-layer context build does NOT run.
+Instead, `build_ambient_context()` produces a lightweight system message (~280 words)
+containing:
+
+1. **Profile** — username, role, project, date
+2. **Selection rules** — intent-to-tool mapping that guides the LLM to pick ONE tool:
+   - Architectural decision → `recall_decisions`
+   - Methodology/pattern → `recall_skills`
+   - Previous session → `recall_recent_sessions`
+   - Everything else → `recall_semantic` (fallback)
+3. **Tool descriptions** — name + truncated description for each visible tool
+
+The LLM reads the selection rules and calls only the most relevant tool per question.
+No proxy-side classifier is needed — the model makes its own routing decision.
+
+```mermaid
+sequenceDiagram
+    participant Handler as _handle_tools_mode
+    participant Registry as tools_visible_to
+    participant Builder as build_ambient_context
+    participant LLM as llama-server
+
+    Handler->>Registry: tools_visible_to(user)
+    Registry-->>Handler: 4 memory tool defs (scope-filtered)
+
+    Handler->>Builder: build_ambient_context(user, project, tools)
+
+    Note over Builder: Assemble ~280 words:<br/>Profile + Selection Rules + Tool list<br/>No memory layer queries fired
+
+    Builder-->>Handler: ambient context string
+
+    Note over Handler: Inject as system message<br/>LLM decides which ONE tool to call<br/>based on selection rules + question intent
+
+    Handler->>LLM: POST /chat/completions<br/>{messages: [system(ambient), user(question)],<br/>tools: [recall_decisions, ...]}
+
+    LLM-->>Handler: {tool_calls: [{name: "recall_decisions", ...}]}
+
+    Note over Handler: LLM selected ONE tool<br/>(not all four)
+```
