@@ -1,0 +1,216 @@
+# sovereign-ai-stack — Docker Compose
+# Phase 1-2: memory-server + PostgreSQL + ChromaDB + Traefik + Keycloak
+# Langfuse runs as a sibling stack (ADR-021.2)
+
+services:
+
+  memory-server:
+    build: .
+    container_name: sovereign-memory-server
+    entrypoint: ["/app/scripts/entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - SOVEREIGN_CHROMA_URL=http://chromadb:8000
+      - SOVEREIGN_CHROMA_TOKEN=${SOVEREIGN_CHROMA_TOKEN}
+      # DESIGN §16 Phase 4: the memory-server connects as the
+      # non-superuser `sovereign_app` role so Postgres RLS policies
+      # actually apply to its queries. The `sovereign` superuser role
+      # is retained for admin tasks but not used on the hot path.
+      # See scripts/init-sovereign-app-role.sh for the role setup.
+      - SOVEREIGN_POSTGRES_URL=postgresql+psycopg2://sovereign_app:${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}@postgres:5432/sovereign_ai
+      - SOVEREIGN_LLAMA_URL=http://host.docker.internal:11435/v1
+      - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
+      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-}
+      - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
+      - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}
+      - SOVEREIGN_LANGFUSE_SECRET_KEY=${SOVEREIGN_LANGFUSE_SECRET_KEY:-}
+      - SOVEREIGN_LANGFUSE_ENABLED=${SOVEREIGN_LANGFUSE_ENABLED:-false}
+      # Langfuse's OTLP endpoint only accepts traces, not metrics.
+      # When OTLP export is pointed at Langfuse, set this to false to
+      # silence recurring 400 Bad Request errors from the OTel metric
+      # exporter. See README §Langfuse for the full note.
+      - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
+      - SOVEREIGN_LOG_LEVEL=${SOVEREIGN_LOG_LEVEL:-INFO}
+      - SOVEREIGN_AUTH_ENABLED=${SOVEREIGN_AUTH_ENABLED:-false}
+      # llama.cpp proxy read timeout. Default (120s) is too tight for
+      # cold model reload + inject-mode memory blobs that blow up the
+      # prompt-eval time. Bumped to 300s so a cold start on Qwen3.5-35B
+      # + a few thousand prompt tokens doesn't trip httpcore.ReadTimeout
+      # mid-stream. If this bites again, flip SOVEREIGN_MEMORY_MODE=tools
+      # (ADR-025) to pay the memory cost only when the LLM asks for it.
+      - SOVEREIGN_LLAMA_PROXY_TIMEOUT=${SOVEREIGN_LLAMA_PROXY_TIMEOUT:-300}
+      # DESIGN §16 Phase 5b: auth required by default — every request
+      # must carry a valid Keycloak JWT. Override with
+      # `SOVEREIGN_AUTH_REQUIRED=false` for the migration bypass if
+      # your client isn't Keycloak-ready yet. The Python test suite
+      # clears all SOVEREIGN_* env vars in conftest.py so its sentinel
+      # path is unaffected by this default.
+      - SOVEREIGN_AUTH_REQUIRED=${SOVEREIGN_AUTH_REQUIRED:-true}
+      - SOVEREIGN_KEYCLOAK_ISSUER=http://keycloak:8080/realms/sovereign-ai
+      - SOVEREIGN_KEYCLOAK_JWKS_URL=http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs
+      - SOVEREIGN_JWT_AUDIENCE=sovereign-memory-server
+      # Redis-backed token cache (ADR-026 §15.4)
+      - SOVEREIGN_REDIS_URL=redis://redis:6379/0
+      - SOVEREIGN_REDIS_PASSWORD=${SOVEREIGN_REDIS_PASSWORD}
+      - SOVEREIGN_TOKEN_CACHE_TTL_SECONDS=${SOVEREIGN_TOKEN_CACHE_TTL_SECONDS:-300}
+      # Memory-as-tools (ADR-025) — kill switch + loop cap + tool result cache
+      - SOVEREIGN_MEMORY_MODE=${SOVEREIGN_MEMORY_MODE:-inject}
+      - SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS=${SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS:-5}
+      - SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS=${SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS:-900}
+      - SOVEREIGN_TOOLS_CONFIG_PATH=${SOVEREIGN_TOOLS_CONFIG_PATH:-tools.toml}
+    volumes:
+      - ./memory/episodic:/app/memory/episodic:ro
+      - ./memory/procedural:/app/memory/procedural:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=sovereign-ai-net"
+      - "traefik.http.routers.memory.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.memory.entrypoints=websecure"
+      - "traefik.http.routers.memory.tls=true"
+      - "traefik.http.services.memory.loadbalancer.server.port=8765"
+    networks:
+      - sovereign-ai-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sovereign-postgres
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_DB: sovereign_ai
+      POSTGRES_USER: sovereign
+      POSTGRES_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
+      # Passed through to init-sovereign-app-role.sh so the app role
+      # gets a dedicated password. Falls back to POSTGRES_PASSWORD if
+      # the operator doesn't set it explicitly (dev-simple default).
+      SOVEREIGN_APP_PASSWORD: ${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-keycloak-db.sql:/docker-entrypoint-initdb.d/01-init-keycloak-db.sql:ro
+      # DESIGN §16 Phase 4: create the non-superuser sovereign_app role
+      # on first init. Runs AFTER keycloak DB creation (alphabetical
+      # ordering via the 01-/02- prefixes). Idempotent — safe to re-run
+      # manually via `docker exec` on an existing volume.
+      - ./scripts/init-sovereign-app-role.sh:/docker-entrypoint-initdb.d/02-init-sovereign-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sovereign -d sovereign_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
+  chromadb:
+    image: chromadb/chroma:1.5.7
+    container_name: sovereign-chromadb
+    ports:
+      - "18000:8000"
+    environment:
+      - CHROMA_SERVER_AUTHN_CREDENTIALS=${SOVEREIGN_CHROMA_TOKEN}
+      - CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8000 && echo -e \"GET /api/v2/heartbeat HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q 200 <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: sovereign-keycloak
+    command: start-dev --import-realm
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: sovereign
+      KC_DB_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./keycloak/realm-sovereign-ai.json:/opt/keycloak/data/import/realm.json:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.keycloak.rule=PathPrefix(`/realms`) || PathPrefix(`/admin`)"
+      - "traefik.http.routers.keycloak.entrypoints=websecure"
+      - "traefik.http.routers.keycloak.tls=true"
+      - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
+  redis:
+    # ADR-026 §15.4 — Redis-backed token cache.
+    # Dedicated to sovereign-memory-server; NOT shared with the Langfuse
+    # Redis (which lives in the sibling Langfuse compose stack). Keeping
+    # the two decoupled avoids cross-system coupling and lets each
+    # scale independently.
+    image: redis:7-alpine
+    container_name: sovereign-redis
+    command:
+      - redis-server
+      - --requirepass
+      - ${SOVEREIGN_REDIS_PASSWORD}
+      - --appendonly
+      - "no"  # token cache is ephemeral by design
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - sovereign_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$SOVEREIGN_REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      - SOVEREIGN_REDIS_PASSWORD=${SOVEREIGN_REDIS_PASSWORD}
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
+  traefik:
+    image: traefik:v3.6
+    container_name: sovereign-traefik
+    ports:
+      - "443:443"
+      - "8080:8080"
+    environment:
+      - DOCKER_API_VERSION=1.40
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./certs:/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  chroma_data:
+  sovereign_redis_data:
+
+networks:
+  sovereign-ai-net:
+    name: sovereign-ai-net
+    external: true
