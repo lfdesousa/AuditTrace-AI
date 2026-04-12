@@ -241,7 +241,7 @@ def build_ambient_context(
             "→ **recall_decisions**\n"
             "- Question about a methodology, pattern, framework, how to do something "
             "→ **recall_skills**\n"
-            "- Question about a previous session, continuity, \"where did we leave off\" "
+            '- Question about a previous session, continuity, "where did we leave off" '
             "→ **recall_recent_sessions**\n"
             "- Conceptual question, semantic search, everything else "
             "→ **recall_semantic**\n"
