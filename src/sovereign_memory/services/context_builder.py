@@ -94,10 +94,9 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Identity — always present, minimal
         sections.append(
-            "## Profil\n"
-            "Tu travailles avec Luis Filipe de Sousa, Solutions Architect, "
-            "spécialisé IAM/OAuth2, auteur d'un Authorization Server OAuth2 (100K users). "
-            f"Projet courant : **{project or 'non spécifié'}**."
+            "## Profile\n"
+            "You are working with a Solutions Architect specialised in IAM/OAuth2. "
+            f"Current project: **{project or 'unspecified'}**."
         )
 
         if not query:
@@ -176,7 +175,7 @@ class DefaultContextBuilder(ContextBuilderService):
 # so this is a safe over-estimate. If we ever hit the ceiling, the
 # per-tool description snippet is what gets trimmed first — the profile
 # line is load-bearing for tool selection.
-_AMBIENT_BUDGET_WORDS = 200
+_AMBIENT_BUDGET_WORDS = 280
 _DESCRIPTION_SNIPPET_LIMIT = 120
 
 
@@ -189,12 +188,19 @@ def build_ambient_context(
 
     Shape (roughly)::
 
-        ## Profil
-        Tu travailles avec <username> (role: admin|user).
-        Projet courant : <project>. Date : <YYYY-MM-DD>.
+        ## Profile
+        You are working with <username> (role: admin|user).
+        Current project: <project>. Date: <YYYY-MM-DD>.
 
-        ## Mémoire disponible
-        Tu peux appeler les outils suivants si le contexte l'exige :
+        ## Available Memory
+        You have several memory tools. Call ONLY the most relevant tool...
+        Selection rules:
+        - architectural decision → recall_decisions
+        - methodology/pattern → recall_skills
+        - previous session → recall_recent_sessions
+        - everything else → recall_semantic
+
+        Available tools:
         - recall_decisions(query): <description>
         - recall_skills(query): <description>
         - recall_recent_sessions(project, n): <description>
@@ -217,16 +223,32 @@ def build_ambient_context(
     project_label = project or "unspecified"
 
     lines: list[str] = []
-    lines.append("## Profil")
+    lines.append("## Profile")
     lines.append(
-        f"Tu travailles avec {user_context.username} (rôle: {role_label}). "
-        f"Projet courant : {project_label}. Date : {today_iso}."
+        f"You are working with {user_context.username} (role: {role_label}). "
+        f"Current project: {project_label}. Date: {today_iso}."
     )
 
     if tools_visible:
         lines.append("")
-        lines.append("## Mémoire disponible")
-        lines.append("Tu peux appeler les outils suivants si le contexte l'exige :")
+        lines.append("## Available Memory")
+        lines.append(
+            "You have several memory tools. "
+            "Call ONLY the most relevant tool for each question — "
+            "do NOT call all tools systematically.\n"
+            "Selection rules:\n"
+            "- Question about an architectural decision, an ADR, a past choice "
+            "→ **recall_decisions**\n"
+            "- Question about a methodology, pattern, framework, how to do something "
+            "→ **recall_skills**\n"
+            "- Question about a previous session, continuity, \"where did we leave off\" "
+            "→ **recall_recent_sessions**\n"
+            "- Conceptual question, semantic search, everything else "
+            "→ **recall_semantic**\n"
+            "When in doubt, prefer **recall_semantic** as fallback."
+        )
+        lines.append("")
+        lines.append("Available tools:")
         for t in tools_visible:
             fn = t.get("function") or {}
             name = fn.get("name", "?")

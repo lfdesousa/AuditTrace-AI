@@ -232,7 +232,7 @@ def test_chat_request_project_defaults_none():
 def test_context_build_response_model():
     """Test ContextBuildResponse model (ADR-018)."""
     response = ContextBuildResponse(
-        context_string="## Profil\nLuis Filipe...",
+        context_string="## Profile\nLuis Filipe...",
         layer_stats={
             "episodic": 2,
             "procedural": 1,
@@ -242,7 +242,7 @@ def test_context_build_response_model():
         query="KV cache compression",
         project="AuditTrace",
     )
-    assert response.context_string.startswith("## Profil")
+    assert response.context_string.startswith("## Profile")
     assert response.layer_stats["episodic"] == 2
     assert response.layer_stats["semantic"] == 4
     assert response.query == "KV cache compression"
