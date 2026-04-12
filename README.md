@@ -15,6 +15,8 @@ This implementation is based on the technical and regulatory framework defined i
 
 This work formalises the *Sovereignty-Reconstructibility Gap* and provides an auditable architecture compliant with **EU AI Act Article 12** and **GDPR Article 44**. The PDF is digitally signed, providing authorship non-repudiation, temporal anchoring, and tamper-evidence -- consistent with the reconstructibility principles defined in Section 7 of the paper.
 
+> **Academic trajectory:** This research is under discussion with the University of Liverpool Department of Computer Science as a potential PhD programme, building on the author's MSc in Big Data Analytics (Liverpool, 2022).
+
 [![CI](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)
 
 ## Features
