@@ -84,34 +84,34 @@ sequenceDiagram
     participant Auth as require_user
     participant Handler as _handle_tools_mode
     participant Loop as run_memory_tool_loop
-    participant Registry as tools_visible_to\\n+ get_tool_by_name
-    participant Cache as ToolResultCache\\n(sovereign-redis)
+    participant Registry as tools_visible_to\n+ get_tool_by_name
+    participant Cache as ToolResultCache\n(sovereign-redis)
     participant Invoke as invoke_tool
     participant Episodic as EpisodicService
     participant LLM as llama-server :11435
     participant PG as PostgreSQL
 
-    Agent->>Handler: POST /v1/chat/completions\\n{messages: [{user: "KV cache?"}], project: "AuditTrace"}
+    Agent->>Handler: POST /v1/chat/completions\n{messages: [{user: "KV cache?"}], project: "AuditTrace"}
     Handler->>Auth: Depends(require_user)
     Auth-->>Handler: UserContext (admin sentinel or Keycloak)
 
-    Note over Handler: Build ambient context\\nprofile + project + date + tool hints
+    Note over Handler: Build ambient context\nprofile + project + date + tool hints
     Handler->>Registry: tools_visible_to(user)
     Registry-->>Handler: 4 memory tool defs (scope-filtered)
 
-    Note over Handler: Merge ambient into system message\\naugmented_tools = client_tools + memory_tools
+    Note over Handler: Merge ambient into system message\naugmented_tools = client_tools + memory_tools
 
-    Handler->>Loop: run_memory_tool_loop(\\n  llama_url, loop_payload,\\n  user, session_id, max_iter=5)
+    Handler->>Loop: run_memory_tool_loop(\n  llama_url, loop_payload,\n  user, session_id, max_iter=5)
 
     rect rgb(220, 230, 250)
         Note over Loop,LLM: Iteration 1 — non-streaming
 
-        Loop->>LLM: POST /chat/completions (stream=false)\\n{messages: [...ambient, user],\\ntools: [bash?, recall_decisions, ...]}
-        LLM-->>Loop: {tool_calls: [{id: c1, name: recall_decisions,\\narguments: '{"query":"KV cache"}'}]}
+        Loop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user],\ntools: [bash?, recall_decisions, ...]}
+        LLM-->>Loop: {tool_calls: [{id: c1, name: recall_decisions,\narguments: '{"query":"KV cache"}'}]}
 
-        Note over Loop: All tool_calls are memory tools\\n→ dispatch, don't exit
+        Note over Loop: All tool_calls are memory tools\n→ dispatch, don't exit
 
-        Loop->>Invoke: invoke_tool(user, recall_decisions_tool,\\n{"query":"KV cache"}, session_id)
+        Loop->>Invoke: invoke_tool(user, recall_decisions_tool,\n{"query":"KV cache"}, session_id)
         Invoke->>Cache: get(sha256(session|tool|args))
         Cache-->>Invoke: None (miss)
         Invoke->>Episodic: search(user_context, "KV cache")
@@ -119,27 +119,27 @@ sequenceDiagram
         Invoke->>Cache: put(cache_id, {matches, total, truncated})
         Invoke-->>Loop: (result, was_cache_hit=False)
 
-        Note over Loop: Append assistant tool_calls message\\n+ tool_result message to conversation\\nRecord PendingToolCall (audit row)
+        Note over Loop: Append assistant tool_calls message\n+ tool_result message to conversation\nRecord PendingToolCall (audit row)
     end
 
     rect rgb(230, 250, 220)
         Note over Loop,LLM: Iteration 2 — final answer
 
-        Loop->>LLM: POST /chat/completions (stream=false)\\n{messages: [...ambient, user,\\nassistant tool_calls, tool_result]}
-        LLM-->>Loop: {content: "Based on ADR-009: 75% reduction."}\\nfinish_reason: "stop"
+        Loop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user,\nassistant tool_calls, tool_result]}
+        LLM-->>Loop: {content: "Based on ADR-009: 75% reduction."}\nfinish_reason: "stop"
 
         Note over Loop: No more tool_calls → done
     end
 
     Loop-->>Handler: (final_body, [pending_tool_call])
 
-    Handler->>PG: INSERT InteractionRecord\\n(user_id, question, answer, session_id, ...)
+    Handler->>PG: INSERT InteractionRecord\n(user_id, question, answer, session_id, ...)
     PG-->>Handler: interaction_id
 
-    Handler->>PG: INSERT ToolCall\\n(interaction_id FK, user_id, tool_name,\\ngranted_scope, duration_ms, result_summary)
+    Handler->>PG: INSERT ToolCall\n(interaction_id FK, user_id, tool_name,\ngranted_scope, duration_ms, result_summary)
     PG-->>Handler: ok
 
-    Handler-->>Agent: 200 OK\\n{choices: [{message: {content: "Based on ADR-009..."}}]}
+    Handler-->>Agent: 200 OK\n{choices: [{message: {content: "Based on ADR-009..."}}]}
 ```
 
 ## Trivial prompt — no tool calls fired
@@ -156,15 +156,15 @@ sequenceDiagram
     participant LLM as llama-server
     participant PG as PostgreSQL
 
-    Agent->>Handler: POST /v1/chat/completions\\n{messages: [{user: "hello"}]}
+    Agent->>Handler: POST /v1/chat/completions\n{messages: [{user: "hello"}]}
 
-    Note over Handler: Build ambient context (~50 words)\\nno memory search fires
+    Note over Handler: Build ambient context (~50 words)\nno memory search fires
 
     Handler->>Loop: run_memory_tool_loop(...)
     Loop->>LLM: POST (stream=false)
     LLM-->>Loop: {content: "Hi!", finish_reason: "stop"}
 
-    Note over Loop: no tool_calls → exit immediately\\n(1 iteration, 0 pending audit rows)
+    Note over Loop: no tool_calls → exit immediately\n(1 iteration, 0 pending audit rows)
 
     Loop-->>Handler: (final_body, [])
     Handler->>PG: INSERT InteractionRecord (user_id, ...)
@@ -190,15 +190,15 @@ sequenceDiagram
 
     Note over Loop: 2nd turn, same session, same args
 
-    Loop->>Invoke: invoke_tool(user, recall_decisions,\\n{"query":"KV cache"}, session_id)
+    Loop->>Invoke: invoke_tool(user, recall_decisions,\n{"query":"KV cache"}, session_id)
     Invoke->>Cache: get(sha256(session|tool|args))
     Cache-->>Invoke: {matches, total, truncated}
 
-    Note over Invoke: HIT — skip handler\\nskip audit row\\nreturn (cached, was_cache_hit=True)
+    Note over Invoke: HIT — skip handler\nskip audit row\nreturn (cached, was_cache_hit=True)
 
     Invoke-->>Loop: (cached_result, True)
 
-    Note over Loop: was_cache_hit=True\\n→ PendingToolCall NOT appended\\n→ tool_result still sent to LLM
+    Note over Loop: was_cache_hit=True\n→ PendingToolCall NOT appended\n→ tool_result still sent to LLM
 ```
 
 ## External tool call — loop exits, body passes through
@@ -218,10 +218,10 @@ sequenceDiagram
     Loop->>LLM: POST (iteration 1)
     LLM-->>Loop: {tool_calls: [{name: "bash", ...}]}
 
-    Note over Loop: tool_calls contains "bash"\\n→ external → exit loop\\nreturn body unchanged, pending=[]
+    Note over Loop: tool_calls contains "bash"\n→ external → exit loop\nreturn body unchanged, pending=[]
 
     Loop-->>Agent: passthrough: bash tool_call
-    Note over Agent: Agent runs bash locally,\\nre-submits with tool_result\\nnext turn
+    Note over Agent: Agent runs bash locally,\nre-submits with tool_result\nnext turn
 ```
 
 ## Iteration cap — defensive bound on chained tool calls
@@ -244,10 +244,10 @@ sequenceDiagram
     end
 
     Note over Loop: cap hit — last body still has tool_calls
-    Loop->>Logger: "memory tool-call loop reached\\nmax iterations (5)"
+    Loop->>Logger: "memory tool-call loop reached\nmax iterations (5)"
     Loop-->>Loop: return (last_body, pending)
 
-    Note over Loop: Caller renders whatever text/tool_calls\\nare in the body; cap-hit is not an error
+    Note over Loop: Caller renders whatever text/tool_calls\nare in the body; cap-hit is not an error
 ```
 
 ## Streaming — stream=true via SSE synthesis
@@ -270,7 +270,7 @@ sequenceDiagram
     alt stream=false
         Handler-->>Handler: return final_body as JSON
     else stream=true
-        Handler->>Synth: _synthesize_sse_from_body(\\n  final_body, requested_model)
+        Handler->>Synth: _synthesize_sse_from_body(\n  final_body, requested_model)
 
         Synth-->>Handler: data: {delta: {content}}
         Synth-->>Handler: data: {finish_reason: "stop"}
