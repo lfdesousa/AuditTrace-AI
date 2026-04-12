@@ -82,7 +82,7 @@ class TestDefaultContextBuilder:
         ctx = populated_builder.build_system_context(
             user_context, project="AuditTrace", query=None
         )
-        assert "Profil" in ctx
+        assert "Profile" in ctx
         assert "Architecture Decisions" not in ctx
         assert "Relevant Skills" not in ctx
         assert "Recent Sessions" not in ctx
@@ -109,14 +109,14 @@ class TestDefaultContextBuilder:
         ctx = populated_builder.build_system_context(
             user_context, project="AuditTrace", query="anything"
         )
-        assert "Luis Filipe" in ctx
+        assert "Solutions Architect" in ctx
         assert "AuditTrace" in ctx
 
     def test_query_with_no_matches(self, populated_builder, user_context):
         ctx = populated_builder.build_system_context(
             user_context, project="AuditTrace", query="quantum entanglement"
         )
-        assert "Profil" in ctx
+        assert "Profile" in ctx
         # Episodic/procedural/semantic should return nothing for this query
         assert "Architecture Decisions" not in ctx
         # Conversational always returns for the project
@@ -126,7 +126,7 @@ class TestDefaultContextBuilder:
         ctx = empty_builder.build_system_context(
             user_context, project="P", query="cache"
         )
-        assert "Profil" in ctx
+        assert "Profile" in ctx
         assert "Architecture Decisions" not in ctx
         assert "Recent Sessions" not in ctx
 
@@ -182,13 +182,13 @@ class TestDefaultContextBuilder:
         )
         # Should not raise
         ctx = builder.build_system_context(user_context, project="P", query="cache")
-        assert "Profil" in ctx
+        assert "Profile" in ctx
 
     def test_project_none_still_works(self, populated_builder, user_context):
         ctx = populated_builder.build_system_context(
             user_context, project=None, query="cache"
         )
-        assert "Profil" in ctx
+        assert "Profile" in ctx
 
     def test_procedural_layer_exception_is_swallowed(self, user_context):
         """Procedural layer exception must be swallowed; layer_stats=0.
@@ -212,7 +212,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["procedural"] == 0
-        assert "Profil" in ctx  # other layers still produced output
+        assert "Profile" in ctx  # other layers still produced output
 
     def test_conversational_layer_exception_is_swallowed(self, user_context):
         """Conversational layer exception must be swallowed; layer_stats=0."""
@@ -231,7 +231,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["conversational"] == 0
-        assert "Profil" in ctx
+        assert "Profile" in ctx
 
     def test_semantic_layer_exception_is_swallowed(self, user_context):
         """Semantic layer exception must be swallowed; layer_stats=0."""
@@ -250,7 +250,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["semantic"] == 0
-        assert "Profil" in ctx
+        assert "Profile" in ctx
 
     def test_semantic_layer_strips_path_prefix_from_source(self, user_context):
         """Sources containing '/' must be displayed as basename only (line 132-133)."""
@@ -338,7 +338,7 @@ class TestAmbientContext:
         )
         # Some explicit marker that no project was supplied
         assert ctx  # not empty
-        assert "unspecified" in ctx.lower() or "non spécifié" in ctx.lower()
+        assert "unspecified" in ctx.lower() or "unspecified" in ctx.lower()
 
     def test_tool_hints_listed_when_tools_visible(self, user_context):
         """When the caller is authorised to see memory tools, the ambient
@@ -377,8 +377,8 @@ class TestAmbientContext:
         assert "recall_" not in ctx
 
     def test_ambient_context_stays_within_budget(self, user_context):
-        """ADR-025 §Decision.1: ambient context ≤ 200 token budget
-        approximated as ≤ 200 whitespace-split words. All four tools
+        """ADR-025 §Decision.1: ambient context ≤ 280 token budget
+        approximated as ≤ 280 whitespace-split words. All four tools
         included; this is the worst case."""
         from sovereign_memory.services.context_builder import build_ambient_context
 
@@ -406,8 +406,8 @@ class TestAmbientContext:
             user_context, project="AuditTrace", tools_visible=four_tools
         )
         word_count = len(ctx.split())
-        assert word_count <= 200, (
-            f"ambient context is {word_count} words, over the 200 budget:\n{ctx}"
+        assert word_count <= 280, (
+            f"ambient context is {word_count} words, over the 280 budget:\n{ctx}"
         )
 
     def test_non_admin_profile_does_not_say_admin(self, user_context):

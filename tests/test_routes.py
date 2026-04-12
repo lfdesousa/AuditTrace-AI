@@ -72,7 +72,7 @@ def test_context_endpoint_empty_results(client):
 
     assert response.status_code == 200
     data = response.json()
-    assert "Profil" in data["context_string"]  # profile always present
+    assert "Profile" in data["context_string"]  # profile always present
 
 
 def test_health_endpoint(client):
