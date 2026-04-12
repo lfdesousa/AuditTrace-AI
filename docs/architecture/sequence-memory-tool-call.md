@@ -244,11 +244,11 @@ sequenceDiagram
         Note over ToolLoop: dispatch, continue
     end
 
-    Note over ToolLoop: cap hit — last body still has tool_calls
-    ToolLoop->>Logger: "memory tool-call loop reached\nmax iterations (5)"
+    Note over ToolLoop: cap hit, last body still has tool_calls
+    ToolLoop->>Logger: memory tool-call loop reached max iterations (5)
     ToolLoop-->>ToolLoop: return (last_body, pending)
 
-    Note over ToolLoop: Caller renders whatever text/tool_calls\nare in the body; cap-hit is not an error
+    Note over ToolLoop: Caller renders whatever is in the body. Cap-hit is not an error
 ```
 
 ## Streaming — stream=true via SSE synthesis
