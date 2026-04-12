@@ -1,7 +1,9 @@
 📄 Core Research Document
 This repository implements the architecture and benchmarks detailed in the primary technical paper:
 "Sovereign Local AI: Why On-Device LLM Inference on Unified Memory Hardware Outperforms Commercial API Stacks for Regulated Industries"
+
 [!IMPORTANT]
+
 **[Read the Full Technical Analysis (PDF)](./main_signed.pdf)**
 Digitally signed via SwissSign to certify authenticity and research priority.
 
