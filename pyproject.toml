@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audittrace-ai"
+version = "0.1.0"
+description = "AuditTrace-AI: sovereign AI memory server with 4-tier memory architecture and OAuth2 authentication"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "AGPL-3.0"}
+authors = [
+    {name = "Luis Filipe de Sousa", email = "ldesousapro@allaboutdata.eu"},
+]
+maintainers = [
+    {name = "Luis Filipe de Sousa", email = "ldesousapro@allaboutdata.eu"},
+]
+keywords = ["ai", "memory", "oauth2", "sovereign", "llama", "chromadb", "audittrace"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    # langchain and langchain-community dropped in ADR-025 — the repo only
+    # used them passively via `from langchain_core.documents import Document`.
+    # langchain-core is retained explicitly so the dataclass import keeps
+    # working without pulling the full Langchain + langchain-community tree.
+    "langchain-core>=0.1.0",
+    "chromadb>=0.4.22",
+    "python-jose[cryptography]>=3.3.0",
+    "python-multipart>=0.0.6",
+    "httpx>=0.25.0",
+    "langfuse>=2.0.0",
+    "openai>=1.12.0",
+    "alembic>=1.13.0",
+    "sqlalchemy>=2.0.25",
+    "psycopg2-binary>=2.9.9",
+    "redis>=5.0.0",
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-logging>=0.48b0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "fakeredis>=2.30.0",
+    "httpx>=0.25.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+    "black>=24.1.0",
+    "pre-commit>=3.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lfdesousa/AuditTrace-AI"
+Documentation = "https://github.com/lfdesousa/AuditTrace-AI#readme"
+Repository = "https://github.com/lfdesousa/AuditTrace-AI"
+Issues = "https://github.com/lfdesousa/AuditTrace-AI/issues"
+
+[project.scripts]
+audittrace = "sovereign_memory.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["sovereign_memory"]
+branch = true
+omit = ["tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # Pyflakes
+    "I",       # isort
+    "N",       # pep8-naming
+    "UP",      # pyupgrade
+    "YTT",     # flake8-2020
+]
+ignore = ["E501"]  # Line length handled by black
+
+[tool.ruff.lint.isort]
+known-first-party = ["sovereign_memory"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]

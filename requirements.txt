@@ -1,0 +1,38 @@
+# Requirements for sovereign-memory-server
+# Generated from pyproject.toml dependencies
+
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+# langchain / langchain-community dropped per ADR-025.
+# langchain-core retained for the passive Document dataclass import.
+langchain-core>=0.1.0
+chromadb>=0.4.22
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.6
+httpx>=0.25.0
+langfuse>=2.0.0
+openai>=1.12.0
+alembic>=1.13.0
+sqlalchemy>=2.0.25
+psycopg2-binary>=2.9.9
+redis>=5.0.0
+
+# Observability (ADR-014.4)
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp>=1.27.0
+opentelemetry-instrumentation-fastapi>=0.48b0
+opentelemetry-instrumentation-logging>=0.48b0
+
+# Dev dependencies
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+fakeredis>=2.30.0
+ruff>=0.1.0
+mypy>=1.8.0
+black>=24.1.0
+pre-commit>=3.6.0

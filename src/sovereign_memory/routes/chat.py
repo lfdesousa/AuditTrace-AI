@@ -1,0 +1,1003 @@
+"""Chat completions route — memory augmentation + llama-server proxy (ADR-024).
+
+Receives OpenAI-compatible chat requests, augments the system message with
+4-layer memory context, and forwards the *raw* request dict to llama-server.
+Pass-through is intentional: every field on the inbound payload (``tools``,
+``tool_choice``, ``tool_calls``, ``tool_call_id``, ``name``, ``function_call``,
+``response_format``, …) is preserved so the OpenAI tool-calling protocol works
+end-to-end. A strict Pydantic schema would silently strip unknown fields and
+break the tool workflow — see ADR-024 for the regression history.
+
+Spans are produced by an explicit ``@observe``-decorated memory build helper
+that returns a ``trace_id`` value. The streaming generator runs *after* the
+request handler returns, so we cannot rely on a context-manager span being
+open during stream consumption — instead we update the trace via Langfuse's
+ingestion API with the captured ``trace_id`` once the stream ends.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+from datetime import date, datetime
+from typing import Any
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+# Side-effect import so the four @register_memory_tool decorators run at
+# module import time — memory tools have to be in the registry before any
+# request reaches ``chat_completions``.
+import sovereign_memory.tools.memory_handlers  # noqa: F401
+from sovereign_memory import telemetry
+from sovereign_memory.auth import require_scope, require_user
+from sovereign_memory.config import get_settings
+from sovereign_memory.db.models import InteractionRecord, ToolCall
+from sovereign_memory.dependencies import get_context_builder, get_postgres_factory
+from sovereign_memory.identity import UserContext
+from sovereign_memory.logging_config import log_call
+from sovereign_memory.routes._memory_tool_loop import (
+    PendingToolCall,
+    run_memory_tool_loop,
+)
+from sovereign_memory.services.context_builder import (
+    ContextBuilderService,
+    build_ambient_context,
+)
+from sovereign_memory.tools import tools_visible_to
+
+# Optional Langfuse decorator + client lookup. The package is in requirements
+# but the @observe path is a soft dependency — when Langfuse is disabled or
+# the import fails for any reason, we fall back to a no-op decorator and a
+# null trace_id so the proxy keeps working unchanged.
+try:
+    from langfuse import get_client as _lf_get_client
+    from langfuse import observe as _lf_observe
+
+    _LANGFUSE_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dep path
+    _LANGFUSE_AVAILABLE = False
+
+    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
+        def deco(fn):
+            return fn
+
+        if args and callable(args[0]):
+            return args[0]
+        return deco
+
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _compute_session_id(source: str, first_user_content: str, user_id: str) -> str:
+    """Deterministic session id grouping all turns of the same conversation.
+
+    Format: ``{source}-{YYYY-MM-DD}-{sha256(source|date|user_id|first)[:16]}``
+    Stable across requests so Langfuse can cluster traces by session and
+    PostgreSQL ``interactions.session_id`` correlates rows.
+
+    DESIGN §15 Phase 2: ``user_id`` (Keycloak ``sub``) is mixed into the
+    hash so two users with identical ``(source, date, first_message)``
+    can never produce the same session id — a correctness invariant
+    once multi-user traffic lands.
+    """
+    today = date.today().isoformat()
+    raw = f"{source}|{today}|{user_id}|{first_user_content}"
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{source}-{today}-{h}"
+
+
+def _detect_source(request: Request) -> str:
+    """Best-effort agent identification from the User-Agent header."""
+    ua = (request.headers.get("user-agent") or "").lower()
+    for marker in ("opencode", "continue", "roocode", "openai", "curl", "httpx"):
+        if marker in ua:
+            return marker
+    return "unknown"
+
+
+def _persist_interaction(
+    project: str,
+    source: str,
+    question: str,
+    answer: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    session_id: str | None,
+    model: str | None,
+    user_id: str,
+) -> int | None:
+    """Persist a question/answer pair to PostgreSQL ``interactions``.
+
+    Best-effort — failures are logged but never raised so a DB hiccup
+    cannot break a chat response. Returns the autoincrement primary key
+    of the new row (or ``None`` on failure) so the caller can use it as
+    the FK for any downstream ``ToolCall`` rows linked to this interaction.
+
+    DESIGN §15 Phase 2: ``user_id`` (Keycloak ``sub``) is persisted on
+    every row so Phase 4 RLS policies and Phase 5 cross-user isolation
+    tests can enforce per-user boundaries.
+
+    ADR-025 Phase 4: return value is used by ``_flush_pending_tool_calls``
+    to populate the ``tool_calls.interaction_id`` FK after the parent
+    row lands.
+    """
+    try:
+        pg_factory = get_postgres_factory()
+        session_factory = pg_factory.get_session_factory()
+        db = session_factory()
+        try:
+            record = InteractionRecord(
+                project=project,
+                source=source,
+                question=question,
+                answer=answer,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                timestamp=datetime.now().isoformat(),
+                session_id=session_id,
+                model=model,
+                user_id=user_id,
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            return record.id
+        finally:
+            db.close()
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        logger.warning("Failed to persist interaction: %s", exc)
+        return None
+
+
+def _flush_pending_tool_calls(
+    pending: list[PendingToolCall],
+    interaction_id: int | None,
+) -> None:
+    """Write the accumulated ``ToolCall`` audit rows to Postgres.
+
+    ADR-025 §Decision.5: every memory-tool invocation produces one row
+    in the ``tool_calls`` table. The loop in ``_memory_tool_loop``
+    accumulates ``PendingToolCall`` records during execution; this
+    helper fills in the ``interaction_id`` FK and persists them after
+    the parent ``InteractionRecord`` has landed.
+
+    Best-effort semantics mirror ``_persist_interaction`` — a DB hiccup
+    logs a warning instead of breaking the chat response. Partial
+    success is acceptable: some rows land, some don't, rather than
+    all-or-nothing rollback.
+    """
+    if not pending or interaction_id is None:
+        return
+    try:
+        pg_factory = get_postgres_factory()
+        session_factory = pg_factory.get_session_factory()
+        db = session_factory()
+        try:
+            for rec in pending:
+                db.add(
+                    ToolCall(
+                        interaction_id=interaction_id,
+                        user_id=rec.user_id,
+                        agent_type=rec.agent_type,
+                        tool_name=rec.tool_name,
+                        args=rec.args,
+                        result_summary=rec.result_summary,
+                        error=rec.error,
+                        started_at=rec.started_at,
+                        duration_ms=rec.duration_ms,
+                        granted_scope=rec.granted_scope,
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        logger.warning(
+            "Failed to persist %d tool_calls for interaction %s: %s",
+            len(pending),
+            interaction_id,
+            exc,
+        )
+
+
+def _set_genai_request_attributes(
+    payload: dict, query: str, session_id: str, source: str, user_id: str
+) -> None:
+    """Tag the current span with gen_ai.* request attributes for Langfuse.
+
+    DESIGN §15 Phase 2: ``langfuse.user.id`` now carries the Keycloak
+    ``sub`` claim (the real identity) and ``sovereign.source`` keeps the
+    agent string for observability.
+    """
+    messages = payload.get("messages") or []
+    telemetry.set_current_span_attributes(
+        {
+            "gen_ai.system": "llama.cpp",
+            "gen_ai.request.model": payload.get("model", ""),
+            "gen_ai.request.temperature": payload.get("temperature"),
+            "gen_ai.request.top_p": payload.get("top_p"),
+            "gen_ai.request.max_tokens": payload.get("max_tokens") or 0,
+            "gen_ai.request.streaming": bool(payload.get("stream")),
+            # Langfuse-native attributes
+            "langfuse.session.id": session_id,
+            "langfuse.user.id": user_id,
+            "input.value": json.dumps(messages, ensure_ascii=False)[:8000],
+            "sovereign.memory.query": query,
+            "sovereign.memory.project": payload.get("project") or "",
+            "sovereign.source": source,
+            "sovereign.user.id": user_id,
+        }
+    )
+
+
+def _set_genai_response_attributes(response_json: dict) -> None:
+    """Tag the current span with gen_ai.* response attributes from llama-server."""
+    try:
+        choices = response_json.get("choices") or []
+        first = choices[0] if choices else {}
+        message = first.get("message") or {}
+        content = message.get("content") or ""
+        finish_reason = first.get("finish_reason") or ""
+        usage = response_json.get("usage") or {}
+        telemetry.set_current_span_attributes(
+            {
+                "gen_ai.response.model": response_json.get("model", ""),
+                "gen_ai.response.finish_reasons": finish_reason,
+                "gen_ai.usage.input_tokens": usage.get("prompt_tokens", 0),
+                "gen_ai.usage.output_tokens": usage.get("completion_tokens", 0),
+                "output.value": content[:8000],
+            }
+        )
+    except Exception:  # pragma: no cover
+        pass
+
+
+@log_call(logger=logger)
+def _extract_query(payload: dict) -> str:
+    """Extract the retrieval query from a raw chat request dict.
+
+    Honours an explicit ``context_query`` field, otherwise falls back to the
+    last user message. Tolerates OpenAI multi-part content arrays by joining
+    their text parts.
+    """
+    cq = payload.get("context_query")
+    if isinstance(cq, str) and cq:
+        return cq
+    for msg in reversed(payload.get("messages") or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+    return ""
+
+
+@log_call(logger=logger)
+def _merge_system_message(messages: list[dict], memory_context: str) -> list[dict]:
+    """Merge memory context into the system message. Preserves all other fields.
+
+    Crucially, every message is shallow-copied with ``dict(m)`` so fields like
+    ``tool_call_id``, ``name``, ``tool_calls``, and ``function_call`` survive
+    the augmentation. Pre-ADR-024 code stripped these.
+    """
+    result = [dict(m) for m in messages]
+    for m in result:
+        if m.get("role") == "system":
+            original = m.get("content", "") or ""
+            m["content"] = (
+                memory_context + "\n\n---\n\n## Agent Instructions\n" + original
+            )
+            return result
+    # No system message — insert one at index 0
+    result.insert(0, {"role": "system", "content": memory_context})
+    return result
+
+
+@_lf_observe(name="sovereign-chat-request")
+def _build_memory_context_with_trace(
+    context_builder: ContextBuilderService,
+    payload: dict,
+    query: str,
+    session_id: str,
+    source: str,
+    user_context: UserContext,
+) -> tuple[str, str | None]:
+    """Build memory context inside a Langfuse span; return (context, trace_id).
+
+    Setting span attributes here works because the span IS active during this
+    function's lifetime — unlike inside the streaming generator, which is
+    consumed *after* the request handler has already returned its
+    StreamingResponse object (at which point any context-manager span is
+    closed). Capturing ``trace_id`` as a return value lets the post-stream
+    code update the trace explicitly via the Langfuse ingestion API.
+
+    DESIGN §15 Phase 2: ``user_context`` is threaded into the context
+    builder so every layer can apply per-user scoping.
+    """
+    _set_genai_request_attributes(
+        payload, query, session_id, source, user_context.user_id
+    )
+    memory_context = context_builder.build_system_context(
+        user_context,
+        project=payload.get("project"),
+        query=query,
+    )
+    trace_id: str | None = None
+    if _LANGFUSE_AVAILABLE:
+        try:
+            client = _lf_get_client()
+            if client is not None:
+                trace_id = client.get_current_trace_id()
+        except Exception:  # pragma: no cover
+            trace_id = None
+    return memory_context, trace_id
+
+
+async def _record_langfuse_output(
+    trace_id: str | None,
+    answer: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    finish_reason: str | None,
+    tool_calls: list[dict] | None,
+    session_id: str | None,
+    model: str | None,
+) -> None:
+    """Update a Langfuse trace with the LLM output via the ingestion API.
+
+    Defensive — uses an explicit ``trace_id`` rather than relying on a span
+    context manager being open. The streaming generator runs *after* the
+    ``@observe`` span has already exited, so context-based updates would land
+    on a closed observation and never appear in the UI.
+
+    Async on purpose: a sync ``httpx.post`` here would block the event loop
+    inside the streaming generator's tail and stall stream completion if
+    Langfuse is slow. Both call sites are async so awaiting is free.
+    """
+    if not trace_id:
+        return
+    settings = get_settings()
+    if not (
+        settings.langfuse_host
+        and settings.langfuse_public_key
+        and settings.langfuse_secret_key
+    ):
+        return
+    metadata: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "finish_reason": finish_reason or "unknown",
+        "has_tool_calls": bool(tool_calls),
+        "model_backend": model or "unknown",
+    }
+    if tool_calls:
+        metadata["tool_calls"] = [
+            {
+                "name": (tc.get("function") or {}).get("name", ""),
+                "id": tc.get("id", ""),
+            }
+            for tc in tool_calls
+        ]
+    body: dict[str, Any] = {
+        "id": trace_id,
+        "output": answer,
+        "metadata": metadata,
+    }
+    if session_id:
+        body["sessionId"] = session_id
+    try:
+        ingestion_url = settings.langfuse_host.rstrip("/") + "/api/public/ingestion"
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                ingestion_url,
+                auth=(settings.langfuse_public_key, settings.langfuse_secret_key),
+                json={
+                    "batch": [
+                        {
+                            "id": f"output-{trace_id}",
+                            "type": "trace-create",
+                            "timestamp": datetime.now().isoformat() + "Z",
+                            "body": body,
+                        }
+                    ]
+                },
+            )
+    except Exception:  # pragma: no cover
+        logger.debug("Langfuse ingestion update failed (non-fatal)", exc_info=True)
+
+
+def _synthesize_sse_from_body(body: dict, requested_model: str):
+    """Produce an OpenAI-spec SSE stream from a non-streamed chat body.
+
+    ADR-025 Phase 4: the tool-call loop is always non-streaming so the
+    proxy can inspect ``tool_calls`` between iterations. When the
+    caller asked for ``stream=true`` we synthesise the SSE bytes from
+    the final body the loop returned — the content lands in one chunk
+    rather than being word-by-word streamed, but the wire format is
+    correct and OpenAI-compatible clients handle it uniformly.
+
+    The emitted frames are:
+
+      1. One data chunk with the full content (and tool_calls if any)
+      2. One data chunk with the finish_reason
+      3. A synthetic usage chunk (so clients that track token counts
+         see the cost the loop incurred in aggregate)
+      4. ``data: [DONE]``
+
+    Returns an async iterator suitable for ``StreamingResponse``.
+    """
+    choices = body.get("choices") or []
+    first = choices[0] if choices else {}
+    message = first.get("message") or {}
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls")
+    finish_reason = first.get("finish_reason") or "stop"
+    usage = body.get("usage") or {}
+    model = body.get("model") or requested_model
+    resp_id = body.get("id") or "chatcmpl-sovereign"
+    created = body.get("created") or 0
+
+    async def _iter():
+        # Content chunk
+        delta: dict[str, Any] = {"content": content}
+        if tool_calls:
+            delta["tool_calls"] = tool_calls
+        content_chunk = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta}],
+        }
+        yield ("data: " + json.dumps(content_chunk) + "\n\n").encode()
+
+        # Finish chunk
+        finish_chunk = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        }
+        yield ("data: " + json.dumps(finish_chunk) + "\n\n").encode()
+
+        # Usage chunk (optional but helps clients that track cost)
+        usage_chunk = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
+        yield ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
+
+    return _iter()
+
+
+def _render_tool_calls_text(tool_calls_acc: dict[int, dict]) -> str:
+    """Render accumulated tool_calls as ``[tool_call] name(args)`` lines."""
+    lines: list[str] = []
+    for idx in sorted(tool_calls_acc):
+        tc = tool_calls_acc[idx]
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or ""
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        lines.append(f"[tool_call] {fn.get('name', '')}({args[:500]})")
+    return "\n".join(lines)
+
+
+@router.get("/models")
+@log_call(logger=logger)
+async def list_models(
+    _auth: dict = Depends(require_scope("sovereign-ai:query")),
+):
+    """Proxy GET /v1/models to llama-server.
+
+    OpenAI-compatible clients (OpenCode, Continue) call this to discover
+    available models before sending chat completions.
+    """
+    settings = get_settings()
+    models_url = settings.llama_url.rstrip("/") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(models_url)
+            return response.json()
+    except httpx.ConnectError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"llama-server unreachable at {models_url}",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"llama-server timeout at {models_url}",
+        ) from exc
+
+
+@_lf_observe(name="sovereign-chat-request", capture_output=False)
+def _prepare_tools_mode_trace(
+    payload: dict,
+    query: str,
+    session_id: str,
+    source: str,
+    user_context: UserContext,
+) -> tuple[list[dict], str | None]:
+    """Set gen_ai.* request attributes on the active Langfuse span and
+    return ``(tools_for_user, trace_id)``.
+
+    Mirrors the inject-mode helper ``_build_memory_context_with_trace`` so
+    tools mode gets a real parent trace visible in the Langfuse UI. We
+    must set the request attributes *inside* the decorated function so
+    they land on the span the decorator just opened — writing them from
+    the caller would land on whichever span is active there, or on none.
+
+    ``tools_for_user`` is returned because computing it here is cheap and
+    the caller needs it to build the ambient context and augment the
+    outbound tools array. Keeping the computation on the same call avoids
+    asking the registry twice.
+
+    ``capture_output=False`` on the decorator stops Langfuse from
+    auto-capturing this helper's return value (the tools list + trace_id
+    tuple) as the span's ``output``. The authoritative output for the
+    span is the LLM reply, which ``_record_langfuse_output`` pushes via
+    the ingestion API *after* the tool-call loop completes. Without this
+    flag the tools list clobbers the real answer in the Langfuse UI.
+    """
+    _set_genai_request_attributes(
+        payload, query, session_id, source, user_context.user_id
+    )
+    tools_for_user = tools_visible_to(user_context)
+    trace_id: str | None = None
+    if _LANGFUSE_AVAILABLE:
+        try:
+            client = _lf_get_client()
+            if client is not None:
+                trace_id = client.get_current_trace_id()
+        except Exception:  # pragma: no cover
+            trace_id = None
+    return tools_for_user, trace_id
+
+
+async def _handle_tools_mode(
+    *,
+    payload: dict,
+    user: UserContext,
+    source: str,
+    session_id: str,
+    query: str,
+    settings,
+) -> Any:
+    """ADR-025 ``memory_mode=tools`` path.
+
+    1. Build the minimal ambient context (identity + project + date +
+       tool hints) and merge it into the request's system message.
+    2. Augment the ``tools`` array with the memory tools the caller is
+       scoped for, alongside whatever tools the client already sent.
+    3. Run the proxy-internal tool-call loop (non-streaming round-trips
+       to llama-server until the model answers, a mixed/external tool
+       call appears, or the iteration cap is hit).
+    4. Persist the ``InteractionRecord`` and flush accumulated
+       ``PendingToolCall`` audit rows linked to its id.
+    5. Push the LLM output to Langfuse via the ingestion API using the
+       ``trace_id`` captured from the ``@_lf_observe`` helper span.
+    6. Return the final body as JSON, or synthesise an SSE stream from
+       it when the caller asked for ``stream=true``.
+
+    Per-tool-call child spans are intentionally not emitted here — that
+    richer instrumentation is a Phase 5 follow-up for ADR-025. The parent
+    chat observation with input/output + usage is enough to restore
+    parity with inject mode in the Langfuse UI.
+    """
+    project = payload.get("project") or "unknown"
+    requested_model = payload.get("model", "")
+    is_stream = bool(payload.get("stream"))
+
+    # 1 — Open the parent Langfuse span, capture trace_id, and compute
+    # which memory tools the caller is scoped for. Runs in a worker
+    # thread so the synchronous @_lf_observe decorator doesn't block the
+    # event loop (same pattern as inject mode's context build).
+    tools_for_user, trace_id = await asyncio.to_thread(
+        _prepare_tools_mode_trace,
+        payload,
+        query,
+        session_id,
+        source,
+        user,
+    )
+
+    ambient = build_ambient_context(user, project, tools_for_user)
+
+    existing_tools = payload.get("tools") or []
+    augmented_tools = list(existing_tools) + tools_for_user
+
+    augmented_messages = _merge_system_message(payload["messages"], ambient)
+    loop_payload = dict(payload)
+    loop_payload["messages"] = augmented_messages
+    loop_payload["tools"] = augmented_tools
+    loop_payload["stream"] = False  # loop is always non-streaming internally
+
+    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+
+    # 2 — Run the loop
+    final_body, pending = await run_memory_tool_loop(
+        llama_url=llama_url,
+        payload=loop_payload,
+        user_context=user,
+        session_id=session_id,
+        max_iterations=settings.memory_tool_loop_max_iterations,
+        timeout_seconds=settings.llama_proxy_timeout,
+    )
+
+    # 3 — Extract answer text + usage for the interaction row
+    choices = final_body.get("choices") or []
+    first = choices[0] if choices else {}
+    message = first.get("message") or {}
+    answer_text = message.get("content") or ""
+    final_tool_calls = message.get("tool_calls") or []
+    if final_tool_calls:
+        tc_acc = {i: tc for i, tc in enumerate(final_tool_calls)}
+        answer_text = (
+            answer_text + "\n" + _render_tool_calls_text(tc_acc)
+            if answer_text
+            else _render_tool_calls_text(tc_acc)
+        )
+    usage = final_body.get("usage") or {}
+    finish_reason = first.get("finish_reason") or "stop"
+    response_model = final_body.get("model") or requested_model
+
+    # 4 — Persist interaction + flush audit rows
+    interaction_id = _persist_interaction(
+        project=project,
+        source=source,
+        question=query,
+        answer=answer_text,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        session_id=session_id,
+        model=response_model,
+        user_id=user.user_id,
+    )
+    _flush_pending_tool_calls(pending, interaction_id)
+
+    # 5 — Push the output to Langfuse. Best-effort: the helper swallows
+    # its own exceptions so a Langfuse outage cannot break the chat
+    # response. No-op when ``trace_id`` is None (Langfuse disabled).
+    await _record_langfuse_output(
+        trace_id=trace_id,
+        answer=answer_text,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        finish_reason=finish_reason,
+        tool_calls=final_tool_calls or None,
+        session_id=session_id,
+        model=response_model,
+    )
+
+    # 6 — Return JSON or synthesised SSE
+    if is_stream:
+        return StreamingResponse(
+            _synthesize_sse_from_body(final_body, requested_model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return final_body
+
+
+@router.post("/chat/completions")
+async def chat_completions(
+    http_request: Request,
+    context_builder: ContextBuilderService = Depends(get_context_builder),
+    _auth: dict = Depends(require_scope("sovereign-ai:query")),
+    user: UserContext = Depends(require_user),
+):
+    """OpenAI-compatible chat completions with memory augmentation.
+
+    Raw dict pass-through proxy: every field on the inbound request is
+    forwarded to llama-server unchanged except ``messages``, which has the
+    memory context merged into its system entry. This preserves
+    ``tools``, ``tool_choice``, ``tool_calls``, ``tool_call_id``, ``name``,
+    ``response_format``, ``parallel_tool_calls``, and any future OpenAI-spec
+    field without code changes (ADR-024).
+
+    No ``@log_call`` decorator on purpose — the streaming generator is
+    consumed *after* this function returns, so a context-manager span here
+    would close before the generator ran. The explicit ``@observe`` on
+    ``_build_memory_context_with_trace`` owns the request span instead.
+    """
+    settings = get_settings()
+    try:
+        payload: dict = await http_request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON body: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        raise HTTPException(status_code=422, detail="messages: list required")
+
+    query = _extract_query(payload)
+    source = _detect_source(http_request)
+    first_user = next(
+        (
+            m.get("content", "")
+            for m in payload["messages"]
+            if isinstance(m, dict)
+            and m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+        ),
+        query or "",
+    )
+    session_id = _compute_session_id(source, first_user, user.user_id)
+
+    # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
+    # runs the pre-Phase-4 4-layer context build; the tools path runs
+    # the proxy-internal tool-call loop.
+    if settings.memory_mode == "tools":
+        return await _handle_tools_mode(
+            payload=payload,
+            user=user,
+            source=source,
+            session_id=session_id,
+            query=query,
+            settings=settings,
+        )
+
+    # Build memory context inside an @observe span (off-loop because the
+    # context builder hits ChromaDB and disk synchronously) and capture an
+    # explicit trace_id for the post-stream Langfuse update.
+    memory_context, trace_id = await asyncio.to_thread(
+        _build_memory_context_with_trace,
+        context_builder,
+        payload,
+        query,
+        session_id,
+        source,
+        user,
+    )
+
+    # Augment messages list — every other message field is preserved verbatim.
+    augmented_messages = _merge_system_message(payload["messages"], memory_context)
+    proxy_payload = dict(payload)  # shallow copy of top-level keys
+    proxy_payload["messages"] = augmented_messages
+
+    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+    project = payload.get("project") or "unknown"
+    requested_model = payload.get("model", "")
+    is_stream = bool(payload.get("stream"))
+
+    # ─────────────────────────── Streaming branch ───────────────────────────
+    if is_stream:
+
+        async def _iter_and_capture():
+            chunks: list[str] = []
+            tool_calls_acc: dict[int, dict] = {}
+            prompt_tokens = 0
+            completion_tokens = 0
+            response_model: str | None = None
+            response_id: str | None = None
+            response_created: int | None = None
+            finish_reason: str | None = None
+            done_seen = False
+            try:
+                async with httpx.AsyncClient(
+                    timeout=settings.llama_proxy_timeout
+                ) as client:
+                    async with client.stream(
+                        "POST", llama_url, json=proxy_payload
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            stripped = line.strip()
+                            if not stripped.startswith("data: "):
+                                # Forward blank/non-data lines verbatim (SSE separators)
+                                yield (line + "\n").encode()
+                                continue
+                            payload_str = stripped[6:]
+                            if payload_str == "[DONE]":
+                                # Hold the marker — synthetic usage chunk goes first.
+                                done_seen = True
+                                continue
+                            yield (line + "\n").encode()
+                            try:
+                                chunk = json.loads(payload_str)
+                            except json.JSONDecodeError:
+                                continue
+                            if not response_model and chunk.get("model"):
+                                response_model = chunk["model"]
+                            if not response_id and chunk.get("id"):
+                                response_id = chunk["id"]
+                            if not response_created and chunk.get("created"):
+                                response_created = chunk["created"]
+                            choices = chunk.get("choices") or []
+                            if choices:
+                                choice0 = choices[0]
+                                if choice0.get("finish_reason"):
+                                    finish_reason = choice0["finish_reason"]
+                                delta = choice0.get("delta") or {}
+                                content = delta.get("content")
+                                if content:
+                                    chunks.append(content)
+                                # Accumulate streamed tool_calls by index — fragments
+                                # of function.arguments arrive across many chunks.
+                                for tc in delta.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    if idx not in tool_calls_acc:
+                                        tool_calls_acc[idx] = {
+                                            "id": tc.get("id", ""),
+                                            "type": tc.get("type", "function"),
+                                            "function": {
+                                                "name": "",
+                                                "arguments": "",
+                                            },
+                                        }
+                                    entry = tool_calls_acc[idx]
+                                    if tc.get("id"):
+                                        entry["id"] = tc["id"]
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        entry["function"]["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        entry["function"]["arguments"] += fn[
+                                            "arguments"
+                                        ]
+                            usage = chunk.get("usage") or {}
+                            if usage:
+                                prompt_tokens = usage.get(
+                                    "prompt_tokens", prompt_tokens
+                                )
+                                completion_tokens = usage.get(
+                                    "completion_tokens", completion_tokens
+                                )
+                            timings = chunk.get("timings") or {}
+                            if timings:
+                                cache_n = int(timings.get("cache_n", 0) or 0)
+                                prompt_n = int(timings.get("prompt_n", 0) or 0)
+                                predicted_n = int(timings.get("predicted_n", 0) or 0)
+                                if prompt_tokens == 0:
+                                    prompt_tokens = cache_n + prompt_n
+                                if completion_tokens == 0:
+                                    completion_tokens = predicted_n
+                # Inject synthetic usage chunk for OpenAI clients that need it.
+                usage_chunk = {
+                    "id": response_id or "chatcmpl-sovereign",
+                    "object": "chat.completion.chunk",
+                    "created": response_created or 0,
+                    "model": response_model or requested_model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                }
+                yield ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
+                if done_seen:
+                    yield b"data: [DONE]\n\n"
+            except httpx.ConnectError:
+                yield b'data: {"error":"llama-server unreachable"}\n\n'
+                yield b"data: [DONE]\n\n"
+                return
+            except httpx.HTTPStatusError as exc:
+                err = json.dumps(
+                    {"error": f"llama-server status {exc.response.status_code}"}
+                )
+                yield ("data: " + err + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                return
+
+            # Post-stream: build answer including tool_calls if present
+            text_answer = "".join(chunks)
+            if tool_calls_acc:
+                tool_calls_text = _render_tool_calls_text(tool_calls_acc)
+                answer = (
+                    text_answer + "\n" + tool_calls_text
+                    if text_answer
+                    else tool_calls_text
+                )
+            else:
+                answer = text_answer
+
+            _persist_interaction(
+                project=project,
+                source=source,
+                question=query,
+                answer=answer,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                session_id=session_id,
+                model=response_model or requested_model,
+                user_id=user.user_id,
+            )
+            await _record_langfuse_output(
+                trace_id=trace_id,
+                answer=answer,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                finish_reason=finish_reason,
+                tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+                if tool_calls_acc
+                else None,
+                session_id=session_id,
+                model=response_model or requested_model,
+            )
+
+        return StreamingResponse(
+            _iter_and_capture(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ──────────────────────── Non-streaming branch ──────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=settings.llama_proxy_timeout) as client:
+            response = await client.post(llama_url, json=proxy_payload)
+        body = response.json()
+    except httpx.ConnectError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"llama-server unreachable at {llama_url}",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"llama-server timeout after {settings.llama_proxy_timeout}s",
+        ) from exc
+
+    _set_genai_response_attributes(body)
+    try:
+        choices = body.get("choices") or []
+        message_obj = (choices[0].get("message") or {}) if choices else {}
+        answer = message_obj.get("content") or ""
+        ns_tool_calls = message_obj.get("tool_calls") or []
+        if ns_tool_calls:
+            # Reuse the same renderer as the streaming branch by indexing into
+            # the same shape (function/{name,arguments}).
+            tc_acc = {i: tc for i, tc in enumerate(ns_tool_calls)}
+            tool_text = _render_tool_calls_text(tc_acc)
+            answer = (answer + "\n" + tool_text) if answer else tool_text
+        usage = body.get("usage") or {}
+        finish_reason = (choices[0].get("finish_reason") if choices else None) or "stop"
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer=answer,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            session_id=session_id,
+            model=body.get("model") or requested_model,
+            user_id=user.user_id,
+        )
+        await _record_langfuse_output(
+            trace_id=trace_id,
+            answer=answer,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            finish_reason=finish_reason,
+            tool_calls=ns_tool_calls or None,
+            session_id=session_id,
+            model=body.get("model") or requested_model,
+        )
+    except Exception:  # pragma: no cover - capture is best-effort
+        logger.exception("post-response capture failed")
+    return body
