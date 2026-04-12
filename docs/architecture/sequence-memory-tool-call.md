@@ -83,7 +83,7 @@ sequenceDiagram
     participant Agent as Coding Agent
     participant Auth as require_user
     participant Handler as _handle_tools_mode
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant Registry as tools_visible_to\n+ get_tool_by_name
     participant Cache as ToolResultCache\n(sovereign-redis)
     participant Invoke as invoke_tool
@@ -101,37 +101,37 @@ sequenceDiagram
 
     Note over Handler: Merge ambient into system message\naugmented_tools = client_tools + memory_tools
 
-    Handler->>Loop: run_memory_tool_loop(\n  llama_url, loop_payload,\n  user, session_id, max_iter=5)
+    Handler->>ToolLoop: run_memory_tool_loop(\n  llama_url, loop_payload,\n  user, session_id, max_iter=5)
 
     rect rgb(220, 230, 250)
-        Note over Loop,LLM: Iteration 1 — non-streaming
+        Note over ToolLoop,LLM: Iteration 1 — non-streaming
 
-        Loop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user],\ntools: [bash?, recall_decisions, ...]}
-        LLM-->>Loop: {tool_calls: [{id: c1, name: recall_decisions,\narguments: '{"query":"KV cache"}'}]}
+        ToolLoop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user],\ntools: [bash?, recall_decisions, ...]}
+        LLM-->>ToolLoop: {tool_calls: [{id: c1, name: recall_decisions,\narguments: '{"query":"KV cache"}'}]}
 
-        Note over Loop: All tool_calls are memory tools\n→ dispatch, don't exit
+        Note over ToolLoop: All tool_calls are memory tools\n→ dispatch, don't exit
 
-        Loop->>Invoke: invoke_tool(user, recall_decisions_tool,\n{"query":"KV cache"}, session_id)
+        ToolLoop->>Invoke: invoke_tool(user, recall_decisions_tool,\n{"query":"KV cache"}, session_id)
         Invoke->>Cache: get(sha256(session|tool|args))
         Cache-->>Invoke: None (miss)
         Invoke->>Episodic: search(user_context, "KV cache")
         Episodic-->>Invoke: [Document(ADR-009, ...)]
         Invoke->>Cache: put(cache_id, {matches, total, truncated})
-        Invoke-->>Loop: (result, was_cache_hit=False)
+        Invoke-->>ToolLoop: (result, was_cache_hit=False)
 
-        Note over Loop: Append assistant tool_calls message\n+ tool_result message to conversation\nRecord PendingToolCall (audit row)
+        Note over ToolLoop: Append assistant tool_calls message\n+ tool_result message to conversation\nRecord PendingToolCall (audit row)
     end
 
     rect rgb(230, 250, 220)
-        Note over Loop,LLM: Iteration 2 — final answer
+        Note over ToolLoop,LLM: Iteration 2 — final answer
 
-        Loop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user,\nassistant tool_calls, tool_result]}
-        LLM-->>Loop: {content: "Based on ADR-009: 75% reduction."}\nfinish_reason: "stop"
+        ToolLoop->>LLM: POST /chat/completions (stream=false)\n{messages: [...ambient, user,\nassistant tool_calls, tool_result]}
+        LLM-->>ToolLoop: {content: "Based on ADR-009: 75% reduction."}\nfinish_reason: "stop"
 
-        Note over Loop: No more tool_calls → done
+        Note over ToolLoop: No more tool_calls → done
     end
 
-    Loop-->>Handler: (final_body, [pending_tool_call])
+    ToolLoop-->>Handler: (final_body, [pending_tool_call])
 
     Handler->>PG: INSERT InteractionRecord\n(user_id, question, answer, session_id, ...)
     PG-->>Handler: interaction_id
@@ -152,7 +152,7 @@ interaction row. This is the cost profile we're optimising for.
 sequenceDiagram
     participant Agent as Coding Agent
     participant Handler as _handle_tools_mode
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant LLM as llama-server
     participant PG as PostgreSQL
 
@@ -160,13 +160,13 @@ sequenceDiagram
 
     Note over Handler: Build ambient context (~50 words)\nno memory search fires
 
-    Handler->>Loop: run_memory_tool_loop(...)
-    Loop->>LLM: POST (stream=false)
-    LLM-->>Loop: {content: "Hi!", finish_reason: "stop"}
+    Handler->>ToolLoop: run_memory_tool_loop(...)
+    ToolLoop->>LLM: POST (stream=false)
+    LLM-->>ToolLoop: {content: "Hi!", finish_reason: "stop"}
 
-    Note over Loop: no tool_calls → exit immediately\n(1 iteration, 0 pending audit rows)
+    Note over ToolLoop: no tool_calls → exit immediately\n(1 iteration, 0 pending audit rows)
 
-    Loop-->>Handler: (final_body, [])
+    ToolLoop-->>Handler: (final_body, [])
     Handler->>PG: INSERT InteractionRecord (user_id, ...)
     Note over PG: ZERO ToolCall rows
 
@@ -183,22 +183,22 @@ same execution was already audited when the cache was populated.
 
 ```mermaid
 sequenceDiagram
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant Invoke as invoke_tool
     participant Cache as ToolResultCache
     participant Episodic as EpisodicService
 
-    Note over Loop: 2nd turn, same session, same args
+    Note over ToolLoop: 2nd turn, same session, same args
 
-    Loop->>Invoke: invoke_tool(user, recall_decisions,\n{"query":"KV cache"}, session_id)
+    ToolLoop->>Invoke: invoke_tool(user, recall_decisions,\n{"query":"KV cache"}, session_id)
     Invoke->>Cache: get(sha256(session|tool|args))
     Cache-->>Invoke: {matches, total, truncated}
 
     Note over Invoke: HIT — skip handler\nskip audit row\nreturn (cached, was_cache_hit=True)
 
-    Invoke-->>Loop: (cached_result, True)
+    Invoke-->>ToolLoop: (cached_result, True)
 
-    Note over Loop: was_cache_hit=True\n→ PendingToolCall NOT appended\n→ tool_result still sent to LLM
+    Note over ToolLoop: was_cache_hit=True\n→ PendingToolCall NOT appended\n→ tool_result still sent to LLM
 ```
 
 ## External tool call — loop exits, body passes through
@@ -212,15 +212,15 @@ model will re-emit them on the next turn if still needed.
 ```mermaid
 sequenceDiagram
     participant Agent as Coding Agent
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant LLM as llama-server
 
-    Loop->>LLM: POST (iteration 1)
-    LLM-->>Loop: {tool_calls: [{name: "bash", ...}]}
+    ToolLoop->>LLM: POST (iteration 1)
+    LLM-->>ToolLoop: {tool_calls: [{name: "bash", ...}]}
 
-    Note over Loop: tool_calls contains "bash"\n→ external → exit loop\nreturn body unchanged, pending=[]
+    Note over ToolLoop: tool_calls contains "bash"\n→ external → exit loop\nreturn body unchanged, pending=[]
 
-    Loop-->>Agent: passthrough: bash tool_call
+    ToolLoop-->>Agent: passthrough: bash tool_call
     Note over Agent: Agent runs bash locally,\nre-submits with tool_result\nnext turn
 ```
 
@@ -233,21 +233,22 @@ operators can correlate cap-hits with bad prompts in production.
 
 ```mermaid
 sequenceDiagram
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant LLM as llama-server
     participant Logger as logger.warning
 
-    loop N iterations (N = max_iter)
-        Loop->>LLM: POST
-        LLM-->>Loop: {tool_calls: [memory tool]}
-        Note over Loop: dispatch, continue
+    rect rgb(255, 240, 230)
+        Note over ToolLoop,LLM: Repeats up to max_iter times
+        ToolLoop->>LLM: POST
+        LLM-->>ToolLoop: {tool_calls: [memory tool]}
+        Note over ToolLoop: dispatch, continue
     end
 
-    Note over Loop: cap hit — last body still has tool_calls
-    Loop->>Logger: "memory tool-call loop reached\nmax iterations (5)"
-    Loop-->>Loop: return (last_body, pending)
+    Note over ToolLoop: cap hit — last body still has tool_calls
+    ToolLoop->>Logger: "memory tool-call loop reached\nmax iterations (5)"
+    ToolLoop-->>ToolLoop: return (last_body, pending)
 
-    Note over Loop: Caller renders whatever text/tool_calls\nare in the body; cap-hit is not an error
+    Note over ToolLoop: Caller renders whatever text/tool_calls\nare in the body; cap-hit is not an error
 ```
 
 ## Streaming — stream=true via SSE synthesis
@@ -261,11 +262,11 @@ synthetic usage chunk, then `[DONE]`.
 ```mermaid
 sequenceDiagram
     participant Handler as _handle_tools_mode
-    participant Loop as run_memory_tool_loop
+    participant ToolLoop as run_memory_tool_loop
     participant Synth as _synthesize_sse_from_body
 
-    Handler->>Loop: run loop (non-streaming internally)
-    Loop-->>Handler: final_body
+    Handler->>ToolLoop: run tool dispatch (non-streaming internally)
+    ToolLoop-->>Handler: final_body
 
     alt stream=false
         Handler-->>Handler: return final_body as JSON
