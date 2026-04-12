@@ -1,0 +1,21 @@
+# Traefik static configuration — sovereign-ai-stack (ADR-021)
+
+api:
+  dashboard: true
+  insecure: true  # Dashboard on :8080 (internal only)
+
+entryPoints:
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: sovereign-ai-net
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO

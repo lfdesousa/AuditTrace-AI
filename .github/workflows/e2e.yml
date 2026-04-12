@@ -1,0 +1,129 @@
+name: E2E
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Docker network
+        run: docker network create sovereign-ai-net
+
+      - name: Generate test secrets
+        run: |
+          mkdir -p secrets
+          echo "test-postgres-password" > secrets/postgres_password.txt
+          echo "test-chroma-token" > secrets/chroma_token.txt
+
+      - name: Generate test TLS certificates
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -keyout certs/sovereign-key.pem \
+            -out certs/sovereign.pem -days 1 -nodes \
+            -subj "/CN=localhost" 2>/dev/null
+
+      - name: Create .env
+        run: |
+          cat > .env <<'EOF'
+          SOVEREIGN_POSTGRES_PASSWORD=test-postgres-password
+          SOVEREIGN_CHROMA_TOKEN=test-chroma-token
+          SOVEREIGN_REDIS_PASSWORD=test-redis-password
+          SOVEREIGN_AUTH_ENABLED=false
+          SOVEREIGN_AUTH_REQUIRED=false
+          SOVEREIGN_LOG_LEVEL=INFO
+          SOVEREIGN_LANGFUSE_ENABLED=false
+          KEYCLOAK_ADMIN_PASSWORD=admin
+          EOF
+          # Remove leading whitespace from heredoc (YAML indentation artifact)
+          sed -i 's/^[[:space:]]*//' .env
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+        env:
+          SOVEREIGN_POSTGRES_PASSWORD: test-postgres-password
+          SOVEREIGN_CHROMA_TOKEN: test-chroma-token
+          SOVEREIGN_REDIS_PASSWORD: test-redis-password
+
+      - name: Show container status
+        if: always()
+        run: docker compose ps
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for memory-server..."
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 5 -k https://localhost/health > /dev/null 2>&1; then
+              echo "memory-server ready after $((i * 3))s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "TIMEOUT: memory-server not ready after 180s"
+              docker compose logs --tail=30
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Health check — memory-server
+        run: |
+          response=$(curl -sf --max-time 10 -k https://localhost/health)
+          echo "Response: ${response}"
+          echo "${response}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok', f'Unexpected: {d}'"
+
+      - name: Health check — ChromaDB (via Docker network)
+        run: |
+          docker exec sovereign-memory-server bash -c \
+            'exec 3<>/dev/tcp/chromadb/8000 && echo -e "GET /api/v2/heartbeat HTTP/1.1\r\nHost: chromadb\r\nConnection: close\r\n\r\n" >&3 && grep -q 200 <&3'
+          echo "ChromaDB healthy"
+
+      - name: Health check — Traefik dashboard
+        run: curl -sf --max-time 10 http://localhost:8080/api/overview
+
+      - name: API test — POST /v1/chat/completions (auth disabled)
+        run: |
+          response=$(curl -sf --max-time 30 -k https://localhost/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model":"test","messages":[{"role":"user","content":"hello"}]}' \
+            -o /dev/null -w "%{http_code}" || true)
+          echo "Status: ${response}"
+          # 502 is expected (no llama-server in CI), but not 401/403/500
+          if [ "${response}" = "401" ] || [ "${response}" = "403" ] || [ "${response}" = "500" ]; then
+            echo "FAIL: unexpected status ${response}"
+            exit 1
+          fi
+          echo "OK: auth bypass working (got ${response}, 502 expected without llama-server)"
+
+      - name: API test — POST /context (auth disabled)
+        run: |
+          response=$(curl -s --max-time 10 -k https://localhost/context \
+            -H "Content-Type: application/json" \
+            -d '{"query":"test query"}')
+          echo "Response: ${response}"
+          echo "${response}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'context_string' in d, f'Unexpected: {d}'"
+
+      - name: API test — GET /metrics (auth disabled)
+        run: curl -sf --max-time 10 -k https://localhost/metrics
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=50
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

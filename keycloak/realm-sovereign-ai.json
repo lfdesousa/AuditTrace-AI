@@ -1,0 +1,139 @@
+{
+  "realm": "sovereign-ai",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "clientScopes": [
+    {
+      "name": "sovereign-ai:query",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "sovereign-ai:context",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "sovereign-ai:audit",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "sovereign-ai:index",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "sovereign-ai:admin",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "memory:episodic:read",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "memory:procedural:read",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "memory:conversational:read-own",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    },
+    {
+      "name": "memory:semantic:read",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "opencode-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["sovereign-ai:query"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "continue-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["sovereign-ai:query", "sovereign-ai:context"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "roocode-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["sovereign-ai:query"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "inject-memory",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["sovereign-ai:context", "sovereign-ai:index"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "admin-client",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["sovereign-ai:admin", "sovereign-ai:audit"],
+      "optionalClientScopes": []
+    },
+    {
+      "description": "DESIGN §16 Phase 7 dev client — client-secret auth + service account for client_credentials grant. Secret is rotated per-deployment; dev default lives in secrets/dev_client_secret.txt. Carries an audience mapper so the emitted JWT has aud=sovereign-memory-server for JWT validation path. Used by scripts/mint-dev-jwt.sh.",
+      "clientId": "sovereign-memory-dev",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "sovereign-ai:query",
+        "sovereign-ai:context",
+        "sovereign-ai:audit",
+        "sovereign-ai:index",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-sovereign-memory-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "sovereign-memory-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,295 @@
+"""Dependency injection for sovereign-memory-server.
+
+ADR-020: PostgreSQL replaces SQLite. ChromaDB is server-mode only.
+No file-based databases from this point forward.
+"""
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends
+
+from sovereign_memory.auth import require_user
+from sovereign_memory.config import Settings, get_settings
+from sovereign_memory.db.factory import (
+    ChromaDBFactory,
+    HTTPChromaDBFactory,
+    MockChromaDBFactory,
+)
+from sovereign_memory.db.postgres import (
+    InMemoryPostgresFactory,
+    PostgresFactory,
+    URLPostgresFactory,
+)
+from sovereign_memory.identity import UserContext
+from sovereign_memory.logging_config import log_call
+from sovereign_memory.services.context_builder import (
+    ContextBuilderService,
+    DefaultContextBuilder,
+)
+from sovereign_memory.services.conversational import (
+    ConversationalService,
+    MockConversationalService,
+    PostgresConversationalService,
+)
+from sovereign_memory.services.episodic import (
+    EpisodicService,
+    FileEpisodicService,
+    MockEpisodicService,
+)
+from sovereign_memory.services.procedural import (
+    FileProceduralService,
+    MockProceduralService,
+    ProceduralService,
+)
+from sovereign_memory.services.semantic import (
+    ChromaSemanticService,
+    MockSemanticService,
+    SemanticService,
+    UserScopedSemanticService,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DependencyContainer:
+    """Container for dependency injection."""
+
+    def __init__(self):
+        self._factories: dict[str, ChromaDBFactory] = {}
+        self._instances: dict[str, Any] = {}
+
+    @log_call(logger=logger)
+    def register_factory(self, name: str, factory: ChromaDBFactory) -> None:
+        self._factories[name] = factory
+
+    @log_call(logger=logger)
+    def get_factory(self, name: str) -> ChromaDBFactory:
+        if name not in self._factories:
+            raise ValueError(f"Factory not registered: {name}")
+        return self._factories[name]
+
+    @log_call(logger=logger)
+    def create_instance(self, name: str) -> Any:
+        factory = self.get_factory(name)
+        instance = factory.get_client()
+        self._instances[name] = instance
+        return instance
+
+    @log_call(logger=logger)
+    def get_instance(self, name: str) -> Any:
+        if name not in self._instances:
+            self._instances[name] = self.create_instance(name)
+        return self._instances[name]
+
+
+# Global dependency container
+container = DependencyContainer()
+
+
+@log_call(logger=logger)
+def register_default_dependencies(settings: Settings | None = None) -> None:
+    """Register default dependencies based on configuration.
+
+    Skips registration if the container already has services (test mode).
+    """
+    if container._instances:
+        logger.debug("Container already populated — skipping registration (test mode)")
+        return
+
+    if settings is None:
+        settings = get_settings()
+
+    # ChromaDB — server mode with optional token auth (ADR-020)
+    container.register_factory(
+        "chromadb",
+        HTTPChromaDBFactory(settings.chroma_url, token=settings.chroma_token),
+    )
+
+    # PostgreSQL factory — real DB required in local/production
+    if settings.database_url:
+        pg_factory = URLPostgresFactory(settings.database_url)
+    elif settings.env == "test":
+        logger.info("Test environment — using in-memory database")
+        pg_factory = InMemoryPostgresFactory()
+    else:
+        raise RuntimeError(
+            f"SOVEREIGN_ENV={settings.env} requires a database. "
+            "Set SOVEREIGN_POSTGRES_PASSWORD or SOVEREIGN_POSTGRES_URL."
+        )
+    container._instances["postgres_factory"] = pg_factory
+
+    _register_memory_services(settings, pg_factory)
+
+
+@log_call(logger=logger)
+def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -> None:
+    """Register all 4 memory layer services + context builder (ADR-018)."""
+    episodic = FileEpisodicService(adr_dir=Path(settings.adr_dir))
+    procedural = FileProceduralService(skill_dir=Path(settings.skill_dir))
+    conversational = PostgresConversationalService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
+    # Semantic service needs ChromaDB client — lazy-resolve via container
+    chroma_client = container.get_instance("chromadb")
+    semantic = ChromaSemanticService(
+        client=chroma_client,
+        default_collections=["decisions", "skills"],
+    )
+
+    context_builder = DefaultContextBuilder(
+        episodic=episodic,
+        procedural=procedural,
+        conversational=conversational,
+        semantic=semantic,
+    )
+
+    container._instances["episodic"] = episodic
+    container._instances["procedural"] = procedural
+    container._instances["conversational"] = conversational
+    container._instances["semantic"] = semantic
+    container._instances["context_builder"] = context_builder
+
+
+@log_call(logger=logger)
+def get_chromadb() -> Any:
+    """Get ChromaDB client instance (dependency injection)."""
+    return container.get_instance("chromadb")
+
+
+@log_call(logger=logger)
+def get_chromadb_factory() -> ChromaDBFactory:
+    return container.get_factory("chromadb")
+
+
+@log_call(logger=logger)
+def get_postgres_factory() -> PostgresFactory:
+    """Get PostgreSQL factory (dependency injection)."""
+    return container._instances["postgres_factory"]
+
+
+@log_call(logger=logger)
+def get_context_builder(
+    user: UserContext = Depends(require_user),
+) -> ContextBuilderService:
+    """Return a per-request context builder with a user-scoped semantic layer.
+
+    DESIGN §16 Phase 4 follow-up. The episodic, procedural and
+    conversational services are shared singletons (their per-user
+    isolation is already enforced at the service layer via the Phase 2
+    `user_context` plumbing + Postgres RLS from migration 005). The
+    semantic service is the one layer that needs the extra
+    ``UserScopedSemanticService`` wrapper: ChromaDB has no native RLS
+    equivalent, and the wrapper enforces the isolation property by
+    construction — the bound UserContext cannot be overridden by the
+    per-call argument, so a bug that leaks an admin context elsewhere
+    in the code cannot bypass the filter.
+
+    One new ``DefaultContextBuilder`` instance is built per request.
+    The three shared services are referenced by identity (no copy);
+    only the semantic slot gets a fresh wrapper.
+    """
+    episodic = container._instances["episodic"]
+    procedural = container._instances["procedural"]
+    conversational = container._instances["conversational"]
+    shared_semantic = container._instances["semantic"]
+
+    scoped_semantic = UserScopedSemanticService(
+        inner=shared_semantic, user_context=user
+    )
+    return DefaultContextBuilder(
+        episodic=episodic,
+        procedural=procedural,
+        conversational=conversational,
+        semantic=scoped_semantic,
+    )
+
+
+@log_call(logger=logger)
+def get_episodic_service() -> EpisodicService:
+    """Get episodic memory service (dependency injection)."""
+    return container._instances["episodic"]
+
+
+@log_call(logger=logger)
+def get_conversational_service() -> ConversationalService:
+    """Get conversational memory service (dependency injection)."""
+    return container._instances["conversational"]
+
+
+@log_call(logger=logger)
+def get_procedural_service() -> ProceduralService:
+    """Get procedural memory service (dependency injection). Added by
+    ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
+    resolve the service without touching container internals."""
+    return container._instances["procedural"]
+
+
+@log_call(logger=logger)
+def get_semantic_service() -> SemanticService:
+    """Get semantic memory service (dependency injection). Added by
+    ADR-025 Phase 2 so the ``recall_semantic`` memory tool handler can
+    resolve the service without touching container internals."""
+    return container._instances["semantic"]
+
+
+@log_call(logger=logger)
+def set_test_mode() -> None:
+    """Set container to test mode with mock dependencies."""
+    container.register_factory("chromadb", MockChromaDBFactory())
+    container._instances.clear()
+    _register_mock_memory_services()
+
+
+@log_call(logger=logger)
+def _register_mock_memory_services() -> None:
+    """Register mock memory services for testing (ADR-018)."""
+    episodic = MockEpisodicService()
+    procedural = MockProceduralService()
+    conversational = MockConversationalService()
+    semantic = MockSemanticService()
+    context_builder = DefaultContextBuilder(
+        episodic=episodic,
+        procedural=procedural,
+        conversational=conversational,
+        semantic=semantic,
+    )
+    container._instances["episodic"] = episodic
+    container._instances["procedural"] = procedural
+    container._instances["conversational"] = conversational
+    container._instances["semantic"] = semantic
+    container._instances["context_builder"] = context_builder
+
+
+@log_call(logger=logger)
+def reset_container() -> None:
+    """Reset container state (useful for tests)."""
+    container._factories.clear()
+    container._instances.clear()
+
+
+def create_test_container() -> DependencyContainer:
+    """Create a fresh test container with mock dependencies."""
+    test_container = DependencyContainer()
+    test_container.register_factory("chromadb", MockChromaDBFactory())
+    # Register mock memory services on the test container
+    episodic = MockEpisodicService()
+    procedural = MockProceduralService()
+    conversational = MockConversationalService()
+    semantic = MockSemanticService()
+    context_builder = DefaultContextBuilder(
+        episodic=episodic,
+        procedural=procedural,
+        conversational=conversational,
+        semantic=semantic,
+    )
+    test_container._instances["episodic"] = episodic
+    test_container._instances["procedural"] = procedural
+    test_container._instances["conversational"] = conversational
+    test_container._instances["semantic"] = semantic
+    test_container._instances["context_builder"] = context_builder
+    # In-memory PostgreSQL factory so persistence side-effects work in tests
+    test_container._instances["postgres_factory"] = InMemoryPostgresFactory()
+    return test_container

@@ -1,0 +1,11 @@
+# Traefik dynamic configuration — TLS with mkcert (ADR-021)
+
+tls:
+  certificates:
+    - certFile: /certs/sovereign.pem
+      keyFile: /certs/sovereign-key.pem
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/sovereign.pem
+        keyFile: /certs/sovereign-key.pem
