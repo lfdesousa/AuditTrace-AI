@@ -20,7 +20,7 @@ sequenceDiagram
 
     Caller->>Builder: build_system_context(project, query)
 
-    Note over Builder: Always include identity section<br/>(~50 tokens)
+    Note over Builder: Always include identity section\n(~50 tokens)
 
     alt query is None
         Builder-->>Caller: profile section only
@@ -31,7 +31,7 @@ sequenceDiagram
         Builder->>Episodic: search(query)
         Episodic->>FS_ADR: glob("ADR-*.md")
         FS_ADR-->>Episodic: file contents
-        Note over Episodic: Keyword filter:<br/>words > 3 chars from query<br/>No arbitrary cap
+        Note over Episodic: Keyword filter:\nwords > 3 chars from query\nNo arbitrary cap
         Episodic-->>Builder: matched Documents
 
         Note over Builder: Layer 2: Procedural
@@ -39,24 +39,24 @@ sequenceDiagram
         Builder->>Procedural: search(query)
         Procedural->>FS_SKILL: glob("SKILL-*.md")
         FS_SKILL-->>Procedural: file contents
-        Note over Procedural: Keyword filter on<br/>skill name + content<br/>No arbitrary cap
+        Note over Procedural: Keyword filter on\nskill name + content\nNo arbitrary cap
         Procedural-->>Builder: matched Documents
 
         Note over Builder: Layer 3: Conversational
 
         Builder->>Conv: as_context(project)
-        Conv->>PG: SELECT sessions<br/>WHERE project = ?<br/>ORDER BY date DESC<br/>(SQLAlchemy ORM, authenticated)
+        Conv->>PG: SELECT sessions\nWHERE project = ?\nORDER BY date DESC\n(SQLAlchemy ORM, authenticated)
         PG-->>Conv: recent sessions
         Conv-->>Builder: formatted session summaries
 
         Note over Builder: Layer 4: Semantic
 
         Builder->>Semantic: search(query, k=4)
-        Semantic->>Chroma: query(query_texts, n_results)<br/>across [decisions, skills]<br/>(Bearer token auth)
+        Semantic->>Chroma: query(query_texts, n_results)\nacross [decisions, skills]\n(Bearer token auth)
         Chroma-->>Semantic: vector search results
         Semantic-->>Builder: Documents with metadata
 
-        Note over Builder: Assemble sections<br/>separated by ---
+        Note over Builder: Assemble sections\nseparated by ---
 
         Builder-->>Caller: (context_string, layer_stats)
     end
@@ -75,7 +75,7 @@ sequenceDiagram
     Builder->>Broken: search(query)
     Broken--xBuilder: RuntimeError
 
-    Note over Builder: Log warning,<br/>layer_stats["episodic"] = 0<br/>Continue to next layer
+    Note over Builder: Log warning,\nlayer_stats["episodic"] = 0\nContinue to next layer
 
     Builder->>Procedural: search(query)
     Procedural-->>Builder: results (normal)
@@ -86,7 +86,7 @@ sequenceDiagram
     Builder->>Semantic: search(query, k)
     Semantic-->>Builder: results (normal)
 
-    Note over Builder: Return context from<br/>3 working layers
+    Note over Builder: Return context from\n3 working layers
 ```
 
 ## Tools-mode: build_ambient_context() (ADR-025, Accepted)
@@ -118,15 +118,15 @@ sequenceDiagram
 
     Handler->>Builder: build_ambient_context(user, project, tools)
 
-    Note over Builder: Assemble ~280 words:<br/>Profile + Selection Rules + Tool list<br/>No memory layer queries fired
+    Note over Builder: Assemble ~280 words:\nProfile + Selection Rules + Tool list\nNo memory layer queries fired
 
     Builder-->>Handler: ambient context string
 
-    Note over Handler: Inject as system message<br/>LLM decides which ONE tool to call<br/>based on selection rules + question intent
+    Note over Handler: Inject as system message\nLLM decides which ONE tool to call\nbased on selection rules + question intent
 
-    Handler->>LLM: POST /chat/completions<br/>{messages: [system(ambient), user(question)],<br/>tools: [recall_decisions, ...]}
+    Handler->>LLM: POST /chat/completions\n{messages: [system(ambient), user(question)],\ntools: [recall_decisions, ...]}
 
     LLM-->>Handler: {tool_calls: [{name: "recall_decisions", ...}]}
 
-    Note over Handler: LLM selected ONE tool<br/>(not all four)
+    Note over Handler: LLM selected ONE tool\n(not all four)
 ```

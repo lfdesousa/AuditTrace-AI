@@ -41,21 +41,21 @@ sequenceDiagram
     participant Traefik as Traefik (TLS)
     participant Auth as require_user
     participant Cache as TokenCache (Redis)
-    participant Chat as chat_completions<br/>(routes/chat.py)
-    participant Build as _build_memory_context_with_trace<br/>(@observe — captures trace_id)
+    participant Chat as chat_completions\n(routes/chat.py)
+    participant Build as _build_memory_context_with_trace\n(@observe — captures trace_id)
     participant Builder as ContextBuilderService
     participant LLM as llama-server :11435
     participant DB as PostgreSQL
-    participant LF as Langfuse<br/>(ingestion API)
+    participant LF as Langfuse\n(ingestion API)
 
-    Agent->>Traefik: POST /v1/chat/completions<br/>Authorization: Bearer <JWT><br/>{messages, model, tools, tool_choice, stream: true}
+    Agent->>Traefik: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\n{messages, model, tools, tool_choice, stream: true}
     Traefik->>Auth: TLS terminated → HTTP
 
     Auth->>Cache: get(sha256(token))
     Cache-->>Auth: UserContext (hot path)
     Auth-->>Chat: UserContext
 
-    Note over Chat: payload = await http_request.json()<br/>(raw dict — never Pydantic-parsed,<br/>tools/tool_calls survive intact)
+    Note over Chat: payload = await http_request.json()\n(raw dict — never Pydantic-parsed,\ntools/tool_calls survive intact)
 
     Chat->>Build: asyncio.to_thread(...)
 
@@ -74,13 +74,13 @@ sequenceDiagram
         end
 
         Builder-->>Build: memory_context string
-        Build->>Build: _set_genai_request_attributes(...)<br/>(input.value, gen_ai.*, langfuse.session.id)
+        Build->>Build: _set_genai_request_attributes(...)\n(input.value, gen_ai.*, langfuse.session.id)
         Build-->>Chat: (memory_context, trace_id)
     end
 
-    Note over Chat: augmented_messages = _merge_system_message(<br/>  payload['messages'], memory_context<br/>)<br/>proxy_payload = dict(payload)<br/>proxy_payload['messages'] = augmented_messages
+    Note over Chat: augmented_messages = _merge_system_message(\n  payload['messages'], memory_context\n)\nproxy_payload = dict(payload)\nproxy_payload['messages'] = augmented_messages
 
-    Chat->>LLM: async with httpx.AsyncClient().stream(<br/>  "POST", llama_url, json=proxy_payload<br/>) as resp
+    Chat->>LLM: async with httpx.AsyncClient().stream(\n  "POST", llama_url, json=proxy_payload\n) as resp
 
     loop For each SSE line from llama-server
         LLM-->>Chat: data: {choices: [{delta: {content/tool_calls/...}}]}
@@ -90,18 +90,18 @@ sequenceDiagram
     end
 
     LLM-->>Chat: data: [DONE]
-    Note over Chat: Inject synthetic OpenAI usage chunk<br/>(from llama.cpp timings field)
+    Note over Chat: Inject synthetic OpenAI usage chunk\n(from llama.cpp timings field)
     Chat-->>Agent: data: {usage: {...}}
     Chat-->>Agent: data: [DONE]
 
     Note over Chat: Stream finished — post-stream work begins
 
-    Chat->>Chat: answer = "".join(text_chunks)<br/>+ render [tool_call] lines if accumulated
-    Chat->>DB: INSERT interactions<br/>(user_id = UserContext.user_id<br/>= Keycloak sub)
+    Chat->>Chat: answer = "".join(text_chunks)\n+ render [tool_call] lines if accumulated
+    Chat->>DB: INSERT interactions\n(user_id = UserContext.user_id\n= Keycloak sub)
 
-    Chat->>LF: POST /api/public/ingestion<br/>{id: trace_id, output: answer,<br/>metadata: {...}, sessionId: ...}
+    Chat->>LF: POST /api/public/ingestion\n{id: trace_id, output: answer,\nmetadata: {...}, sessionId: ...}
 
-    Note over LF: Trace updated WITHOUT relying on<br/>the @observe span context manager<br/>(it has already exited — see ADR-024)
+    Note over LF: Trace updated WITHOUT relying on\nthe @observe span context manager\n(it has already exited — see ADR-024)
 ```
 
 ## Tool call round-trip
@@ -119,9 +119,9 @@ sequenceDiagram
 
     Note over Agent,LLM: Turn 1 — initial request
 
-    Agent->>Chat: POST /v1/chat/completions<br/>{messages: [{user: "loc count?"}],<br/>tools: [{type: function, name: bash, ...}]}
-    Chat->>LLM: forward (with memory-augmented system message<br/>+ tools UNCHANGED)
-    LLM-->>Chat: stream: data: {delta: {tool_calls: [{id: c_1, name: bash,<br/>arguments: '{"cmd":"wc -l"}'}]}}
+    Agent->>Chat: POST /v1/chat/completions\n{messages: [{user: "loc count?"}],\ntools: [{type: function, name: bash, ...}]}
+    Chat->>LLM: forward (with memory-augmented system message\n+ tools UNCHANGED)
+    LLM-->>Chat: stream: data: {delta: {tool_calls: [{id: c_1, name: bash,\narguments: '{"cmd":"wc -l"}'}]}}
     Chat-->>Agent: byte-equal SSE forward
     LLM-->>Chat: data: [DONE]
 
@@ -129,11 +129,11 @@ sequenceDiagram
 
     Note over Agent,LLM: Turn 2 — tool result
 
-    Agent->>Chat: POST /v1/chat/completions<br/>{messages: [<br/>  {user: "loc count?"},<br/>  {assistant, tool_calls: [{id: c_1, ...}]},<br/>  {role: tool, tool_call_id: c_1, content: "12345"}<br/>]}
+    Agent->>Chat: POST /v1/chat/completions\n{messages: [\n  {user: "loc count?"},\n  {assistant, tool_calls: [{id: c_1, ...}]},\n  {role: tool, tool_call_id: c_1, content: "12345"}\n]}
 
-    Note over Chat: Pre-ADR-024 the Pydantic schema would<br/>have stripped tool_call_id and broken this turn.<br/>Now the raw dict is forwarded intact.
+    Note over Chat: Pre-ADR-024 the Pydantic schema would\nhave stripped tool_call_id and broken this turn.\nNow the raw dict is forwarded intact.
 
-    Chat->>LLM: forward (memory re-injected,<br/>tool_call_id + role: tool preserved)
+    Chat->>LLM: forward (memory re-injected,\ntool_call_id + role: tool preserved)
     LLM-->>Chat: stream: "The repo has 12345 lines of code."
     Chat-->>Agent: byte-equal SSE forward
 ```
@@ -145,14 +145,14 @@ sequenceDiagram
     participant Agent as Coding Agent
     participant Auth as require_user
 
-    Agent->>Auth: POST /v1/chat/completions<br/>(no Authorization)
-    Auth-->>Agent: HTTP 401<br/>{"detail": "Missing authentication token"}
+    Agent->>Auth: POST /v1/chat/completions\n(no Authorization)
+    Auth-->>Agent: HTTP 401\n{"detail": "Missing authentication token"}
 
-    Agent->>Auth: POST /v1/chat/completions<br/>Bearer <expired JWT>
-    Auth-->>Agent: HTTP 401<br/>{"detail": "Invalid or expired token"}
+    Agent->>Auth: POST /v1/chat/completions\nBearer <expired JWT>
+    Auth-->>Agent: HTTP 401\n{"detail": "Invalid or expired token"}
 
-    Agent->>Auth: POST /v1/chat/completions<br/>Bearer <JWT, missing sub claim>
-    Auth-->>Agent: HTTP 401<br/>{"detail": "Token missing subject claim"}
+    Agent->>Auth: POST /v1/chat/completions\nBearer <JWT, missing sub claim>
+    Auth-->>Agent: HTTP 401\n{"detail": "Token missing subject claim"}
 ```
 
 See `sequence-oauth2-flow.md` for the full identity resolution flow
@@ -173,12 +173,12 @@ sequenceDiagram
     alt Connection refused
         Chat->>LLM: stream POST
         LLM--xChat: ConnectError
-        Note over Chat: Streaming branch yields an<br/>SSE error frame + [DONE] so the<br/>client sees a clean stream end
-        Chat-->>Agent: data: {"error": "llama-server unreachable"}<br/>data: [DONE]
+        Note over Chat: Streaming branch yields an\nSSE error frame + [DONE] so the\nclient sees a clean stream end
+        Chat-->>Agent: data: {"error": "llama-server unreachable"}\ndata: [DONE]
     else HTTP 5xx from upstream
         Chat->>LLM: stream POST
         LLM-->>Chat: HTTP 503
-        Chat-->>Agent: data: {"error": "llama-server status 503"}<br/>data: [DONE]
+        Chat-->>Agent: data: {"error": "llama-server status 503"}\ndata: [DONE]
     end
 ```
 
