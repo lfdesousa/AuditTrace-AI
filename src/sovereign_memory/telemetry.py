@@ -100,8 +100,13 @@ def init_telemetry(
                     OTLPSpanExporter,
                 )
 
+                traces_endpoint = (
+                    otlp_endpoint.rstrip("/") + "/v1/traces"
+                    if not otlp_endpoint.endswith("/v1/traces")
+                    else otlp_endpoint
+                )
                 tracer_provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
+                    BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint))
                 )
                 logger.info("OTel tracing exporter -> %s", otlp_endpoint)
             except Exception as e:  # pragma: no cover
@@ -117,9 +122,14 @@ def init_telemetry(
                     OTLPMetricExporter,
                 )
 
+                metrics_endpoint = (
+                    otlp_endpoint.rstrip("/") + "/v1/metrics"
+                    if not otlp_endpoint.endswith("/v1/metrics")
+                    else otlp_endpoint
+                )
                 readers.append(
                     PeriodicExportingMetricReader(
-                        OTLPMetricExporter(endpoint=otlp_endpoint)
+                        OTLPMetricExporter(endpoint=metrics_endpoint)
                     )
                 )
                 logger.info("OTel metrics exporter -> %s", otlp_endpoint)

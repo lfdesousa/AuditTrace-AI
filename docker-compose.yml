@@ -32,7 +32,7 @@ services:
       - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
       # ADR-028: OTLP export → OTel Collector (metrics + logs).
       # Traces go to Langfuse via the SDK, not OTLP.
-      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-http://otel-collector:4318/v1/traces}
+      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-http://otel-collector:4318}
       - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
       - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}

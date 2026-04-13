@@ -17,5 +17,11 @@ providers:
     filename: /etc/traefik/dynamic.yml
     watch: true
 
+metrics:
+  prometheus:
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
 log:
   level: INFO

@@ -128,8 +128,12 @@ def test_init_telemetry_wires_otlp_exporters_when_endpoint_set(monkeypatch):
             tracing_enabled=True,
             metrics_enabled=True,
         )
-        span_exporter_mock.assert_called_once_with(endpoint="http://otel.test")
-        metric_exporter_mock.assert_called_once_with(endpoint="http://otel.test")
+        span_exporter_mock.assert_called_once_with(
+            endpoint="http://otel.test/v1/traces"
+        )
+        metric_exporter_mock.assert_called_once_with(
+            endpoint="http://otel.test/v1/metrics"
+        )
     finally:
         telemetry._reset_for_tests()
         # Restore the no-op state used by the rest of the suite
