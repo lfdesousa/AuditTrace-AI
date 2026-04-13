@@ -61,10 +61,10 @@ invoke_tool (tools/__init__.py)
       │  cache.put(key, result)
       ▼
 memory handlers (tools/memory_handlers.py)
-      │ recall_decisions → EpisodicService.search
-      │ recall_skills    → ProceduralService.search
-      │ recall_recent_sessions → ConversationalService.load_sessions
-      │ recall_semantic  → ChromaSemanticService.search
+      │ recall_decisions → EpisodicService.search (S3 → MinIO / File fallback)
+      │ recall_skills    → ProceduralService.search (S3 → MinIO / File fallback)
+      │ recall_recent_sessions → ConversationalService.load_sessions (PostgreSQL)
+      │ recall_semantic  → ChromaSemanticService.search (ChromaDB)
 ```
 
 Two persistence boundaries are involved: `InteractionRecord` lands

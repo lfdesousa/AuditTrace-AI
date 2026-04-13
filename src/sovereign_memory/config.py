@@ -80,10 +80,19 @@ class Settings(BaseSettings):
     memory_max_context_turns: int = 117000  # ~131k - system prompt - output buffer
     memory_embedding_dim: int = 1024  # Nomic-embed-text default
 
-    # 4-layer memory paths (ADR-018)
+    # 4-layer memory paths (ADR-018) — filesystem fallback for tests/local dev
     adr_dir: str = "./memory/episodic"
     skill_dir: str = "./memory/procedural"
     llama_proxy_timeout: int = 120  # seconds — timeout for llama-server proxy calls
+
+    # MinIO / S3 object storage (ADR-027) — replaces filesystem bind mounts.
+    # When minio_secret_key is non-empty, S3*Services activate and read from
+    # MinIO buckets. When empty, File*Services use the filesystem paths above.
+    minio_url: str = "http://localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = ""
+    minio_shared_bucket: str = "memory-shared"
+    minio_private_bucket: str = "memory-private"
 
     # ─────────────── ADR-025 — memory-as-tools ──────────────────────────────
     # Kill switch (§Decision.4). During the rollout the default is the legacy

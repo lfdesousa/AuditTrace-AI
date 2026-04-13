@@ -37,11 +37,13 @@ from sovereign_memory.services.episodic import (
     EpisodicService,
     FileEpisodicService,
     MockEpisodicService,
+    S3EpisodicService,
 )
 from sovereign_memory.services.procedural import (
     FileProceduralService,
     MockProceduralService,
     ProceduralService,
+    S3ProceduralService,
 )
 from sovereign_memory.services.semantic import (
     ChromaSemanticService,
@@ -123,11 +125,57 @@ def register_default_dependencies(settings: Settings | None = None) -> None:
     _register_memory_services(settings, pg_factory)
 
 
+def _create_minio_client(settings: Settings) -> object | None:
+    """Create a MinIO client if credentials are configured (ADR-027)."""
+    if not settings.minio_secret_key:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        from minio import Minio
+
+        parsed = urlparse(settings.minio_url)
+        endpoint = parsed.netloc or parsed.path
+        secure = parsed.scheme == "https"
+        client = Minio(
+            endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=secure,
+        )
+        logger.info("MinIO client initialised — endpoint=%s", endpoint)
+        return client
+    except Exception as exc:
+        logger.warning("MinIO client init failed, falling back to filesystem: %s", exc)
+        return None
+
+
 @log_call(logger=logger)
 def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -> None:
-    """Register all 4 memory layer services + context builder (ADR-018)."""
-    episodic = FileEpisodicService(adr_dir=Path(settings.adr_dir))
-    procedural = FileProceduralService(skill_dir=Path(settings.skill_dir))
+    """Register all 4 memory layer services + context builder (ADR-018, ADR-027).
+
+    When MinIO credentials are configured, S3-backed services replace the
+    filesystem services for Layers 1+2. Otherwise falls back to File* services.
+    """
+    minio_client = _create_minio_client(settings)
+
+    if minio_client is not None:
+        episodic: EpisodicService = S3EpisodicService(
+            minio_client=minio_client,
+            bucket=settings.minio_shared_bucket,
+            prefix="episodic/",
+        )
+        procedural: ProceduralService = S3ProceduralService(
+            minio_client=minio_client,
+            bucket=settings.minio_shared_bucket,
+            prefix="procedural/",
+        )
+        logger.info("Memory layers 1+2: S3-backed (MinIO)")
+    else:
+        episodic = FileEpisodicService(adr_dir=Path(settings.adr_dir))
+        procedural = FileProceduralService(skill_dir=Path(settings.skill_dir))
+        logger.info("Memory layers 1+2: filesystem-backed (fallback)")
+
     conversational = PostgresConversationalService(
         session_factory=pg_factory.get_session_factory(),
     )
@@ -136,7 +184,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     chroma_client = container.get_instance("chromadb")
     semantic = ChromaSemanticService(
         client=chroma_client,
-        default_collections=["decisions", "skills"],
+        default_collections=["decisions", "skills", "ai_research", "scm_coursework"],
     )
 
     context_builder = DefaultContextBuilder(

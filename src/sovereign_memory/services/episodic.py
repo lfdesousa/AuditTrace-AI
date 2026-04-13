@@ -91,6 +91,93 @@ class FileEpisodicService(EpisodicService):
         return "\n".join(lines)
 
 
+class S3EpisodicService(EpisodicService):
+    """S3/MinIO-backed episodic service reading ADR-*.md from object storage.
+
+    Reads from the ``memory-shared`` bucket under the ``episodic/`` prefix.
+    ADRs are shared content — ``user_context`` is required (authenticated)
+    but not used for path scoping (ADR-027 §2).
+
+    Documents are cached in memory on first load since ADRs are static,
+    small (~14 files), and read-heavy. Cache is per-process lifetime.
+    """
+
+    def __init__(self, minio_client: object, bucket: str, prefix: str = "episodic/"):
+        self._client = minio_client  # minio.Minio instance
+        self._bucket = bucket
+        self._prefix = prefix
+        self._cache: list[Document] | None = None
+
+    def _load_from_s3(self) -> list[Document]:
+        """Download all ADR-*.md objects from MinIO and parse as Documents."""
+        if self._cache is not None:
+            return self._cache
+        docs: list[Document] = []
+        try:
+            from minio import Minio
+
+            client: Minio = self._client  # type: ignore[assignment]
+            objects = client.list_objects(self._bucket, prefix=self._prefix)
+            for obj in objects:
+                name = obj.object_name or ""
+                filename = name.rsplit("/", 1)[-1] if "/" in name else name
+                if not filename.startswith("ADR-") or not filename.endswith(".md"):
+                    continue
+                response = client.get_object(self._bucket, name)
+                try:
+                    content = response.read().decode("utf-8")
+                finally:
+                    response.close()
+                    response.release_conn()
+                title = filename.replace(".md", "")
+                for line in content.splitlines():
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+                docs.append(
+                    Document(
+                        page_content=content,
+                        metadata={
+                            "source": "episodic",
+                            "file": filename,
+                            "title": title,
+                        },
+                    )
+                )
+        except Exception as exc:
+            logger.warning("S3EpisodicService load failed: %s", exc)
+        self._cache = docs
+        return docs
+
+    @log_call(logger=logger)
+    def load(self, user_context: UserContext) -> list[Document]:
+        del user_context  # shared content — not per-user scoped
+        return list(self._load_from_s3())
+
+    @log_call(logger=logger)
+    def search(self, user_context: UserContext, query: str) -> list[Document]:
+        adrs = self.load(user_context)
+        query_lower = query.lower()
+        keywords = [kw for kw in query_lower.split() if len(kw) > 3]
+        if not keywords:
+            return []
+        return [
+            adr
+            for adr in adrs
+            if any(kw in adr.page_content.lower() for kw in keywords)
+        ]
+
+    @log_call(logger=logger)
+    def as_context(self, user_context: UserContext, query: str) -> str:
+        matched = self.search(user_context, query)
+        if not matched:
+            return ""
+        lines = ["## Architecture Decisions"]
+        for adr in matched:
+            lines.append(f"\n### {adr.metadata['title']}\n{adr.page_content[:400]}")
+        return "\n".join(lines)
+
+
 class MockEpisodicService(EpisodicService):
     """Mock episodic service for unit testing."""
 
