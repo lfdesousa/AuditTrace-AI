@@ -299,7 +299,15 @@ def _merge_system_message(messages: list[dict], memory_context: str) -> list[dic
         if m.get("role") == "system":
             original = m.get("content", "") or ""
             m["content"] = (
-                memory_context + "\n\n---\n\n## Agent Instructions\n" + original
+                memory_context
+                + "\n\n---\n\n"
+                + "**IMPORTANT: The memory context above contains ADRs, skills, "
+                + "and semantic search results retrieved from the memory-server. "
+                + "Answer questions from this context FIRST before using external "
+                + "tools like bash, curl, or file reads. Only use tools when the "
+                + "answer is not in the context above.**"
+                + "\n\n---\n\n## Agent Instructions\n"
+                + original
             )
             return result
     # No system message — insert one at index 0
@@ -934,9 +942,11 @@ async def chat_completions(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 finish_reason=finish_reason,
-                tool_calls=[tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-                if tool_calls_acc
-                else None,
+                tool_calls=(
+                    [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+                    if tool_calls_acc
+                    else None
+                ),
                 session_id=session_id,
                 model=response_model or requested_model,
             )
