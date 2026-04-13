@@ -56,7 +56,7 @@ def _is_postgres() -> bool:
     False here makes the whole migration a no-op on that path.
     """
     bind = op.get_bind()
-    return bind.dialect.name == "postgresql"
+    return bool(bind.dialect.name == "postgresql")
 
 
 def upgrade() -> None:

@@ -7,47 +7,65 @@
     {
       "name": "sovereign-ai:query",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "sovereign-ai:context",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "sovereign-ai:audit",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "sovereign-ai:index",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "sovereign-ai:admin",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "memory:episodic:read",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "memory:procedural:read",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "memory:conversational:read-own",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     },
     {
       "name": "memory:semantic:read",
       "protocol": "openid-connect",
-      "attributes": { "include.in.token.scope": "true" }
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     }
   ],
   "clients": [
@@ -58,7 +76,9 @@
       "serviceAccountsEnabled": true,
       "publicClient": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["sovereign-ai:query"],
+      "defaultClientScopes": [
+        "sovereign-ai:query"
+      ],
       "optionalClientScopes": []
     },
     {
@@ -68,7 +88,10 @@
       "serviceAccountsEnabled": true,
       "publicClient": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["sovereign-ai:query", "sovereign-ai:context"],
+      "defaultClientScopes": [
+        "sovereign-ai:query",
+        "sovereign-ai:context"
+      ],
       "optionalClientScopes": []
     },
     {
@@ -78,7 +101,9 @@
       "serviceAccountsEnabled": true,
       "publicClient": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["sovereign-ai:query"],
+      "defaultClientScopes": [
+        "sovereign-ai:query"
+      ],
       "optionalClientScopes": []
     },
     {
@@ -88,7 +113,10 @@
       "serviceAccountsEnabled": true,
       "publicClient": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["sovereign-ai:context", "sovereign-ai:index"],
+      "defaultClientScopes": [
+        "sovereign-ai:context",
+        "sovereign-ai:index"
+      ],
       "optionalClientScopes": []
     },
     {
@@ -98,11 +126,14 @@
       "serviceAccountsEnabled": true,
       "publicClient": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["sovereign-ai:admin", "sovereign-ai:audit"],
+      "defaultClientScopes": [
+        "sovereign-ai:admin",
+        "sovereign-ai:audit"
+      ],
       "optionalClientScopes": []
     },
     {
-      "description": "Dev client — client_credentials grant with audience mapper (aud=sovereign-memory-server). Secret in secrets/dev_client_secret.txt. See DESIGN §16 Phase 7.",
+      "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=sovereign-memory-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",
       "clientId": "sovereign-memory-dev",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
@@ -135,5 +166,6 @@
         }
       ]
     }
-  ]
+  ],
+  "accessTokenLifespan": 86400
 }

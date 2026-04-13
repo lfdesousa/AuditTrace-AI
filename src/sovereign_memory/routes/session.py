@@ -5,6 +5,7 @@ so the row carries the caller's ``UserContext.user_id`` on the write path.
 """
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -29,8 +30,8 @@ router = APIRouter()
 @log_call(logger=logger)
 async def save_session(
     request: SessionSaveRequest,
-    _auth: dict = Depends(require_scope("sovereign-ai:query")),
-):
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:query")),
+) -> dict[str, Any]:
     """Persist session interactions to the audit trail."""
     settings = get_settings()
     logger.debug(
@@ -51,9 +52,9 @@ async def save_session(
 async def save_session_summary(
     request: SessionSummaryRequest,
     conversational: ConversationalService = Depends(get_conversational_service),
-    _auth: dict = Depends(require_scope("sovereign-ai:query")),
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:query")),
     user: UserContext = Depends(require_user),
-):
+) -> SessionSummaryResponse:
     """Save a session summary to the conversational memory layer.
 
     Equivalent of the legacy ``python3 memory.py session-save`` workflow —

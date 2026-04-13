@@ -7,7 +7,7 @@ in logs, traces, and metrics.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Protocol
+from typing import Any, Protocol
 
 import chromadb
 
@@ -20,8 +20,9 @@ class ChromaDBClient(Protocol):
     """Protocol for ChromaDB client abstraction."""
 
     def get_or_create_collection(
-        self, name: str, **kwargs
-    ) -> "chromadb.Collection": ...
+        self, name: str, **kwargs: Any
+    ) -> "chromadb.Collection":
+        ...
 
 
 class ChromaDBFactory(ABC):
@@ -37,7 +38,7 @@ class MemoryChromaDBFactory(ChromaDBFactory):
 
     @log_call(logger=logger)
     def get_client(self) -> ChromaDBClient:
-        return chromadb.Client()
+        return chromadb.Client()  # type: ignore[return-value]
 
 
 class HTTPChromaDBFactory(ChromaDBFactory):
@@ -54,10 +55,10 @@ class HTTPChromaDBFactory(ChromaDBFactory):
         if "://" in url:
             url = url.split("://", 1)[1]
         host, _, port = url.partition(":")
-        kwargs: dict = {"host": host, "port": int(port or 8000)}
+        kwargs: dict[str, Any] = {"host": host, "port": int(port or 8000)}
         if self.token:
             kwargs["headers"] = {"Authorization": f"Bearer {self.token}"}
-        return chromadb.HttpClient(**kwargs)
+        return chromadb.HttpClient(**kwargs)  # type: ignore[return-value]
 
 
 class MockChromaDBFactory(ChromaDBFactory):
@@ -69,7 +70,7 @@ class MockChromaDBFactory(ChromaDBFactory):
     clients within a single test.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.collections: dict[str, MockCollection] = {}
         self.call_count: int = 0
 
@@ -78,7 +79,7 @@ class MockChromaDBFactory(ChromaDBFactory):
         self.call_count += 1
         return _MockChromaDBClient(self)
 
-    def _get_or_create_collection(self, name: str, **kwargs) -> "MockCollection":
+    def _get_or_create_collection(self, name: str, **kwargs: Any) -> "MockCollection":
         if name not in self.collections:
             self.collections[name] = MockCollection(name)
         return self.collections[name]
@@ -95,7 +96,7 @@ class _MockChromaDBClient:
         self._factory = factory
 
     @log_call(logger=logger)
-    def get_or_create_collection(self, name: str, **kwargs) -> "MockCollection":
+    def get_or_create_collection(self, name: str, **kwargs: Any) -> "MockCollection":
         return self._factory._get_or_create_collection(name, **kwargs)
 
 
@@ -104,10 +105,16 @@ class MockCollection:
 
     def __init__(self, name: str):
         self.name = name
-        self.data: list[dict] = []
+        self.data: list[dict[str, Any]] = []
 
     @log_call(logger=logger)
-    def add(self, ids=None, documents=None, metadatas=None, **kwargs):
+    def add(
+        self,
+        ids: list[str] | None = None,
+        documents: list[str] | None = None,
+        metadatas: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
         ids = ids or []
         documents = documents or []
         metadatas = metadatas or [{} for _ in ids]
@@ -122,7 +129,13 @@ class MockCollection:
         return list(ids)
 
     @log_call(logger=logger)
-    def query(self, query_texts=None, n_results=5, where=None, **kwargs):
+    def query(
+        self,
+        query_texts: list[str] | None = None,
+        n_results: int = 5,
+        where: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         rows = self.data
         if where:
             rows = [
@@ -139,7 +152,7 @@ class MockCollection:
         }
 
     @log_call(logger=logger)
-    def get(self, **kwargs):
+    def get(self, **kwargs: Any) -> dict[str, Any]:
         return {
             "ids": [r["id"] for r in self.data],
             "documents": [r["document"] for r in self.data],
@@ -147,7 +160,7 @@ class MockCollection:
         }
 
     @log_call(logger=logger)
-    def count(self, where=None, **kwargs) -> int:
+    def count(self, where: dict[str, Any] | None = None, **kwargs: Any) -> int:
         if where:
             return sum(
                 1

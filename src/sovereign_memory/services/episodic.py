@@ -12,6 +12,7 @@ for uniform service shape and future audit/scope checks in Phase 3.
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 from langchain_core.documents import Document
 
@@ -114,9 +115,7 @@ class S3EpisodicService(EpisodicService):
             return self._cache
         docs: list[Document] = []
         try:
-            from minio import Minio
-
-            client: Minio = self._client  # type: ignore[assignment]
+            client: Any = self._client
             objects = client.list_objects(self._bucket, prefix=self._prefix)
             for obj in objects:
                 name = obj.object_name or ""
@@ -181,13 +180,13 @@ class S3EpisodicService(EpisodicService):
 class MockEpisodicService(EpisodicService):
     """Mock episodic service for unit testing."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._documents: list[Document] = []
 
     @log_call(logger=logger)
     def add_document(
         self, content: str, title: str = "Mock ADR", file: str = "ADR-mock.md"
-    ):
+    ) -> None:
         """Add a document for testing."""
         self._documents.append(
             Document(
@@ -224,6 +223,6 @@ class MockEpisodicService(EpisodicService):
             lines.append(f"\n### {d.metadata['title']}\n{d.page_content[:400]}")
         return "\n".join(lines)
 
-    def reset(self):
+    def reset(self) -> None:
         """Clear all documents."""
         self._documents.clear()

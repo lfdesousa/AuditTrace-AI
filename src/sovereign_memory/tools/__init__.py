@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────── MemoryTool ──────────────────────────────────
 
 
-ToolHandler = Callable[["UserContext", dict], Awaitable[dict]]
+ToolHandler = Callable[["UserContext", dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 @dataclass(frozen=True)

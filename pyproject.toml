@@ -128,6 +128,24 @@ strict = true
 ignore_missing_imports = true
 warn_unused_ignores = true
 
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
 [tool.black]
 line-length = 88
 target-version = ["py312"]
+
+[[tool.mypy.overrides]]
+module = "sovereign_memory.routes.chat"
+# Langfuse @observe is an untyped decorator; Request generic requires starlette stubs
+disable_error_code = ["misc", "type-arg"]
+
+[[tool.mypy.overrides]]
+module = "sovereign_memory.auth"
+# FastAPI Request generic requires starlette stubs
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "scripts.*"
+ignore_errors = true

@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import AsyncIterator
 from datetime import date, datetime
 from typing import Any
 
@@ -32,7 +33,7 @@ from fastapi.responses import StreamingResponse
 import sovereign_memory.tools.memory_handlers  # noqa: F401
 from sovereign_memory import telemetry
 from sovereign_memory.auth import require_scope, require_user
-from sovereign_memory.config import get_settings
+from sovereign_memory.config import Settings, get_settings
 from sovereign_memory.db.models import InteractionRecord, ToolCall
 from sovereign_memory.dependencies import get_context_builder, get_postgres_factory
 from sovereign_memory.identity import UserContext
@@ -59,15 +60,15 @@ try:
 except Exception:  # pragma: no cover - optional dep path
     _LANGFUSE_AVAILABLE = False
 
-    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
-        def deco(fn):
+    def _lf_observe(*args: Any, **kwargs: Any) -> Any:
+        def deco(fn: Any) -> Any:
             return fn
 
         if args and callable(args[0]):
             return args[0]
         return deco
 
-    def _lf_get_client():  # type: ignore[no-redef]
+    def _lf_get_client() -> None:
         return None
 
 
@@ -94,7 +95,9 @@ def _compute_session_id(source: str, first_user_content: str, user_id: str) -> s
     return f"{source}-{today}-{h}"
 
 
-def _detect_source(request: Request) -> str:
+def _detect_source(
+    request: Request,  # type: ignore[type-arg]
+) -> str:
     """Best-effort agent identification from the User-Agent header."""
     ua = (request.headers.get("user-agent") or "").lower()
     for marker in ("opencode", "continue", "roocode", "openai", "curl", "httpx"):
@@ -209,7 +212,7 @@ def _flush_pending_tool_calls(
 
 
 def _set_genai_request_attributes(
-    payload: dict, query: str, session_id: str, source: str, user_id: str
+    payload: dict[str, Any], query: str, session_id: str, source: str, user_id: str
 ) -> None:
     """Tag the current span with gen_ai.* request attributes for Langfuse.
 
@@ -238,7 +241,7 @@ def _set_genai_request_attributes(
     )
 
 
-def _set_genai_response_attributes(response_json: dict) -> None:
+def _set_genai_response_attributes(response_json: dict[str, Any]) -> None:
     """Tag the current span with gen_ai.* response attributes from llama-server."""
     try:
         choices = response_json.get("choices") or []
@@ -261,7 +264,7 @@ def _set_genai_response_attributes(response_json: dict) -> None:
 
 
 @log_call(logger=logger)
-def _extract_query(payload: dict) -> str:
+def _extract_query(payload: dict[str, Any]) -> str:
     """Extract the retrieval query from a raw chat request dict.
 
     Honours an explicit ``context_query`` field, otherwise falls back to the
@@ -287,7 +290,9 @@ def _extract_query(payload: dict) -> str:
 
 
 @log_call(logger=logger)
-def _merge_system_message(messages: list[dict], memory_context: str) -> list[dict]:
+def _merge_system_message(
+    messages: list[dict[str, Any]], memory_context: str
+) -> list[dict[str, Any]]:
     """Merge memory context into the system message. Preserves all other fields.
 
     Crucially, every message is shallow-copied with ``dict(m)`` so fields like
@@ -315,10 +320,10 @@ def _merge_system_message(messages: list[dict], memory_context: str) -> list[dic
     return result
 
 
-@_lf_observe(name="sovereign-chat-request")
+@_lf_observe(name="sovereign-chat-request")  # type: ignore[misc]
 def _build_memory_context_with_trace(
     context_builder: ContextBuilderService,
-    payload: dict,
+    payload: dict[str, Any],
     query: str,
     session_id: str,
     source: str,
@@ -361,7 +366,7 @@ async def _record_langfuse_output(
     prompt_tokens: int,
     completion_tokens: int,
     finish_reason: str | None,
-    tool_calls: list[dict] | None,
+    tool_calls: list[dict[str, Any]] | None,
     session_id: str | None,
     model: str | None,
 ) -> None:
@@ -428,7 +433,9 @@ async def _record_langfuse_output(
         logger.debug("Langfuse ingestion update failed (non-fatal)", exc_info=True)
 
 
-def _synthesize_sse_from_body(body: dict, requested_model: str):
+def _synthesize_sse_from_body(
+    body: dict[str, Any], requested_model: str
+) -> AsyncIterator[bytes]:
     """Produce an OpenAI-spec SSE stream from a non-streamed chat body.
 
     ADR-025 Phase 4: the tool-call loop is always non-streaming so the
@@ -459,7 +466,7 @@ def _synthesize_sse_from_body(body: dict, requested_model: str):
     resp_id = body.get("id") or "chatcmpl-sovereign"
     created = body.get("created") or 0
 
-    async def _iter():
+    async def _iter() -> AsyncIterator[bytes]:
         # Content chunk
         delta: dict[str, Any] = {"content": content}
         if tool_calls:
@@ -474,7 +481,7 @@ def _synthesize_sse_from_body(body: dict, requested_model: str):
         yield ("data: " + json.dumps(content_chunk) + "\n\n").encode()
 
         # Finish chunk
-        finish_chunk = {
+        finish_chunk: dict[str, Any] = {
             "id": resp_id,
             "object": "chat.completion.chunk",
             "created": created,
@@ -484,7 +491,7 @@ def _synthesize_sse_from_body(body: dict, requested_model: str):
         yield ("data: " + json.dumps(finish_chunk) + "\n\n").encode()
 
         # Usage chunk (optional but helps clients that track cost)
-        usage_chunk = {
+        usage_chunk: dict[str, Any] = {
             "id": resp_id,
             "object": "chat.completion.chunk",
             "created": created,
@@ -502,7 +509,7 @@ def _synthesize_sse_from_body(body: dict, requested_model: str):
     return _iter()
 
 
-def _render_tool_calls_text(tool_calls_acc: dict[int, dict]) -> str:
+def _render_tool_calls_text(tool_calls_acc: dict[int, dict[str, Any]]) -> str:
     """Render accumulated tool_calls as ``[tool_call] name(args)`` lines."""
     lines: list[str] = []
     for idx in sorted(tool_calls_acc):
@@ -518,8 +525,8 @@ def _render_tool_calls_text(tool_calls_acc: dict[int, dict]) -> str:
 @router.get("/models")
 @log_call(logger=logger)
 async def list_models(
-    _auth: dict = Depends(require_scope("sovereign-ai:query")),
-):
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:query")),
+) -> Any:
     """Proxy GET /v1/models to llama-server.
 
     OpenAI-compatible clients (OpenCode, Continue) call this to discover
@@ -543,14 +550,14 @@ async def list_models(
         ) from exc
 
 
-@_lf_observe(name="sovereign-chat-request", capture_output=False)
+@_lf_observe(name="sovereign-chat-request", capture_output=False)  # type: ignore[misc]
 def _prepare_tools_mode_trace(
-    payload: dict,
+    payload: dict[str, Any],
     query: str,
     session_id: str,
     source: str,
     user_context: UserContext,
-) -> tuple[list[dict], str | None]:
+) -> tuple[list[dict[str, Any]], str | None]:
     """Set gen_ai.* request attributes on the active Langfuse span and
     return ``(tools_for_user, trace_id)``.
 
@@ -589,12 +596,12 @@ def _prepare_tools_mode_trace(
 
 async def _handle_tools_mode(
     *,
-    payload: dict,
+    payload: dict[str, Any],
     user: UserContext,
     source: str,
     session_id: str,
     query: str,
-    settings,
+    settings: Settings,
 ) -> Any:
     """ADR-025 ``memory_mode=tools`` path.
 
@@ -716,9 +723,9 @@ async def _handle_tools_mode(
 async def chat_completions(
     http_request: Request,
     context_builder: ContextBuilderService = Depends(get_context_builder),
-    _auth: dict = Depends(require_scope("sovereign-ai:query")),
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:query")),
     user: UserContext = Depends(require_user),
-):
+) -> Any:
     """OpenAI-compatible chat completions with memory augmentation.
 
     Raw dict pass-through proxy: every field on the inbound request is
@@ -735,7 +742,7 @@ async def chat_completions(
     """
     settings = get_settings()
     try:
-        payload: dict = await http_request.json()
+        payload: dict[str, Any] = await http_request.json()
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Invalid JSON body: {exc}"
@@ -796,9 +803,9 @@ async def chat_completions(
     # ─────────────────────────── Streaming branch ───────────────────────────
     if is_stream:
 
-        async def _iter_and_capture():
+        async def _iter_and_capture() -> AsyncIterator[bytes]:
             chunks: list[str] = []
-            tool_calls_acc: dict[int, dict] = {}
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
             prompt_tokens = 0
             completion_tokens = 0
             response_model: str | None = None
@@ -886,7 +893,7 @@ async def chat_completions(
                                 if completion_tokens == 0:
                                     completion_tokens = predicted_n
                 # Inject synthetic usage chunk for OpenAI clients that need it.
-                usage_chunk = {
+                usage_chunk: dict[str, Any] = {
                     "id": response_id or "chatcmpl-sovereign",
                     "object": "chat.completion.chunk",
                     "created": response_created or 0,

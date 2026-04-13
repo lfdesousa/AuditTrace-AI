@@ -1,7 +1,7 @@
 """Redis-backed per-session tool result cache (ADR-025 §Decision.8).
 
 Mirrors the ``identity.TokenCache`` pattern: a thin class wrapping a
-``redis.Redis`` client with deterministic key namespacing and graceful
+``redis.Redis[str]`` client with deterministic key namespacing and graceful
 degradation on Redis errors. The two caches share the same
 ``sovereign-redis`` container from DESIGN §15 but live under disjoint
 key prefixes so they cannot collide:
@@ -14,7 +14,7 @@ the TTL to ``0`` disables both ``get`` and ``put`` entirely — the
 handler always runs and nothing is stored. That's the operator's
 escape hatch if caching ever causes a correctness issue.
 
-Resilience: every Redis call is wrapped so a cache miss, a malformed
+Resilience: every Redis[str] call is wrapped so a cache miss, a malformed
 payload, or a full Redis outage all degrade to "behave like a cache
 miss". The chat path keeps working and the real handler fires.
 """
@@ -48,7 +48,7 @@ class ToolResultCache:
 
     KEY_PREFIX = "sovereign:tool-result:"
 
-    def __init__(self, redis_client: Redis, default_ttl_seconds: int = 900):
+    def __init__(self, redis_client: Redis[str], default_ttl_seconds: int = 900):
         self._redis = redis_client
         self._default_ttl = default_ttl_seconds
 
@@ -66,14 +66,14 @@ class ToolResultCache:
         if self._default_ttl <= 0:
             return None
         try:
-            raw = self._redis.get(self._key(cache_id))
+            raw: Any = self._redis.get(self._key(cache_id))
         except Exception as exc:
             logger.warning("ToolResultCache.get failed: %s", exc)
             return None
         if raw is None:
             return None
         try:
-            return json.loads(raw)
+            return dict(json.loads(str(raw)))
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning("ToolResultCache.get malformed payload: %s", exc)
             return None
@@ -81,7 +81,7 @@ class ToolResultCache:
     def put(self, cache_id: str, result: dict[str, Any]) -> None:
         """Store a handler result under ``cache_id`` for the default TTL.
 
-        No-op when the cache is disabled (TTL=0). Swallows Redis errors
+        No-op when the cache is disabled (TTL=0). Swallows Redis[str] errors
         with a warning so a cache-write failure never breaks a chat
         response — the result is returned to the caller regardless.
         """
@@ -100,7 +100,7 @@ class ToolResultCache:
         """Drop every cache entry under the ``sovereign:tool-result:`` prefix.
 
         Uses SCAN (not KEYS *) so the operation is non-blocking on a busy
-        Redis. Keys under other prefixes (``sovereign:token:`` for the
+        Redis[str]. Keys under other prefixes (``sovereign:token:`` for the
         TokenCache) are untouched.
         """
         cursor = 0

@@ -79,7 +79,7 @@ class DefaultContextBuilder(ContextBuilderService):
     ) -> str:
         """Build context string. Delegates to build_system_context_with_stats."""
         ctx, _ = self.build_system_context_with_stats(user_context, project, query)
-        return ctx
+        return str(ctx)
 
     @log_call(logger=logger)
     def build_system_context_with_stats(

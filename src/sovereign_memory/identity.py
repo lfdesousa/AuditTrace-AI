@@ -152,9 +152,9 @@ class TokenCache:
 
     Thread-safe via Redis itself; no in-process locks needed. FastAPI
     runs request handlers across a thread pool that all share a single
-    ``redis.Redis`` client.
+    ``redis.Redis[str]`` client.
 
-    Resilience: ``get`` returns ``None`` on any Redis error (treated as
+    Resilience: ``get`` returns ``None`` on any Redis[str] error (treated as
     cache miss — the middleware falls through to JWT validation).
     ``put`` swallows Redis errors with a warning so cache failures
     never break requests.
@@ -162,7 +162,7 @@ class TokenCache:
 
     KEY_PREFIX = "sovereign:token:"
 
-    def __init__(self, redis_client: Redis, default_ttl_seconds: int = 300):
+    def __init__(self, redis_client: Redis[str], default_ttl_seconds: int = 300):
         self._redis = redis_client
         self._default_ttl = default_ttl_seconds
 
@@ -172,7 +172,7 @@ class TokenCache:
     def get(self, token_hash: str) -> UserContext | None:
         """Return the cached ``UserContext`` for this hash, or ``None``.
 
-        ``None`` is returned for: missing key, expired entry (Redis
+        ``None`` is returned for: missing key, expired entry (Redis[str]
         evicted), unparseable payload, or any Redis connectivity error.
         Treat ``None`` as "validate the JWT and re-cache".
         """
@@ -184,7 +184,7 @@ class TokenCache:
         if raw is None:
             return None
         try:
-            data = json.loads(raw)
+            data = json.loads(str(raw))
             return UserContext(
                 user_id=data["user_id"],
                 username=data["username"],
@@ -212,7 +212,7 @@ class TokenCache:
         """
         ttl = ttl_seconds if ttl_seconds is not None else self._default_ttl
         if ttl <= 0:
-            return  # nothing to cache — avoid Redis SETEX with TTL=0
+            return  # nothing to cache — avoid Redis[str] SETEX with TTL=0
         payload = {
             "user_id": ctx.user_id,
             "username": ctx.username,
@@ -277,7 +277,7 @@ class TokenCache:
 # backed instance without ever touching production settings.
 
 _token_cache: TokenCache | None = None
-_redis_client: Redis | None = None
+_redis_client: Redis[str] | None = None
 
 
 def get_token_cache() -> TokenCache:

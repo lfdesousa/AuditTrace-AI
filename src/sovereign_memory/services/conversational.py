@@ -19,6 +19,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -35,7 +36,7 @@ class ConversationalService(ABC):
     @abstractmethod
     def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Load the N most recent sessions for a project."""
 
     @abstractmethod
@@ -62,7 +63,7 @@ class PostgresConversationalService(ConversationalService):
     @log_call(logger=logger)
     def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Load the N most recent sessions for a project **for this user**."""
         session = self._session_factory()
         try:
@@ -145,13 +146,13 @@ class MockConversationalService(ConversationalService):
     can't accidentally leak rows across users.
     """
 
-    def __init__(self):
-        self._sessions: list[dict] = []
+    def __init__(self) -> None:
+        self._sessions: list[dict[str, Any]] = []
 
     @log_call(logger=logger)
     def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         filtered = [
             s
             for s in self._sessions
@@ -190,6 +191,6 @@ class MockConversationalService(ConversationalService):
             lines.append(f"\n**Session:** {s['summary'][:200]}")
         return "\n".join(lines)
 
-    def reset(self):
+    def reset(self) -> None:
         """Clear all sessions."""
         self._sessions.clear()

@@ -54,7 +54,7 @@ _JWKS_FETCH_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
 
 
 @log_call(logger=logger)
-def _fetch_jwks_keys(jwks_url: str) -> list[str]:
+def _fetch_jwks_keys(jwks_url: str) -> list[Any]:
     """Fetch public keys from Keycloak JWKS endpoint.
 
     Retries with exponential backoff to handle the startup race where the
@@ -66,7 +66,7 @@ def _fetch_jwks_keys(jwks_url: str) -> list[str]:
             response = httpx.get(jwks_url, timeout=10)
             response.raise_for_status()
             jwks = response.json()
-            return [key for key in jwks.get("keys", [])]
+            return list(jwks.get("keys", []))
         except (httpx.HTTPError, httpx.ConnectError) as exc:
             last_exc = exc
             if attempt < _JWKS_FETCH_RETRIES:
@@ -82,33 +82,33 @@ def _fetch_jwks_keys(jwks_url: str) -> list[str]:
     raise last_exc  # type: ignore[misc]
 
 
-def _get_jwks_keys(jwks_url: str) -> list[str]:
+def _get_jwks_keys(jwks_url: str) -> list[Any]:
     """Get JWKS keys with caching."""
     now = time.time()
     if (
         "keys" in _jwks_cache
         and now - _jwks_cache.get("fetched_at", 0) < _JWKS_CACHE_TTL
     ):
-        return _jwks_cache["keys"]
+        return list(_jwks_cache["keys"])
 
     keys = _fetch_jwks_keys(jwks_url)
     _jwks_cache["keys"] = keys
     _jwks_cache["fetched_at"] = now
-    return keys
+    return keys  # type: ignore[no-any-return]
 
 
-def require_scope(required_scope: str):
+def require_scope(required_scope: str):  # type: ignore[no-untyped-def]
     """FastAPI dependency that enforces JWT authentication and scope.
 
     Usage:
         @router.get("/protected")
-        async def endpoint(payload: dict = Depends(require_scope("sovereign-ai:query"))):
+        async def endpoint(payload: dict[str, Any] = Depends(require_scope("sovereign-ai:query"))):
             ...
     """
 
     async def _validate(
         credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-    ) -> dict:
+    ) -> dict[str, Any]:
         settings = get_settings()
 
         # Auth bypass when disabled
@@ -143,7 +143,7 @@ def require_scope(required_scope: str):
                 detail=f"Required scope: {required_scope}",
             )
 
-        return payload
+        return dict(payload)
 
     return _validate
 

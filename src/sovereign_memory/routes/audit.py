@@ -1,6 +1,7 @@
 """Audit and interactions route."""
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -19,8 +20,8 @@ async def list_interactions(
     project: str | None = None,
     limit: int = 100,
     offset: int = 0,
-    _auth: dict = Depends(require_scope("sovereign-ai:audit")),
-):
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:audit")),
+) -> dict[str, Any]:
     """List interaction records from audit trail."""
     # TODO: Phase 1 - PostgreSQL query
     return {"interactions": [], "total": 0, "limit": limit, "offset": offset}
@@ -30,8 +31,8 @@ async def list_interactions(
 @log_call(logger=logger)
 async def create_interaction(
     record: InteractionRecord,
-    _auth: dict = Depends(require_scope("sovereign-ai:audit")),
-):
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:audit")),
+) -> dict[str, Any]:
     """Create a new interaction audit record."""
     # TODO: Phase 1 - insert into PostgreSQL
     return record.model_dump()

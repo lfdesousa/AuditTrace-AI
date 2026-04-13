@@ -5,6 +5,7 @@ carries a concrete ``UserContext`` down through all four layers.
 """
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -25,9 +26,9 @@ router = APIRouter()
 async def get_context(
     request: ContextRequest,
     context_builder: ContextBuilderService = Depends(get_context_builder),
-    _auth: dict = Depends(require_scope("sovereign-ai:context")),
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:context")),
     user: UserContext = Depends(require_user),
-):
+) -> ContextBuildResponse:
     """Retrieve relevant context from all 4 memory layers."""
     context_string, layer_stats = context_builder.build_system_context_with_stats(
         user,

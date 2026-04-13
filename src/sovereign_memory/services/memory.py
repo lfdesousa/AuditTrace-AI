@@ -20,7 +20,7 @@ class MemoryService(ABC):
         project: str,
         source: str,
         content: str,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Store a memory chunk."""
 
@@ -50,7 +50,7 @@ class ChromaMemoryService(MemoryService):
         self._collection = self._ensure_collection()
 
     @log_call(logger=logger)
-    def _ensure_collection(self):
+    def _ensure_collection(self) -> Any:
         return self.client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -62,7 +62,7 @@ class ChromaMemoryService(MemoryService):
         project: str,
         source: str,
         content: str,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         mem_id = str(uuid.uuid4())
         doc_metadata = {
@@ -99,9 +99,9 @@ class ChromaMemoryService(MemoryService):
                     "id": results["ids"][0][i],
                     "content": results["documents"][0][i],
                     "metadata": results["metadatas"][0][i],
-                    "distance": results["distances"][0][i]
-                    if "distances" in results
-                    else None,
+                    "distance": (
+                        results["distances"][0][i] if "distances" in results else None
+                    ),
                 }
             )
         return memories
@@ -109,15 +109,15 @@ class ChromaMemoryService(MemoryService):
     @log_call(logger=logger)
     def count(self, project: str | None = None) -> int:
         if project:
-            return self._collection.count(where={"project": project})
-        return self._collection.count()
+            return int(self._collection.count(where={"project": project}))
+        return int(self._collection.count())
 
 
 class MockMemoryService(MemoryService):
     """Mock memory service for unit testing."""
 
-    def __init__(self):
-        self.memories: list[dict] = []
+    def __init__(self) -> None:
+        self.memories: list[dict[str, Any]] = []
         self.call_count: int = 0
 
     @log_call(logger=logger)
@@ -126,7 +126,7 @@ class MockMemoryService(MemoryService):
         project: str,
         source: str,
         content: str,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         mem_id = str(uuid.uuid4())
         self.memories.append(
@@ -168,6 +168,6 @@ class MockMemoryService(MemoryService):
             return len([m for m in self.memories if m["project"] == project])
         return len(self.memories)
 
-    def reset(self):
+    def reset(self) -> None:
         self.memories.clear()
         self.call_count = 0
