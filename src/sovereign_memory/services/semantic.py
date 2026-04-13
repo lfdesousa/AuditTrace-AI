@@ -12,6 +12,7 @@ every row, which keeps the sentinel-backed test fixtures visible.
 
 import logging
 from abc import ABC, abstractmethod
+from typing import Any
 
 from langchain_core.documents import Document
 
@@ -70,7 +71,7 @@ class ChromaSemanticService(SemanticService):
         target_collections = collections or self._default_collections
         all_docs: list[Document] = []
 
-        where: dict | None = None
+        where: dict[str, Any] | None = None
         if not user_context.is_admin:
             where = {"user_id": user_context.user_id}
 
@@ -80,7 +81,7 @@ class ChromaSemanticService(SemanticService):
                 count = collection.count()
                 if count == 0:
                     continue
-                query_kwargs: dict = {
+                query_kwargs: dict[str, Any] = {
                     "query_texts": [query],
                     "n_results": min(k, count),
                     "include": ["documents", "metadatas"],
@@ -89,9 +90,9 @@ class ChromaSemanticService(SemanticService):
                     query_kwargs["where"] = where
                 results = collection.query(**query_kwargs)
                 for i in range(len(results["ids"][0])):
-                    doc_content = results["documents"][0][i]
+                    doc_content = results["documents"][0][i]  # type: ignore[index]
                     doc_metadata = (
-                        results["metadatas"][0][i] if results["metadatas"] else {}
+                        results["metadatas"][0][i] if results.get("metadatas") else {}  # type: ignore[index]
                     )
                     all_docs.append(
                         Document(
@@ -110,7 +111,7 @@ class ChromaSemanticService(SemanticService):
     def available_collections(self) -> list[str]:
         """List all collections in ChromaDB."""
         try:
-            return [c.name for c in self._client.list_collections()]
+            return [c.name for c in self._client.list_collections()]  # type: ignore[attr-defined]
         except Exception:
             return []
 
@@ -162,13 +163,13 @@ class UserScopedSemanticService(SemanticService):
 class MockSemanticService(SemanticService):
     """Mock semantic service for unit testing."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._docs: dict[str, list[Document]] = {}
 
     @log_call(logger=logger)
     def add_document(
         self, content: str, source: str = "mock", collection: str = "default"
-    ):
+    ) -> None:
         """Add a document to a collection for testing."""
         if collection not in self._docs:
             self._docs[collection] = []
@@ -204,6 +205,6 @@ class MockSemanticService(SemanticService):
     def available_collections(self) -> list[str]:
         return list(self._docs.keys())
 
-    def reset(self):
+    def reset(self) -> None:
         """Clear all documents."""
         self._docs.clear()

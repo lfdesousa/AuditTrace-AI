@@ -1,6 +1,7 @@
 """Health and metrics routes."""
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -16,7 +17,7 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse)
 @log_call(logger=logger)
-async def health_check():
+async def health_check() -> HealthResponse:
     """Health check endpoint for Kubernetes/docker probes."""
     settings = get_settings()
     return HealthResponse(
@@ -33,8 +34,8 @@ async def health_check():
 @router.get("/metrics", response_model=MetricsResponse)
 @log_call(logger=logger)
 async def metrics(
-    _auth: dict = Depends(require_scope("sovereign-ai:admin")),
-):
+    _auth: dict[str, Any] = Depends(require_scope("sovereign-ai:admin")),
+) -> MetricsResponse:
     """Application-level metrics endpoint.
 
     Note: operation-level metrics (latency, error counts) are exported

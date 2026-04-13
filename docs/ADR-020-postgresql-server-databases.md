@@ -1,8 +1,8 @@
 # ADR-020: PostgreSQL + Server-Mode Databases
 
-**Status:** Accepted  
-**Date:** 2026-04-10  
-**Deciders:** Luis Filipe de Sousa  
+**Status:** Accepted
+**Date:** 2026-04-10
+**Deciders:** Luis Filipe de Sousa
 **Related:** ADR-018 (4-layer memory port), ADR-014 (package structure)
 
 ## Context

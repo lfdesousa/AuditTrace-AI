@@ -1,8 +1,8 @@
 # ADR-014: Python Package Structure for Memory Server
 
-**Status**: Accepted  
-**Date**: 2026-04-09  
-**Authors**: Luis Filipe de Sousa  
+**Status**: Accepted
+**Date**: 2026-04-09
+**Authors**: Luis Filipe de Sousa
 **Phase**: Phase 0
 
 ---

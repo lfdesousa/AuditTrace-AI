@@ -74,7 +74,7 @@ class PendingToolCall:
 # ─────────────────────── Tool-call extraction helpers ──────────────────────
 
 
-def _extract_tool_calls(body: dict) -> list[dict]:
+def _extract_tool_calls(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the ``tool_calls`` list from an OpenAI chat.completion body.
 
     Returns ``[]`` when the response has no tool calls (final answer).
@@ -88,7 +88,7 @@ def _extract_tool_calls(body: dict) -> list[dict]:
     return [tc for tc in tool_calls if isinstance(tc, dict)]
 
 
-def _extract_assistant_message(body: dict) -> dict:
+def _extract_assistant_message(body: dict[str, Any]) -> dict[str, Any]:
     """Return the assistant message dict verbatim so it can be appended
     to the conversation history before we send the tool_result message.
     The second llama-server call must see the exact same tool_calls block
@@ -102,12 +102,12 @@ def _extract_assistant_message(body: dict) -> dict:
 
 
 def _split_tool_calls_by_type(
-    tool_calls: list[dict],
-) -> tuple[list[dict], list[dict]]:
+    tool_calls: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Partition tool calls into (memory, external). A memory tool is one
     whose name resolves via the registry; everything else is external."""
-    memory: list[dict] = []
-    external: list[dict] = []
+    memory: list[dict[str, Any]] = []
+    external: list[dict[str, Any]] = []
     for tc in tool_calls:
         fn = tc.get("function") or {}
         name = fn.get("name", "")
@@ -142,12 +142,12 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 async def run_memory_tool_loop(
     *,
     llama_url: str,
-    payload: dict,
+    payload: dict[str, Any],
     user_context: UserContext,
     session_id: str,
     max_iterations: int,
     timeout_seconds: int = 120,
-) -> tuple[dict, list[PendingToolCall]]:
+) -> tuple[dict[str, Any], list[PendingToolCall]]:
     """Run the proxy-internal tool-call loop and return the final body.
 
     ``payload`` must already carry the augmented ``tools`` array
@@ -168,7 +168,7 @@ async def run_memory_tool_loop(
     messages = list(proxy_payload.get("messages") or [])
 
     pending: list[PendingToolCall] = []
-    last_body: dict = {}
+    last_body: dict[str, Any] = {}
 
     for iteration in range(max_iterations):
         proxy_payload["messages"] = messages
@@ -218,10 +218,10 @@ async def run_memory_tool_loop(
 
 async def _execute_memory_tool(
     *,
-    tc: dict,
+    tc: dict[str, Any],
     user_context: UserContext,
     session_id: str,
-    messages: list[dict],
+    messages: list[dict[str, Any]],
     pending: list[PendingToolCall],
 ) -> None:
     """Dispatch one memory tool_call, append the tool_result message, and
@@ -328,10 +328,10 @@ async def _execute_memory_tool(
 
 
 def _append_tool_result(
-    messages: list[dict],
+    messages: list[dict[str, Any]],
     tool_call_id: str,
     tool_name: str,
-    result: dict,
+    result: dict[str, Any],
 ) -> None:
     """Append an OpenAI-spec tool_result message to the conversation.
 

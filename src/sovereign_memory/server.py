@@ -16,7 +16,7 @@ logger = getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
     settings = get_settings()
     setup_logging(level=settings.log_level, structured=False)
@@ -85,7 +85,7 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-def main():
+def main() -> None:
     """Entry point for CLI execution."""
     import uvicorn
 

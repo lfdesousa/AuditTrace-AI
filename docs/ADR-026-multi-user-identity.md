@@ -1043,22 +1043,22 @@ independently.
 ```python
 class TokenCache:
     """sha256(token) → UserContext + TTL, backed by Redis.
-    
+
     Cache keys are namespaced under ``sovereign:token:<hash>`` so
     multiple consumers of the same Redis instance (none today, but
     designing for it) cannot collide.
-    
+
     Thread-safe by virtue of Redis itself — no in-process locks needed.
     Survives process restart (the Redis container persists across
     sovereign-memory-server restarts).
-    
+
     Phase 8+ horizontal scaling: just point N processes at the same
     Redis. No code change.
     """
     KEY_PREFIX = "sovereign:token:"
-    
+
     def __init__(self, redis_client: Redis, default_ttl_seconds: int = 300): ...
-    
+
     def get(self, token_hash: str) -> UserContext | None: ...
     def put(self, token_hash: str, ctx: UserContext, ttl_seconds: int | None = None) -> None: ...
     def invalidate(self, token_hash: str) -> None: ...

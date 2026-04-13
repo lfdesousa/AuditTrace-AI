@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
+from typing import Any
 
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
@@ -85,7 +86,7 @@ def current_user_id() -> str | None:
 # in-memory test path is unaffected.
 
 
-def _apply_rls_guc(session, transaction, connection) -> None:  # noqa: ARG001
+def _apply_rls_guc(session: Any, transaction: Any, connection: Any) -> None:  # noqa: ARG001
     """Push the request-scoped user id into Postgres as a GUC.
 
     Emitted via ``set_config('app.current_user_id', :uid, true)`` where

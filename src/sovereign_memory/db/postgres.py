@@ -64,7 +64,7 @@ class InMemoryPostgresFactory(PostgresFactory):
     creates a fresh empty DB per thread and our tables vanish.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._engine = create_engine(
             "sqlite://",
             echo=False,
@@ -86,7 +86,7 @@ class InMemoryPostgresFactory(PostgresFactory):
 class MockPostgresFactory(PostgresFactory):
     """Mock factory for unit testing — tracks calls, no real connections."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.call_count: int = 0
         self._engine = create_engine(
             "sqlite://",

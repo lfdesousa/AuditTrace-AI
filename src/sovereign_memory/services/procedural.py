@@ -11,6 +11,7 @@ the parameter is pure plumbing here.
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 from langchain_core.documents import Document
 
@@ -121,9 +122,7 @@ class S3ProceduralService(ProceduralService):
             return self._cache
         docs: list[Document] = []
         try:
-            from minio import Minio
-
-            client: Minio = self._client  # type: ignore[assignment]
+            client: Any = self._client
             objects = client.list_objects(self._bucket, prefix=self._prefix)
             for obj in objects:
                 name = obj.object_name or ""
@@ -188,13 +187,13 @@ class S3ProceduralService(ProceduralService):
 class MockProceduralService(ProceduralService):
     """Mock procedural service for unit testing."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._documents: list[Document] = []
 
     @log_call(logger=logger)
     def add_document(
         self, content: str, skill: str = "MockSkill", file: str = "SKILL-mock.md"
-    ):
+    ) -> None:
         """Add a document for testing."""
         self._documents.append(
             Document(
@@ -235,6 +234,6 @@ class MockProceduralService(ProceduralService):
             lines.append(f"- **{s.metadata['skill']}** ({s.metadata['file']})")
         return "\n".join(lines)
 
-    def reset(self):
+    def reset(self) -> None:
         """Clear all documents."""
         self._documents.clear()

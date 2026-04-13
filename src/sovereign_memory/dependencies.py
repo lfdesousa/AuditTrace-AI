@@ -6,7 +6,7 @@ No file-based databases from this point forward.
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Depends
 
@@ -49,7 +49,7 @@ from sovereign_memory.services.procedural import (
 try:
     from minio import Minio
 except ImportError:  # pragma: no cover - optional dep
-    Minio = None  # type: ignore[assignment,misc]
+    Minio = None
 
 from sovereign_memory.services.semantic import (
     ChromaSemanticService,
@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 class DependencyContainer:
     """Container for dependency injection."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._factories: dict[str, ChromaDBFactory] = {}
         self._instances: dict[str, Any] = {}
 
@@ -117,7 +117,7 @@ def register_default_dependencies(settings: Settings | None = None) -> None:
 
     # PostgreSQL factory — real DB required in local/production
     if settings.database_url:
-        pg_factory = URLPostgresFactory(settings.database_url)
+        pg_factory: PostgresFactory = URLPostgresFactory(settings.database_url)
     elif settings.env == "test":
         logger.info("Test environment — using in-memory database")
         pg_factory = InMemoryPostgresFactory()
@@ -148,7 +148,7 @@ def _create_minio_client(settings: Settings) -> object | None:
             secure=secure,
         )
         logger.info("MinIO client initialised — endpoint=%s", endpoint)
-        return client
+        return client  # type: ignore[no-any-return]
     except Exception as exc:
         logger.warning("MinIO client init failed, falling back to filesystem: %s", exc)
         return None
@@ -208,18 +208,18 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
 @log_call(logger=logger)
 def get_chromadb() -> Any:
     """Get ChromaDB client instance (dependency injection)."""
-    return container.get_instance("chromadb")
+    return cast(Any, container.get_instance("chromadb"))
 
 
 @log_call(logger=logger)
 def get_chromadb_factory() -> ChromaDBFactory:
-    return container.get_factory("chromadb")
+    return cast(ChromaDBFactory, container.get_factory("chromadb"))
 
 
 @log_call(logger=logger)
 def get_postgres_factory() -> PostgresFactory:
     """Get PostgreSQL factory (dependency injection)."""
-    return container._instances["postgres_factory"]
+    return cast(PostgresFactory, container._instances["postgres_factory"])
 
 
 @log_call(logger=logger)
@@ -262,13 +262,13 @@ def get_context_builder(
 @log_call(logger=logger)
 def get_episodic_service() -> EpisodicService:
     """Get episodic memory service (dependency injection)."""
-    return container._instances["episodic"]
+    return cast(EpisodicService, container._instances["episodic"])
 
 
 @log_call(logger=logger)
 def get_conversational_service() -> ConversationalService:
     """Get conversational memory service (dependency injection)."""
-    return container._instances["conversational"]
+    return cast(ConversationalService, container._instances["conversational"])
 
 
 @log_call(logger=logger)
@@ -276,7 +276,7 @@ def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
     resolve the service without touching container internals."""
-    return container._instances["procedural"]
+    return cast(ProceduralService, container._instances["procedural"])
 
 
 @log_call(logger=logger)
@@ -284,7 +284,7 @@ def get_semantic_service() -> SemanticService:
     """Get semantic memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_semantic`` memory tool handler can
     resolve the service without touching container internals."""
-    return container._instances["semantic"]
+    return cast(SemanticService, container._instances["semantic"])
 
 
 @log_call(logger=logger)
