@@ -40,7 +40,7 @@ docker compose -f "${STACK_DIR}/docker-compose.yml" up -d
 echo ""
 echo "Observability stack started:"
 echo "  Grafana:    http://localhost:3001  (admin / sovereign)"
-echo "  Prometheus: http://localhost:9090"
+echo "  Prometheus: http://localhost:19090"
 echo "  Loki:       http://localhost:3100"
 echo "  OTel:       http://localhost:4318  (OTLP HTTP receiver)"
 echo ""

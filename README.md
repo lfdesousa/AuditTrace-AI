@@ -210,12 +210,71 @@ All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQ
 
 | Priority | Item | Description |
 |---|---|---|
-| ✅ Done | **Intelligent Memory Tool Routing** | Solved via system prompt guidance — the ambient context now instructs the LLM to select ONLY the most relevant tool per question. Validated: Qwen3.5-35B-A3B selectively calls individual tools instead of blast-calling all 4. ADR-025 promoted to Accepted. |
-| 🔴 Next | **Observability Aggregation Stack** | Prometheus scraper for llama-server `/metrics`, Grafana dashboards (P50/P95 latency, token budgets, tool-call iteration distribution), Loki log aggregation. Sibling compose stack mirroring the Langfuse pattern. |
-| 🟡 Planned | **Full Package Rename** | Rename Python package from `sovereign_memory` to `audittrace`, env prefix from `SOVEREIGN_` to `AUDITTRACE_`, all container/service/network names. Dedicated PR. |
-| 🟡 Planned | **OAuth2 Device Flow** | Human authentication beyond the current `client_credentials` dev client. Dedicated Keycloak public client. |
+| ✅ Done | **Intelligent Memory Tool Routing** | Solved via system prompt guidance — ambient context instructs the LLM to pick ONE tool per question. Validated with Qwen3.5-35B-A3B. Quantitative measurement pending (needs observability dashboards). ADR-025 Accepted. |
+| ✅ Done | **MinIO Object Storage** | Stateless 12-factor containers — host filesystem mounts replaced with MinIO S3 (ADR-027). Two-tier buckets: `memory-shared` (ADRs, skills) + `memory-private` (per-user, JWT sub prefix). SSE-S3 encryption at rest. |
+| ✅ Done | **Observability Aggregation Stack** | Prometheus + Grafana + Loki + OTel Collector as sibling compose stack (ADR-028). Scrapes Traefik, llama-server, MinIO. Promtail for container log aggregation. Pre-provisioned Grafana dashboard. |
+| ✅ Done | **mypy --strict Clean** | 0 errors across 41 source files. Pre-commit pipeline passes without SKIP=mypy. types-redis stubs installed. |
+| 🔴 Next | **Full Package Rename** | Rename Python package from `sovereign_memory` to `audittrace`, env prefix from `SOVEREIGN_` to `AUDITTRACE_`, all container/service/network names. Dedicated PR. |
+| 🟡 Planned | **OAuth2 Device Flow** | Human authentication beyond the current `client_credentials` dev client. Dedicated Keycloak public client for OpenCode. |
+| 🟡 Planned | **Tool Routing Measurement** | Quantitative comparison of inject vs tools mode: latency, token efficiency, context utilisation. Requires observability dashboards (now available). |
 | 🔵 Future | **Async Persistence** | Non-blocking audit row writes for `_persist_interaction` and `_flush_pending_tool_calls`. |
 | 🔵 Future | **Kubernetes** | K3s + Istio mTLS + SPIFFE/SVID identity. |
+
+## Observability Stack (ADR-028)
+
+Sibling Docker Compose stack following the Langfuse pattern (ADR-021.2). Provides metrics aggregation, log search, and dashboards.
+
+```bash
+# Start the observability stack
+./scripts/setup-observability.sh
+
+# Stop
+./scripts/setup-observability.sh --down
+```
+
+| Service | URL | Purpose |
+|---|---|---|
+| Grafana | `http://localhost:3001` (admin / sovereign) | Dashboards: latency percentiles, error rates, infra metrics, logs |
+| Prometheus | `http://localhost:19090` | Metrics storage + PromQL queries |
+| Loki | `http://localhost:3100` | Log aggregation + LogQL queries |
+| OTel Collector | `http://localhost:4318` | OTLP receiver (memory-server exports here) |
+
+**Data flow:**
+- Memory-server sends OTLP metrics/logs to OTel Collector, which fans out to Prometheus + Loki
+- Prometheus scrapes Traefik, llama-server, and MinIO natively
+- Promtail auto-discovers Docker containers and pushes logs to Loki
+- Langfuse retains exclusive ownership of LLM traces (SDK path, unchanged)
+- Grafana queries both Prometheus and Loki for the unified operations dashboard
+
+**Pre-provisioned dashboard:** "Sovereign AI Operations" — P50/P95/P99 latency, error rates by type, llama-server tokens/sec, KV cache usage, MinIO API requests, container error logs.
+
+## Memory Seeding (ADR-027)
+
+After a fresh clone or when knowledge changes:
+
+```bash
+# Generate secrets (includes MinIO KMS key)
+./scripts/setup-secrets.sh
+
+# Upload to MinIO + index into ChromaDB
+python scripts/seed-memory.py --user-id <keycloak-sub-claim>
+
+# Index only (skip MinIO upload)
+python scripts/index-chromadb.py --user-id <keycloak-sub-claim>
+
+# Selective re-index
+python scripts/index-chromadb.py --collections decisions skills
+
+# Preview without writing
+python scripts/index-chromadb.py --dry-run --user-id <sub>
+```
+
+| Collection | Source | Content |
+|---|---|---|
+| `decisions` | `docs/ADR-*.md` | Architecture Decision Records |
+| `skills` | `~/work/claude-config/skills/` | Domain knowledge skill files |
+| `ai_research` | `~/work/ai-knowledge/` | Research papers (PDF + text) |
+| `scm_coursework` | `~/work/scm-knowledge/` | MIT SCM coursework (transcripts, notes, slides) |
 
 ## Configuration
 
