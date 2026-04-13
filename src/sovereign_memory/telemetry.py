@@ -190,7 +190,7 @@ def start_span(
         yield span
 
 
-def set_current_span_attributes(attributes: dict) -> None:
+def set_current_span_attributes(attributes: dict[str, Any]) -> None:
     """Set attributes on the currently active span. No-op if tracing disabled.
 
     Used by route handlers to enrich chat completion spans with gen_ai.*

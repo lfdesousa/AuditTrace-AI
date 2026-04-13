@@ -7,6 +7,7 @@ No real Keycloak required — all validation is tested in isolation.
 import time
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -14,7 +15,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
 
-from sovereign_memory.auth import _jwks_cache, require_scope
+from sovereign_memory.auth import _fetch_jwks_keys, _jwks_cache, require_scope
 
 # ── Test RSA key pair ──────────────────────────────────────────────────────────
 
@@ -101,6 +102,75 @@ def mock_jwks():
     with patch("sovereign_memory.auth._fetch_jwks_keys") as mock:
         mock.return_value = [TEST_PUBLIC_PEM]
         yield mock
+
+
+# ── JWKS fetch retry tests ────────────────────────────────────────────────────
+
+
+class TestJWKSFetchRetry:
+    """_fetch_jwks_keys retries with exponential backoff on HTTP errors."""
+
+    def test_succeeds_on_second_attempt(self):
+        """First call fails, second succeeds — must return keys."""
+        fake_keys = [{"kty": "RSA", "n": "abc"}]
+        ok_response = MagicMock()
+        ok_response.json.return_value = {"keys": fake_keys}
+        ok_response.raise_for_status = MagicMock()
+
+        with (
+            patch("sovereign_memory.auth.httpx.get") as mock_get,
+            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+        ):
+            mock_get.side_effect = [
+                httpx.ConnectError("refused"),
+                ok_response,
+            ]
+            result = _fetch_jwks_keys("http://keycloak:8080/jwks")
+
+        assert result == fake_keys
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once()
+
+    def test_exhausts_retries_and_reraises(self):
+        """All attempts fail — must raise the last exception."""
+        with (
+            patch("sovereign_memory.auth.httpx.get") as mock_get,
+            patch("sovereign_memory.auth.time.sleep"),
+        ):
+            mock_get.side_effect = httpx.ConnectError("down")
+            with pytest.raises(httpx.ConnectError, match="down"):
+                _fetch_jwks_keys("http://keycloak:8080/jwks")
+
+        # 1 initial + 3 retries = 4 calls
+        assert mock_get.call_count == 4
+
+    def test_backoff_delays_are_exponential(self):
+        """Sleep delays must follow 2^(attempt+1): 2, 4, 8."""
+        with (
+            patch("sovereign_memory.auth.httpx.get") as mock_get,
+            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+        ):
+            mock_get.side_effect = httpx.ConnectError("down")
+            with pytest.raises(httpx.ConnectError):
+                _fetch_jwks_keys("http://keycloak:8080/jwks")
+
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays == [2.0, 4.0, 8.0]
+
+    def test_succeeds_immediately_without_sleep(self):
+        """Happy path — no retries, no sleep."""
+        ok_response = MagicMock()
+        ok_response.json.return_value = {"keys": [{"kty": "RSA"}]}
+        ok_response.raise_for_status = MagicMock()
+
+        with (
+            patch("sovereign_memory.auth.httpx.get", return_value=ok_response),
+            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+        ):
+            result = _fetch_jwks_keys("http://keycloak:8080/jwks")
+
+        assert result == [{"kty": "RSA"}]
+        mock_sleep.assert_not_called()
 
 
 # ── Auth disabled tests ────────────────────────────────────────────────────────

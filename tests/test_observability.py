@@ -389,6 +389,52 @@ def test_structured_formatter_emits_json():
     assert data["operation"] == "op"
 
 
+class TestRecordSpanError:
+    """Tests for _record_span_error — dispatches to OTel or Langfuse APIs."""
+
+    def test_otel_span_calls_record_exception(self):
+        """OTel spans expose record_exception; it must be called."""
+        from sovereign_memory.logging_config import _record_span_error
+
+        span = MagicMock(spec=["record_exception"])
+        exc = ValueError("boom")
+        _record_span_error(span, exc)
+        span.record_exception.assert_called_once_with(exc)
+
+    def test_langfuse_span_calls_update_with_error_level(self):
+        """Langfuse spans have update() but not record_exception()."""
+        from sovereign_memory.logging_config import _record_span_error
+
+        span = MagicMock(spec=["update"])
+        exc = RuntimeError("crash")
+        _record_span_error(span, exc)
+        span.update.assert_called_once_with(
+            level="ERROR", status_message="RuntimeError: crash"
+        )
+
+    def test_none_span_is_noop(self):
+        """None span must not raise."""
+        from sovereign_memory.logging_config import _record_span_error
+
+        _record_span_error(None, ValueError("ignored"))
+
+    def test_span_with_neither_method_is_noop(self):
+        """A span that has neither record_exception nor update must not raise."""
+        from sovereign_memory.logging_config import _record_span_error
+
+        span = MagicMock(spec=[])
+        _record_span_error(span, ValueError("ignored"))
+
+    def test_failing_record_exception_is_swallowed(self):
+        """If record_exception itself raises, the error must be swallowed."""
+        from sovereign_memory.logging_config import _record_span_error
+
+        span = MagicMock(spec=["record_exception"])
+        span.record_exception.side_effect = RuntimeError("telemetry broken")
+        # Must not raise
+        _record_span_error(span, ValueError("original"))
+
+
 def test_telemetry_start_span_returns_none_when_uninitialised():
     telemetry._reset_for_tests()
     with telemetry.start_span("whatever") as span:
