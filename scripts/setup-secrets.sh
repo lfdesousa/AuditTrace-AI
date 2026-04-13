@@ -37,8 +37,8 @@ else
 fi
 
 if [ ! -f "${SECRETS_DIR}/minio_kms_key.txt" ]; then
-    openssl rand -hex 32 > "${SECRETS_DIR}/minio_kms_key.txt"
-    echo "Generated: secrets/minio_kms_key.txt (encryption at rest)"
+    openssl rand 32 | base64 | tr -d '\n' > "${SECRETS_DIR}/minio_kms_key.txt"
+    echo "Generated: secrets/minio_kms_key.txt (encryption at rest, 32-byte base64)"
 else
     echo "Exists: secrets/minio_kms_key.txt (skipped)"
 fi
