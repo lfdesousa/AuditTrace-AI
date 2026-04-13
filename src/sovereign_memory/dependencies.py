@@ -45,6 +45,12 @@ from sovereign_memory.services.procedural import (
     ProceduralService,
     S3ProceduralService,
 )
+
+try:
+    from minio import Minio
+except ImportError:  # pragma: no cover - optional dep
+    Minio = None  # type: ignore[assignment,misc]
+
 from sovereign_memory.services.semantic import (
     ChromaSemanticService,
     MockSemanticService,
@@ -130,9 +136,7 @@ def _create_minio_client(settings: Settings) -> object | None:
     if not settings.minio_secret_key:
         return None
     try:
-        from urllib.parse import urlparse
-
-        from minio import Minio
+        from urllib.parse import urlparse  # noqa: E402
 
         parsed = urlparse(settings.minio_url)
         endpoint = parsed.netloc or parsed.path
