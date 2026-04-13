@@ -21,8 +21,7 @@ class ChromaDBClient(Protocol):
 
     def get_or_create_collection(
         self, name: str, **kwargs: Any
-    ) -> "chromadb.Collection":
-        ...
+    ) -> "chromadb.Collection": ...
 
 
 class ChromaDBFactory(ABC):
