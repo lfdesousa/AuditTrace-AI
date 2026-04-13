@@ -217,7 +217,7 @@ services:
       - "19000:9000"    # S3 API (internal — not exposed via Traefik)
       - "19001:9001"    # Console (dev only)
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
