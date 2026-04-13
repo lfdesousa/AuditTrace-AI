@@ -22,6 +22,9 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs (ADR-022, DESIGN §15)" {
             tags "External"
         }
+        observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
+            tags "External"
+        }
 
         // The system
         memoryServer = softwareSystem "sovereign-memory-server" "Transparent augmentation proxy with 4-layer memory + Keycloak-delegated identity" {
@@ -76,7 +79,8 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
         memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
         memoryServer.api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
-        memoryServer.api -> langfuse "Exports traces + per-trace updates via ingestion API (ADR-024)" "HTTP/OTLP"
+        memoryServer.api -> langfuse "Exports traces via Langfuse SDK (ADR-024)" "HTTP/OTLP"
+        memoryServer.api -> observability "Exports metrics + logs via OTLP to OTel Collector (ADR-028)" "HTTP/OTLP"
 
         // Relationships — identity layer (DESIGN §15)
         memoryServer.api.chatRoute -> memoryServer.api.requireUser "depends on (Phase 5 cutover)"
@@ -180,6 +184,13 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 langfuseInstance = infrastructureNode "Langfuse Web" "Observability traces + OTLP ingest" "Langfuse v3"
             }
 
+            deploymentNode "Observability Stack" "Sibling compose — shared network (ADR-028)" "Docker Compose" {
+                otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver → Prometheus + Loki fan-out" "otel-contrib"
+                prometheusInstance = infrastructureNode "Prometheus" "Metrics storage + query (:9090)" "Prometheus"
+                lokiInstance = infrastructureNode "Loki" "Log aggregation (:3100)" "Grafana Loki"
+                grafanaInstance = infrastructureNode "Grafana" "Dashboards (:3001)" "Grafana"
+            }
+
             // Deployment relationships
             traefikInstance -> apiInstance "HTTPS → HTTP proxy"
             traefikInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
@@ -187,7 +198,12 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
             apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"
             apiInstance -> llamaInstance "Proxies augmented requests (streaming)" "HTTP/SSE"
-            apiInstance -> langfuseInstance "Exports traces + ingestion API updates" "HTTP/OTLP"
+            apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
+            apiInstance -> otelCollectorInstance "OTLP metrics + logs" "HTTP/OTLP"
+            otelCollectorInstance -> prometheusInstance "Remote write (metrics)" "HTTP"
+            otelCollectorInstance -> lokiInstance "Push (logs)" "HTTP"
+            grafanaInstance -> prometheusInstance "Query metrics" "PromQL"
+            grafanaInstance -> lokiInstance "Query logs" "LogQL"
             chromaInstance -> embedInstance "Embedding vectors" "HTTP"
         }
     }
