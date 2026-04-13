@@ -140,7 +140,7 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
     container_name: sovereign-keycloak
-    command: start-dev --import-realm
+    command: start-dev --import-realm --health-enabled=true
     depends_on:
       postgres:
         condition: service_healthy
