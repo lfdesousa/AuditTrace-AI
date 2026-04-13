@@ -46,7 +46,7 @@ jobs:
           SOVEREIGN_REDIS_PASSWORD=test-redis-password
           SOVEREIGN_MINIO_SECRET_KEY=test-minio-secret-key-32chars!!
           SOVEREIGN_MINIO_ACCESS_KEY=minioadmin
-          SOVEREIGN_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LWV4YWN0bHktMzItYnl0ZXMhIQ==
+          SOVEREIGN_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LWV4YWN0bHktMzItYnl0ZXMhISE=
           SOVEREIGN_AUTH_ENABLED=false
           SOVEREIGN_AUTH_REQUIRED=false
           SOVEREIGN_LOG_LEVEL=INFO
