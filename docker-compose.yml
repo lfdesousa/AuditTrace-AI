@@ -30,16 +30,14 @@ services:
       - SOVEREIGN_POSTGRES_URL=postgresql+psycopg2://sovereign_app:${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}@postgres:5432/sovereign_ai
       - SOVEREIGN_LLAMA_URL=http://host.docker.internal:11435/v1
       - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
-      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-}
+      # ADR-028: OTLP export → OTel Collector (metrics + logs).
+      # Traces go to Langfuse via the SDK, not OTLP.
+      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-http://otel-collector:4318/v1/traces}
+      - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
       - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}
       - SOVEREIGN_LANGFUSE_SECRET_KEY=${SOVEREIGN_LANGFUSE_SECRET_KEY:-}
       - SOVEREIGN_LANGFUSE_ENABLED=${SOVEREIGN_LANGFUSE_ENABLED:-false}
-      # Langfuse's OTLP endpoint only accepts traces, not metrics.
-      # When OTLP export is pointed at Langfuse, set this to false to
-      # silence recurring 400 Bad Request errors from the OTel metric
-      # exporter. See README §Langfuse for the full note.
-      - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LOG_LEVEL=${SOVEREIGN_LOG_LEVEL:-INFO}
       - SOVEREIGN_AUTH_ENABLED=${SOVEREIGN_AUTH_ENABLED:-false}
       # llama.cpp proxy read timeout. Default (120s) is too tight for
