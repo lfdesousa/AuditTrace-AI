@@ -46,7 +46,7 @@ jobs:
         run: ruff format --check src/ tests/
 
       - name: Tests + project-wide coverage gate
-        run: pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+        run: pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-report=html:htmlcov --cov-fail-under=90
 
       - name: Per-file coverage gate (each component >= 90%)
         # Mirrors `make test` locally: project-wide --cov-fail-under hides
@@ -54,10 +54,18 @@ jobs:
         # fails if ANY non-trivial source file is below 90%.
         run: python scripts/check-per-file-coverage.py
 
-      - name: Upload coverage
+      - name: Upload coverage XML
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: coverage-xml
           path: coverage.xml
+          retention-days: 30
+
+      - name: Upload coverage HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov/
           retention-days: 30
