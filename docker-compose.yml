@@ -15,6 +15,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      keycloak:
+        condition: service_healthy
     environment:
       - SOVEREIGN_CHROMA_URL=http://chromadb:8000
       - SOVEREIGN_CHROMA_TOKEN=${SOVEREIGN_CHROMA_TOKEN}
@@ -144,6 +146,12 @@ services:
       KC_DB_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && grep -q 200 <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     volumes:
       - ./keycloak/realm-sovereign-ai.json:/opt/keycloak/data/import/realm.json:ro
     labels:

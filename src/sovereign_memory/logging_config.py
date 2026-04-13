@@ -76,7 +76,7 @@ def setup_logging(
     root.addHandler(handler)
 
 
-def _operation_name(func: Callable, args: tuple) -> str:
+def _operation_name(func: Callable[..., Any], args: tuple[Any, ...]) -> str:
     if args and hasattr(args[0], "__class__") and not isinstance(args[0], type):
         cls = args[0].__class__.__name__
         if cls not in ("str", "int", "dict", "list", "tuple"):
@@ -201,12 +201,31 @@ def _friendly_span_name(op: str) -> str:
     return op
 
 
+def _record_span_error(span: Any, exc: Exception) -> None:
+    """Record an exception on the active span (OTel or Langfuse).
+
+    OTel spans expose ``record_exception``; Langfuse spans do not — they
+    use ``update(level="ERROR", status_message=...)`` instead. Dispatch
+    based on what the span object supports so the error surfaces in both
+    backends without one masking the other.
+    """
+    if span is None:
+        return
+    try:
+        if hasattr(span, "record_exception"):
+            span.record_exception(exc)
+        elif hasattr(span, "update"):
+            span.update(level="ERROR", status_message=f"{type(exc).__name__}: {exc}")
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def log_call(
     logger: logging.Logger | None = None,
     include_input: bool = True,
     include_output: bool = True,
     include_duration: bool = True,
-) -> Callable:
+) -> Callable[..., Any]:
     """Observability aspect: log + trace + meter every decorated call.
 
     Emits:
@@ -217,11 +236,11 @@ def log_call(
     Works for both sync and async functions.
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         log = logger or logging.getLogger(func.__module__)
         is_async = asyncio.iscoroutinefunction(func)
 
-        def _log_input(op: str, args: tuple, kwargs: dict) -> None:
+        def _log_input(op: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
             if include_input and log.isEnabledFor(logging.DEBUG):
                 log.debug(
                     f"INPUT {op}",
@@ -250,7 +269,9 @@ def log_call(
                 )
             telemetry.record_operation(op, duration, error)
 
-        def _set_span_input(span: Any, op: str, args: tuple, kwargs: dict) -> None:
+        def _set_span_input(
+            span: Any, op: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> None:
             """Attach call arguments + component label to the span.
 
             Langfuse maps ``input.value`` to the trace UI's Input panel and
@@ -323,7 +344,7 @@ def log_call(
         if is_async:
 
             @wraps(func)
-            async def async_wrapper(*args, **kwargs) -> Any:
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 op = _operation_name(func, args)
                 span_name = _friendly_span_name(op)
                 _log_input(op, args, kwargs)
@@ -350,17 +371,7 @@ def log_call(
                             exc_info=True,
                             extra={"operation": op},
                         )
-                        if span is not None:
-                            # Defensive: LangfuseSpan (from the Langfuse SDK)
-                            # does not implement OTel's ``record_exception``
-                            # method. Only OTel spans do. Guard with hasattr
-                            # + try so a telemetry-path failure never masks
-                            # the original exception as a 500 (Phase 7 bug).
-                            try:
-                                if hasattr(span, "record_exception"):
-                                    span.record_exception(e)
-                            except Exception:  # pragma: no cover - defensive
-                                pass
+                        _record_span_error(span, e)
                         raise
                     finally:
                         _record(op, time.perf_counter() - start, err)
@@ -368,7 +379,7 @@ def log_call(
             return async_wrapper
 
         @wraps(func)
-        def sync_wrapper(*args, **kwargs) -> Any:
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             op = _operation_name(func, args)
             span_name = _friendly_span_name(op)
             _log_input(op, args, kwargs)
@@ -395,12 +406,7 @@ def log_call(
                         exc_info=True,
                         extra={"operation": op},
                     )
-                    if span is not None:
-                        try:
-                            if hasattr(span, "record_exception"):
-                                span.record_exception(e)
-                        except Exception:  # pragma: no cover - defensive
-                            pass
+                    _record_span_error(span, e)
                     raise
                 finally:
                     _record(op, time.perf_counter() - start, err)

@@ -49,13 +49,37 @@ _JWKS_CACHE_TTL = 300  # 5 minutes
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+_JWKS_FETCH_RETRIES = 3
+_JWKS_FETCH_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
+
+
 @log_call(logger=logger)
 def _fetch_jwks_keys(jwks_url: str) -> list[str]:
-    """Fetch public keys from Keycloak JWKS endpoint."""
-    response = httpx.get(jwks_url, timeout=10)
-    response.raise_for_status()
-    jwks = response.json()
-    return [key for key in jwks.get("keys", [])]
+    """Fetch public keys from Keycloak JWKS endpoint.
+
+    Retries with exponential backoff to handle the startup race where the
+    memory-server is ready before Keycloak has finished initialising.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_JWKS_FETCH_RETRIES + 1):
+        try:
+            response = httpx.get(jwks_url, timeout=10)
+            response.raise_for_status()
+            jwks = response.json()
+            return [key for key in jwks.get("keys", [])]
+        except (httpx.HTTPError, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < _JWKS_FETCH_RETRIES:
+                delay = _JWKS_FETCH_BACKOFF_BASE ** (attempt + 1)
+                logger.warning(
+                    "JWKS fetch attempt %d/%d failed (%s), retrying in %.0fs",
+                    attempt + 1,
+                    _JWKS_FETCH_RETRIES + 1,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 def _get_jwks_keys(jwks_url: str) -> list[str]:
