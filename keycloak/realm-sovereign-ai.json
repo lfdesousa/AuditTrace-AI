@@ -102,7 +102,7 @@
       "optionalClientScopes": []
     },
     {
-      "description": "DESIGN §16 Phase 7 dev client — client-secret auth + service account for client_credentials grant. Secret is rotated per-deployment; dev default lives in secrets/dev_client_secret.txt. Carries an audience mapper so the emitted JWT has aud=sovereign-memory-server for JWT validation path. Used by scripts/mint-dev-jwt.sh.",
+      "description": "Dev client — client_credentials grant with audience mapper (aud=sovereign-memory-server). Secret in secrets/dev_client_secret.txt. See DESIGN §16 Phase 7.",
       "clientId": "sovereign-memory-dev",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
