@@ -32,7 +32,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API
 - 🐳 **Docker Compose** -- One command deployment: memory-server, PostgreSQL, ChromaDB, Redis, Keycloak, Traefik
-- ✅ **417 Tests** -- 95% coverage, 90% per-file gate enforced in CI
+- ✅ **Comprehensive Test Suite** -- 90% project-wide + 90% per-file coverage gates enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml))
 
 ## Quick Start
 
