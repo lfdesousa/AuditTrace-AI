@@ -44,6 +44,9 @@ jobs:
           SOVEREIGN_POSTGRES_PASSWORD=test-postgres-password
           SOVEREIGN_CHROMA_TOKEN=test-chroma-token
           SOVEREIGN_REDIS_PASSWORD=test-redis-password
+          SOVEREIGN_MINIO_SECRET_KEY=test-minio-secret-key-32chars!!
+          SOVEREIGN_MINIO_ACCESS_KEY=minioadmin
+          SOVEREIGN_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LTMyLWJ5dGVzLXBhZGRlZA==
           SOVEREIGN_AUTH_ENABLED=false
           SOVEREIGN_AUTH_REQUIRED=false
           SOVEREIGN_LOG_LEVEL=INFO
