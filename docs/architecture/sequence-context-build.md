@@ -9,10 +9,9 @@ the others. The query drives what is retrieved — "hello" returns nothing,
 sequenceDiagram
     participant Caller as Route Handler
     participant Builder as DefaultContextBuilder
-    participant Episodic as FileEpisodicService
-    participant FS_ADR as ADR-*.md files
-    participant Procedural as FileProceduralService
-    participant FS_SKILL as SKILL-*.md files
+    participant Episodic as S3EpisodicService
+    participant MinIO as MinIO (memory-shared)
+    participant Procedural as S3ProceduralService
     participant Conv as PostgresConversationalService
     participant PG as PostgreSQL 16
     participant Semantic as ChromaSemanticService
@@ -29,16 +28,16 @@ sequenceDiagram
         Note over Builder: Layer 1: Episodic
 
         Builder->>Episodic: search(query)
-        Episodic->>FS_ADR: glob("ADR-*.md")
-        FS_ADR-->>Episodic: file contents
+        Episodic->>MinIO: list_objects("episodic/ADR-*.md")
+        MinIO-->>Episodic: objects (cached in memory)
         Note over Episodic: Keyword filter:\nwords > 3 chars from query\nNo arbitrary cap
         Episodic-->>Builder: matched Documents
 
         Note over Builder: Layer 2: Procedural
 
         Builder->>Procedural: search(query)
-        Procedural->>FS_SKILL: glob("SKILL-*.md")
-        FS_SKILL-->>Procedural: file contents
+        Procedural->>MinIO: list_objects("procedural/SKILL-*.md")
+        MinIO-->>Procedural: objects (cached in memory)
         Note over Procedural: Keyword filter on\nskill name + content\nNo arbitrary cap
         Procedural-->>Builder: matched Documents
 

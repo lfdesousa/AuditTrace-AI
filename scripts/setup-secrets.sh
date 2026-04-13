@@ -28,8 +28,25 @@ else
     echo "Exists: secrets/redis_password.txt (skipped)"
 fi
 
+# MinIO S3 object storage (ADR-027)
+if [ ! -f "${SECRETS_DIR}/minio_secret_key.txt" ]; then
+    openssl rand -base64 32 | tr -d '\n' > "${SECRETS_DIR}/minio_secret_key.txt"
+    echo "Generated: secrets/minio_secret_key.txt"
+else
+    echo "Exists: secrets/minio_secret_key.txt (skipped)"
+fi
+
+if [ ! -f "${SECRETS_DIR}/minio_kms_key.txt" ]; then
+    openssl rand -hex 32 > "${SECRETS_DIR}/minio_kms_key.txt"
+    echo "Generated: secrets/minio_kms_key.txt (encryption at rest)"
+else
+    echo "Exists: secrets/minio_kms_key.txt (skipped)"
+fi
+
 echo ""
 echo "Add these to your .env file:"
 echo "  SOVEREIGN_POSTGRES_PASSWORD=$(cat "${SECRETS_DIR}/postgres_password.txt")"
 echo "  SOVEREIGN_CHROMA_TOKEN=$(cat "${SECRETS_DIR}/chroma_token.txt")"
 echo "  SOVEREIGN_REDIS_PASSWORD=$(cat "${SECRETS_DIR}/redis_password.txt")"
+echo "  SOVEREIGN_MINIO_SECRET_KEY=$(cat "${SECRETS_DIR}/minio_secret_key.txt")"
+echo "  SOVEREIGN_MINIO_KMS_KEY=$(cat "${SECRETS_DIR}/minio_kms_key.txt")"

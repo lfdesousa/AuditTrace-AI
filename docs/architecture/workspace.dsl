@@ -39,8 +39,8 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
 
                 // Memory layers (inject mode + shared by tools mode handlers)
                 contextBuilder = component "ContextBuilderService" "Aggregates all 4 memory layers (inject mode). In tools mode: build_ambient_context with intent-based selection rules guiding the LLM to pick ONE tool per question (ADR-025 Accepted)" "ABC + DefaultContextBuilder"
-                episodicSvc = component "EpisodicService" "Layer 1 — ADR markdown loading" "ABC + FileEpisodicService"
-                proceduralSvc = component "ProceduralService" "Layer 2 — SKILL file loading" "ABC + FileProceduralService"
+                episodicSvc = component "EpisodicService" "Layer 1 — ADR markdown loading from MinIO (ADR-027)" "ABC + S3EpisodicService (File fallback for tests)"
+                proceduralSvc = component "ProceduralService" "Layer 2 — SKILL file loading from MinIO (ADR-027)" "ABC + S3ProceduralService (File fallback for tests)"
                 conversationalSvc = component "ConversationalService" "Layer 3 — PostgreSQL sessions (ADR-020)" "ABC + PostgresConversationalService"
                 semanticSvc = component "SemanticService" "Layer 4 — ChromaDB vector search" "ABC + ChromaSemanticService"
 
@@ -65,10 +65,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             redisCache = container "Redis 7" "Shared cache — sovereign:token:* for TokenCache (DESIGN §15.4) and sovereign:tool-result:* for ToolResultCache (ADR-025 §Decision.8). Disjoint key prefixes." "Redis" {
                 tags "Database"
             }
-            adrFiles = container "ADR Files" "Architecture Decision Records (ADR-*.md)" "Filesystem" {
-                tags "Database"
-            }
-            skillFiles = container "SKILL Files" "Procedural skill documents (SKILL-*.md)" "Filesystem" {
+            minioStore = container "MinIO" "S3-compatible object storage — memory-shared (ADRs, skills) + memory-private (per-user knowledge). SSE-S3 encryption at rest (ADR-027)" "MinIO" {
                 tags "Database"
             }
         }
@@ -76,8 +73,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         // Relationships — system level
         agent -> keycloak "OAuth2 device flow → JWT" "HTTPS/OIDC"
         agent -> memoryServer.api "POST /v1/chat/completions (Bearer JWT)" "HTTPS/JSON"
-        architect -> memoryServer.adrFiles "Writes ADRs"
-        architect -> memoryServer.skillFiles "Writes SKILL files"
+        architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
         memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
         memoryServer.api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
         memoryServer.api -> langfuse "Exports traces + per-trace updates via ingestion API (ADR-024)" "HTTP/OTLP"
@@ -122,8 +118,8 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         memoryServer.api.contextBuilder -> memoryServer.api.conversationalSvc "as_context(user_context, project)"
         memoryServer.api.contextBuilder -> memoryServer.api.semanticSvc "search(user_context, query, k)"
 
-        memoryServer.api.episodicSvc -> memoryServer.adrFiles "Reads ADR-*.md" "pathlib"
-        memoryServer.api.proceduralSvc -> memoryServer.skillFiles "Reads SKILL-*.md" "pathlib"
+        memoryServer.api.episodicSvc -> memoryServer.minioStore "Lists + downloads ADR-*.md from memory-shared/episodic/" "S3 API"
+        memoryServer.api.proceduralSvc -> memoryServer.minioStore "Lists + downloads SKILL-*.md from memory-shared/procedural/" "S3 API"
         memoryServer.api.conversationalSvc -> memoryServer.postgresDb "SELECT/INSERT sessions" "SQLAlchemy ORM"
         memoryServer.api.semanticSvc -> memoryServer.chromaDb "query()" "HTTP + Bearer token"
         memoryServer.chromaDb -> embedServer "Embedding vectors" "HTTP/OpenAI-compat"
@@ -166,6 +162,10 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                     chromaInstance = containerInstance memoryServer.chromaDb
                 }
 
+                deploymentNode "minio" "S3 object storage — SSE-S3 encryption at rest, per-user isolation via path prefix (ADR-027)" "MinIO" {
+                    minioInstance = containerInstance memoryServer.minioStore
+                }
+
                 deploymentNode "keycloak" "Identity provider — owns users/roles/JWT issuance" "Keycloak 24" {
                     keycloakInstance = infrastructureNode "Keycloak" "Realm: sovereign-ai, OIDC + private_key_jwt" "Keycloak 24"
                 }
@@ -185,6 +185,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             traefikInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
             apiInstance -> keycloakInstance "JWKS fetch (cached)" "HTTP/JSON"
             apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
+            apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"
             apiInstance -> llamaInstance "Proxies augmented requests (streaming)" "HTTP/SSE"
             apiInstance -> langfuseInstance "Exports traces + ingestion API updates" "HTTP/OTLP"
             chromaInstance -> embedInstance "Embedding vectors" "HTTP"

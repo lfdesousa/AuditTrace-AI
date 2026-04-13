@@ -1,5 +1,5 @@
 # sovereign-ai-stack — Docker Compose
-# Phase 1-2: memory-server + PostgreSQL + ChromaDB + Traefik + Keycloak
+# Phase 1-2: memory-server + PostgreSQL + ChromaDB + MinIO + Traefik + Keycloak
 # Langfuse runs as a sibling stack (ADR-021.2)
 
 services:
@@ -16,6 +16,8 @@ services:
       redis:
         condition: service_healthy
       keycloak:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     environment:
       - SOVEREIGN_CHROMA_URL=http://chromadb:8000
@@ -66,9 +68,12 @@ services:
       - SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS=${SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS:-5}
       - SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS=${SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS:-900}
       - SOVEREIGN_TOOLS_CONFIG_PATH=${SOVEREIGN_TOOLS_CONFIG_PATH:-tools.toml}
-    volumes:
-      - ./memory/episodic:/app/memory/episodic:ro
-      - ./memory/procedural:/app/memory/procedural:ro
+      # MinIO S3 object storage (ADR-027) — replaces filesystem bind mounts
+      - SOVEREIGN_MINIO_URL=http://minio:9000
+      - SOVEREIGN_MINIO_ACCESS_KEY=${SOVEREIGN_MINIO_ACCESS_KEY:-minioadmin}
+      - SOVEREIGN_MINIO_SECRET_KEY=${SOVEREIGN_MINIO_SECRET_KEY}
+      - SOVEREIGN_MINIO_SHARED_BUCKET=${SOVEREIGN_MINIO_SHARED_BUCKET:-memory-shared}
+      - SOVEREIGN_MINIO_PRIVATE_BUCKET=${SOVEREIGN_MINIO_PRIVATE_BUCKET:-memory-private}
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=sovereign-ai-net"
@@ -196,6 +201,33 @@ services:
       - sovereign-ai-net
     restart: unless-stopped
 
+  minio:
+    # ADR-027 — S3-compatible object storage for memory layers 1+2.
+    # Replaces host filesystem bind mounts (12-factor VI: stateless processes).
+    # Encryption at rest via SSE-S3 (MINIO_KMS_SECRET_KEY).
+    image: minio/minio:latest
+    container_name: sovereign-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${SOVEREIGN_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${SOVEREIGN_MINIO_SECRET_KEY}
+      # Encryption at rest — SSE-S3 with auto-managed keys (ADR-027 §3)
+      MINIO_KMS_SECRET_KEY: "sovereign-key:${SOVEREIGN_MINIO_KMS_KEY}"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "19000:9000"    # S3 API (internal — not exposed via Traefik)
+      - "19001:9001"    # Console (dev only)
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - sovereign-ai-net
+    restart: unless-stopped
+
   traefik:
     image: traefik:v3.6
     container_name: sovereign-traefik
@@ -217,6 +249,7 @@ volumes:
   postgres_data:
   chroma_data:
   sovereign_redis_data:
+  minio_data:
 
 networks:
   sovereign-ai-net:
