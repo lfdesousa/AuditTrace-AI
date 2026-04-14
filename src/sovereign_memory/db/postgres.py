@@ -46,6 +46,19 @@ class URLPostgresFactory(PostgresFactory):
                 pool_size=self._pool_size,
                 pool_pre_ping=True,
             )
+            # Per-engine SQLAlchemy instrumentation gives statement-level
+            # spans (SELECT/INSERT/UPDATE with db.statement). The global
+            # SQLAlchemyInstrumentor().instrument() in server.lifespan
+            # only catches connect events — engine=... is the supported
+            # hook for query events. Safe to call once per engine.
+            try:
+                from opentelemetry.instrumentation.sqlalchemy import (
+                    SQLAlchemyInstrumentor,
+                )
+
+                SQLAlchemyInstrumentor().instrument(engine=self._engine)
+            except Exception as exc:  # pragma: no cover - optional dep
+                logger.warning("SQLAlchemy engine instrumentation failed: %s", exc)
         return self._engine
 
     @log_call(logger=logger)

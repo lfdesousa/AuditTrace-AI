@@ -33,20 +33,20 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # that Langfuse just installed as global — not the earlier
     # ProxyTracerProvider. Spans then fan out to both Tempo (via our
     # OTLP processor attached in init_telemetry) and Langfuse.
+    # SQLAlchemy is instrumented per-engine in db/postgres.py so query
+    # spans (SELECT/INSERT) are emitted. Global SQLAlchemyInstrumentor()
+    # was tried here and produced connect-only spans — engine-scoped is
+    # the supported hook for before/after_cursor_execute events.
     if settings.tracing_enabled:
         try:
             from opentelemetry import trace
             from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
             from opentelemetry.instrumentation.redis import RedisInstrumentor
-            from opentelemetry.instrumentation.sqlalchemy import (
-                SQLAlchemyInstrumentor,
-            )
 
             tp = trace.get_tracer_provider()
             HTTPXClientInstrumentor().instrument(tracer_provider=tp)
-            SQLAlchemyInstrumentor().instrument(tracer_provider=tp)
             RedisInstrumentor().instrument(tracer_provider=tp)
-            logger.info("OTel outbound instrumentation: HTTPX + SQLAlchemy + Redis")
+            logger.info("OTel outbound instrumentation: HTTPX + Redis")
         except Exception as e:  # pragma: no cover
             logger.warning("Outbound OTel instrumentation failed: %s", e)
 
