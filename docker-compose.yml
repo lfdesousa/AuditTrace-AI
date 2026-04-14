@@ -30,9 +30,16 @@ services:
       - SOVEREIGN_POSTGRES_URL=postgresql+psycopg2://sovereign_app:${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}@postgres:5432/sovereign_ai
       - SOVEREIGN_LLAMA_URL=http://host.docker.internal:11435/v1
       - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
-      # ADR-028: OTLP export → OTel Collector (metrics + logs).
-      # Traces go to Langfuse via the SDK, not OTLP.
+      # ADR-028: OTLP export → OTel Collector. Traces fan out to Tempo
+      # (call chain) AND Langfuse (LLM-specific) via dual processors on
+      # the Langfuse TracerProvider. See telemetry.py init_telemetry.
       - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-http://otel-collector:4318}
+      # OTel SDK resource attributes — read by the default
+      # OTELResourceDetector, which runs regardless of which provider
+      # (ours or Langfuse's) ends up installed as global. Gets us a
+      # correct ``service.name`` on every trace's Resource.
+      - OTEL_SERVICE_NAME=sovereign-memory-server
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sovereign-ai,service.version=0.2.0,deployment.environment=${SOVEREIGN_ENV:-local}
       - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
       - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}
