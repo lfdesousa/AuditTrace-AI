@@ -39,7 +39,7 @@ services:
       # (ours or Langfuse's) ends up installed as global. Gets us a
       # correct ``service.name`` on every trace's Resource.
       - OTEL_SERVICE_NAME=sovereign-memory-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sovereign-ai,service.version=0.3.0,deployment.environment=${SOVEREIGN_ENV:-local}
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sovereign-ai,service.version=0.3.1,deployment.environment=${SOVEREIGN_ENV:-local}
       - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
       - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}

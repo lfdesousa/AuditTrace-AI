@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # evaluation. Idempotent and a no-op on SQLite (tests).
     install_rls_listener()
 
-    logger.info("Starting sovereign-memory-server v0.3.0")
+    logger.info("Starting sovereign-memory-server v0.3.1")
     logger.info("LLM URL: %s", settings.llama_url)
     logger.info("ChromaDB URL: %s", settings.chroma_url)
     logger.info("Auth enabled: %s", settings.auth_enabled)
@@ -83,7 +83,7 @@ def create_app() -> FastAPI:
             "Production-grade sovereign AI memory server with 4-tier memory "
             "and OAuth2 authentication"
         ),
-        version="0.3.0",
+        version="0.3.1",
         lifespan=lifespan,
     )
 

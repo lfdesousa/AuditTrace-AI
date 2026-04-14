@@ -22,7 +22,7 @@ async def health_check() -> HealthResponse:
     settings = get_settings()
     return HealthResponse(
         status="ok",
-        version="0.3.0",
+        version="0.3.1",
         components={
             "server": "running",
             "llama_url": settings.llama_url,
