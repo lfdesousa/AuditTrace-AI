@@ -137,7 +137,7 @@ class HealthResponse(BaseModel):
     """Schema for /health endpoint."""
 
     status: str = "ok"
-    version: str = "0.2.0"
+    version: str = "0.3.0"
     components: dict[str, str] = Field(default_factory=dict)
 
 
