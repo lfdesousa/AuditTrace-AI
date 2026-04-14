@@ -52,6 +52,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.48b0",
     "opentelemetry-instrumentation-logging>=0.48b0",
     "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-instrumentation-urllib3>=0.48b0",
     "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
     "opentelemetry-instrumentation-redis>=0.48b0",
 ]

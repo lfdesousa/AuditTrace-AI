@@ -39,14 +39,44 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # the supported hook for before/after_cursor_execute events.
     if settings.tracing_enabled:
         try:
+            from typing import Any
+            from urllib.parse import urlparse
+
             from opentelemetry import trace
             from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
             from opentelemetry.instrumentation.redis import RedisInstrumentor
+            from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
+            from opentelemetry.trace import Span
 
             tp = trace.get_tracer_provider()
             HTTPXClientInstrumentor().instrument(tracer_provider=tp)
+
+            # urllib3 0.62b0 emits http.url / url.full but does NOT set
+            # server.address or net.peer.name on client spans (upstream
+            # gap in the stability layer). Without one of those, Tempo's
+            # service-graph processor can't materialise a peer node for
+            # MinIO traffic (which uses urllib3 via the minio SDK). This
+            # hook back-fills server.address/port from the request URL.
+            def _urllib3_set_server_address(
+                span: Span, _instance: Any, request_info: Any
+            ) -> None:
+                if span is None or not span.is_recording():
+                    return
+                try:
+                    parsed = urlparse(request_info.url)
+                    if parsed.hostname:
+                        span.set_attribute("server.address", parsed.hostname)
+                    if parsed.port:
+                        span.set_attribute("server.port", parsed.port)
+                except Exception:  # pragma: no cover - hook must never raise
+                    pass
+
+            URLLib3Instrumentor().instrument(
+                tracer_provider=tp,
+                request_hook=_urllib3_set_server_address,
+            )
             RedisInstrumentor().instrument(tracer_provider=tp)
-            logger.info("OTel outbound instrumentation: HTTPX + Redis")
+            logger.info("OTel outbound instrumentation: HTTPX + urllib3 + Redis")
         except Exception as e:  # pragma: no cover
             logger.warning("Outbound OTel instrumentation failed: %s", e)
 
