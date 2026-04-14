@@ -409,6 +409,11 @@ the filter match count *for the caller*.
 - [Agent Configuration (OpenCode, Continue, Roo Code)](docs/agent-configuration.md)
 - Dev JWT minting: `scripts/mint-dev-jwt.sh`
 - App role init: `scripts/init-sovereign-app-role.sh` (creates the non-superuser Postgres role for RLS)
+- Project tagging: `scripts/configure-project.py <name>` (ADR-029)
+
+### Evaluation Reports
+
+- [Memory Access Modes — 2026-04-14 smoke](docs/eval-memory-modes-20260414.md) — inject vs tools baseline; tools wins on latency, reliability, and tool-selection accuracy. Follow-ups: LangGraph-style exit conditions + ADR-030 before re-measuring at full N=100.
 
 ## Legal Disclaimer & Copyright
 
