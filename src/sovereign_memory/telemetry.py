@@ -51,12 +51,32 @@ def _init_langfuse_client() -> None:
         return
     try:
         from langfuse import Langfuse
+        from langfuse.span_filter import is_default_export_span
+
+        def _should_export_span(span: Any) -> bool:
+            """Extend Langfuse's default export filter.
+
+            Default behaviour accepts spans from the ``langfuse-sdk``
+            tracer, anything carrying ``gen_ai.*`` attributes, and known
+            LLM-instrumentor scopes. We additionally accept the
+            FastAPI server-root span for ``/v1/chat/completions`` — it
+            covers the full request wall time (including the tool-loop
+            httpx iterations to llama-server that otherwise leave no
+            langfuse-sdk breadcrumb). Without this, Langfuse's
+            ``latency`` field under-reports by the duration of the
+            final tool-loop iteration.
+            """
+            if is_default_export_span(span):
+                return True
+            attrs = span.attributes or {}
+            return attrs.get("http.route") == "/v1/chat/completions"
 
         _langfuse_client = Langfuse(
             public_key=public_key,
             secret_key=secret_key,
             host=host,
             tracing_enabled=True,
+            should_export_span=_should_export_span,
         )
         logger.info("Langfuse SDK initialised — host=%s", host)
     except Exception as exc:  # pragma: no cover - optional dep path
@@ -189,7 +209,22 @@ def init_telemetry(
             tracer_provider.add_span_processor(otlp_processor)
             trace.set_tracer_provider(tracer_provider)
             logger.info("App TracerProvider installed (Tempo-only path)")
-        _tracer = trace.get_tracer(service_name)
+
+        # When Langfuse is enabled, tag our tracer with the scope name
+        # "langfuse-sdk" and a public_key attribute so LangfuseSpanProcessor's
+        # default filter (``is_default_export_span`` → ``is_langfuse_span``)
+        # accepts every span we emit. Without this, Langfuse would drop
+        # @log_call spans silently (they carry no ``gen_ai.*`` attrs and
+        # wouldn't match any known-LLM-instrumentor prefix). Tempo is
+        # unaffected — scope name doesn't change its trace grouping.
+        if _langfuse_client is not None:
+            public_key = os.environ.get("SOVEREIGN_LANGFUSE_PUBLIC_KEY", "")
+            _tracer = trace.get_tracer_provider().get_tracer(
+                "langfuse-sdk",
+                attributes={"public_key": public_key} if public_key else None,
+            )
+        else:
+            _tracer = trace.get_tracer(service_name)
 
     _initialized = True
     logger.info(
