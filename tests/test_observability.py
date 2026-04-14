@@ -65,16 +65,28 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
     import sys
 
     monkeypatch.setitem(sys.modules, "langfuse", MagicMock(Langfuse=fake_lf_class))
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse.span_filter",
+        MagicMock(is_default_export_span=lambda span: False),
+    )
 
     try:
         telemetry._init_langfuse_client()
         assert telemetry._langfuse_client is fake_instance
-        fake_lf_class.assert_called_once_with(
-            public_key="pk-test",
-            secret_key="sk-test",
-            host="http://lf.test",
-            tracing_enabled=True,
-        )
+        assert fake_lf_class.call_count == 1
+        call_kwargs = fake_lf_class.call_args.kwargs
+        assert call_kwargs["public_key"] == "pk-test"
+        assert call_kwargs["secret_key"] == "sk-test"
+        assert call_kwargs["host"] == "http://lf.test"
+        assert call_kwargs["tracing_enabled"] is True
+        # should_export_span is our custom filter — accepts the FastAPI
+        # /v1/chat/completions root span on top of Langfuse's defaults.
+        filter_fn = call_kwargs["should_export_span"]
+        chat_root = MagicMock(attributes={"http.route": "/v1/chat/completions"})
+        other_span = MagicMock(attributes={"http.route": "/health"})
+        assert filter_fn(chat_root) is True
+        assert filter_fn(other_span) is False
         # Second call must early-return (idempotent guard at line 41-42)
         telemetry._init_langfuse_client()
         assert fake_lf_class.call_count == 1
