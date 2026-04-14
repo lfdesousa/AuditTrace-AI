@@ -2,6 +2,8 @@
 
 from contextlib import asynccontextmanager
 from logging import getLogger
+from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 
@@ -13,6 +15,34 @@ from sovereign_memory.logging_config import setup_logging
 from sovereign_memory.routes import audit, chat, context, health, session
 
 logger = getLogger(__name__)
+
+
+def urllib3_set_server_address(span: Any, _instance: Any, request_info: Any) -> None:
+    """Back-fill ``server.address`` + ``server.port`` from the request URL.
+
+    The opentelemetry-instrumentation-urllib3 package at 0.62b0 emits
+    ``http.url`` / ``url.full`` on client spans but does NOT set
+    ``server.address`` or ``net.peer.name`` in either HTTP semconv
+    opt-in mode. Without one of those, Tempo's service-graph processor
+    cannot materialise a peer node for MinIO traffic (the ``minio``
+    Python SDK uses urllib3 directly).
+
+    Wired as the ``request_hook`` callback on
+    ``URLLib3Instrumentor().instrument(...)`` during lifespan setup.
+    Must never raise — logging a failure would be noise on every
+    outbound request and OTel swallows exceptions here anyway. See
+    ADR-029 for the full rationale.
+    """
+    if span is None or not span.is_recording():
+        return
+    try:
+        parsed = urlparse(request_info.url)
+        if parsed.hostname:
+            span.set_attribute("server.address", parsed.hostname)
+        if parsed.port:
+            span.set_attribute("server.port", parsed.port)
+    except Exception:  # pragma: no cover - hook must never raise
+        pass
 
 
 @asynccontextmanager
@@ -37,47 +67,22 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # spans (SELECT/INSERT) are emitted. Global SQLAlchemyInstrumentor()
     # was tried here and produced connect-only spans — engine-scoped is
     # the supported hook for before/after_cursor_execute events.
-    if settings.tracing_enabled:
+    if settings.tracing_enabled:  # pragma: no cover - smoke-tested live, not in pytest
         try:
-            from typing import Any
-            from urllib.parse import urlparse
-
             from opentelemetry import trace
             from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
             from opentelemetry.instrumentation.redis import RedisInstrumentor
             from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
-            from opentelemetry.trace import Span
 
             tp = trace.get_tracer_provider()
             HTTPXClientInstrumentor().instrument(tracer_provider=tp)
-
-            # urllib3 0.62b0 emits http.url / url.full but does NOT set
-            # server.address or net.peer.name on client spans (upstream
-            # gap in the stability layer). Without one of those, Tempo's
-            # service-graph processor can't materialise a peer node for
-            # MinIO traffic (which uses urllib3 via the minio SDK). This
-            # hook back-fills server.address/port from the request URL.
-            def _urllib3_set_server_address(
-                span: Span, _instance: Any, request_info: Any
-            ) -> None:
-                if span is None or not span.is_recording():
-                    return
-                try:
-                    parsed = urlparse(request_info.url)
-                    if parsed.hostname:
-                        span.set_attribute("server.address", parsed.hostname)
-                    if parsed.port:
-                        span.set_attribute("server.port", parsed.port)
-                except Exception:  # pragma: no cover - hook must never raise
-                    pass
-
             URLLib3Instrumentor().instrument(
                 tracer_provider=tp,
-                request_hook=_urllib3_set_server_address,
+                request_hook=urllib3_set_server_address,
             )
             RedisInstrumentor().instrument(tracer_provider=tp)
             logger.info("OTel outbound instrumentation: HTTPX + urllib3 + Redis")
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             logger.warning("Outbound OTel instrumentation failed: %s", e)
 
     # Register DI container with all services (ADR-020)
@@ -141,8 +146,8 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-def main() -> None:
-    """Entry point for CLI execution."""
+def main() -> None:  # pragma: no cover
+    """Entry point for CLI execution (exercised via the docker entrypoint)."""
     import uvicorn
 
     settings = get_settings()
@@ -156,5 +161,5 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
