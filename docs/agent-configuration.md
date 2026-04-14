@@ -67,7 +67,10 @@ once per workday.
       "name": "audittrace-ai",
       "options": {
         "baseURL": "https://localhost/v1",
-        "apiKey": "<paste the JWT from sovereign-jwt.txt here>"
+        "apiKey": "<paste the JWT from sovereign-jwt.txt here>",
+        "headers": {
+          "X-Project": "default"
+        }
       },
       "models": {
         "qwen3.5": {
@@ -80,6 +83,41 @@ once per workday.
   "instructions": ["~/.config/opencode/AGENTS.md"]
 }
 ```
+
+### Step 3 — tag each OpenCode session with a project (ADR-029)
+
+Without an `X-Project` header every interaction lands with
+`project="default"` — `recall_recent_sessions` then has no way to scope
+cross-session memory to the project you're actually working on. The
+memory-server reads the header on every `/v1/chat/completions`, falls
+back to `body.metadata.project`, then `body.project`, then
+`"default"`.
+
+One helper script ships with the server to set the tag without editing
+JSON by hand:
+
+```bash
+# Before starting a new project session
+scripts/configure-project.py AuditTrace-AI
+
+# Preview without writing
+scripts/configure-project.py SMC --dry-run
+
+# Inspect the current value per provider
+scripts/configure-project.py --show
+
+# Set the tag AND launch opencode in one go
+scripts/configure-project.py SMC --launch
+```
+
+The script walks every `provider.*.options` block in
+`~/.config/opencode/config.json` and sets
+`headers["X-Project"] = <name>`. A timestamped backup is written
+alongside the config; the new file replaces the old atomically
+(`os.replace`), so a partial write cannot leave the config broken.
+
+Restart OpenCode after running the script — it reads config at launch,
+so a session that is already open is still using the old header.
 
 A single-line refresh wrapper (optional, nicer DX) — save as
 `~/.config/opencode/refresh-jwt.sh`:

@@ -133,12 +133,135 @@ def test_chat_endpoint_with_context_query(client):
     assert response.status_code == 200
 
 
-def test_list_interactions(client):
+def test_list_interactions_empty(client):
     r = client.get("/interactions?project=p&limit=5&offset=0")
     assert r.status_code == 200
     body = r.json()
     assert body["interactions"] == []
     assert body["limit"] == 5
+    assert body["offset"] == 0
+    assert body["total"] == 0
+
+
+def _seed_interaction(
+    *,
+    project: str,
+    question: str = "q",
+    answer: str = "a",
+    session_id: str = "sess-1",
+    source: str = "curl",
+    user_id: str = "user-1",
+    timestamp: str = "2026-04-14T12:00:00",
+) -> int:
+    """Insert one interaction row through the real DB factory."""
+    from sovereign_memory.db.models import InteractionRecord as Row
+    from sovereign_memory.dependencies import get_postgres_factory
+
+    pg = get_postgres_factory()
+    with pg.get_session_factory()() as db:
+        r = Row(
+            project=project,
+            question=question,
+            answer=answer,
+            session_id=session_id,
+            source=source,
+            user_id=user_id,
+            timestamp=timestamp,
+        )
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        return int(r.id)
+
+
+def test_list_interactions_returns_seeded_rows(client):
+    """Seeded rows come back in DESC id order with correct shape."""
+    _seed_interaction(project="alpha", question="q1")
+    _seed_interaction(project="alpha", question="q2")
+    _seed_interaction(project="beta", question="q3")
+
+    r = client.get("/interactions?project=alpha&limit=10")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+    assert len(body["interactions"]) == 2
+    # DESC by id — newest first.
+    assert body["interactions"][0]["question"] == "q2"
+    assert body["interactions"][1]["question"] == "q1"
+    # Shape check: every documented field round-trips.
+    row = body["interactions"][0]
+    for key in (
+        "id",
+        "project",
+        "source",
+        "question",
+        "answer",
+        "prompt_tokens",
+        "completion_tokens",
+        "timestamp",
+        "session_id",
+        "model",
+        "user_id",
+    ):
+        assert key in row
+
+
+def test_list_interactions_filters_by_session_source_user(client):
+    """All four filter params narrow the result set independently."""
+    _seed_interaction(
+        project="multi", session_id="s-A", source="opencode", user_id="u-A"
+    )
+    _seed_interaction(
+        project="multi", session_id="s-B", source="opencode", user_id="u-B"
+    )
+    _seed_interaction(project="multi", session_id="s-A", source="curl", user_id="u-A")
+
+    r = client.get("/interactions?project=multi&session_id=s-A")
+    assert r.json()["total"] == 2
+
+    r = client.get("/interactions?project=multi&source=curl")
+    assert r.json()["total"] == 1
+
+    r = client.get("/interactions?project=multi&user_id=u-B")
+    assert r.json()["total"] == 1
+
+
+def test_list_interactions_filter_since(client):
+    """since= is an inclusive lower bound on timestamp."""
+    _seed_interaction(project="t", timestamp="2026-04-13T00:00:00")
+    _seed_interaction(project="t", timestamp="2026-04-14T00:00:00")
+    _seed_interaction(project="t", timestamp="2026-04-15T00:00:00")
+
+    r = client.get("/interactions?project=t&since=2026-04-14T00:00:00")
+    body = r.json()
+    assert body["total"] == 2
+
+
+def test_list_interactions_pagination(client):
+    """limit + offset slice the ordered result set."""
+    for i in range(5):
+        _seed_interaction(project="page", question=f"q{i}")
+
+    r = client.get("/interactions?project=page&limit=2&offset=0")
+    body = r.json()
+    assert body["total"] == 5
+    assert len(body["interactions"]) == 2
+
+    r = client.get("/interactions?project=page&limit=2&offset=4")
+    body = r.json()
+    assert body["total"] == 5
+    assert len(body["interactions"]) == 1
+
+
+def test_list_interactions_rejects_limit_over_max(client):
+    """limit > 1000 is a 422 (FastAPI query-param validation)."""
+    r = client.get("/interactions?limit=10000")
+    assert r.status_code == 422
+
+
+def test_list_interactions_rejects_negative_offset(client):
+    r = client.get("/interactions?offset=-1")
+    assert r.status_code == 422
 
 
 def test_create_interaction(client):

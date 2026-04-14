@@ -125,7 +125,7 @@ uvicorn sovereign_memory.server:app --reload
 |---|---|---|
 | `/v1/chat/completions` | POST | OpenAI-compatible chat with memory augmentation |
 | `/context` | POST | 4-layer memory retrieval |
-| `/interactions` | GET/POST | Audit trail queries |
+| `/interactions` | GET | Human-facing audit browser — filters `project`, `user_id`, `session_id`, `source`, `since`; pagination via `limit` (≤1000) + `offset`. RLS scopes every caller to their own rows. See [Auditing conversations](#auditing-conversations-interactions). |
 | `/session/save` | POST | Persist session data |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Monitoring metrics |
@@ -227,10 +227,12 @@ All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQ
 | ✅ Done | **MinIO Object Storage** | Stateless 12-factor containers — host filesystem mounts replaced with MinIO S3 (ADR-027). Two-tier buckets: `memory-shared` (ADRs, skills) + `memory-private` (per-user, JWT sub prefix). SSE-S3 encryption at rest. |
 | ✅ Done | **Observability Aggregation Stack** | Prometheus + Grafana + Loki + OTel Collector as sibling compose stack (ADR-028). Scrapes Traefik, llama-server, MinIO. Promtail for container log aggregation. Pre-provisioned Grafana dashboard. |
 | ✅ Done | **mypy --strict Clean** | 0 errors across 41 source files. Pre-commit pipeline passes without SKIP=mypy. types-redis stubs installed. |
+| ✅ Done | **Audit Trail Completeness** | Project tagging via X-Project header (ADR-029) + urllib3 instrumentation + Tempo service-graph clean host-name edges. `/interactions` endpoint live with RLS-scoped pagination. |
+| 🔴 Next | **Session Summarizer** | Hybrid `recall_recent_sessions` (sessions table first, interactions fallback) + background summarizer loop writing `SessionRecord` rows. ADR-030. |
 | 🔴 Next | **Full Package Rename** | Rename Python package from `sovereign_memory` to `audittrace`, env prefix from `SOVEREIGN_` to `AUDITTRACE_`, all container/service/network names. Dedicated PR. |
 | 🟡 Planned | **OAuth2 Device Flow** | Human authentication beyond the current `client_credentials` dev client. Dedicated Keycloak public client for OpenCode. |
-| 🟡 Planned | **Tool Routing Measurement** | Quantitative comparison of inject vs tools mode: latency, token efficiency, context utilisation. Requires observability dashboards (now available). |
-| 🔵 Future | **Async Persistence** | Non-blocking audit row writes for `_persist_interaction` and `_flush_pending_tool_calls`. |
+| 🟡 Planned | **Tool Routing Measurement** | Quantitative comparison of inject vs tools mode: latency, token efficiency, context utilisation. `scripts/eval-memory-modes.py` harness ready; baseline run pending. |
+| 🔵 Future | **Async Persistence** | Non-blocking audit row writes for `_persist_interaction` and `_flush_pending_tool_calls`. Prerequisite satisfied by ADR-029 (payload now carries project tag). |
 | 🔵 Future | **Kubernetes** | K3s + Istio mTLS + SPIFFE/SVID identity. |
 
 ## Observability Stack (ADR-028)
@@ -288,6 +290,37 @@ python scripts/index-chromadb.py --dry-run --user-id <sub>
 | `skills` | `~/work/claude-config/skills/` | Domain knowledge skill files |
 | `ai_research` | `~/work/ai-knowledge/` | Research papers (PDF + text) |
 | `scm_coursework` | `~/work/scm-knowledge/` | MIT SCM coursework (transcripts, notes, slides) |
+
+## Auditing conversations (`/interactions`)
+
+The `/interactions` endpoint is the **human-facing** view over the audit trail — distinct from the **model-facing** `recall_*` tools. The LLM never calls it; it's what you (or a dashboard) curl when you want to browse or filter history.
+
+```bash
+# Every row the caller is allowed to see, newest first
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://localhost/interactions?limit=20"
+
+# Scoped to one project
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://localhost/interactions?project=AuditTrace-AI&limit=50"
+
+# Everything in one session
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://localhost/interactions?session_id=opencode-2026-04-14-d1c6f4a0f67f4f67"
+
+# Rolling window since a point in time
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://localhost/interactions?since=2026-04-14T00:00:00&limit=100"
+```
+
+Filters: `project`, `user_id`, `session_id`, `source`, `since` (ISO-8601).
+Pagination: `limit` (1-1000, default 100) + `offset`.
+Response: `{interactions: [...], total, limit, offset}` — `total` reflects
+the filter match count *for the caller*.
+
+**Per-user isolation is automatic.** Postgres RLS sets `app.current_user_id` from the caller's Keycloak `sub` on every transaction (ADR-026). You cannot accidentally see another user's rows, even with a forged `user_id` query parameter — the RLS policy intersects `WHERE user_id = current_setting(...)`. Scope required on the token: `sovereign-ai:audit`.
+
+**Project tagging contract** (ADR-029). Every interaction carries a `project` tag resolved on entry: `X-Project` header → `body.metadata.project` → `body.project` → `"default"`. Configure the header per-project once via `scripts/configure-project.py <name>`.
 
 ## Configuration
 
