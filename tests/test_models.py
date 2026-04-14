@@ -265,11 +265,11 @@ def test_health_response_model():
     """Test HealthResponse model."""
     response = HealthResponse(
         status="ok",
-        version="0.2.0",
+        version="0.3.0",
         components={"server": "running"},
     )
     assert response.status == "ok"
-    assert response.version == "0.2.0"
+    assert response.version == "0.3.0"
 
 
 def test_metrics_response_model():
