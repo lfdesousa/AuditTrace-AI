@@ -37,19 +37,28 @@ OTel Collector (:4318)
 Promtail ───── Docker socket ───────────┘  (container stdout/stderr)
 
 Grafana (:3001)
-   ├──▶ Prometheus (metrics queries)
-   └──▶ Loki (log queries)
+   ├──▶ Prometheus (metrics queries + service graph)
+   ├──▶ Loki (log queries, trace-ID derived-field → Tempo)
+   └──▶ Tempo (trace queries, service map + node graph)      ← added 2026-04-14
 
-memory-server ──▶ Langfuse (:3000)  ← traces via SDK (unchanged, ADR-021.2)
+memory-server ──▶ Langfuse (:3000)  ← LLM traces via LangfuseSpanProcessor
+                                       attached to the same TracerProvider
+                                       (see ADR-014.4 amendment 2026-04-14)
 ```
 
 The OTel Collector decouples the memory-server's export format (OTLP) from the
-storage backends. Adding a new exporter (e.g. Tempo for traces) is a collector
-config change, not an application change.
+storage backends. New exporters are collector config changes, not application
+changes.
 
-**Langfuse retains exclusive ownership of LLM traces.** The Langfuse SDK path
-(`telemetry.py:_init_langfuse_client`) is unchanged — traces flow directly from
-the memory-server to Langfuse. The OTel Collector handles metrics and logs only.
+**Traces now fan out to both Tempo and Langfuse** — Tempo captures the full
+cross-service call chain (HTTP → auth → DB → llama-server → ChromaDB → MinIO),
+Langfuse continues to surface LLM-specific observations with its own
+first-class Input/Output panels. Both signals flow through the Langfuse-installed
+global ``TracerProvider`` via dual SpanProcessors — see ADR-014.4 §Amendment 2026-04-14.
+
+**Collector self-telemetry** is exposed on ``:8888/metrics`` via the 0.149
+``service.telemetry.metrics.readers.pull`` config block; Prometheus scrapes
+it for the "OTel Collector — Throughput / Queue Saturation" dashboard panels.
 
 ### §2. Sibling stack structure
 
