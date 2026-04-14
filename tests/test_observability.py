@@ -10,36 +10,43 @@ from sovereign_memory import telemetry
 from sovereign_memory.logging_config import log_call, setup_logging
 
 
-def test_set_current_span_attributes_routes_to_langfuse_sdk(monkeypatch):
-    """ADR-024: when the Langfuse SDK is active, attributes must reach the SDK
-    observation via update_current_span — not only the OTel tracer. The
-    pre-fix code wrote OTel-only and Langfuse rendered the field as 'undefined'.
+def test_set_current_span_attributes_mirrors_langfuse_keys(monkeypatch):
+    """Post-refactor (ADR-014.4 §Amendment 2026-04-14): the Langfuse SDK
+    branching was removed. Attributes are written directly to the active
+    OTel span; ``input.value`` / ``output.value`` are mirrored to
+    ``langfuse.observation.input`` / ``.output`` so Langfuse's server-side
+    attribute mapping still populates its Input/Output panels. None values
+    are filtered so a second write never clobbers the first.
     """
-    fake_lf = MagicMock()
-    monkeypatch.setattr(telemetry, "_langfuse_client", fake_lf)
-    try:
-        telemetry.set_current_span_attributes(
-            {
-                "gen_ai.system": "llama.cpp",
-                "input.value": "hello",
-                "output.value": "world",
-                "skip_me": None,
-            }
-        )
-    finally:
-        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    fake_span = MagicMock()
+    fake_span.is_recording.return_value = True
 
-    # Metadata call: only non-None attributes
-    metadata_call = fake_lf.update_current_span.call_args_list[0]
-    assert metadata_call.kwargs["metadata"] == {
-        "gen_ai.system": "llama.cpp",
-        "input.value": "hello",
-        "output.value": "world",
+    import opentelemetry.trace as otel_trace
+
+    monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
+    # _tracer must be truthy so set_current_span_attributes doesn't short-circuit
+    monkeypatch.setattr(telemetry, "_tracer", MagicMock())
+
+    telemetry.set_current_span_attributes(
+        {
+            "gen_ai.system": "llama.cpp",
+            "input.value": "hello",
+            "output.value": "world",
+            "skip_me": None,
+        }
+    )
+
+    attrs_set = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
     }
-    # Second call: input/output surfaced as first-class fields
-    io_call = fake_lf.update_current_span.call_args_list[1]
-    assert io_call.kwargs["input"] == "hello"
-    assert io_call.kwargs["output"] == "world"
+    assert attrs_set["gen_ai.system"] == "llama.cpp"
+    assert attrs_set["input.value"] == "hello"
+    assert attrs_set["output.value"] == "world"
+    # Langfuse-specific mirrors for first-class panel rendering
+    assert attrs_set["langfuse.observation.input"] == "hello"
+    assert attrs_set["langfuse.observation.output"] == "world"
+    # None values must not be set
+    assert "skip_me" not in attrs_set
 
 
 def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
@@ -178,114 +185,116 @@ def test_set_current_span_attributes_no_op_when_uninitialised(monkeypatch):
 
 
 def test_log_call_emits_input_for_self_only_methods(monkeypatch):
-    """ADR-024 follow-up: the @log_call aspect must emit input.value even
-    when a method is called with no positional args after self. The previous
-    gate ``if payload:`` skipped these calls entirely, leaving Langfuse's
-    Input panel rendering 'undefined' for spans like FileEpisodicService.load(self).
+    """The @log_call aspect must emit ``input.value`` (as an OTel attribute)
+    even when a method is called with no positional args after self —
+    ``{}`` is a meaningful display value, ``undefined`` is misleading.
     """
-    fake_lf = MagicMock()
-    monkeypatch.setattr(telemetry, "_langfuse_client", fake_lf)
+    fake_span = MagicMock()
+    fake_span.is_recording.return_value = True
+    import opentelemetry.trace as otel_trace
+
+    monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
+    monkeypatch.setattr(telemetry, "_tracer", MagicMock())
 
     class _Thing:
         @log_call(logger=logging.getLogger("sovereign_memory.tests.self_only"))
         def no_args_method(self):
             return ["item-a", "item-b"]
 
-    try:
-        _Thing().no_args_method()
-    finally:
-        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    _Thing().no_args_method()
 
-    # Find the input write — must be present even though args[1:] is empty
-    input_calls = [
-        c for c in fake_lf.update_current_span.call_args_list if "input" in c.kwargs
-    ]
-    assert input_calls, (
+    attrs_set = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
+    }
+    assert attrs_set.get("input.value") == "{}", (
         "input.value was not emitted for a self-only method — "
         "the len(args) > 1 gate is back"
     )
-    # Empty payload renders as "{}", not undefined
-    assert input_calls[0].kwargs["input"] == "{}"
+    # Mirrored for Langfuse's Input panel
+    assert attrs_set.get("langfuse.observation.input") == "{}"
 
 
 def test_log_call_emits_output_for_none_returning_function(monkeypatch):
-    """Functions that legitimately return None must still write output.value
-    so the Langfuse Output panel renders 'null' instead of 'undefined'."""
-    fake_lf = MagicMock()
-    monkeypatch.setattr(telemetry, "_langfuse_client", fake_lf)
+    """Functions that legitimately return ``None`` must still write
+    ``output.value`` (serialised as JSON ``null``) so downstream tooling
+    shows the real outcome rather than ``undefined``.
+    """
+    fake_span = MagicMock()
+    fake_span.is_recording.return_value = True
+    import opentelemetry.trace as otel_trace
+
+    monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
+    monkeypatch.setattr(telemetry, "_tracer", MagicMock())
 
     @log_call(logger=logging.getLogger("sovereign_memory.tests.none_return"))
     def void_function(x):
         return None
 
-    try:
-        void_function("anything")
-    finally:
-        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    void_function("anything")
 
-    output_calls = [
-        c for c in fake_lf.update_current_span.call_args_list if "output" in c.kwargs
-    ]
-    assert output_calls, (
+    attrs_set = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
+    }
+    assert attrs_set.get("output.value") == "null", (
         "output.value was not emitted for a None-returning function — "
         "the early-return on `result is None` is back"
     )
+    # Mirrored for Langfuse's Output panel
+    assert attrs_set.get("langfuse.observation.output") == "null"
 
 
-def test_set_current_span_attributes_does_not_clobber_input_with_none(monkeypatch):
-    """ADR-024 second-fix regression: the @log_call aspect calls
-    set_current_span_attributes TWICE per span — once with input.value before
-    the function runs, then with output.value after. The first version of the
-    fix passed both kwargs unconditionally, so the second call's
-    ``input=None`` cleared the input that the first call had set, leaving
-    Langfuse's Input panel rendering 'undefined' for every memory layer span.
-
-    This test asserts that two separate calls (input-only, then output-only)
-    never pass a None kwarg to update_current_span — i.e. the second call
-    must not have an ``input`` key at all.
+def test_set_current_span_attributes_skips_none_values(monkeypatch):
+    """Post-refactor: ``None`` values are dropped at the OTel-API call site
+    rather than cleared via a second-call clobber. Two separate calls
+    (input-only, then output-only) must leave both values intact on the
+    underlying span.
     """
-    fake_lf = MagicMock()
-    monkeypatch.setattr(telemetry, "_langfuse_client", fake_lf)
-    try:
-        telemetry.set_current_span_attributes({"input.value": "the input"})
-        telemetry.set_current_span_attributes({"output.value": "the output"})
-    finally:
-        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+    fake_span = MagicMock()
+    fake_span.is_recording.return_value = True
+    import opentelemetry.trace as otel_trace
 
-    # Find the io kwargs calls (the second of each pair — first is metadata)
-    io_calls = [
-        call
-        for call in fake_lf.update_current_span.call_args_list
-        if "input" in call.kwargs or "output" in call.kwargs
-    ]
-    assert len(io_calls) == 2
+    monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
+    monkeypatch.setattr(telemetry, "_tracer", MagicMock())
 
-    # First io call: input set, NO output key whatsoever
-    assert io_calls[0].kwargs == {"input": "the input"}
-    assert "output" not in io_calls[0].kwargs
+    telemetry.set_current_span_attributes({"input.value": "the input"})
+    telemetry.set_current_span_attributes({"output.value": "the output"})
 
-    # Second io call: output set, NO input key whatsoever — this is the fix
-    assert io_calls[1].kwargs == {"output": "the output"}
-    assert "input" not in io_calls[1].kwargs
+    attrs_set: dict[str, object] = {}
+    for call in fake_span.set_attribute.call_args_list:
+        attrs_set[call.args[0]] = call.args[1]
+
+    assert attrs_set["input.value"] == "the input"
+    assert attrs_set["output.value"] == "the output"
+    assert attrs_set["langfuse.observation.input"] == "the input"
+    assert attrs_set["langfuse.observation.output"] == "the output"
+    # No None writes — would have clobbered prior values
+    for call in fake_span.set_attribute.call_args_list:
+        assert call.args[1] is not None
 
 
-def test_start_span_routes_through_langfuse_sdk_when_initialised(monkeypatch):
-    """start_span context manager must yield the Langfuse SDK observation
-    when the SDK is set, so @log_call wrappers nest correctly."""
-    fake_lf = MagicMock()
-    sdk_span = MagicMock()
-    fake_lf.start_as_current_observation.return_value.__enter__.return_value = sdk_span
-    fake_lf.start_as_current_observation.return_value.__exit__.return_value = False
-    monkeypatch.setattr(telemetry, "_langfuse_client", fake_lf)
-    try:
-        with telemetry.start_span("test-op", metadata={"k": "v"}) as span:
-            assert span is sdk_span
-    finally:
-        monkeypatch.setattr(telemetry, "_langfuse_client", None)
+def test_start_span_uses_otel_tracer(monkeypatch):
+    """Post-refactor: ``start_span`` always routes through the global OTel
+    tracer. Metadata keys are stamped with the ``langfuse.observation.metadata.``
+    prefix so Langfuse's server-side mapping surfaces them.
+    """
+    fake_span = MagicMock()
+    ctx_mgr = MagicMock()
+    ctx_mgr.__enter__ = MagicMock(return_value=fake_span)
+    ctx_mgr.__exit__ = MagicMock(return_value=False)
 
-    fake_lf.start_as_current_observation.assert_called_once_with(
-        name="test-op", as_type="span", metadata={"k": "v"}
-    )
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value = ctx_mgr
+    monkeypatch.setattr(telemetry, "_tracer", fake_tracer)
+
+    with telemetry.start_span("test-op", metadata={"node": "foo", "step": 1}) as span:
+        assert span is fake_span
+
+    fake_tracer.start_as_current_span.assert_called_once_with("test-op")
+    stamped = {
+        call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
+    }
+    assert stamped["langfuse.observation.metadata.node"] == "foo"
+    assert stamped["langfuse.observation.metadata.step"] == 1
 
 
 def test_setup_logging_uses_stdout_only():
