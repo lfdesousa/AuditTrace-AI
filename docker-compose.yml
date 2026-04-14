@@ -40,6 +40,15 @@ services:
       # correct ``service.name`` on every trace's Resource.
       - OTEL_SERVICE_NAME=sovereign-memory-server
       - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sovereign-ai,service.version=0.3.1,deployment.environment=${SOVEREIGN_ENV:-local}
+      # HTTP semconv migration (1.25+). `http/dup` makes the httpx and
+      # urllib3 instrumentors emit BOTH the old attrs (http.url,
+      # net.peer.name) and the new stable ones (server.address,
+      # url.full). Tempo's service-graph peer_attributes can then use
+      # `server.address` for clean node labels (keycloak/langfuse/minio
+      # etc.) instead of dirty full URLs. Drop to `http` to stop
+      # emitting the legacy keys once all downstream consumers are on
+      # the new semconv.
+      - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
       - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
       - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
       - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}

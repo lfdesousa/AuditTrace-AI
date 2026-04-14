@@ -175,6 +175,19 @@ Langfuse runs as a **sibling compose stack** on the shared `sovereign-ai-net` ne
 
 All services follow the ABC + implementation + mock pattern with `@log_call` observability.
 
+### Memory Access Modes (ADR-025)
+
+The 4-layer memory can be exposed to the LLM in two different ways. The choice is a runtime flag (`SOVEREIGN_MEMORY_MODE`) and does not change the underlying storage layout.
+
+| Mode | What happens on every `/v1/chat/completions` | Trade-off |
+|---|---|---|
+| **`tools`** *(live default — `.env` ships with this set)* | The proxy advertises four recall tools to the LLM and runs a tool-call loop. The model decides which layer it needs and calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, or `recall_semantic` on demand — at most once per question in practice. Results are cached in Redis (TTL 900s) and audit-logged to `tool_calls`. | Pay memory cost only when the model asks. Extra round-trips to llama-server (one per tool iteration), bounded by `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS`. |
+| **`inject`** *(legacy — v0.2.x default)* | The proxy retrieves all 4 layers up front and injects them into the system message. The model sees a preassembled context block and never issues tool calls for memory. | Zero tool-loop latency but every prompt pays the full 4-layer retrieval + token cost, even when the model would have ignored memory. |
+
+The four tools in `tools` mode each map to one layer and carry their own Keycloak scope (`memory:episodic:read`, `memory:procedural:read`, `memory:conversational:read-own`, `memory:semantic:read`). Per-user isolation, RLS, and the ChromaDB scoped wrapper apply unchanged to both modes — the difference is purely *when* the layers are queried, not *what* the user sees.
+
+Switch modes by setting `SOVEREIGN_MEMORY_MODE=inject|tools` in `.env` and recreating the `memory-server` container. See [ADR-025](docs/ADR-025-memory-as-tools.md) for the full design and the acceptance evidence.
+
 ### Security
 
 - **OAuth2** -- Keycloak-delegated identity (ADR-022, ADR-023, ADR-026). Every request is a JWT validated against the Keycloak JWKS endpoint. Hot path hits a Redis-backed `TokenCache` for sub-millisecond lookups.
@@ -304,7 +317,7 @@ python scripts/index-chromadb.py --dry-run --user-id <sub>
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_MEMORY_MODE` | `inject` | `inject` = legacy 4-layer dump into system message; `tools` = proxy-internal tool-call loop |
+| `SOVEREIGN_MEMORY_MODE` | `tools` (shipped `.env`) / `inject` (compose fallback) | `tools` = proxy-internal tool-call loop (current default); `inject` = legacy 4-layer dump into system message. See [Memory Access Modes](#memory-access-modes-adr-025). |
 | `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` | `5` | Hard cap on tool-call round-trips per request |
 | `SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS` | `900` | Redis tool result cache TTL; `0` disables caching |
 | `SOVEREIGN_TOOLS_CONFIG_PATH` | `tools.toml` | Optional TOML overlay to disable/rename/retune tools |
