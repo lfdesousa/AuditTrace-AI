@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sovereign_memory.identity import SENTINEL_SUBJECT
-from sovereign_memory.routes.chat import _compute_session_id
+from sovereign_memory.routes.chat import _compute_session_id, _resolve_project
 
 # ──────────────────────────── httpx.AsyncClient fakes ────────────────────────
 #
@@ -180,6 +180,48 @@ class TestSessionId:
         today = date.today().isoformat()
         assert sid.startswith(f"opencode-{today}-")
         assert len(sid.split("-")[-1]) == 16  # 16-char sha256 prefix
+
+
+class _FakeRequest:
+    """Minimal stand-in for fastapi.Request — only ``.headers.get`` is used."""
+
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
+        self.headers = headers or {}
+
+
+class TestResolveProject:
+    """ADR-029 project tag precedence: header → metadata.project → body.project → default."""
+
+    def test_header_wins_over_metadata_and_body(self):
+        req = _FakeRequest({"x-project": "FromHeader"})
+        payload = {"project": "FromBody", "metadata": {"project": "FromMetadata"}}
+        assert _resolve_project(req, payload) == "FromHeader"
+
+    def test_metadata_wins_when_no_header(self):
+        req = _FakeRequest()
+        payload = {"project": "FromBody", "metadata": {"project": "FromMetadata"}}
+        assert _resolve_project(req, payload) == "FromMetadata"
+
+    def test_body_project_used_when_only_body_set(self):
+        req = _FakeRequest()
+        assert _resolve_project(req, {"project": "FromBody"}) == "FromBody"
+
+    def test_default_returned_when_nothing_set(self):
+        req = _FakeRequest()
+        assert _resolve_project(req, {}) == "default"
+
+    def test_whitespace_trimmed_from_header(self):
+        req = _FakeRequest({"x-project": "   Spaced  "})
+        assert _resolve_project(req, {}) == "Spaced"
+
+    def test_empty_header_falls_through_to_next_tier(self):
+        req = _FakeRequest({"x-project": "   "})
+        assert _resolve_project(req, {"project": "FromBody"}) == "FromBody"
+
+    def test_non_string_metadata_project_ignored(self):
+        req = _FakeRequest()
+        payload = {"metadata": {"project": 42}, "project": "FromBody"}
+        assert _resolve_project(req, payload) == "FromBody"
 
 
 # ─────────────────────────── Non-streaming proxy ────────────────────────────
@@ -555,6 +597,84 @@ class TestChatProxy:
             )
 
         assert response.status_code == 200
+
+    def test_chat_proxy_x_project_header_wins_over_body(self, client):
+        """ADR-029: X-Project header is authoritative over body.project."""
+        from sovereign_memory.db.models import InteractionRecord
+        from sovereign_memory.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-Project": "HeaderProject"},
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "project": "BodyProject",
+                },
+            )
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        with pg.get_session_factory()() as db:
+            row = (
+                db.query(InteractionRecord)
+                .order_by(InteractionRecord.id.desc())
+                .first()
+            )
+        assert row is not None
+        assert row.project == "HeaderProject"
+
+    def test_chat_proxy_metadata_project_used_when_no_header(self, client):
+        """ADR-029: body.metadata.project is the second-tier source."""
+        from sovereign_memory.db.models import InteractionRecord
+        from sovereign_memory.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "metadata": {"project": "FromMetadata"},
+                },
+            )
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        with pg.get_session_factory()() as db:
+            row = (
+                db.query(InteractionRecord)
+                .order_by(InteractionRecord.id.desc())
+                .first()
+            )
+        assert row is not None
+        assert row.project == "FromMetadata"
+
+    def test_chat_proxy_defaults_project_when_none_provided(self, client):
+        """ADR-029: project defaults to "default" (not "unknown") when caller omits it."""
+        from sovereign_memory.db.models import InteractionRecord
+        from sovereign_memory.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        with pg.get_session_factory()() as db:
+            row = (
+                db.query(InteractionRecord)
+                .order_by(InteractionRecord.id.desc())
+                .first()
+            )
+        assert row is not None
+        assert row.project == "default"
 
     # ───────── Edge cases & error paths (chat.py coverage) ─────────────────
 

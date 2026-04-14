@@ -359,6 +359,9 @@ python scripts/index-chromadb.py --dry-run --user-id <sub>
 - [ADR-024: Chat Proxy Pass-Through + Langfuse Trace Decoupling](docs/ADR-024-proxy-passthrough-and-langfuse-trace-decoupling.md)
 - [ADR-025: Memory-as-Tools](docs/ADR-025-memory-as-tools.md)
 - [ADR-026: Multi-user Identity, Scopes, and Cross-user Isolation](docs/ADR-026-multi-user-identity.md)
+- [ADR-027: MinIO Object Storage](docs/ADR-027-minio-object-storage.md)
+- [ADR-028: Observability Aggregation Stack](docs/ADR-028-observability-aggregation-stack.md)
+- [ADR-029: End-to-End Audit Trail — Project Tagging & HTTP Telemetry Refinements](docs/ADR-029-audit-trail-completeness.md)
 
 ### Architecture Diagrams
 

@@ -95,9 +95,35 @@ def _compute_session_id(source: str, first_user_content: str, user_id: str) -> s
     return f"{source}-{today}-{h}"
 
 
-def _detect_source(
-    request: Request,  # type: ignore[type-arg]
-) -> str:
+def _resolve_project(request: Request, payload: dict[str, Any]) -> str:
+    """Resolve the project tag for this request (ADR-029).
+
+    Precedence:
+      1. ``X-Project`` HTTP header (case-insensitive — preferred).
+      2. ``body.metadata.project`` — OpenAI-compatible metadata dict, if the
+         client uses the standard field.
+      3. ``body.project`` — legacy / direct JSON body field.
+      4. ``"default"`` — unknown caller, still queryable.
+
+    The header is trusted at face value (same honesty model as source
+    detection). Per-project ACLs would add a JWT-claim cross-check; for
+    now this is metadata for audit + recall_recent_sessions filtering.
+    """
+    header = request.headers.get("x-project")
+    if isinstance(header, str) and header.strip():
+        return header.strip()
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        meta_project = metadata.get("project")
+        if isinstance(meta_project, str) and meta_project.strip():
+            return meta_project.strip()
+    body_project = payload.get("project")
+    if isinstance(body_project, str) and body_project.strip():
+        return body_project.strip()
+    return "default"
+
+
+def _detect_source(request: Request) -> str:
     """Best-effort agent identification from the User-Agent header."""
     ua = (request.headers.get("user-agent") or "").lower()
     for marker in ("opencode", "continue", "roocode", "openai", "curl", "httpx"):
@@ -320,7 +346,7 @@ def _merge_system_message(
     return result
 
 
-@_lf_observe(name="sovereign-chat-request")  # type: ignore[misc]
+@_lf_observe(name="sovereign-chat-request")
 def _build_memory_context_with_trace(
     context_builder: ContextBuilderService,
     payload: dict[str, Any],
@@ -550,7 +576,7 @@ async def list_models(
         ) from exc
 
 
-@_lf_observe(name="sovereign-chat-request", capture_output=False)  # type: ignore[misc]
+@_lf_observe(name="sovereign-chat-request", capture_output=False)
 def _prepare_tools_mode_trace(
     payload: dict[str, Any],
     query: str,
@@ -624,7 +650,7 @@ async def _handle_tools_mode(
     chat observation with input/output + usage is enough to restore
     parity with inject mode in the Langfuse UI.
     """
-    project = payload.get("project") or "unknown"
+    project = payload["project"]  # ADR-029: set by _resolve_project on entry
     requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
@@ -750,6 +776,12 @@ async def chat_completions(
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise HTTPException(status_code=422, detail="messages: list required")
 
+    # ADR-029: tag every interaction with the caller's project. Precedence:
+    # X-Project header → body.metadata.project → body.project → "default".
+    # Header wins so an agent can carry one provider config per project and
+    # drop the tag in cleanly via a single HTTP header.
+    payload["project"] = _resolve_project(http_request, payload)
+
     query = _extract_query(payload)
     source = _detect_source(http_request)
     first_user = next(
@@ -796,7 +828,7 @@ async def chat_completions(
     proxy_payload["messages"] = augmented_messages
 
     llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
-    project = payload.get("project") or "unknown"
+    project = payload["project"]  # ADR-029: set by _resolve_project on entry
     requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
