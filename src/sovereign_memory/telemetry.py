@@ -31,11 +31,12 @@ _langfuse_client: Any | None = None
 def _init_langfuse_client() -> None:
     """Best-effort init of the Langfuse SDK client.
 
-    The Langfuse SDK uses OTel under the hood but writes its own metadata
-    fields (langgraph_node, langgraph_step, etc.) at the top level of the
-    observation metadata Map in ClickHouse, which is what triggers the
-    graph view in the trace UI. The OTLP exporter alone does not — it
-    nests OTel attributes inside metadata['attributes'] as a JSON string.
+    The Langfuse 4.x constructor installs its own ``TracerProvider`` as
+    the OTel global. That provider already carries a
+    ``LangfuseSpanProcessor`` for shipping spans to the Langfuse OTLP
+    endpoint, so the caller just needs to attach its own OTLP exporter
+    as an additional processor on the same provider to fan spans out
+    to Tempo as well.
     """
     global _langfuse_client
     if _langfuse_client is not None:
@@ -92,27 +93,32 @@ def init_telemetry(
 
     resource = Resource.create({SERVICE_NAME: service_name})
 
-    if tracing_enabled:
-        tracer_provider = TracerProvider(resource=resource)
-        if otlp_endpoint:
-            try:
-                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-                    OTLPSpanExporter,
-                )
+    # When Langfuse is enabled we defer TracerProvider creation so the
+    # Langfuse SDK's own provider becomes global (it would otherwise
+    # refuse to override ours — OTel's ``set_tracer_provider`` enforces
+    # set-once). We then attach OUR OTLP exporter as an extra span
+    # processor on Langfuse's provider, so every span fans out to both
+    # Tempo and Langfuse under a single trace tree.
+    tracer_provider: Any = None
+    otlp_processor: Any = None
 
-                traces_endpoint = (
-                    otlp_endpoint.rstrip("/") + "/v1/traces"
-                    if not otlp_endpoint.endswith("/v1/traces")
-                    else otlp_endpoint
-                )
-                tracer_provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint))
-                )
-                logger.info("OTel tracing exporter -> %s", otlp_endpoint)
-            except Exception as e:  # pragma: no cover
-                logger.warning("Failed to configure OTLP span exporter: %s", e)
-        trace.set_tracer_provider(tracer_provider)
-        _tracer = trace.get_tracer(service_name)
+    if tracing_enabled and otlp_endpoint:
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+
+            traces_endpoint = (
+                otlp_endpoint.rstrip("/") + "/v1/traces"
+                if not otlp_endpoint.endswith("/v1/traces")
+                else otlp_endpoint
+            )
+            otlp_processor = BatchSpanProcessor(
+                OTLPSpanExporter(endpoint=traces_endpoint)
+            )
+            logger.info("OTel tracing exporter -> %s", otlp_endpoint)
+        except Exception as e:  # pragma: no cover
+            logger.warning("Failed to configure OTLP span exporter: %s", e)
 
     if metrics_enabled:
         readers = []
@@ -156,6 +162,35 @@ def init_telemetry(
     except Exception as e:  # pragma: no cover
         logger.debug("LoggingInstrumentor not enabled: %s", e)
 
+    # Initialise Langfuse FIRST — its constructor sets the global
+    # TracerProvider. We then attach our OTLP exporter as an additional
+    # SpanProcessor on that same provider so every span reaches both
+    # Tempo and Langfuse.
+    _init_langfuse_client()
+    if tracing_enabled:
+        from opentelemetry import trace
+
+        global_provider = trace.get_tracer_provider()
+        if otlp_processor is not None and hasattr(
+            global_provider, "add_span_processor"
+        ):
+            try:
+                global_provider.add_span_processor(otlp_processor)
+                logger.info(
+                    "OTLP span processor attached to global TracerProvider (%s)",
+                    type(global_provider).__name__,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to attach OTLP span processor: %s", exc)
+        elif otlp_processor is not None:
+            # No Langfuse, or Langfuse didn't install an SDK TracerProvider.
+            # Install our own so spans still reach Tempo.
+            tracer_provider = TracerProvider(resource=resource)
+            tracer_provider.add_span_processor(otlp_processor)
+            trace.set_tracer_provider(tracer_provider)
+            logger.info("App TracerProvider installed (Tempo-only path)")
+        _tracer = trace.get_tracer(service_name)
+
     _initialized = True
     logger.info(
         "OpenTelemetry initialised (service=%s, tracing=%s, metrics=%s, export=%s)",
@@ -165,77 +200,52 @@ def init_telemetry(
         otlp_endpoint or "disabled",
     )
 
-    # Initialise the Langfuse SDK so spans can carry top-level metadata
-    # (langgraph_node, langgraph_step, etc.) that the trace graph view needs.
-    _init_langfuse_client()
-
 
 @contextmanager
 def start_span(
     name: str,
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[object | None]:
-    """Start a span and yield it.
+    """Start an OTel span and yield it.
 
-    When the Langfuse SDK is initialised, route the span through it so that
-    `metadata` lands at the top level of the observation in ClickHouse —
-    that is what triggers the trace graph view in Langfuse's UI. Otherwise
-    fall back to plain OpenTelemetry.
+    Routes through the app's global TracerProvider, which has both the
+    OTLP exporter (→ Tempo) and the Langfuse span processor attached.
+    Every emitted span therefore reaches both backends under a single
+    trace tree. Metadata keys are stamped with the ``langfuse.observation.metadata.``
+    prefix so Langfuse's server-side mapping surfaces them as first-class
+    observation metadata.
     """
-    if _langfuse_client is not None:
-        # SDK manages its own context — wraps OTel under the hood, so a
-        # nested @log_call inside this block still nests correctly.
-        with _langfuse_client.start_as_current_observation(
-            name=name,
-            as_type="span",
-            metadata=metadata or {},
-        ) as span:
-            yield span
-        return
-
     if _tracer is None:
         yield None
         return
     with _tracer.start_as_current_span(name) as span:
+        if metadata:
+            for k, v in metadata.items():
+                if v is None:
+                    continue
+                try:
+                    span.set_attribute(f"langfuse.observation.metadata.{k}", v)
+                except Exception:  # pragma: no cover
+                    pass
         yield span
 
 
+# Attribute keys Langfuse maps to first-class observation fields. Anything
+# we write on a span with these keys shows up in Langfuse's Input/Output
+# panels; writes to the plain OTel keys (``input.value`` / ``output.value``)
+# stay visible in Tempo for unified search.
+_LANGFUSE_INPUT_KEY = "langfuse.observation.input"
+_LANGFUSE_OUTPUT_KEY = "langfuse.observation.output"
+
+
 def set_current_span_attributes(attributes: dict[str, Any]) -> None:
-    """Set attributes on the currently active span. No-op if tracing disabled.
+    """Set attributes on the currently active OTel span.
 
-    Used by route handlers to enrich chat completion spans with gen_ai.*
-    semantic conventions so Langfuse displays prompts and completions.
-
-    When the Langfuse SDK is active, attributes must be routed through
-    ``_langfuse_client.update_current_span`` — the SDK does not push its
-    observation onto the OTel current-span context, so writing only via
-    OTel leaves the Langfuse observation empty (renders as ``undefined``
-    in the trace UI).
+    Mirrors ``input.value`` / ``output.value`` to the Langfuse-specific
+    attribute keys so the Langfuse UI populates the Input/Output panels,
+    while leaving the OTel keys in place for Tempo. No-op if tracing is
+    disabled or there is no active span.
     """
-    if _langfuse_client is not None:
-        try:
-            metadata = {k: v for k, v in attributes.items() if v is not None}
-            _langfuse_client.update_current_span(metadata=metadata)
-            # Surface input/output to Langfuse's first-class fields too so the
-            # trace UI populates the Input/Output panels (not just metadata).
-            #
-            # CRITICAL: Build kwargs conditionally — passing ``input=None`` to
-            # Langfuse v4 ``update_current_span`` does NOT no-op, it CLEARS
-            # the existing input field. The @log_call aspect calls this helper
-            # twice per span (once with input.value before the call, once with
-            # output.value after), so passing the missing key as None on the
-            # second call would wipe the first call's write. Only pass keys
-            # that are actually present.
-            io_kwargs: dict[str, Any] = {}
-            if "input.value" in attributes and attributes["input.value"] is not None:
-                io_kwargs["input"] = attributes["input.value"]
-            if "output.value" in attributes and attributes["output.value"] is not None:
-                io_kwargs["output"] = attributes["output.value"]
-            if io_kwargs:
-                _langfuse_client.update_current_span(**io_kwargs)
-        except Exception:  # pragma: no cover
-            pass
-
     if _tracer is None:
         return
     try:
@@ -245,8 +255,13 @@ def set_current_span_attributes(attributes: dict[str, Any]) -> None:
         if span is None or not span.is_recording():
             return
         for key, value in attributes.items():
-            if value is not None:
-                span.set_attribute(key, value)
+            if value is None:
+                continue
+            span.set_attribute(key, value)
+            if key == "input.value":
+                span.set_attribute(_LANGFUSE_INPUT_KEY, value)
+            elif key == "output.value":
+                span.set_attribute(_LANGFUSE_OUTPUT_KEY, value)
     except Exception:  # pragma: no cover
         pass
 

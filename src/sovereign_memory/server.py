@@ -28,14 +28,6 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         metrics_enabled=settings.metrics_enabled,
     )
 
-    # Auto-instrument FastAPI request handling (ADR-014.4).
-    try:
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-        FastAPIInstrumentor.instrument_app(app)
-    except Exception as e:  # pragma: no cover
-        logger.warning("FastAPI OTel instrumentation failed: %s", e)
-
     # Register DI container with all services (ADR-020)
     register_default_dependencies(settings)
 
@@ -78,6 +70,19 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(health.router, tags=["health"])
+
+    # Auto-instrument FastAPI request handling (ADR-014.4). Must run at
+    # app-construction time so the patched ``build_middleware_stack`` is
+    # in place before uvicorn builds the stack on the first request.
+    # Uses OTel's ProxyTracer, which resolves to the real provider when
+    # a span is created — so init_telemetry can still run in lifespan.
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app)
+        logger.info("FastAPI OTel instrumentation attached")
+    except Exception as e:  # pragma: no cover
+        logger.warning("FastAPI OTel instrumentation failed: %s", e)
 
     return app
 
