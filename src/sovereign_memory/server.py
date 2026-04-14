@@ -28,6 +28,28 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         metrics_enabled=settings.metrics_enabled,
     )
 
+    # Auto-instrument outbound I/O AFTER init_telemetry so the
+    # instrumentors bind their closures to the concrete TracerProvider
+    # that Langfuse just installed as global — not the earlier
+    # ProxyTracerProvider. Spans then fan out to both Tempo (via our
+    # OTLP processor attached in init_telemetry) and Langfuse.
+    if settings.tracing_enabled:
+        try:
+            from opentelemetry import trace
+            from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+            from opentelemetry.instrumentation.redis import RedisInstrumentor
+            from opentelemetry.instrumentation.sqlalchemy import (
+                SQLAlchemyInstrumentor,
+            )
+
+            tp = trace.get_tracer_provider()
+            HTTPXClientInstrumentor().instrument(tracer_provider=tp)
+            SQLAlchemyInstrumentor().instrument(tracer_provider=tp)
+            RedisInstrumentor().instrument(tracer_provider=tp)
+            logger.info("OTel outbound instrumentation: HTTPX + SQLAlchemy + Redis")
+        except Exception as e:  # pragma: no cover
+            logger.warning("Outbound OTel instrumentation failed: %s", e)
+
     # Register DI container with all services (ADR-020)
     register_default_dependencies(settings)
 
@@ -71,16 +93,15 @@ def create_app() -> FastAPI:
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(health.router, tags=["health"])
 
-    # Auto-instrument FastAPI request handling (ADR-014.4). Must run at
-    # app-construction time so the patched ``build_middleware_stack`` is
-    # in place before uvicorn builds the stack on the first request.
-    # Uses OTel's ProxyTracer, which resolves to the real provider when
-    # a span is created — so init_telemetry can still run in lifespan.
+    # FastAPI instrumentation must run at app-construction time so the
+    # patched ``build_middleware_stack`` is in place before uvicorn
+    # builds the stack on first request. Outbound instrumentors
+    # (HTTPX/SQLAlchemy/Redis) live in the lifespan handler so they
+    # bind to the concrete TracerProvider Langfuse installs there.
     try:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
         FastAPIInstrumentor.instrument_app(app)
-        logger.info("FastAPI OTel instrumentation attached")
     except Exception as e:  # pragma: no cover
         logger.warning("FastAPI OTel instrumentation failed: %s", e)
 
