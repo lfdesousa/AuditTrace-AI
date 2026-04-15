@@ -41,10 +41,18 @@ def populated_builder(user_context):
 
     conversational = MockConversationalService()
     conversational.save_session(
-        user_context, "AuditTrace", "KV cache compression enabled", ["ADR-009"]
+        user_context,
+        "AuditTrace",
+        "KV cache compression enabled",
+        ["ADR-009"],
+        session_id="cb-kv-1",
     )
     conversational.save_session(
-        user_context, "AuditTrace", "Phase 0 complete", ["DI container"]
+        user_context,
+        "AuditTrace",
+        "Phase 0 complete",
+        ["DI container"],
+        session_id="cb-phase0-1",
     )
 
     semantic = MockSemanticService()

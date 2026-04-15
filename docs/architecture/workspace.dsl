@@ -136,7 +136,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
 
         // Session summariser (ADR-030)
         memoryServer.api.sessionSummarizer -> memoryServer.postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
-        memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points)"
+        memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
         memoryServer.api.sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
 
         // DI wiring

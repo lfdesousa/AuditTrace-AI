@@ -80,6 +80,7 @@ def _populated_container():
         "AuditTrace",
         "Session about KV cache compression",
         ["ADR-009 accepted"],
+        session_id="seed-kv-1",
     )
     c._instances["semantic"].add_document(
         "RAG body about cache optimisation",

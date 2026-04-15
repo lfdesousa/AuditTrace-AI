@@ -5,6 +5,7 @@ so the row carries the caller's ``UserContext.user_id`` on the write path.
 """
 
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -61,11 +62,16 @@ async def save_session_summary(
     one row per session in the ``sessions`` table, used by Layer 3
     (conversational memory) to provide continuity across conversations.
     """
+    # ADR-030: the service requires an explicit session_id. Accept one
+    # from the client when they know it (summarising a real chat), or
+    # generate a UUID for standalone admin-style summaries.
+    resolved_session_id = request.session_id or str(uuid.uuid4())
     session_id = conversational.save_session(
         user,
         project=request.project,
         summary=request.summary,
         key_points=request.key_points,
+        session_id=resolved_session_id,
     )
     return SessionSummaryResponse(
         status="ok", session_id=session_id, project=request.project
