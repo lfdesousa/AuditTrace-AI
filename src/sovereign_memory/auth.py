@@ -49,6 +49,40 @@ _JWKS_CACHE_TTL = 300  # 5 minutes
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def _decode_jwt_with_allowed_issuers(
+    token: str,
+    keys: Any,
+    audience: str,
+    primary_issuer: str,
+    extra_issuers: list[str],
+) -> dict[str, Any]:
+    """Decode + validate a JWT accepting one of several ``iss`` values.
+
+    python-jose's ``jwt.decode`` only accepts a single ``issuer``
+    string. ADR-032 introduces Device-Flow tokens that ride the
+    Traefik-exposed URL and therefore carry a different ``iss`` even
+    though they are signed by the same Keycloak. Decoding without
+    enforcing ``issuer`` and then cross-checking against the union
+    set keeps both flows working from one validation path.
+    """
+    payload = jwt.decode(
+        token,
+        keys,
+        algorithms=["RS256"],
+        audience=audience,
+        # issuer check handled below against the union set
+    )
+    token_iss = payload.get("iss")
+    allowed = {primary_issuer, *(extra_issuers or [])}
+    if token_iss not in allowed:
+        raise JWTError(
+            f"Invalid issuer {token_iss!r}; expected one of {sorted(allowed)!r}"
+        )
+    # python-jose's jwt.decode returns Any; the dict cast is for mypy.
+    assert isinstance(payload, dict), "jwt.decode returned non-dict payload"
+    return payload
+
+
 _JWKS_FETCH_RETRIES = 3
 _JWKS_FETCH_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
 
@@ -124,12 +158,12 @@ def require_scope(required_scope: str):  # type: ignore[no-untyped-def]
         # Decode and validate JWT
         try:
             keys = _get_jwks_keys(settings.keycloak_jwks_url)
-            payload = jwt.decode(
+            payload = _decode_jwt_with_allowed_issuers(
                 token,
                 keys,
-                algorithms=["RS256"],
                 audience=settings.jwt_audience,
-                issuer=settings.keycloak_issuer,
+                primary_issuer=settings.keycloak_issuer,
+                extra_issuers=settings.keycloak_issuer_extras,
             )
         except JWTError as e:
             logger.warning("JWT validation failed: %s", e)
@@ -235,12 +269,12 @@ async def require_user(
     # Cold path: validate JWT against Keycloak JWKS
     try:
         keys = _get_jwks_keys(settings.keycloak_jwks_url)
-        payload = jwt.decode(
+        payload = _decode_jwt_with_allowed_issuers(
             raw_token,
             keys,
-            algorithms=["RS256"],
             audience=settings.jwt_audience,
-            issuer=settings.keycloak_issuer,
+            primary_issuer=settings.keycloak_issuer,
+            extra_issuers=settings.keycloak_issuer_extras,
         )
     except JWTError as exc:
         logger.warning("JWT validation failed: %s", exc)

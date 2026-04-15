@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     keycloak_realm: str = "sovereign-ai"
     keycloak_issuer: str = ""
     keycloak_jwks_url: str = ""
+    # ADR-032: additional ``iss`` values to accept on inbound JWTs.
+    # Primary ``keycloak_issuer`` is the docker-network-internal URL
+    # that service-account flows (client_credentials, client-JWT) mint
+    # tokens against. Human-facing Device Flow tokens arrive via the
+    # Traefik-exposed hostname and carry a different ``iss`` even
+    # though they're signed by the same Keycloak. Putting the
+    # externally-resolvable URL here lets both token families pass
+    # validation. Empty list keeps the existing single-issuer
+    # behaviour — no behaviour change for deployments that do not
+    # enable Device Flow.
+    keycloak_issuer_extras: list[str] = []
     jwt_audience: str = "sovereign-memory-server"
 
     # Multi-user identity gate (ADR-026 §15).
