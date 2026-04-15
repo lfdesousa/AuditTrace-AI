@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# OAuth2 Device Authorization Grant (RFC 8628) against the local
+# Keycloak realm. See ADR-032.
+#
+# One-time interactive login:
+#
+#   scripts/audittrace-login
+#
+# then subsequently in scripts / wrappers:
+#
+#   BEARER=$(scripts/audittrace-login --show)     # refresh if needed, print access_token
+#   scripts/audittrace-login --ensure              # refresh if needed, exit 0 if token valid
+#   scripts/audittrace-login --logout              # delete the saved token pair
+#
+# Tokens land in ~/.config/audittrace/tokens.json (mode 600). The
+# file holds {access_token, refresh_token, access_expires_at,
+# refresh_expires_at, realm_issuer, client_id}. ``--show`` transparently
+# refreshes the access_token if it's within ``REFRESH_THRESHOLD_SECONDS``
+# of expiry so long-lived scripts don't have to know about the
+# refresh dance.
+#
+# Why Device Flow:
+#   - OpenCode + Continue + Roo Code have no browser of their own.
+#   - Password grant (resource owner) is deprecated by the OAuth2 BCP.
+#   - Client credentials gives flat identity (all traffic as "the dev
+#     client"), defeating the per-user RLS design (ADR-026).
+#   - Device Flow is the RFC-8628 standard pattern for this exact
+#     scenario: user logs in once interactively on ANY browser, agent
+#     gets a refreshable token bound to that user's identity.
+
+set -euo pipefail
+
+# ───────────────────────────── config ─────────────────────────────
+
+KEYCLOAK_BASE="${KEYCLOAK_BASE:-http://localhost:8080}"
+REALM="${KEYCLOAK_REALM:-sovereign-ai}"
+CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
+
+TOKENS_DIR="${AUDITTRACE_TOKENS_DIR:-$HOME/.config/audittrace}"
+TOKENS_FILE="$TOKENS_DIR/tokens.json"
+
+# Refresh the access_token if it expires within this window.
+REFRESH_THRESHOLD_SECONDS="${REFRESH_THRESHOLD_SECONDS:-60}"
+
+DEVICE_ENDPOINT="$KEYCLOAK_BASE/realms/$REALM/protocol/openid-connect/auth/device"
+TOKEN_ENDPOINT="$KEYCLOAK_BASE/realms/$REALM/protocol/openid-connect/token"
+
+# ───────────────────────────── helpers ────────────────────────────
+
+require() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "error: $cmd required but not found on PATH" >&2
+    exit 2
+  }
+}
+
+require curl
+require jq
+
+# Self-signed mkcert TLS is the dev default; auto-bypass for localhost
+# unless the operator opts in via CURL_VERIFY=1.
+CURL_OPTS=()
+if [[ "$KEYCLOAK_BASE" == https://localhost* ]] && [[ "${CURL_VERIFY:-0}" != "1" ]]; then
+  CURL_OPTS+=("-k")
+fi
+
+log() { echo "[audittrace-login] $*" >&2; }
+
+ensure_tokens_dir() {
+  mkdir -p "$TOKENS_DIR"
+  chmod 700 "$TOKENS_DIR"
+}
+
+write_tokens() {
+  local payload="$1"
+  ensure_tokens_dir
+  umask 077
+  printf '%s' "$payload" > "$TOKENS_FILE"
+  chmod 600 "$TOKENS_FILE"
+}
+
+now_epoch() { date +%s; }
+
+# Parse a Keycloak token response JSON and emit the persisted shape.
+persist_from_token_response() {
+  local body="$1"
+  local now
+  now="$(now_epoch)"
+  echo "$body" | jq --arg now "$now" --arg realm "$KEYCLOAK_BASE/realms/$REALM" --arg cid "$CLIENT_ID" '
+    {
+      access_token: .access_token,
+      refresh_token: .refresh_token,
+      access_expires_at: (($now | tonumber) + (.expires_in // 0)),
+      refresh_expires_at: (($now | tonumber) + (.refresh_expires_in // 0)),
+      token_type: .token_type,
+      realm_issuer: $realm,
+      client_id: $cid
+    }
+  '
+}
+
+# ───────────────────────────── actions ────────────────────────────
+
+action_login() {
+  log "initiating Device Authorization Grant at $DEVICE_ENDPOINT"
+  local init_body
+  init_body="$(curl "${CURL_OPTS[@]}" -s -S --fail \
+    -d "client_id=$CLIENT_ID" \
+    -d "scope=openid memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read sovereign-ai:query sovereign-ai:context sovereign-ai:audit" \
+    "$DEVICE_ENDPOINT")" || {
+    echo "error: device-auth request failed — is Keycloak reachable at $KEYCLOAK_BASE?" >&2
+    exit 3
+  }
+
+  local device_code user_code verification_uri verification_uri_complete interval expires_in
+  device_code="$(echo "$init_body"           | jq -r '.device_code // empty')"
+  user_code="$(echo "$init_body"             | jq -r '.user_code // empty')"
+  verification_uri="$(echo "$init_body"      | jq -r '.verification_uri // empty')"
+  verification_uri_complete="$(echo "$init_body" | jq -r '.verification_uri_complete // .verification_uri // empty')"
+  interval="$(echo "$init_body"              | jq -r '.interval // 5')"
+  expires_in="$(echo "$init_body"            | jq -r '.expires_in // 600')"
+
+  if [[ -z "$device_code" ]]; then
+    echo "error: Keycloak did not return a device_code. Response was:" >&2
+    echo "$init_body" >&2
+    exit 3
+  fi
+
+  cat <<EOF >&2
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Complete login in a browser:                                 │
+  │                                                              │
+  │   1. Open:  $verification_uri
+  │   2. Enter code:  $user_code
+  │                                                              │
+  │ Or go directly to:                                           │
+  │   $verification_uri_complete
+  │                                                              │
+  │ Waiting for approval... (expires in ${expires_in}s, polling every ${interval}s)
+  └──────────────────────────────────────────────────────────────┘
+
+EOF
+
+  local deadline
+  deadline="$(( $(now_epoch) + expires_in ))"
+  while [[ "$(now_epoch)" -lt "$deadline" ]]; do
+    sleep "$interval"
+    local poll
+    poll="$(curl "${CURL_OPTS[@]}" -s -S \
+      -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+      -d "client_id=$CLIENT_ID" \
+      -d "device_code=$device_code" \
+      "$TOKEN_ENDPOINT")"
+    local err
+    err="$(echo "$poll" | jq -r '.error // empty')"
+    case "$err" in
+      "")
+        # Success.
+        persist_from_token_response "$poll" | (ensure_tokens_dir && umask 077 && cat > "$TOKENS_FILE")
+        chmod 600 "$TOKENS_FILE"
+        log "✅ logged in — tokens saved to $TOKENS_FILE"
+        return 0
+        ;;
+      authorization_pending)
+        : # keep polling
+        ;;
+      slow_down)
+        interval="$(( interval + 5 ))"
+        log "Keycloak asked to slow down; bumping interval to ${interval}s"
+        ;;
+      access_denied)
+        echo "error: user denied the authorization request" >&2
+        exit 4
+        ;;
+      expired_token)
+        echo "error: device code expired before approval — run login again" >&2
+        exit 5
+        ;;
+      *)
+        echo "error: unexpected token-endpoint response:" >&2
+        echo "$poll" >&2
+        exit 6
+        ;;
+    esac
+  done
+  echo "error: polling loop exceeded ${expires_in}s without a response" >&2
+  exit 5
+}
+
+action_logout() {
+  if [[ -f "$TOKENS_FILE" ]]; then
+    rm -f "$TOKENS_FILE"
+    log "deleted $TOKENS_FILE"
+  else
+    log "no token file at $TOKENS_FILE — nothing to delete"
+  fi
+}
+
+# Refresh the access token in-place. No-op if current access_token
+# has more than REFRESH_THRESHOLD_SECONDS of life left.
+# Exit 7 = no token file. Exit 8 = refresh failed.
+action_refresh_if_needed() {
+  if [[ ! -f "$TOKENS_FILE" ]]; then
+    echo "error: no token file at $TOKENS_FILE — run without flags to log in first" >&2
+    exit 7
+  fi
+  local access_expires_at refresh_token now
+  access_expires_at="$(jq -r '.access_expires_at // 0' "$TOKENS_FILE")"
+  refresh_token="$(jq -r '.refresh_token // empty' "$TOKENS_FILE")"
+  now="$(now_epoch)"
+
+  if [[ "$(( access_expires_at - now ))" -gt "$REFRESH_THRESHOLD_SECONDS" ]]; then
+    return 0  # plenty of life left
+  fi
+
+  if [[ -z "$refresh_token" ]]; then
+    echo "error: saved token file has no refresh_token — re-login required" >&2
+    exit 8
+  fi
+
+  log "refreshing access_token (expires in $(( access_expires_at - now ))s)"
+  local body
+  body="$(curl "${CURL_OPTS[@]}" -s -S --fail \
+    -d "grant_type=refresh_token" \
+    -d "client_id=$CLIENT_ID" \
+    -d "refresh_token=$refresh_token" \
+    "$TOKEN_ENDPOINT")" || {
+    echo "error: refresh-token grant failed — re-login required" >&2
+    exit 8
+  }
+  persist_from_token_response "$body" > "$TOKENS_FILE"
+  chmod 600 "$TOKENS_FILE"
+}
+
+action_show() {
+  action_refresh_if_needed
+  jq -r '.access_token' "$TOKENS_FILE"
+}
+
+action_ensure() {
+  action_refresh_if_needed
+  log "token valid"
+}
+
+# ─────────────────────────────── main ─────────────────────────────
+
+case "${1:-login}" in
+  login|"")       action_login ;;
+  --show)         action_show ;;
+  --ensure)       action_ensure ;;
+  --logout)       action_logout ;;
+  -h|--help)
+    cat <<EOF
+audittrace-login — OAuth2 Device Flow helper (ADR-032)
+
+Usage:
+  audittrace-login                 Interactive login (Device Flow)
+  audittrace-login --show          Print access_token to stdout (refresh if needed)
+  audittrace-login --ensure        Refresh if needed, exit 0 if token valid
+  audittrace-login --logout        Delete the saved token pair
+
+Environment overrides:
+  KEYCLOAK_BASE            (default http://localhost:8080)
+  KEYCLOAK_REALM           (default sovereign-ai)
+  CLIENT_ID                (default audittrace-opencode)
+  AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
+  REFRESH_THRESHOLD_SECONDS (default 60 — refresh if expires within this window)
+EOF
+    ;;
+  *)
+    echo "error: unknown argument '$1' (try --help)" >&2
+    exit 64
+    ;;
+esac

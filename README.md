@@ -202,9 +202,34 @@ Switch modes by setting `SOVEREIGN_MEMORY_MODE=inject|tools` in `.env` and recre
 - **Network isolation** -- Database services on Docker internal network only
 - **Secrets** -- Credentials via environment variables, never in code
 
-### Authentication (ADR-022, ADR-023, ADR-026)
+### Authentication (ADR-022, ADR-023, ADR-026, ADR-032)
 
 All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQUIRED=true` is the docker-compose default -- every request needs `Authorization: Bearer <JWT>`.
+
+**Human agents (OpenCode / Continue / Roo Code) — OAuth2 Device Flow (ADR-032):**
+
+```bash
+# One-time on a fresh Keycloak (realm import handles it): nothing to do.
+# On an already-running Keycloak: provision the public client + realm user once.
+KEYCLOAK_ADMIN_PASSWORD=admin scripts/setup-human-user.sh
+
+# Interactive login (opens a browser login on any device):
+scripts/audittrace-login
+#   → prints a short verification URL + user code; log in as `luis`,
+#     tokens land in ~/.config/audittrace/tokens.json (mode 0600).
+
+# Launch OpenCode with a fresh token wired into ~/.config/opencode/config.json:
+scripts/opencode-wrapper.sh
+
+# In scripts / ad-hoc curl calls:
+BEARER=$(scripts/audittrace-login --show)   # auto-refreshes if near expiry
+curl -H "Authorization: Bearer $BEARER" https://localhost/v1/chat/completions ...
+```
+
+Silent refresh is automatic within the 30-day SSO session lifetime. After that, `scripts/audittrace-login` re-logs in interactively.
+
+**Service accounts (CI, smoke tests) -- `client_credentials`:**
+The `sovereign-memory-dev` client is the legacy path. Still the right choice for non-interactive scripts; see `scripts/mint-dev-jwt.sh`.
 
 **Scopes exposed by the `sovereign-ai` realm:**
 
