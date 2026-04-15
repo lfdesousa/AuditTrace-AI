@@ -226,10 +226,30 @@ sequenceDiagram
 
 ## Iteration cap — defensive bound on chained tool calls
 
-A misbehaving model that keeps emitting memory tool calls every turn
-is stopped at `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` (default 5).
-The loop returns whatever the last body was and logs a WARNING so
-operators can correlate cap-hits with bad prompts in production.
+Two stop conditions, in this order:
+
+1. **Identity-based early exit (ADR-030, commit `e18800c`)** — if two
+   consecutive iterations emit the exact same `{(tool_name, args_json_sorted)}`
+   frozenset, the loop stops without executing. The model is asking for
+   the same data it already received; another round-trip can only
+   return a cached identical result and waste an iteration. Logs
+   `memory tool-call loop detected repeated signatures`.
+2. **Hard iteration cap** at `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS`
+   (default 5; production override 10) — defence against a misbehaving
+   model that varies its args every turn but never converges. Returns
+   whatever the last body was and logs `memory tool-call loop reached
+   max iterations`.
+
+**Empirical note (2026-04-15 evals):** the identity exit did NOT fire
+on a single probe across the `decisions` (N=10) and `ambiguous` (N=10)
+categories — every iteration used distinct args. The pathology it
+guards against does not occur on these prompt shapes. The real tail
+failure mode is "model makes 10 *distinct* calls exploring different
+angles, prompt grows each round, client times out" — a token-budget
+problem the identity heuristic does not address. See
+`docs/eval-memory-modes-20260415-ambiguous.md` for the full finding.
+Identity exit stays as cheap defensive insurance; a future
+token-budget-based exit is a separate concern.
 
 ```mermaid
 sequenceDiagram

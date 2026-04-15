@@ -12,8 +12,18 @@
 > merged into the system message. The alternative **`tools`** path —
 > ambient context + proxy-internal memory tool-call loop — is covered
 > in its own document: [`sequence-memory-tool-call.md`](sequence-memory-tool-call.md).
-> Tools-mode becomes the default once ADR-025 graduates from Proposed
-> to Accepted.
+> Tools-mode is now the shipped default as of v0.3.0.
+>
+> **Hybrid recall (ADR-030 Part 1):** the `recall_recent_sessions`
+> arrow into `PostgresConversationalService.load_sessions` now merges
+> REAL `SessionRecord` rows with SYNTHETIC rows built from the first
+> question + last answer of `interactions.session_id` values that have
+> no matching summary yet. Synthetic rows carry `synthetic: True` and
+> the memory-handler prefixes the snippet with `[draft — not yet
+> summarised]` so the LLM treats them as lower-confidence hints. The
+> background worker that populates real summaries (and so transparently
+> drains the synthetic pool) is documented in
+> [`sequence-summariser-cycle.md`](sequence-summariser-cycle.md).
 
 The chat completions endpoint (inject mode):
 
