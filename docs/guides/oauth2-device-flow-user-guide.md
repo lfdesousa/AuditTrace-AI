@@ -120,11 +120,21 @@ scripts/opencode-wrapper.sh
 
 Under the hood: calls `audittrace-login --ensure` (silent refresh if
 within 60s of expiry, falls back to interactive login if no token
-exists), merges `Authorization: Bearer <token>` into every provider's
-`options.headers` in `~/.config/opencode/config.json` (timestamped
-backup alongside, atomic via mktemp+mv), then execs `opencode`. From
+exists), writes the raw token into every provider's `options.apiKey`
+in `~/.config/opencode/config.json` (timestamped backup alongside,
+atomic via mktemp+mv), scrubs any stale `options.headers.Authorization`
+so there's no dual-source ambiguity, then execs `opencode`. From
 there you're in a normal OpenCode session — every chat request reaches
 the memory-server with your Bearer.
+
+**Why apiKey, not headers?** The `@ai-sdk/openai-compatible` provider
+OpenCode uses builds its outbound `Authorization: Bearer <…>` from
+`options.apiKey`. Setting `headers.Authorization` alone looks
+right in the config but gets *overridden* by the SDK's
+apiKey-derived header on the wire — producing silent 401s if the
+apiKey is stale. The wrapper writes both cleanly: apiKey =
+current token, headers.Authorization = removed. (Fix commit:
+`537ddd8`.)
 
 Verify your identity is attached (scenario 10 has the full audit-row
 check):
@@ -387,6 +397,8 @@ hybrid recall, audit trail) is working as designed.
 | `curl: (60) SSL certificate problem: self-signed certificate` | mkcert CA not in curl's trust store | Default `-k` covers it on localhost. For CA-signed remote hosts set `CURL_VERIFY=1` explicitly |
 | Browser: "Firefox can't connect to localhost" after entering the code | Keycloak renders redirect URLs as `http://localhost/...` (no HTTPS awareness) | Check `docker-compose.yml` sets `KC_HOSTNAME_URL=https://localhost` + `KC_PROXY=edge` on the keycloak service (fixed in commit 5d0ed5e) |
 | `401 Unauthorized: {"detail":"Invalid or expired token"}` on chat requests | Memory-server rejects the token's `iss` claim | Verify `SOVEREIGN_KEYCLOAK_ISSUER_EXTRAS` env on the memory-server container includes the issuer your token carries. `docker compose exec memory-server env \| grep KEYCLOAK` |
+| `401 Unauthorized` from OpenCode specifically, but direct `curl` with the same token works | Stale `options.apiKey` in the OpenCode config still carries an old token — `@ai-sdk/openai-compatible` builds Authorization from apiKey and that wins over any `headers.Authorization` we inject | `scripts/opencode-wrapper.sh` writes apiKey directly (fixed in commit `537ddd8`). On older wrapper, either re-run the wrapper or manually: `jq '.provider \|= with_entries(.value.options.apiKey = "<fresh-token>" \| .value.options.headers \|= del(.Authorization))' ~/.config/opencode/config.json` |
+| OpenCode 401 persists after wrapper rewrites the config | OpenCode cached the apiKey at session start and didn't re-read the config | Quit OpenCode fully and relaunch — the config is only read at startup |
 | Browser shows login page but "invalid username or password" | Password reset needed | Scenario 9 (admin reset) |
 | `scripts/audittrace-login --show` prints empty string | Token file exists but refresh failed | `cat ~/.config/audittrace/tokens.json \| jq` — check `refresh_expires_at`; if past, re-login per Scenario 6 |
 | Polling loop hangs past the `expires_in` window | Browser approval didn't reach Keycloak | Re-run `scripts/audittrace-login` (fresh device_code), try again |
