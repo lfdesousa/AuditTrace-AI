@@ -18,12 +18,17 @@ PORT="${PORT:-11437}"
 CTX_SIZE="${CTX_SIZE:-16384}"
 ALIAS="${ALIAS:-mistral-7b-summarizer}"
 # GPU_LAYERS = how many of Mistral's ~33 layers to offload to the iGPU.
-# 99 = full offload (default; fastest summarisation but maximum
-# contention with Qwen on the unified Strix Halo iGPU). Lower values
-# trade summariser speed for Qwen latency budget. 10 is a sensible
-# starting point for a single-GPU box where Qwen is user-facing
-# critical path. 0 = pure CPU (no GPU contention but 5-10x slower).
-GPU_LAYERS="${GPU_LAYERS:-99}"
+# 10 = partial offload (recommended default for single-iGPU boxes such
+#      as Ryzen AI Max+ 395 / Strix Halo where Qwen is the user-facing
+#      critical path). Mistral takes ~1 GB GPU at rest, ~24 s/summary
+#      throughput. Measured on 2026-04-15 contention run as having
+#      no measurable cost on Qwen tools-mode latency
+#      (see docs/eval-memory-modes-20260415-contention.md).
+# 99 = full offload (~3-14 s/summary but contends with Qwen on shared
+#      iGPU compute slots — only sensible on a discrete-GPU host where
+#      a second GPU is dedicated to summarisation).
+# 0  = pure CPU (no GPU contention but ~60 s/summary).
+GPU_LAYERS="${GPU_LAYERS:-10}"
 
 if [[ ! -x "$LLAMA_BIN" ]]; then
   echo "error: llama-server binary not found at $LLAMA_BIN" >&2
