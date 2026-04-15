@@ -187,6 +187,16 @@ services:
       KC_DB_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # ADR-032: Keycloak is fronted by Traefik on :443. Without
+      # these, Keycloak renders login redirects as http://localhost
+      # (no scheme awareness) and the browser hits :80 which nothing
+      # listens on — broken Device Flow. Setting KC_HOSTNAME_URL
+      # forces https-qualified URLs everywhere and KC_PROXY=edge
+      # tells Keycloak to trust Traefik's X-Forwarded-* headers so
+      # the TLS-termination is transparent.
+      KC_HOSTNAME_URL: https://localhost
+      KC_HOSTNAME_ADMIN_URL: https://localhost
+      KC_PROXY: edge
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && grep -q 200 <&3"]
       interval: 10s
