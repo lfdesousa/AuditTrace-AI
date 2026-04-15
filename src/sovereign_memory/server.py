@@ -50,6 +50,66 @@ def urllib3_set_server_address(span: Any, _instance: Any, request_info: Any) -> 
         pass
 
 
+def _build_httpx_peer_service_map(settings: Any) -> dict[int, str]:
+    """Build a ``{port: peer.service}`` map from the configured LLM URLs.
+
+    Returns the port → service-name mapping used by ``httpx_set_peer_service``
+    to disambiguate the three llama-server endpoints on a shared host.
+    The map is derived from settings so re-pointing ``SOVEREIGN_*_URL`` at a
+    different port updates the service-graph label for free.
+    """
+    mapping: dict[int, str] = {}
+    for attr, name in (
+        ("llama_url", "qwen-chat-llm"),
+        ("embed_url", "nomic-embed-server"),
+        ("summarizer_url", "mistral-summariser-llm"),
+    ):
+        raw = getattr(settings, attr, None)
+        if not raw:
+            continue
+        try:
+            port = urlparse(raw).port
+        except Exception:  # pragma: no cover - defensive
+            port = None
+        if port is not None:
+            mapping[port] = name
+    return mapping
+
+
+def make_httpx_peer_service_hook(
+    peer_service_by_port: dict[int, str],
+) -> Any:
+    """Closure factory for the httpx ``request_hook``.
+
+    Tempo's service-graph processor collapses every HTTP outbound to a
+    shared hostname into a single edge. On a single-host deployment all
+    three llama-servers live under ``host.docker.internal`` and the
+    default service graph shows one lumped edge per host. Setting
+    ``peer.service`` explicitly per destination splits that into three
+    semantic edges (``qwen-chat-llm``, ``nomic-embed-server``,
+    ``mistral-summariser-llm``). Tempo reads ``peer.service`` ahead of
+    ``server.address`` when it is present, so this is a clean per-edge
+    label without fighting the peer_attributes list. Requests to
+    destinations not in the map are left untouched — falls back to
+    ``server.address``.
+    """
+
+    def _hook(span: Any, request_info: Any) -> None:
+        if span is None or not span.is_recording():
+            return
+        try:
+            parsed = urlparse(str(request_info.url))
+            if parsed.port is None:
+                return
+            name = peer_service_by_port.get(parsed.port)
+            if name is not None:
+                span.set_attribute("peer.service", name)
+        except Exception:  # pragma: no cover - hook must never raise
+            pass
+
+    return _hook
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
@@ -80,13 +140,20 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
             from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
 
             tp = trace.get_tracer_provider()
-            HTTPXClientInstrumentor().instrument(tracer_provider=tp)
+            peer_service_map = _build_httpx_peer_service_map(settings)
+            HTTPXClientInstrumentor().instrument(
+                tracer_provider=tp,
+                request_hook=make_httpx_peer_service_hook(peer_service_map),
+            )
             URLLib3Instrumentor().instrument(
                 tracer_provider=tp,
                 request_hook=urllib3_set_server_address,
             )
             RedisInstrumentor().instrument(tracer_provider=tp)
-            logger.info("OTel outbound instrumentation: HTTPX + urllib3 + Redis")
+            logger.info(
+                "OTel outbound instrumentation: HTTPX (peer.service map=%s) + urllib3 + Redis",
+                peer_service_map,
+            )
         except Exception as e:
             logger.warning("Outbound OTel instrumentation failed: %s", e)
 
