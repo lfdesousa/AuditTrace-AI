@@ -54,6 +54,11 @@ class SessionRecord(Base):
     # store. Nullable until Phase 5 flips it after backfill + isolation
     # tests.
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # ADR-030 Part 2. NULL = never summarised. A value older than the
+    # session's max interaction timestamp means "stale — re-summarise".
+    summarized_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
 
 
 class InteractionRecord(Base):

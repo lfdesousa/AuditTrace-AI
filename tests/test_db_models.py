@@ -46,7 +46,8 @@ class TestSessionRecordSchema:
     def test_columns_exist(self, engine):
         inspector = inspect(engine)
         columns = {col["name"] for col in inspector.get_columns("sessions")}
-        # user_id added in Phase 0 of multi-user identity (DESIGN doc)
+        # user_id (Phase 0 multi-user identity) and summarized_at
+        # (ADR-030 Part 2 background summariser) are later additions.
         assert columns == {
             "id",
             "project",
@@ -55,6 +56,7 @@ class TestSessionRecordSchema:
             "key_points",
             "model",
             "user_id",
+            "summarized_at",
         }
 
     def test_primary_key_is_id(self, engine):
