@@ -12,7 +12,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sovereign_memory.server import urllib3_set_server_address
+from sovereign_memory.server import (
+    _build_httpx_peer_service_map,
+    make_httpx_peer_service_hook,
+    urllib3_set_server_address,
+)
 
 
 def _mk_span(is_recording: bool = True) -> MagicMock:
@@ -78,3 +82,83 @@ class TestUrllib3SetServerAddress:
         )
         span.set_attribute.assert_any_call("server.address", "api.example.com")
         span.set_attribute.assert_any_call("server.port", 8443)
+
+
+class TestBuildHttpxPeerServiceMap:
+    """The per-port label map is built from Settings at lifespan start,
+    so changing an LLM endpoint URL propagates to the service-graph
+    label automatically."""
+
+    def test_maps_all_three_llm_endpoints(self):
+        settings = SimpleNamespace(
+            llama_url="http://host.docker.internal:11435/v1",
+            embed_url="http://host.docker.internal:11436/v1",
+            summarizer_url="http://host.docker.internal:11437/v1",
+        )
+        got = _build_httpx_peer_service_map(settings)
+        assert got == {
+            11435: "qwen-chat-llm",
+            11436: "nomic-embed-server",
+            11437: "mistral-summariser-llm",
+        }
+
+    def test_omits_entry_when_port_is_missing(self):
+        """A URL without a port (http://host/path) contributes nothing
+        to the map; the edge falls back to server.address."""
+        settings = SimpleNamespace(
+            llama_url="http://llama/v1",
+            embed_url="http://host:11436/v1",
+            summarizer_url=None,
+        )
+        got = _build_httpx_peer_service_map(settings)
+        assert got == {11436: "nomic-embed-server"}
+
+    def test_empty_settings_produces_empty_map(self):
+        settings = SimpleNamespace(llama_url=None, embed_url=None, summarizer_url=None)
+        assert _build_httpx_peer_service_map(settings) == {}
+
+
+class TestHttpxPeerServiceHook:
+    """The hook sets peer.service from the URL port via a closed-over map.
+    Tempo's service-graph processor reads peer.service ahead of
+    server.address, so this produces one semantic edge per endpoint."""
+
+    def _hook_with_defaults(self):
+        mapping = {
+            11435: "qwen-chat-llm",
+            11437: "mistral-summariser-llm",
+        }
+        return make_httpx_peer_service_hook(mapping)
+
+    def test_sets_peer_service_for_known_port(self):
+        span = _mk_span()
+        hook = self._hook_with_defaults()
+        hook(span, _mk_request("http://host.docker.internal:11437/v1/chat/completions"))
+        span.set_attribute.assert_any_call("peer.service", "mistral-summariser-llm")
+
+    def test_does_not_set_for_unknown_port(self):
+        """Ports not in the map fall back to server.address — the hook
+        must not emit a misleading peer.service for chromadb etc."""
+        span = _mk_span()
+        hook = self._hook_with_defaults()
+        hook(span, _mk_request("http://chromadb:8000/api/v2/foo"))
+        keys = [c.args[0] for c in span.set_attribute.call_args_list]
+        assert "peer.service" not in keys
+
+    def test_no_op_on_none_span(self):
+        hook = self._hook_with_defaults()
+        # Must not raise.
+        hook(None, _mk_request("http://host.docker.internal:11435/v1/x"))
+
+    def test_no_op_on_non_recording_span(self):
+        span = _mk_span(is_recording=False)
+        hook = self._hook_with_defaults()
+        hook(span, _mk_request("http://host.docker.internal:11435/v1/x"))
+        span.set_attribute.assert_not_called()
+
+    def test_no_op_when_url_has_no_port(self):
+        span = _mk_span()
+        hook = self._hook_with_defaults()
+        hook(span, _mk_request("http://host/path"))
+        keys = [c.args[0] for c in span.set_attribute.call_args_list]
+        assert "peer.service" not in keys
