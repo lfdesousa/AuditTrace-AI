@@ -1,51 +1,109 @@
-# Sequence Diagram: OAuth2 + Identity Resolution (DESIGN §15)
+# Sequence Diagram: OAuth2 + Identity Resolution (DESIGN §15, ADR-032)
 
-> **Updated 2026-04-11** for the §15 refactor: identity is delegated entirely
-> to Keycloak, with a Redis-backed token cache for the hot path. The
-> previous PAT model from Phase 0/1 was dropped via Alembic migration 004
-> (forward migration). See `ADR-026` §15 for the
-> mental model.
+> **Updated 2026-04-15** for ADR-032 (OAuth2 Device Authorization Grant
+> + multi-issuer JWT validation). Prior updates: 2026-04-11 for the §15
+> refactor (Keycloak-delegated identity + Redis-backed token cache).
+>
+> The previous PAT model from Phase 0/1 was dropped via Alembic migration
+> 004. Authentication today is two flows side-by-side: **Device Flow for
+> humans** (this document's headline path) and **client_credentials for
+> service accounts** (CI, smoke tests).
 
-## Token acquisition (OAuth2 device flow — for human users)
+## The three-script surface (ADR-032)
 
-The agent (OpenCode, Continue, Roo Code) runs an interactive `auth login`
-once per machine. The user authenticates against Keycloak via a browser,
-the agent caches the resulting JWT plus a refresh token, and uses the
-access token on every subsequent request.
+Three CLI tools ship with the Device Flow; everything else in this
+document is the protocol they implement.
+
+| Script | Role |
+|---|---|
+| `scripts/audittrace-login` | User-facing login: interactive Device Flow (default), `--show` (print access_token, silent refresh), `--ensure` (refresh-if-needed, exit 0 on valid), `--logout` (delete tokens). Tokens land in `~/.config/audittrace/tokens.json` mode 0600. |
+| `scripts/opencode-wrapper.sh` | Canonical OpenCode launcher. Runs `--ensure`, merges `Authorization: Bearer <token>` into every provider in `~/.config/opencode/config.json`, execs `opencode`. One-command session start. |
+| `scripts/setup-human-user.sh` | Realm provisioner for already-running Keycloak instances that pre-date ADR-032. Uses the master-realm admin API to create the `audittrace-opencode` public client + `luis` realm user. Idempotent. |
+
+## Token acquisition (OAuth2 Device Flow — for human users)
+
+The human runs `scripts/audittrace-login` once per machine. Keycloak
+returns a `user_code` + `verification_uri_complete`; the user opens
+that URL in any browser, logs in, and the script's polling loop picks
+up the access_token + refresh_token. Tokens persist to
+`~/.config/audittrace/tokens.json` (mode 0600) with absolute expiry
+timestamps so no consumer has to track "when did I fetch this".
 
 ```mermaid
 sequenceDiagram
     participant User as Luis (human)
-    participant Agent as OpenCode CLI
+    participant CLI as scripts/audittrace-login
     participant Browser as Browser
-    participant KC as Keycloak\nsovereign-ai realm
+    participant KC as Keycloak\nsovereign-ai realm\n(Traefik-fronted :443)
 
-    User->>Agent: opencode auth login
-    Agent->>KC: POST /protocol/openid-connect/auth/device\nclient_id=opencode\nscope=memory:read memory:admin
-    KC-->>Agent: {device_code, user_code, verification_uri_complete}
+    User->>CLI: scripts/audittrace-login
+    CLI->>KC: POST /realms/sovereign-ai/protocol/openid-connect/auth/device\nclient_id=audittrace-opencode\nscope=openid sovereign-ai:query sovereign-ai:context\n      sovereign-ai:audit memory:episodic:read\n      memory:procedural:read memory:conversational:read-own\n      memory:semantic:read
+    KC-->>CLI: {device_code, user_code, verification_uri,\nverification_uri_complete, expires_in: 600, interval: 5}
 
-    Agent->>User: Open this URL: <verification_uri_complete>
+    CLI->>User: Open URL + enter code (or follow verification_uri_complete)
     User->>Browser: visit URL
-    Browser->>KC: GET /device?user_code=ABCD-EFGH
+    Browser->>KC: GET /realms/sovereign-ai/device?user_code=XXXX-YYYY
     KC->>Browser: login form
-    User->>Browser: username + password (+ MFA)
+    User->>Browser: username=luis + password
     Browser->>KC: POST credentials
-    KC-->>Browser: consent screen
+    KC-->>Browser: consent screen (if first time)
     User->>Browser: approve
     Browser->>KC: POST consent
 
-    Agent->>KC: POST /token (polling)\ngrant_type=urn:ietf:params:oauth:grant-type:device_code\ndevice_code=...
-    KC-->>Agent: {access_token: "<JWT>", refresh_token: "<...>",\nexpires_in: 3600, token_type: "Bearer"}
+    rect rgb(230, 240, 250)
+        Note over CLI,KC: Polling loop — every `interval` seconds until expires_in
+        CLI->>KC: POST /token\ngrant_type=urn:ietf:params:oauth:grant-type:device_code\nclient_id=audittrace-opencode\ndevice_code=...
+        Note over KC: First polls: {error: authorization_pending}\nOnce user approves: {access_token, refresh_token, ...}
+        KC-->>CLI: {access_token, refresh_token,\nexpires_in (access, seconds),\nrefresh_expires_in (refresh, seconds),\ntoken_type: "Bearer"}
+    end
 
-    Note over Agent: Cache JWT in ~/.config/opencode/token\n(refreshable for ~7 days)
+    Note over CLI: Persist ~/.config/audittrace/tokens.json (mode 0600):\n{access_token, refresh_token,\n access_expires_at: now + expires_in,\n refresh_expires_at: now + refresh_expires_in,\n realm_issuer, client_id}
+    CLI-->>User: ✅ logged in — tokens saved
 ```
+
+## Token refresh (silent, inside the SSO session lifetime)
+
+`audittrace-login --show` and `--ensure` check the saved
+`access_expires_at` against now. If the access token is within
+`REFRESH_THRESHOLD_SECONDS` (default 60) of expiry, the CLI silently
+posts a `refresh_token` grant, overwrites `tokens.json` with the new
+pair, and returns. Callers (wrappers, ad-hoc scripts) never see a
+401 from expired tokens while the refresh chain still holds.
+
+```mermaid
+sequenceDiagram
+    participant Caller as opencode-wrapper.sh\nor BEARER=$(audittrace-login --show)
+    participant CLI as audittrace-login
+    participant FS as ~/.config/audittrace/tokens.json
+    participant KC as Keycloak
+
+    Caller->>CLI: --show (or --ensure)
+    CLI->>FS: read access_expires_at, refresh_token
+    alt access_expires_at - now > 60s (REFRESH_THRESHOLD_SECONDS)
+        Note over CLI: plenty of life left — return current access_token as-is
+        CLI-->>Caller: access_token
+    else near expiry
+        CLI->>KC: POST /token\ngrant_type=refresh_token\nclient_id=audittrace-opencode\nrefresh_token=...
+        KC-->>CLI: {access_token, refresh_token,\nexpires_in, refresh_expires_in}
+        CLI->>FS: overwrite tokens.json (mode 0600)
+        CLI-->>Caller: fresh access_token
+    end
+```
+
+After the refresh chain itself expires (realm `ssoSessionMaxLifespan`
++ `offlineSessionIdleTimeout`, both set to 30 days in our realm JSON),
+`--ensure` exits non-zero; the wrapper falls back to the interactive
+login path.
 
 ## Token acquisition (OAuth2 client_credentials — for service accounts)
 
-Headless agents (CI jobs, automation) use a Keycloak service account
-client with `private_key_jwt`. Same outcome as the device flow — a
-standard Keycloak JWT. **No PATs anywhere in the system after the §15
-refactor.**
+Headless agents (CI jobs, automation, smoke tests) use
+`sovereign-memory-dev` via `client_credentials`. Same output shape —
+a Keycloak-signed JWT — but the token's `iss` claim carries the
+**internal** docker-network hostname because the client authenticates
+from inside the stack (see `scripts/mint-dev-jwt.sh`). **No PATs
+anywhere in the system after the §15 refactor.** See ADR-032 §2 for
+why both issuer values coexist.
 
 ```mermaid
 sequenceDiagram
@@ -126,7 +184,7 @@ sequenceDiagram
         Note over Auth,KC: COLD PATH — ~1-2ms
         Auth->>KC: GET /realms/sovereign-ai/protocol/openid-connect/certs\n(JWKS — cached 5 min in _jwks_cache)
         KC-->>Auth: {"keys": [...]}
-        Auth->>Auth: jwt.decode(token, keys, RS256, aud, iss)
+        Auth->>Auth: _decode_jwt_with_allowed_issuers(token, keys, aud,\n  primary=keycloak_issuer,\n  extras=keycloak_issuer_extras)\n  1. jwt.decode(token, keys, RS256, audience) — no single-issuer lock\n  2. cross-check payload.iss against {primary} ∪ extras (ADR-032 §2)
     end
 
     Auth->>Auth: Build UserContext from claims:\nuser_id = sub\nusername = preferred_username\nscopes = scope.split()\ntoken_id = jti\nis_admin = is_admin_scope(scopes)
@@ -200,20 +258,37 @@ the full reasoning. Tighter revocation is one config flip away
 
 Scopes come from the Keycloak realm — NOT from a local roles→scopes
 mapping table. The realm administrator configures which OAuth2 scopes
-are granted to which clients via the Keycloak admin console. The
-`scope` claim in the JWT is authoritative.
+are granted to which clients via the Keycloak admin console (or, in
+our case, via the shipped `keycloak/realm-sovereign-ai.json` +
+`scripts/setup-human-user.sh`). The `scope` claim in the JWT is
+authoritative.
 
-| Scope | Granted to | What it allows |
+The sovereign-ai realm declares these nine client-scopes (source of
+truth: `keycloak/realm-sovereign-ai.json`):
+
+| Scope | Granted to | What it gates |
 |---|---|---|
-| `memory:read` | every authenticated user | call `recall_*` tools (when memory-as-tools lands) |
-| `memory:read-decisions` | members + senior | search ADRs specifically |
-| `memory:read-sessions` | senior + admin | read past chat sessions |
-| `memory:admin` | admin only | full memory access; bypass scoping |
-| `admin:tokens:read` | admin only | list issued tokens |
-| `admin:tokens:write` | admin only | issue / revoke tokens (when implemented) |
-| `admin:audit:read` | admin + auditor | read the immutable audit trail |
-| `session:read-own` | every authenticated user | read your own session history |
+| `sovereign-ai:query` | every authenticated client | `/v1/chat/completions`, `/session/save` |
+| `sovereign-ai:context` | humans + context-builder clients | `/context` endpoint |
+| `sovereign-ai:audit` | humans + admin-client | `/interactions` audit endpoint (ADR-029) |
+| `sovereign-ai:index` | `inject-memory` client only | write-side memory indexing |
+| `sovereign-ai:admin` | `admin-client` only | `/metrics` + admin-only ops |
+| `memory:episodic:read` | humans + dev client | `recall_decisions` tool (ADR-025) — read ADRs |
+| `memory:procedural:read` | humans + dev client | `recall_skills` tool — read SKILL files |
+| `memory:conversational:read-own` | humans + dev client | `recall_recent_sessions` tool — read your own chat history |
+| `memory:semantic:read` | humans + dev client | `recall_semantic` tool — vector search |
+
+**Client → scope matrix** (shipped defaults):
+
+| Client | Flow | Default scopes |
+|---|---|---|
+| `audittrace-opencode` (ADR-032, humans) | Device Flow | `sovereign-ai:query`, `:context`, `:audit`, all four `memory:*` |
+| `sovereign-memory-dev` (CI / smoke) | client_credentials | identical to `audittrace-opencode` — so the dev path exercises the full scope surface |
+| `opencode-agent`, `continue-agent`, `roocode-agent` | client-JWT client_credentials | `sovereign-ai:query` only (legacy, pre-ADR-032) |
+| `inject-memory` | client-JWT | `sovereign-ai:context`, `:index` |
+| `admin-client` | client-JWT | `sovereign-ai:admin`, `:audit` |
 
 `is_admin` in the resolved `UserContext` is derived programmatically
-via `is_admin_scope()` — true if any `memory:admin` or `admin:*` scope
-is present.
+via `is_admin_scope()` — true when the `sovereign-ai:admin` scope is
+present. No `memory:admin` or `admin:*` scope exists in the realm;
+admin capability flows through `sovereign-ai:admin` only.

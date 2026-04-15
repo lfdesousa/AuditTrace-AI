@@ -8,6 +8,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         // Actors
         agent = person "Coding Agent" "OpenCode, Roo Code, Continue — any OpenAI-compatible client"
         architect = person "Luis Filipe" "Solutions Architect — configures memory layers and ADRs"
+        humanUser = person "Human User" "Browser-capable human authenticating via OAuth2 Device Flow (RFC 8628, ADR-032) so every agent request carries a real Keycloak sub on the audit trail instead of the flat dev-client identity"
 
         // External systems
         llamaServer = softwareSystem "Chat LLM Server" "Qwen3.5-35B-A3B Q4_K_M on :11435 — chat + tool-loop reasoning (GPU, ROCm)" {
@@ -22,7 +23,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         langfuse = softwareSystem "Langfuse" "Observability — traces, spans, metrics (sibling stack)" {
             tags "External"
         }
-        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs (ADR-022, DESIGN §15)" {
+        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; sovereign-memory-dev serves the CI / smoke-test path." {
             tags "External"
         }
         observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
@@ -39,7 +40,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 healthRoute = component "Health Route" "/health, /metrics" "FastAPI Router"
 
                 // Identity layer (DESIGN §15) — replaces the Phase 0/1 PAT model
-                requireUser = component "require_user" "FastAPI dependency: validates Keycloak JWT, returns typed UserContext (DESIGN §15)" "auth.py"
+                requireUser = component "require_user" "FastAPI dependency: validates Keycloak JWT via JWKS, accepts iss from the union of keycloak_issuer + keycloak_issuer_extras (ADR-032 §2 — lets Device-Flow tokens on the Traefik-exposed issuer coexist with service-account tokens on the internal issuer), returns typed UserContext (DESIGN §15)" "auth.py"
                 tokenCache = component "TokenCache" "sha256(token) → UserContext, TTL eviction, Redis-backed (DESIGN §15.4)" "identity.py"
                 requireScope = component "require_scope (legacy)" "JWT scope check returning raw payload dict (ADR-022, ADR-023)" "auth.py"
 
@@ -80,7 +81,9 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         }
 
         // Relationships — system level
-        agent -> keycloak "OAuth2 device flow → JWT" "HTTPS/OIDC"
+        humanUser -> keycloak "Interactive Device Flow login via browser (client_id=audittrace-opencode) — ADR-032" "HTTPS/OIDC"
+        humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
+        agent -> keycloak "Token refresh + service-account client_credentials (sovereign-memory-dev)" "HTTPS/OIDC"
         agent -> memoryServer.api "POST /v1/chat/completions (Bearer JWT)" "HTTPS/JSON"
         architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
         memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
