@@ -32,7 +32,10 @@ set -euo pipefail
 
 # ───────────────────────────── config ─────────────────────────────
 
-KEYCLOAK_BASE="${KEYCLOAK_BASE:-http://localhost:8080}"
+# Keycloak is fronted by Traefik on :443 (see docker-compose.yml). The
+# bare :8080 port is Traefik's own dashboard. Override if you're
+# running Keycloak standalone on another host.
+KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://localhost}"
 REALM="${KEYCLOAK_REALM:-sovereign-ai}"
 CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
 
@@ -262,7 +265,7 @@ Usage:
   audittrace-login --logout        Delete the saved token pair
 
 Environment overrides:
-  KEYCLOAK_BASE            (default http://localhost:8080)
+  KEYCLOAK_BASE            (default https://localhost — Traefik-fronted)
   KEYCLOAK_REALM           (default sovereign-ai)
   CLIENT_ID                (default audittrace-opencode)
   AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
