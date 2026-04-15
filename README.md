@@ -237,7 +237,7 @@ All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQ
 
 ## Observability Stack (ADR-028)
 
-Sibling Docker Compose stack following the Langfuse pattern (ADR-021.2). Provides metrics aggregation, log search, and dashboards.
+Sibling Docker Compose stack following the Langfuse pattern (ADR-021.2). Provides metrics aggregation, log search, and dashboards. Lives in its own repository at [lfdesousa/AiSovereignObservability](https://github.com/lfdesousa/AiSovereignObservability) — clone alongside this repo for the full observability surface.
 
 ```bash
 # Start the observability stack
