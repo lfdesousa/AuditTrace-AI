@@ -480,6 +480,81 @@ class TestRunOnce:
             db.close()
 
     @pytest.mark.asyncio
+    async def test_never_summarised_beats_backlog_of_up_to_date(self, pg_factory):
+        """Regression guard (2026-04-15): with max_per_cycle=10 and a
+        backlog of 20 already-up-to-date sessions older than an
+        unsummarised session, the old ordering (``last_ts ASC`` only)
+        starved the unsummarised row because the oldest 30 fetched
+        rows were all fresh-enough-already. Fixed by
+        ``ORDER BY (summarized_at IS NULL) DESC`` — unsummarised rows
+        are prioritised regardless of their relative age."""
+        db = pg_factory.get_session_factory()()
+        try:
+            # 20 old sessions, all already summarised AFTER their last
+            # interaction — up-to-date, should never be picked.
+            for idx in range(20):
+                sid = f"sess-old-{idx:02d}"
+                db.add_all(
+                    [
+                        InteractionRecord(
+                            project="P",
+                            source="chat",
+                            question="q",
+                            answer="a",
+                            timestamp=_iso_minutes_ago(120 + idx),
+                            session_id=sid,
+                            user_id="user-1",
+                        ),
+                        SessionRecord(
+                            id=sid,
+                            project="P",
+                            date=_iso_minutes_ago(100),
+                            summary=f"up-to-date {idx}",
+                            key_points="[]",
+                            model="mistral-7b-summarizer",
+                            user_id="user-1",
+                            summarized_at=datetime.now() - timedelta(minutes=90),
+                        ),
+                    ]
+                )
+            # One NEVER-summarised session, NEWER than the backlog
+            # head but still past the idle threshold.
+            db.add(
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="new q",
+                    answer="new a",
+                    timestamp=_iso_minutes_ago(30),
+                    session_id="sess-fresh-but-unsummarised",
+                    user_id="user-1",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_max_per_cycle=10),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        await summariser.run_once()
+
+        db = pg_factory.get_session_factory()()
+        try:
+            # The unsummarised session must have been picked despite
+            # being newer than the 20-session backlog.
+            assert (
+                db.query(SessionRecord)
+                .filter_by(id="sess-fresh-but-unsummarised")
+                .one_or_none()
+                is not None
+            )
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     async def test_per_user_attribution(self, pg_factory):
         """Two idle sessions for different users → each SessionRecord
         carries its own user_id (no cross-user leakage)."""

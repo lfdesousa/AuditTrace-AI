@@ -88,7 +88,13 @@ _ELIGIBILITY_SQL = text(
     ) sub
     LEFT JOIN sessions s ON s.id = sub.session_id
     WHERE sub.last_ts < :threshold
-    ORDER BY sub.last_ts ASC
+    -- Never-summarised rows first (summarized_at IS NULL sorts before
+    -- NOT NULL when we order by the IS NULL expression DESC). Within
+    -- each group, oldest idle first so we drain legacy backlogs
+    -- before touching recent activity. Without this ordering, a
+    -- populated backlog of already-summarised sessions at the head
+    -- of the ASC-by-last_ts list starves the never-summarised ones.
+    ORDER BY (s.summarized_at IS NULL) DESC, sub.last_ts ASC
     LIMIT :fetch_limit
     """
 )
