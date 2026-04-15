@@ -26,15 +26,17 @@ class TestMockConversationalService:
 
     def test_mock_save_and_load(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "AuditTrace", "Test summary", ["point1"])
+        service.save_session(
+            user_context, "AuditTrace", "Test summary", ["point1"], session_id="s1"
+        )
         sessions = service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 1
         assert sessions[0]["summary"] == "Test summary"
 
     def test_mock_filters_by_project(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "ProjectA", "Summary A", [])
-        service.save_session(user_context, "ProjectB", "Summary B", [])
+        service.save_session(user_context, "ProjectA", "Summary A", [], session_id="a1")
+        service.save_session(user_context, "ProjectB", "Summary B", [], session_id="b1")
         assert len(service.load_sessions(user_context, "ProjectA")) == 1
         assert len(service.load_sessions(user_context, "ProjectB")) == 1
 
@@ -44,8 +46,12 @@ class TestMockConversationalService:
         service = MockConversationalService()
         alice = replace(user_context, user_id="user-alice", is_admin=False)
         bob = replace(user_context, user_id="user-bob", is_admin=False)
-        service.save_session(alice, "SharedProject", "Alice summary", [])
-        service.save_session(bob, "SharedProject", "Bob summary", [])
+        service.save_session(
+            alice, "SharedProject", "Alice summary", [], session_id="alice-1"
+        )
+        service.save_session(
+            bob, "SharedProject", "Bob summary", [], session_id="bob-1"
+        )
         alice_sessions = service.load_sessions(alice, "SharedProject")
         bob_sessions = service.load_sessions(bob, "SharedProject")
         assert len(alice_sessions) == 1
@@ -55,7 +61,7 @@ class TestMockConversationalService:
 
     def test_mock_reset(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "P", "S", [])
+        service.save_session(user_context, "P", "S", [], session_id="reset-1")
         service.reset()
         assert service.load_sessions(user_context, "P") == []
 
@@ -64,7 +70,7 @@ class TestMockConversationalService:
 
     def test_mock_as_context_passes_through(self, user_context):
         service = MockConversationalService()
-        service.save_session(user_context, "P", "A summary", ["k1"])
+        service.save_session(user_context, "P", "A summary", ["k1"], session_id="ctx-1")
         ctx = service.as_context(user_context, "P")
         assert "Recent Sessions" in ctx
         assert "A summary" in ctx

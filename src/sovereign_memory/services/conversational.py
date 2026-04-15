@@ -47,8 +47,19 @@ class ConversationalService(ABC):
         project: str,
         summary: str,
         key_points: list[str] | None = None,
+        *,
+        session_id: str,
     ) -> str:
-        """Save a session summary. Returns session ID."""
+        """Save a session summary. Returns the persisted session_id.
+
+        ADR-030 contract: ``session_id`` is required and kw-only so callers
+        cannot accidentally rely on the old timestamp-style auto-generation.
+        For chat-session summaries, pass the ``InteractionRecord.session_id``
+        so ``recall_recent_sessions`` can merge real + synthetic rows on a
+        single primary-key join. For manual/admin summaries that do not
+        correspond to a chat session, any stable string works (the route
+        layer generates a UUID when the client does not supply one).
+        """
 
     @abstractmethod
     def as_context(self, user_context: UserContext, project: str) -> str:
@@ -178,17 +189,18 @@ class PostgresConversationalService(ConversationalService):
         project: str,
         summary: str,
         key_points: list[str] | None = None,
+        *,
+        session_id: str,
     ) -> str:
-        """Save a session summary to PostgreSQL. Returns session ID.
+        """Save a session summary to PostgreSQL under the given session_id.
 
         The row is stamped with ``user_context.user_id`` so subsequent
-        ``load_sessions`` calls for the same user see it.
+        ``load_sessions`` calls for the same user see it, and with the
+        caller-supplied ``session_id`` so the ADR-030 hybrid-recall join
+        (SessionRecord.id == InteractionRecord.session_id) lines up.
         """
         session = self._session_factory()
         try:
-            # Microsecond precision keeps row ids unique within a process
-            # when two saves (e.g. two users in a test) land in the same second.
-            session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             record = SessionRecord(
                 id=session_id,
                 project=project,
@@ -252,8 +264,9 @@ class MockConversationalService(ConversationalService):
         project: str,
         summary: str,
         key_points: list[str] | None = None,
+        *,
+        session_id: str,
     ) -> str:
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._sessions.append(
             {
                 "id": session_id,

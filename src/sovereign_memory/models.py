@@ -123,6 +123,18 @@ class SessionSummaryRequest(BaseModel):
     key_points: list[str] = Field(
         default_factory=list, description="Discrete decisions, facts, or milestones"
     )
+    # ADR-030 contract: callers summarising a real chat session should
+    # pass the chat session_id here so hybrid recall can merge this row
+    # with the matching interactions. Standalone summaries (admin,
+    # historical import) can omit — the route generates a UUID.
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Session identifier. Omit to have the server generate a UUID "
+            "for standalone summaries; pass the chat session_id when "
+            "summarising a chat the LLM participated in."
+        ),
+    )
 
 
 class SessionSummaryResponse(BaseModel):

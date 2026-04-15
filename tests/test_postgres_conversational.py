@@ -140,8 +140,9 @@ class TestPostgresConversationalService:
             "AuditTrace",
             "Test save",
             ["point1"],
+            session_id="creates-1",
         )
-        assert session_id is not None
+        assert session_id == "creates-1"
         sessions = empty_service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 1
         assert sessions[0]["summary"] == "Test save"
@@ -149,7 +150,9 @@ class TestPostgresConversationalService:
     def test_save_session_persists_user_id(self, empty_service, user_context):
         """Phase 2 write-side contract: save_session persists
         ``user_context.user_id`` on the SessionRecord row."""
-        empty_service.save_session(user_context, "P", "Summary", ["k1"])
+        empty_service.save_session(
+            user_context, "P", "Summary", ["k1"], session_id="uid-1"
+        )
         # Read back via raw query to see the column value, not the dict slice.
         from sqlalchemy.orm import Session as _Session
 
@@ -161,12 +164,20 @@ class TestPostgresConversationalService:
             sess.close()
 
     def test_save_session_persists(self, service, user_context):
-        service.save_session(user_context, "AuditTrace", "New session", ["k1", "k2"])
+        service.save_session(
+            user_context,
+            "AuditTrace",
+            "New session",
+            ["k1", "k2"],
+            session_id="new-1",
+        )
         sessions = service.load_sessions(user_context, "AuditTrace")
         assert len(sessions) == 3  # 2 existing + 1 new
 
     def test_save_session_key_points_default(self, empty_service, user_context):
-        empty_service.save_session(user_context, "P", "Summary")
+        empty_service.save_session(
+            user_context, "P", "Summary", session_id="kp-default-1"
+        )
         sessions = empty_service.load_sessions(user_context, "P")
         assert sessions[0]["key_points"] == []
 
@@ -188,8 +199,12 @@ class TestPostgresConversationalService:
         even for the same project. No admin bypass at this layer."""
         alice = replace(user_context, user_id="user-alice", is_admin=False)
         bob = replace(user_context, user_id="user-bob", is_admin=False)
-        empty_service.save_session(alice, "SharedProject", "Alice summary", [])
-        empty_service.save_session(bob, "SharedProject", "Bob summary", [])
+        empty_service.save_session(
+            alice, "SharedProject", "Alice summary", [], session_id="alice-cui-1"
+        )
+        empty_service.save_session(
+            bob, "SharedProject", "Bob summary", [], session_id="bob-cui-1"
+        )
 
         alice_sessions = empty_service.load_sessions(alice, "SharedProject")
         bob_sessions = empty_service.load_sessions(bob, "SharedProject")
@@ -206,7 +221,9 @@ class TestPostgresConversationalService:
         svc2 = PostgresConversationalService(
             session_factory=pg_factory.get_session_factory(),
         )
-        svc1.save_session(user_context, "Isolated", "From svc1", ["p1"])
+        svc1.save_session(
+            user_context, "Isolated", "From svc1", ["p1"], session_id="iso-1"
+        )
         # svc2 should see svc1's committed data (same engine)
         sessions = svc2.load_sessions(user_context, "Isolated")
         assert len(sessions) == 1

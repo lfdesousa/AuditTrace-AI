@@ -187,8 +187,20 @@ class TestCrossUserIsolation:
         Phase 2."""
         conv = container._instances["conversational"]
 
-        conv.save_session(alice, "shared-project", "alice: KV cache notes", ["a1"])
-        conv.save_session(bob, "shared-project", "bob: OAuth2 notes", ["b1"])
+        conv.save_session(
+            alice,
+            "shared-project",
+            "alice: KV cache notes",
+            ["a1"],
+            session_id="alice-kv-1",
+        )
+        conv.save_session(
+            bob,
+            "shared-project",
+            "bob: OAuth2 notes",
+            ["b1"],
+            session_id="bob-oauth-1",
+        )
 
         alice_sessions = conv.load_sessions(alice, "shared-project", n=10)
         bob_sessions = conv.load_sessions(bob, "shared-project", n=10)
@@ -210,7 +222,7 @@ class TestCrossUserIsolation:
         """Side-effect confirmation: the row actually lands with
         `user_id=alice.user_id`, not NULL or sentinel."""
         conv = container._instances["conversational"]
-        conv.save_session(alice, "P", "A", ["k"])
+        conv.save_session(alice, "P", "A", ["k"], session_id="alice-persist-1")
         # Mock stores it in self._sessions with user_id field
         assert conv._sessions[-1]["user_id"] == alice.user_id
 
@@ -304,8 +316,12 @@ class TestCrossUserIsolation:
         context includes the caller's conversational data but not
         the other user's."""
         conv = container._instances["conversational"]
-        conv.save_session(alice, "shared-project", "alice KV cache", [])
-        conv.save_session(bob, "shared-project", "bob OAuth2", [])
+        conv.save_session(
+            alice, "shared-project", "alice KV cache", [], session_id="alice-builder-1"
+        )
+        conv.save_session(
+            bob, "shared-project", "bob OAuth2", [], session_id="bob-builder-1"
+        )
 
         alice_builder = get_context_builder(alice)
         bob_builder = get_context_builder(bob)
@@ -340,8 +356,20 @@ class TestCrossUserIsolation:
         the per-user filter. Proves the Phase 3 tool-handler layer
         honours isolation end-to-end through invoke_tool."""
         conv = container._instances["conversational"]
-        conv.save_session(alice, "shared-project", "alice KV cache session", ["x"])
-        conv.save_session(bob, "shared-project", "bob OAuth2 session", ["y"])
+        conv.save_session(
+            alice,
+            "shared-project",
+            "alice KV cache session",
+            ["x"],
+            session_id="alice-handler-1",
+        )
+        conv.save_session(
+            bob,
+            "shared-project",
+            "bob OAuth2 session",
+            ["y"],
+            session_id="bob-handler-1",
+        )
 
         tool = get_tool_by_name("recall_recent_sessions")
         assert tool is not None
@@ -381,9 +409,9 @@ class TestCrossUserIsolation:
         # "no admin god read"; admin admin-ness is about scopes, not
         # data.
         conv = container._instances["conversational"]
-        conv.save_session(alice, "shared", "alice", [])
-        conv.save_session(bob, "shared", "bob", [])
-        conv.save_session(admin, "shared", "admin's own", [])
+        conv.save_session(alice, "shared", "alice", [], session_id="alice-admin-1")
+        conv.save_session(bob, "shared", "bob", [], session_id="bob-admin-1")
+        conv.save_session(admin, "shared", "admin's own", [], session_id="admin-own-1")
         admin_sessions = conv.load_sessions(admin, "shared", n=10)
         assert len(admin_sessions) == 1
         assert admin_sessions[0]["summary"] == "admin's own"
