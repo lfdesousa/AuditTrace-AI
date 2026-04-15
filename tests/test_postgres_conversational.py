@@ -15,7 +15,7 @@ from dataclasses import replace
 import pytest
 from sqlalchemy.orm import Session
 
-from sovereign_memory.db.models import SessionRecord
+from sovereign_memory.db.models import InteractionRecord, SessionRecord
 from sovereign_memory.db.postgres import InMemoryPostgresFactory
 from sovereign_memory.identity import SENTINEL_SUBJECT
 from sovereign_memory.services.conversational import (
@@ -210,3 +210,225 @@ class TestPostgresConversationalService:
         # svc2 should see svc1's committed data (same engine)
         sessions = svc2.load_sessions(user_context, "Isolated")
         assert len(sessions) == 1
+
+    def test_real_sessions_flagged_synthetic_false(self, service, user_context):
+        """ADR-030 Part 1: real summaries carry ``synthetic=False``."""
+        sessions = service.load_sessions(user_context, "AuditTrace")
+        assert all(s["synthetic"] is False for s in sessions)
+
+
+# ── ADR-030 Part 1 — hybrid recall_recent_sessions ───────────────────────────
+
+
+class TestHybridRecall:
+    """Hybrid recall: real ``sessions`` rows padded with synthetic rows
+    from ``interactions`` for session_ids not yet summarised by the
+    background loop (ADR-030 §3)."""
+
+    @pytest.fixture
+    def hybrid_factory(self, pg_factory, pg_session):
+        """Seed a mix of real sessions + interaction-only sessions so we
+        can exercise the merge path."""
+        pg_session.add_all(
+            [
+                # One real summary for session "sess-real" in project P.
+                SessionRecord(
+                    id="sess-real",
+                    project="P",
+                    date="2026-04-10T12:00:00",
+                    summary="Real summary for sess-real",
+                    key_points=json.dumps(["kp-real"]),
+                    model="mistral-7b",
+                    user_id=SENTINEL_SUBJECT,
+                ),
+                # Interactions belonging to sess-real — must NOT create a
+                # synthetic row because a real summary already exists.
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="Question for sess-real",
+                    answer="Answer for sess-real",
+                    timestamp="2026-04-10T11:55:00",
+                    session_id="sess-real",
+                    user_id=SENTINEL_SUBJECT,
+                ),
+                # Session "sess-draft-newer" — no real summary, most recent
+                # — should appear first after merge.
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="First Q in newer",
+                    answer="First A in newer",
+                    timestamp="2026-04-12T09:00:00",
+                    session_id="sess-draft-newer",
+                    user_id=SENTINEL_SUBJECT,
+                ),
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="Second Q in newer",
+                    answer="Last A in newer",
+                    timestamp="2026-04-12T09:30:00",
+                    session_id="sess-draft-newer",
+                    user_id=SENTINEL_SUBJECT,
+                ),
+                # Session "sess-draft-older" — no real summary, older than
+                # "sess-draft-newer".
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="Only Q in older",
+                    answer="Only A in older",
+                    timestamp="2026-04-11T15:00:00",
+                    session_id="sess-draft-older",
+                    user_id=SENTINEL_SUBJECT,
+                ),
+                # Orphan interaction with NULL session_id — must be ignored.
+                InteractionRecord(
+                    project="P",
+                    source="test",
+                    question="Orphan q",
+                    answer="Orphan a",
+                    timestamp="2026-04-13T10:00:00",
+                    session_id=None,
+                    user_id=SENTINEL_SUBJECT,
+                ),
+            ]
+        )
+        pg_session.commit()
+        return pg_factory
+
+    @pytest.fixture
+    def hybrid_service(self, hybrid_factory) -> PostgresConversationalService:
+        return PostgresConversationalService(
+            session_factory=hybrid_factory.get_session_factory(),
+        )
+
+    def test_merges_real_and_synthetic(self, hybrid_service, user_context):
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        ids = [s["id"] for s in sessions]
+        assert "sess-real" in ids
+        assert "sess-draft-newer" in ids
+        assert "sess-draft-older" in ids
+
+    def test_ordered_by_date_desc_across_shapes(self, hybrid_service, user_context):
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        # Newest first regardless of real/synthetic.
+        assert sessions[0]["id"] == "sess-draft-newer"
+        # sess-real (2026-04-10) comes before sess-draft-older (2026-04-11)?
+        # No — sess-draft-older is newer (04-11 > 04-10).
+        assert sessions[1]["id"] == "sess-draft-older"
+        assert sessions[2]["id"] == "sess-real"
+
+    def test_real_session_wins_over_interactions(self, hybrid_service, user_context):
+        """Even though sess-real has an InteractionRecord, only the real
+        SessionRecord should surface (no duplicate synthetic row)."""
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        sess_real = next(s for s in sessions if s["id"] == "sess-real")
+        assert sess_real["synthetic"] is False
+        assert sess_real["summary"] == "Real summary for sess-real"
+
+    def test_synthetic_flag_set(self, hybrid_service, user_context):
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        drafts = [s for s in sessions if s["id"].startswith("sess-draft-")]
+        assert len(drafts) == 2
+        assert all(s["synthetic"] is True for s in drafts)
+
+    def test_synthetic_summary_uses_first_q_and_last_a(
+        self, hybrid_service, user_context
+    ):
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        newer = next(s for s in sessions if s["id"] == "sess-draft-newer")
+        assert "First Q in newer" in newer["summary"]
+        assert "Last A in newer" in newer["summary"]
+        # Middle turn's answer must NOT be used as the last_a.
+        assert "First A in newer" not in newer["summary"]
+
+    def test_null_session_id_interactions_excluded(self, hybrid_service, user_context):
+        """Orphan interactions (NULL session_id) must not leak into any
+        synthetic row and must not surface as a standalone match."""
+        sessions = hybrid_service.load_sessions(user_context, "P")
+        for s in sessions:
+            assert "Orphan" not in s["summary"]
+
+    def test_respects_n_after_merge(self, hybrid_service, user_context):
+        sessions = hybrid_service.load_sessions(user_context, "P", n=2)
+        assert len(sessions) == 2
+        # Top-2 by recency across shapes.
+        assert sessions[0]["id"] == "sess-draft-newer"
+        assert sessions[1]["id"] == "sess-draft-older"
+
+    def test_cross_user_isolation_on_synthetic_rows(
+        self, pg_factory, pg_session, user_context
+    ):
+        """Bob's interactions must not produce synthetic rows for Alice."""
+        pg_session.add(
+            InteractionRecord(
+                project="P",
+                source="test",
+                question="Bob's question",
+                answer="Bob's answer",
+                timestamp="2026-04-14T10:00:00",
+                session_id="sess-bob",
+                user_id="user-bob",
+            )
+        )
+        pg_session.commit()
+        svc = PostgresConversationalService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+        alice = replace(user_context, user_id="user-alice", is_admin=False)
+        sessions = svc.load_sessions(alice, "P")
+        assert all(s["id"] != "sess-bob" for s in sessions)
+
+    def test_cross_project_isolation_on_synthetic_rows(
+        self, pg_factory, pg_session, user_context
+    ):
+        """Interactions in project Q must not produce synthetic rows for P."""
+        pg_session.add(
+            InteractionRecord(
+                project="Q",
+                source="test",
+                question="Project Q question",
+                answer="Project Q answer",
+                timestamp="2026-04-14T10:00:00",
+                session_id="sess-q",
+                user_id=SENTINEL_SUBJECT,
+            )
+        )
+        pg_session.commit()
+        svc = PostgresConversationalService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+        sessions = svc.load_sessions(user_context, "P")
+        assert all(s["id"] != "sess-q" for s in sessions)
+
+    def test_only_interactions_no_real_sessions(
+        self, pg_factory, pg_session, user_context
+    ):
+        """Cold-start case: no summaries at all, only raw interactions.
+        This is the ADR-030 day-one promise — the tool must not return []."""
+        pg_session.add(
+            InteractionRecord(
+                project="NEW",
+                source="test",
+                question="Cold-start q",
+                answer="Cold-start a",
+                timestamp="2026-04-14T11:00:00",
+                session_id="sess-cold",
+                user_id=SENTINEL_SUBJECT,
+            )
+        )
+        pg_session.commit()
+        svc = PostgresConversationalService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+        sessions = svc.load_sessions(user_context, "NEW")
+        assert len(sessions) == 1
+        assert sessions[0]["id"] == "sess-cold"
+        assert sessions[0]["synthetic"] is True
+
+    def test_as_context_labels_synthetic(self, hybrid_service, user_context):
+        ctx = hybrid_service.as_context(user_context, "P")
+        assert "Session (draft)" in ctx
+        assert "Session" in ctx  # Real one is also rendered.
