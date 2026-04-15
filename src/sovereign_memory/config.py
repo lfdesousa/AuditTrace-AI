@@ -129,6 +129,17 @@ class Settings(BaseSettings):
     summarizer_url: str = "http://host.docker.internal:11437/v1"
     summarizer_model: str = "mistral-7b-summarizer"
 
+    # Optional dedicated database URL for the summariser worker. The
+    # main memory-server connects as the non-superuser ``sovereign_app``
+    # role so RLS policies apply to every proxy query (ADR-026 §16
+    # Phase 4). The summariser is an admin-grade batch worker that
+    # must read across every user's interactions to build audit-time
+    # summaries; that requires the owner role so
+    # ``SET LOCAL row_security = off`` (in the read transaction)
+    # actually bypasses RLS. When unset, falls back to the main
+    # ``database_url`` (useful for tests where RLS is a no-op).
+    summarizer_postgres_url: str | None = None
+
     # Kill switch. When False the background task is never started, even if
     # the server is otherwise configured correctly.
     summarizer_enabled: bool = True
@@ -170,6 +181,20 @@ class Settings(BaseSettings):
                 f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
             )
         return None
+
+    @property
+    def summarizer_database_url(self) -> str | None:
+        """URL for the summariser's Postgres connection.
+
+        Prefers the explicit ``summarizer_postgres_url`` (owner-role
+        credentials) so the RLS-bypass ``SET LOCAL row_security = off``
+        in the read transaction actually takes effect. Falls back to
+        the main ``database_url`` when unset — acceptable for tests
+        (SQLite has no RLS) and single-tenant dev deployments.
+        """
+        if self.summarizer_postgres_url:
+            return self.summarizer_postgres_url
+        return self.database_url
 
     @property
     def langfuse_enabled_flag(self) -> bool:
