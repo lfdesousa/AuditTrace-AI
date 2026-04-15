@@ -1010,6 +1010,15 @@ def parse_args() -> argparse.Namespace:
         help="Print what would run without touching .env, docker, or the proxy.",
     )
     parser.add_argument(
+        "--category",
+        default=None,
+        help=(
+            "Restrict the prompt set to one category "
+            "(decisions | skills | recent_sessions | semantic | ambiguous | control). "
+            "Default: no filter (first N from the full set, which is 25 decisions first)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python log level (default: INFO).",
@@ -1028,7 +1037,23 @@ def main() -> int:
         logger.error("docker binary not found on PATH")
         return 2
 
-    prompts = PROMPTS[: args.n_per_mode]
+    if args.category:
+        filtered = [p for p in PROMPTS if p[2] == args.category]
+        if not filtered:
+            valid = sorted({p[2] for p in PROMPTS})
+            logger.error(
+                "unknown category %r; valid values: %s", args.category, ", ".join(valid)
+            )
+            return 2
+        prompts = filtered[: args.n_per_mode]
+        logger.info(
+            "category filter: %s (%d available, %d selected)",
+            args.category,
+            len(filtered),
+            len(prompts),
+        )
+    else:
+        prompts = PROMPTS[: args.n_per_mode]
     if len(prompts) < args.n_per_mode:
         logger.warning(
             "only %d prompts defined; requested %d",
