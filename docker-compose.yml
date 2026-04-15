@@ -88,6 +88,12 @@ services:
       - SOVEREIGN_AUTH_REQUIRED=${SOVEREIGN_AUTH_REQUIRED:-true}
       - SOVEREIGN_KEYCLOAK_ISSUER=http://keycloak:8080/realms/sovereign-ai
       - SOVEREIGN_KEYCLOAK_JWKS_URL=http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs
+      # ADR-032: Device-Flow tokens ride the Traefik-exposed URL and
+      # carry a different ``iss`` than the internal docker-network one
+      # used by service-account flows. Accepting both keeps the
+      # memory-server usable from BOTH token families without
+      # relaxing validation to skip issuer entirely.
+      - SOVEREIGN_KEYCLOAK_ISSUER_EXTRAS=["http://localhost/realms/sovereign-ai","https://localhost/realms/sovereign-ai"]
       - SOVEREIGN_JWT_AUDIENCE=sovereign-memory-server
       # Redis-backed token cache (ADR-026 §15.4)
       - SOVEREIGN_REDIS_URL=redis://redis:6379/0

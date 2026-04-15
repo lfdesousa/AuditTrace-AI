@@ -64,6 +64,7 @@ def _mock_settings(**overrides):
     defaults = {
         "auth_enabled": True,
         "keycloak_issuer": TEST_ISSUER,
+        "keycloak_issuer_extras": [],
         "keycloak_jwks_url": "http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs",
         "jwt_audience": TEST_AUDIENCE,
     }
@@ -306,6 +307,64 @@ class TestAuthSuccess:
             assert payload["sub"] == "opencode-agent"
             assert payload["iss"] == TEST_ISSUER
             assert "sovereign-ai:query" in payload["scope"]
+
+
+# ── ADR-032 multi-issuer acceptance ────────────────────────────────────────────
+
+
+class TestMultiIssuer:
+    """ADR-032: service-account tokens carry the internal docker URL as
+    ``iss``; human Device-Flow tokens arrive via Traefik and carry a
+    different ``iss``. Both must validate as long as either is in the
+    configured allow-set."""
+
+    EXTRA_ISSUER = "http://localhost/realms/sovereign-ai"
+
+    def test_primary_issuer_accepted(self, mock_jwks):
+        token = _make_token(scope="sovereign-ai:query", issuer=TEST_ISSUER)
+        settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
+        with patch("sovereign_memory.auth.get_settings", return_value=settings):
+            app = _create_test_app("sovereign-ai:query")
+            resp = TestClient(app).get(
+                "/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            assert resp.status_code == 200
+
+    def test_extra_issuer_accepted(self, mock_jwks):
+        """Token minted with the extra issuer claim must pass even
+        though it does not match the primary keycloak_issuer."""
+        token = _make_token(scope="sovereign-ai:query", issuer=self.EXTRA_ISSUER)
+        settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
+        with patch("sovereign_memory.auth.get_settings", return_value=settings):
+            app = _create_test_app("sovereign-ai:query")
+            resp = TestClient(app).get(
+                "/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            assert resp.status_code == 200
+
+    def test_unknown_issuer_rejected(self, mock_jwks):
+        token = _make_token(
+            scope="sovereign-ai:query", issuer="http://evil.example/realms/sovereign-ai"
+        )
+        settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
+        with patch("sovereign_memory.auth.get_settings", return_value=settings):
+            app = _create_test_app("sovereign-ai:query")
+            resp = TestClient(app).get(
+                "/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            assert resp.status_code == 401
+
+    def test_empty_extras_falls_back_to_primary_only(self, mock_jwks):
+        """Default config (empty list) must preserve single-issuer behaviour."""
+        token = _make_token(
+            scope="sovereign-ai:query", issuer="http://other/realms/sovereign-ai"
+        )
+        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("sovereign-ai:query")
+            resp = TestClient(app).get(
+                "/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            assert resp.status_code == 401
 
 
 # ── JWKS caching tests ────────────────────────────────────────────────────────
