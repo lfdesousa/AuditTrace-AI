@@ -214,6 +214,11 @@ async def recall_recent_sessions(
         if key_points:
             kp_joined = "; ".join(str(kp) for kp in key_points)
             snippet = f"{snippet}\nKey points: {kp_joined}"
+        # ADR-030 Part 1: flag synthetic (draft) summaries inline so the
+        # LLM can treat them as lower-confidence hints rather than as
+        # finalised session records.
+        if s.get("synthetic"):
+            snippet = f"[draft — not yet summarised] {snippet}"
         matches.append(
             {
                 "title": s.get("id", "session"),
