@@ -136,6 +136,26 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
         return {}
 
 
+def _tool_call_signatures(
+    tool_calls: list[dict[str, Any]],
+) -> frozenset[tuple[str, str]]:
+    """Stable ``{(tool_name, args_json)}`` set for repeat detection.
+
+    Used to decide whether this iteration is asking for the same thing
+    the previous iteration asked for. Args are serialised with
+    ``sort_keys=True`` so semantically equal arg dicts compare equal
+    regardless of key order. Returns a ``frozenset`` so set equality is
+    order-insensitive across the iteration's calls.
+    """
+    sigs: set[tuple[str, str]] = set()
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        args = _parse_arguments(fn.get("arguments"))
+        sigs.add((name, json.dumps(args, sort_keys=True)))
+    return frozenset(sigs)
+
+
 # ───────────────────────────── The loop ─────────────────────────────────────
 
 
@@ -169,6 +189,11 @@ async def run_memory_tool_loop(
 
     pending: list[PendingToolCall] = []
     last_body: dict[str, Any] = {}
+    # ADR-030: signatures of the PREVIOUS iteration's memory tool calls.
+    # When the current iteration's signatures equal this set, the model
+    # is asking for the same thing again — no new information possible.
+    # Exit early to save the remaining llama round-trips.
+    last_sigs: frozenset[tuple[str, str]] | None = None
 
     for iteration in range(max_iterations):
         proxy_payload["messages"] = messages
@@ -189,6 +214,22 @@ async def run_memory_tool_loop(
             # (the model will re-emit them next turn if it still needs
             # them — keeping the semantics with the client clean).
             return last_body, pending
+
+        # ADR-030 early exit: if this iteration's memory tool calls are
+        # exactly the previous iteration's, the model is stuck repeating
+        # itself. Executing again can only return the same tool_results
+        # (cache-backed), so we short-circuit and let the caller render
+        # whatever partial content has accumulated.
+        this_sigs = _tool_call_signatures(memory_calls)
+        if last_sigs is not None and this_sigs == last_sigs:
+            logger.info(
+                "memory tool-call loop detected repeated signatures at "
+                "iteration %d — exiting early (saved %d iterations)",
+                iteration + 1,
+                max_iterations - iteration - 1,
+            )
+            return last_body, pending
+        last_sigs = this_sigs
 
         # All memory tools — execute each, append tool_result messages,
         # and loop for the next iteration.

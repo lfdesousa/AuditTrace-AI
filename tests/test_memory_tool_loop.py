@@ -358,15 +358,17 @@ class TestLoopExitConditions:
     async def test_iteration_cap_hit(
         self, _populated_container, _fakeredis_cache, monkeypatch
     ):
-        """A misbehaving model that emits memory tool calls every turn must
-        be stopped by the cap. After MAX iterations the loop returns the
-        last body and a WARNING is logged."""
+        """A misbehaving model that emits *distinct* memory tool calls
+        every turn must still be stopped by the hard iteration cap. The
+        ADR-030 early-exit only fires on repeated signatures; the cap is
+        the safety net when each iteration asks something different."""
         user = sentinel_user_context()
-        # Always return the same memory tool call — the model is in a loop.
+        # Each iteration uses a different query so the repeat-detection
+        # cannot fire — only the hard cap can stop this loop.
         responses = [
             _tool_call_response(
                 "recall_decisions",
-                '{"query": "cache"}',
+                f'{{"query": "cache-variant-{i}"}}',
                 call_id=f"call_{i}",
             )
             for i in range(10)
@@ -394,18 +396,103 @@ class TestLoopExitConditions:
                 session_id="sess-1",
                 max_iterations=3,
             )
-        # 3 iterations → 3 POSTs to llama-server (the iteration cap still
-        # applies even when the memory tool is cached — the loop is bounded
-        # by llama.cpp round-trips, not by tool executions).
+        # 3 iterations → 3 POSTs to llama-server.
         assert len(fake.post_calls) == 3
-        # Only 1 pending audit row: the first iteration executed the tool
-        # (cache miss), iterations 2+ hit the cache and correctly skipped
-        # the audit row per ADR-025 §Decision.8.
-        assert len(pending) == 1
+        # All 3 iterations executed distinct tool calls (cache misses) so
+        # each produced a pending audit row.
+        assert len(pending) == 3
         # Final body is the 3rd response (still tool_calls — we gave up)
         assert final_body["choices"][0]["finish_reason"] == "tool_calls"
         # And a cap-hit warning was logged
         assert any("max iterations" in w.lower() for w in warnings), warnings
+
+    @pytest.mark.asyncio
+    async def test_early_exit_on_repeated_signatures(
+        self, _populated_container, _fakeredis_cache, monkeypatch
+    ):
+        """ADR-030: if two consecutive iterations emit identical memory
+        tool calls, the loop exits early — executing again can only
+        return the same cached result, so there is no new information
+        to feed the model. We save the remaining llama round-trips."""
+        user = sentinel_user_context()
+        # Every iteration asks for the same thing — the ADR-030 exit
+        # should fire after iteration 2 (first iteration sets the
+        # baseline, second detects the repeat).
+        responses = [
+            _tool_call_response(
+                "recall_decisions",
+                '{"query": "cache"}',
+                call_id=f"call_{i}",
+            )
+            for i in range(10)
+        ]
+        fake = _SequencedClient(responses)
+
+        from sovereign_memory.routes import _memory_tool_loop
+
+        infos: list[str] = []
+        monkeypatch.setattr(
+            _memory_tool_loop.logger,
+            "info",
+            lambda msg, *a, **k: infos.append(msg % a if a else msg),
+        )
+
+        with _patch_async_client(fake):
+            final_body, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "cache?"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-1",
+                max_iterations=5,
+            )
+        # Exactly 2 llama POSTs: the baseline + the detected repeat.
+        assert len(fake.post_calls) == 2
+        # One pending audit row from iteration 1 (cache miss); iteration 2
+        # exited before executing, so no second row. ADR-030 §3.
+        assert len(pending) == 1
+        # Final body still carries the repeated tool_calls — the caller
+        # will render whatever partial content is there.
+        assert final_body["choices"][0]["finish_reason"] == "tool_calls"
+        # And an info log recorded the early exit.
+        assert any("repeated signatures" in msg.lower() for msg in infos), infos
+
+    @pytest.mark.asyncio
+    async def test_different_tools_do_not_trigger_early_exit(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Two different tools across iterations are a legitimate
+        multi-tool progression, not a repeat. The loop must keep going."""
+        user = sentinel_user_context()
+        responses = [
+            _tool_call_response(
+                "recall_decisions", '{"query": "cache"}', call_id="call_1"
+            ),
+            _tool_call_response("recall_skills", '{"query": "IAM"}', call_id="call_2"),
+            _text_response("done"),
+        ]
+        fake = _SequencedClient(responses)
+
+        with _patch_async_client(fake):
+            final_body, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "both?"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-multitool",
+                max_iterations=5,
+            )
+        # All 3 responses consumed — the varied tool calls must not
+        # trigger the early-exit heuristic.
+        assert len(fake.post_calls) == 3
+        assert final_body["choices"][0]["message"]["content"] == "done"
+        assert len(pending) == 2
 
 
 # ─────────────────────── Audit row bookkeeping ──────────────────────────────
