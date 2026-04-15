@@ -44,7 +44,8 @@ class TestAlembicMigrations:
 
             inspector = inspect(conn)
             columns = {col["name"] for col in inspector.get_columns("sessions")}
-            # user_id added in Phase 0 of multi-user identity (DESIGN doc)
+            # user_id (Phase 0 multi-user identity) and summarized_at
+            # (ADR-030 Part 2 background summariser) are later additions.
             assert columns == {
                 "id",
                 "project",
@@ -53,6 +54,7 @@ class TestAlembicMigrations:
                 "key_points",
                 "model",
                 "user_id",
+                "summarized_at",
             }
 
     def test_upgrade_creates_project_index(self, alembic_cfg, engine):

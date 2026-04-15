@@ -1,5 +1,6 @@
 """FastAPI application factory for sovereign-memory-server."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from logging import getLogger
 from typing import Any
@@ -10,9 +11,13 @@ from fastapi import FastAPI
 from sovereign_memory import telemetry
 from sovereign_memory.config import get_settings
 from sovereign_memory.db.rls import install_rls_listener
-from sovereign_memory.dependencies import register_default_dependencies
+from sovereign_memory.dependencies import (
+    get_postgres_factory,
+    register_default_dependencies,
+)
 from sovereign_memory.logging_config import setup_logging
 from sovereign_memory.routes import audit, chat, context, health, session
+from sovereign_memory.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
 
@@ -104,9 +109,44 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         settings.otlp_endpoint or "disabled",
     )
 
+    # ADR-030 Part 2 — background session summariser. Started here so
+    # it shares the FastAPI event loop and is cancelled cleanly on
+    # shutdown. Guarded by ``summarizer_enabled`` so operators can
+    # disable without removing settings. Exercised via live stack
+    # spin-up, not pytest (the summariser itself is unit-tested in
+    # test_session_summarizer.py).
+    summarizer_task: asyncio.Task[None] | None = None
+    if (
+        settings.summarizer_enabled and settings.database_url
+    ):  # pragma: no cover - live-startup path
+        summarizer = SessionSummarizer(
+            settings=settings,
+            session_factory=get_postgres_factory().get_session_factory(),
+        )
+        summarizer_task = asyncio.create_task(
+            summarizer.run(), name="session-summarizer"
+        )
+        logger.info(
+            "Session summariser scheduled — idle=%dm interval=%dm",
+            settings.summarizer_idle_minutes,
+            settings.summarizer_interval_minutes,
+        )
+    else:
+        logger.info(
+            "Session summariser NOT started (enabled=%s, db=%s)",
+            settings.summarizer_enabled,
+            "yes" if settings.database_url else "no",
+        )
+
     yield
 
     logger.info("Shutting down sovereign-memory-server")
+    if summarizer_task is not None:  # pragma: no cover - paired with startup
+        summarizer_task.cancel()
+        try:
+            await asyncio.wait_for(summarizer_task, timeout=5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
     telemetry.shutdown()
 
 
