@@ -120,6 +120,32 @@ class Settings(BaseSettings):
     # is not an error; the decorator-built registry is authoritative.
     tools_config_path: str = "tools.toml"
 
+    # ─────────────── ADR-030 — session summariser ────────────────────────────
+    # Dedicated llama-server endpoint for background session summarisation.
+    # Separate port so summarisation never contends with the interactive
+    # tool-loop on the Qwen slot. Falls back to llama_url when the dedicated
+    # Mistral endpoint is not running so the feature degrades rather than
+    # crashes.
+    summarizer_url: str = "http://host.docker.internal:11437/v1"
+    summarizer_model: str = "mistral-7b-summarizer"
+
+    # Kill switch. When False the background task is never started, even if
+    # the server is otherwise configured correctly.
+    summarizer_enabled: bool = True
+
+    # Idle window — a session becomes eligible for summarisation once its
+    # most recent interaction is older than this threshold. Short enough
+    # that today's sessions get summarised before tomorrow's work starts,
+    # long enough that we do not summarise mid-conversation.
+    summarizer_idle_minutes: int = 15
+
+    # Wake cadence for the background loop.
+    summarizer_interval_minutes: int = 5
+
+    # Upper bound on sessions processed per wake cycle. Protects against a
+    # first-run spike when there are thousands of unsummarised sessions.
+    summarizer_max_per_cycle: int = 10
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
