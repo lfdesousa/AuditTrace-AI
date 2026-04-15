@@ -10,10 +10,13 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         architect = person "Luis Filipe" "Solutions Architect — configures memory layers and ADRs"
 
         // External systems
-        llamaServer = softwareSystem "llama-server" "Local LLM inference (Qwen3.5-35B-A3B on ROCm)" {
+        llamaServer = softwareSystem "Chat LLM Server" "Qwen3.5-35B-A3B Q4_K_M on :11435 — chat + tool-loop reasoning (GPU, ROCm)" {
             tags "External"
         }
-        embedServer = softwareSystem "Embedding Server" "nomic-embed-text on CPU (:11436)" {
+        embedServer = softwareSystem "Embedding Server" "nomic-embed-text v1.5 Q8_0 on :11436 — 768-dim embeddings (CPU)" {
+            tags "External"
+        }
+        summarizerServer = softwareSystem "Summariser LLM Server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 — background session summarisation, strict-JSON output (GPU, EU-origin) (ADR-030)" {
             tags "External"
         }
         langfuse = softwareSystem "Langfuse" "Observability — traces, spans, metrics (sibling stack)" {
@@ -52,6 +55,9 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 memoryHandlers = component "Memory Tool Handlers" "recall_decisions, recall_skills, recall_recent_sessions, recall_semantic — thin adapters to the 4 services, canonical {matches, total, truncated} result schema" "tools/memory_handlers.py"
                 toolResultCache = component "ToolResultCache" "sha256(session|tool|args) → result dict, TTL eviction, Redis-backed, namespace sovereign:tool-result:, disjoint from TokenCache (ADR-025 §Decision.8)" "tools/cache.py"
                 memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute selected memory tool → repeat. LLM selects ONE tool per question via ambient context selection rules. Bounded by SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 Accepted)" "routes/_memory_tool_loop.py"
+
+                // Background summarisation (ADR-030)
+                sessionSummarizer = component "SessionSummarizer" "Background asyncio task — every SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES picks idle sessions (last interaction > SOVEREIGN_SUMMARIZER_IDLE_MINUTES) via FOR UPDATE SKIP LOCKED, calls the summariser LLM with strict-JSON response_format, writes SessionRecord rows. Sets app.current_user_id GUC per-session for RLS attribution (ADR-030)" "services/session_summarizer.py"
 
                 // Plumbing
                 diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"
@@ -128,6 +134,11 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         memoryServer.api.semanticSvc -> memoryServer.chromaDb "query()" "HTTP + Bearer token"
         memoryServer.chromaDb -> embedServer "Embedding vectors" "HTTP/OpenAI-compat"
 
+        // Session summariser (ADR-030)
+        memoryServer.api.sessionSummarizer -> memoryServer.postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
+        memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points)"
+        memoryServer.api.sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
+
         // DI wiring
         memoryServer.api.diContainer -> memoryServer.api.contextBuilder "Injects"
         memoryServer.api.diContainer -> memoryServer.api.episodicSvc "Injects"
@@ -175,9 +186,10 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 }
             }
 
-            deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU" "Linux / ROCm" {
-                llamaInstance = infrastructureNode "llama-server" "Qwen3.5-35B-A3B on :11435" "llama.cpp / ROCm"
-                embedInstance = infrastructureNode "embed-server" "nomic-embed-text on :11436" "llama.cpp / CPU"
+            deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU (three model processes, separate ports)" "Linux / ROCm" {
+                llamaInstance = infrastructureNode "chat-llama-server" "Qwen3.5-35B-A3B Q4_K_M on :11435 (GPU)" "llama.cpp / ROCm"
+                embedInstance = infrastructureNode "embed-server" "nomic-embed-text v1.5 Q8_0 on :11436 (CPU)" "llama.cpp / CPU"
+                summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
             }
 
             deploymentNode "Langfuse Stack" "Sibling compose — shared network (ADR-021.2)" "Docker Compose" {
@@ -198,6 +210,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
             apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"
             apiInstance -> llamaInstance "Proxies augmented requests (streaming)" "HTTP/SSE"
+            apiInstance -> summarizerInstance "Background summariser loop — non-streaming JSON (ADR-030)" "HTTP/JSON"
             apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
             apiInstance -> otelCollectorInstance "OTLP metrics + logs" "HTTP/OTLP"
             otelCollectorInstance -> prometheusInstance "Remote write (metrics)" "HTTP"
