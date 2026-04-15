@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 from sovereign_memory.server import (
     _build_httpx_peer_service_map,
+    make_httpx_async_peer_service_hook,
     make_httpx_peer_service_hook,
     urllib3_set_server_address,
 )
@@ -162,3 +163,37 @@ class TestHttpxPeerServiceHook:
         hook(span, _mk_request("http://host/path"))
         keys = [c.args[0] for c in span.set_attribute.call_args_list]
         assert "peer.service" not in keys
+
+
+class TestHttpxAsyncPeerServiceHook:
+    """AsyncClient outbound calls need an ``async_request_hook`` that
+    passes ``iscoroutinefunction()`` in the httpx instrumentor. A sync
+    hook passed there is silently dropped — the failure mode that caused
+    the Mistral summariser's spans to land without ``peer.service`` on
+    the first wiring pass (2026-04-15)."""
+
+    import pytest as _pytest
+
+    @_pytest.mark.asyncio
+    async def test_async_hook_is_coroutine_function(self):
+        """The instrumentor gates async hooks on
+        ``iscoroutinefunction`` — regression guard for the silent-drop."""
+        import inspect
+
+        hook = make_httpx_async_peer_service_hook({11437: "mistral"})
+        assert inspect.iscoroutinefunction(hook)
+
+    @_pytest.mark.asyncio
+    async def test_async_hook_sets_peer_service(self):
+        hook = make_httpx_async_peer_service_hook({11437: "mistral-summariser-llm"})
+        span = _mk_span()
+        await hook(
+            span,
+            _mk_request("http://host.docker.internal:11437/v1/chat/completions"),
+        )
+        span.set_attribute.assert_any_call("peer.service", "mistral-summariser-llm")
+
+    @_pytest.mark.asyncio
+    async def test_async_hook_no_op_on_none_span(self):
+        hook = make_httpx_async_peer_service_hook({11437: "mistral"})
+        await hook(None, _mk_request("http://host.docker.internal:11437/v1/x"))

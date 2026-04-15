@@ -76,10 +76,27 @@ def _build_httpx_peer_service_map(settings: Any) -> dict[int, str]:
     return mapping
 
 
+def _apply_peer_service(
+    span: Any, request_info: Any, peer_service_by_port: dict[int, str]
+) -> None:
+    """Shared peer.service logic used by both sync and async hooks."""
+    if span is None or not span.is_recording():
+        return
+    try:
+        parsed = urlparse(str(request_info.url))
+        if parsed.port is None:
+            return
+        name = peer_service_by_port.get(parsed.port)
+        if name is not None:
+            span.set_attribute("peer.service", name)
+    except Exception:  # pragma: no cover - hook must never raise
+        pass
+
+
 def make_httpx_peer_service_hook(
     peer_service_by_port: dict[int, str],
 ) -> Any:
-    """Closure factory for the httpx ``request_hook``.
+    """Closure factory for the sync httpx ``request_hook``.
 
     Tempo's service-graph processor collapses every HTTP outbound to a
     shared hostname into a single edge. On a single-host deployment all
@@ -88,24 +105,32 @@ def make_httpx_peer_service_hook(
     ``peer.service`` explicitly per destination splits that into three
     semantic edges (``qwen-chat-llm``, ``nomic-embed-server``,
     ``mistral-summariser-llm``). Tempo reads ``peer.service`` ahead of
-    ``server.address`` when it is present, so this is a clean per-edge
-    label without fighting the peer_attributes list. Requests to
-    destinations not in the map are left untouched — falls back to
-    ``server.address``.
+    ``server.address`` when it is present. Requests to destinations not
+    in the map fall back to ``server.address``.
     """
 
     def _hook(span: Any, request_info: Any) -> None:
-        if span is None or not span.is_recording():
-            return
-        try:
-            parsed = urlparse(str(request_info.url))
-            if parsed.port is None:
-                return
-            name = peer_service_by_port.get(parsed.port)
-            if name is not None:
-                span.set_attribute("peer.service", name)
-        except Exception:  # pragma: no cover - hook must never raise
-            pass
+        _apply_peer_service(span, request_info, peer_service_by_port)
+
+    return _hook
+
+
+def make_httpx_async_peer_service_hook(
+    peer_service_by_port: dict[int, str],
+) -> Any:
+    """Async counterpart for ``httpx.AsyncClient`` outbound calls.
+
+    The ``opentelemetry-instrumentation-httpx`` package discriminates
+    between sync (``Client``) and async (``AsyncClient``) hooks by
+    coroutine-function check (``iscoroutinefunction``). A sync hook
+    passed as ``async_request_hook`` is silently dropped — which is how
+    the Mistral summariser's outbound spans went unlabelled on the
+    first wiring pass. This factory returns a coroutine function with
+    the same body so both transports emit ``peer.service``.
+    """
+
+    async def _hook(span: Any, request_info: Any) -> None:
+        _apply_peer_service(span, request_info, peer_service_by_port)
 
     return _hook
 
@@ -144,6 +169,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
             HTTPXClientInstrumentor().instrument(
                 tracer_provider=tp,
                 request_hook=make_httpx_peer_service_hook(peer_service_map),
+                async_request_hook=make_httpx_async_peer_service_hook(peer_service_map),
             )
             URLLib3Instrumentor().instrument(
                 tracer_provider=tp,
