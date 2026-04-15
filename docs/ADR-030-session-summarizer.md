@@ -64,7 +64,7 @@ the deployment view so it is legible at L2.
 |---|---|---|---|
 | `:11435` | `Qwen3.5-35B-A3B-Q4_K_M` | Chat / tool-loop reasoning | MoE (3B active of 35B). Strong multi-turn reasoning, long context, the model the memory-as-tools loop was measured against in ADR-025. GPU-offloaded (`--n-gpu-layers 99`), Q4 KV cache, 64k ctx. |
 | `:11436` | `nomic-embed-text-v1.5.Q8_0` | Embeddings for ChromaDB semantic recall | 768-dim embeddings, 8k ctx, CPU-only (`--n-gpu-layers 0`). Q8 quant because embedding quality is more sensitive to quantisation than chat generation; CPU-only because ChromaDB queries are not on the user-facing critical path. |
-| `:11437` | `Mistral-7B-Instruct-v0.3-Q4_K_M` | Session summariser | Dense 7B, fast greedy decoding, strong instruction-following for strict-JSON output. Proven reliable (same vendor and tokenizer family as Mistral Small — minimal vendor surface). 🇫🇷 EU-origin, consistent with the AuditTrace-AI sovereignty framing. GPU-offloaded, Q4 KV cache (`--cache-type-k q4_0 --cache-type-v q4_0`), 16k ctx — plenty for a 15-min idle session transcript. Kept on a separate port so summarisation never contends with the interactive tool-loop for the Qwen slot. |
+| `:11437` | `Mistral-7B-Instruct-v0.3-Q4_K_M` | Session summariser | Dense 7B, fast greedy decoding, strong instruction-following for strict-JSON output. Proven reliable (same vendor and tokenizer family as Mistral Small — minimal vendor surface). 🇫🇷 EU-origin, consistent with the AuditTrace-AI sovereignty framing. **Partial GPU offload `--n-gpu-layers 10`** (~1 GB GPU at rest, ~24 s/summary, no measurable contention with Qwen — see [eval-memory-modes-20260415-contention.md](eval-memory-modes-20260415-contention.md)). Q4 KV cache (`--cache-type-k q4_0 --cache-type-v q4_0`), 16k ctx — plenty for a 15-min idle session transcript. Kept on a separate port so summarisation never contends with the interactive tool-loop for the Qwen slot. |
 
 Launch command for the new summariser endpoint (mirrors the Qwen
 process in `~/opt/llamacpp/`):
@@ -76,17 +76,28 @@ process in `~/opt/llamacpp/`):
   --ctx-size 16384 \
   --batch-size 1024 --ubatch-size 256 \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --n-gpu-layers 99 --flash-attn on \
+  --n-gpu-layers 10 --flash-attn on \
   --threads 8 --metrics \
   --alias mistral-7b-summarizer \
   --reasoning-format none
 ```
 
-Resident memory budget at rest: Qwen ~20GB + Mistral 7B ~5GB = ~25GB
-GPU (including Q4 KV cache at 16k ctx). Nomic sits on CPU and does
-not compete. Comfortable headroom on the Aigle workstation — room
-for observability containers, additional agents, or a larger
-embedding model if required.
+Resident memory budget at rest: Qwen ~20 GB + Mistral 7B at
+`--n-gpu-layers 10` ~1 GB GPU + ~4 GB CPU. Nomic sits on CPU and does
+not compete. Mistral residency at this offload level was measured on
+2026-04-15 to add no statistically meaningful cost to Qwen's
+tools-mode latency (mean +4.6 % at N=10, well inside the per-probe
+variance of -52 s to +58 s — see `eval-memory-modes-20260415-contention.md`).
+Comfortable headroom on the Aigle workstation for observability
+containers and additional agents.
+
+> **Operator note** — `--n-gpu-layers 10` is the recommended default
+> for single-iGPU boxes (Ryzen AI Max+ 395 / Strix Halo and similar
+> unified-memory architectures). On a discrete-GPU host where a
+> second GPU can be dedicated to summarisation, raise to `99` for
+> 3-14 s/summary throughput. On a constrained box, drop to `0` for
+> pure-CPU summarisation (~60 s/summary). Tunable via the
+> `GPU_LAYERS` env var on `scripts/start-summarizer-llama.sh`.
 
 ### §2. Settings
 
