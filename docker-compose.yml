@@ -30,6 +30,17 @@ services:
       - SOVEREIGN_POSTGRES_URL=postgresql+psycopg2://sovereign_app:${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}@postgres:5432/sovereign_ai
       - SOVEREIGN_LLAMA_URL=http://host.docker.internal:11435/v1
       - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
+      # ADR-030: dedicated summariser endpoint (Mistral 7B Instruct v0.3)
+      # on port 11437. Separate process so background summarisation does
+      # not contend with the interactive tool-loop on the Qwen slot.
+      # Disable without editing the image by setting
+      # SOVEREIGN_SUMMARIZER_ENABLED=false.
+      - SOVEREIGN_SUMMARIZER_URL=${SOVEREIGN_SUMMARIZER_URL:-http://host.docker.internal:11437/v1}
+      - SOVEREIGN_SUMMARIZER_MODEL=${SOVEREIGN_SUMMARIZER_MODEL:-mistral-7b-summarizer}
+      - SOVEREIGN_SUMMARIZER_ENABLED=${SOVEREIGN_SUMMARIZER_ENABLED:-true}
+      - SOVEREIGN_SUMMARIZER_IDLE_MINUTES=${SOVEREIGN_SUMMARIZER_IDLE_MINUTES:-15}
+      - SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES=${SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES:-5}
+      - SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE=${SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE:-10}
       # ADR-028: OTLP export → OTel Collector. Traces fan out to Tempo
       # (call chain) AND Langfuse (LLM-specific) via dual processors on
       # the Langfuse TracerProvider. See telemetry.py init_telemetry.
