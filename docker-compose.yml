@@ -41,6 +41,11 @@ services:
       - SOVEREIGN_SUMMARIZER_IDLE_MINUTES=${SOVEREIGN_SUMMARIZER_IDLE_MINUTES:-15}
       - SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES=${SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES:-5}
       - SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE=${SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE:-10}
+      # Summariser uses the ``sovereign`` owner role (not ``sovereign_app``)
+      # so ``SET LOCAL row_security = off`` in its eligibility txn
+      # actually bypasses FORCE RLS on the audit tables. This is the
+      # admin-batch-worker split flagged in docker-compose.yml line 28.
+      - SOVEREIGN_SUMMARIZER_POSTGRES_URL=postgresql+psycopg2://sovereign:${SOVEREIGN_POSTGRES_PASSWORD}@postgres:5432/sovereign_ai
       # ADR-028: OTLP export → OTel Collector. Traces fan out to Tempo
       # (call chain) AND Langfuse (LLM-specific) via dual processors on
       # the Langfuse TracerProvider. See telemetry.py init_telemetry.

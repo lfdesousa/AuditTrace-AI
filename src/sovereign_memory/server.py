@@ -115,13 +115,36 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # disable without removing settings. Exercised via live stack
     # spin-up, not pytest (the summariser itself is unit-tested in
     # test_session_summarizer.py).
+    #
+    # The summariser uses a DEDICATED Postgres factory when
+    # ``summarizer_postgres_url`` is set, built with the owner-role
+    # credentials so ``SET LOCAL row_security = off`` in the
+    # eligibility txn actually bypasses RLS for the cross-user read.
+    # Without a dedicated URL (tests, single-tenant dev), falls back
+    # to the main factory — RLS is then the caller's problem.
     summarizer_task: asyncio.Task[None] | None = None
     if (
-        settings.summarizer_enabled and settings.database_url
+        settings.summarizer_enabled and settings.summarizer_database_url
     ):  # pragma: no cover - live-startup path
+        if (
+            settings.summarizer_postgres_url
+            and settings.summarizer_postgres_url != settings.database_url
+        ):
+            from sovereign_memory.db.postgres import URLPostgresFactory
+
+            summarizer_factory = URLPostgresFactory(
+                settings.summarizer_postgres_url, pool_size=2
+            )
+            summarizer_session_factory = summarizer_factory.get_session_factory()
+            logger.info("Session summariser: using dedicated owner-role connection")
+        else:
+            summarizer_session_factory = get_postgres_factory().get_session_factory()
+            logger.info(
+                "Session summariser: sharing main Postgres factory (RLS bypass may not apply)"
+            )
         summarizer = SessionSummarizer(
             settings=settings,
-            session_factory=get_postgres_factory().get_session_factory(),
+            session_factory=summarizer_session_factory,
         )
         summarizer_task = asyncio.create_task(
             summarizer.run(), name="session-summarizer"
@@ -135,7 +158,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         logger.info(
             "Session summariser NOT started (enabled=%s, db=%s)",
             settings.summarizer_enabled,
-            "yes" if settings.database_url else "no",
+            "yes" if settings.summarizer_database_url else "no",
         )
 
     yield
