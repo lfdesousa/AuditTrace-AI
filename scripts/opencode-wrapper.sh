@@ -57,19 +57,31 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 4
 fi
 
-# Back up the config, then merge Authorization into every provider's
-# options.headers. jq writes atomically via the temp file pattern so
-# a crash in the middle does not corrupt the user's config.
+# Back up the config, then inject the fresh Bearer. The
+# ``@ai-sdk/openai-compatible`` provider that OpenCode uses builds
+# its outbound ``Authorization: Bearer <token>`` from
+# ``options.apiKey`` — NOT from ``options.headers.Authorization``.
+# Setting the header alone leaves a stale apiKey-derived Authorization
+# in flight and produces 401s (live-surfaced 2026-04-15).
+#
+# Write the raw token to ``options.apiKey`` (SDK prepends "Bearer ").
+# Also scrub any lingering ``Authorization`` from ``options.headers``
+# so there's no ambiguity for readers of the config. jq writes
+# atomically via the temp file pattern so a crash in the middle does
+# not corrupt the user's config.
 BACKUP="${CONFIG}.bak-$(date +%Y%m%d_%H%M%S)"
 cp "$CONFIG" "$BACKUP"
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-jq --arg bearer "Bearer $BEARER" '
+jq --arg token "$BEARER" '
   .provider = (.provider // {}) |
   .provider |= with_entries(
     .value.options = (.value.options // {}) |
-    .value.options.headers = ((.value.options.headers // {}) + {"Authorization": $bearer}) |
+    .value.options.apiKey = $token |
+    (if .value.options.headers then
+       .value.options.headers |= del(.Authorization, .authorization)
+     else . end) |
     .
   )
 ' "$CONFIG" > "$TMP"
