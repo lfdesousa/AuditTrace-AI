@@ -27,7 +27,8 @@
 
 set -euo pipefail
 
-KEYCLOAK_BASE="${KEYCLOAK_BASE:-http://localhost:8080}"
+# Keycloak is fronted by Traefik on :443 (see docker-compose.yml).
+KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://localhost}"
 REALM="${KEYCLOAK_REALM:-sovereign-ai}"
 ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-}"
