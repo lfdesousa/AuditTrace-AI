@@ -62,7 +62,12 @@ class SessionRecord(Base):
 
 
 class InteractionRecord(Base):
-    """Audit trail — every question/answer pair with token counts."""
+    """Audit trail — every question/answer pair with token counts.
+
+    ``status`` == 'failed' rows carry ``failure_class`` +
+    ``error_detail`` and typically have ``answer=''`` and
+    ``*_tokens=0``. See migration 007 for the motivation.
+    """
 
     __tablename__ = "interactions"
 
@@ -78,6 +83,12 @@ class InteractionRecord(Base):
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     # Keycloak ``sub`` claim — see SessionRecord.user_id docstring.
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="success", nullable=False, index=True
+    )
+    failure_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ToolCall(Base):

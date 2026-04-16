@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import date, datetime
 from typing import Any
@@ -47,6 +48,15 @@ from sovereign_memory.services.context_builder import (
     build_ambient_context,
 )
 from sovereign_memory.tools import tools_visible_to
+
+# Failure taxonomy (ADR-033 seed). Stored verbatim in
+# ``interactions.failure_class``. Kept as module-level constants rather than
+# an Enum so call sites read as plain strings and the value written to
+# Postgres is copy-pasteable in SQL audit queries.
+FAILURE_PROXY_TIMEOUT = "proxy_timeout"
+FAILURE_UPSTREAM_ERROR = "upstream_error"
+FAILURE_UPSTREAM_UNREACHABLE = "upstream_unreachable"
+FAILURE_INTERNAL_ERROR = "internal_error"
 
 # Optional Langfuse decorator + client lookup. The package is in requirements
 # but the @observe path is a soft dependency — when Langfuse is disabled or
@@ -142,6 +152,11 @@ def _persist_interaction(
     session_id: str | None,
     model: str | None,
     user_id: str,
+    *,
+    status: str = "success",
+    failure_class: str | None = None,
+    error_detail: str | None = None,
+    duration_ms: int | None = None,
 ) -> int | None:
     """Persist a question/answer pair to PostgreSQL ``interactions``.
 
@@ -157,6 +172,11 @@ def _persist_interaction(
     ADR-025 Phase 4: return value is used by ``_flush_pending_tool_calls``
     to populate the ``tool_calls.interaction_id`` FK after the parent
     row lands.
+
+    Migration 007 / ADR-033 seed: ``status`` defaults to ``"success"``;
+    pass ``status="failed"`` with a ``failure_class`` when the upstream
+    call timed out or errored so the failure is auditable alongside the
+    successes.
     """
     try:
         pg_factory = get_postgres_factory()
@@ -174,6 +194,10 @@ def _persist_interaction(
                 session_id=session_id,
                 model=model,
                 user_id=user_id,
+                status=status,
+                failure_class=failure_class,
+                error_detail=error_detail,
+                duration_ms=duration_ms,
             )
             db.add(record)
             db.commit()
@@ -680,15 +704,101 @@ async def _handle_tools_mode(
 
     llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
 
-    # 2 — Run the loop
-    final_body, pending = await run_memory_tool_loop(
-        llama_url=llama_url,
-        payload=loop_payload,
-        user_context=user,
-        session_id=session_id,
-        max_iterations=settings.memory_tool_loop_max_iterations,
-        timeout_seconds=settings.llama_proxy_timeout,
-    )
+    # 2 — Run the loop. On TimeoutException or unexpected Exception we
+    # persist a failed-interaction audit row BEFORE propagating, so a
+    # request that times out mid-loop still has a forensic DB trail.
+    # Accumulated ``pending`` tool_calls from pre-failure iterations
+    # are intentionally dropped — the tool_calls FK needs an
+    # interaction_id and linking them to a failed parent is out of
+    # scope for this fix (see migration 007 plan, "pending tool_calls
+    # … deliberately NOT flushed").
+    perf_start = time.perf_counter()
+    try:
+        final_body, pending = await run_memory_tool_loop(
+            llama_url=llama_url,
+            payload=loop_payload,
+            user_context=user,
+            session_id=session_id,
+            max_iterations=settings.memory_tool_loop_max_iterations,
+            timeout_seconds=settings.llama_proxy_timeout,
+        )
+    except httpx.TimeoutException as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_PROXY_TIMEOUT,
+            error_detail=str(exc)[:500],
+            duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(f"llama-server timeout after {settings.llama_proxy_timeout}s"),
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_UPSTREAM_ERROR,
+            error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+            duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"llama-server returned {exc.response.status_code}",
+        ) from exc
+    except httpx.ConnectError as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_UPSTREAM_UNREACHABLE,
+            error_detail=str(exc)[:500],
+            duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"llama-server unreachable at {llama_url}",
+        ) from exc
+    except Exception as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_INTERNAL_ERROR,
+            error_detail=str(exc)[:500],
+            duration_ms=int((time.perf_counter() - perf_start) * 1000),
+        )
+        raise  # let the FastAPI global handler shape the 500
 
     # 3 — Extract answer text + usage for the interaction row
     choices = final_body.get("choices") or []
@@ -718,6 +828,7 @@ async def _handle_tools_mode(
         session_id=session_id,
         model=response_model,
         user_id=user.user_id,
+        duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
     _flush_pending_tool_calls(pending, interaction_id)
 
@@ -845,6 +956,7 @@ async def chat_completions(
             response_created: int | None = None
             finish_reason: str | None = None
             done_seen = False
+            perf_start = time.perf_counter()
             try:
                 async with httpx.AsyncClient(
                     timeout=settings.llama_proxy_timeout
@@ -940,9 +1052,60 @@ async def chat_completions(
                 yield ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
                 if done_seen:
                     yield b"data: [DONE]\n\n"
-            except httpx.ConnectError:
+            except httpx.TimeoutException as exc:
+                # Proxy timeout — the Qwen <think> loop took longer than
+                # SOVEREIGN_LLAMA_PROXY_TIMEOUT. Emit a structured SSE
+                # error frame so clients (OpenCode, curl) see the shape
+                # of the failure, persist a failed-interaction audit
+                # row, and let the stream close cleanly. See migration
+                # 007 and the 2026-04-16 plan in
+                # ~/.claude/plans/reflective-discovering-platypus.md.
+                err_body = {
+                    "error": {
+                        "message": (
+                            f"llama-server timeout after "
+                            f"{settings.llama_proxy_timeout}s"
+                        ),
+                        "type": "timeout",
+                        "code": 504,
+                    }
+                }
+                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_PROXY_TIMEOUT,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                )
+                return
+            except httpx.ConnectError as exc:
                 yield b'data: {"error":"llama-server unreachable"}\n\n'
                 yield b"data: [DONE]\n\n"
+                _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_UPSTREAM_UNREACHABLE,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                )
                 return
             except httpx.HTTPStatusError as exc:
                 err = json.dumps(
@@ -950,6 +1113,48 @@ async def chat_completions(
                 )
                 yield ("data: " + err + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
+                _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_UPSTREAM_ERROR,
+                    error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                )
+                return
+            except Exception as exc:
+                logger.exception("streaming chat generator failed unexpectedly")
+                err_body = {
+                    "error": {
+                        "message": "Internal error during streaming.",
+                        "type": "internal_error",
+                        "code": 500,
+                    }
+                }
+                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_INTERNAL_ERROR,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                )
                 return
 
             # Post-stream: build answer including tool_calls if present
@@ -974,6 +1179,7 @@ async def chat_completions(
                 session_id=session_id,
                 model=response_model or requested_model,
                 user_id=user.user_id,
+                duration_ms=int((time.perf_counter() - perf_start) * 1000),
             )
             await _record_langfuse_output(
                 trace_id=trace_id,
@@ -997,16 +1203,47 @@ async def chat_completions(
         )
 
     # ──────────────────────── Non-streaming branch ──────────────────────────
+    ns_perf_start = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=settings.llama_proxy_timeout) as client:
             response = await client.post(llama_url, json=proxy_payload)
         body = response.json()
     except httpx.ConnectError as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_UPSTREAM_UNREACHABLE,
+            error_detail=str(exc)[:500],
+            duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+        )
         raise HTTPException(
             status_code=502,
             detail=f"llama-server unreachable at {llama_url}",
         ) from exc
     except httpx.TimeoutException as exc:
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            session_id=session_id,
+            model=requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=FAILURE_PROXY_TIMEOUT,
+            error_detail=str(exc)[:500],
+            duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+        )
         raise HTTPException(
             status_code=504,
             detail=f"llama-server timeout after {settings.llama_proxy_timeout}s",
@@ -1036,6 +1273,7 @@ async def chat_completions(
             session_id=session_id,
             model=body.get("model") or requested_model,
             user_id=user.user_id,
+            duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
         await _record_langfuse_output(
             trace_id=trace_id,
