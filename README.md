@@ -350,6 +350,8 @@ the filter match count *for the caller*.
 
 **Project tagging contract** (ADR-029). Every interaction carries a `project` tag resolved on entry: `X-Project` header → `body.metadata.project` → `body.project` → `"default"`. Configure the header per-project once via `scripts/configure-project.py <name>`.
 
+**Failure rows are audited too** (migration 007 / ADR-033 seed, 2026-04-16). Every upstream failure on `/v1/chat/completions` — proxy timeout, llama-server error, connect failure, unexpected exception — produces an interaction row with `status='failed'` and a controlled-vocabulary `failure_class`. Pre-migration, silent streaming/tools-mode timeouts left zero audit trail: the 10 HTTP 500s observed on 2026-04-14/15 were reconstructible only from Loki logs. Query `SELECT * FROM interactions WHERE status='failed' ORDER BY timestamp DESC` to enumerate the failure history. 5xx responses on non-streaming paths now carry a 3-audience envelope (`code`, `status`, `message`, `operator_hint`, `trace_id`, `user_facing_message`) — the operator pivots from the `trace_id` into Loki / Langfuse / Grafana.
+
 ## Configuration
 
 ### Database (ADR-020)

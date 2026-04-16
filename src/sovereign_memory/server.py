@@ -6,7 +6,8 @@ from logging import getLogger
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from sovereign_memory import telemetry
 from sovereign_memory.config import get_settings
@@ -283,6 +284,56 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(health.router, tags=["health"])
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(  # pyright: ignore[reportUnusedFunction]
+        request: Request[Any], exc: Exception
+    ) -> JSONResponse:
+        """Return the ADR-033 3-audience error envelope for unhandled 500s.
+
+        Non-streaming routes only: FastAPI cannot intercept an exception
+        raised inside a ``StreamingResponse`` generator after the response
+        headers have been sent — the streaming chat path in
+        ``routes/chat.py`` handles its own taxonomy.
+
+        The envelope shape is the seed for ADR-033: one payload with
+        signal for three audiences (user, operator, engineer). ``trace_id``
+        is the pivot that links the 5xx back to Loki / Langfuse / Grafana.
+        """
+        from opentelemetry import trace
+
+        try:
+            span = trace.get_current_span()
+            ctx = span.get_span_context() if span is not None else None
+            trace_id_hex = (
+                format(ctx.trace_id, "032x") if ctx and ctx.is_valid else None
+            )
+        except Exception:  # pragma: no cover - defensive
+            trace_id_hex = None
+
+        logger.exception(
+            "Unhandled exception on %s %s (trace_id=%s): %s",
+            request.method,
+            request.url.path,
+            trace_id_hex,
+            exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "status": 500,
+                    "message": "An internal error occurred.",
+                    "operator_hint": (
+                        "Grep memory-server logs in Loki with this trace_id; "
+                        "cross-reference Langfuse observations."
+                    ),
+                    "trace_id": trace_id_hex,
+                    "user_facing_message": ("Something went wrong. Please try again."),
+                }
+            },
+        )
 
     # FastAPI instrumentation must run at app-construction time so the
     # patched ``build_middleware_stack`` is in place before uvicorn
