@@ -1,0 +1,10 @@
+# Gitleaks allowlist — false positives from vendored upstream content
+# and legitimate example strings.
+
+# Vendored OpenAI OpenAPI spec — `docs/reference/openai/openapi.yaml` is
+# pulled verbatim from Stainless (the source OpenAI themselves point
+# to) and contains example payloads with example names like "Wolfgang"
+# that trip the colleague-names rule. The file is auto-generated
+# upstream; we never hand-edit it. See docs/reference/openai/README.md
+# and scripts/refresh-openai-spec.sh for provenance.
+docs/reference/openai/openapi.yaml:colleague-names:2257
