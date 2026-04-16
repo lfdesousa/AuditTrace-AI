@@ -58,6 +58,40 @@ FAILURE_UPSTREAM_ERROR = "upstream_error"
 FAILURE_UPSTREAM_UNREACHABLE = "upstream_unreachable"
 FAILURE_INTERNAL_ERROR = "internal_error"
 
+
+def _openai_error_body(
+    message: str,
+    code: str,
+    *,
+    type_: str = "api_error",
+    param: str | None = None,
+    **extensions: Any,
+) -> dict[str, Any]:
+    """Build an error body that is a strict superset of OpenAI's shape.
+
+    OpenAI's canonical error body is
+    ``{"error": {"message", "type", "param", "code"}}``. We keep those
+    four keys with OpenAI-compatible semantics so any OpenAI SDK parses
+    the error unchanged. AuditTrace-specific extensions
+    (``status``, ``operator_hint``, ``trace_id``,
+    ``user_facing_message``) are added as NET-NEW keys — a client that
+    only reads the four OpenAI keys keeps working.
+
+    See ``feedback_openai_schema_inviolate`` memory for the principle:
+    OpenAI compatibility is the project's integration fan-in and the
+    thing that keeps us in the race; every error-shape change must
+    preserve it.
+    """
+    body: dict[str, Any] = {
+        "message": message,
+        "type": type_,
+        "param": param,
+        "code": code,
+    }
+    body.update(extensions)
+    return {"error": body}
+
+
 # Optional Langfuse decorator + client lookup. The package is in requirements
 # but the @observe path is a soft dependency — when Langfuse is disabled or
 # the import fails for any reason, we fall back to a no-op decorator and a
@@ -1060,16 +1094,13 @@ async def chat_completions(
                 # row, and let the stream close cleanly. See migration
                 # 007 and the 2026-04-16 plan in
                 # ~/.claude/plans/reflective-discovering-platypus.md.
-                err_body = {
-                    "error": {
-                        "message": (
-                            f"llama-server timeout after "
-                            f"{settings.llama_proxy_timeout}s"
-                        ),
-                        "type": "timeout",
-                        "code": 504,
-                    }
-                }
+                err_body = _openai_error_body(
+                    message=(
+                        f"llama-server timeout after {settings.llama_proxy_timeout}s"
+                    ),
+                    code=FAILURE_PROXY_TIMEOUT,
+                    status=504,
+                )
                 yield ("data: " + json.dumps(err_body) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
                 _persist_interaction(
@@ -1089,7 +1120,12 @@ async def chat_completions(
                 )
                 return
             except httpx.ConnectError as exc:
-                yield b'data: {"error":"llama-server unreachable"}\n\n'
+                err_body = _openai_error_body(
+                    message=f"llama-server unreachable at {llama_url}",
+                    code=FAILURE_UPSTREAM_UNREACHABLE,
+                    status=502,
+                )
+                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
@@ -1108,10 +1144,14 @@ async def chat_completions(
                 )
                 return
             except httpx.HTTPStatusError as exc:
-                err = json.dumps(
-                    {"error": f"llama-server status {exc.response.status_code}"}
+                err_body = _openai_error_body(
+                    message=(
+                        f"llama-server returned status {exc.response.status_code}"
+                    ),
+                    code=FAILURE_UPSTREAM_ERROR,
+                    status=502,
                 )
-                yield ("data: " + err + "\n\n").encode()
+                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
@@ -1131,13 +1171,11 @@ async def chat_completions(
                 return
             except Exception as exc:
                 logger.exception("streaming chat generator failed unexpectedly")
-                err_body = {
-                    "error": {
-                        "message": "Internal error during streaming.",
-                        "type": "internal_error",
-                        "code": 500,
-                    }
-                }
+                err_body = _openai_error_body(
+                    message="Internal error during streaming.",
+                    code=FAILURE_INTERNAL_ERROR,
+                    status=500,
+                )
                 yield ("data: " + json.dumps(err_body) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
                 _persist_interaction(

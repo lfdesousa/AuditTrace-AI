@@ -3,9 +3,19 @@ repos:
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
+        # Vendored upstream content must match source byte-for-byte so
+        # diffs against upstream stay readable.
+        exclude: ^docs/reference/
       - id: end-of-file-fixer
+        exclude: ^docs/reference/
       - id: check-yaml
       - id: check-added-large-files
+        # OpenAI's OpenAPI spec is ~2.5MB. Vendoring it is load-bearing
+        # (see docs/reference/openai/README.md — North Star for API
+        # compatibility reviews). Bump the per-file cap and exempt the
+        # spec explicitly so the refresh script needs no special casing.
+        args: ['--maxkb=3000']
+        exclude: ^docs/reference/openai/openapi\.yaml$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.10

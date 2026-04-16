@@ -318,13 +318,22 @@ def create_app() -> FastAPI:
             trace_id_hex,
             exc,
         )
+        # Envelope is a strict SUPERSET of OpenAI's error shape
+        # ``{message, type, param, code}`` so any OpenAI SDK keeps parsing
+        # unchanged. AuditTrace-specific keys (``status``,
+        # ``operator_hint``, ``trace_id``, ``user_facing_message``) are
+        # additive — OpenAI-only readers simply ignore them. See
+        # ``feedback_openai_schema_inviolate`` memory; ADR-033 when it
+        # lands documents the full contract.
         return JSONResponse(
             status_code=500,
             content={
                 "error": {
+                    "message": "An internal error occurred.",
+                    "type": "api_error",
+                    "param": None,
                     "code": "internal_error",
                     "status": 500,
-                    "message": "An internal error occurred.",
                     "operator_hint": (
                         "Grep memory-server logs in Loki with this trace_id; "
                         "cross-reference Langfuse observations."

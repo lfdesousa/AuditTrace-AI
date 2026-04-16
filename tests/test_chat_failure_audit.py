@@ -93,8 +93,10 @@ class TestStreamingFailureAudit:
         # Stream opens OK; the failure surfaces as an error frame in the body.
         assert response.status_code == 200
         body = response.content.decode()
-        assert '"timeout"' in body
-        assert '"code": 504' in body or '"code":504' in body
+        # OpenAI-shape error frame: {error: {message, type, param, code, ...}}
+        assert '"type": "api_error"' in body
+        assert '"code": "proxy_timeout"' in body
+        assert '"status": 504' in body
         assert "[DONE]" in body
 
         row = _latest_interaction()
@@ -122,7 +124,8 @@ class TestStreamingFailureAudit:
 
         assert response.status_code == 200
         body = response.content.decode()
-        assert '"internal_error"' in body
+        assert '"type": "api_error"' in body
+        assert '"code": "internal_error"' in body
         assert "[DONE]" in body
 
         row = _latest_interaction()
@@ -158,6 +161,8 @@ class TestStreamingFailureAudit:
 
         assert response.status_code == 200
         body = response.content.decode()
+        assert '"type": "api_error"' in body
+        assert '"code": "upstream_unreachable"' in body
         assert "unreachable" in body
         assert "[DONE]" in body
 
@@ -285,9 +290,13 @@ class TestToolsModeFailureAudit:
         body = response.json()
         assert "error" in body
         err = body["error"]
+        # OpenAI-compatible core (strict superset):
+        assert err["message"]
+        assert err["type"] == "api_error"
+        assert err["param"] is None
         assert err["code"] == "internal_error"
+        # AuditTrace extensions:
         assert err["status"] == 500
-        assert "message" in err
         assert "user_facing_message" in err
         assert "operator_hint" in err
         assert "trace_id" in err  # may be None in test env, but key present

@@ -119,6 +119,40 @@ source .venv/bin/activate
 uvicorn sovereign_memory.server:app --reload
 ```
 
+## Drop-in OpenAI compatibility
+
+**Strict OpenAI `/v1/chat/completions` compatibility is
+AuditTrace-AI's North Star.** Point any OpenAI SDK
+(`openai-python`, `@ai-sdk/openai-compatible`, `langchain`,
+`llamaindex`) or IDE integration (OpenCode, Continue, Cursor, Zed) at
+`https://<your-audittrace-host>/v1` and it works. Every request field
+the SDK sends passes through unchanged (ADR-024 dict pass-through);
+every response shape — success, streaming chunk, error — is a strict
+superset of what the OpenAI OpenAPI spec defines.
+
+All AuditTrace-specific features are **additive and opt-in**:
+
+| Extension | Where | Opt-in mechanism |
+|---|---|---|
+| Project tagging | request | `X-Project: …` header (ADR-029) |
+| Memory-mode routing | request | `X-Memory-Mode: inject \| tools` header (ADR-031, scoped) |
+| Depth-of-thinking | request | `X-Thinking: deep \| fast \| auto` header (ADR-034, scoped) |
+| Audit-row forensics | response error body | net-new keys `status`, `operator_hint`, `trace_id`, `user_facing_message` alongside OpenAI's `{message,type,param,code}` |
+| Async job pattern | request | `X-Async: true` header OR separate endpoint — default POST stays strictly OpenAI-shaped (ADR-035, scoped) |
+
+No custom header is ever *required* for the default path to work.
+The guardrail is codified in
+[`docs/reference/openai/`](docs/reference/openai/) — we vendor the
+current upstream OpenAI OpenAPI spec and compare our response shapes
+against it directly. Regression tests in
+`tests/test_openai_compatibility.py` lock the key contracts
+(ChatCompletion, ChatCompletionChunk, Error/ErrorResponse) so any
+future change that would break compatibility fails CI before it
+reaches main.
+
+Refresh the vendored spec with `./scripts/refresh-openai-spec.sh`
+and review the diff like any other dependency bump.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
