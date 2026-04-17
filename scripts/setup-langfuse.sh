@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Bootstrap Langfuse as sibling compose stack (ADR-021.2)
-# Langfuse runs on the shared sovereign-ai-net but with its own Postgres.
+# Langfuse runs on the shared audittrace-net but with its own Postgres.
 set -euo pipefail
 
 LANGFUSE_DIR="${1:-../langfuse}"
 
 echo "Creating shared Docker network..."
-docker network create sovereign-ai-net 2>/dev/null || echo "Network sovereign-ai-net already exists"
+docker network create audittrace-net 2>/dev/null || echo "Network audittrace-net already exists"
 
 echo "Setting up Langfuse in ${LANGFUSE_DIR}..."
 mkdir -p "${LANGFUSE_DIR}"
@@ -28,7 +28,7 @@ fi
 # and binds to whatever IP it resolves to. Docker sets HOSTNAME to
 # the container ID, which resolves (via /etc/hosts) to a SINGLE IP
 # on ONE of the container's networks. Since langfuse-web is attached
-# to both `default` (langfuse_default) and `sovereign-ai-net`, the
+# to both `default` (langfuse_default) and `audittrace-net`, the
 # default hostname resolution picks one interface and the other
 # silently gets "connection refused" — from host curl AND from
 # audittrace-ai's OTel exporter, even though the web app
@@ -41,11 +41,11 @@ cat > docker-compose.override.yml <<'YAML'
 # See that script for the rationale behind HOSTNAME=0.0.0.0.
 services:
   langfuse-web:
-    networks: [default, sovereign-ai-net]
+    networks: [default, audittrace-net]
     environment:
       HOSTNAME: 0.0.0.0
 networks:
-  sovereign-ai-net:
+  audittrace-net:
     external: true
 YAML
 
@@ -55,4 +55,4 @@ echo "Start with: cd ${LANGFUSE_DIR} && docker compose up -d"
 echo "Upgrade with: cd ${LANGFUSE_DIR} && docker compose pull && docker compose up -d"
 echo ""
 echo "OTLP endpoint: http://langfuse-web:3000/api/public/otel"
-echo "Set SOVEREIGN_OTLP_ENDPOINT in your .env to activate trace export."
+echo "Set AUDITTRACE_OTLP_ENDPOINT in your .env to activate trace export."

@@ -1,4 +1,4 @@
-# sovereign-ai-stack — Docker Compose
+# audittrace-stack — Docker Compose
 # Phase 1-2: memory-server + PostgreSQL + ChromaDB + MinIO + Traefik + Keycloak
 # Langfuse runs as a sibling stack (ADR-021.2)
 
@@ -6,7 +6,7 @@ services:
 
   memory-server:
     build: .
-    container_name: sovereign-memory-server
+    container_name: audittrace-server
     entrypoint: ["/app/scripts/entrypoint.sh"]
     depends_on:
       postgres:
@@ -20,42 +20,42 @@ services:
       minio:
         condition: service_healthy
     environment:
-      - SOVEREIGN_CHROMA_URL=http://chromadb:8000
-      - SOVEREIGN_CHROMA_TOKEN=${SOVEREIGN_CHROMA_TOKEN}
+      - AUDITTRACE_CHROMA_URL=http://chromadb:8000
+      - AUDITTRACE_CHROMA_TOKEN=${AUDITTRACE_CHROMA_TOKEN}
       # DESIGN §16 Phase 4: the memory-server connects as the
-      # non-superuser `sovereign_app` role so Postgres RLS policies
-      # actually apply to its queries. The `sovereign` superuser role
+      # non-superuser `audittrace_app` role so Postgres RLS policies
+      # actually apply to its queries. The `audittrace` superuser role
       # is retained for admin tasks but not used on the hot path.
-      # See scripts/init-sovereign-app-role.sh for the role setup.
-      - SOVEREIGN_POSTGRES_URL=postgresql+psycopg2://sovereign_app:${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}@postgres:5432/sovereign_ai
-      - SOVEREIGN_LLAMA_URL=http://host.docker.internal:11435/v1
-      - SOVEREIGN_EMBED_URL=http://host.docker.internal:11436/v1
+      # See scripts/init-audittrace-app-role.sh for the role setup.
+      - AUDITTRACE_POSTGRES_URL=postgresql+psycopg2://audittrace_app:${AUDITTRACE_APP_PASSWORD:-${AUDITTRACE_POSTGRES_PASSWORD}}@postgres:5432/audittrace
+      - AUDITTRACE_LLAMA_URL=http://host.docker.internal:11435/v1
+      - AUDITTRACE_EMBED_URL=http://host.docker.internal:11436/v1
       # ADR-030: dedicated summariser endpoint (Mistral 7B Instruct v0.3)
       # on port 11437. Separate process so background summarisation does
       # not contend with the interactive tool-loop on the Qwen slot.
       # Disable without editing the image by setting
-      # SOVEREIGN_SUMMARIZER_ENABLED=false.
-      - SOVEREIGN_SUMMARIZER_URL=${SOVEREIGN_SUMMARIZER_URL:-http://host.docker.internal:11437/v1}
-      - SOVEREIGN_SUMMARIZER_MODEL=${SOVEREIGN_SUMMARIZER_MODEL:-mistral-7b-summarizer}
-      - SOVEREIGN_SUMMARIZER_ENABLED=${SOVEREIGN_SUMMARIZER_ENABLED:-true}
-      - SOVEREIGN_SUMMARIZER_IDLE_MINUTES=${SOVEREIGN_SUMMARIZER_IDLE_MINUTES:-15}
-      - SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES=${SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES:-5}
-      - SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE=${SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE:-10}
-      # Summariser uses the ``sovereign`` owner role (not ``sovereign_app``)
+      # AUDITTRACE_SUMMARIZER_ENABLED=false.
+      - AUDITTRACE_SUMMARIZER_URL=${AUDITTRACE_SUMMARIZER_URL:-http://host.docker.internal:11437/v1}
+      - AUDITTRACE_SUMMARIZER_MODEL=${AUDITTRACE_SUMMARIZER_MODEL:-mistral-7b-summarizer}
+      - AUDITTRACE_SUMMARIZER_ENABLED=${AUDITTRACE_SUMMARIZER_ENABLED:-true}
+      - AUDITTRACE_SUMMARIZER_IDLE_MINUTES=${AUDITTRACE_SUMMARIZER_IDLE_MINUTES:-15}
+      - AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES=${AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES:-5}
+      - AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE=${AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE:-10}
+      # Summariser uses the ``audittrace`` owner role (not ``audittrace_app``)
       # so ``SET LOCAL row_security = off`` in its eligibility txn
       # actually bypasses FORCE RLS on the audit tables. This is the
       # admin-batch-worker split flagged in docker-compose.yml line 28.
-      - SOVEREIGN_SUMMARIZER_POSTGRES_URL=postgresql+psycopg2://sovereign:${SOVEREIGN_POSTGRES_PASSWORD}@postgres:5432/sovereign_ai
+      - AUDITTRACE_SUMMARIZER_POSTGRES_URL=postgresql+psycopg2://audittrace:${AUDITTRACE_POSTGRES_PASSWORD}@postgres:5432/audittrace
       # ADR-028: OTLP export → OTel Collector. Traces fan out to Tempo
       # (call chain) AND Langfuse (LLM-specific) via dual processors on
       # the Langfuse TracerProvider. See telemetry.py init_telemetry.
-      - SOVEREIGN_OTLP_ENDPOINT=${SOVEREIGN_OTLP_ENDPOINT:-http://otel-collector:4318}
+      - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-http://otel-collector:4318}
       # OTel SDK resource attributes — read by the default
       # OTELResourceDetector, which runs regardless of which provider
       # (ours or Langfuse's) ends up installed as global. Gets us a
       # correct ``service.name`` on every trace's Resource.
-      - OTEL_SERVICE_NAME=sovereign-memory-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sovereign-ai,service.version=0.3.1,deployment.environment=${SOVEREIGN_ENV:-local}
+      - OTEL_SERVICE_NAME=audittrace-server
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=0.3.1,deployment.environment=${AUDITTRACE_ENV:-local}
       # HTTP semconv migration (1.25+). `http/dup` makes the httpx and
       # urllib3 instrumentors emit BOTH the old attrs (http.url,
       # net.peer.name) and the new stable ones (server.address,
@@ -65,108 +65,108 @@ services:
       # emitting the legacy keys once all downstream consumers are on
       # the new semconv.
       - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
-      - SOVEREIGN_METRICS_ENABLED=${SOVEREIGN_METRICS_ENABLED:-true}
-      - SOVEREIGN_LANGFUSE_HOST=${SOVEREIGN_LANGFUSE_HOST:-http://langfuse-web:3000}
-      - SOVEREIGN_LANGFUSE_PUBLIC_KEY=${SOVEREIGN_LANGFUSE_PUBLIC_KEY:-}
-      - SOVEREIGN_LANGFUSE_SECRET_KEY=${SOVEREIGN_LANGFUSE_SECRET_KEY:-}
-      - SOVEREIGN_LANGFUSE_ENABLED=${SOVEREIGN_LANGFUSE_ENABLED:-false}
-      - SOVEREIGN_LOG_LEVEL=${SOVEREIGN_LOG_LEVEL:-INFO}
-      - SOVEREIGN_AUTH_ENABLED=${SOVEREIGN_AUTH_ENABLED:-true}
+      - AUDITTRACE_METRICS_ENABLED=${AUDITTRACE_METRICS_ENABLED:-true}
+      - AUDITTRACE_LANGFUSE_HOST=${AUDITTRACE_LANGFUSE_HOST:-http://langfuse-web:3000}
+      - AUDITTRACE_LANGFUSE_PUBLIC_KEY=${AUDITTRACE_LANGFUSE_PUBLIC_KEY:-}
+      - AUDITTRACE_LANGFUSE_SECRET_KEY=${AUDITTRACE_LANGFUSE_SECRET_KEY:-}
+      - AUDITTRACE_LANGFUSE_ENABLED=${AUDITTRACE_LANGFUSE_ENABLED:-false}
+      - AUDITTRACE_LOG_LEVEL=${AUDITTRACE_LOG_LEVEL:-INFO}
+      - AUDITTRACE_AUTH_ENABLED=${AUDITTRACE_AUTH_ENABLED:-true}
       # llama.cpp proxy read timeout. Default (120s) is too tight for
       # cold model reload + inject-mode memory blobs that blow up the
       # prompt-eval time. Bumped to 300s so a cold start on Qwen3.5-35B
       # + a few thousand prompt tokens doesn't trip httpcore.ReadTimeout
-      # mid-stream. If this bites again, flip SOVEREIGN_MEMORY_MODE=tools
+      # mid-stream. If this bites again, flip AUDITTRACE_MEMORY_MODE=tools
       # (ADR-025) to pay the memory cost only when the LLM asks for it.
-      - SOVEREIGN_LLAMA_PROXY_TIMEOUT=${SOVEREIGN_LLAMA_PROXY_TIMEOUT:-300}
+      - AUDITTRACE_LLAMA_PROXY_TIMEOUT=${AUDITTRACE_LLAMA_PROXY_TIMEOUT:-300}
       # ADR-034: per-chunk idle timeout replaces the flat proxy timeout for
       # streaming. If no SSE chunk arrives within this window, the stream
       # is considered stalled and a 504 + audit row are emitted.
-      - SOVEREIGN_LLAMA_CHUNK_TIMEOUT=${SOVEREIGN_LLAMA_CHUNK_TIMEOUT:-120}
+      - AUDITTRACE_LLAMA_CHUNK_TIMEOUT=${AUDITTRACE_LLAMA_CHUNK_TIMEOUT:-120}
       # ADR-034: SSE keep-alive comment frames emitted during quiet periods
       # (e.g. Qwen <think> reasoning). Holds connections through proxies.
-      - SOVEREIGN_SSE_KEEPALIVE_INTERVAL=${SOVEREIGN_SSE_KEEPALIVE_INTERVAL:-15}
+      - AUDITTRACE_SSE_KEEPALIVE_INTERVAL=${AUDITTRACE_SSE_KEEPALIVE_INTERVAL:-15}
       # DESIGN §16 Phase 5b: auth required by default — every request
       # must carry a valid Keycloak JWT. Override with
-      # `SOVEREIGN_AUTH_REQUIRED=false` for the migration bypass if
+      # `AUDITTRACE_AUTH_REQUIRED=false` for the migration bypass if
       # your client isn't Keycloak-ready yet. The Python test suite
-      # clears all SOVEREIGN_* env vars in conftest.py so its sentinel
+      # clears all AUDITTRACE_* env vars in conftest.py so its sentinel
       # path is unaffected by this default.
-      - SOVEREIGN_AUTH_REQUIRED=${SOVEREIGN_AUTH_REQUIRED:-true}
-      - SOVEREIGN_KEYCLOAK_ISSUER=http://keycloak:8080/realms/sovereign-ai
-      - SOVEREIGN_KEYCLOAK_JWKS_URL=http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs
+      - AUDITTRACE_AUTH_REQUIRED=${AUDITTRACE_AUTH_REQUIRED:-true}
+      - AUDITTRACE_KEYCLOAK_ISSUER=http://keycloak:8080/realms/audittrace
+      - AUDITTRACE_KEYCLOAK_JWKS_URL=http://keycloak:8080/realms/audittrace/protocol/openid-connect/certs
       # ADR-032: Device-Flow tokens ride the Traefik-exposed URL and
       # carry a different ``iss`` than the internal docker-network one
       # used by service-account flows. Accepting both keeps the
       # memory-server usable from BOTH token families without
       # relaxing validation to skip issuer entirely.
-      - SOVEREIGN_KEYCLOAK_ISSUER_EXTRAS=["http://localhost/realms/sovereign-ai","https://localhost/realms/sovereign-ai"]
-      - SOVEREIGN_JWT_AUDIENCE=sovereign-memory-server
+      - AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS=["http://localhost/realms/audittrace","https://localhost/realms/audittrace"]
+      - AUDITTRACE_JWT_AUDIENCE=audittrace-server
       # Redis-backed token cache (ADR-026 §15.4)
-      - SOVEREIGN_REDIS_URL=redis://redis:6379/0
-      - SOVEREIGN_REDIS_PASSWORD=${SOVEREIGN_REDIS_PASSWORD}
-      - SOVEREIGN_TOKEN_CACHE_TTL_SECONDS=${SOVEREIGN_TOKEN_CACHE_TTL_SECONDS:-300}
+      - AUDITTRACE_REDIS_URL=redis://redis:6379/0
+      - AUDITTRACE_REDIS_PASSWORD=${AUDITTRACE_REDIS_PASSWORD}
+      - AUDITTRACE_TOKEN_CACHE_TTL_SECONDS=${AUDITTRACE_TOKEN_CACHE_TTL_SECONDS:-300}
       # Memory-as-tools (ADR-025) — kill switch + loop cap + tool result cache
-      - SOVEREIGN_MEMORY_MODE=${SOVEREIGN_MEMORY_MODE:-inject}
-      - SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS=${SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS:-5}
-      - SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS=${SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS:-900}
-      - SOVEREIGN_TOOLS_CONFIG_PATH=${SOVEREIGN_TOOLS_CONFIG_PATH:-tools.toml}
+      - AUDITTRACE_MEMORY_MODE=${AUDITTRACE_MEMORY_MODE:-inject}
+      - AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS=${AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS:-5}
+      - AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS=${AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS:-900}
+      - AUDITTRACE_TOOLS_CONFIG_PATH=${AUDITTRACE_TOOLS_CONFIG_PATH:-tools.toml}
       # MinIO S3 object storage (ADR-027) — replaces filesystem bind mounts
-      - SOVEREIGN_MINIO_URL=http://minio:9000
-      - SOVEREIGN_MINIO_ACCESS_KEY=${SOVEREIGN_MINIO_ACCESS_KEY:-minioadmin}
-      - SOVEREIGN_MINIO_SECRET_KEY=${SOVEREIGN_MINIO_SECRET_KEY}
-      - SOVEREIGN_MINIO_SHARED_BUCKET=${SOVEREIGN_MINIO_SHARED_BUCKET:-memory-shared}
-      - SOVEREIGN_MINIO_PRIVATE_BUCKET=${SOVEREIGN_MINIO_PRIVATE_BUCKET:-memory-private}
+      - AUDITTRACE_MINIO_URL=http://minio:9000
+      - AUDITTRACE_MINIO_ACCESS_KEY=${AUDITTRACE_MINIO_ACCESS_KEY:-minioadmin}
+      - AUDITTRACE_MINIO_SECRET_KEY=${AUDITTRACE_MINIO_SECRET_KEY}
+      - AUDITTRACE_MINIO_SHARED_BUCKET=${AUDITTRACE_MINIO_SHARED_BUCKET:-memory-shared}
+      - AUDITTRACE_MINIO_PRIVATE_BUCKET=${AUDITTRACE_MINIO_PRIVATE_BUCKET:-memory-private}
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=sovereign-ai-net"
+      - "traefik.docker.network=audittrace-net"
       - "traefik.http.routers.memory.rule=PathPrefix(`/`)"
       - "traefik.http.routers.memory.entrypoints=websecure"
       - "traefik.http.routers.memory.tls=true"
       - "traefik.http.services.memory.loadbalancer.server.port=8765"
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
-    container_name: sovereign-postgres
+    container_name: audittrace-postgres
     ports:
       - "15432:5432"
     environment:
-      POSTGRES_DB: sovereign_ai
-      POSTGRES_USER: sovereign
-      POSTGRES_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
-      # Passed through to init-sovereign-app-role.sh so the app role
+      POSTGRES_DB: audittrace
+      POSTGRES_USER: audittrace
+      POSTGRES_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
+      # Passed through to init-audittrace-app-role.sh so the app role
       # gets a dedicated password. Falls back to POSTGRES_PASSWORD if
       # the operator doesn't set it explicitly (dev-simple default).
-      SOVEREIGN_APP_PASSWORD: ${SOVEREIGN_APP_PASSWORD:-${SOVEREIGN_POSTGRES_PASSWORD}}
+      AUDITTRACE_APP_PASSWORD: ${AUDITTRACE_APP_PASSWORD:-${AUDITTRACE_POSTGRES_PASSWORD}}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-keycloak-db.sql:/docker-entrypoint-initdb.d/01-init-keycloak-db.sql:ro
-      # DESIGN §16 Phase 4: create the non-superuser sovereign_app role
+      # DESIGN §16 Phase 4: create the non-superuser audittrace_app role
       # on first init. Runs AFTER keycloak DB creation (alphabetical
       # ordering via the 01-/02- prefixes). Idempotent — safe to re-run
       # manually via `docker exec` on an existing volume.
-      - ./scripts/init-sovereign-app-role.sh:/docker-entrypoint-initdb.d/02-init-sovereign-app-role.sh:ro
+      - ./scripts/init-audittrace-app-role.sh:/docker-entrypoint-initdb.d/02-init-audittrace-app-role.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sovereign -d sovereign_ai"]
+      test: ["CMD-SHELL", "pg_isready -U audittrace -d audittrace"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
   chromadb:
     image: chromadb/chroma:1.5.7
-    container_name: sovereign-chromadb
+    container_name: audittrace-chromadb
     ports:
       - "18000:8000"
     environment:
-      - CHROMA_SERVER_AUTHN_CREDENTIALS=${SOVEREIGN_CHROMA_TOKEN}
+      - CHROMA_SERVER_AUTHN_CREDENTIALS=${AUDITTRACE_CHROMA_TOKEN}
       - CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider
     volumes:
       - chroma_data:/chroma/chroma
@@ -177,12 +177,12 @@ services:
       retries: 10
       start_period: 15s
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
-    container_name: sovereign-keycloak
+    container_name: audittrace-keycloak
     command: start-dev --import-realm --health-enabled=true
     depends_on:
       postgres:
@@ -190,8 +190,8 @@ services:
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
-      KC_DB_USERNAME: sovereign
-      KC_DB_PASSWORD: ${SOVEREIGN_POSTGRES_PASSWORD}
+      KC_DB_USERNAME: audittrace
+      KC_DB_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # ADR-032: Keycloak is fronted by Traefik on :443. Without
@@ -211,7 +211,7 @@ services:
       retries: 12
       start_period: 30s
     volumes:
-      - ./keycloak/realm-sovereign-ai.json:/opt/keycloak/data/import/realm.json:ro
+      - ./keycloak/realm-audittrace.json:/opt/keycloak/data/import/realm.json:ro
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.keycloak.rule=PathPrefix(`/realms`) || PathPrefix(`/admin`)"
@@ -219,21 +219,21 @@ services:
       - "traefik.http.routers.keycloak.tls=true"
       - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
   redis:
     # ADR-026 §15.4 — Redis-backed token cache.
-    # Dedicated to sovereign-memory-server; NOT shared with the Langfuse
+    # Dedicated to audittrace-server; NOT shared with the Langfuse
     # Redis (which lives in the sibling Langfuse compose stack). Keeping
     # the two decoupled avoids cross-system coupling and lets each
     # scale independently.
     image: redis:7-alpine
-    container_name: sovereign-redis
+    container_name: audittrace-redis
     command:
       - redis-server
       - --requirepass
-      - ${SOVEREIGN_REDIS_PASSWORD}
+      - ${AUDITTRACE_REDIS_PASSWORD}
       - --appendonly
       - "no"  # token cache is ephemeral by design
       - --maxmemory
@@ -241,17 +241,17 @@ services:
       - --maxmemory-policy
       - allkeys-lru
     volumes:
-      - sovereign_redis_data:/data
+      - audittrace_redis_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $$SOVEREIGN_REDIS_PASSWORD ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli -a $$AUDITTRACE_REDIS_PASSWORD ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     environment:
-      - SOVEREIGN_REDIS_PASSWORD=${SOVEREIGN_REDIS_PASSWORD}
+      - AUDITTRACE_REDIS_PASSWORD=${AUDITTRACE_REDIS_PASSWORD}
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
   minio:
@@ -259,13 +259,13 @@ services:
     # Replaces host filesystem bind mounts (12-factor VI: stateless processes).
     # Encryption at rest via SSE-S3 (MINIO_KMS_SECRET_KEY).
     image: minio/minio:latest
-    container_name: sovereign-minio
+    container_name: audittrace-minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${SOVEREIGN_MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${SOVEREIGN_MINIO_SECRET_KEY}
+      MINIO_ROOT_USER: ${AUDITTRACE_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AUDITTRACE_MINIO_SECRET_KEY}
       # Encryption at rest — SSE-S3 with auto-managed keys (ADR-027 §3)
-      MINIO_KMS_SECRET_KEY: "sovereign-key:${SOVEREIGN_MINIO_KMS_KEY}"
+      MINIO_KMS_SECRET_KEY: "audittrace-key:${AUDITTRACE_MINIO_KMS_KEY}"
     volumes:
       - minio_data:/data
     ports:
@@ -278,12 +278,12 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
   traefik:
     image: traefik:v3.6
-    container_name: sovereign-traefik
+    container_name: audittrace-traefik
     ports:
       - "443:443"
       - "8080:8080"
@@ -295,16 +295,16 @@ services:
       - ./certs:/certs:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - sovereign-ai-net
+      - audittrace-net
     restart: unless-stopped
 
 volumes:
   postgres_data:
   chroma_data:
-  sovereign_redis_data:
+  audittrace_redis_data:
   minio_data:
 
 networks:
-  sovereign-ai-net:
-    name: sovereign-ai-net
+  audittrace-net:
+    name: audittrace-net
     external: true

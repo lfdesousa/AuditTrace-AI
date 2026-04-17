@@ -2,10 +2,10 @@
 # Health check for audittrace-stack services
 set -euo pipefail
 
-MEMORY_URL="${SOVEREIGN_MEMORY_URL:-https://localhost/health}"
-CHROMA_URL="${SOVEREIGN_CHROMA_HEALTH:-http://localhost:8000/api/v2/heartbeat}"
-LANGFUSE_URL="${SOVEREIGN_LANGFUSE_HEALTH:-http://localhost:3000/}"
-TRAEFIK_URL="${SOVEREIGN_TRAEFIK_HEALTH:-http://localhost:8080/api/overview}"
+MEMORY_URL="${AUDITTRACE_MEMORY_URL:-https://localhost/health}"
+CHROMA_URL="${AUDITTRACE_CHROMA_HEALTH:-http://localhost:8000/api/v2/heartbeat}"
+LANGFUSE_URL="${AUDITTRACE_LANGFUSE_HEALTH:-http://localhost:3000/}"
+TRAEFIK_URL="${AUDITTRACE_TRAEFIK_HEALTH:-http://localhost:8080/api/overview}"
 
 echo "Checking audittrace-stack services..."
 echo ""

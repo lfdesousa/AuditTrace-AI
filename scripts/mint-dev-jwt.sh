@@ -2,13 +2,13 @@
 # DESIGN §16 Phase 7 — mint a dev JWT against the running Keycloak.
 #
 # Fetches an access token via the OAuth2 client_credentials grant
-# using the `sovereign-memory-dev` client. The token carries all the
-# scopes the memory-server needs (legacy sovereign-ai:* + Phase 3
+# using the `audittrace-dev` client. The token carries all the
+# scopes the memory-server needs (legacy audittrace:* + Phase 3
 # memory:*), a hardcoded audience claim `audittrace-ai`
 # for the JWT validation path, and a real Keycloak `sub` that
 # threads through as the UserContext user_id.
 #
-# **This script is designed to run INSIDE the sovereign-ai-net
+# **This script is designed to run INSIDE the audittrace-net
 # docker network** so the JWT's ``iss`` claim matches the memory-
 # server's configured ``keycloak_issuer`` (http://keycloak:8080/...).
 # Running it from the host would produce a token with a different
@@ -25,7 +25,7 @@
 #
 # Use cases:
 #
-#   1. **Curl smoke tests** with SOVEREIGN_AUTH_REQUIRED=true —
+#   1. **Curl smoke tests** with AUDITTRACE_AUTH_REQUIRED=true —
 #      wrap the `docker exec` pattern above in a shell function.
 #   2. **Bruno collection variables** — pre-request script that
 #      shells out to the same docker exec pattern.
@@ -39,8 +39,8 @@
 #                          memory-server is configured to trust).
 #                          Override when running outside the network
 #                          but note the issuer-mismatch trap above.
-#   REALM                — defaults to `sovereign-ai`
-#   CLIENT_ID            — defaults to `sovereign-memory-dev`
+#   REALM                — defaults to `audittrace`
+#   CLIENT_ID            — defaults to `audittrace-dev`
 #   CLIENT_SECRET        — required; read from the environment or
 #                          from `secrets/dev_client_secret.txt` as a
 #                          fallback (create the file the first time
@@ -54,8 +54,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak:8080}"
-REALM="${REALM:-sovereign-ai}"
-CLIENT_ID="${CLIENT_ID:-sovereign-memory-dev}"
+REALM="${REALM:-audittrace}"
+CLIENT_ID="${CLIENT_ID:-audittrace-dev}"
 
 # Secret: env var wins, falls back to secrets/dev_client_secret.txt.
 CLIENT_SECRET="${CLIENT_SECRET:-}"
@@ -70,13 +70,13 @@ if [[ -z "${CLIENT_SECRET}" ]]; then
     echo "ERROR: CLIENT_SECRET not set and secrets/dev_client_secret.txt missing" >&2
     echo "" >&2
     echo "To create the secrets file:" >&2
-    echo "  docker exec sovereign-keycloak /opt/keycloak/bin/kcadm.sh \\" >&2
+    echo "  docker exec audittrace-keycloak /opt/keycloak/bin/kcadm.sh \\" >&2
     echo "      config credentials --server http://localhost:8080 \\" >&2
     echo "      --realm master --user admin --password admin" >&2
-    echo "  CLIENT_INTERNAL_ID=\$(docker exec sovereign-keycloak \\" >&2
+    echo "  CLIENT_INTERNAL_ID=\$(docker exec audittrace-keycloak \\" >&2
     echo "      /opt/keycloak/bin/kcadm.sh get clients -r ${REALM} \\" >&2
     echo "      -q clientId=${CLIENT_ID} --fields id --format csv --noquotes)" >&2
-    echo "  docker exec sovereign-keycloak /opt/keycloak/bin/kcadm.sh \\" >&2
+    echo "  docker exec audittrace-keycloak /opt/keycloak/bin/kcadm.sh \\" >&2
     echo "      get clients/\$CLIENT_INTERNAL_ID/client-secret \\" >&2
     echo "      -r ${REALM} | python3 -c \"import sys,json; print(json.load(sys.stdin)['value'])\" \\" >&2
     echo "      > secrets/dev_client_secret.txt" >&2

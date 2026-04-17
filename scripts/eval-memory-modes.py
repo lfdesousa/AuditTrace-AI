@@ -14,13 +14,13 @@ chat-completions proxy under each memory mode and records:
 Design constraints (user-stated, non-negotiable):
 
 * **Sequential**: probes run one at a time. No asyncio, no threads.
-* **Two runs per prompt**: the script flips ``SOVEREIGN_MEMORY_MODE`` in
+* **Two runs per prompt**: the script flips ``AUDITTRACE_MEMORY_MODE`` in
   ``.env``, restarts the ``memory-server`` container, waits for
   ``/health``, then runs all prompts in that mode. Two restarts total.
 * **Bounded blast radius**: original ``.env`` is restored on exit via
   ``try/finally``, including on ``KeyboardInterrupt``.
 
-The script intentionally does **not** import from the ``sovereign_memory``
+The script intentionally does **not** import from the ``audittrace``
 package so it can run against any deployed stack where the repo layout
 may differ.
 """
@@ -57,16 +57,16 @@ OUTPUT_DIR = REPO_ROOT / "tmp"
 
 PROXY_URL = "https://localhost/v1/chat/completions"
 HEALTH_URL = "https://localhost/health"
-MEMORY_CONTAINER = "sovereign-memory-server"
-POSTGRES_CONTAINER = "sovereign-postgres"
-POSTGRES_DB = "sovereign_ai"
-POSTGRES_USER = "sovereign"
+MEMORY_CONTAINER = "audittrace-server"
+POSTGRES_CONTAINER = "audittrace-postgres"
+POSTGRES_DB = "audittrace"
+POSTGRES_USER = "audittrace"
 
 REQUEST_TIMEOUT_S = 1800  # 30 min — allows long <think> reasoning (ADR-034)
 HEALTH_POLL_TIMEOUT_S = 120
 HEALTH_POLL_INTERVAL_S = 2
 CHECKPOINT_EVERY = 10
-MODE_ENV_KEY = "SOVEREIGN_MEMORY_MODE"
+MODE_ENV_KEY = "AUDITTRACE_MEMORY_MODE"
 ANCHOR_LINE = "KEYCLOAK_ADMIN_PASSWORD=admin"
 
 logger = logging.getLogger("eval-memory-modes")
@@ -101,7 +101,7 @@ PROMPTS: list[tuple[str, str | None, str]] = [
         "recall_decisions",
         "decisions",
     ),
-    ("Why is SOVEREIGN_MEMORY_MODE a kill switch?", "recall_decisions", "decisions"),
+    ("Why is AUDITTRACE_MEMORY_MODE a kill switch?", "recall_decisions", "decisions"),
     (
         "Recall the reasoning behind transparent proxy augmentation.",
         "recall_decisions",
@@ -449,7 +449,7 @@ def read_env_file(path: Path) -> str:
 
 
 def write_env_mode(original: str, mode: str) -> str:
-    """Return a new ``.env`` body with ``SOVEREIGN_MEMORY_MODE=<mode>`` set.
+    """Return a new ``.env`` body with ``AUDITTRACE_MEMORY_MODE=<mode>`` set.
 
     If the line already exists it is replaced in place; otherwise the line
     is inserted immediately after the ``KEYCLOAK_ADMIN_PASSWORD=admin``
@@ -532,7 +532,7 @@ def switch_mode(mode: str, original_env: str) -> None:
     """Rewrite ``.env``, restart the container, and wait for health."""
     new_body = write_env_mode(original_env, mode)
     ENV_FILE.write_text(new_body, encoding="utf-8")
-    logger.info("switched .env SOVEREIGN_MEMORY_MODE=%s", mode)
+    logger.info("switched .env AUDITTRACE_MEMORY_MODE=%s", mode)
     restart_memory_server()
     wait_for_health()
 

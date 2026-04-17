@@ -17,10 +17,10 @@ services:
         echo "Running database migrations..."
         python -m alembic upgrade head
         echo "Starting audittrace-ai (dev mode — hot reload)..."
-        exec uvicorn sovereign_memory.server:app \
-          --host "$${SOVEREIGN_HOST:-0.0.0.0}" \
-          --port "$${SOVEREIGN_PORT:-8765}" \
+        exec uvicorn audittrace.server:app \
+          --host "$${AUDITTRACE_HOST:-0.0.0.0}" \
+          --port "$${AUDITTRACE_PORT:-8765}" \
           --reload \
           --reload-dir /app/src
     environment:
-      - SOVEREIGN_LOG_LEVEL=DEBUG
+      - AUDITTRACE_LOG_LEVEL=DEBUG
