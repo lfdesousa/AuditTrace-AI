@@ -79,6 +79,13 @@ services:
       # mid-stream. If this bites again, flip SOVEREIGN_MEMORY_MODE=tools
       # (ADR-025) to pay the memory cost only when the LLM asks for it.
       - SOVEREIGN_LLAMA_PROXY_TIMEOUT=${SOVEREIGN_LLAMA_PROXY_TIMEOUT:-300}
+      # ADR-034: per-chunk idle timeout replaces the flat proxy timeout for
+      # streaming. If no SSE chunk arrives within this window, the stream
+      # is considered stalled and a 504 + audit row are emitted.
+      - SOVEREIGN_LLAMA_CHUNK_TIMEOUT=${SOVEREIGN_LLAMA_CHUNK_TIMEOUT:-120}
+      # ADR-034: SSE keep-alive comment frames emitted during quiet periods
+      # (e.g. Qwen <think> reasoning). Holds connections through proxies.
+      - SOVEREIGN_SSE_KEEPALIVE_INTERVAL=${SOVEREIGN_SSE_KEEPALIVE_INTERVAL:-15}
       # DESIGN §16 Phase 5b: auth required by default — every request
       # must carry a valid Keycloak JWT. Override with
       # `SOVEREIGN_AUTH_REQUIRED=false` for the migration bypass if

@@ -94,7 +94,9 @@ class Settings(BaseSettings):
     # 4-layer memory paths (ADR-018) — filesystem fallback for tests/local dev
     adr_dir: str = "./memory/episodic"
     skill_dir: str = "./memory/procedural"
-    llama_proxy_timeout: int = 120  # seconds — timeout for llama-server proxy calls
+    llama_proxy_timeout: int = 120  # seconds — DEPRECATED: use llama_chunk_timeout
+    llama_chunk_timeout: int = 120  # seconds — per-chunk idle timeout (ADR-034)
+    sse_keepalive_interval: int = 15  # seconds — SSE keep-alive interval (ADR-034)
 
     # MinIO / S3 object storage (ADR-027) — replaces filesystem bind mounts.
     # When minio_secret_key is non-empty, S3*Services activate and read from

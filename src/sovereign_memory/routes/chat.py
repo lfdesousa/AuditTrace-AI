@@ -176,6 +176,31 @@ def _detect_source(request: Request) -> str:
     return "unknown"
 
 
+def _resolve_thinking(request: Request) -> str | None:
+    """Parse ``X-Thinking`` header (ADR-034).
+
+    Returns ``"deep"`` or ``"fast"`` when explicitly set, or ``None``
+    for ``auto`` (the default — don't touch ``chat_template_kwargs``).
+    """
+    raw = (request.headers.get("x-thinking") or "").strip().lower()
+    if raw in ("deep", "fast"):
+        return raw
+    return None
+
+
+def _apply_thinking_mode(payload: dict[str, Any], thinking: str | None) -> None:
+    """Inject ``chat_template_kwargs.enable_thinking`` into *payload* in-place.
+
+    ``deep``  → ``enable_thinking = True``
+    ``fast``  → ``enable_thinking = False``
+    ``None``  → leave payload untouched (auto / model default)
+    """
+    if thinking is None:
+        return
+    kwargs = payload.setdefault("chat_template_kwargs", {})
+    kwargs["enable_thinking"] = thinking == "deep"
+
+
 def _persist_interaction(
     project: str,
     source: str,
@@ -926,6 +951,12 @@ async def chat_completions(
     # Header wins so an agent can carry one provider config per project and
     # drop the tag in cleanly via a single HTTP header.
     payload["project"] = _resolve_project(http_request, payload)
+
+    # ADR-034: depth is a user-expressed knob. Parse X-Thinking header
+    # and inject chat_template_kwargs.enable_thinking into the payload
+    # BEFORE branching into inject/tools so both paths honour it.
+    thinking = _resolve_thinking(http_request)
+    _apply_thinking_mode(payload, thinking)
 
     query = _extract_query(payload)
     source = _detect_source(http_request)
