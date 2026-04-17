@@ -1,4 +1,5 @@
-.PHONY: help venv install lint test test-cov test-coverage clean
+.PHONY: help venv install lint test test-cov test-coverage clean \
+       docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -88,3 +89,39 @@ docker-build: ## Build Docker image
 docker-run: ## Run Docker container
 	@echo "🐳 Running container..."
 	@docker run -p 8765:8765 --env-file .env audittrace-ai:latest
+
+# ─────────────────── Kubernetes (k3s + Istio) ─────────────────────────
+
+CHART_DIR   := charts/audittrace
+RELEASE     := audittrace
+NAMESPACE   := audittrace
+VALUES_FILE := $(CHART_DIR)/values-local.yaml
+
+k8s-build: docker-build ## Build + push to local k3s registry
+	@docker tag audittrace-ai:latest localhost:5000/audittrace/memory-server:latest
+	@docker push localhost:5000/audittrace/memory-server:latest
+	@echo "pushed to localhost:5000"
+
+k8s-deps: ## Update Helm chart dependencies (Bitnami subcharts)
+	@helm dependency update $(CHART_DIR)
+
+k8s-template: ## Render templates without installing (dry-run)
+	@helm template $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+
+k8s-install: k8s-deps ## Install the Helm chart on k3s
+	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
+	@helm install $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+
+k8s-upgrade: ## Upgrade the Helm release
+	@helm upgrade $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+
+k8s-status: ## Show pod/service/Istio status
+	@echo "=== Pods ==="
+	@kubectl get pods -n $(NAMESPACE) -o wide
+	@echo "\n=== Services ==="
+	@kubectl get svc -n $(NAMESPACE)
+	@echo "\n=== Istio VirtualServices ==="
+	@kubectl get virtualservices -n $(NAMESPACE) 2>/dev/null || true
+	@echo "\n=== Istio PeerAuthentication ==="
+	@kubectl get peerauthentication -n $(NAMESPACE) 2>/dev/null || true

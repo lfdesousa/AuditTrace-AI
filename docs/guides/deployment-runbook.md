@@ -258,3 +258,77 @@ curl http://localhost:11435/health  # Qwen
 curl http://localhost:11436/health  # Embeddings
 curl http://localhost:11437/health  # Mistral summariser
 ```
+
+---
+
+## Kubernetes Deployment (k3s + Istio)
+
+### Prerequisites
+
+```bash
+# Install k3s
+curl -sfL https://get.k3s.io | sh -
+
+# Install Istio
+istioctl install --set profile=default -y
+
+# Install Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Local registry for k3s
+# Add to /etc/rancher/k3s/registries.yaml:
+#   mirrors:
+#     "localhost:5000":
+#       endpoint:
+#         - "http://localhost:5000"
+docker run -d -p 5000:5000 --name registry registry:2
+```
+
+### Deploy
+
+```bash
+# 1. Build and push the memory-server image
+make k8s-build
+
+# 2. Generate TLS cert for the Istio Gateway
+mkcert -cert-file tls.crt -key-file tls.key audittrace.local localhost
+kubectl create namespace audittrace
+kubectl create secret tls audittrace-tls \
+    --cert=tls.crt --key=tls.key -n audittrace
+
+# 3. Install with secrets
+make k8s-install \
+    --set secrets.postgres.password=<password> \
+    --set secrets.postgres.appPassword=<password> \
+    --set secrets.chromadb.token=<token> \
+    --set secrets.redis.password=<password> \
+    --set secrets.minio.secretKey=<key> \
+    --set secrets.minio.kmsKey=<key>
+
+# 4. Wait for all pods
+kubectl get pods -n audittrace -w
+
+# 5. Add /etc/hosts entry
+echo "127.0.0.1 audittrace.local" | sudo tee -a /etc/hosts
+
+# 6. Verify
+curl -sk https://audittrace.local/health
+```
+
+### Day-2 operations
+
+```bash
+make k8s-status       # pod + service + Istio status
+make k8s-upgrade      # apply values changes
+make k8s-template     # dry-run template rendering
+
+# Istio analysis
+istioctl analyze -n audittrace
+
+# Check mTLS is enforced
+istioctl proxy-config clusters -n audittrace deploy/audittrace-memory-server
+
+# Verify ZTA: direct pod access should be denied
+kubectl exec -n audittrace deploy/audittrace-redis -- redis-cli ping
+# Expected: connection refused (AuthorizationPolicy blocks non-SPIFFE sources)
+```
