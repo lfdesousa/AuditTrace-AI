@@ -13,7 +13,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sovereign_memory.identity import SENTINEL_SUBJECT
-from sovereign_memory.routes.chat import _compute_session_id, _resolve_project
+from sovereign_memory.routes.chat import (
+    _apply_thinking_mode,
+    _compute_session_id,
+    _resolve_project,
+    _resolve_thinking,
+)
 
 # ──────────────────────────── httpx.AsyncClient fakes ────────────────────────
 #
@@ -1234,3 +1239,59 @@ class TestToolsModeIntegration:
         with pg.get_session_factory()() as db:
             tool_calls_rows = db.query(ToolCall).all()
         assert tool_calls_rows == []
+
+
+# ──────────────────── ADR-034: X-Thinking header ─────────────────────────
+
+
+class TestResolveThinking:
+    """ADR-034: parse X-Thinking header → deep | fast | None (auto)."""
+
+    def test_deep(self):
+        req = _FakeRequest({"x-thinking": "deep"})
+        assert _resolve_thinking(req) == "deep"
+
+    def test_fast(self):
+        req = _FakeRequest({"x-thinking": "fast"})
+        assert _resolve_thinking(req) == "fast"
+
+    def test_auto_explicit(self):
+        req = _FakeRequest({"x-thinking": "auto"})
+        assert _resolve_thinking(req) is None
+
+    def test_absent_returns_none(self):
+        req = _FakeRequest({})
+        assert _resolve_thinking(req) is None
+
+    def test_case_insensitive(self):
+        req = _FakeRequest({"x-thinking": "DEEP"})
+        assert _resolve_thinking(req) == "deep"
+
+    def test_whitespace_stripped(self):
+        req = _FakeRequest({"x-thinking": "  fast  "})
+        assert _resolve_thinking(req) == "fast"
+
+
+class TestApplyThinkingMode:
+    """ADR-034: inject chat_template_kwargs.enable_thinking into payload."""
+
+    def test_deep_sets_enable_thinking_true(self):
+        payload: dict = {}
+        _apply_thinking_mode(payload, "deep")
+        assert payload["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_fast_sets_enable_thinking_false(self):
+        payload: dict = {}
+        _apply_thinking_mode(payload, "fast")
+        assert payload["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_none_leaves_payload_untouched(self):
+        payload: dict = {"messages": []}
+        _apply_thinking_mode(payload, None)
+        assert "chat_template_kwargs" not in payload
+
+    def test_preserves_existing_chat_template_kwargs(self):
+        payload: dict = {"chat_template_kwargs": {"some_other_flag": 42}}
+        _apply_thinking_mode(payload, "deep")
+        assert payload["chat_template_kwargs"]["some_other_flag"] == 42
+        assert payload["chat_template_kwargs"]["enable_thinking"] is True
