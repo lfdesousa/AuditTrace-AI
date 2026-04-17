@@ -1,0 +1,10 @@
+AuditTrace-AI deployed to namespace {{ .Release.Namespace }}.
+
+Memory server: https://{{ (index .Values.istio.gateway.hosts 0) }}/health
+Keycloak:      https://{{ (index .Values.istio.gateway.hosts 0) }}/admin
+
+Next steps:
+  1. Verify pods:     kubectl get pods -n {{ .Release.Namespace }}
+  2. Check Istio:     istioctl analyze -n {{ .Release.Namespace }}
+  3. Login:           scripts/audittrace-login
+  4. Smoke test:      curl -sk https://{{ (index .Values.istio.gateway.hosts 0) }}/health

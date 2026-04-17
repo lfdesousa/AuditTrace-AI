@@ -1,0 +1,15 @@
+enabled: true
+image:
+  repository: chromadb/chroma
+  tag: "1.5.7"
+port: 8000
+persistence:
+  size: 10Gi
+  storageClass: local-path
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 2Gi

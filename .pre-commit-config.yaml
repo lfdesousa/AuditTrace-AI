@@ -9,6 +9,7 @@ repos:
       - id: end-of-file-fixer
         exclude: ^docs/reference/
       - id: check-yaml
+        exclude: ^charts/
       - id: check-added-large-files
         # OpenAI's OpenAPI spec is ~2.5MB. Vendoring it is load-bearing
         # (see docs/reference/openai/README.md — North Star for API

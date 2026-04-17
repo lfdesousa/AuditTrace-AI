@@ -1,0 +1,209 @@
+# =============================================================================
+# AuditTrace-AI — Helm values
+# =============================================================================
+
+# -- Global -------------------------------------------------------------------
+global:
+  namespace: audittrace
+  hostNodeIP: "192.168.1.100"
+
+# -- Memory Server (our app) -------------------------------------------------
+memoryServer:
+  replicaCount: 1
+  image:
+    repository: localhost:5000/audittrace/memory-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: memory-server
+  port: 8765
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+  env:
+    AUDITTRACE_ENV: "local"
+    AUDITTRACE_HOST: "0.0.0.0"
+    AUDITTRACE_PORT: "8765"
+    AUDITTRACE_WORKERS: "1"
+    AUDITTRACE_LOG_LEVEL: "INFO"
+    AUDITTRACE_AUTH_ENABLED: "true"
+    AUDITTRACE_AUTH_REQUIRED: "true"
+    AUDITTRACE_MEMORY_MODE: "tools"
+    AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS: "10"
+    AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS: "900"
+    AUDITTRACE_TOKEN_CACHE_TTL_SECONDS: "300"
+    AUDITTRACE_LLAMA_PROXY_TIMEOUT: "300"
+    AUDITTRACE_LLAMA_CHUNK_TIMEOUT: "120"
+    AUDITTRACE_SSE_KEEPALIVE_INTERVAL: "15"
+    AUDITTRACE_MINIO_SHARED_BUCKET: "memory-shared"
+    AUDITTRACE_MINIO_PRIVATE_BUCKET: "memory-private"
+    AUDITTRACE_TOOLS_CONFIG_PATH: "tools.toml"
+    AUDITTRACE_METRICS_ENABLED: "true"
+    AUDITTRACE_LANGFUSE_ENABLED: "false"
+    AUDITTRACE_SUMMARIZER_ENABLED: "true"
+    AUDITTRACE_SUMMARIZER_MODEL: "mistral-7b-summarizer"
+    AUDITTRACE_SUMMARIZER_IDLE_MINUTES: "15"
+    AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES: "5"
+    AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE: "10"
+    OTEL_SERVICE_NAME: "audittrace-server"
+    OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
+    OTEL_RESOURCE_ATTRIBUTES: "service.namespace=audittrace,service.version=1.0.0,deployment.environment=local"
+
+# -- External LLM (host-network endpoints) -----------------------------------
+externalLLM:
+  hostIP: "192.168.1.100"
+  chat:
+    name: llm-chat
+    port: 11435
+  embed:
+    name: llm-embed
+    port: 11436
+  summarizer:
+    name: llm-summarizer
+    port: 11437
+
+# -- Istio --------------------------------------------------------------------
+istio:
+  enabled: true
+  gateway:
+    name: audittrace-gateway
+    hosts:
+      - "audittrace.local"
+      - "localhost"
+    credentialName: audittrace-tls
+    port: 443
+  mtls:
+    mode: STRICT
+  defaultDenyAll: true
+
+# -- Observability ------------------------------------------------------------
+observability:
+  otelCollector:
+    enabled: true
+    image:
+      repository: otel/opentelemetry-collector-contrib
+      tag: "0.102.0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  external:
+    langfuseIP: "192.168.1.100"
+    langfusePort: 3000
+    prometheusIP: "192.168.1.100"
+    prometheusPort: 19090
+
+# -- TLS ----------------------------------------------------------------------
+tls:
+  createSecret: false
+  secretName: audittrace-tls
+
+# =============================================================================
+# Subchart overrides
+# =============================================================================
+
+postgresql:
+  enabled: true
+  auth:
+    database: audittrace
+    username: audittrace
+    password: ""
+    postgresPassword: ""
+  primary:
+    initdb:
+      scriptsConfigMap: "{{ .Release.Name }}-initdb"
+    persistence:
+      size: 10Gi
+      storageClass: local-path
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+
+redis:
+  enabled: true
+  auth:
+    password: ""
+  architecture: standalone
+  master:
+    persistence:
+      size: 1Gi
+      storageClass: local-path
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+minio:
+  enabled: true
+  auth:
+    rootUser: minioadmin
+    rootPassword: ""
+  persistence:
+    size: 20Gi
+    storageClass: local-path
+  defaultBuckets: "memory-shared,memory-private"
+
+keycloak:
+  enabled: true
+  auth:
+    adminUser: admin
+    adminPassword: ""
+  postgresql:
+    enabled: false
+  externalDatabase:
+    host: ""
+    port: 5432
+    user: audittrace
+    password: ""
+    database: keycloak
+  proxy: edge
+  httpRelativePath: /
+  extraEnvVars:
+    - name: KC_HOSTNAME_URL
+      value: "https://audittrace.local"
+    - name: KC_HOSTNAME_ADMIN_URL
+      value: "https://audittrace.local"
+
+chromadb:
+  enabled: true
+  image:
+    repository: chromadb/chroma
+    tag: "1.5.7"
+  port: 8000
+  persistence:
+    size: 10Gi
+    storageClass: local-path
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+# -- Secrets (override via --set or external secret manager) ------------------
+secrets:
+  postgres:
+    password: ""
+    appPassword: ""
+  chromadb:
+    token: ""
+  redis:
+    password: ""
+  minio:
+    secretKey: ""
+    kmsKey: ""
+  keycloak:
+    adminPassword: "admin"
