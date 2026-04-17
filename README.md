@@ -282,20 +282,24 @@ The `sovereign-memory-dev` client is the legacy path. Still the right choice for
 
 | Priority | Item | Description |
 |---|---|---|
-| ✅ Done | **Intelligent Memory Tool Routing** | Solved via system prompt guidance — ambient context instructs the LLM to pick ONE tool per question. Validated with Qwen3.5-35B-A3B. Quantitative measurement pending (needs observability dashboards). ADR-025 Accepted. |
-| ✅ Done | **MinIO Object Storage** | Stateless 12-factor containers — host filesystem mounts replaced with MinIO S3 (ADR-027). Two-tier buckets: `memory-shared` (ADRs, skills) + `memory-private` (per-user, JWT sub prefix). SSE-S3 encryption at rest. |
-| ✅ Done | **Observability Aggregation Stack** | Prometheus + Grafana + Loki + OTel Collector as sibling compose stack (ADR-028). Scrapes Traefik, llama-server, MinIO. Promtail for container log aggregation. Pre-provisioned Grafana dashboard. |
-| ✅ Done | **mypy --strict Clean** | 0 errors across 41 source files. Pre-commit pipeline passes without SKIP=mypy. types-redis stubs installed. |
-| ✅ Done | **Audit Trail Completeness** | Project tagging via X-Project header (ADR-029) + urllib3 instrumentation + Tempo service-graph clean host-name edges. `/interactions` endpoint live with RLS-scoped pagination. |
-| ✅ Done | **Session Summariser** | Hybrid `recall_recent_sessions` (real `SessionRecord` rows padded with synthetic rows from `interactions` not yet summarised) + background asyncio summariser loop writing `SessionRecord` rows via Mistral 7B Instruct v0.3 on `:11437`. Three-model topology (Qwen chat + nomic embed + Mistral summariser). ADR-030 Accepted. |
-| ✅ Done | **Tool Routing Measurement** | Three N=10 evals on 2026-04-15: clean baseline, contention (Mistral-resident), and ambiguous-category. Clear architectural finding — factual probes favour `tools` mode, analytical probes favour `inject` mode. Motivates ADR-031 per-request routing. |
-| 🔴 Next | **ADR-031 Per-Request Memory-Mode Routing** | Accept `X-Memory-Mode: tools\|inject\|auto` header (symmetric with `X-Project`); when `auto`, classify user prompt via regex fast-path (`^(why\|how has\|explain\|recap\|describe)` → inject) with Mistral fallback for ambiguous cases. Gated on the full N=100 sweep to confirm the category split holds. |
-| 🔴 Next | **Cache-Controlled N=100 Eval Sweep** | ~4 hours wall. Full 100 probes × 6 categories × 2 modes with randomised ordering, `drop_caches` between runs, and summariser interaction-backdating to measure concurrent-generation contention (today's runs only measured Mistral residency). Precondition for ADR-031. |
-| 🔴 Next | **Full Package Rename** | Rename Python package from `sovereign_memory` to `audittrace`, env prefix from `SOVEREIGN_` to `AUDITTRACE_`, all container/service/network names. Dedicated PR. |
-| 🟡 Planned | **OAuth2 Device Flow** | Human authentication beyond the current `client_credentials` dev client. Dedicated Keycloak public client for OpenCode. |
-| 🟡 Planned | **Langfuse Trace Verification (Summariser Path)** | Tempo side confirmed: summariser calls land as a dedicated `mistral-summariser-llm` service-graph edge via the per-LLM `peer.service` httpx hook. Confirm the Langfuse side picks them up too. |
-| 🔵 Future | **Async Persistence** | Non-blocking audit row writes for `_persist_interaction` and `_flush_pending_tool_calls`. Prerequisite satisfied by ADR-029 (payload now carries project tag). |
-| 🔵 Future | **Kubernetes** | K3s + Istio mTLS + SPIFFE/SVID identity. |
+| ✅ Done | **Intelligent Memory Tool Routing** | Ambient context instructs the LLM to pick ONE tool per question. Validated with Qwen 3.6-35B-A3B. ADR-025 Accepted. |
+| ✅ Done | **MinIO Object Storage** | Stateless 12-factor containers — host filesystem mounts replaced with MinIO S3 (ADR-027). SSE-S3 encryption at rest. |
+| ✅ Done | **Observability Aggregation Stack** | Prometheus + Grafana + Loki + OTel Collector as sibling compose stack (ADR-028). Per-LLM `peer.service` edges on Tempo service graph. |
+| ✅ Done | **mypy --strict Clean** | 0 errors across all source files. |
+| ✅ Done | **Audit Trail Completeness** | Project tagging via X-Project header (ADR-029). `/interactions` endpoint with RLS-scoped pagination. |
+| ✅ Done | **Session Summariser** | Background asyncio loop via Mistral 7B Instruct v0.3 (ADR-030). Three-model topology. |
+| ✅ Done | **OAuth2 Device Flow** | RFC 8628 Device Flow for human agents (ADR-032). Multi-issuer JWT validation. Per-user RLS bites at user granularity. |
+| ✅ Done | **Three-Audience Error Envelope** | Classify + persist chat-path failures (ADR-033). OpenAI strict-superset error shape. Migration 007. |
+| ✅ Done | **Long-Running Generation** | Per-chunk idle timeout, SSE keep-alive, X-Thinking header (ADR-034). Qwen `<think>` reasoning runs indefinitely as long as tokens flow. |
+| ✅ Done | **Qwen 3.6-35B-A3B Upgrade** | DeltaNet linear attention, ~2x throughput vs 3.5, native thinking mode on/off. |
+| ✅ Done | **Auth Fully Enabled** | Both `AUDITTRACE_AUTH_ENABLED` and `AUDITTRACE_AUTH_REQUIRED` active. Per-route scope enforcement. |
+| ✅ Done | **Backlog Cleared** | All 7 tech-debt items resolved: streaming generator decomposed, step counter scoped per-trace, session ID hash widened, empty stubs deleted, dev compose overlay added. |
+| ✅ Done | **Package Rename** | `sovereign_memory` → `audittrace`, `SOVEREIGN_*` → `AUDITTRACE_*`, all containers/DB/realm/scopes aligned (ADR-035). |
+| ✅ Done | **N=100 Eval Sweep** | Full 100 probes × 2 modes with 30-min client timeout. Validates Qwen 3.6 + ADR-034 per-chunk idle timeout. |
+| 🔴 Next | **Kubernetes + Istio ZTA** | k3s + Istio mTLS + SPIFFE/SVID workload identity. Helm chart + Kustomize overlays. The v1.0 destination. |
+| 🟡 Planned | **ADR-031 Per-Request Memory-Mode Routing** | `X-Memory-Mode: tools\|inject\|auto` header. Gated on N=100 eval results. |
+| 🟡 Planned | **Async Persistence** | Non-blocking audit row writes. k8s prerequisite. |
+| 🟡 Planned | **External IdP** | Keycloak brokering to Google/Okta/EntraID for multi-user SSO. |
 
 ## Observability Stack (ADR-028)
 
