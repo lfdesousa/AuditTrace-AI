@@ -45,8 +45,8 @@ fi
 
 echo ""
 echo "Add these to your .env file:"
-echo "  SOVEREIGN_POSTGRES_PASSWORD=$(cat "${SECRETS_DIR}/postgres_password.txt")"
-echo "  SOVEREIGN_CHROMA_TOKEN=$(cat "${SECRETS_DIR}/chroma_token.txt")"
-echo "  SOVEREIGN_REDIS_PASSWORD=$(cat "${SECRETS_DIR}/redis_password.txt")"
-echo "  SOVEREIGN_MINIO_SECRET_KEY=$(cat "${SECRETS_DIR}/minio_secret_key.txt")"
-echo "  SOVEREIGN_MINIO_KMS_KEY=$(cat "${SECRETS_DIR}/minio_kms_key.txt")"
+echo "  AUDITTRACE_POSTGRES_PASSWORD=$(cat "${SECRETS_DIR}/postgres_password.txt")"
+echo "  AUDITTRACE_CHROMA_TOKEN=$(cat "${SECRETS_DIR}/chroma_token.txt")"
+echo "  AUDITTRACE_REDIS_PASSWORD=$(cat "${SECRETS_DIR}/redis_password.txt")"
+echo "  AUDITTRACE_MINIO_SECRET_KEY=$(cat "${SECRETS_DIR}/minio_secret_key.txt")"
+echo "  AUDITTRACE_MINIO_KMS_KEY=$(cat "${SECRETS_DIR}/minio_kms_key.txt")"

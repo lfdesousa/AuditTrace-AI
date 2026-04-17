@@ -3,7 +3,7 @@
 # Sibling compose stack (same pattern as Langfuse, ADR-021.2).
 #
 # Starts: OTel Collector, Prometheus, Loki, Promtail, Grafana
-# Shares: sovereign-ai-net with the main application stack
+# Shares: audittrace-net with the main application stack
 #
 # Usage:
 #   ./scripts/setup-observability.sh          # Start stack
@@ -25,7 +25,7 @@ if [[ ! -d "${STACK_DIR}" ]]; then
 fi
 
 # Ensure shared network exists (idempotent)
-docker network create sovereign-ai-net 2>/dev/null || true
+docker network create audittrace-net 2>/dev/null || true
 
 if [[ "${1:-}" == "--down" ]]; then
     echo "Stopping observability stack..."
@@ -45,4 +45,4 @@ echo "  Loki:       http://localhost:3100"
 echo "  OTel:       http://localhost:4318  (OTLP HTTP receiver)"
 echo ""
 echo "Memory-server OTLP export should point at:"
-echo "  SOVEREIGN_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces"
+echo "  AUDITTRACE_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces"

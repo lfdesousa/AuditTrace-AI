@@ -329,8 +329,8 @@ def main() -> None:
         )
 
     # Read ChromaDB connection parameters
-    chroma_url = os.environ.get("SOVEREIGN_CHROMA_URL", "http://localhost:18000")
-    chroma_token = os.environ.get("SOVEREIGN_CHROMA_TOKEN", "")
+    chroma_url = os.environ.get("AUDITTRACE_CHROMA_URL", "http://localhost:18000")
+    chroma_token = os.environ.get("AUDITTRACE_CHROMA_TOKEN", "")
     if not chroma_token:
         token_file = REPO_ROOT / "secrets" / "chroma_token.txt"
         if token_file.exists():

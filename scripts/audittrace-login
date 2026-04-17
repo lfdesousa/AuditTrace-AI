@@ -36,7 +36,7 @@ set -euo pipefail
 # bare :8080 port is Traefik's own dashboard. Override if you're
 # running Keycloak standalone on another host.
 KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://localhost}"
-REALM="${KEYCLOAK_REALM:-sovereign-ai}"
+REALM="${KEYCLOAK_REALM:-audittrace}"
 CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
 
 TOKENS_DIR="${AUDITTRACE_TOKENS_DIR:-$HOME/.config/audittrace}"
@@ -110,7 +110,7 @@ action_login() {
   local init_body
   init_body="$(curl "${CURL_OPTS[@]}" -s -S --fail \
     -d "client_id=$CLIENT_ID" \
-    -d "scope=openid memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read sovereign-ai:query sovereign-ai:context sovereign-ai:audit" \
+    -d "scope=openid memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read audittrace:query audittrace:context audittrace:audit" \
     "$DEVICE_ENDPOINT")" || {
     echo "error: device-auth request failed — is Keycloak reachable at $KEYCLOAK_BASE?" >&2
     exit 3
@@ -266,7 +266,7 @@ Usage:
 
 Environment overrides:
   KEYCLOAK_BASE            (default https://localhost — Traefik-fronted)
-  KEYCLOAK_REALM           (default sovereign-ai)
+  KEYCLOAK_REALM           (default audittrace)
   CLIENT_ID                (default audittrace-opencode)
   AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
   REFRESH_THRESHOLD_SECONDS (default 60 — refresh if expires within this window)

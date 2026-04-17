@@ -2,9 +2,9 @@
 # Provision the ADR-032 Device-Flow client + realm user against a
 # RUNNING Keycloak via the admin REST API.
 #
-# Background: the realm-sovereign-ai.json realm import only runs on
+# Background: the realm-audittrace.json realm import only runs on
 # Keycloak first-boot. If you already have a Keycloak container with
-# the sovereign-ai realm created (from before ADR-032 landed), this
+# the audittrace realm created (from before ADR-032 landed), this
 # script brings your live realm up to the new spec without the
 # destructive realm re-import.
 #
@@ -19,7 +19,7 @@
 # Creates (if missing):
 #   • Public client ``audittrace-opencode`` with Device Flow enabled
 #   • Realm user ``luis`` with a temporary password
-#   • Audience mapper (aud=sovereign-memory-server) on the client
+#   • Audience mapper (aud=audittrace-server) on the client
 #
 # Prints the client-id, the user-id, and the temporary password to
 # stdout — capture them in your notes, then complete the password
@@ -29,7 +29,7 @@ set -euo pipefail
 
 # Keycloak is fronted by Traefik on :443 (see docker-compose.yml).
 KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://localhost}"
-REALM="${KEYCLOAK_REALM:-sovereign-ai}"
+REALM="${KEYCLOAK_REALM:-audittrace}"
 ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-}"
 CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
@@ -104,9 +104,9 @@ if [[ -z "$CLIENT_UUID" ]]; then
       "oauth2.device.polling.interval": "5"
     },
     defaultClientScopes: [
-      "sovereign-ai:query",
-      "sovereign-ai:context",
-      "sovereign-ai:audit",
+      "audittrace:query",
+      "audittrace:context",
+      "audittrace:audit",
       "memory:episodic:read",
       "memory:procedural:read",
       "memory:conversational:read-own",
@@ -122,15 +122,15 @@ if [[ -z "$CLIENT_UUID" ]]; then
     | jq -r '.[0].id')"
   log "client uuid: $CLIENT_UUID"
 
-  # Attach the audience mapper so tokens carry aud=sovereign-memory-server
+  # Attach the audience mapper so tokens carry aud=audittrace-server
   # (our JWT validator checks this claim).
   log "adding audience mapper"
   MAPPER_PAYLOAD='{
-    "name": "aud-sovereign-memory-server",
+    "name": "aud-audittrace-server",
     "protocol": "openid-connect",
     "protocolMapper": "oidc-audience-mapper",
     "config": {
-      "included.custom.audience": "sovereign-memory-server",
+      "included.custom.audience": "audittrace-server",
       "id.token.claim": "false",
       "access.token.claim": "true"
     }
