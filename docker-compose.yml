@@ -71,7 +71,7 @@ services:
       - SOVEREIGN_LANGFUSE_SECRET_KEY=${SOVEREIGN_LANGFUSE_SECRET_KEY:-}
       - SOVEREIGN_LANGFUSE_ENABLED=${SOVEREIGN_LANGFUSE_ENABLED:-false}
       - SOVEREIGN_LOG_LEVEL=${SOVEREIGN_LOG_LEVEL:-INFO}
-      - SOVEREIGN_AUTH_ENABLED=${SOVEREIGN_AUTH_ENABLED:-false}
+      - SOVEREIGN_AUTH_ENABLED=${SOVEREIGN_AUTH_ENABLED:-true}
       # llama.cpp proxy read timeout. Default (120s) is too tight for
       # cold model reload + inject-mode memory blobs that blow up the
       # prompt-eval time. Bumped to 300s so a cold start on Qwen3.5-35B
