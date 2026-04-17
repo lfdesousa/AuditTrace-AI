@@ -16,6 +16,7 @@ spec:
       labels:
         {{- include "audittrace.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: otel-collector
+        sidecar.istio.io/inject: "false"
     spec:
       containers:
         - name: otel-collector
