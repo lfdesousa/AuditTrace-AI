@@ -1,0 +1,32 @@
+apiVersion: v2
+name: audittrace
+description: AuditTrace-AI — audit-trail-first memory augmentation platform
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - ai
+  - audit
+  - memory
+  - llm
+  - zero-trust
+maintainers:
+  - name: Luis Filipe de Sousa
+    email: lde.sousa@gmail.com
+dependencies:
+  - name: postgresql
+    version: "~16"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: "~19"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+  - name: minio
+    version: "~14"
+    repository: https://charts.bitnami.com/bitnami
+    condition: minio.enabled
+  - name: keycloak
+    version: "~22"
+    repository: https://charts.bitnami.com/bitnami
+    condition: keycloak.enabled
