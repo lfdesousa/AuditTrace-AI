@@ -201,6 +201,34 @@ def _apply_thinking_mode(payload: dict[str, Any], thinking: str | None) -> None:
     kwargs["enable_thinking"] = thinking == "deep"
 
 
+async def _iter_with_idle_timeout(
+    resp: httpx.Response,
+    chunk_timeout: float,
+) -> AsyncIterator[str]:
+    """Wrap ``resp.aiter_lines()`` with a per-chunk idle timeout (ADR-034).
+
+    As long as SSE lines keep arriving within *chunk_timeout* seconds of
+    each other, the stream stays alive indefinitely — even if the total
+    duration far exceeds any flat timeout. This directly solves the
+    "15-minute valid ``<think>`` reasoning killed at 300s" problem.
+
+    If no line arrives within *chunk_timeout*, raises
+    ``httpx.ReadTimeout`` so the existing ``except httpx.TimeoutException``
+    handler catches it identically to the old flat timeout.
+    """
+    aiter = resp.aiter_lines().__aiter__()
+    while True:
+        try:
+            line = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_timeout)
+            yield line
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise httpx.ReadTimeout(
+                f"No data received for {chunk_timeout}s (per-chunk idle timeout)"
+            )
+
+
 def _persist_interaction(
     project: str,
     source: str,
@@ -779,7 +807,7 @@ async def _handle_tools_mode(
             user_context=user,
             session_id=session_id,
             max_iterations=settings.memory_tool_loop_max_iterations,
-            timeout_seconds=settings.llama_proxy_timeout,
+            timeout_seconds=settings.llama_chunk_timeout,
         )
     except httpx.TimeoutException as exc:
         _persist_interaction(
@@ -799,7 +827,7 @@ async def _handle_tools_mode(
         )
         raise HTTPException(
             status_code=504,
-            detail=(f"llama-server timeout after {settings.llama_proxy_timeout}s"),
+            detail=(f"llama-server timeout after {settings.llama_chunk_timeout}s"),
         ) from exc
     except httpx.HTTPStatusError as exc:
         _persist_interaction(
@@ -1024,13 +1052,17 @@ async def chat_completions(
             perf_start = time.perf_counter()
             try:
                 async with httpx.AsyncClient(
-                    timeout=settings.llama_proxy_timeout
+                    timeout=httpx.Timeout(
+                        connect=10.0, read=None, write=30.0, pool=10.0
+                    )
                 ) as client:
                     async with client.stream(
                         "POST", llama_url, json=proxy_payload
                     ) as resp:
                         resp.raise_for_status()
-                        async for line in resp.aiter_lines():
+                        async for line in _iter_with_idle_timeout(
+                            resp, settings.llama_chunk_timeout
+                        ):
                             stripped = line.strip()
                             if not stripped.startswith("data: "):
                                 # Forward blank/non-data lines verbatim (SSE separators)
@@ -1127,7 +1159,7 @@ async def chat_completions(
                 # ~/.claude/plans/reflective-discovering-platypus.md.
                 err_body = _openai_error_body(
                     message=(
-                        f"llama-server timeout after {settings.llama_proxy_timeout}s"
+                        f"llama-server idle timeout after {settings.llama_chunk_timeout}s"
                     ),
                     code=FAILURE_PROXY_TIMEOUT,
                     status=504,
@@ -1274,7 +1306,11 @@ async def chat_completions(
     # ──────────────────────── Non-streaming branch ──────────────────────────
     ns_perf_start = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.llama_proxy_timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10.0, read=settings.llama_chunk_timeout, write=30.0, pool=10.0
+            )
+        ) as client:
             response = await client.post(llama_url, json=proxy_payload)
         body = response.json()
     except httpx.ConnectError as exc:
@@ -1315,7 +1351,7 @@ async def chat_completions(
         )
         raise HTTPException(
             status_code=504,
-            detail=f"llama-server timeout after {settings.llama_proxy_timeout}s",
+            detail=f"llama-server timeout after {settings.llama_chunk_timeout}s",
         ) from exc
 
     _set_genai_response_attributes(body)
