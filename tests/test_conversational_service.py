@@ -11,7 +11,7 @@ admin bypass at this layer.
 
 from dataclasses import replace
 
-from sovereign_memory.services.conversational import (
+from audittrace.services.conversational import (
     ConversationalService,
     MockConversationalService,
 )

@@ -39,7 +39,7 @@ exercised:
   9. `get_context_builder(user)` — the Phase 4 follow-up per-request
      wiring wraps the semantic layer with the caller's identity.
 
-Phase 5a does NOT yet flip `SOVEREIGN_AUTH_REQUIRED=true`. That's
+Phase 5a does NOT yet flip `AUDITTRACE_AUTH_REQUIRED=true`. That's
 Phase 5b, which depends on Phase 7 Keycloak operator setup.
 """
 
@@ -49,21 +49,21 @@ import pytest
 
 # Import memory-handler module so @register_memory_tool decorators
 # populate the registry before the tool-layer tests run.
-import sovereign_memory.tools.memory_handlers  # noqa: F401
-from sovereign_memory import dependencies as deps_module
-from sovereign_memory.dependencies import create_test_container, get_context_builder
-from sovereign_memory.identity import UserContext
-from sovereign_memory.routes.chat import _compute_session_id
-from sovereign_memory.services.semantic import (
+import audittrace.tools.memory_handlers  # noqa: F401
+from audittrace import dependencies as deps_module
+from audittrace.dependencies import create_test_container, get_context_builder
+from audittrace.identity import UserContext
+from audittrace.routes.chat import _compute_session_id
+from audittrace.services.semantic import (
     ChromaSemanticService,
     UserScopedSemanticService,
 )
-from sovereign_memory.tools import (
+from audittrace.tools import (
     get_tool_by_name,
     invoke_tool,
     reset_registry_for_tests,
 )
-from sovereign_memory.tools.cache import (
+from audittrace.tools.cache import (
     ToolResultCache,
     reset_tool_result_cache,
     set_tool_result_cache,
@@ -134,7 +134,7 @@ def _fresh_handlers_registry():
     reset_registry_for_tests()
     import importlib
 
-    import sovereign_memory.tools.memory_handlers as handlers_mod
+    import audittrace.tools.memory_handlers as handlers_mod
 
     importlib.reload(handlers_mod)
     yield
@@ -235,7 +235,7 @@ class TestCrossUserIsolation:
         Chroma query. Alice's docs are tagged with her user_id, Bob's
         with his; searching as alice returns only alice's rows."""
         client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="sovereign_memory")
+        col = client.get_or_create_collection(name="audittrace")
         col.add(
             ids=["a1", "b1", "legacy"],
             documents=[
@@ -250,7 +250,7 @@ class TestCrossUserIsolation:
             ],
         )
         semantic = ChromaSemanticService(
-            client=client, default_collections=["sovereign_memory"]
+            client=client, default_collections=["audittrace"]
         )
 
         alice_results = semantic.search(alice, "cache", k=10)
@@ -271,7 +271,7 @@ class TestCrossUserIsolation:
         and ignores whatever user_context is passed at call time.
         Proves the Phase 4 'isolation by construction' property."""
         client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="sovereign_memory")
+        col = client.get_or_create_collection(name="audittrace")
         col.add(
             ids=["a1", "b1"],
             documents=[
@@ -283,9 +283,7 @@ class TestCrossUserIsolation:
                 {"source": "b", "user_id": "user-bob"},
             ],
         )
-        inner = ChromaSemanticService(
-            client=client, default_collections=["sovereign_memory"]
-        )
+        inner = ChromaSemanticService(client=client, default_collections=["audittrace"])
         alice_wrapper = UserScopedSemanticService(inner=inner, user_context=alice)
 
         # Call with bob's context — the wrapper must ignore it and
@@ -397,9 +395,9 @@ class TestCrossUserIsolation:
     def test_admin_sentinel_sees_everything(self, container, alice, bob):
         """The sentinel bypass UserContext (is_admin=True) should
         bypass every per-user filter. This is the behaviour
-        `SOVEREIGN_AUTH_REQUIRED=false` depends on — existing tests
+        `AUDITTRACE_AUTH_REQUIRED=false` depends on — existing tests
         and dev workflows that pre-date multi-user keep working."""
-        from sovereign_memory.identity import sentinel_user_context
+        from audittrace.identity import sentinel_user_context
 
         admin = sentinel_user_context()
         assert admin.is_admin is True
@@ -421,7 +419,7 @@ class TestCrossUserIsolation:
         # inject mode still works. Seed tagged rows and verify admin
         # sees them all.
         client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="sovereign_memory")
+        col = client.get_or_create_collection(name="audittrace")
         col.add(
             ids=["a1", "b1"],
             documents=["alice cache", "bob cache"],
@@ -431,7 +429,7 @@ class TestCrossUserIsolation:
             ],
         )
         semantic = ChromaSemanticService(
-            client=client, default_collections=["sovereign_memory"]
+            client=client, default_collections=["audittrace"]
         )
         admin_results = semantic.search(admin, "cache", k=10)
         assert len(admin_results) == 2  # admin bypass returns both

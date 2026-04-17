@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from sovereign_memory.identity import UserContext
-from sovereign_memory.services.episodic import S3EpisodicService
-from sovereign_memory.services.procedural import S3ProceduralService
+from audittrace.identity import UserContext
+from audittrace.services.episodic import S3EpisodicService
+from audittrace.services.procedural import S3ProceduralService
 
 
 def _make_user(user_id: str = "kc-test-001", is_admin: bool = False) -> UserContext:
@@ -197,21 +197,21 @@ class TestCreateMinioClient:
     """Tests for _create_minio_client in dependencies.py."""
 
     def test_returns_none_when_secret_key_empty(self):
-        from sovereign_memory.dependencies import _create_minio_client
+        from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
         settings.minio_secret_key = ""
         assert _create_minio_client(settings) is None
 
     def test_returns_client_when_configured(self):
-        from sovereign_memory.dependencies import _create_minio_client
+        from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
         settings.minio_url = "http://minio:9000"
         settings.minio_access_key = "minioadmin"
         settings.minio_secret_key = "secret123"
 
-        with patch("sovereign_memory.dependencies.Minio") as mock_minio:
+        with patch("audittrace.dependencies.Minio") as mock_minio:
             mock_minio.return_value = MagicMock()
             client = _create_minio_client(settings)
             assert client is not None
@@ -223,7 +223,7 @@ class TestCreateMinioClient:
             )
 
     def test_returns_none_on_import_error(self):
-        from sovereign_memory.dependencies import _create_minio_client
+        from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
         settings.minio_url = "http://minio:9000"
@@ -231,21 +231,21 @@ class TestCreateMinioClient:
         settings.minio_secret_key = "secret123"
 
         with patch(
-            "sovereign_memory.dependencies.Minio",
+            "audittrace.dependencies.Minio",
             side_effect=Exception("minio not installed"),
         ):
             client = _create_minio_client(settings)
             assert client is None
 
     def test_https_url_sets_secure_true(self):
-        from sovereign_memory.dependencies import _create_minio_client
+        from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
         settings.minio_url = "https://minio.prod:9000"
         settings.minio_access_key = "admin"
         settings.minio_secret_key = "secret"
 
-        with patch("sovereign_memory.dependencies.Minio") as mock_minio:
+        with patch("audittrace.dependencies.Minio") as mock_minio:
             mock_minio.return_value = MagicMock()
             _create_minio_client(settings)
             mock_minio.assert_called_once_with(

@@ -30,16 +30,16 @@ import fakeredis
 import pytest
 
 # Side-effect import — decorators populate MEMORY_TOOL_REGISTRY.
-import sovereign_memory.tools.memory_handlers  # noqa: F401
-from sovereign_memory import dependencies
-from sovereign_memory.dependencies import create_test_container
-from sovereign_memory.identity import sentinel_user_context
-from sovereign_memory.routes._memory_tool_loop import (
+import audittrace.tools.memory_handlers  # noqa: F401
+from audittrace import dependencies
+from audittrace.dependencies import create_test_container
+from audittrace.identity import sentinel_user_context
+from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     run_memory_tool_loop,
 )
-from sovereign_memory.tools import reset_registry_for_tests
-from sovereign_memory.tools.cache import (
+from audittrace.tools import reset_registry_for_tests
+from audittrace.tools.cache import (
     ToolResultCache,
     reset_tool_result_cache,
     set_tool_result_cache,
@@ -57,7 +57,7 @@ def _fresh_registry_with_handlers():
     reset_registry_for_tests()
     import importlib
 
-    import sovereign_memory.tools.memory_handlers as handlers_mod
+    import audittrace.tools.memory_handlers as handlers_mod
 
     importlib.reload(handlers_mod)
     yield
@@ -375,7 +375,7 @@ class TestLoopExitConditions:
         ]
         fake = _SequencedClient(responses)
 
-        from sovereign_memory.routes import _memory_tool_loop
+        from audittrace.routes import _memory_tool_loop
 
         warnings: list[str] = []
         monkeypatch.setattr(
@@ -428,7 +428,7 @@ class TestLoopExitConditions:
         ]
         fake = _SequencedClient(responses)
 
-        from sovereign_memory.routes import _memory_tool_loop
+        from audittrace.routes import _memory_tool_loop
 
         infos: list[str] = []
         monkeypatch.setattr(
@@ -598,7 +598,7 @@ class TestPendingAuditRows:
         a tool was invoked is the auditable event, success or failure."""
         from dataclasses import replace
 
-        from sovereign_memory.tools import MEMORY_TOOL_REGISTRY, get_tool_by_name
+        from audittrace.tools import MEMORY_TOOL_REGISTRY, get_tool_by_name
 
         tool = get_tool_by_name("recall_decisions")
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sovereign_memory.services.procedural import (
+from audittrace.services.procedural import (
     FileProceduralService,
     MockProceduralService,
     ProceduralService,

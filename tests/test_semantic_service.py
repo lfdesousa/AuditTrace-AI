@@ -12,8 +12,8 @@ from dataclasses import replace
 
 import pytest
 
-from sovereign_memory.db.factory import MockChromaDBFactory
-from sovereign_memory.services.semantic import (
+from audittrace.db.factory import MockChromaDBFactory
+from audittrace.services.semantic import (
     ChromaSemanticService,
     MockSemanticService,
     SemanticService,
@@ -241,7 +241,7 @@ class TestUserScopedSemanticService:
         call time."""
         from dataclasses import replace
 
-        from sovereign_memory.services.semantic import (
+        from audittrace.services.semantic import (
             ChromaSemanticService,
             UserScopedSemanticService,
         )
@@ -265,7 +265,7 @@ class TestUserScopedSemanticService:
         This is the 'isolation by construction' property."""
         from dataclasses import replace
 
-        from sovereign_memory.services.semantic import (
+        from audittrace.services.semantic import (
             ChromaSemanticService,
             UserScopedSemanticService,
         )
@@ -290,7 +290,7 @@ class TestUserScopedSemanticService:
         filter entirely, mirroring Phase 2 admin semantics. The binding
         is the authority — it's just pinned at construction time instead
         of being decided per call."""
-        from sovereign_memory.services.semantic import (
+        from audittrace.services.semantic import (
             ChromaSemanticService,
             UserScopedSemanticService,
         )
@@ -310,7 +310,7 @@ class TestUserScopedSemanticService:
     ):
         """available_collections is a pass-through; it doesn't touch the
         where filter."""
-        from sovereign_memory.services.semantic import (
+        from audittrace.services.semantic import (
             ChromaSemanticService,
             UserScopedSemanticService,
         )
@@ -324,7 +324,7 @@ class TestUserScopedSemanticService:
     def test_wrapper_is_semantic_service(self, user_context):
         """The wrapper must implement SemanticService so context_builder
         can inject it transparently as a drop-in replacement."""
-        from sovereign_memory.services.semantic import (
+        from audittrace.services.semantic import (
             MockSemanticService,
             UserScopedSemanticService,
         )

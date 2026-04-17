@@ -16,10 +16,10 @@ from datetime import datetime, timedelta
 import httpx
 import pytest
 
-from sovereign_memory.config import Settings
-from sovereign_memory.db.models import InteractionRecord, SessionRecord
-from sovereign_memory.db.postgres import InMemoryPostgresFactory
-from sovereign_memory.services.session_summarizer import (
+from audittrace.config import Settings
+from audittrace.db.models import InteractionRecord, SessionRecord
+from audittrace.db.postgres import InMemoryPostgresFactory
+from audittrace.services.session_summarizer import (
     SessionSummarizer,
     _format_transcript,
     _parse_llm_response,
@@ -147,37 +147,37 @@ class TestCoerceDatetime:
     must parse both datetime objects (Postgres) and ISO / SQLite strings."""
 
     def test_datetime_passthrough(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         dt = datetime.now()
         assert _coerce_datetime(dt) is dt
 
     def test_none_returns_none(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         assert _coerce_datetime(None) is None
 
     def test_iso_string(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         got = _coerce_datetime("2026-04-15T10:30:00")
         assert isinstance(got, datetime)
         assert got.year == 2026 and got.month == 4 and got.day == 15
 
     def test_sqlite_style_space_separator(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         got = _coerce_datetime("2026-04-15 10:30:00.123456")
         assert isinstance(got, datetime)
         assert got.hour == 10 and got.minute == 30
 
     def test_malformed_string_returns_none(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         assert _coerce_datetime("not a date") is None
 
     def test_other_type_returns_none(self):
-        from sovereign_memory.services.session_summarizer import _coerce_datetime
+        from audittrace.services.session_summarizer import _coerce_datetime
 
         assert _coerce_datetime(12345) is None
 

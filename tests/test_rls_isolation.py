@@ -52,7 +52,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from sovereign_memory.db.rls import install_rls_listener, set_current_user_id
+from audittrace.db.rls import install_rls_listener, set_current_user_id
 
 POSTGRES_HOST = "localhost"
 POSTGRES_PORT = 15432

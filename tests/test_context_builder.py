@@ -7,15 +7,15 @@ layer methods with Phase-2 signatures (``user_context, query, ...``).
 
 import pytest
 
-from sovereign_memory.services.context_builder import (
+from audittrace.services.context_builder import (
     ContextBuilderService,
     DefaultContextBuilder,
     MockContextBuilder,
 )
-from sovereign_memory.services.conversational import MockConversationalService
-from sovereign_memory.services.episodic import MockEpisodicService
-from sovereign_memory.services.procedural import MockProceduralService
-from sovereign_memory.services.semantic import MockSemanticService
+from audittrace.services.conversational import MockConversationalService
+from audittrace.services.episodic import MockEpisodicService
+from audittrace.services.procedural import MockProceduralService
+from audittrace.services.semantic import MockSemanticService
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -310,7 +310,7 @@ class TestMockContextBuilder:
 
 class TestAmbientContext:
     def test_profile_includes_username_and_admin_flag(self, user_context):
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         ctx = build_ambient_context(
             user_context,
@@ -326,7 +326,7 @@ class TestAmbientContext:
     def test_profile_includes_project_and_date(self, user_context):
         from datetime import date
 
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         ctx = build_ambient_context(
             user_context,
@@ -337,7 +337,7 @@ class TestAmbientContext:
         assert date.today().isoformat() in ctx
 
     def test_profile_handles_missing_project(self, user_context):
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         ctx = build_ambient_context(
             user_context,
@@ -351,7 +351,7 @@ class TestAmbientContext:
     def test_tool_hints_listed_when_tools_visible(self, user_context):
         """When the caller is authorised to see memory tools, the ambient
         context enumerates them by name so the LLM knows what is available."""
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         tools = [
             {
@@ -378,7 +378,7 @@ class TestAmbientContext:
     def test_no_tool_hints_when_empty(self, user_context):
         """Zero visible tools → no enumeration section (happens when a
         non-admin user has no memory scopes at all)."""
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         ctx = build_ambient_context(user_context, project="P", tools_visible=[])
         # The header line still appears but no bullet list of tools
@@ -388,7 +388,7 @@ class TestAmbientContext:
         """ADR-025 §Decision.1: ambient context ≤ 280 token budget
         approximated as ≤ 280 whitespace-split words. All four tools
         included; this is the worst case."""
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         four_tools = [
             {
@@ -424,7 +424,7 @@ class TestAmbientContext:
         authority, not boilerplate."""
         from dataclasses import replace
 
-        from sovereign_memory.services.context_builder import build_ambient_context
+        from audittrace.services.context_builder import build_ambient_context
 
         non_admin = replace(user_context, is_admin=False, scopes=())
         ctx = build_ambient_context(non_admin, project="P", tools_visible=[])

@@ -78,7 +78,7 @@ Repository = "https://github.com/lfdesousa/AuditTrace-AI"
 Issues = "https://github.com/lfdesousa/AuditTrace-AI/issues"
 
 [project.scripts]
-audittrace = "sovereign_memory.server:main"
+audittrace = "audittrace.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -93,7 +93,7 @@ addopts = "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["sovereign_memory"]
+source = ["audittrace"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 
@@ -124,7 +124,7 @@ select = [
 ignore = ["E501"]  # Line length handled by black
 
 [tool.ruff.lint.isort]
-known-first-party = ["sovereign_memory"]
+known-first-party = ["audittrace"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -141,12 +141,12 @@ line-length = 88
 target-version = ["py312"]
 
 [[tool.mypy.overrides]]
-module = "sovereign_memory.routes.chat"
+module = "audittrace.routes.chat"
 # Langfuse @observe is an untyped decorator; Request generic requires starlette stubs
 disable_error_code = ["misc", "type-arg"]
 
 [[tool.mypy.overrides]]
-module = "sovereign_memory.auth"
+module = "audittrace.auth"
 # FastAPI Request generic requires starlette stubs
 disable_error_code = ["type-arg"]
 

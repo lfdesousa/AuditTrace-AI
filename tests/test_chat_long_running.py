@@ -10,7 +10,7 @@ import asyncio
 import httpx
 import pytest
 
-from sovereign_memory.routes.chat import _iter_with_idle_timeout
+from audittrace.routes.chat import _iter_with_idle_timeout
 
 # ──────────────── helpers: fake httpx.Response for aiter_lines ────────────────
 

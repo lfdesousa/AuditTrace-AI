@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sovereign_memory.identity import SENTINEL_SUBJECT
-from sovereign_memory.routes.chat import (
+from audittrace.identity import SENTINEL_SUBJECT
+from audittrace.routes.chat import (
     _apply_thinking_mode,
     _compute_session_id,
     _resolve_project,
@@ -105,7 +105,7 @@ class _FakeStreamResponse:
 def _patch_async_client(fake: _FakeAsyncClient):
     """Patch httpx.AsyncClient so its constructor returns ``fake``."""
     return patch(
-        "sovereign_memory.routes.chat.httpx.AsyncClient",
+        "audittrace.routes.chat.httpx.AsyncClient",
         return_value=fake,
     )
 
@@ -137,12 +137,12 @@ def _patch_tool_loop_client(fake):
     """Patch the httpx.AsyncClient used INSIDE the memory tool-call loop.
 
     The loop imports httpx at module level in
-    ``sovereign_memory.routes._memory_tool_loop`` so patching
+    ``audittrace.routes._memory_tool_loop`` so patching
     ``routes.chat.httpx`` is not enough in tools mode — we also have to
     patch the loop module's own httpx reference.
     """
     return patch(
-        "sovereign_memory.routes._memory_tool_loop.httpx.AsyncClient",
+        "audittrace.routes._memory_tool_loop.httpx.AsyncClient",
         return_value=fake,
     )
 
@@ -491,8 +491,8 @@ class TestChatProxy:
         """ADR-024 regression: streamed delta.tool_calls must be (a) forwarded
         byte-equal so OpenCode sees them, (b) accumulated by index so the
         persisted answer reflects the tool call, not an empty string."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         stream_lines = [
             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz",'
@@ -542,8 +542,8 @@ class TestChatProxy:
 
     def test_chat_proxy_persists_interaction(self, client):
         """A successful chat completion writes a row to interactions."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _FakeAsyncClient(
             post_json={
@@ -605,8 +605,8 @@ class TestChatProxy:
 
     def test_chat_proxy_x_project_header_wins_over_body(self, client):
         """ADR-029: X-Project header is authoritative over body.project."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
         with _patch_async_client(fake):
@@ -632,8 +632,8 @@ class TestChatProxy:
 
     def test_chat_proxy_metadata_project_used_when_no_header(self, client):
         """ADR-029: body.metadata.project is the second-tier source."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
         with _patch_async_client(fake):
@@ -658,8 +658,8 @@ class TestChatProxy:
 
     def test_chat_proxy_defaults_project_when_none_provided(self, client):
         """ADR-029: project defaults to "default" (not "unknown") when caller omits it."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
         with _patch_async_client(fake):
@@ -703,8 +703,8 @@ class TestChatProxy:
 
     def test_chat_proxy_renders_tool_calls_in_non_streaming(self, client):
         """Non-streaming branch must render tool_calls into the persisted answer."""
-        from sovereign_memory.db.models import InteractionRecord
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _FakeAsyncClient(
             post_json={
@@ -790,22 +790,22 @@ class TestChatProxy:
         flows through the same patched httpx.AsyncClient as the LLM call, so
         the test inspects the fake's post_calls history for the ingestion URL.
         """
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
 
         config_mod.get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_HOST", "http://lf.test")
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
 
         fake = _FakeAsyncClient(post_json=_ok_chat_response("hello"))
 
         with (
             _patch_async_client(fake),
             patch(
-                "sovereign_memory.routes.chat._lf_get_client",
+                "audittrace.routes.chat._lf_get_client",
                 return_value=MagicMock(get_current_trace_id=lambda: "trace-test-1"),
             ),
-            patch("sovereign_memory.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -886,7 +886,7 @@ class TestChatProxy:
 
     def test_extract_query_handles_multipart_content(self, client):
         """_extract_query should join text parts when content is a list."""
-        from sovereign_memory.routes.chat import _extract_query
+        from audittrace.routes.chat import _extract_query
 
         payload = {
             "messages": [
@@ -917,7 +917,7 @@ class TestChatProxy:
 
 
 # ──────────────────── ADR-025 — memory_mode=tools integration ───────────────
-# End-to-end tests that flip SOVEREIGN_MEMORY_MODE=tools and exercise the
+# End-to-end tests that flip AUDITTRACE_MEMORY_MODE=tools and exercise the
 # full chat_completions handler via the TestClient fixture. These prove:
 #
 #   - Inject mode (default) is unchanged — covered by the 20+ tests above.
@@ -974,29 +974,29 @@ def _tools_mode_tool_call_response(
 
 
 class TestToolsModeIntegration:
-    """Full chat_completions flow with SOVEREIGN_MEMORY_MODE=tools."""
+    """Full chat_completions flow with AUDITTRACE_MEMORY_MODE=tools."""
 
     def _flip_to_tools_mode(self, monkeypatch):
         """Flip the global settings to tools mode for the duration of one
         test. The @lru_cache on get_settings means we have to clear it
         before and after."""
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
 
         config_mod.get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
         yield
         config_mod.get_settings.cache_clear()
 
     @pytest.fixture
     def _tools_mode(self, monkeypatch):
-        """Flip SOVEREIGN_MEMORY_MODE=tools for the duration of a test."""
+        """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test."""
         yield from self._flip_to_tools_mode(monkeypatch)
 
     def test_tools_mode_trivial_prompt_single_llama_call(self, client, _tools_mode):
         """A prompt that doesn't trigger any tool_calls results in exactly
         one POST to llama-server and no ToolCall audit rows."""
-        from sovereign_memory.db.models import InteractionRecord, ToolCall
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord, ToolCall
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _SequencedClient([_tools_mode_response_text("Just text.")])
         with _patch_tool_loop_client(fake), _patch_async_client(fake):
@@ -1038,8 +1038,8 @@ class TestToolsModeIntegration:
     def test_tools_mode_memory_prompt_fires_loop_and_audits(self, client, _tools_mode):
         """Prompt that triggers recall_decisions: TWO POSTs, final text
         answer, ToolCall audit row written with user_id + granted_scope."""
-        from sovereign_memory.db.models import InteractionRecord, ToolCall
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import InteractionRecord, ToolCall
+        from audittrace.dependencies import get_postgres_factory
 
         fake = _SequencedClient(
             [
@@ -1116,23 +1116,23 @@ class TestToolsModeIntegration:
         in the Langfuse UI even though the proxy kept persisting rows to
         Postgres.
         """
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
 
         config_mod.get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_HOST", "http://lf.test")
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setenv("SOVEREIGN_LANGFUSE_SECRET_KEY", "sk-test")
-        # _tools_mode fixture already flipped SOVEREIGN_MEMORY_MODE=tools
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+        # _tools_mode fixture already flipped AUDITTRACE_MEMORY_MODE=tools
 
         fake = _SequencedClient([_tools_mode_response_text("Answer in tools mode.")])
         with (
             _patch_tool_loop_client(fake),
             _patch_async_client(fake),
             patch(
-                "sovereign_memory.routes.chat._lf_get_client",
+                "audittrace.routes.chat._lf_get_client",
                 return_value=MagicMock(get_current_trace_id=lambda: "trace-tools-1"),
             ),
-            patch("sovereign_memory.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1170,8 +1170,8 @@ class TestToolsModeIntegration:
         unchanged — the proxy cannot execute bash, and the loop's
         external-tool exit branch must kick in. Zero ToolCall audit
         rows because no memory tools were dispatched."""
-        from sovereign_memory.db.models import ToolCall
-        from sovereign_memory.dependencies import get_postgres_factory
+        from audittrace.db.models import ToolCall
+        from audittrace.dependencies import get_postgres_factory
 
         bash_response = {
             "id": "cmpl-test",

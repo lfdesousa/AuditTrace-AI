@@ -9,8 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from sovereign_memory.db.models import Base, SessionRecord
-from sovereign_memory.db.postgres import (
+from audittrace.db.models import Base, SessionRecord
+from audittrace.db.postgres import (
     InMemoryPostgresFactory,
     MockPostgresFactory,
     PostgresFactory,

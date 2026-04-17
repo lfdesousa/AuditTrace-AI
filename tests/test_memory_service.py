@@ -1,6 +1,6 @@
 """Tests for memory service."""
 
-from sovereign_memory.services.memory import (
+from audittrace.services.memory import (
     ChromaMemoryService,
     MemoryService,
     MockMemoryService,
@@ -79,7 +79,7 @@ def test_chroma_memory_service_interface():
 
 def test_chroma_memory_service_with_mock_client():
     """Test ChromaMemoryService with mock ChromaDB client."""
-    from sovereign_memory.db.factory import MockChromaDBFactory
+    from audittrace.db.factory import MockChromaDBFactory
 
     factory = MockChromaDBFactory()
     client = factory.get_client()

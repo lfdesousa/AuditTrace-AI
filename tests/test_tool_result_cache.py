@@ -1,7 +1,7 @@
 """Tests for ToolResultCache (ADR-025 §Decision.8).
 
 Redis-backed per-session tool result cache. Mirrors the TokenCache
-pattern from identity.py — the two caches share the same sovereign-redis
+pattern from identity.py — the two caches share the same audittrace-redis
 container but live under disjoint key prefixes so they cannot collide.
 
 All tests use fakeredis so nothing touches a live Redis instance. The
@@ -15,7 +15,7 @@ import json
 import fakeredis
 import pytest
 
-from sovereign_memory.tools.cache import ToolResultCache
+from audittrace.tools.cache import ToolResultCache
 
 
 @pytest.fixture
@@ -51,13 +51,13 @@ class TestGetPut:
         assert json.loads(raw) == payload
 
     def test_key_prefix_is_tool_result(self, cache, redis_client):
-        """Namespace must be 'sovereign:tool-result:' so TokenCache keys
-        (prefix 'sovereign:token:') cannot collide."""
+        """Namespace must be 'audittrace:tool-result:' so TokenCache keys
+        (prefix 'audittrace:token:') cannot collide."""
         cache.put("abc123", {"matches": [], "total": 0, "truncated": False})
-        keys = list(redis_client.scan_iter(match="sovereign:tool-result:*"))
+        keys = list(redis_client.scan_iter(match="audittrace:tool-result:*"))
         assert len(keys) == 1
         # And NO entry ended up under the token namespace
-        token_keys = list(redis_client.scan_iter(match="sovereign:token:*"))
+        token_keys = list(redis_client.scan_iter(match="audittrace:token:*"))
         assert token_keys == []
 
     def test_get_malformed_payload_returns_none(self, cache, redis_client):
@@ -87,7 +87,7 @@ class TestDisabled:
     def test_ttl_zero_put_is_noop(self, redis_client):
         cache = ToolResultCache(redis_client, default_ttl_seconds=0)
         cache.put("key-1", {"matches": [], "total": 0, "truncated": False})
-        keys = list(redis_client.scan_iter(match="sovereign:tool-result:*"))
+        keys = list(redis_client.scan_iter(match="audittrace:tool-result:*"))
         assert keys == []
 
 
@@ -130,9 +130,9 @@ class TestHousekeeping:
         cache.clear()
         assert cache.size() == 0
         # And only OUR namespace was touched — a sibling token entry survives
-        redis_client.set("sovereign:token:xyz", "preserved")
+        redis_client.set("audittrace:token:xyz", "preserved")
         cache.clear()
-        assert redis_client.get("sovereign:token:xyz") == "preserved"
+        assert redis_client.get("audittrace:token:xyz") == "preserved"
 
     def test_size_returns_zero_on_redis_error(self):
         class BrokenRedis:
@@ -163,7 +163,7 @@ class TestSingleton:
         ToolResultCache from settings; subsequent calls return the same
         instance. set_tool_result_cache + reset round-trip covers the test
         escape hatch in one shot."""
-        from sovereign_memory.tools import cache as cache_mod
+        from audittrace.tools import cache as cache_mod
 
         cache_mod.reset_tool_result_cache()
 

@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-from sovereign_memory.models import (
+from audittrace.models import (
     ChatChoice,
     ChatCompletionResponse,
     ChatMessage,
@@ -32,11 +32,11 @@ def test_chat_message_model():
 def test_chat_request_model():
     """Test ChatRequest model."""
     request = ChatRequest(
-        model="sovereign-memory",
+        model="audittrace",
         messages=[ChatMessage(role="user", content="Test")],
         temperature=0.7,
     )
-    assert request.model == "sovereign-memory"
+    assert request.model == "audittrace"
     assert len(request.messages) == 1
     assert request.temperature == 0.7
     assert request.top_p == 1.0
@@ -119,7 +119,7 @@ def test_chat_completion_response_model():
     """Test ChatCompletionResponse model."""
     response = ChatCompletionResponse(
         id="test-id",
-        model="sovereign-memory",
+        model="audittrace",
         choices=[
             ChatChoice(
                 index=0,

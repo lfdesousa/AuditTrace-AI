@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
 
-from sovereign_memory.auth import _fetch_jwks_keys, _jwks_cache, require_scope
+from audittrace.auth import _fetch_jwks_keys, _jwks_cache, require_scope
 
 # ── Test RSA key pair ──────────────────────────────────────────────────────────
 
@@ -33,12 +33,12 @@ TEST_PUBLIC_PEM = _test_public_key.public_bytes(
     format=serialization.PublicFormat.SubjectPublicKeyInfo,
 ).decode()
 
-TEST_ISSUER = "http://keycloak:8080/realms/sovereign-ai"
+TEST_ISSUER = "http://keycloak:8080/realms/audittrace"
 TEST_AUDIENCE = "sovereign-memory-server"
 
 
 def _make_token(
-    scope: str = "sovereign-ai:query",
+    scope: str = "audittrace:query",
     audience: str = TEST_AUDIENCE,
     issuer: str = TEST_ISSUER,
     exp_offset: int = 3600,
@@ -65,7 +65,7 @@ def _mock_settings(**overrides):
         "auth_enabled": True,
         "keycloak_issuer": TEST_ISSUER,
         "keycloak_issuer_extras": [],
-        "keycloak_jwks_url": "http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs",
+        "keycloak_jwks_url": "http://keycloak:8080/realms/audittrace/protocol/openid-connect/certs",
         "jwt_audience": TEST_AUDIENCE,
     }
     defaults.update(overrides)
@@ -100,7 +100,7 @@ def _clear_jwks_cache():
 @pytest.fixture
 def mock_jwks():
     """Patch JWKS fetching to return test public key."""
-    with patch("sovereign_memory.auth._fetch_jwks_keys") as mock:
+    with patch("audittrace.auth._fetch_jwks_keys") as mock:
         mock.return_value = [TEST_PUBLIC_PEM]
         yield mock
 
@@ -119,8 +119,8 @@ class TestJWKSFetchRetry:
         ok_response.raise_for_status = MagicMock()
 
         with (
-            patch("sovereign_memory.auth.httpx.get") as mock_get,
-            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth.httpx.get") as mock_get,
+            patch("audittrace.auth.time.sleep") as mock_sleep,
         ):
             mock_get.side_effect = [
                 httpx.ConnectError("refused"),
@@ -135,8 +135,8 @@ class TestJWKSFetchRetry:
     def test_exhausts_retries_and_reraises(self):
         """All attempts fail — must raise the last exception."""
         with (
-            patch("sovereign_memory.auth.httpx.get") as mock_get,
-            patch("sovereign_memory.auth.time.sleep"),
+            patch("audittrace.auth.httpx.get") as mock_get,
+            patch("audittrace.auth.time.sleep"),
         ):
             mock_get.side_effect = httpx.ConnectError("down")
             with pytest.raises(httpx.ConnectError, match="down"):
@@ -148,8 +148,8 @@ class TestJWKSFetchRetry:
     def test_backoff_delays_are_exponential(self):
         """Sleep delays must follow 2^(attempt+1): 2, 4, 8."""
         with (
-            patch("sovereign_memory.auth.httpx.get") as mock_get,
-            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth.httpx.get") as mock_get,
+            patch("audittrace.auth.time.sleep") as mock_sleep,
         ):
             mock_get.side_effect = httpx.ConnectError("down")
             with pytest.raises(httpx.ConnectError):
@@ -165,8 +165,8 @@ class TestJWKSFetchRetry:
         ok_response.raise_for_status = MagicMock()
 
         with (
-            patch("sovereign_memory.auth.httpx.get", return_value=ok_response),
-            patch("sovereign_memory.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth.httpx.get", return_value=ok_response),
+            patch("audittrace.auth.time.sleep") as mock_sleep,
         ):
             result = _fetch_jwks_keys("http://keycloak:8080/jwks")
 
@@ -181,20 +181,20 @@ class TestAuthDisabled:
     def test_auth_disabled_allows_all(self, mock_jwks):
         """When auth_enabled=False, all requests pass without token."""
         with patch(
-            "sovereign_memory.auth.get_settings",
+            "audittrace.auth.get_settings",
             return_value=_mock_settings(auth_enabled=False),
         ):
-            app = _create_test_app("sovereign-ai:query")
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get("/protected")
             assert resp.status_code == 200
 
     def test_auth_disabled_returns_empty_payload(self, mock_jwks):
         with patch(
-            "sovereign_memory.auth.get_settings",
+            "audittrace.auth.get_settings",
             return_value=_mock_settings(auth_enabled=False),
         ):
-            app = _create_test_app("sovereign-ai:query")
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get("/protected")
             assert resp.json()["payload"] == {}
@@ -205,23 +205,23 @@ class TestAuthDisabled:
 
 class TestAuthErrors:
     def test_missing_token_returns_401(self, mock_jwks):
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get("/protected")
             assert resp.status_code == 401
 
     def test_invalid_token_returns_401(self, mock_jwks):
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get("/protected", headers={"Authorization": "Bearer garbage"})
             assert resp.status_code == 401
 
     def test_expired_token_returns_401(self, mock_jwks):
         token = _make_token(exp_offset=-3600)  # Expired 1 hour ago
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -230,8 +230,8 @@ class TestAuthErrors:
 
     def test_wrong_audience_returns_401(self, mock_jwks):
         token = _make_token(audience="wrong-audience")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -240,8 +240,8 @@ class TestAuthErrors:
 
     def test_wrong_issuer_returns_401(self, mock_jwks):
         token = _make_token(issuer="http://evil-server/realms/fake")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -249,9 +249,9 @@ class TestAuthErrors:
             assert resp.status_code == 401
 
     def test_missing_scope_returns_403(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:audit")  # Wrong scope
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")  # Requires :query
+        token = _make_token(scope="audittrace:audit")  # Wrong scope
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")  # Requires :query
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -260,8 +260,8 @@ class TestAuthErrors:
 
     def test_empty_scope_returns_403(self, mock_jwks):
         token = _make_token(scope="")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -274,9 +274,9 @@ class TestAuthErrors:
 
 class TestAuthSuccess:
     def test_valid_token_with_correct_scope(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:query")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        token = _make_token(scope="audittrace:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -285,10 +285,10 @@ class TestAuthSuccess:
 
     def test_multiple_scopes_includes_required(self, mock_jwks):
         token = _make_token(
-            scope="sovereign-ai:query sovereign-ai:context sovereign-ai:admin"
+            scope="audittrace:query audittrace:context audittrace:admin"
         )
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:context")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:context")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -296,9 +296,9 @@ class TestAuthSuccess:
             assert resp.status_code == 200
 
     def test_payload_contains_claims(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:query")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        token = _make_token(scope="audittrace:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             resp = client.get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
@@ -306,7 +306,7 @@ class TestAuthSuccess:
             payload = resp.json()["payload"]
             assert payload["sub"] == "opencode-agent"
             assert payload["iss"] == TEST_ISSUER
-            assert "sovereign-ai:query" in payload["scope"]
+            assert "audittrace:query" in payload["scope"]
 
 
 # ── ADR-032 multi-issuer acceptance ────────────────────────────────────────────
@@ -318,13 +318,13 @@ class TestMultiIssuer:
     different ``iss``. Both must validate as long as either is in the
     configured allow-set."""
 
-    EXTRA_ISSUER = "http://localhost/realms/sovereign-ai"
+    EXTRA_ISSUER = "http://localhost/realms/audittrace"
 
     def test_primary_issuer_accepted(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:query", issuer=TEST_ISSUER)
+        token = _make_token(scope="audittrace:query", issuer=TEST_ISSUER)
         settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
-        with patch("sovereign_memory.auth.get_settings", return_value=settings):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=settings):
+            app = _create_test_app("audittrace:query")
             resp = TestClient(app).get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
             )
@@ -333,10 +333,10 @@ class TestMultiIssuer:
     def test_extra_issuer_accepted(self, mock_jwks):
         """Token minted with the extra issuer claim must pass even
         though it does not match the primary keycloak_issuer."""
-        token = _make_token(scope="sovereign-ai:query", issuer=self.EXTRA_ISSUER)
+        token = _make_token(scope="audittrace:query", issuer=self.EXTRA_ISSUER)
         settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
-        with patch("sovereign_memory.auth.get_settings", return_value=settings):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=settings):
+            app = _create_test_app("audittrace:query")
             resp = TestClient(app).get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
             )
@@ -344,11 +344,11 @@ class TestMultiIssuer:
 
     def test_unknown_issuer_rejected(self, mock_jwks):
         token = _make_token(
-            scope="sovereign-ai:query", issuer="http://evil.example/realms/sovereign-ai"
+            scope="audittrace:query", issuer="http://evil.example/realms/audittrace"
         )
         settings = _mock_settings(keycloak_issuer_extras=[self.EXTRA_ISSUER])
-        with patch("sovereign_memory.auth.get_settings", return_value=settings):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=settings):
+            app = _create_test_app("audittrace:query")
             resp = TestClient(app).get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
             )
@@ -357,10 +357,10 @@ class TestMultiIssuer:
     def test_empty_extras_falls_back_to_primary_only(self, mock_jwks):
         """Default config (empty list) must preserve single-issuer behaviour."""
         token = _make_token(
-            scope="sovereign-ai:query", issuer="http://other/realms/sovereign-ai"
+            scope="audittrace:query", issuer="http://other/realms/audittrace"
         )
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             resp = TestClient(app).get(
                 "/protected", headers={"Authorization": f"Bearer {token}"}
             )
@@ -372,9 +372,9 @@ class TestMultiIssuer:
 
 class TestJWKSCaching:
     def test_jwks_fetched_once_for_multiple_requests(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:query")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        token = _make_token(scope="audittrace:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             client.get("/protected", headers={"Authorization": f"Bearer {token}"})
             client.get("/protected", headers={"Authorization": f"Bearer {token}"})
@@ -382,9 +382,9 @@ class TestJWKSCaching:
             assert mock_jwks.call_count == 1
 
     def test_cache_cleared_forces_refetch(self, mock_jwks):
-        token = _make_token(scope="sovereign-ai:query")
-        with patch("sovereign_memory.auth.get_settings", return_value=_mock_settings()):
-            app = _create_test_app("sovereign-ai:query")
+        token = _make_token(scope="audittrace:query")
+        with patch("audittrace.auth.get_settings", return_value=_mock_settings()):
+            app = _create_test_app("audittrace:query")
             client = TestClient(app)
             client.get("/protected", headers={"Authorization": f"Bearer {token}"})
             _jwks_cache.clear()
@@ -400,9 +400,9 @@ class TestJWKSCaching:
 
 import fakeredis  # noqa: E402
 
-from sovereign_memory import identity as _identity_mod  # noqa: E402
-from sovereign_memory.auth import require_user  # noqa: E402
-from sovereign_memory.identity import (  # noqa: E402
+from audittrace import identity as _identity_mod  # noqa: E402
+from audittrace.auth import require_user  # noqa: E402
+from audittrace.identity import (  # noqa: E402
     SENTINEL_SUBJECT,
     SENTINEL_USERNAME,
     TokenCache,
@@ -454,14 +454,14 @@ def auth_client(auth_required_app):
 
 
 def _enable_auth(monkeypatch):
-    """Flip SOVEREIGN_AUTH_REQUIRED on and rebind the settings cache."""
-    from sovereign_memory import config as config_mod
+    """Flip AUDITTRACE_AUTH_REQUIRED on and rebind the settings cache."""
+    from audittrace import config as config_mod
 
     config_mod.get_settings.cache_clear()
-    monkeypatch.setenv("SOVEREIGN_AUTH_REQUIRED", "true")
-    monkeypatch.setenv("SOVEREIGN_KEYCLOAK_ISSUER", TEST_ISSUER)
-    monkeypatch.setenv("SOVEREIGN_KEYCLOAK_JWKS_URL", "http://test/jwks")
-    monkeypatch.setenv("SOVEREIGN_JWT_AUDIENCE", TEST_AUDIENCE)
+    monkeypatch.setenv("AUDITTRACE_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("AUDITTRACE_KEYCLOAK_ISSUER", TEST_ISSUER)
+    monkeypatch.setenv("AUDITTRACE_KEYCLOAK_JWKS_URL", "http://test/jwks")
+    monkeypatch.setenv("AUDITTRACE_JWT_AUDIENCE", TEST_AUDIENCE)
 
 
 @pytest.fixture
@@ -469,7 +469,7 @@ def auth_required_env(monkeypatch):
     """Enable required mode + clean up afterwards."""
     _enable_auth(monkeypatch)
     yield
-    from sovereign_memory import config as config_mod
+    from audittrace import config as config_mod
 
     config_mod.get_settings.cache_clear()
 
@@ -499,7 +499,7 @@ def _make_user_token(
 
 
 class TestRequireUserBypass:
-    """SOVEREIGN_AUTH_REQUIRED=false → sentinel UserContext, no validation."""
+    """AUDITTRACE_AUTH_REQUIRED=false → sentinel UserContext, no validation."""
 
     def test_no_token_returns_sentinel(self, auth_client):
         response = auth_client.get("/whoami", headers={"User-Agent": "opencode/1.0"})

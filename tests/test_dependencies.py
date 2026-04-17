@@ -5,8 +5,8 @@ ADR-020: PostgreSQL-only path. No SQLite fallback.
 
 import pytest
 
-from sovereign_memory.db.factory import MockChromaDBFactory
-from sovereign_memory.dependencies import (
+from audittrace.db.factory import MockChromaDBFactory
+from audittrace.dependencies import (
     DependencyContainer,
     create_test_container,
     register_default_dependencies,
@@ -74,9 +74,9 @@ def test_register_default_dependencies_no_pg(monkeypatch):
 
     Uses MockChromaDBFactory to avoid needing a live ChromaDB server.
     """
-    from sovereign_memory import dependencies as deps_module
-    from sovereign_memory.config import Settings
-    from sovereign_memory.db.postgres import InMemoryPostgresFactory
+    from audittrace import dependencies as deps_module
+    from audittrace.config import Settings
+    from audittrace.db.postgres import InMemoryPostgresFactory
 
     # Patch the factory constructor to avoid real ChromaDB connection
     monkeypatch.setattr(
@@ -97,7 +97,7 @@ def test_register_default_dependencies_no_pg(monkeypatch):
 
 def test_set_test_mode():
     """Test setting test mode registers a mock factory on the global container."""
-    from sovereign_memory import dependencies as deps_module
+    from audittrace import dependencies as deps_module
 
     set_test_mode()
     factory = deps_module.container.get_factory("chromadb")
@@ -118,10 +118,10 @@ class TestPerRequestContextBuilder:
         """Phase 4 follow-up: get_context_builder(user) must return a
         DefaultContextBuilder whose semantic layer is a
         UserScopedSemanticService bound to the request's user."""
-        from sovereign_memory import dependencies as deps_module
-        from sovereign_memory.dependencies import get_context_builder
-        from sovereign_memory.services.context_builder import DefaultContextBuilder
-        from sovereign_memory.services.semantic import UserScopedSemanticService
+        from audittrace import dependencies as deps_module
+        from audittrace.dependencies import get_context_builder
+        from audittrace.services.context_builder import DefaultContextBuilder
+        from audittrace.services.semantic import UserScopedSemanticService
 
         # Swap global container so the dependency reads test services.
         deps_module.container = test_container
@@ -138,8 +138,8 @@ class TestPerRequestContextBuilder:
     ):
         """The wrapper is applied only to the semantic layer; the other
         three services are shared singletons from the container."""
-        from sovereign_memory import dependencies as deps_module
-        from sovereign_memory.dependencies import get_context_builder
+        from audittrace import dependencies as deps_module
+        from audittrace.dependencies import get_context_builder
 
         deps_module.container = test_container
         builder = get_context_builder(user_context)
@@ -155,8 +155,8 @@ class TestPerRequestContextBuilder:
         identity."""
         from dataclasses import replace
 
-        from sovereign_memory import dependencies as deps_module
-        from sovereign_memory.dependencies import get_context_builder
+        from audittrace import dependencies as deps_module
+        from audittrace.dependencies import get_context_builder
 
         deps_module.container = test_container
         alice = replace(user_context, user_id="user-alice", is_admin=False)

@@ -1,4 +1,4 @@
-"""Unit tests for sovereign_memory.server module-level helpers.
+"""Unit tests for audittrace.server module-level helpers.
 
 Integration coverage of the FastAPI app assembly + lifespan lives in the
 route tests (``test_routes.py``, ``test_chat_proxy.py``). These tests
@@ -12,7 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sovereign_memory.server import (
+from audittrace.server import (
     _build_httpx_peer_service_map,
     make_httpx_async_peer_service_hook,
     make_httpx_peer_service_hook,

@@ -154,8 +154,8 @@ def _seed_interaction(
     timestamp: str = "2026-04-14T12:00:00",
 ) -> int:
     """Insert one interaction row through the real DB factory."""
-    from sovereign_memory.db.models import InteractionRecord as Row
-    from sovereign_memory.dependencies import get_postgres_factory
+    from audittrace.db.models import InteractionRecord as Row
+    from audittrace.dependencies import get_postgres_factory
 
     pg = get_postgres_factory()
     with pg.get_session_factory()() as db:
@@ -317,8 +317,8 @@ def test_save_session_summary(client):
     # Verify it landed in the test conversational service. Bypass mode
     # writes under the sentinel user_context — read back with the same
     # sentinel identity.
-    from sovereign_memory.dependencies import get_conversational_service
-    from sovereign_memory.identity import sentinel_user_context
+    from audittrace.dependencies import get_conversational_service
+    from audittrace.identity import sentinel_user_context
 
     service = get_conversational_service()
     sessions = service.load_sessions(sentinel_user_context(), "AuditTrace")

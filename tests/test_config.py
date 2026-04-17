@@ -6,7 +6,7 @@ database_url now uses postgresql+psycopg2:// driver prefix.
 
 import os
 
-from sovereign_memory.config import Settings
+from audittrace.config import Settings
 
 
 def test_settings_default_values():
@@ -23,9 +23,9 @@ def test_settings_default_values():
 
 def test_settings_from_env():
     """Test configuration from environment variables."""
-    os.environ["SOVEREIGN_PORT"] = "9999"
-    os.environ["SOVEREIGN_AUTH_ENABLED"] = "true"
-    os.environ["SOVEREIGN_LOG_LEVEL"] = "DEBUG"
+    os.environ["AUDITTRACE_PORT"] = "9999"
+    os.environ["AUDITTRACE_AUTH_ENABLED"] = "true"
+    os.environ["AUDITTRACE_LOG_LEVEL"] = "DEBUG"
 
     settings = Settings()
     assert settings.port == 9999
@@ -33,9 +33,9 @@ def test_settings_from_env():
     assert settings.log_level == "DEBUG"
 
     # Cleanup
-    del os.environ["SOVEREIGN_PORT"]
-    del os.environ["SOVEREIGN_AUTH_ENABLED"]
-    del os.environ["SOVEREIGN_LOG_LEVEL"]
+    del os.environ["AUDITTRACE_PORT"]
+    del os.environ["AUDITTRACE_AUTH_ENABLED"]
+    del os.environ["AUDITTRACE_LOG_LEVEL"]
 
 
 def test_settings_chroma_server_mode():
@@ -59,15 +59,15 @@ def test_settings_chroma_token_defaults_none():
 def test_database_url_property():
     """Test PostgreSQL URL construction with psycopg2 driver."""
     settings = Settings(
-        postgres_user="sovereign",
+        postgres_user="audittrace",
         postgres_password="secret",
         postgres_host="postgres",
         postgres_port=5432,
-        postgres_db="sovereign_ai",
+        postgres_db="audittrace",
     )
 
     url = settings.database_url
-    assert url == "postgresql+psycopg2://sovereign:secret@postgres:5432/sovereign_ai"
+    assert url == "postgresql+psycopg2://audittrace:secret@postgres:5432/audittrace"
 
 
 def test_database_url_from_full_url():
@@ -104,8 +104,8 @@ def test_auth_configured():
 
     settings = Settings(
         auth_enabled=True,
-        keycloak_issuer="http://kc:8080/realms/sovereign",
-        keycloak_jwks_url="http://kc:8080/realms/sovereign/protocol/openid-connect/certs",
+        keycloak_issuer="http://kc:8080/realms/audittrace",
+        keycloak_jwks_url="http://kc:8080/realms/audittrace/protocol/openid-connect/certs",
     )
     assert settings.auth_configured is True
 
@@ -147,18 +147,18 @@ def test_settings_four_layer_memory_defaults():
 
 def test_settings_four_layer_memory_from_env():
     """Test 4-layer memory paths from environment variables."""
-    os.environ["SOVEREIGN_ADR_DIR"] = "/data/adrs"
-    os.environ["SOVEREIGN_SKILL_DIR"] = "/data/skills"
-    os.environ["SOVEREIGN_LLAMA_PROXY_TIMEOUT"] = "60"
+    os.environ["AUDITTRACE_ADR_DIR"] = "/data/adrs"
+    os.environ["AUDITTRACE_SKILL_DIR"] = "/data/skills"
+    os.environ["AUDITTRACE_LLAMA_PROXY_TIMEOUT"] = "60"
 
     settings = Settings()
     assert settings.adr_dir == "/data/adrs"
     assert settings.skill_dir == "/data/skills"
     assert settings.llama_proxy_timeout == 60
 
-    del os.environ["SOVEREIGN_ADR_DIR"]
-    del os.environ["SOVEREIGN_SKILL_DIR"]
-    del os.environ["SOVEREIGN_LLAMA_PROXY_TIMEOUT"]
+    del os.environ["AUDITTRACE_ADR_DIR"]
+    del os.environ["AUDITTRACE_SKILL_DIR"]
+    del os.environ["AUDITTRACE_LLAMA_PROXY_TIMEOUT"]
 
 
 def test_no_file_based_db_fields():
@@ -179,13 +179,13 @@ def test_settings_memory_mode_defaults_to_inject():
 
 
 def test_settings_memory_mode_accepts_tools():
-    """ADR-025: SOVEREIGN_MEMORY_MODE=tools enables the tool-call loop path."""
-    os.environ["SOVEREIGN_MEMORY_MODE"] = "tools"
+    """ADR-025: AUDITTRACE_MEMORY_MODE=tools enables the tool-call loop path."""
+    os.environ["AUDITTRACE_MEMORY_MODE"] = "tools"
     try:
         settings = Settings()
         assert settings.memory_mode == "tools"
     finally:
-        del os.environ["SOVEREIGN_MEMORY_MODE"]
+        del os.environ["AUDITTRACE_MEMORY_MODE"]
 
 
 def test_settings_memory_tool_loop_max_iterations_default():
@@ -197,12 +197,12 @@ def test_settings_memory_tool_loop_max_iterations_default():
 
 def test_settings_memory_tool_loop_max_iterations_from_env():
     """ADR-025: operator can raise or lower the cap via env."""
-    os.environ["SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS"] = "12"
+    os.environ["AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS"] = "12"
     try:
         settings = Settings()
         assert settings.memory_tool_loop_max_iterations == 12
     finally:
-        del os.environ["SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS"]
+        del os.environ["AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS"]
 
 
 def test_settings_memory_tool_cache_ttl_default():
@@ -216,12 +216,12 @@ def test_settings_memory_tool_cache_ttl_zero_disables():
     """ADR-025: TTL=0 is the disable signal. The cache layer reads this and
     short-circuits both get and put so the handler always runs and nothing
     is stored."""
-    os.environ["SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS"] = "0"
+    os.environ["AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS"] = "0"
     try:
         settings = Settings()
         assert settings.memory_tool_cache_ttl_seconds == 0
     finally:
-        del os.environ["SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS"]
+        del os.environ["AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS"]
 
 
 def test_settings_tools_config_path_default():
@@ -234,9 +234,9 @@ def test_settings_tools_config_path_default():
 
 def test_settings_tools_config_path_from_env():
     """ADR-025: immutable-image deployments override via env."""
-    os.environ["SOVEREIGN_TOOLS_CONFIG_PATH"] = "/etc/sovereign/tools.toml"
+    os.environ["AUDITTRACE_TOOLS_CONFIG_PATH"] = "/etc/audittrace/tools.toml"
     try:
         settings = Settings()
-        assert settings.tools_config_path == "/etc/sovereign/tools.toml"
+        assert settings.tools_config_path == "/etc/audittrace/tools.toml"
     finally:
-        del os.environ["SOVEREIGN_TOOLS_CONFIG_PATH"]
+        del os.environ["AUDITTRACE_TOOLS_CONFIG_PATH"]
