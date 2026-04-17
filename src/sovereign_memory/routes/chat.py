@@ -204,29 +204,55 @@ def _apply_thinking_mode(payload: dict[str, Any], thinking: str | None) -> None:
 async def _iter_with_idle_timeout(
     resp: httpx.Response,
     chunk_timeout: float,
-) -> AsyncIterator[str]:
-    """Wrap ``resp.aiter_lines()`` with a per-chunk idle timeout (ADR-034).
+    keepalive_interval: float = 0,
+) -> AsyncIterator[str | None]:
+    """Wrap ``resp.aiter_lines()`` with per-chunk idle timeout + keep-alive (ADR-034).
 
     As long as SSE lines keep arriving within *chunk_timeout* seconds of
     each other, the stream stays alive indefinitely — even if the total
-    duration far exceeds any flat timeout. This directly solves the
-    "15-minute valid ``<think>`` reasoning killed at 300s" problem.
+    duration far exceeds any flat timeout.
 
-    If no line arrives within *chunk_timeout*, raises
-    ``httpx.ReadTimeout`` so the existing ``except httpx.TimeoutException``
-    handler catches it identically to the old flat timeout.
+    When *keepalive_interval* > 0, yields ``None`` every
+    *keepalive_interval* seconds during quiet periods (e.g. Qwen
+    ``<think>``). The caller converts ``None`` to ``b": keep-alive\\n\\n"``
+    (SSE comment frame). After *chunk_timeout* total silence, raises
+    ``httpx.ReadTimeout``.
+
+    When *keepalive_interval* is 0 (default), raises ``httpx.ReadTimeout``
+    after *chunk_timeout* of silence — pure idle-timeout mode.
     """
     aiter = resp.aiter_lines().__aiter__()
-    while True:
-        try:
-            line = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_timeout)
-            yield line
-        except StopAsyncIteration:
-            return
-        except TimeoutError:
-            raise httpx.ReadTimeout(
-                f"No data received for {chunk_timeout}s (per-chunk idle timeout)"
-            )
+    idle_elapsed = 0.0
+    wait = keepalive_interval if keepalive_interval > 0 else chunk_timeout
+    # We keep a single pending __anext__ task alive across keep-alive cycles
+    # so cancellation doesn't corrupt the async generator's internal state.
+    pending_next: asyncio.Task[str] | None = None
+    try:
+        while True:
+            if pending_next is None:
+                pending_next = asyncio.ensure_future(aiter.__anext__())
+            done, _ = await asyncio.wait({pending_next}, timeout=wait)
+            if done:
+                try:
+                    line = pending_next.result()
+                except StopAsyncIteration:
+                    return
+                pending_next = None
+                idle_elapsed = 0.0
+                yield line
+            else:
+                # Timeout — no data arrived in this window.
+                idle_elapsed += wait
+                if keepalive_interval <= 0 or idle_elapsed >= chunk_timeout:
+                    pending_next.cancel()
+                    raise httpx.ReadTimeout(
+                        f"No data received for {chunk_timeout}s"
+                        " (per-chunk idle timeout)"
+                    )
+                yield None  # keep-alive signal
+    finally:
+        if pending_next is not None and not pending_next.done():
+            pending_next.cancel()
 
 
 def _persist_interaction(
@@ -1061,8 +1087,15 @@ async def chat_completions(
                     ) as resp:
                         resp.raise_for_status()
                         async for line in _iter_with_idle_timeout(
-                            resp, settings.llama_chunk_timeout
+                            resp,
+                            settings.llama_chunk_timeout,
+                            settings.sse_keepalive_interval,
                         ):
+                            if line is None:
+                                # ADR-034: SSE comment frame — invisible to
+                                # JSON parsers, holds connection through proxies.
+                                yield b": keep-alive\n\n"
+                                continue
                             stripped = line.strip()
                             if not stripped.startswith("data: "):
                                 # Forward blank/non-data lines verbatim (SSE separators)
