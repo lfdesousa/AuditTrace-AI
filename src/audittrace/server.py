@@ -17,7 +17,7 @@ from audittrace.dependencies import (
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
-from audittrace.routes import audit, chat, context, health, session
+from audittrace.routes import audit, chat, context, health, memory, session
 from audittrace.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
@@ -283,6 +283,7 @@ def create_app() -> FastAPI:
     app.include_router(context.router, tags=["context"])
     app.include_router(audit.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
+    app.include_router(memory.router, prefix="/memory", tags=["memory"])
     app.include_router(health.router, tags=["health"])
 
     @app.exception_handler(Exception)

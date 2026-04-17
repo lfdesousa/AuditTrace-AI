@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
-"""Index documents into ChromaDB collections for semantic search (ADR-027).
+"""Index documents into ChromaDB via the AuditTrace memory server API.
 
-Reads from source directories on the host filesystem, extracts text (including
-PDFs via pymupdf), chunks, and pushes to ChromaDB on localhost:18000.
+Uploads files to ``POST /memory/upload`` and triggers reindexing via
+``POST /memory/index``.  The memory server is the single gateway — this
+script never talks to MinIO or ChromaDB directly.
 
 Usage:
-    # Index all collections
-    python scripts/index-chromadb.py --user-id kc-luis-001
+    # Upload ADRs as episodic memory
+    python scripts/index-chromadb.py \\
+      --server https://localhost:30952 -k \\
+      --token "$TOKEN" \\
+      --upload-dir docs/ --layer episodic
 
-    # Index specific collections only
-    python scripts/index-chromadb.py --collections decisions skills
+    # Upload skills as procedural memory
+    python scripts/index-chromadb.py \\
+      --server https://localhost:30952 -k \\
+      --token "$TOKEN" \\
+      --upload-dir ~/work/claude-config/skills/ --layer procedural
 
-    # Preview without writing
-    python scripts/index-chromadb.py --dry-run --user-id kc-luis-001
+    # Trigger reindex only (no upload)
+    python scripts/index-chromadb.py \\
+      --server https://localhost:30952 -k \\
+      --token "$TOKEN" \\
+      --index-only
 
-    # Verbose output
-    python scripts/index-chromadb.py --user-id kc-luis-001 --verbose
+    # Legacy mode — direct ChromaDB indexing (backward compat)
+    python scripts/index-chromadb.py --legacy --user-id kc-luis-001
+    python scripts/index-chromadb.py --legacy --collections decisions skills
+    python scripts/index-chromadb.py --legacy --dry-run --user-id kc-luis-001
 """
 
 from __future__ import annotations
@@ -24,6 +36,7 @@ import argparse
 import hashlib
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -41,6 +54,9 @@ SCM_KNOWLEDGE = Path.home() / "work" / "scm-knowledge"
 # truncation while keeping chunks semantically coherent.
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
+
+
+# ── shared helpers (used by both legacy and HTTP modes) ──────────────────────
 
 
 def _chunk_text(
@@ -94,6 +110,129 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+# ── HTTP-client mode ─────────────────────────────────────────────────────────
+
+
+def _resolve_token(args: argparse.Namespace) -> str:
+    """Resolve the bearer token from CLI arg, env var, or login script."""
+    if args.token:
+        return args.token
+    env_token = os.environ.get("AUDITTRACE_TOKEN")
+    if env_token:
+        return env_token
+    logger.error(
+        "No auth token. Pass --token, set AUDITTRACE_TOKEN, "
+        "or run: TOKEN=$(scripts/audittrace-login --show)"
+    )
+    sys.exit(1)
+
+
+def _upload_files(
+    server: str,
+    token: str,
+    upload_dir: Path,
+    layer: str,
+    verify: bool,
+) -> int:
+    """Upload all .md files from *upload_dir* to POST /memory/upload."""
+    import httpx
+
+    uploaded = 0
+    md_files = sorted(upload_dir.rglob("*.md"))
+    if not md_files:
+        logger.warning("No .md files found in %s", upload_dir)
+        return 0
+
+    headers = {"Authorization": f"Bearer {token}"}
+    for f in md_files:
+        relative = f.relative_to(upload_dir)
+        filename = str(relative)
+        logger.info("Uploading %s (%s) ...", filename, layer)
+        try:
+            with open(f, "rb") as fh:
+                resp = httpx.post(
+                    f"{server}/memory/upload",
+                    params={"layer": layer, "filename": filename},
+                    files={"file": (filename, fh, "text/markdown")},
+                    headers=headers,
+                    verify=verify,
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(
+                "  -> %s (%d bytes)", data.get("key"), data.get("size_bytes", 0)
+            )
+            uploaded += 1
+        except Exception as exc:
+            logger.error("  FAILED: %s", exc)
+
+    return uploaded
+
+
+def _trigger_index(
+    server: str,
+    token: str,
+    collections: str | None,
+    verify: bool,
+) -> None:
+    """Call POST /memory/index to trigger reindexing."""
+    import httpx
+
+    headers = {"Authorization": f"Bearer {token}"}
+    params: dict[str, str] = {}
+    if collections:
+        params["collections"] = collections
+
+    logger.info(
+        "Triggering reindex%s ...",
+        f" (collections={collections})" if collections else "",
+    )
+    resp = httpx.post(
+        f"{server}/memory/index",
+        params=params,
+        headers=headers,
+        verify=verify,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    logger.info(
+        "Indexing complete: %d total chunks across %d collections in %.1fs",
+        data.get("total_chunks", 0),
+        len(data.get("collections", {})),
+        data.get("duration_s", 0),
+    )
+    for col, count in data.get("collections", {}).items():
+        logger.info("  %s: %d chunks", col, count)
+
+
+def run_http_mode(args: argparse.Namespace) -> None:
+    """HTTP-client mode: upload files and/or trigger index via the API."""
+    token = _resolve_token(args)
+    verify = not args.insecure
+
+    if not args.index_only:
+        if not args.upload_dir:
+            logger.error("--upload-dir is required (or use --index-only)")
+            sys.exit(1)
+        if not args.layer:
+            logger.error("--layer is required when uploading")
+            sys.exit(1)
+        upload_dir = Path(args.upload_dir).expanduser().resolve()
+        if not upload_dir.is_dir():
+            logger.error("Upload directory does not exist: %s", upload_dir)
+            sys.exit(1)
+        uploaded = _upload_files(args.server, token, upload_dir, args.layer, verify)
+        logger.info("Uploaded %d files", uploaded)
+
+    # Always trigger reindex after upload (or if --index-only)
+    _trigger_index(args.server, token, args.reindex_collections, verify)
+
+
+# ── legacy direct-to-ChromaDB mode ──────────────────────────────────────────
+
+
 def _get_chromadb_client(url: str, token: str | None):
     """Create ChromaDB HTTP client."""
     import chromadb
@@ -120,23 +259,17 @@ def _index_collection(
     docs: list[dict],
     dry_run: bool = False,
 ) -> int:
-    """Index documents into a ChromaDB collection.
-
-    Each doc dict has: id, document, metadata.
-    Returns the number of chunks indexed.
-    """
+    """Index documents into a ChromaDB collection."""
     if dry_run:
         logger.info("  [DRY RUN] %s: %d chunks", name, len(docs))
         return len(docs)
 
-    # Delete and recreate for idempotency
     try:
         client.delete_collection(name)
     except Exception:
         pass
     collection = client.get_or_create_collection(name=name)
 
-    # Batch in groups of 100 (ChromaDB recommendation)
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         batch = docs[i : i + batch_size]
@@ -177,9 +310,7 @@ def build_decisions_docs() -> list[dict]:
 def build_skills_docs() -> list[dict]:
     """Build document list from SKILL-*.md files in memory/procedural/."""
     docs = []
-    # Check skills source directly if procedural dir is empty
     if not list(PROCEDURAL_DIR.glob("SKILL-*.md")):
-        # Fall back to claude-config skills
         skills_src = Path.home() / "work" / "claude-config" / "skills"
         if skills_src.exists():
             for skill_dir in sorted(skills_src.iterdir()):
@@ -289,31 +420,8 @@ def _build_knowledge_docs(
     return docs
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Index documents into ChromaDB (ADR-027)"
-    )
-    parser.add_argument(
-        "--collections",
-        nargs="+",
-        choices=["decisions", "skills", "ai_research", "scm_coursework"],
-        default=None,
-        help="Index specific collections only (default: all).",
-    )
-    parser.add_argument(
-        "--user-id",
-        default=None,
-        help="Keycloak user ID for private collection metadata. Required for ai_research/scm_coursework.",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Preview without writing."
-    )
-    parser.add_argument("--verbose", "-v", action="store_true")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+def run_legacy_mode(args: argparse.Namespace) -> None:
+    """Legacy direct-to-ChromaDB mode (backward compat)."""
     target_collections = args.collections or [
         "decisions",
         "skills",
@@ -321,14 +429,13 @@ def main() -> None:
         "scm_coursework",
     ]
 
-    # Require user_id for private collections
     private_collections = {"ai_research", "scm_coursework"}
     if private_collections & set(target_collections) and not args.user_id:
-        parser.error(
+        logger.error(
             "--user-id is required for ai_research and scm_coursework collections"
         )
+        sys.exit(1)
 
-    # Read ChromaDB connection parameters
     chroma_url = os.environ.get("AUDITTRACE_CHROMA_URL", "http://localhost:18000")
     chroma_token = os.environ.get("AUDITTRACE_CHROMA_TOKEN", "")
     if not chroma_token:
@@ -344,7 +451,6 @@ def main() -> None:
     start = time.time()
     total_chunks = 0
 
-    # Build and index each collection
     collection_builders: dict[str, tuple] = {
         "decisions": (build_decisions_docs, {}),
         "skills": (build_skills_docs, {}),
@@ -386,6 +492,89 @@ def main() -> None:
         len(target_collections),
         elapsed,
     )
+
+
+# ── CLI entrypoint ───────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Index documents into ChromaDB via the AuditTrace memory server API"
+    )
+
+    # HTTP-client mode args
+    parser.add_argument(
+        "--server",
+        default="https://localhost:30952",
+        help="Memory server URL (default: https://localhost:30952).",
+    )
+    parser.add_argument(
+        "--upload-dir",
+        default=None,
+        help="Upload all .md files from this directory.",
+    )
+    parser.add_argument(
+        "--layer",
+        choices=["episodic", "procedural"],
+        default=None,
+        help="Memory layer to upload to.",
+    )
+    parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Skip upload, just trigger reindex.",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="Bearer token for auth (or set AUDITTRACE_TOKEN env).",
+    )
+    parser.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="Skip TLS verification.",
+    )
+    parser.add_argument(
+        "--reindex-collections",
+        default=None,
+        help="Comma-separated collections for reindex (default: all).",
+    )
+
+    # Legacy mode args (backward compat)
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Use legacy direct-to-ChromaDB indexing (bypass the API).",
+    )
+    parser.add_argument(
+        "--collections",
+        nargs="+",
+        choices=["decisions", "skills", "ai_research", "scm_coursework"],
+        default=None,
+        help="(Legacy) Index specific collections only.",
+    )
+    parser.add_argument(
+        "--user-id",
+        default=None,
+        help="(Legacy) Keycloak user ID for private collections.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="(Legacy) Preview without writing.",
+    )
+    parser.add_argument("--verbose", "-v", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.legacy:
+        run_legacy_mode(args)
+    else:
+        run_http_mode(args)
 
 
 if __name__ == "__main__":
