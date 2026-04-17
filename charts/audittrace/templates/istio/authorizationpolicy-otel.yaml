@@ -1,0 +1,30 @@
+{{- if and .Values.istio.enabled .Values.observability.otelCollector.enabled }}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-otel-collector
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: otel-collector
+  action: ALLOW
+  rules:
+    # Memory-server sends OTLP traces + metrics
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
+      to:
+        - operation:
+            ports: ["4318"]
+    # Prometheus scrapes the collector's metrics endpoint
+    - from:
+        - source:
+            namespaces: ["{{ .Release.Namespace }}"]
+      to:
+        - operation:
+            ports: ["8889"]
+{{- end }}
