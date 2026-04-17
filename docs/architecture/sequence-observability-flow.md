@@ -11,7 +11,7 @@ sequenceDiagram
     participant Collector as OTel Collector
     participant Prom as Prometheus
 
-    App->>Collector: OTLP/HTTP (:4318)<br/>sovereign.operation.duration histogram<br/>sovereign.operation.errors counter
+    App->>Collector: OTLP/HTTP (:4318)<br/>audittrace.operation.duration histogram<br/>audittrace.operation.errors counter
 
     Collector->>Prom: Remote write (:9090/api/v1/write)
 
@@ -23,13 +23,13 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Prom as Prometheus
-    participant Istio Gateway as Istio Gateway (:8080)
+    participant Istio as Istio IngressGateway (:15090)
     participant Llama as llama-server (:11435)
     participant MinIO as MinIO (:9000)
 
     loop Every 15s
-        Prom->>Istio Gateway: GET /metrics
-        Istio Gateway-->>Prom: request rate, latency, status codes
+        Prom->>Istio: GET /stats/prometheus
+        Istio-->>Prom: request rate, latency, status codes (Envoy metrics)
 
         Prom->>Llama: GET /metrics
         Llama-->>Prom: tokens/sec, prompt eval, KV cache
@@ -43,20 +43,25 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Containers as Docker containers
-    participant Promtail as Promtail
+    participant Pods as k8s Pods (audittrace namespace)
+    participant Promtail as Promtail (DaemonSet)
     participant Loki as Loki
 
-    Promtail->>Containers: Docker socket (/var/run/docker.sock)<br/>discover containers on audittrace-net
+    Promtail->>Pods: kubelet API / node log directory<br/>discover pods in audittrace namespace
 
     loop Continuous
-        Containers-->>Promtail: stdout/stderr log lines
+        Pods-->>Promtail: stdout/stderr log lines
 
-        Note over Promtail: Extract labels:<br/>container, compose_service<br/>Parse JSON (level, logger, trace_id)
+        Note over Promtail: Extract labels:<br/>pod, namespace, container<br/>Parse JSON (level, logger, trace_id)
 
         Promtail->>Loki: POST /loki/api/v1/push
     end
 ```
+
+**OTel Collector** runs as a DaemonSet inside the `audittrace` namespace,
+receiving OTLP from the audittrace-server sidecar (mesh-local traffic).
+Envoy sidecars on every pod also emit their own metrics to Prometheus
+via the `/stats/prometheus` scrape endpoint.
 
 ## Trace Path — Langfuse SDK (unchanged)
 
@@ -82,9 +87,9 @@ sequenceDiagram
     participant Prom as Prometheus
     participant Loki as Loki
 
-    User->>Grafana: Open Sovereign AI Operations dashboard
+    User->>Grafana: Open AuditTrace Operations dashboard
 
-    Grafana->>Prom: PromQL: histogram_quantile(0.95, sovereign_operation_duration)
+    Grafana->>Prom: PromQL: histogram_quantile(0.95, audittrace_operation_duration)
     Prom-->>Grafana: P95 latency time-series
 
     Grafana->>Loki: LogQL: {compose_service=~".+"} |= "ERROR"
@@ -101,7 +106,7 @@ memory-server
   ├── Langfuse SDK ──► Langfuse (traces) [ADR-021.2]
   └── stdout ──► Promtail ──► Loki (logs)
 
-Prometheus ◄── scrape ── Istio Gateway, llama-server, MinIO
+Prometheus ◄── scrape ── Istio IngressGateway, Envoy sidecars, llama-server, MinIO
 
 Grafana
   ├── PromQL ──► Prometheus
