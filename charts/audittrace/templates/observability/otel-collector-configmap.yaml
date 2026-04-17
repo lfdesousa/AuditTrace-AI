@@ -20,15 +20,15 @@ data:
     exporters:
       prometheus:
         endpoint: "0.0.0.0:8889"
-      otlphttp/traces:
-        endpoint: "http://{{ .Release.Name }}-langfuse:{{ .Values.observability.external.langfusePort }}"
+      otlphttp/tempo:
+        endpoint: "http://{{ .Values.observability.external.tempoIP | default .Values.global.hostNodeIP }}:{{ .Values.observability.external.tempoOtlpPort | default 14318 }}"
 
     service:
       pipelines:
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [otlphttp/traces]
+          exporters: [otlphttp/tempo]
         metrics:
           receivers: [otlp]
           processors: [batch]
