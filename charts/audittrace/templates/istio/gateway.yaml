@@ -17,7 +17,5 @@ spec:
         mode: SIMPLE
         credentialName: {{ .Values.istio.gateway.credentialName }}
       hosts:
-        {{- range .Values.istio.gateway.hosts }}
-        - {{ . | quote }}
-        {{- end }}
+        - "*"
 {{- end }}

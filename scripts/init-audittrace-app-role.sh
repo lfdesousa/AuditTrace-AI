@@ -49,6 +49,10 @@ POSTGRES_USER="${POSTGRES_USER:-audittrace}"
 POSTGRES_DB="${POSTGRES_DB:-audittrace}"
 APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
 
+# Bitnami postgres uses md5 auth even for local connections during init.
+# Export PGPASSWORD so psql can authenticate non-interactively.
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
 if [[ -z "${APP_PASSWORD}" ]]; then
     echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2
     exit 1

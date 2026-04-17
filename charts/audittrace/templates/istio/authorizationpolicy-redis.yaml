@@ -8,7 +8,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/component: redis
+      app.kubernetes.io/name: redis
   action: ALLOW
   rules:
     - from:
