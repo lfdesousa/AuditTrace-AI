@@ -1,7 +1,7 @@
 # Sequence Diagram: /v1/chat/completions with `memory_mode=tools`
 
 > **Created 2026-04-11** for ADR-025 (memory-as-tools). This document
-> covers the `SOVEREIGN_MEMORY_MODE=tools` code path. For the default
+> covers the `AUDITTRACE_MEMORY_MODE=tools` code path. For the default
 > inject-mode path see `sequence-chat-completions.md`.
 >
 > Status: ADR-025 is **Accepted** (2026-04-12). The flow below matches
@@ -85,7 +85,7 @@ sequenceDiagram
     participant Handler as _handle_tools_mode
     participant ToolLoop as run_memory_tool_loop
     participant Registry as tools_visible_to\n+ get_tool_by_name
-    participant Cache as ToolResultCache\n(sovereign-redis)
+    participant Cache as ToolResultCache\n(audittrace-redis)
     participant Invoke as invoke_tool
     participant Episodic as EpisodicService
     participant LLM as llama-server :11435
@@ -234,7 +234,7 @@ Two stop conditions, in this order:
    the same data it already received; another round-trip can only
    return a cached identical result and waste an iteration. Logs
    `memory tool-call loop detected repeated signatures`.
-2. **Hard iteration cap** at `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS`
+2. **Hard iteration cap** at `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS`
    (default 5; production override 10) — defence against a misbehaving
    model that varies its args every turn but never converges. Returns
    whatever the last body was and logs `memory tool-call loop reached
@@ -344,7 +344,7 @@ with the error populated. The loop continues.
 - **Seed** (`docs/architecture/BRAINSTORM-memory-as-tools.md`) — the
   exploration that preceded the ADR.
 - **Inject-mode sequence** (`sequence-chat-completions.md`) — the
-  legacy path, retained as a feature flag (`SOVEREIGN_MEMORY_MODE=inject`).
+  legacy path, retained as a feature flag (`AUDITTRACE_MEMORY_MODE=inject`).
 - **Multi-user identity** (`ADR-026` §15) —
   how `UserContext` reaches the loop; Phase 2 of that design shipped
   in the preceding commits.

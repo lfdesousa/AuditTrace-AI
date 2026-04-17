@@ -90,7 +90,7 @@ sequenceDiagram
 
 ## Tools-mode: build_ambient_context() (ADR-025, Accepted)
 
-When `SOVEREIGN_MEMORY_MODE=tools`, the full 4-layer context build does NOT run.
+When `AUDITTRACE_MEMORY_MODE=tools`, the full 4-layer context build does NOT run.
 Instead, `build_ambient_context()` produces a lightweight system message (~280 words)
 containing:
 

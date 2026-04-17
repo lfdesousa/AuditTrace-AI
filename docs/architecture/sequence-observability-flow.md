@@ -23,13 +23,13 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Prom as Prometheus
-    participant Traefik as Traefik (:8080)
+    participant Istio Gateway as Istio Gateway (:8080)
     participant Llama as llama-server (:11435)
     participant MinIO as MinIO (:9000)
 
     loop Every 15s
-        Prom->>Traefik: GET /metrics
-        Traefik-->>Prom: request rate, latency, status codes
+        Prom->>Istio Gateway: GET /metrics
+        Istio Gateway-->>Prom: request rate, latency, status codes
 
         Prom->>Llama: GET /metrics
         Llama-->>Prom: tokens/sec, prompt eval, KV cache
@@ -47,7 +47,7 @@ sequenceDiagram
     participant Promtail as Promtail
     participant Loki as Loki
 
-    Promtail->>Containers: Docker socket (/var/run/docker.sock)<br/>discover containers on sovereign-ai-net
+    Promtail->>Containers: Docker socket (/var/run/docker.sock)<br/>discover containers on audittrace-net
 
     loop Continuous
         Containers-->>Promtail: stdout/stderr log lines
@@ -101,7 +101,7 @@ memory-server
   ├── Langfuse SDK ──► Langfuse (traces) [ADR-021.2]
   └── stdout ──► Promtail ──► Loki (logs)
 
-Prometheus ◄── scrape ── Traefik, llama-server, MinIO
+Prometheus ◄── scrape ── Istio Gateway, llama-server, MinIO
 
 Grafana
   ├── PromQL ──► Prometheus
