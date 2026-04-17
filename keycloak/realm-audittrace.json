@@ -1,39 +1,39 @@
 {
-  "realm": "sovereign-ai",
+  "realm": "audittrace",
   "enabled": true,
   "sslRequired": "none",
   "registrationAllowed": false,
   "clientScopes": [
     {
-      "name": "sovereign-ai:query",
+      "name": "audittrace:query",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
       }
     },
     {
-      "name": "sovereign-ai:context",
+      "name": "audittrace:context",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
       }
     },
     {
-      "name": "sovereign-ai:audit",
+      "name": "audittrace:audit",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
       }
     },
     {
-      "name": "sovereign-ai:index",
+      "name": "audittrace:index",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
       }
     },
     {
-      "name": "sovereign-ai:admin",
+      "name": "audittrace:admin",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true"
@@ -77,7 +77,7 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:query"
+        "audittrace:query"
       ],
       "optionalClientScopes": []
     },
@@ -89,8 +89,8 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:query",
-        "sovereign-ai:context"
+        "audittrace:query",
+        "audittrace:context"
       ],
       "optionalClientScopes": []
     },
@@ -102,7 +102,7 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:query"
+        "audittrace:query"
       ],
       "optionalClientScopes": []
     },
@@ -114,8 +114,8 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:context",
-        "sovereign-ai:index"
+        "audittrace:context",
+        "audittrace:index"
       ],
       "optionalClientScopes": []
     },
@@ -127,14 +127,14 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:admin",
-        "sovereign-ai:audit"
+        "audittrace:admin",
+        "audittrace:audit"
       ],
       "optionalClientScopes": []
     },
     {
-      "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=sovereign-memory-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",
-      "clientId": "sovereign-memory-dev",
+      "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=audittrace-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",
+      "clientId": "audittrace-dev",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
       "serviceAccountsEnabled": true,
@@ -143,10 +143,10 @@
       "publicClient": false,
       "protocol": "openid-connect",
       "defaultClientScopes": [
-        "sovereign-ai:query",
-        "sovereign-ai:context",
-        "sovereign-ai:audit",
-        "sovereign-ai:index",
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "audittrace:index",
         "memory:episodic:read",
         "memory:procedural:read",
         "memory:conversational:read-own",
@@ -155,11 +155,11 @@
       "optionalClientScopes": [],
       "protocolMappers": [
         {
-          "name": "aud-sovereign-memory-server",
+          "name": "aud-audittrace-server",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "config": {
-            "included.custom.audience": "sovereign-memory-server",
+            "included.custom.audience": "audittrace-server",
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
@@ -187,9 +187,9 @@
         "oauth2.device.polling.interval": "5"
       },
       "defaultClientScopes": [
-        "sovereign-ai:query",
-        "sovereign-ai:context",
-        "sovereign-ai:audit",
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
         "memory:episodic:read",
         "memory:procedural:read",
         "memory:conversational:read-own",
@@ -198,11 +198,11 @@
       "optionalClientScopes": [],
       "protocolMappers": [
         {
-          "name": "aud-sovereign-memory-server",
+          "name": "aud-audittrace-server",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "config": {
-            "included.custom.audience": "sovereign-memory-server",
+            "included.custom.audience": "audittrace-server",
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
@@ -226,7 +226,7 @@
         }
       ],
       "realmRoles": [
-        "default-roles-sovereign-ai"
+        "default-roles-audittrace"
       ]
     }
   ],

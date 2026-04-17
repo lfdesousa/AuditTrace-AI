@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Create Docker network
-        run: docker network create sovereign-ai-net
+        run: docker network create audittrace-net
 
       - name: Generate test secrets
         run: |
@@ -41,16 +41,16 @@ jobs:
       - name: Create .env
         run: |
           cat > .env <<'EOF'
-          SOVEREIGN_POSTGRES_PASSWORD=test-postgres-password
-          SOVEREIGN_CHROMA_TOKEN=test-chroma-token
-          SOVEREIGN_REDIS_PASSWORD=test-redis-password
-          SOVEREIGN_MINIO_SECRET_KEY=test-minio-secret-key-32chars!!
-          SOVEREIGN_MINIO_ACCESS_KEY=minioadmin
-          SOVEREIGN_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LWV4YWN0bHktMzItYnl0ZXMhISE=
-          SOVEREIGN_AUTH_ENABLED=false
-          SOVEREIGN_AUTH_REQUIRED=false
-          SOVEREIGN_LOG_LEVEL=INFO
-          SOVEREIGN_LANGFUSE_ENABLED=false
+          AUDITTRACE_POSTGRES_PASSWORD=test-postgres-password
+          AUDITTRACE_CHROMA_TOKEN=test-chroma-token
+          AUDITTRACE_REDIS_PASSWORD=test-redis-password
+          AUDITTRACE_MINIO_SECRET_KEY=test-minio-secret-key-32chars!!
+          AUDITTRACE_MINIO_ACCESS_KEY=minioadmin
+          AUDITTRACE_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LWV4YWN0bHktMzItYnl0ZXMhISE=
+          AUDITTRACE_AUTH_ENABLED=false
+          AUDITTRACE_AUTH_REQUIRED=false
+          AUDITTRACE_LOG_LEVEL=INFO
+          AUDITTRACE_LANGFUSE_ENABLED=false
           KEYCLOAK_ADMIN_PASSWORD=admin
           EOF
           # Remove leading whitespace from heredoc (YAML indentation artifact)
@@ -59,9 +59,9 @@ jobs:
       - name: Build and start stack
         run: docker compose up -d --build
         env:
-          SOVEREIGN_POSTGRES_PASSWORD: test-postgres-password
-          SOVEREIGN_CHROMA_TOKEN: test-chroma-token
-          SOVEREIGN_REDIS_PASSWORD: test-redis-password
+          AUDITTRACE_POSTGRES_PASSWORD: test-postgres-password
+          AUDITTRACE_CHROMA_TOKEN: test-chroma-token
+          AUDITTRACE_REDIS_PASSWORD: test-redis-password
 
       - name: Show container status
         if: always()
@@ -91,7 +91,7 @@ jobs:
 
       - name: Health check — ChromaDB (via Docker network)
         run: |
-          docker exec sovereign-memory-server bash -c \
+          docker exec audittrace-server bash -c \
             'exec 3<>/dev/tcp/chromadb/8000 && echo -e "GET /api/v2/heartbeat HTTP/1.1\r\nHost: chromadb\r\nConnection: close\r\n\r\n" >&3 && grep -q 200 <&3'
           echo "ChromaDB healthy"
 
