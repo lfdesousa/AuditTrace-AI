@@ -17,6 +17,8 @@ spec:
         {{- include "audittrace.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: memory-server
         sidecar.istio.io/inject: "true"
+      annotations:
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
     spec:
       {{- if .Values.memoryServer.serviceAccount.create }}
       serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}

@@ -56,7 +56,9 @@ class HTTPChromaDBFactory(ChromaDBFactory):
         host, _, port = url.partition(":")
         kwargs: dict[str, Any] = {"host": host, "port": int(port or 8000)}
         if self.token:
-            kwargs["headers"] = {"Authorization": f"Bearer {self.token}"}
+            # ChromaDB 1.x TokenAuthenticationServerProvider expects
+            # X-Chroma-Token header, not Authorization: Bearer.
+            kwargs["headers"] = {"X-Chroma-Token": self.token}
         return chromadb.HttpClient(**kwargs)  # type: ignore[return-value]
 
 

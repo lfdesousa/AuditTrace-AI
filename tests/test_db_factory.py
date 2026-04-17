@@ -137,7 +137,7 @@ def test_http_factory_attaches_token_when_set(monkeypatch):
     monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
     f = HTTPChromaDBFactory(url="http://chroma:8000", token="secret-token")
     f.get_client()
-    assert captured["headers"] == {"Authorization": "Bearer secret-token"}
+    assert captured["headers"] == {"X-Chroma-Token": "secret-token"}
 
 
 # ── MockCollection where-filter branches ─────────────────────────────────────

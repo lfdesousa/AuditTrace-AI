@@ -18,6 +18,7 @@ spec:
       labels:
         app.kubernetes.io/name: chromadb
         app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: chromadb
         sidecar.istio.io/inject: "true"
     spec:
       containers:
