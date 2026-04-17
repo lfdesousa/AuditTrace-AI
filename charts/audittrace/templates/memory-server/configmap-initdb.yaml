@@ -14,9 +14,15 @@ data:
     # DESIGN §16 Phase 4 — create a non-superuser application role.
     set -euo pipefail
 
-    POSTGRES_USER="${POSTGRES_USER:-audittrace}"
+    # Bitnami creates the POSTGRES_USER as a regular (non-super) user.
+    # Init scripts that CREATE ROLE must run as the postgres superuser.
+    POSTGRES_USER="postgres"
     POSTGRES_DB="${POSTGRES_DB:-audittrace}"
     APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+
+    # Bitnami postgres uses md5 auth even for local connections during init.
+    # Use the postgres superuser password (POSTGRES_POSTGRES_PASSWORD in Bitnami).
+    export PGPASSWORD="${POSTGRES_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:-}}"
 
     if [[ -z "${APP_PASSWORD}" ]]; then
         echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2

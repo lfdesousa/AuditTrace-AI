@@ -1,25 +1,2 @@
-{{- if .Values.istio.enabled }}
-apiVersion: networking.istio.io/v1beta1
-kind: ServiceEntry
-metadata:
-  name: {{ .Release.Name }}-external-llm
-  labels:
-    {{- include "audittrace.labels" . | nindent 4 }}
-spec:
-  hosts:
-    - llm-external.{{ .Release.Namespace }}.svc.cluster.local
-  location: MESH_EXTERNAL
-  ports:
-    - number: {{ .Values.externalLLM.chat.port }}
-      name: http-chat
-      protocol: HTTP
-    - number: {{ .Values.externalLLM.embed.port }}
-      name: http-embed
-      protocol: HTTP
-    - number: {{ .Values.externalLLM.summarizer.port }}
-      name: http-summarizer
-      protocol: HTTP
-  resolution: STATIC
-  endpoints:
-    - address: {{ .Values.externalLLM.hostIP }}
-{{- end }}
+{{- /* ServiceEntry not needed — headless Services + Endpoints handle DNS resolution */ -}}
+{{- /* Kept as placeholder for future cloud deployments where ExternalName is used */ -}}

@@ -7,9 +7,7 @@ metadata:
     {{- include "audittrace.labels" . | nindent 4 }}
 spec:
   hosts:
-    {{- range .Values.istio.gateway.hosts }}
-    - {{ . | quote }}
-    {{- end }}
+    - "*"
   gateways:
     - {{ .Values.istio.gateway.name }}
   http:
@@ -18,7 +16,7 @@ spec:
             prefix: /realms
       route:
         - destination:
-            host: {{ .Release.Name }}-keycloak
+            host: {{ .Release.Name }}-keycloak.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: 8080
     - match:
@@ -26,7 +24,7 @@ spec:
             prefix: /admin
       route:
         - destination:
-            host: {{ .Release.Name }}-keycloak
+            host: {{ .Release.Name }}-keycloak.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: 8080
 {{- end }}

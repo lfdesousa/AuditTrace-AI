@@ -7,20 +7,15 @@ metadata:
     {{- include "audittrace.labels" . | nindent 4 }}
 spec:
   hosts:
-    {{- range .Values.istio.gateway.hosts }}
-    - {{ . | quote }}
-    {{- end }}
+    - "*"
   gateways:
     - {{ .Values.istio.gateway.name }}
   http:
-    # Route everything except /realms/* and /admin/* to memory-server.
-    # Keycloak paths are handled by virtualservice-keycloak.
-    - match:
-        - uri:
-            regex: "^/(?!realms|admin).*"
-      route:
+    # Catch-all route — Keycloak VirtualService has higher-priority
+    # prefix matches for /realms and /admin, so this handles everything else.
+    - route:
         - destination:
-            host: {{ .Release.Name }}-memory-server
+            host: {{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: {{ .Values.memoryServer.port }}
 {{- end }}

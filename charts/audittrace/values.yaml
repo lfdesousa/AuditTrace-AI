@@ -5,7 +5,7 @@
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
-  hostNodeIP: "192.168.1.100"
+  hostNodeIP: "192.168.1.231"
 
 # -- Memory Server (our app) -------------------------------------------------
 memoryServer:
@@ -147,6 +147,9 @@ redis:
 
 minio:
   enabled: true
+  image:
+    repository: minio/minio
+    tag: latest
   auth:
     rootUser: minioadmin
     rootPassword: ""
@@ -154,27 +157,27 @@ minio:
     size: 20Gi
     storageClass: local-path
   defaultBuckets: "memory-shared,memory-private"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
 
 keycloak:
   enabled: true
-  auth:
-    adminUser: admin
-    adminPassword: ""
-  postgresql:
-    enabled: false
-  externalDatabase:
-    host: ""
-    port: 5432
-    user: audittrace
-    password: ""
-    database: keycloak
-  proxy: edge
-  httpRelativePath: /
-  extraEnvVars:
-    - name: KC_HOSTNAME_URL
-      value: "https://audittrace.local"
-    - name: KC_HOSTNAME_ADMIN_URL
-      value: "https://audittrace.local"
+  image:
+    repository: quay.io/keycloak/keycloak
+    tag: "24.0"
+  hostnameUrl: "https://audittrace.local"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
 
 chromadb:
   enabled: true

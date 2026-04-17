@@ -8,14 +8,14 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/component: postgresql
+      app.kubernetes.io/name: postgresql
   action: ALLOW
   rules:
     - from:
         - source:
             principals:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
-              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-keycloak"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
       to:
         - operation:
             ports: ["5432"]

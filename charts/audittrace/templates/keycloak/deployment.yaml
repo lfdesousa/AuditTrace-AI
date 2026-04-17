@@ -1,0 +1,87 @@
+{{- if .Values.keycloak.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-keycloak
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: keycloak
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: keycloak
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: keycloak
+          image: "{{ .Values.keycloak.image.repository }}:{{ .Values.keycloak.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/keycloak/bin/kc.sh
+          args:
+            - start-dev
+            - --import-realm
+            - --health-enabled=true
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: "jdbc:postgresql://{{ .Release.Name }}-postgresql:5432/keycloak"
+            - name: KC_DB_USERNAME
+              value: {{ .Values.postgresql.auth.username | quote }}
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-postgresql
+                  key: password
+            - name: KEYCLOAK_ADMIN
+              value: "admin"
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-keycloak-secret
+                  key: admin-password
+            - name: KC_HOSTNAME_URL
+              value: {{ .Values.keycloak.hostnameUrl | quote }}
+            - name: KC_HOSTNAME_ADMIN_URL
+              value: {{ .Values.keycloak.hostnameUrl | quote }}
+            - name: KC_PROXY
+              value: edge
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 10
+          resources:
+            {{- toYaml .Values.keycloak.resources | nindent 12 }}
+          volumeMounts:
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import/realm.json
+              subPath: realm.json
+              readOnly: true
+      volumes:
+        - name: realm-import
+          configMap:
+            name: {{ .Release.Name }}-keycloak-realm
+{{- end }}

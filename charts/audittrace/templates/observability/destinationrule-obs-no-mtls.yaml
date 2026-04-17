@@ -1,12 +1,11 @@
-{{- if .Values.istio.enabled }}
+{{- if and .Values.istio.enabled .Values.observability.otelCollector.enabled }}
+---
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
 metadata:
-  name: {{ .Release.Name }}-obs-no-mtls
-  labels:
-    {{- include "audittrace.labels" . | nindent 4 }}
+  name: {{ .Release.Name }}-langfuse-no-mtls
 spec:
-  host: observability-external.{{ .Release.Namespace }}.svc.cluster.local
+  host: {{ .Release.Name }}-langfuse.{{ .Release.Namespace }}.svc.cluster.local
   trafficPolicy:
     tls:
       mode: DISABLE
