@@ -1,0 +1,13 @@
+{{- if .Values.istio.enabled }}
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: {{ .Release.Name }}-obs-no-mtls
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  host: observability-external.{{ .Release.Namespace }}.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+{{- end }}

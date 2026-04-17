@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-memory-server
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: memory-server
+spec:
+  replicas: {{ .Values.memoryServer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: memory-server
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: memory-server
+        sidecar.istio.io/inject: "true"
+    spec:
+      {{- if .Values.memoryServer.serviceAccount.create }}
+      serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}
+      {{- end }}
+      containers:
+        - name: memory-server
+          image: "{{ .Values.memoryServer.image.repository }}:{{ .Values.memoryServer.image.tag }}"
+          imagePullPolicy: {{ .Values.memoryServer.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.memoryServer.port }}
+              protocol: TCP
+          env:
+            # ── Plain config from values ──────────────────────────────
+            {{- range $key, $value := .Values.memoryServer.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            # ── Computed service URLs ─────────────────────────────────
+            - name: AUDITTRACE_POSTGRES_URL
+              value: {{ include "audittrace.postgresAppUrl" . | quote }}
+            - name: AUDITTRACE_SUMMARIZER_POSTGRES_URL
+              value: {{ include "audittrace.postgresOwnerUrl" . | quote }}
+            - name: AUDITTRACE_CHROMA_URL
+              value: "http://{{ .Release.Name }}-chromadb:8000"
+            - name: AUDITTRACE_REDIS_URL
+              value: "redis://{{ .Release.Name }}-redis-master:6379/0"
+            - name: AUDITTRACE_MINIO_URL
+              value: "http://{{ .Release.Name }}-minio:9000"
+            - name: AUDITTRACE_KEYCLOAK_ISSUER
+              value: {{ include "audittrace.keycloakIssuer" . | quote }}
+            - name: AUDITTRACE_KEYCLOAK_JWKS_URL
+              value: {{ include "audittrace.keycloakJwksUrl" . | quote }}
+            - name: AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS
+              value: '["https://{{ index .Values.istio.gateway.hosts 0 }}/realms/audittrace"]'
+            - name: AUDITTRACE_JWT_AUDIENCE
+              value: "audittrace-server"
+            - name: AUDITTRACE_LLAMA_URL
+              value: "http://{{ .Release.Name }}-llm-chat:{{ .Values.externalLLM.chat.port }}/v1"
+            - name: AUDITTRACE_EMBED_URL
+              value: "http://{{ .Release.Name }}-llm-embed:{{ .Values.externalLLM.embed.port }}/v1"
+            - name: AUDITTRACE_SUMMARIZER_URL
+              value: "http://{{ .Release.Name }}-llm-summarizer:{{ .Values.externalLLM.summarizer.port }}/v1"
+            - name: AUDITTRACE_OTLP_ENDPOINT
+              value: "http://{{ .Release.Name }}-otel-collector:4318"
+            # ── Secret-sourced ────────────────────────────────────────
+            - name: AUDITTRACE_CHROMA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-chromadb-secret
+                  key: token
+            - name: AUDITTRACE_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-redis
+                  key: redis-password
+            - name: AUDITTRACE_MINIO_ACCESS_KEY
+              value: "minioadmin"
+            - name: AUDITTRACE_MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio
+                  key: root-password
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.memoryServer.resources | nindent 12 }}

@@ -1,0 +1,36 @@
+{{- if .Values.observability.otelCollector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-otel-collector-config
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    processors:
+      batch:
+        timeout: 5s
+
+    exporters:
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+      otlphttp/traces:
+        endpoint: "http://{{ .Release.Name }}-langfuse:{{ .Values.observability.external.langfusePort }}"
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlphttp/traces]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheus]
+{{- end }}

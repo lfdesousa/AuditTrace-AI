@@ -1,0 +1,26 @@
+{{- if .Values.istio.enabled }}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ .Release.Name }}-memory
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  hosts:
+    {{- range .Values.istio.gateway.hosts }}
+    - {{ . | quote }}
+    {{- end }}
+  gateways:
+    - {{ .Values.istio.gateway.name }}
+  http:
+    # Route everything except /realms/* and /admin/* to memory-server.
+    # Keycloak paths are handled by virtualservice-keycloak.
+    - match:
+        - uri:
+            regex: "^/(?!realms|admin).*"
+      route:
+        - destination:
+            host: {{ .Release.Name }}-memory-server
+            port:
+              number: {{ .Values.memoryServer.port }}
+{{- end }}

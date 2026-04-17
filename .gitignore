@@ -38,8 +38,8 @@ env/
 .env.local
 .env.*.local
 
-# Secrets
-secrets/
+# Secrets (root-level only — charts/*/templates/secrets/ are Helm templates, not actual secrets)
+/secrets/
 *.pem
 *.key
 

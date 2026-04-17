@@ -1,0 +1,32 @@
+{{- if .Values.istio.enabled }}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ .Release.Name }}-keycloak
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  hosts:
+    {{- range .Values.istio.gateway.hosts }}
+    - {{ . | quote }}
+    {{- end }}
+  gateways:
+    - {{ .Values.istio.gateway.name }}
+  http:
+    - match:
+        - uri:
+            prefix: /realms
+      route:
+        - destination:
+            host: {{ .Release.Name }}-keycloak
+            port:
+              number: 8080
+    - match:
+        - uri:
+            prefix: /admin
+      route:
+        - destination:
+            host: {{ .Release.Name }}-keycloak
+            port:
+              number: 8080
+{{- end }}

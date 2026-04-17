@@ -1,0 +1,236 @@
+{
+  "realm": "audittrace",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "clientScopes": [
+    {
+      "name": "audittrace:query",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:context",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:audit",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:index",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:admin",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:episodic:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:procedural:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:conversational:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:semantic:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "opencode-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:query"
+      ],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "continue-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context"
+      ],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "roocode-agent",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:query"
+      ],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "inject-memory",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:context",
+        "audittrace:index"
+      ],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "admin-client",
+      "enabled": true,
+      "clientAuthenticatorType": "client-jwt",
+      "serviceAccountsEnabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:admin",
+        "audittrace:audit"
+      ],
+      "optionalClientScopes": []
+    },
+    {
+      "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=audittrace-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",
+      "clientId": "audittrace-dev",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "audittrace:index",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Human-facing public client for OpenCode / Continue / Roo Code. Uses OAuth2 Device Authorization Grant (RFC 8628) so browser-less agents can authenticate as a real Keycloak user without handling passwords or client secrets. ADR-032.",
+      "clientId": "audittrace-opencode",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "urn:ietf:wg:oauth:2.0:oob",
+        "http://localhost:*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "luis",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Luis Filipe",
+      "lastName": "de Sousa",
+      "email": "lde.sousa@gmail.com",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "change-me-on-first-login",
+          "temporary": true
+        }
+      ],
+      "realmRoles": [
+        "default-roles-audittrace"
+      ]
+    }
+  ],
+  "accessTokenLifespan": 86400,
+  "ssoSessionMaxLifespan": 2592000,
+  "offlineSessionIdleTimeout": 2592000
+}
