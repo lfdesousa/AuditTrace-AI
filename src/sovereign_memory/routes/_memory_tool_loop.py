@@ -197,7 +197,11 @@ async def run_memory_tool_loop(
 
     for iteration in range(max_iterations):
         proxy_payload["messages"] = messages
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
+            )
+        ) as client:
             response = await client.post(llama_url, json=proxy_payload)
         last_body = response.json()
 
