@@ -297,7 +297,7 @@ The `sovereign-memory-dev` client is the legacy path. Still the right choice for
 | ✅ Done | **Package Rename** | `sovereign_memory` → `audittrace`, `SOVEREIGN_*` → `AUDITTRACE_*`, all containers/DB/realm/scopes aligned (ADR-035). |
 | ✅ Done | **N=100 Eval Sweep** | Full 100 probes × 2 modes with 30-min client timeout. Validates Qwen 3.6 + ADR-034 per-chunk idle timeout. |
 | 🔴 Next | **Kubernetes + Istio ZTA** | k3s + Istio mTLS + SPIFFE/SVID workload identity. Helm chart + Kustomize overlays. The v1.0 destination. |
-| 🟡 Planned | **ADR-031 Per-Request Memory-Mode Routing** | `X-Memory-Mode: tools\|inject\|auto` header. Gated on N=100 eval results. |
+| ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |
 | 🟡 Planned | **Async Persistence** | Non-blocking audit row writes. k8s prerequisite. |
 | 🟡 Planned | **External IdP** | Keycloak brokering to Google/Okta/EntraID for multi-user SSO. |
 
