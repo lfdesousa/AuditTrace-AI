@@ -62,7 +62,7 @@ POSTGRES_CONTAINER = "sovereign-postgres"
 POSTGRES_DB = "sovereign_ai"
 POSTGRES_USER = "sovereign"
 
-REQUEST_TIMEOUT_S = 180
+REQUEST_TIMEOUT_S = 1800  # 30 min — allows long <think> reasoning (ADR-034)
 HEALTH_POLL_TIMEOUT_S = 120
 HEALTH_POLL_INTERVAL_S = 2
 CHECKPOINT_EVERY = 10
@@ -1019,6 +1019,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=REQUEST_TIMEOUT_S,
+        help=f"Per-request client timeout in seconds (default: {REQUEST_TIMEOUT_S}).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python log level (default: INFO).",
@@ -1032,6 +1038,9 @@ def main() -> int:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    global REQUEST_TIMEOUT_S  # noqa: PLW0603
+    REQUEST_TIMEOUT_S = args.timeout
 
     if shutil.which("docker") is None:
         logger.error("docker binary not found on PATH")
