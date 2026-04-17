@@ -27,8 +27,8 @@ from pathlib import Path
 
 import pytest
 
-from sovereign_memory.identity import sentinel_user_context
-from sovereign_memory.tools import (
+from audittrace.identity import sentinel_user_context
+from audittrace.tools import (
     MEMORY_TOOL_REGISTRY,
     MemoryTool,
     load_config_overrides,
@@ -326,7 +326,7 @@ description = "ghost"
 """
         )
         warnings: list[str] = []
-        from sovereign_memory import tools as tools_mod
+        from audittrace import tools as tools_mod
 
         def _capture(msg, *args, **kwargs):
             try:
@@ -368,7 +368,7 @@ class TestLookup:
         async def h(user_context, args):
             return {"ok": True}
 
-        from sovereign_memory.tools import get_tool_by_name
+        from audittrace.tools import get_tool_by_name
 
         tool = get_tool_by_name("recall_decisions")
         assert tool is not None
@@ -396,7 +396,7 @@ name = "recall_past_decisions"
         )
         load_config_overrides(cfg)
 
-        from sovereign_memory.tools import get_tool_by_name
+        from audittrace.tools import get_tool_by_name
 
         tool = get_tool_by_name("recall_past_decisions")
         assert tool is not None
@@ -427,6 +427,6 @@ enabled = false
         )
         load_config_overrides(cfg)
 
-        from sovereign_memory.tools import get_tool_by_name
+        from audittrace.tools import get_tool_by_name
 
         assert get_tool_by_name("recall_decisions") is None

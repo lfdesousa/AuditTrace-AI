@@ -1,6 +1,6 @@
 """Unit tests for the Phase 4 RLS plumbing (DESIGN §16 Phase 4).
 
-This file covers the ``sovereign_memory.db.rls`` module — the ContextVar
+This file covers the ``audittrace.db.rls`` module — the ContextVar
 that carries ``app.current_user_id`` through a request and the SQLAlchemy
 ``after_begin`` event listener that emits ``SET LOCAL`` (via
 ``set_config``) at the start of every Postgres transaction.
@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sovereign_memory.db.rls import (
+from audittrace.db.rls import (
     _apply_rls_guc,
     current_user_id,
     install_rls_listener,
@@ -141,7 +141,7 @@ class TestListenerSetConfig:
         string: the listener emits set_config with the sentinel value.
         The RLS policy then matches rows whose user_id equals the
         sentinel, which is exactly what Phase 2 rows are tagged with."""
-        from sovereign_memory.identity import SENTINEL_SUBJECT
+        from audittrace.identity import SENTINEL_SUBJECT
 
         set_current_user_id(SENTINEL_SUBJECT)
         try:
@@ -191,13 +191,13 @@ class TestRequireUserPopulatesContextVar:
         the sentinel sub."""
         from fastapi import Request
 
-        from sovereign_memory.auth import require_user
-        from sovereign_memory.config import get_settings
-        from sovereign_memory.identity import SENTINEL_SUBJECT
+        from audittrace.auth import require_user
+        from audittrace.config import get_settings
+        from audittrace.identity import SENTINEL_SUBJECT
 
         # Make sure settings load with auth_required=false.
         get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_AUTH_REQUIRED", "false")
+        monkeypatch.setenv("AUDITTRACE_AUTH_REQUIRED", "false")
 
         # Fresh ContextVar
         set_current_user_id(None)

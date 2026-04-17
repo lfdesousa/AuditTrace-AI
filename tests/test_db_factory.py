@@ -4,7 +4,7 @@ ADR-020: SQLiteChromaDBFactory removed. ChromaDB is server-mode only.
 HTTPChromaDBFactory now supports token-based authentication.
 """
 
-from sovereign_memory.db.factory import (
+from audittrace.db.factory import (
     HTTPChromaDBFactory,
     MemoryChromaDBFactory,
     MockChromaDBFactory,
@@ -91,7 +91,7 @@ def test_factory_call_tracking():
 
 def test_http_factory_parses_url_with_scheme(monkeypatch):
     """HTTPChromaDBFactory.get_client must strip the scheme and split host:port."""
-    from sovereign_memory.db import factory as factory_mod
+    from audittrace.db import factory as factory_mod
 
     captured: dict = {}
 
@@ -109,7 +109,7 @@ def test_http_factory_parses_url_with_scheme(monkeypatch):
 
 def test_http_factory_parses_url_without_scheme(monkeypatch):
     """Bare host:port form is also accepted."""
-    from sovereign_memory.db import factory as factory_mod
+    from audittrace.db import factory as factory_mod
 
     captured: dict = {}
 
@@ -126,7 +126,7 @@ def test_http_factory_parses_url_without_scheme(monkeypatch):
 
 def test_http_factory_attaches_token_when_set(monkeypatch):
     """Bearer token must land in the Authorization header."""
-    from sovereign_memory.db import factory as factory_mod
+    from audittrace.db import factory as factory_mod
 
     captured: dict = {}
 

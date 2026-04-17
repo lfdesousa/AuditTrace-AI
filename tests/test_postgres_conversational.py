@@ -15,10 +15,10 @@ from dataclasses import replace
 import pytest
 from sqlalchemy.orm import Session
 
-from sovereign_memory.db.models import InteractionRecord, SessionRecord
-from sovereign_memory.db.postgres import InMemoryPostgresFactory
-from sovereign_memory.identity import SENTINEL_SUBJECT
-from sovereign_memory.services.conversational import (
+from audittrace.db.models import InteractionRecord, SessionRecord
+from audittrace.db.postgres import InMemoryPostgresFactory
+from audittrace.identity import SENTINEL_SUBJECT
+from audittrace.services.conversational import (
     ConversationalService,
     PostgresConversationalService,
 )
@@ -57,7 +57,7 @@ def seeded_factory(pg_factory, pg_session):
             id="20260409_230504",
             project="AuditTrace",
             date="2026-04-09T23:05:04",
-            summary="Phase 0 complete: sovereign-memory-server with Factory pattern",
+            summary="Phase 0 complete: audittrace-server with Factory pattern",
             key_points=json.dumps(["DI container", "90%+ test coverage"]),
             model="Qwen3.5-35B-A3B",
             user_id=SENTINEL_SUBJECT,

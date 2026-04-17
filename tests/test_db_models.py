@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
-from sovereign_memory.db.models import (
+from audittrace.db.models import (
     Base,
     InteractionRecord,
     SessionRecord,
@@ -79,7 +79,7 @@ class TestSessionRecordCRUD:
             date="2026-04-10T12:00:00",
             summary="Test session",
             key_points=json.dumps(["point1", "point2"]),
-            model="sovereign-memory",
+            model="audittrace",
         )
         db_session.add(record)
         db_session.flush()
@@ -97,7 +97,7 @@ class TestSessionRecordCRUD:
             date="2026-04-10T13:00:00",
             summary="JSON test",
             key_points=json.dumps(points),
-            model="sovereign-memory",
+            model="audittrace",
         )
         db_session.add(record)
         db_session.flush()
@@ -114,7 +114,7 @@ class TestSessionRecordCRUD:
                     date=f"2026-04-10T{10 + i}:00:00",
                     summary=f"Summary {i}",
                     key_points="[]",
-                    model="sovereign-memory",
+                    model="audittrace",
                 )
             )
         db_session.flush()

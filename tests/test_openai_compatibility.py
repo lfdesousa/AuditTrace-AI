@@ -175,14 +175,14 @@ class TestErrorBodyOpenAIShape:
         ADR-033 envelope, which MUST include the four OpenAI keys."""
         from fastapi.testclient import TestClient
 
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
 
         config_mod.get_settings.cache_clear()
         fake = _FakeAsyncClient(post_exc=RuntimeError("boom"))
         # Flip to tools mode so RuntimeError escapes to global handler.
         import os
 
-        os.environ["SOVEREIGN_MEMORY_MODE"] = "tools"
+        os.environ["AUDITTRACE_MEMORY_MODE"] = "tools"
         try:
             config_mod.get_settings.cache_clear()
             with TestClient(app, raise_server_exceptions=False) as client:
@@ -196,7 +196,7 @@ class TestErrorBodyOpenAIShape:
                         },
                     )
         finally:
-            os.environ.pop("SOVEREIGN_MEMORY_MODE", None)
+            os.environ.pop("AUDITTRACE_MEMORY_MODE", None)
             config_mod.get_settings.cache_clear()
 
         assert response.status_code == 500

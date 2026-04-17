@@ -18,9 +18,9 @@ covered for good rows too).
 import httpx
 import pytest
 
-from sovereign_memory.db.models import InteractionRecord
-from sovereign_memory.dependencies import get_postgres_factory
-from sovereign_memory.identity import SENTINEL_SUBJECT
+from audittrace.db.models import InteractionRecord
+from audittrace.dependencies import get_postgres_factory
+from audittrace.identity import SENTINEL_SUBJECT
 from tests.test_chat_proxy import (
     _FakeAsyncClient,
     _ok_chat_response,
@@ -225,10 +225,10 @@ class TestToolsModeFailureAudit:
     both ``_persist_interaction`` and ``_flush_pending_tool_calls``."""
 
     def _flip_to_tools_mode(self, monkeypatch):
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
 
         config_mod.get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
         yield
         config_mod.get_settings.cache_clear()
 
@@ -362,11 +362,11 @@ class TestSuccessCaseDurationPersisted:
         assert row.duration_ms is not None
 
     def test_tools_mode_success_populates_duration_ms(self, client, monkeypatch):
-        from sovereign_memory import config as config_mod
+        from audittrace import config as config_mod
         from tests.test_chat_proxy import _SequencedClient
 
         config_mod.get_settings.cache_clear()
-        monkeypatch.setenv("SOVEREIGN_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
         try:
             fake = _SequencedClient([_tools_mode_response_text("done")])
             with _patch_tool_loop_client(fake), _patch_async_client(fake):

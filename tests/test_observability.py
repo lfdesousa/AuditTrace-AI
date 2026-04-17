@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sovereign_memory import telemetry
-from sovereign_memory.logging_config import log_call, setup_logging
+from audittrace import telemetry
+from audittrace.logging_config import log_call, setup_logging
 
 
 def test_set_current_span_attributes_mirrors_langfuse_keys(monkeypatch):
@@ -51,12 +51,12 @@ def test_set_current_span_attributes_mirrors_langfuse_keys(monkeypatch):
 
 def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
     """_init_langfuse_client should construct a Langfuse SDK instance when
-    SOVEREIGN_LANGFUSE_ENABLED + keys + host are all present."""
+    AUDITTRACE_LANGFUSE_ENABLED + keys + host are all present."""
     monkeypatch.setattr(telemetry, "_langfuse_client", None)
-    monkeypatch.setenv("SOVEREIGN_LANGFUSE_ENABLED", "true")
-    monkeypatch.setenv("SOVEREIGN_LANGFUSE_PUBLIC_KEY", "pk-test")
-    monkeypatch.setenv("SOVEREIGN_LANGFUSE_SECRET_KEY", "sk-test")
-    monkeypatch.setenv("SOVEREIGN_LANGFUSE_HOST", "http://lf.test")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
 
     fake_lf_class = MagicMock()
     fake_instance = MagicMock()
@@ -95,9 +95,9 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
 
 
 def test_init_langfuse_client_skips_when_disabled(monkeypatch):
-    """No SDK when SOVEREIGN_LANGFUSE_ENABLED is unset/false."""
+    """No SDK when AUDITTRACE_LANGFUSE_ENABLED is unset/false."""
     monkeypatch.setattr(telemetry, "_langfuse_client", None)
-    monkeypatch.delenv("SOVEREIGN_LANGFUSE_ENABLED", raising=False)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_ENABLED", raising=False)
     telemetry._init_langfuse_client()
     assert telemetry._langfuse_client is None
 
@@ -105,10 +105,10 @@ def test_init_langfuse_client_skips_when_disabled(monkeypatch):
 def test_init_langfuse_client_skips_when_keys_missing(monkeypatch):
     """SDK is skipped (with INFO log) when env flag is true but keys absent."""
     monkeypatch.setattr(telemetry, "_langfuse_client", None)
-    monkeypatch.setenv("SOVEREIGN_LANGFUSE_ENABLED", "true")
-    monkeypatch.delenv("SOVEREIGN_LANGFUSE_PUBLIC_KEY", raising=False)
-    monkeypatch.delenv("SOVEREIGN_LANGFUSE_SECRET_KEY", raising=False)
-    monkeypatch.delenv("SOVEREIGN_LANGFUSE_HOST", raising=False)
+    monkeypatch.setenv("AUDITTRACE_LANGFUSE_ENABLED", "true")
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_HOST", raising=False)
     telemetry._init_langfuse_client()
     assert telemetry._langfuse_client is None
 
@@ -118,7 +118,7 @@ def test_init_telemetry_wires_otlp_exporters_when_endpoint_set(monkeypatch):
     OTLP span and metric exporters and attach them to the providers."""
     telemetry._reset_for_tests()
     monkeypatch.setattr(telemetry, "_langfuse_client", None)
-    monkeypatch.delenv("SOVEREIGN_LANGFUSE_ENABLED", raising=False)
+    monkeypatch.delenv("AUDITTRACE_LANGFUSE_ENABLED", raising=False)
 
     span_exporter_mock = MagicMock()
     metric_exporter_mock = MagicMock()
@@ -157,7 +157,7 @@ def test_init_telemetry_wires_otlp_exporters_when_endpoint_set(monkeypatch):
         telemetry._reset_for_tests()
         # Restore the no-op state used by the rest of the suite
         telemetry.init_telemetry(
-            service_name="sovereign-memory-server-tests",
+            service_name="audittrace-server-tests",
             otlp_endpoint="",
             tracing_enabled=True,
             metrics_enabled=True,
@@ -189,7 +189,7 @@ def test_set_current_span_attributes_no_op_when_uninitialised(monkeypatch):
         # Restore test session tracer
         telemetry._reset_for_tests()
         telemetry.init_telemetry(
-            service_name="sovereign-memory-server-tests",
+            service_name="audittrace-server-tests",
             otlp_endpoint="",
             tracing_enabled=True,
             metrics_enabled=True,
@@ -209,7 +209,7 @@ def test_log_call_emits_input_for_self_only_methods(monkeypatch):
     monkeypatch.setattr(telemetry, "_tracer", MagicMock())
 
     class _Thing:
-        @log_call(logger=logging.getLogger("sovereign_memory.tests.self_only"))
+        @log_call(logger=logging.getLogger("audittrace.tests.self_only"))
         def no_args_method(self):
             return ["item-a", "item-b"]
 
@@ -238,7 +238,7 @@ def test_log_call_emits_output_for_none_returning_function(monkeypatch):
     monkeypatch.setattr(otel_trace, "get_current_span", lambda: fake_span)
     monkeypatch.setattr(telemetry, "_tracer", MagicMock())
 
-    @log_call(logger=logging.getLogger("sovereign_memory.tests.none_return"))
+    @log_call(logger=logging.getLogger("audittrace.tests.none_return"))
     def void_function(x):
         return None
 
@@ -323,7 +323,7 @@ def test_setup_logging_uses_stdout_only():
 
 def test_log_call_emits_input_output_duration(caplog):
     """The aspect must produce INPUT/OUTPUT/DURATION records."""
-    logger = logging.getLogger("sovereign_memory.tests.sync")
+    logger = logging.getLogger("audittrace.tests.sync")
 
     @log_call(logger=logger)
     def add(a, b):
@@ -340,7 +340,7 @@ def test_log_call_emits_input_output_duration(caplog):
 
 
 def test_log_call_works_on_async_functions(caplog):
-    logger = logging.getLogger("sovereign_memory.tests.async")
+    logger = logging.getLogger("audittrace.tests.async")
 
     @log_call(logger=logger)
     async def aop(x):
@@ -356,7 +356,7 @@ def test_log_call_works_on_async_functions(caplog):
 
 
 def test_log_call_logs_and_reraises_errors(caplog):
-    logger = logging.getLogger("sovereign_memory.tests.err")
+    logger = logging.getLogger("audittrace.tests.err")
 
     @log_call(logger=logger)
     def boom():
@@ -382,7 +382,7 @@ def test_telemetry_init_is_idempotent_and_noop_without_endpoint():
 
 
 def test_log_call_bare_form_without_parentheses(caplog):
-    logger = logging.getLogger("sovereign_memory.tests.bare")
+    logger = logging.getLogger("audittrace.tests.bare")
 
     @log_call
     def echo(x):
@@ -395,7 +395,7 @@ def test_log_call_bare_form_without_parentheses(caplog):
 def test_structured_formatter_emits_json():
     import json as _json
 
-    from sovereign_memory.logging_config import StructuredFormatter
+    from audittrace.logging_config import StructuredFormatter
 
     fmt = StructuredFormatter()
     record = logging.LogRecord(
@@ -419,7 +419,7 @@ class TestRecordSpanError:
 
     def test_otel_span_calls_record_exception(self):
         """OTel spans expose record_exception; it must be called."""
-        from sovereign_memory.logging_config import _record_span_error
+        from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=["record_exception"])
         exc = ValueError("boom")
@@ -428,7 +428,7 @@ class TestRecordSpanError:
 
     def test_langfuse_span_calls_update_with_error_level(self):
         """Langfuse spans have update() but not record_exception()."""
-        from sovereign_memory.logging_config import _record_span_error
+        from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=["update"])
         exc = RuntimeError("crash")
@@ -439,20 +439,20 @@ class TestRecordSpanError:
 
     def test_none_span_is_noop(self):
         """None span must not raise."""
-        from sovereign_memory.logging_config import _record_span_error
+        from audittrace.logging_config import _record_span_error
 
         _record_span_error(None, ValueError("ignored"))
 
     def test_span_with_neither_method_is_noop(self):
         """A span that has neither record_exception nor update must not raise."""
-        from sovereign_memory.logging_config import _record_span_error
+        from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=[])
         _record_span_error(span, ValueError("ignored"))
 
     def test_failing_record_exception_is_swallowed(self):
         """If record_exception itself raises, the error must be swallowed."""
-        from sovereign_memory.logging_config import _record_span_error
+        from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=["record_exception"])
         span.record_exception.side_effect = RuntimeError("telemetry broken")
@@ -465,6 +465,4 @@ def test_telemetry_start_span_returns_none_when_uninitialised():
     with telemetry.start_span("whatever") as span:
         assert span is None
     # Re-init so downstream tests keep working
-    telemetry.init_telemetry(
-        service_name="sovereign-memory-server-tests", otlp_endpoint=""
-    )
+    telemetry.init_telemetry(service_name="audittrace-server-tests", otlp_endpoint="")

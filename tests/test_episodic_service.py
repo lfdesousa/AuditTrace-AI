@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from sovereign_memory.services.episodic import (
+from audittrace.services.episodic import (
     EpisodicService,
     FileEpisodicService,
     MockEpisodicService,

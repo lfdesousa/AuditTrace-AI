@@ -1,4 +1,4 @@
-"""Tests for src/sovereign_memory/identity.py — ADR-026 §15.
+"""Tests for src/audittrace/identity.py — ADR-026 §15.
 
 Covers:
   - UserContext frozen dataclass (immutability, construction)
@@ -21,7 +21,7 @@ import time
 import fakeredis
 import pytest
 
-from sovereign_memory.identity import (
+from audittrace.identity import (
     SENTINEL_SUBJECT,
     SENTINEL_USERNAME,
     TokenCache,
@@ -182,7 +182,7 @@ class TestTokenCacheBasic:
         cache.invalidate("never-existed")  # must not raise
 
     def test_clear_removes_only_sovereign_keys(self, cache, fake_redis):
-        """clear() must NOT touch keys outside the sovereign:token: namespace."""
+        """clear() must NOT touch keys outside the audittrace:token: namespace."""
         cache.put("hash-1", _user_ctx())
         cache.put("hash-2", _user_ctx(user_id="other"))
         # Stash an unrelated key
@@ -208,12 +208,12 @@ class TestTokenCacheTTL:
     def test_explicit_ttl_overrides_default(self, cache, fake_redis):
         cache.put("hash-1", _user_ctx(), ttl_seconds=60)
         # Verify Redis TTL via the fake's TTL command
-        ttl = fake_redis.ttl("sovereign:token:hash-1")
+        ttl = fake_redis.ttl("audittrace:token:hash-1")
         assert 0 < ttl <= 60
 
     def test_default_ttl_used_when_unspecified(self, cache, fake_redis):
         cache.put("hash-1", _user_ctx())
-        ttl = fake_redis.ttl("sovereign:token:hash-1")
+        ttl = fake_redis.ttl("audittrace:token:hash-1")
         assert 250 < ttl <= 300  # default 300, allow drift
 
     def test_zero_or_negative_ttl_skips_write(self, cache):
@@ -234,7 +234,7 @@ class TestTokenCacheNamespace:
     def test_keys_are_prefixed(self, cache, fake_redis):
         cache.put("hash-1", _user_ctx())
         # Direct Redis key should be namespaced
-        assert fake_redis.exists("sovereign:token:hash-1")
+        assert fake_redis.exists("audittrace:token:hash-1")
         assert not fake_redis.exists("hash-1")  # bare key not used
 
     def test_two_caches_share_redis_safely(self, fake_redis):
@@ -253,13 +253,13 @@ class TestTokenCacheNamespace:
 class TestTokenCacheMalformed:
     def test_get_returns_none_on_malformed_json(self, cache, fake_redis):
         """A corrupted cache entry must not crash the middleware."""
-        fake_redis.setex("sovereign:token:bad-json", 60, "this is not json")
+        fake_redis.setex("audittrace:token:bad-json", 60, "this is not json")
         assert cache.get("bad-json") is None
 
     def test_get_returns_none_on_missing_required_field(self, cache, fake_redis):
         """Payload missing user_id should be treated as cache miss."""
         fake_redis.setex(
-            "sovereign:token:missing-fields",
+            "audittrace:token:missing-fields",
             60,
             json.dumps({"username": "luis"}),
         )

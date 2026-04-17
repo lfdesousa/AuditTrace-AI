@@ -11,26 +11,26 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-# Test isolation: clear all SOVEREIGN_* env vars so a developer's local .env
+# Test isolation: clear all AUDITTRACE_* env vars so a developer's local .env
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.
-# This must run BEFORE importing sovereign_memory.config so the .env-skip
-# logic in config._ENV_FILE sees SOVEREIGN_ENV=test.
-for _key in [k for k in os.environ if k.startswith("SOVEREIGN_")]:
+# This must run BEFORE importing audittrace.config so the .env-skip
+# logic in config._ENV_FILE sees AUDITTRACE_ENV=test.
+for _key in [k for k in os.environ if k.startswith("AUDITTRACE_")]:
     del os.environ[_key]
-os.environ["SOVEREIGN_ENV"] = "test"
+os.environ["AUDITTRACE_ENV"] = "test"
 
-from sovereign_memory import dependencies, telemetry  # noqa: E402
-from sovereign_memory.dependencies import (  # noqa: E402
+from audittrace import dependencies, telemetry  # noqa: E402
+from audittrace.dependencies import (  # noqa: E402
     create_test_container,
     reset_container,
 )
-from sovereign_memory.identity import (  # noqa: E402
+from audittrace.identity import (  # noqa: E402
     UserContext,
     sentinel_user_context,
 )
-from sovereign_memory.logging_config import setup_logging  # noqa: E402
-from sovereign_memory.server import create_app  # noqa: E402
-from sovereign_memory.services.memory import MockMemoryService  # noqa: E402
+from audittrace.logging_config import setup_logging  # noqa: E402
+from audittrace.server import create_app  # noqa: E402
+from audittrace.services.memory import MockMemoryService  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -39,7 +39,7 @@ def configure_observability() -> None:
     setup_logging(level="DEBUG", structured=False)
     telemetry._reset_for_tests()
     telemetry.init_telemetry(
-        service_name="sovereign-memory-server-tests",
+        service_name="audittrace-server-tests",
         otlp_endpoint="",
         tracing_enabled=True,
         metrics_enabled=True,

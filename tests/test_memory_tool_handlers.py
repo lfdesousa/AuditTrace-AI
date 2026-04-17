@@ -22,17 +22,17 @@ import pytest
 
 # Side-effect import — running the module is what runs the @register_memory_tool
 # decorators. Must happen before any test code dispatches through the registry.
-import sovereign_memory.tools.memory_handlers  # noqa: F401
-from sovereign_memory import dependencies
-from sovereign_memory.dependencies import create_test_container
-from sovereign_memory.identity import sentinel_user_context
-from sovereign_memory.tools import (
+import audittrace.tools.memory_handlers  # noqa: F401
+from audittrace import dependencies
+from audittrace.dependencies import create_test_container
+from audittrace.identity import sentinel_user_context
+from audittrace.tools import (
     MEMORY_TOOL_REGISTRY,
     get_tool_by_name,
     invoke_tool,
     reset_registry_for_tests,
 )
-from sovereign_memory.tools.cache import (
+from audittrace.tools.cache import (
     ToolResultCache,
     reset_tool_result_cache,
     set_tool_result_cache,
@@ -52,7 +52,7 @@ def _fresh_registry_with_handlers():
     reset_registry_for_tests()
     import importlib
 
-    import sovereign_memory.tools.memory_handlers as handlers_mod
+    import audittrace.tools.memory_handlers as handlers_mod
 
     importlib.reload(handlers_mod)
     yield
