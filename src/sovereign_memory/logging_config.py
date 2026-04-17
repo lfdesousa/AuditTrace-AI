@@ -9,7 +9,10 @@ an OpenTelemetry span, and records a histogram metric. It works for
 both sync and async functions.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextvars
 import itertools
 import json
 import logging
@@ -21,9 +24,27 @@ from typing import Any
 
 from sovereign_memory import telemetry
 
-# Monotonic counter used as `langgraph_step` so Langfuse can order nodes
-# in its graph view. The Langfuse adapter requires step to be a number.
-_langgraph_step_counter = itertools.count(1)
+# Per-trace step counter (backlog #02). A process-global counter interleaved
+# step numbers across concurrent requests. The ContextVar scopes the counter
+# to the current async context (one per chat request).
+_LANGGRAPH_STEP: contextvars.ContextVar[itertools.count[int]] = contextvars.ContextVar(
+    "langgraph_step"
+)
+
+
+def _next_step() -> int:
+    """Return the next langgraph_step for the current trace context."""
+    try:
+        counter = _LANGGRAPH_STEP.get()
+    except LookupError:
+        counter = itertools.count(1)
+        _LANGGRAPH_STEP.set(counter)
+    return next(counter)
+
+
+def reset_langgraph_step() -> None:
+    """Reset the per-trace step counter. Call at the start of each request."""
+    _LANGGRAPH_STEP.set(itertools.count(1))
 
 
 class StructuredFormatter(logging.Formatter):
@@ -297,7 +318,7 @@ def log_call(
                 # (underscores, not dots) and renders the trace as a graph
                 # view in the left panel when both are present.
                 span.set_attribute("langgraph_node", friendly)
-                span.set_attribute("langgraph_step", next(_langgraph_step_counter))
+                span.set_attribute("langgraph_step", _next_step())
             except Exception:  # pragma: no cover
                 pass
             if not include_input:
@@ -350,7 +371,7 @@ def log_call(
                 _log_input(op, args, kwargs)
                 start = time.perf_counter()
                 err: str | None = None
-                step_n = next(_langgraph_step_counter)
+                step_n = _next_step()
                 span_metadata = {
                     "langgraph_node": span_name,
                     "langgraph_step": step_n,
@@ -385,7 +406,7 @@ def log_call(
             _log_input(op, args, kwargs)
             start = time.perf_counter()
             err: str | None = None
-            step_n = next(_langgraph_step_counter)
+            step_n = _next_step()
             span_metadata = {
                 "langgraph_node": span_name,
                 "langgraph_step": step_n,

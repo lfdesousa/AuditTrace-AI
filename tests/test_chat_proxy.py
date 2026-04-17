@@ -184,7 +184,7 @@ class TestSessionId:
         sid = _compute_session_id("opencode", "Hello", "user-1")
         today = date.today().isoformat()
         assert sid.startswith(f"opencode-{today}-")
-        assert len(sid.split("-")[-1]) == 16  # 16-char sha256 prefix
+        assert len(sid.split("-")[-1]) == 32  # 128-bit sha256 prefix
 
 
 class _FakeRequest:
