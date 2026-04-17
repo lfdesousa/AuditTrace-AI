@@ -99,8 +99,12 @@ observability:
         cpu: 500m
         memory: 512Mi
   external:
-    langfuseIP: "192.168.1.100"
+    langfuseIP: "192.168.1.231"
     langfusePort: 3000
+    tempoIP: "192.168.1.231"
+    tempoOtlpPort: 14318
+    prometheusIP: "192.168.1.231"
+    prometheusPort: 19090
     prometheusIP: "192.168.1.100"
     prometheusPort: 19090
 
