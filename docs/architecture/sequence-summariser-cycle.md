@@ -5,9 +5,9 @@
 > `sessionSummarizer` component and `summarizerServer` softwareSystem.
 
 The session summariser is an `asyncio.create_task` started from
-`server.py::lifespan` when `SOVEREIGN_SUMMARIZER_ENABLED=true`. It
-wakes every `SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES` (default 5m),
-picks up to `SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE` eligible sessions
+`server.py::lifespan` when `AUDITTRACE_SUMMARIZER_ENABLED=true`. It
+wakes every `AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES` (default 5m),
+picks up to `AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE` eligible sessions
 (default 10), calls Mistral 7B Instruct v0.3 on `:11437` for each,
 and upserts a `SessionRecord` under the session's user identity.
 The hybrid `recall_recent_sessions` tool (ADR-030 Part 1) transparently
@@ -60,11 +60,11 @@ from being picked. This is the fix from commit `1428ec1` (the
 ```mermaid
 sequenceDiagram
     participant Loop as SessionSummarizer.run\n(background asyncio task)
-    participant DB as sovereign-postgres\n(owner-role connection, ADR-030 §4)
+    participant DB as audittrace-postgres\n(owner-role connection, ADR-030 §4)
     participant LLM as llama-server :11437\n(Mistral 7B Instruct v0.3)
     participant Parse as _parse_llm_response
 
-    Note over Loop: Wake every SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES (5m default).\nUsing dedicated owner-role factory when summarizer_postgres_url is set.
+    Note over Loop: Wake every AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES (5m default).\nUsing dedicated owner-role factory when summarizer_postgres_url is set.
 
     Loop->>DB: BEGIN; SET LOCAL row_security = off
     Loop->>DB: SELECT sub.session_id, sub.user_id, sub.project, sub.last_ts, s.summarized_at\nFROM (SELECT … MAX(timestamp) …) sub\nLEFT JOIN sessions s ON s.id = sub.session_id\nWHERE sub.last_ts < :threshold\nORDER BY (s.summarized_at IS NULL) DESC, sub.last_ts ASC\nLIMIT :fetch_limit
@@ -119,7 +119,7 @@ sequenceDiagram
     participant Loop as SessionSummarizer.run
     participant LLM as llama-server :11437
     participant Parse as _parse_llm_response
-    participant DB as sovereign-postgres
+    participant DB as audittrace-postgres
     participant Log as logger
 
     Loop->>LLM: POST /v1/chat/completions (strict JSON)
@@ -149,12 +149,12 @@ here so the design rationale survives.
 
 ADR-026 §16 (Phase 4) forces RLS on the `interactions`, `sessions`,
 and `tool_calls` tables. The main memory-server connects as
-`sovereign_app` — a role without the privilege to bypass RLS via
+`audittrace_app` — a role without the privilege to bypass RLS via
 `SET LOCAL row_security = off`. The summariser reads across every
 user's interactions to build audit summaries — a privilege the main
 memory-server intentionally does not have. Hence the `summarizer_
 postgres_url` setting: when set, a **dedicated owner-role
-connection** (as `sovereign`, the schema owner) handles the
+connection** (as `audittrace`, the schema owner) handles the
 eligibility read. Inside each per-session write transaction the
 worker re-narrows scope with `SET LOCAL app.current_user_id = :uid`
 so the row's `user_id` matches the GUC — RLS `WITH CHECK` passes.
@@ -163,7 +163,7 @@ On SQLite (tests), both `SET LOCAL` statements are no-ops because
 SQLite has no RLS.
 
 Fixed in commit `1a82eed` after live-validation surfaced the original
-`sovereign_app`-connection variant failing with
+`audittrace_app`-connection variant failing with
 `query would be affected by row-level security policy`.
 
 ## What this doc does NOT cover
@@ -181,6 +181,6 @@ Fixed in commit `1a82eed` after live-validation surfaced the original
 ## Related documents
 
 - **ADR-030** — the authoritative design record (hybrid recall + background loop + three-model topology).
-- **`sequence-oauth2-flow.md`** — for the per-request identity resolution the summariser bypasses by running under `sovereign` directly.
+- **`sequence-oauth2-flow.md`** — for the per-request identity resolution the summariser bypasses by running under `audittrace` directly.
 - **`sequence-memory-tool-call.md`** — for how `recall_recent_sessions` consumes the rows this worker writes.
 - **`eval-memory-modes-20260415-contention.md`** — for the empirical Mistral residency cost measurement behind the `--n-gpu-layers 10` default.

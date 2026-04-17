@@ -33,12 +33,12 @@ winning option** at the time. The decisions were made in
 - **Dynamic decorator-based registration** with optional TOML overlay
   — ADR-025 §Decision.3
 - **Configurable iteration cap** via
-  `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` — ADR-025 §Decision.2
-- **Redis-backed tool result cache** (sovereign-redis, disjoint
+  `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS` — ADR-025 §Decision.2
+- **Redis-backed tool result cache** (audittrace-redis, disjoint
   namespace from TokenCache) — ADR-025 §Decision.8
 - **Audit via `tool_calls` rows** with interaction_id FK; cache hits
   skip audit — ADR-025 §Decision.5
-- **Kill switch** `SOVEREIGN_MEMORY_MODE={inject|tools}`, default
+- **Kill switch** `AUDITTRACE_MEMORY_MODE={inject|tools}`, default
   `inject` until the dogfood canary completes — ADR-025 §Decision.4
 
 Read ADR-025 first. Come back here only for the design-space archaeology
@@ -223,8 +223,8 @@ transparent proxy.
 
 ```
 OpenCode configured with:
-  - LLM endpoint  : sovereign-memory-server (transparent proxy)
-  - MCP server    : sovereign-memory-server  (memory tools)
+  - LLM endpoint  : audittrace-server (transparent proxy)
+  - MCP server    : audittrace-server  (memory tools)
   - Local tools   : bash, read_file, edit_file
               │
               ▼
@@ -362,8 +362,8 @@ LRU cache in the proxy.
 
 ### 5.5 Backwards-compatibility / kill switch
 
-Keep the old "always inject" mode behind a feature flag (`SOVEREIGN_MEMORY_MODE=tools`
-vs `SOVEREIGN_MEMORY_MODE=inject`)? Useful for:
+Keep the old "always inject" mode behind a feature flag (`AUDITTRACE_MEMORY_MODE=tools`
+vs `AUDITTRACE_MEMORY_MODE=inject`)? Useful for:
 - A/B comparing the two modes on identical prompts
 - A panic-revert path if the new mode misbehaves
 - Models that genuinely don't tool-call well
@@ -529,10 +529,10 @@ the design decision.
 - Output: a baseline that the new design must beat.
 
 ### Phase 1 — Tool definitions + ambient context (2-3 days)
-- Define the tool schemas in a new `src/sovereign_memory/tools.py`.
+- Define the tool schemas in a new `src/audittrace/tools.py`.
 - Build the ambient context generator (profile + project + date + tool
   hints) — small, fast, no I/O.
-- Add `SOVEREIGN_MEMORY_MODE` env var defaulting to `inject` (current
+- Add `AUDITTRACE_MEMORY_MODE` env var defaulting to `inject` (current
   behaviour).
 
 ### Phase 2 — Proxy-side tool orchestration loop (3-5 days)
@@ -559,7 +559,7 @@ the design decision.
   span names.
 
 ### Phase 5 — Cutover (1 day + canary period)
-- Flip `SOVEREIGN_MEMORY_MODE=tools` in `.env`.
+- Flip `AUDITTRACE_MEMORY_MODE=tools` in `.env`.
 - Run for a week as primary. Keep `inject` mode reachable via env var.
 - After a week, decide whether to delete the inject path entirely.
 
@@ -607,7 +607,7 @@ Out of scope intentionally:
    produced the ADR-025 decisions listed in the status block at the
    top of this file. Specifically: Pattern C+A, Qwen3.5-35B-A3B,
    fine-grained tools, verb-oriented naming, OpenCode first, kill
-   switch via `SOVEREIGN_MEMORY_MODE`, iteration cap configurable.
+   switch via `AUDITTRACE_MEMORY_MODE`, iteration cap configurable.
 3. ⚠ **Phase 0 measurement was SKIPPED** as an intentional trade-off —
    the token cost and latency estimates in §1 were deemed close enough
    to proceed without instrumentation first. The Phase 7b dogfood
@@ -778,7 +778,7 @@ A non-exhaustive list of places that quietly assume one user:
 - **Langfuse `langfuse.user.id` attribute.** Already populated, but with
   the agent name, not a real user identity.
 - **Auth.** Wired (Keycloak ADR-022, JWT ADR-023) but
-  `SOVEREIGN_AUTH_ENABLED=false` for local dev. Flipping it on is a
+  `AUDITTRACE_AUTH_ENABLED=false` for local dev. Flipping it on is a
   one-flag change in env, but the *consequences* are repo-wide.
 - **`/session/summary` endpoint.** Persists with no user attribution.
 - **The CLAUDE.md memory profile.** Currently hard-codes "Luis Filipe"
@@ -810,7 +810,7 @@ Concrete examples in increasing severity:
    version + timestamp, all replayable.
 
 The common denominator is **reconstructibility under audit**. The
-sovereign-memory-server's foundational ambition (ADR-014: *full agentic
+audittrace-server's foundational ambition (ADR-014: *full agentic
 trace capture*) was always about this — but ADR-014 implicitly assumed
 one user. In a multi-user world, reconstructibility must be **per user
 session**, with hard boundaries.

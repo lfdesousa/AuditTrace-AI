@@ -2,7 +2,7 @@
 
 ![Sovereign Architecture Overview](./docs/sovereign-architecture-overview.png)
 
-Production-grade sovereign AI memory server with 4-layer memory architecture, Docker Compose deployment, TLS, and full observability.
+Production-grade sovereign AI memory server with 4-layer memory architecture, full observability, and Zero Trust deployment on Kubernetes (Istio mTLS, SPIFFE/SVID workload identity, deny-all AuthorizationPolicies) or Docker Compose for local development.
 
 ## Research & Governance
 
@@ -23,7 +23,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 
 - 🧠 **4-Layer Memory Architecture** -- Episodic (ADRs), procedural (skills), conversational (PostgreSQL), semantic (ChromaDB)
 - 🛠️ **Memory-as-Tools** -- LLM calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` on demand instead of paying the 4-layer cost on every prompt (ADR-025). Dynamic registry, Redis-backed result cache, configurable iteration cap.
-- 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `sovereign_app` role means RLS actually bites at the DB layer (ADR-026).
+- 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026).
 - 🗄️ **Server-Mode Databases** -- PostgreSQL 16 + ChromaDB HTTP server + Redis 7, all with authentication (ADR-019, ADR-020)
 - 🔒 **TLS Everywhere** -- Traefik v3 reverse proxy with mkcert certificates (ADR-021)
 - 🔍 **Reconstructible by Design** -- Every interaction + memory tool call traced via Langfuse + OpenTelemetry; one `tool_calls` audit row per memory invocation with `interaction_id` FK
@@ -31,12 +31,19 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🔄 **Transparent LLM Proxy** -- Raw dict pass-through for OpenAI tool-calling protocol (ADR-024); memory context injected into the system message without stripping `tools`, `tool_calls`, `tool_call_id`
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API
-- 🐳 **Docker Compose** -- One command deployment: memory-server, PostgreSQL, ChromaDB, Redis, Keycloak, Traefik
-- ✅ **Comprehensive Test Suite** -- 90% project-wide + 90% per-file coverage gates enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml))
+- 🐳 **Docker Compose + Kubernetes** -- Docker Compose for local dev; k3s + Istio + Helm chart for production ZTA (mTLS, SPIFFE/SVID, deny-all AuthorizationPolicies)
+- ✅ **Comprehensive Test Suite** -- 558 tests, 94.88% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml))
 
 ## Quick Start
 
-### Deploy with Docker Compose
+### Deployment Options
+
+| Mode | Infrastructure | Use case |
+|------|---------------|----------|
+| Docker Compose | Traefik + docker-compose.yml | Local development |
+| Kubernetes | k3s + Istio + Helm chart | Production / ZTA |
+
+### Deploy with Docker Compose (local dev)
 
 ```bash
 # Clone repository
@@ -50,7 +57,7 @@ cd AuditTrace-AI
 ./certs/generate-certs.sh
 
 # Create shared Docker network
-docker network create sovereign-ai-net
+docker network create audittrace-net
 
 # Configure environment
 cp .env.example .env
@@ -65,6 +72,18 @@ The stack exposes:
 - **http://localhost:8080** -- Traefik dashboard
 - **http://localhost:3000** -- Langfuse (if set up)
 
+### Deploy with Kubernetes (k3s + Istio)
+
+```bash
+# Build container images
+make k8s-build
+
+# Install (Helm chart + Istio resources)
+make k8s-install
+```
+
+See [docs/guides/deployment-runbook.md](docs/guides/deployment-runbook.md) for full instructions including Istio setup, SPIFFE/SVID workload identity, deny-all AuthorizationPolicies, and secret provisioning.
+
 ### Optional: Langfuse Observability
 
 ```bash
@@ -78,14 +97,14 @@ cd ../AuditTrace-AI
 # 3. Settings -> API Keys -> Create new key. Copy public + secret keys.
 
 # Set in your .env (replace pk-lf-... and sk-lf-... with your real keys):
-SOVEREIGN_LANGFUSE_ENABLED=true
-SOVEREIGN_LANGFUSE_HOST=http://host.docker.internal:3000
-SOVEREIGN_LANGFUSE_PUBLIC_KEY=pk-lf-your-public-key
-SOVEREIGN_LANGFUSE_SECRET_KEY=sk-lf-your-secret-key
+AUDITTRACE_LANGFUSE_ENABLED=true
+AUDITTRACE_LANGFUSE_HOST=http://host.docker.internal:3000
+AUDITTRACE_LANGFUSE_PUBLIC_KEY=pk-lf-your-public-key
+AUDITTRACE_LANGFUSE_SECRET_KEY=sk-lf-your-secret-key
 # OTLP endpoint with basic auth -- Langfuse v3 native ingest
-SOVEREIGN_OTLP_ENDPOINT=http://pk-lf-your-public-key:sk-lf-your-secret-key@host.docker.internal:3000/api/public/otel/v1/traces
+AUDITTRACE_OTLP_ENDPOINT=http://pk-lf-your-public-key:sk-lf-your-secret-key@host.docker.internal:3000/api/public/otel/v1/traces
 # Langfuse only accepts OTLP traces, not metrics -- disable to silence 400 errors
-SOVEREIGN_METRICS_ENABLED=false
+AUDITTRACE_METRICS_ENABLED=false
 
 # Restart to pick up changes
 docker compose up -d --force-recreate memory-server
@@ -116,7 +135,7 @@ make format
 
 # Run development server (without Docker)
 source .venv/bin/activate
-uvicorn sovereign_memory.server:app --reload
+uvicorn audittrace.server:app --reload
 ```
 
 ## Drop-in OpenAI compatibility
@@ -166,7 +185,7 @@ and review the diff like any other dependency bump.
 
 ## Architecture
 
-### Docker Compose Topology
+### Service Topology (Docker Compose)
 
 ```
 Client (HTTPS :443, Bearer JWT)
@@ -174,8 +193,8 @@ Client (HTTPS :443, Bearer JWT)
     v
 +---------+     +------------------+     +--------------+
 | Traefik |---->| memory-server    |---->| PostgreSQL 16|
-| (TLS)   |     | (FastAPI +       |     | (RLS: sover- |
-+---------+     |  require_user +  |     |  eign_app    |
+| (TLS)   |     | (FastAPI +       |     | (RLS: audit- |
++---------+     |  require_user +  |     |  trace_app   |
       ^         |  tool-call loop) |     |  non-super)  |
       |         +-----+----+------+      +--------------+
       |               |    |
@@ -190,13 +209,13 @@ Client (HTTPS :443, Bearer JWT)
                                 |             +--------------+
                          +--------------+     | llama-server |
                          | Redis 7      |     | (Qwen, ROCm) |
-                         |  sovereign:  |     +--------------+
+                         |  audittrace: |     +--------------+
                          |  token:*     |
                          |  tool-result:*|
                          +--------------+
 ```
 
-Langfuse runs as a **sibling compose stack** on the shared `sovereign-ai-net` network (ADR-021.2). Redis serves both the `TokenCache` (JWT hot path) and the `ToolResultCache` (memory-as-tools result cache) under disjoint key prefixes.
+Langfuse runs as a **sibling compose stack** on the shared `audittrace-net` network (ADR-021.2). Redis serves both the `TokenCache` (JWT hot path) and the `ToolResultCache` (memory-as-tools result cache) under disjoint key prefixes.
 
 ### 4-Layer Memory
 
@@ -211,16 +230,16 @@ All services follow the ABC + implementation + mock pattern with `@log_call` obs
 
 ### Memory Access Modes (ADR-025)
 
-The 4-layer memory can be exposed to the LLM in two different ways. The choice is a runtime flag (`SOVEREIGN_MEMORY_MODE`) and does not change the underlying storage layout.
+The 4-layer memory can be exposed to the LLM in two different ways. The choice is a runtime flag (`AUDITTRACE_MEMORY_MODE`) and does not change the underlying storage layout.
 
 | Mode | What happens on every `/v1/chat/completions` | Trade-off |
 |---|---|---|
-| **`tools`** *(live default — `.env` ships with this set)* | The proxy advertises four recall tools to the LLM and runs a tool-call loop. The model decides which layer it needs and calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, or `recall_semantic` on demand — at most once per question in practice. Results are cached in Redis (TTL 900s) and audit-logged to `tool_calls`. | Pay memory cost only when the model asks. Extra round-trips to llama-server (one per tool iteration), bounded by `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS`. |
+| **`tools`** *(live default — `.env` ships with this set)* | The proxy advertises four recall tools to the LLM and runs a tool-call loop. The model decides which layer it needs and calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, or `recall_semantic` on demand — at most once per question in practice. Results are cached in Redis (TTL 900s) and audit-logged to `tool_calls`. | Pay memory cost only when the model asks. Extra round-trips to llama-server (one per tool iteration), bounded by `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS`. |
 | **`inject`** *(legacy — v0.2.x default)* | The proxy retrieves all 4 layers up front and injects them into the system message. The model sees a preassembled context block and never issues tool calls for memory. | Zero tool-loop latency but every prompt pays the full 4-layer retrieval + token cost, even when the model would have ignored memory. |
 
 The four tools in `tools` mode each map to one layer and carry their own Keycloak scope (`memory:episodic:read`, `memory:procedural:read`, `memory:conversational:read-own`, `memory:semantic:read`). Per-user isolation, RLS, and the ChromaDB scoped wrapper apply unchanged to both modes — the difference is purely *when* the layers are queried, not *what* the user sees.
 
-Switch modes by setting `SOVEREIGN_MEMORY_MODE=inject|tools` in `.env` and recreating the `memory-server` container. See [ADR-025](docs/ADR-025-memory-as-tools.md) for the full design and the acceptance evidence.
+Switch modes by setting `AUDITTRACE_MEMORY_MODE=inject|tools` in `.env` and recreating the `memory-server` container. See [ADR-025](docs/ADR-025-memory-as-tools.md) for the full design and the acceptance evidence.
 
 ### Security
 
@@ -228,7 +247,7 @@ Switch modes by setting `SOVEREIGN_MEMORY_MODE=inject|tools` in `.env` and recre
 - **Per-user isolation, defense in depth:**
   1. **Service layer** -- every memory service method takes a `UserContext` first arg; conversational `load_sessions` applies unconditional `WHERE user_id =`
   2. **Postgres RLS** -- `interactions`, `sessions`, `tool_calls` all carry `ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` + one policy per table gated on `current_setting('app.current_user_id', true)`
-  3. **Non-superuser app role** -- memory-server connects as `sovereign_app` (NOSUPERUSER + NOBYPASSRLS). Postgres superusers always bypass RLS, so this is not optional for real enforcement.
+  3. **Non-superuser app role** -- memory-server connects as `audittrace_app` (NOSUPERUSER + NOBYPASSRLS). Postgres superusers always bypass RLS, so this is not optional for real enforcement.
   4. **ChromaDB wrapper** -- `UserScopedSemanticService` binds a `UserContext` at construction and overrides any per-call context; isolation is true by construction
   5. **Session-id uniqueness** -- `_compute_session_id` includes `user_id` in the sha256 so two users with the same first message never produce a colliding session id
 - **TLS** -- Traefik terminates HTTPS on :443 with mkcert certificates
@@ -238,7 +257,7 @@ Switch modes by setting `SOVEREIGN_MEMORY_MODE=inject|tools` in `.env` and recre
 
 ### Authentication (ADR-022, ADR-023, ADR-026, ADR-032)
 
-All endpoints except `/health` require a valid Keycloak JWT. `SOVEREIGN_AUTH_REQUIRED=true` is the docker-compose default -- every request needs `Authorization: Bearer <JWT>`.
+All endpoints except `/health` require a valid Keycloak JWT. `AUDITTRACE_AUTH_REQUIRED=true` is the docker-compose default -- every request needs `Authorization: Bearer <JWT>`.
 
 **Human agents (OpenCode / Continue / Roo Code) — OAuth2 Device Flow (ADR-032):**
 
@@ -263,16 +282,16 @@ curl -H "Authorization: Bearer $BEARER" https://localhost/v1/chat/completions ..
 Silent refresh is automatic within the 30-day SSO session lifetime. After that, `scripts/audittrace-login` re-logs in interactively.
 
 **Service accounts (CI, smoke tests) -- `client_credentials`:**
-The `sovereign-memory-dev` client is the legacy path. Still the right choice for non-interactive scripts; see `scripts/mint-dev-jwt.sh`.
+The `audittrace-dev` client is the legacy path. Still the right choice for non-interactive scripts; see `scripts/mint-dev-jwt.sh`.
 
-**Scopes exposed by the `sovereign-ai` realm:**
+**Scopes exposed by the `audittrace` realm:**
 
 | Scope | Endpoints / Tools |
 |---|---|
-| `sovereign-ai:query` | `/v1/chat/completions`, `/session/save` |
-| `sovereign-ai:context` | `/context` |
-| `sovereign-ai:audit` | `/interactions` |
-| `sovereign-ai:admin` | `/metrics` |
+| `audittrace:query` | `/v1/chat/completions`, `/session/save` |
+| `audittrace:context` | `/context` |
+| `audittrace:audit` | `/interactions` |
+| `audittrace:admin` | `/metrics` |
 | `memory:episodic:read` | `recall_decisions` tool (ADR-025) |
 | `memory:procedural:read` | `recall_skills` tool |
 | `memory:conversational:read-own` | `recall_recent_sessions` tool |
@@ -296,7 +315,7 @@ The `sovereign-memory-dev` client is the legacy path. Still the right choice for
 | ✅ Done | **Backlog Cleared** | All 7 tech-debt items resolved: streaming generator decomposed, step counter scoped per-trace, session ID hash widened, empty stubs deleted, dev compose overlay added. |
 | ✅ Done | **Package Rename** | `sovereign_memory` → `audittrace`, `SOVEREIGN_*` → `AUDITTRACE_*`, all containers/DB/realm/scopes aligned (ADR-035). |
 | ✅ Done | **N=100 Eval Sweep** | Full 100 probes × 2 modes with 30-min client timeout. Validates Qwen 3.6 + ADR-034 per-chunk idle timeout. |
-| 🔴 Next | **Kubernetes + Istio ZTA** | k3s + Istio mTLS + SPIFFE/SVID workload identity. Helm chart + Kustomize overlays. The v1.0 destination. |
+| ✅ Done | **Kubernetes + Istio ZTA** | k3s + Istio mTLS + SPIFFE/SVID workload identity. Helm chart + deny-all AuthorizationPolicies. The v1.0 milestone. |
 | ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |
 | 🟡 Planned | **Async Persistence** | Non-blocking audit row writes. k8s prerequisite. |
 | 🟡 Planned | **External IdP** | Keycloak brokering to Google/Okta/EntraID for multi-user SSO. |
@@ -315,7 +334,7 @@ Sibling Docker Compose stack following the Langfuse pattern (ADR-021.2). Provide
 
 | Service | URL | Purpose |
 |---|---|---|
-| Grafana | `http://localhost:3001` (admin / sovereign) | Dashboards: latency percentiles, error rates, infra metrics, logs |
+| Grafana | `http://localhost:3001` (admin / audittrace) | Dashboards: latency percentiles, error rates, infra metrics, logs |
 | Prometheus | `http://localhost:19090` | Metrics storage + PromQL queries |
 | Loki | `http://localhost:3100` | Log aggregation + LogQL queries |
 | OTel Collector | `http://localhost:4318` | OTLP receiver (memory-server exports here) |
@@ -384,7 +403,7 @@ Pagination: `limit` (1-1000, default 100) + `offset`.
 Response: `{interactions: [...], total, limit, offset}` — `total` reflects
 the filter match count *for the caller*.
 
-**Per-user isolation is automatic.** Postgres RLS sets `app.current_user_id` from the caller's Keycloak `sub` on every transaction (ADR-026). You cannot accidentally see another user's rows, even with a forged `user_id` query parameter — the RLS policy intersects `WHERE user_id = current_setting(...)`. Scope required on the token: `sovereign-ai:audit`.
+**Per-user isolation is automatic.** Postgres RLS sets `app.current_user_id` from the caller's Keycloak `sub` on every transaction (ADR-026). You cannot accidentally see another user's rows, even with a forged `user_id` query parameter — the RLS policy intersects `WHERE user_id = current_setting(...)`. Scope required on the token: `audittrace:audit`.
 
 **Project tagging contract** (ADR-029). Every interaction carries a `project` tag resolved on entry: `X-Project` header → `body.metadata.project` → `body.project` → `"default"`. Configure the header per-project once via `scripts/configure-project.py <name>`.
 
@@ -396,51 +415,51 @@ the filter match count *for the caller*.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_POSTGRES_URL` | -- | Full PostgreSQL URL. Production connects as the non-superuser `sovereign_app` role so RLS policies actually apply |
-| `SOVEREIGN_POSTGRES_PASSWORD` | -- | Database password (required) |
-| `SOVEREIGN_APP_PASSWORD` | fallback to `SOVEREIGN_POSTGRES_PASSWORD` | Dedicated password for the `sovereign_app` role |
-| `SOVEREIGN_CHROMA_URL` | `http://chromadb:8000` | ChromaDB server URL |
-| `SOVEREIGN_CHROMA_TOKEN` | -- | ChromaDB auth token |
-| `SOVEREIGN_REDIS_URL` | `redis://redis:6379/0` | Redis URL for TokenCache + ToolResultCache |
-| `SOVEREIGN_REDIS_PASSWORD` | -- | Required for the TokenCache hot path |
-| `SOVEREIGN_TOKEN_CACHE_TTL_SECONDS` | `300` | JWT TTL in TokenCache |
+| `AUDITTRACE_POSTGRES_URL` | -- | Full PostgreSQL URL. Production connects as the non-superuser `audittrace_app` role so RLS policies actually apply |
+| `AUDITTRACE_POSTGRES_PASSWORD` | -- | Database password (required) |
+| `AUDITTRACE_APP_PASSWORD` | fallback to `AUDITTRACE_POSTGRES_PASSWORD` | Dedicated password for the `audittrace_app` role |
+| `AUDITTRACE_CHROMA_URL` | `http://chromadb:8000` | ChromaDB server URL |
+| `AUDITTRACE_CHROMA_TOKEN` | -- | ChromaDB auth token |
+| `AUDITTRACE_REDIS_URL` | `redis://redis:6379/0` | Redis URL for TokenCache + ToolResultCache |
+| `AUDITTRACE_REDIS_PASSWORD` | -- | Required for the TokenCache hot path |
+| `AUDITTRACE_TOKEN_CACHE_TTL_SECONDS` | `300` | JWT TTL in TokenCache |
 
 ### Auth (ADR-022, ADR-023, ADR-026)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_AUTH_REQUIRED` | `true` (docker-compose default) | When true, every request needs a valid Keycloak JWT |
-| `SOVEREIGN_KEYCLOAK_ISSUER` | `http://keycloak:8080/realms/sovereign-ai` | Must match the JWT `iss` claim |
-| `SOVEREIGN_KEYCLOAK_JWKS_URL` | `http://keycloak:8080/realms/sovereign-ai/protocol/openid-connect/certs` | JWKS endpoint for RS256 validation (cached 5 min) |
-| `SOVEREIGN_JWT_AUDIENCE` | `sovereign-memory-server` | Must match the JWT `aud` claim |
+| `AUDITTRACE_AUTH_REQUIRED` | `true` (docker-compose default) | When true, every request needs a valid Keycloak JWT |
+| `AUDITTRACE_KEYCLOAK_ISSUER` | `http://keycloak:8080/realms/audittrace` | Must match the JWT `iss` claim |
+| `AUDITTRACE_KEYCLOAK_JWKS_URL` | `http://keycloak:8080/realms/audittrace/protocol/openid-connect/certs` | JWKS endpoint for RS256 validation (cached 5 min) |
+| `AUDITTRACE_JWT_AUDIENCE` | `audittrace-server` | Must match the JWT `aud` claim |
 
 ### Memory-as-Tools (ADR-025)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_MEMORY_MODE` | `tools` (shipped `.env`) / `inject` (compose fallback) | `tools` = proxy-internal tool-call loop (current default); `inject` = legacy 4-layer dump into system message. See [Memory Access Modes](#memory-access-modes-adr-025). |
-| `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` | `5` | Hard cap on tool-call round-trips per request |
-| `SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS` | `900` | Redis tool result cache TTL; `0` disables caching |
-| `SOVEREIGN_TOOLS_CONFIG_PATH` | `tools.toml` | Optional TOML overlay to disable/rename/retune tools |
+| `AUDITTRACE_MEMORY_MODE` | `tools` (shipped `.env`) / `inject` (compose fallback) | `tools` = proxy-internal tool-call loop (current default); `inject` = legacy 4-layer dump into system message. See [Memory Access Modes](#memory-access-modes-adr-025). |
+| `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS` | `5` | Hard cap on tool-call round-trips per request |
+| `AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS` | `900` | Redis tool result cache TTL; `0` disables caching |
+| `AUDITTRACE_TOOLS_CONFIG_PATH` | `tools.toml` | Optional TOML overlay to disable/rename/retune tools |
 
 ### Observability (ADR-014.4)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_LOG_LEVEL` | `INFO` | Log level |
-| `SOVEREIGN_OTLP_ENDPOINT` | `""` (no export) | OTLP/HTTP collector URL |
-| `SOVEREIGN_OTEL_SERVICE_NAME` | `sovereign-memory-server` | OTel service name |
-| `SOVEREIGN_TRACING_ENABLED` | `true` | Enable OTel tracing |
-| `SOVEREIGN_METRICS_ENABLED` | `true` | Enable OTel metrics |
+| `AUDITTRACE_LOG_LEVEL` | `INFO` | Log level |
+| `AUDITTRACE_OTLP_ENDPOINT` | `""` (no export) | OTLP/HTTP collector URL |
+| `AUDITTRACE_OTEL_SERVICE_NAME` | `audittrace-server` | OTel service name |
+| `AUDITTRACE_TRACING_ENABLED` | `true` | Enable OTel tracing |
+| `AUDITTRACE_METRICS_ENABLED` | `true` | Enable OTel metrics |
 
 ### Langfuse (ADR-021.2)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SOVEREIGN_LANGFUSE_HOST` | `http://langfuse-web:3000` | Langfuse server URL |
-| `SOVEREIGN_LANGFUSE_PUBLIC_KEY` | -- | Langfuse public key |
-| `SOVEREIGN_LANGFUSE_SECRET_KEY` | -- | Langfuse secret key |
-| `SOVEREIGN_LANGFUSE_ENABLED` | `false` | Enable Langfuse integration |
+| `AUDITTRACE_LANGFUSE_HOST` | `http://langfuse-web:3000` | Langfuse server URL |
+| `AUDITTRACE_LANGFUSE_PUBLIC_KEY` | -- | Langfuse public key |
+| `AUDITTRACE_LANGFUSE_SECRET_KEY` | -- | Langfuse secret key |
+| `AUDITTRACE_LANGFUSE_ENABLED` | `false` | Enable Langfuse integration |
 
 ## Documentation
 
@@ -463,6 +482,11 @@ the filter match count *for the caller*.
 - [ADR-027: MinIO Object Storage](docs/ADR-027-minio-object-storage.md)
 - [ADR-028: Observability Aggregation Stack](docs/ADR-028-observability-aggregation-stack.md)
 - [ADR-029: End-to-End Audit Trail — Project Tagging & HTTP Telemetry Refinements](docs/ADR-029-audit-trail-completeness.md)
+- [ADR-030: Session Summariser](docs/ADR-030-session-summarizer.md)
+- [ADR-032: OAuth2 Device Flow](docs/ADR-032-oauth2-device-flow.md)
+- [ADR-033: Three-Audience Error Envelope](docs/ADR-033-three-audience-error-envelope.md)
+- [ADR-034: Long-Running Generation](docs/ADR-034-long-running-generation.md)
+- [ADR-035: Package Rename](docs/ADR-035-package-rename.md)
 
 ### Architecture Diagrams
 
@@ -476,7 +500,7 @@ the filter match count *for the caller*.
 - [Langfuse Dashboards -- Recipes](docs/langfuse-dashboards.md)
 - [Agent Configuration (OpenCode, Continue, Roo Code)](docs/agent-configuration.md)
 - Dev JWT minting: `scripts/mint-dev-jwt.sh`
-- App role init: `scripts/init-sovereign-app-role.sh` (creates the non-superuser Postgres role for RLS)
+- App role init: `scripts/init-audittrace-app-role.sh` (creates the non-superuser Postgres role for RLS)
 - Project tagging: `scripts/configure-project.py <name>` (ADR-029)
 
 ### Evaluation Reports

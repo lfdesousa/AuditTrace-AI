@@ -34,15 +34,15 @@ sequenceDiagram
     participant User as Luis (human)
     participant CLI as scripts/audittrace-login
     participant Browser as Browser
-    participant KC as Keycloak\nsovereign-ai realm\n(Traefik-fronted :443)
+    participant KC as Keycloak\naudittrace realm\n(Istio Gateway-fronted :443)
 
     User->>CLI: scripts/audittrace-login
-    CLI->>KC: POST /realms/sovereign-ai/protocol/openid-connect/auth/device\nclient_id=audittrace-opencode\nscope=openid sovereign-ai:query sovereign-ai:context\n      sovereign-ai:audit memory:episodic:read\n      memory:procedural:read memory:conversational:read-own\n      memory:semantic:read
+    CLI->>KC: POST /realms/audittrace/protocol/openid-connect/auth/device\nclient_id=audittrace-opencode\nscope=openid audittrace:query audittrace:context\n      audittrace:audit memory:episodic:read\n      memory:procedural:read memory:conversational:read-own\n      memory:semantic:read
     KC-->>CLI: {device_code, user_code, verification_uri,\nverification_uri_complete, expires_in: 600, interval: 5}
 
     CLI->>User: Open URL + enter code (or follow verification_uri_complete)
     User->>Browser: visit URL
-    Browser->>KC: GET /realms/sovereign-ai/device?user_code=XXXX-YYYY
+    Browser->>KC: GET /realms/audittrace/device?user_code=XXXX-YYYY
     KC->>Browser: login form
     User->>Browser: username=luis + password
     Browser->>KC: POST credentials
@@ -98,7 +98,7 @@ login path.
 ## Token acquisition (OAuth2 client_credentials — for service accounts)
 
 Headless agents (CI jobs, automation, smoke tests) use
-`sovereign-memory-dev` via `client_credentials`. Same output shape —
+`audittrace-dev` via `client_credentials`. Same output shape —
 a Keycloak-signed JWT — but the token's `iss` claim carries the
 **internal** docker-network hostname because the client authenticates
 from inside the stack (see `scripts/mint-dev-jwt.sh`). **No PATs
@@ -131,22 +131,22 @@ the cache for subsequent requests.
 ```mermaid
 sequenceDiagram
     participant Agent as Coding Agent
-    participant Traefik as Traefik (TLS)
+    participant Gateway as Istio Gateway (TLS)
     participant Auth as require_user\n(auth.py)
     participant Cache as TokenCache\n(identity.py)
-    participant Redis as sovereign-redis
+    participant Redis as audittrace-redis
     participant KC as Keycloak\n(JWKS only)
     participant Route as Chat Route
 
-    Agent->>Traefik: POST /v1/chat/completions\nAuthorization: Bearer <JWT>
-    Traefik->>Auth: TLS terminated → HTTP
+    Agent->>Gateway: POST /v1/chat/completions\nAuthorization: Bearer <JWT>
+    Gateway->>Auth: TLS terminated → HTTP (mTLS via Envoy sidecar)
 
     Auth->>Auth: token_hash = sha256(raw_token)
 
     rect rgb(220, 240, 220)
         Note over Auth,Redis: HOT PATH — sub-millisecond
         Auth->>Cache: get(token_hash)
-        Cache->>Redis: GET sovereign:token:<hash>
+        Cache->>Redis: GET audittrace:token:<hash>
         Redis-->>Cache: JSON UserContext
         Cache-->>Auth: UserContext
     end
@@ -166,7 +166,7 @@ sequenceDiagram
     participant Agent as Coding Agent
     participant Auth as require_user
     participant Cache as TokenCache
-    participant Redis as sovereign-redis
+    participant Redis as audittrace-redis
     participant KC as Keycloak
 
     Agent->>Auth: POST /v1/chat/completions\nAuthorization: Bearer <new JWT>
@@ -174,7 +174,7 @@ sequenceDiagram
     Auth->>Auth: token_hash = sha256(raw_token)
 
     Auth->>Cache: get(token_hash)
-    Cache->>Redis: GET sovereign:token:<hash>
+    Cache->>Redis: GET audittrace:token:<hash>
     Redis-->>Cache: nil
     Cache-->>Auth: None
 
@@ -182,7 +182,7 @@ sequenceDiagram
 
     rect rgb(255, 230, 220)
         Note over Auth,KC: COLD PATH — ~1-2ms
-        Auth->>KC: GET /realms/sovereign-ai/protocol/openid-connect/certs\n(JWKS — cached 5 min in _jwks_cache)
+        Auth->>KC: GET /realms/audittrace/protocol/openid-connect/certs\n(JWKS — cached 5 min in _jwks_cache)
         KC-->>Auth: {"keys": [...]}
         Auth->>Auth: _decode_jwt_with_allowed_issuers(token, keys, aud,\n  primary=keycloak_issuer,\n  extras=keycloak_issuer_extras)\n  1. jwt.decode(token, keys, RS256, audience) — no single-issuer lock\n  2. cross-check payload.iss against {primary} ∪ extras (ADR-032 §2)
     end
@@ -190,7 +190,7 @@ sequenceDiagram
     Auth->>Auth: Build UserContext from claims:\nuser_id = sub\nusername = preferred_username\nscopes = scope.split()\ntoken_id = jti\nis_admin = is_admin_scope(scopes)
 
     Auth->>Cache: put(token_hash, UserContext, ttl=min(jwt.exp - now, 300))
-    Cache->>Redis: SETEX sovereign:token:<hash> <ttl> <json>
+    Cache->>Redis: SETEX audittrace:token:<hash> <ttl> <json>
 
     Auth-->>Agent: continues to chat handler with UserContext
 ```
@@ -220,7 +220,7 @@ sequenceDiagram
 
 ### Bypass mode (development / migration window)
 
-When `SOVEREIGN_AUTH_REQUIRED=false` (the default during the multi-user
+When `AUDITTRACE_AUTH_REQUIRED=false` (the default during the multi-user
 migration window), `require_user` short-circuits the entire flow and
 returns a sentinel `UserContext`. No JWKS fetch, no cache lookup, no
 Keycloak round-trip. Used so existing tests and dev workflows continue
@@ -252,27 +252,27 @@ Two layers of revocation, with different latencies:
 **Maximum revocation latency:** the cache TTL (5 minutes by default).
 This is a deliberate trade-off for performance — see DESIGN §15.6 for
 the full reasoning. Tighter revocation is one config flip away
-(`SOVEREIGN_TOKEN_CACHE_TTL_SECONDS=60`).
+(`AUDITTRACE_TOKEN_CACHE_TTL_SECONDS=60`).
 
 ## Scope vocabulary
 
 Scopes come from the Keycloak realm — NOT from a local roles→scopes
 mapping table. The realm administrator configures which OAuth2 scopes
 are granted to which clients via the Keycloak admin console (or, in
-our case, via the shipped `keycloak/realm-sovereign-ai.json` +
+our case, via the shipped `keycloak/realm-audittrace.json` +
 `scripts/setup-human-user.sh`). The `scope` claim in the JWT is
 authoritative.
 
-The sovereign-ai realm declares these nine client-scopes (source of
-truth: `keycloak/realm-sovereign-ai.json`):
+The audittrace realm declares these nine client-scopes (source of
+truth: `keycloak/realm-audittrace.json`):
 
 | Scope | Granted to | What it gates |
 |---|---|---|
-| `sovereign-ai:query` | every authenticated client | `/v1/chat/completions`, `/session/save` |
-| `sovereign-ai:context` | humans + context-builder clients | `/context` endpoint |
-| `sovereign-ai:audit` | humans + admin-client | `/interactions` audit endpoint (ADR-029) |
-| `sovereign-ai:index` | `inject-memory` client only | write-side memory indexing |
-| `sovereign-ai:admin` | `admin-client` only | `/metrics` + admin-only ops |
+| `audittrace:query` | every authenticated client | `/v1/chat/completions`, `/session/save` |
+| `audittrace:context` | humans + context-builder clients | `/context` endpoint |
+| `audittrace:audit` | humans + admin-client | `/interactions` audit endpoint (ADR-029) |
+| `audittrace:index` | `inject-memory` client only | write-side memory indexing |
+| `audittrace:admin` | `admin-client` only | `/metrics` + admin-only ops |
 | `memory:episodic:read` | humans + dev client | `recall_decisions` tool (ADR-025) — read ADRs |
 | `memory:procedural:read` | humans + dev client | `recall_skills` tool — read SKILL files |
 | `memory:conversational:read-own` | humans + dev client | `recall_recent_sessions` tool — read your own chat history |
@@ -282,13 +282,13 @@ truth: `keycloak/realm-sovereign-ai.json`):
 
 | Client | Flow | Default scopes |
 |---|---|---|
-| `audittrace-opencode` (ADR-032, humans) | Device Flow | `sovereign-ai:query`, `:context`, `:audit`, all four `memory:*` |
-| `sovereign-memory-dev` (CI / smoke) | client_credentials | identical to `audittrace-opencode` — so the dev path exercises the full scope surface |
-| `opencode-agent`, `continue-agent`, `roocode-agent` | client-JWT client_credentials | `sovereign-ai:query` only (legacy, pre-ADR-032) |
-| `inject-memory` | client-JWT | `sovereign-ai:context`, `:index` |
-| `admin-client` | client-JWT | `sovereign-ai:admin`, `:audit` |
+| `audittrace-opencode` (ADR-032, humans) | Device Flow | `audittrace:query`, `:context`, `:audit`, all four `memory:*` |
+| `audittrace-dev` (CI / smoke) | client_credentials | identical to `audittrace-opencode` — so the dev path exercises the full scope surface |
+| `opencode-agent`, `continue-agent`, `roocode-agent` | client-JWT client_credentials | `audittrace:query` only (legacy, pre-ADR-032) |
+| `inject-memory` | client-JWT | `audittrace:context`, `:index` |
+| `admin-client` | client-JWT | `audittrace:admin`, `:audit` |
 
 `is_admin` in the resolved `UserContext` is derived programmatically
-via `is_admin_scope()` — true when the `sovereign-ai:admin` scope is
+via `is_admin_scope()` — true when the `audittrace:admin` scope is
 present. No `memory:admin` or `admin:*` scope exists in the realm;
-admin capability flows through `sovereign-ai:admin` only.
+admin capability flows through `audittrace:admin` only.

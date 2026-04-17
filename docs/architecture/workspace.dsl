@@ -1,4 +1,4 @@
-workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local LLMs" {
+workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs" {
 
     !identifiers hierarchical
     !impliedRelationships true
@@ -23,7 +23,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         langfuse = softwareSystem "Langfuse" "Observability — traces, spans, metrics (sibling stack)" {
             tags "External"
         }
-        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; sovereign-memory-dev serves the CI / smoke-test path." {
+        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; audittrace-dev serves the CI / smoke-test path." {
             tags "External"
         }
         observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
@@ -31,7 +31,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         }
 
         // The system
-        memoryServer = softwareSystem "sovereign-memory-server" "Transparent augmentation proxy with 4-layer memory + Keycloak-delegated identity" {
+        memoryServer = softwareSystem "audittrace-server" "Transparent augmentation proxy with 4-layer memory + Keycloak-delegated identity" {
 
             api = container "FastAPI Application" "OpenAI-compatible API + /context endpoint" "Python / FastAPI / uvicorn" {
 
@@ -40,7 +40,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 healthRoute = component "Health Route" "/health, /metrics" "FastAPI Router"
 
                 // Identity layer (DESIGN §15) — replaces the Phase 0/1 PAT model
-                requireUser = component "require_user" "FastAPI dependency: validates Keycloak JWT via JWKS, accepts iss from the union of keycloak_issuer + keycloak_issuer_extras (ADR-032 §2 — lets Device-Flow tokens on the Traefik-exposed issuer coexist with service-account tokens on the internal issuer), returns typed UserContext (DESIGN §15)" "auth.py"
+                requireUser = component "require_user" "FastAPI dependency: validates Keycloak JWT via JWKS, accepts iss from the union of keycloak_issuer + keycloak_issuer_extras (ADR-032 §2 — lets Device-Flow tokens on the Istio-exposed issuer coexist with service-account tokens on the internal issuer), returns typed UserContext (DESIGN §15)" "auth.py"
                 tokenCache = component "TokenCache" "sha256(token) → UserContext, TTL eviction, Redis-backed (DESIGN §15.4)" "identity.py"
                 requireScope = component "require_scope (legacy)" "JWT scope check returning raw payload dict (ADR-022, ADR-023)" "auth.py"
 
@@ -54,11 +54,11 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 // Memory-as-tools (ADR-025) — dynamic registry + tool-call loop
                 memoryToolRegistry = component "MemoryToolRegistry" "Decorator-based registry (@register_memory_tool). tools_visible_to(user) scope filter. invoke_tool cache-aware dispatch. Optional TOML overlay (ADR-025)" "tools/__init__.py"
                 memoryHandlers = component "Memory Tool Handlers" "recall_decisions, recall_skills, recall_recent_sessions, recall_semantic — thin adapters to the 4 services, canonical {matches, total, truncated} result schema" "tools/memory_handlers.py"
-                toolResultCache = component "ToolResultCache" "sha256(session|tool|args) → result dict, TTL eviction, Redis-backed, namespace sovereign:tool-result:, disjoint from TokenCache (ADR-025 §Decision.8)" "tools/cache.py"
-                memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute selected memory tool → repeat. LLM selects ONE tool per question via ambient context selection rules. Bounded by SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 Accepted)" "routes/_memory_tool_loop.py"
+                toolResultCache = component "ToolResultCache" "sha256(session|tool|args) → result dict, TTL eviction, Redis-backed, namespace audittrace:tool-result:, disjoint from TokenCache (ADR-025 §Decision.8)" "tools/cache.py"
+                memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute selected memory tool → repeat. LLM selects ONE tool per question via ambient context selection rules. Bounded by AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 Accepted)" "routes/_memory_tool_loop.py"
 
                 // Background summarisation (ADR-030)
-                sessionSummarizer = component "SessionSummarizer" "Background asyncio task — every SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES picks idle sessions (last interaction > SOVEREIGN_SUMMARIZER_IDLE_MINUTES) via FOR UPDATE SKIP LOCKED, calls the summariser LLM with strict-JSON response_format, writes SessionRecord rows. Sets app.current_user_id GUC per-session for RLS attribution (ADR-030)" "services/session_summarizer.py"
+                sessionSummarizer = component "SessionSummarizer" "Background asyncio task — every AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES picks idle sessions (last interaction > AUDITTRACE_SUMMARIZER_IDLE_MINUTES) via FOR UPDATE SKIP LOCKED, calls the summariser LLM with strict-JSON response_format, writes SessionRecord rows. Sets app.current_user_id GUC per-session for RLS attribution (ADR-030)" "services/session_summarizer.py"
 
                 // Plumbing
                 diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"
@@ -72,7 +72,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             chromaDb = container "ChromaDB Server" "Vector store — decisions, skills collections — token auth" "ChromaDB HTTP Server" {
                 tags "Database"
             }
-            redisCache = container "Redis 7" "Shared cache — sovereign:token:* for TokenCache (DESIGN §15.4) and sovereign:tool-result:* for ToolResultCache (ADR-025 §Decision.8). Disjoint key prefixes." "Redis" {
+            redisCache = container "Redis 7" "Shared cache — audittrace:token:* for TokenCache (DESIGN §15.4) and audittrace:tool-result:* for ToolResultCache (ADR-025 §Decision.8). Disjoint key prefixes." "Redis" {
                 tags "Database"
             }
             minioStore = container "MinIO" "S3-compatible object storage — memory-shared (ADRs, skills) + memory-private (per-user knowledge). SSE-S3 encryption at rest (ADR-027)" "MinIO" {
@@ -83,7 +83,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         // Relationships — system level
         humanUser -> keycloak "Interactive Device Flow login via browser (client_id=audittrace-opencode) — ADR-032" "HTTPS/OIDC"
         humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
-        agent -> keycloak "Token refresh + service-account client_credentials (sovereign-memory-dev)" "HTTPS/OIDC"
+        agent -> keycloak "Token refresh + service-account client_credentials (audittrace-dev)" "HTTPS/OIDC"
         agent -> memoryServer.api "POST /v1/chat/completions (Bearer JWT)" "HTTPS/JSON"
         architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
         memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
@@ -97,7 +97,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         memoryServer.api.requireUser -> memoryServer.api.tokenCache "hot path: get(sha256(token))"
         memoryServer.api.requireUser -> keycloak "cold path: validate JWT against JWKS" "HTTP/JSON"
         memoryServer.api.requireUser -> memoryServer.api.tokenCache "cold path: put(sha256(token), UserContext, TTL)"
-        memoryServer.api.tokenCache -> memoryServer.redisCache "GET/SETEX/SCAN under sovereign:token:*" "Redis protocol"
+        memoryServer.api.tokenCache -> memoryServer.redisCache "GET/SETEX/SCAN under audittrace:token:*" "Redis protocol"
 
         // Legacy JWT path (kept for backwards compat until Phase 7)
         memoryServer.api.contextRoute -> memoryServer.api.requireScope "legacy: returns raw payload dict"
@@ -117,7 +117,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         memoryServer.api.memoryToolLoop -> memoryServer.api.memoryToolRegistry "get_tool_by_name + invoke_tool dispatch"
         memoryServer.api.memoryToolRegistry -> memoryServer.api.toolResultCache "cache.get / cache.put (skip on exception)"
         memoryServer.api.memoryToolRegistry -> memoryServer.api.memoryHandlers "await tool.handler(user_context, args)"
-        memoryServer.api.toolResultCache -> memoryServer.redisCache "GET/SETEX/SCAN under sovereign:tool-result:*" "Redis protocol"
+        memoryServer.api.toolResultCache -> memoryServer.redisCache "GET/SETEX/SCAN under audittrace:tool-result:*" "Redis protocol"
 
         // Memory tool handlers wrap the existing 4-layer services
         memoryServer.api.memoryHandlers -> memoryServer.api.episodicSvc "recall_decisions → search(user, query)"
@@ -155,37 +155,48 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
         memoryServer.api.chatRoute -> memoryServer.postgresDb "INSERT interactions (user_id = Keycloak sub)"
         memoryServer.api.chatRoute -> memoryServer.postgresDb "INSERT tool_calls (ADR-025: one row per memory tool invocation; cache hits skip)"
 
-        // Deployment — Docker Compose
-        deploymentEnvironment "Docker" {
+        // Deployment — Kubernetes + Istio
+        deploymentEnvironment "Kubernetes" {
 
-            deploymentNode "Docker Compose" "sovereign-ai-stack" "Docker Compose v2" {
+            deploymentNode "k3s Cluster" "pcluislinux" "k3s v1.34 + Istio 1.29" {
 
-                deploymentNode "traefik" "TLS termination + reverse proxy" "Traefik v3" {
-                    traefikInstance = infrastructureNode "Traefik" "HTTPS :443 → memory-server :8765" "Traefik v3"
+                deploymentNode "Namespace: istio-system" "Istio control plane" "Kubernetes" {
+                    istiodInstance = infrastructureNode "istiod" "Service mesh control plane — xDS, cert rotation, policy" "Istio 1.29"
                 }
 
-                deploymentNode "memory-server" "FastAPI application container" "Python 3.12 / uvicorn" {
-                    apiInstance = containerInstance memoryServer.api
-                }
+                deploymentNode "Namespace: audittrace" "Istio sidecar injection enabled" "Kubernetes" {
 
-                deploymentNode "postgres" "Audit + sessions — interactions, sessions, tool_calls (DESIGN §15)" "PostgreSQL 16 Alpine" {
-                    pgInstance = containerInstance memoryServer.postgresDb
-                }
+                    deploymentNode "Istio IngressGateway" "TLS termination + routing" "Envoy" {
+                        ingressInstance = infrastructureNode "Istio IngressGateway" "HTTPS :443 → audittrace-server :8765, /realms/* → keycloak" "Envoy"
+                    }
 
-                deploymentNode "redis" "Shared cache: sovereign:token:* (DESIGN §15.4) + sovereign:tool-result:* (ADR-025 §Decision.8). Dedicated — NOT shared with Langfuse Redis." "Redis 7 Alpine" {
-                    redisInstance = containerInstance memoryServer.redisCache
-                }
+                    deploymentNode "audittrace-server Deployment" "FastAPI application pod" "Python 3.12 / uvicorn" {
+                        apiInstance = containerInstance memoryServer.api
+                    }
 
-                deploymentNode "chromadb" "Vector store — token auth" "ChromaDB HTTP Server" {
-                    chromaInstance = containerInstance memoryServer.chromaDb
-                }
+                    deploymentNode "postgresql StatefulSet" "Audit + sessions — interactions, sessions, tool_calls (DESIGN §15)" "PostgreSQL 16 Alpine" {
+                        pgInstance = containerInstance memoryServer.postgresDb
+                    }
 
-                deploymentNode "minio" "S3 object storage — SSE-S3 encryption at rest, per-user isolation via path prefix (ADR-027)" "MinIO" {
-                    minioInstance = containerInstance memoryServer.minioStore
-                }
+                    deploymentNode "redis StatefulSet" "Shared cache: audittrace:token:* (DESIGN §15.4) + audittrace:tool-result:* (ADR-025 §Decision.8). Dedicated — NOT shared with Langfuse Redis." "Redis 7 Alpine" {
+                        redisInstance = containerInstance memoryServer.redisCache
+                    }
 
-                deploymentNode "keycloak" "Identity provider — owns users/roles/JWT issuance" "Keycloak 24" {
-                    keycloakInstance = infrastructureNode "Keycloak" "Realm: sovereign-ai, OIDC + private_key_jwt" "Keycloak 24"
+                    deploymentNode "chromadb StatefulSet" "Vector store — token auth" "ChromaDB HTTP Server" {
+                        chromaInstance = containerInstance memoryServer.chromaDb
+                    }
+
+                    deploymentNode "minio StatefulSet" "S3 object storage — SSE-S3 encryption at rest, per-user isolation via path prefix (ADR-027)" "MinIO" {
+                        minioInstance = containerInstance memoryServer.minioStore
+                    }
+
+                    deploymentNode "keycloak Deployment" "Identity provider — owns users/roles/JWT issuance" "Keycloak 24" {
+                        keycloakInstance = infrastructureNode "Keycloak" "Realm: audittrace, OIDC + private_key_jwt" "Keycloak 24"
+                    }
+
+                    deploymentNode "otel-collector DaemonSet" "OTLP receiver → Prometheus + Loki fan-out" "otel-contrib" {
+                        otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver → Prometheus + Loki fan-out (mesh-local)" "otel-contrib"
+                    }
                 }
             }
 
@@ -199,16 +210,9 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
                 langfuseInstance = infrastructureNode "Langfuse Web" "Observability traces + OTLP ingest" "Langfuse v3"
             }
 
-            deploymentNode "Observability Stack" "Sibling compose — shared network (ADR-028)" "Docker Compose" {
-                otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver → Prometheus + Loki fan-out" "otel-contrib"
-                prometheusInstance = infrastructureNode "Prometheus" "Metrics storage + query (:9090)" "Prometheus"
-                lokiInstance = infrastructureNode "Loki" "Log aggregation (:3100)" "Grafana Loki"
-                grafanaInstance = infrastructureNode "Grafana" "Dashboards (:3001)" "Grafana"
-            }
-
             // Deployment relationships
-            traefikInstance -> apiInstance "HTTPS → HTTP proxy"
-            traefikInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
+            ingressInstance -> apiInstance "HTTPS → HTTP proxy (mTLS via Istio sidecar)"
+            ingressInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
             apiInstance -> keycloakInstance "JWKS fetch (cached)" "HTTP/JSON"
             apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
             apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"
@@ -216,22 +220,18 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             apiInstance -> summarizerInstance "Background summariser loop — non-streaming JSON (ADR-030)" "HTTP/JSON"
             apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
             apiInstance -> otelCollectorInstance "OTLP metrics + logs" "HTTP/OTLP"
-            otelCollectorInstance -> prometheusInstance "Remote write (metrics)" "HTTP"
-            otelCollectorInstance -> lokiInstance "Push (logs)" "HTTP"
-            grafanaInstance -> prometheusInstance "Query metrics" "PromQL"
-            grafanaInstance -> lokiInstance "Query logs" "LogQL"
             chromaInstance -> embedInstance "Embedding vectors" "HTTP"
         }
     }
 
     views {
 
-        systemContext memoryServer "SystemContext" "sovereign-memory-server — who uses it" {
+        systemContext memoryServer "SystemContext" "audittrace-server — who uses it" {
             include *
             autolayout lr
         }
 
-        container memoryServer "Containers" "sovereign-memory-server — deployable units (incl. Redis token cache)" {
+        container memoryServer "Containers" "audittrace-server — deployable units (incl. Redis token cache)" {
             include *
             autolayout lr
         }
@@ -241,7 +241,7 @@ workspace "sovereign-memory-server" "4-Layer Memory Augmentation Proxy for Local
             autolayout tb
         }
 
-        deployment memoryServer "Docker" "DockerCompose" "Docker Compose topology — incl. sovereign-redis container (DESIGN §15.4)" {
+        deployment memoryServer "Kubernetes" "K8sIstio" "k3s + Istio topology — Namespace audittrace with Envoy sidecars" {
             include *
             autolayout lr
         }

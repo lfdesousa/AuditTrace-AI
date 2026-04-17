@@ -48,7 +48,7 @@ The chat completions endpoint (inject mode):
 ```mermaid
 sequenceDiagram
     participant Agent as Coding Agent
-    participant Traefik as Traefik (TLS)
+    participant Gateway as Istio Gateway (TLS)
     participant Auth as require_user
     participant Cache as TokenCache (Redis)
     participant Chat as chat_completions\n(routes/chat.py)
@@ -58,8 +58,8 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant LF as Langfuse\n(ingestion API)
 
-    Agent->>Traefik: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\n{messages, model, tools, tool_choice, stream: true}
-    Traefik->>Auth: TLS terminated → HTTP
+    Agent->>Gateway: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\n{messages, model, tools, tool_choice, stream: true}
+    Gateway->>Auth: TLS terminated → HTTP (mTLS via Envoy sidecar)
 
     Auth->>Cache: get(sha256(token))
     Cache-->>Auth: UserContext (hot path)
@@ -95,8 +95,8 @@ sequenceDiagram
     loop For each SSE line from llama-server
         LLM-->>Chat: data: {choices: [{delta: {content/tool_calls/...}}]}
         Chat->>Chat: accumulate text content + tool_calls (by index)
-        Chat-->>Traefik: yield (line + "\n").encode()
-        Traefik-->>Agent: byte-equal SSE chunk
+        Chat-->>Gateway: yield (line + "\n").encode()
+        Gateway-->>Agent: byte-equal SSE chunk
     end
 
     LLM-->>Chat: data: [DONE]
