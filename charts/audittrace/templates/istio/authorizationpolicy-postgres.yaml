@@ -1,0 +1,22 @@
+{{- if .Values.istio.enabled }}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-postgres
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgresql
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-keycloak"
+      to:
+        - operation:
+            ports: ["5432"]
+{{- end }}

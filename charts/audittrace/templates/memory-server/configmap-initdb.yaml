@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-initdb
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  init-keycloak-db.sql: |
+    -- Create keycloak database in the same PostgreSQL instance.
+    -- This script runs only on first initialization (docker-entrypoint-initdb.d).
+    CREATE DATABASE keycloak;
+  init-audittrace-app-role.sh: |
+    #!/usr/bin/env bash
+    # DESIGN §16 Phase 4 — create a non-superuser application role.
+    set -euo pipefail
+
+    POSTGRES_USER="${POSTGRES_USER:-audittrace}"
+    POSTGRES_DB="${POSTGRES_DB:-audittrace}"
+    APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+
+    if [[ -z "${APP_PASSWORD}" ]]; then
+        echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2
+        exit 1
+    fi
+
+    echo "[init-audittrace-app-role] Creating non-superuser app role..."
+
+    psql \
+        --username="${POSTGRES_USER}" \
+        --dbname="${POSTGRES_DB}" \
+        --set ON_ERROR_STOP=on \
+        --set "app_password=${APP_PASSWORD}" \
+        <<'EOSQL'
+    -- Hoist the psql variable into a session GUC the DO block can read.
+    SELECT set_config('audittrace.app_password', :'app_password', false);
+
+    -- ────────────────────── Create or rotate role ───────────────────────
+    DO $$
+    DECLARE
+        pw text := current_setting('audittrace.app_password', true);
+    BEGIN
+        IF pw IS NULL OR pw = '' THEN
+            RAISE EXCEPTION 'audittrace.app_password GUC is empty';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'audittrace_app') THEN
+            EXECUTE format(
+                'CREATE ROLE audittrace_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD %L',
+                pw
+            );
+            RAISE NOTICE 'Created role audittrace_app (NOSUPERUSER, NOBYPASSRLS, LOGIN)';
+        ELSE
+            EXECUTE format('ALTER ROLE audittrace_app WITH PASSWORD %L', pw);
+            RAISE NOTICE 'Role audittrace_app already existed — password rotated';
+        END IF;
+    END
+    $$;
+
+    -- ───────────────────────────── Grants ─────────────────────────────
+    GRANT USAGE, CREATE ON SCHEMA public TO audittrace_app;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO audittrace_app;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO audittrace_app;
+
+    ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO audittrace_app;
+    ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
+        GRANT USAGE, SELECT ON SEQUENCES TO audittrace_app;
+
+    -- ────────── Ownership transfer for RLS-protected tables ─────────
+    DO $$
+    DECLARE
+        t text;
+    BEGIN
+        FOR t IN SELECT unnest(ARRAY['interactions', 'sessions', 'tool_calls'])
+        LOOP
+            IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = t) THEN
+                EXECUTE format('ALTER TABLE public.%I OWNER TO audittrace_app', t);
+                RAISE NOTICE 'Transferred ownership of public.% to audittrace_app', t;
+            END IF;
+        END LOOP;
+    END
+    $$;
+
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'interactions_id_seq') THEN
+            ALTER SEQUENCE public.interactions_id_seq OWNER TO audittrace_app;
+            RAISE NOTICE 'Transferred ownership of interactions_id_seq to audittrace_app';
+        END IF;
+    END
+    $$;
+    EOSQL
+
+    echo "[init-audittrace-app-role] Done."

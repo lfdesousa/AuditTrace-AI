@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-langfuse
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: langfuse
+spec:
+  clusterIP: None
+  ports:
+    - port: {{ .Values.observability.external.langfusePort }}
+      targetPort: {{ .Values.observability.external.langfusePort }}
+      protocol: TCP
+      name: http
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: {{ .Release.Name }}-langfuse
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+subsets:
+  - addresses:
+      - ip: {{ .Values.observability.external.langfuseIP }}
+    ports:
+      - port: {{ .Values.observability.external.langfusePort }}
+        protocol: TCP
+        name: http

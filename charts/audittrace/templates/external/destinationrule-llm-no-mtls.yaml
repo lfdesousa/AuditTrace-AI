@@ -1,0 +1,26 @@
+{{- if .Values.istio.enabled }}
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: {{ .Release.Name }}-llm-no-mtls
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  host: llm-external.{{ .Release.Namespace }}.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+    portLevelSettings:
+      - port:
+          number: {{ .Values.externalLLM.chat.port }}
+        tls:
+          mode: DISABLE
+      - port:
+          number: {{ .Values.externalLLM.embed.port }}
+        tls:
+          mode: DISABLE
+      - port:
+          number: {{ .Values.externalLLM.summarizer.port }}
+        tls:
+          mode: DISABLE
+{{- end }}

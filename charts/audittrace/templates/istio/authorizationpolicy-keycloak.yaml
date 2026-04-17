@@ -1,0 +1,22 @@
+{{- if .Values.istio.enabled }}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-keycloak
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: keycloak
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+      to:
+        - operation:
+            ports: ["8080"]
+{{- end }}

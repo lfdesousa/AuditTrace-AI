@@ -1,0 +1,21 @@
+{{- if .Values.istio.enabled }}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-redis
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: redis
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+      to:
+        - operation:
+            ports: ["6379"]
+{{- end }}

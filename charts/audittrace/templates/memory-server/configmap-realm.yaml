@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-keycloak-realm
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  realm.json: |-
+    {{ .Files.Get "files/realm-audittrace.json" | nindent 4 }}
