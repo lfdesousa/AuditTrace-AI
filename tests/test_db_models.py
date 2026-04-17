@@ -144,10 +144,11 @@ class TestSessionRecordCRUD:
             model="m2",
         )
         db_session.add(record1)
-        db_session.flush()
+        db_session.commit()
         db_session.add(record2)
-        with pytest.raises(Exception):  # IntegrityError
-            db_session.flush()
+        with pytest.raises(Exception):  # IntegrityError from DB constraint
+            db_session.commit()
+        db_session.rollback()
 
 
 # ────────── Audit + identity-bearing tables (DESIGN §15) ────────────────────

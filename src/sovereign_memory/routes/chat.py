@@ -21,6 +21,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
@@ -38,7 +39,7 @@ from sovereign_memory.config import Settings, get_settings
 from sovereign_memory.db.models import InteractionRecord, ToolCall
 from sovereign_memory.dependencies import get_context_builder, get_postgres_factory
 from sovereign_memory.identity import UserContext
-from sovereign_memory.logging_config import log_call
+from sovereign_memory.logging_config import log_call, reset_langgraph_step
 from sovereign_memory.routes._memory_tool_loop import (
     PendingToolCall,
     run_memory_tool_loop,
@@ -92,6 +93,102 @@ def _openai_error_body(
     return {"error": body}
 
 
+# ──────────────── Stream helpers (backlog #01) ─────────────────────────
+
+
+@dataclass
+class _StreamState:
+    """Mutable accumulator for SSE stream parsing."""
+
+    chunks: list[str] = field(default_factory=list)
+    tool_calls_acc: dict[int, dict[str, Any]] = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str | None = None
+    id: str | None = None
+    created: int | None = None
+    finish_reason: str | None = None
+    done_seen: bool = False
+
+
+def _accumulate_chunk(state: _StreamState, chunk: dict[str, Any]) -> None:
+    """Extract metadata, content, tool_calls, and usage from a parsed SSE chunk."""
+    if not state.model and chunk.get("model"):
+        state.model = chunk["model"]
+    if not state.id and chunk.get("id"):
+        state.id = chunk["id"]
+    if not state.created and chunk.get("created"):
+        state.created = chunk["created"]
+    choices = chunk.get("choices") or []
+    if choices:
+        choice0 = choices[0]
+        if choice0.get("finish_reason"):
+            state.finish_reason = choice0["finish_reason"]
+        delta = choice0.get("delta") or {}
+        content = delta.get("content")
+        if content:
+            state.chunks.append(content)
+        # Accumulate streamed tool_calls by index — fragments
+        # of function.arguments arrive across many chunks.
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            if idx not in state.tool_calls_acc:
+                state.tool_calls_acc[idx] = {
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": "",
+                        "arguments": "",
+                    },
+                }
+            entry = state.tool_calls_acc[idx]
+            if tc.get("id"):
+                entry["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                entry["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                entry["function"]["arguments"] += fn["arguments"]
+    usage = chunk.get("usage") or {}
+    if usage:
+        state.prompt_tokens = usage.get("prompt_tokens", state.prompt_tokens)
+        state.completion_tokens = usage.get(
+            "completion_tokens", state.completion_tokens
+        )
+    timings = chunk.get("timings") or {}
+    if timings:
+        cache_n = int(timings.get("cache_n", 0) or 0)
+        prompt_n = int(timings.get("prompt_n", 0) or 0)
+        predicted_n = int(timings.get("predicted_n", 0) or 0)
+        if state.prompt_tokens == 0:
+            state.prompt_tokens = cache_n + prompt_n
+        if state.completion_tokens == 0:
+            state.completion_tokens = predicted_n
+
+
+def _build_synthetic_usage_chunk(state: _StreamState, requested_model: str) -> bytes:
+    """Build the synthetic usage SSE chunk emitted after the stream ends."""
+    usage_chunk: dict[str, Any] = {
+        "id": state.id or "chatcmpl-sovereign",
+        "object": "chat.completion.chunk",
+        "created": state.created or 0,
+        "model": state.model or requested_model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": state.prompt_tokens,
+            "completion_tokens": state.completion_tokens,
+            "total_tokens": state.prompt_tokens + state.completion_tokens,
+        },
+    }
+    return ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
+
+
+def _emit_sse_error_frame(failure_class: str, message: str, status: int) -> bytes:
+    """Build an SSE error frame + [DONE] terminator for streaming errors."""
+    err_body = _openai_error_body(message=message, code=failure_class, status=status)
+    return ("data: " + json.dumps(err_body) + "\n\n" + "data: [DONE]\n\n").encode()
+
+
 # Optional Langfuse decorator + client lookup. The package is in requirements
 # but the @observe path is a soft dependency — when Langfuse is disabled or
 # the import fails for any reason, we fall back to a no-op decorator and a
@@ -135,7 +232,7 @@ def _compute_session_id(source: str, first_user_content: str, user_id: str) -> s
     """
     today = date.today().isoformat()
     raw = f"{source}|{today}|{user_id}|{first_user_content}"
-    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
     return f"{source}-{today}-{h}"
 
 
@@ -991,6 +1088,7 @@ async def chat_completions(
     ``_build_memory_context_with_trace`` owns the request span instead.
     """
     settings = get_settings()
+    reset_langgraph_step()  # backlog #02: per-trace step counter
     try:
         payload: dict[str, Any] = await http_request.json()
     except Exception as exc:
@@ -1066,15 +1164,7 @@ async def chat_completions(
     if is_stream:
 
         async def _iter_and_capture() -> AsyncIterator[bytes]:
-            chunks: list[str] = []
-            tool_calls_acc: dict[int, dict[str, Any]] = {}
-            prompt_tokens = 0
-            completion_tokens = 0
-            response_model: str | None = None
-            response_id: str | None = None
-            response_created: int | None = None
-            finish_reason: str | None = None
-            done_seen = False
+            state = _StreamState()
             perf_start = time.perf_counter()
             try:
                 async with httpx.AsyncClient(
@@ -1104,83 +1194,17 @@ async def chat_completions(
                             payload_str = stripped[6:]
                             if payload_str == "[DONE]":
                                 # Hold the marker — synthetic usage chunk goes first.
-                                done_seen = True
+                                state.done_seen = True
                                 continue
                             yield (line + "\n").encode()
                             try:
                                 chunk = json.loads(payload_str)
                             except json.JSONDecodeError:
                                 continue
-                            if not response_model and chunk.get("model"):
-                                response_model = chunk["model"]
-                            if not response_id and chunk.get("id"):
-                                response_id = chunk["id"]
-                            if not response_created and chunk.get("created"):
-                                response_created = chunk["created"]
-                            choices = chunk.get("choices") or []
-                            if choices:
-                                choice0 = choices[0]
-                                if choice0.get("finish_reason"):
-                                    finish_reason = choice0["finish_reason"]
-                                delta = choice0.get("delta") or {}
-                                content = delta.get("content")
-                                if content:
-                                    chunks.append(content)
-                                # Accumulate streamed tool_calls by index — fragments
-                                # of function.arguments arrive across many chunks.
-                                for tc in delta.get("tool_calls") or []:
-                                    idx = tc.get("index", 0)
-                                    if idx not in tool_calls_acc:
-                                        tool_calls_acc[idx] = {
-                                            "id": tc.get("id", ""),
-                                            "type": tc.get("type", "function"),
-                                            "function": {
-                                                "name": "",
-                                                "arguments": "",
-                                            },
-                                        }
-                                    entry = tool_calls_acc[idx]
-                                    if tc.get("id"):
-                                        entry["id"] = tc["id"]
-                                    fn = tc.get("function") or {}
-                                    if fn.get("name"):
-                                        entry["function"]["name"] = fn["name"]
-                                    if fn.get("arguments"):
-                                        entry["function"]["arguments"] += fn[
-                                            "arguments"
-                                        ]
-                            usage = chunk.get("usage") or {}
-                            if usage:
-                                prompt_tokens = usage.get(
-                                    "prompt_tokens", prompt_tokens
-                                )
-                                completion_tokens = usage.get(
-                                    "completion_tokens", completion_tokens
-                                )
-                            timings = chunk.get("timings") or {}
-                            if timings:
-                                cache_n = int(timings.get("cache_n", 0) or 0)
-                                prompt_n = int(timings.get("prompt_n", 0) or 0)
-                                predicted_n = int(timings.get("predicted_n", 0) or 0)
-                                if prompt_tokens == 0:
-                                    prompt_tokens = cache_n + prompt_n
-                                if completion_tokens == 0:
-                                    completion_tokens = predicted_n
+                            _accumulate_chunk(state, chunk)
                 # Inject synthetic usage chunk for OpenAI clients that need it.
-                usage_chunk: dict[str, Any] = {
-                    "id": response_id or "chatcmpl-sovereign",
-                    "object": "chat.completion.chunk",
-                    "created": response_created or 0,
-                    "model": response_model or requested_model,
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                    },
-                }
-                yield ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
-                if done_seen:
+                yield _build_synthetic_usage_chunk(state, requested_model)
+                if state.done_seen:
                     yield b"data: [DONE]\n\n"
             except httpx.TimeoutException as exc:
                 # Proxy timeout — the Qwen <think> loop took longer than
@@ -1190,15 +1214,11 @@ async def chat_completions(
                 # row, and let the stream close cleanly. See migration
                 # 007 and the 2026-04-16 plan in
                 # ~/.claude/plans/reflective-discovering-platypus.md.
-                err_body = _openai_error_body(
-                    message=(
-                        f"llama-server idle timeout after {settings.llama_chunk_timeout}s"
-                    ),
-                    code=FAILURE_PROXY_TIMEOUT,
-                    status=504,
+                yield _emit_sse_error_frame(
+                    FAILURE_PROXY_TIMEOUT,
+                    f"llama-server idle timeout after {settings.llama_chunk_timeout}s",
+                    504,
                 )
-                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
                     source=source,
@@ -1216,13 +1236,11 @@ async def chat_completions(
                 )
                 return
             except httpx.ConnectError as exc:
-                err_body = _openai_error_body(
-                    message=f"llama-server unreachable at {llama_url}",
-                    code=FAILURE_UPSTREAM_UNREACHABLE,
-                    status=502,
+                yield _emit_sse_error_frame(
+                    FAILURE_UPSTREAM_UNREACHABLE,
+                    f"llama-server unreachable at {llama_url}",
+                    502,
                 )
-                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
                     source=source,
@@ -1240,15 +1258,11 @@ async def chat_completions(
                 )
                 return
             except httpx.HTTPStatusError as exc:
-                err_body = _openai_error_body(
-                    message=(
-                        f"llama-server returned status {exc.response.status_code}"
-                    ),
-                    code=FAILURE_UPSTREAM_ERROR,
-                    status=502,
+                yield _emit_sse_error_frame(
+                    FAILURE_UPSTREAM_ERROR,
+                    f"llama-server returned status {exc.response.status_code}",
+                    502,
                 )
-                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
                     source=source,
@@ -1267,13 +1281,11 @@ async def chat_completions(
                 return
             except Exception as exc:
                 logger.exception("streaming chat generator failed unexpectedly")
-                err_body = _openai_error_body(
-                    message="Internal error during streaming.",
-                    code=FAILURE_INTERNAL_ERROR,
-                    status=500,
+                yield _emit_sse_error_frame(
+                    FAILURE_INTERNAL_ERROR,
+                    "Internal error during streaming.",
+                    500,
                 )
-                yield ("data: " + json.dumps(err_body) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
                 _persist_interaction(
                     project=project,
                     source=source,
@@ -1292,9 +1304,9 @@ async def chat_completions(
                 return
 
             # Post-stream: build answer including tool_calls if present
-            text_answer = "".join(chunks)
-            if tool_calls_acc:
-                tool_calls_text = _render_tool_calls_text(tool_calls_acc)
+            text_answer = "".join(state.chunks)
+            if state.tool_calls_acc:
+                tool_calls_text = _render_tool_calls_text(state.tool_calls_acc)
                 answer = (
                     text_answer + "\n" + tool_calls_text
                     if text_answer
@@ -1308,26 +1320,26 @@ async def chat_completions(
                 source=source,
                 question=query,
                 answer=answer,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                prompt_tokens=state.prompt_tokens,
+                completion_tokens=state.completion_tokens,
                 session_id=session_id,
-                model=response_model or requested_model,
+                model=state.model or requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - perf_start) * 1000),
             )
             await _record_langfuse_output(
                 trace_id=trace_id,
                 answer=answer,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                finish_reason=finish_reason,
+                prompt_tokens=state.prompt_tokens,
+                completion_tokens=state.completion_tokens,
+                finish_reason=state.finish_reason,
                 tool_calls=(
-                    [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-                    if tool_calls_acc
+                    [state.tool_calls_acc[i] for i in sorted(state.tool_calls_acc)]
+                    if state.tool_calls_acc
                     else None
                 ),
                 session_id=session_id,
-                model=response_model or requested_model,
+                model=state.model or requested_model,
             )
 
         return StreamingResponse(
