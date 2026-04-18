@@ -18,6 +18,31 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Postgres service container for the RLS integration tests. Without
+    # this the tests skipped silently and the RLS contract (migration 005,
+    # ADR-026 §RLS posture) ran unverified in CI — a liability for a
+    # compliance-first architecture.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: audittrace
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # tests/test_rls_isolation.py looks this up first; without it the
+      # suite falls back to a localhost:15432 compose probe. In CI we
+      # publish the service on :5432, so set the URL accordingly.
+      AUDITTRACE_TEST_POSTGRES_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/audittrace"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -45,8 +70,55 @@ jobs:
       - name: Format check
         run: ruff format --check src/ tests/
 
-      - name: Tests + project-wide coverage gate
-        run: pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-report=html:htmlcov --cov-fail-under=90
+      - name: Assert RLS integration tests are actually runnable
+        # Belt + braces: prove the Postgres service is reachable before
+        # we rely on it, and fail loudly (not silently skip) if it's not.
+        run: |
+          python - <<'PY'
+          import socket
+          with socket.create_connection(("localhost", 5432), timeout=10):
+              print("postgres reachable on :5432 — RLS tests will run")
+          PY
+
+      - name: Tests + project-wide coverage gate (with junit-xml for skip audit)
+        run: |
+          pytest tests/ -v \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-report=html:htmlcov \
+            --cov-fail-under=90 \
+            --junit-xml=junit.xml
+
+      - name: Fail if any test was silently skipped
+        # Zero-tolerance on skips in CI (directive 2026-04-18): a skip is
+        # a missing assertion in disguise. If a test depends on an
+        # environmental resource, CI provisions it (see the postgres
+        # service above). Otherwise the test is broken and should be
+        # fixed or deleted — never skipped.
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, sys
+          root = ET.parse("junit.xml").getroot()
+          # junit's <testsuite> carries skipped="N"; roll them up.
+          total = 0
+          skipped = []
+          for ts in root.iter("testsuite"):
+              total += int(ts.get("skipped", "0"))
+          # For names + reasons, inspect <skipped> children on testcases.
+          for tc in root.iter("testcase"):
+              for skip in tc.findall("skipped"):
+                  skipped.append(
+                      f"{tc.get('classname')}.{tc.get('name')} — "
+                      f"{skip.get('message','<no reason>')}"
+                  )
+          if total:
+              print("::error::%d skipped test(s) — skips are forbidden in CI." % total)
+              for s in skipped[:20]:
+                  print(f"  - {s}")
+              sys.exit(1)
+          print("No skipped tests. Good.")
+          PY
 
       - name: Per-file coverage gate (each component >= 90%)
         # Mirrors `make test` locally: project-wide --cov-fail-under hides

@@ -44,10 +44,24 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
+	@echo "🚫 Enforcing zero-skip policy..."
+	@.venv/bin/python scripts/check-no-skipped-tests.py
 	@echo "✅ Tests passed"
+
+test-rls-local: ## Run RLS integration tests against the k3s Postgres (port-forwards for you)
+	@echo "🔌 Port-forwarding audittrace-postgresql svc → localhost:15432 ..."
+	@KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} \
+	  kubectl -n audittrace port-forward svc/audittrace-postgresql 15432:5432 >/tmp/pgforward.log 2>&1 & \
+	  pf=$$!; trap "kill $$pf 2>/dev/null" EXIT; \
+	  sleep 3; \
+	  pw=$$(KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} \
+	    kubectl -n audittrace get secret audittrace-postgresql -o jsonpath='{.data.postgres-password}' | base64 -d); \
+	  AUDITTRACE_TEST_POSTGRES_URL="postgresql+psycopg2://postgres:$$pw@localhost:15432/audittrace" \
+	    .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov
+	@echo "✅ RLS integration tests passed"
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
