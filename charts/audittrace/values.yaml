@@ -13,7 +13,13 @@ memoryServer:
   image:
     repository: localhost:5000/audittrace/memory-server
     tag: latest
-    pullPolicy: IfNotPresent
+    # Default is Always because the default tag is the mutable "latest".
+    # With IfNotPresent + latest, kubelet never re-pulls on rollout (the
+    # tag is the key, not the digest), so developers iterating on code
+    # silently keep running the stale image — a trap that cost us 20 min
+    # on 2026-04-18. Override to IfNotPresent when you pin to an
+    # immutable digest or a semver-tagged release.
+    pullPolicy: Always
   summariser:
     # When true, a post-install/post-upgrade Helm hook provisions a
     # dedicated, minimum-privilege `audittrace_summariser` role with
