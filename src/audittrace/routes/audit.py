@@ -36,6 +36,12 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
     Kept explicit (rather than piped through a Pydantic model) because
     ``InteractionRow.timestamp`` is stored as an ISO string and we want
     the response to mirror that without a parse/format round-trip.
+
+    Includes the migration-007 failure-audit columns (``status``,
+    ``failure_class``, ``error_detail``, ``duration_ms``) so the audit
+    browser surfaces failed calls — without these the ADR-033 "every
+    failure gets a row" promise is half-landed: the rows exist but the
+    audit API pretends they're all successes.
     """
     return {
         "id": row.id,
@@ -49,6 +55,10 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         "session_id": row.session_id,
         "model": row.model,
         "user_id": row.user_id,
+        "status": row.status,
+        "failure_class": row.failure_class,
+        "error_detail": row.error_detail,
+        "duration_ms": row.duration_ms,
     }
 
 
@@ -71,6 +81,13 @@ async def list_interactions(
         None,
         description=(
             "ISO-8601 timestamp. Only rows with timestamp >= since are returned."
+        ),
+    ),
+    status: str | None = Query(
+        None,
+        description=(
+            "Filter by status: 'success' or 'failed' (migration 007 / ADR-033). "
+            "Use 'failed' to enumerate rows where the chat path errored out."
         ),
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
@@ -103,6 +120,8 @@ async def list_interactions(
             q = q.filter(InteractionRow.source == source)
         if since is not None:
             q = q.filter(InteractionRow.timestamp >= since)
+        if status is not None:
+            q = q.filter(InteractionRow.status == status)
 
         total = q.count()
         rows = q.order_by(InteractionRow.id.desc()).offset(offset).limit(limit).all()
