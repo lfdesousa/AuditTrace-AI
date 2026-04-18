@@ -25,7 +25,7 @@ def _render_chart() -> list[dict]:
     if helm is None:
         pytest.skip("helm not installed")
     result = subprocess.run(
-        [helm, "template", "audittrace", str(CHART_DIR)],
+        [helm, "template", "audittrace", str(CHART_DIR), "--namespace", "audittrace"],
         capture_output=True,
         text=True,
         check=True,
