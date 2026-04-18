@@ -14,6 +14,19 @@ memoryServer:
     repository: localhost:5000/audittrace/memory-server
     tag: latest
     pullPolicy: IfNotPresent
+  summariser:
+    # When true, a post-install/post-upgrade Helm hook provisions a
+    # dedicated, minimum-privilege `audittrace_summariser` role with
+    # BYPASSRLS — needed for the cross-user scan over `interactions`
+    # in the session-summariser loop (ADR-026 §RLS posture,
+    # ADR-030 §Summariser). Set to false when you run your own
+    # role management externally (Terraform, dbmate, etc.).
+    manageRole: true
+    # The summariser reads interactions cross-user and writes sessions
+    # back. It has no grants on tool_calls. Role name is fixed to
+    # keep the Job's SQL self-consistent; override only if you need
+    # multiple chart installs in one DB.
+    roleName: audittrace_summariser
   serviceAccount:
     create: true
     name: memory-server
@@ -220,6 +233,12 @@ secrets:
   postgres:
     password: ""
     appPassword: ""
+  summariser:
+    # Password for the dedicated audittrace_summariser role (LOGIN
+    # NOSUPERUSER BYPASSRLS). Required when memoryServer.summariser.
+    # manageRole is true. Set via --set or an external secret
+    # manager — the Helm template errors out if left blank.
+    password: ""
   chromadb:
     token: ""
   redis:

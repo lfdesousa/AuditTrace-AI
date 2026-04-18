@@ -24,7 +24,16 @@ def _render_chart() -> list[dict]:
     if helm is None:
         pytest.skip("helm not installed")
     result = subprocess.run(
-        [helm, "template", "audittrace", str(CHART_DIR), "--namespace", "audittrace"],
+        [
+            helm,
+            "template",
+            "audittrace",
+            str(CHART_DIR),
+            "--namespace",
+            "audittrace",
+            "--set",
+            "secrets.summariser.password=dummy-pw-for-render",
+        ],
         capture_output=True,
         text=True,
         check=True,

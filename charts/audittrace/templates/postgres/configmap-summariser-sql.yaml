@@ -1,0 +1,50 @@
+{{- if and .Values.postgresql.enabled .Values.memoryServer.summariser.manageRole }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-ensure-summariser-sql
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ensure-summariser-role
+  annotations:
+    # Chained with the Job so Helm renders it before the hook fires.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  ensure-role.sql: |
+    -- Hoist the psql :pw variable into a Postgres session GUC so the
+    -- DO block (PL/pgSQL — which doesn't expand psql vars directly)
+    -- can read it via current_setting().
+    SELECT set_config('audittrace.summariser_pw', :'pw', false);
+
+    DO $$
+    DECLARE
+        rname text := 'audittrace_summariser';
+        rpass text := current_setting('audittrace.summariser_pw', true);
+    BEGIN
+        IF rpass IS NULL OR rpass = '' THEN
+            RAISE EXCEPTION 'pw psql variable is empty';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = rname) THEN
+            EXECUTE format(
+                'CREATE ROLE %I LOGIN NOSUPERUSER BYPASSRLS PASSWORD %L',
+                rname, rpass
+            );
+            RAISE NOTICE 'Created role % (LOGIN NOSUPERUSER BYPASSRLS)', rname;
+        ELSE
+            EXECUTE format(
+                'ALTER ROLE %I WITH LOGIN NOSUPERUSER BYPASSRLS PASSWORD %L',
+                rname, rpass
+            );
+            RAISE NOTICE 'Role % already existed — posture enforced + password rotated', rname;
+        END IF;
+    END
+    $$;
+
+    -- Minimum grants: cross-user read on interactions, RW on sessions.
+    GRANT USAGE ON SCHEMA public TO audittrace_summariser;
+    GRANT SELECT ON TABLE public.interactions TO audittrace_summariser;
+    GRANT SELECT, INSERT, UPDATE ON TABLE public.sessions TO audittrace_summariser;
+    -- Explicitly no grants on tool_calls — summariser doesn't need it.
+{{- end }}

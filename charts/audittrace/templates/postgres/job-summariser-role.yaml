@@ -1,0 +1,96 @@
+{{- if and .Values.postgresql.enabled .Values.memoryServer.summariser.manageRole }}
+# Ensures a dedicated, minimum-privilege `audittrace_summariser` role
+# exists with exactly the grants needed for the session-summariser
+# background loop (ADR-026 §RLS posture, ADR-030 §Summariser):
+#
+#   - LOGIN NOSUPERUSER BYPASSRLS    — bypass RLS on interactions/sessions
+#     only. Still a normal (non-super) role so it can't touch pg_catalog
+#     or DDL.
+#   - SELECT on `interactions`        — cross-user read to pick eligible
+#     sessions for summarisation. NO INSERT/UPDATE/DELETE on interactions
+#     so a compromised summariser cannot rewrite chat history.
+#   - SELECT/INSERT/UPDATE on `sessions`  — writes summaries back. No
+#     DELETE: summaries only grow, never disappear.
+#   - No access to `tool_calls`       — summariser doesn't need it.
+#
+# The generic `audittrace` (Bitnami default) and `audittrace_app` roles
+# keep their NOSUPERUSER + NOBYPASSRLS posture. Only this one role
+# carries the elevated privilege, and only the summariser connects as
+# it — so RLS isolation for every other caller is preserved.
+#
+# Runs as a post-install / post-upgrade Helm hook so the role shape is
+# kept consistent across chart lifecycle events and across existing
+# clusters where `docker-entrypoint-initdb.d` has already fired.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-ensure-summariser-role
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ensure-summariser-role
+        # Postgres runs with PeerAuthentication STRICT + an Authorization-
+        # Policy that allows only the memory-server SA and the default SA
+        # inside the namespace. The Job needs an Istio sidecar to present
+        # a SPIFFE identity; native-sidecar semantics let the sidecar
+        # terminate with the main container so the Job actually completes.
+        sidecar.istio.io/inject: "true"
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: default
+      containers:
+        - name: psql
+          image: bitnami/postgresql:16
+          env:
+            - name: PGHOST
+              value: "{{ .Release.Name }}-postgresql"
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: "{{ .Values.postgresql.auth.database | default "audittrace" }}"
+            - name: PGUSER
+              value: "postgres"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-postgresql
+                  key: postgres-password
+            - name: SUMMARISER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-summariser-db
+                  key: password
+          volumeMounts:
+            - name: sql
+              mountPath: /work
+              readOnly: true
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "ensuring dedicated summariser role with minimum privileges..."
+              # Expand the password into a psql variable so the SQL file
+              # stays static and safely quoted at the SQL layer (%L).
+              psql --set ON_ERROR_STOP=on \
+                   --set "pw=$SUMMARISER_PASSWORD" \
+                   -f /work/ensure-role.sql
+              echo "done."
+              # Signal the Istio sidecar to quit so the pod can terminate.
+              # Without this, an injected sidecar keeps the pod Running
+              # forever and the Job never completes.
+              curl --max-time 5 -fsS -X POST http://127.0.0.1:15020/quitquitquit || true
+      volumes:
+        - name: sql
+          configMap:
+            name: {{ .Release.Name }}-ensure-summariser-sql
+{{- end }}
