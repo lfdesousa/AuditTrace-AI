@@ -208,13 +208,73 @@ async def run_memory_tool_loop(
 
     for iteration in range(max_iterations):
         proxy_payload["messages"] = messages
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
+        # Wrap the outbound LLM round-trip in a Langfuse-recognised
+        # generation span so the trace UI shows the call as an LLM
+        # generation (model, prompt, completion) and not a bare HTTP
+        # POST. Nested inside the HTTPXClientInstrumentor span so the
+        # Tempo service-graph edge (peer.service=qwen-chat-llm) is
+        # preserved.
+        with _tracer.start_as_current_span("llm.chat.completions") as gen_span:
+            gen_span.set_attribute("langfuse.observation.type", "generation")
+            gen_span.set_attribute("openinference.span.kind", "LLM")
+            gen_span.set_attribute(
+                "gen_ai.request.model", proxy_payload.get("model", "")
             )
-        ) as client:
-            response = await client.post(llama_url, json=proxy_payload)
-        last_body = response.json()
+            gen_span.set_attribute("langfuse.user.id", user_context.user_id)
+            gen_span.set_attribute("user.id", user_context.user_id)
+            gen_span.set_attribute("gen_ai.iteration", iteration)
+            try:
+                gen_span.set_attribute(
+                    "input.value",
+                    json.dumps({"messages": messages[-10:]}, ensure_ascii=False)[
+                        :_SPAN_ATTR_CAP
+                    ],
+                )
+            except Exception:  # pragma: no cover - defensive serialisation
+                pass
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
+                )
+            ) as client:
+                response = await client.post(llama_url, json=proxy_payload)
+            last_body = response.json()
+            try:
+                usage = last_body.get("usage", {}) or {}
+                gen_span.set_attribute(
+                    "gen_ai.usage.prompt_tokens",
+                    int(usage.get("prompt_tokens") or 0),
+                )
+                gen_span.set_attribute(
+                    "gen_ai.usage.completion_tokens",
+                    int(usage.get("completion_tokens") or 0),
+                )
+                gen_span.set_attribute(
+                    "gen_ai.response.model",
+                    str(last_body.get("model", "") or ""),
+                )
+                choice_msg = (last_body.get("choices") or [{}])[0].get("message") or {}
+                completion = choice_msg.get("content") or ""
+                if completion:
+                    gen_span.set_attribute(
+                        "gen_ai.response.completion",
+                        str(completion)[:_SPAN_ATTR_CAP],
+                    )
+                    gen_span.set_attribute(
+                        "output.value", str(completion)[:_SPAN_ATTR_CAP]
+                    )
+                else:
+                    # Tool-calling turn — no content, but record that
+                    # the response pivoted to tool_calls so the span
+                    # isn't flagged "empty generation".
+                    tc_list = choice_msg.get("tool_calls") or []
+                    if tc_list:
+                        gen_span.set_attribute(
+                            "output.value",
+                            f"<tool_calls x{len(tc_list)}>",
+                        )
+            except Exception:  # pragma: no cover - defensive serialisation
+                pass
 
         tool_calls = _extract_tool_calls(last_body)
         if not tool_calls:
