@@ -1,5 +1,7 @@
 """Tests for API routes with mocked dependencies."""
 
+from typing import Any
+
 # Reuse the AsyncClient fake from the chat-proxy tests so this file doesn't
 # duplicate the mock plumbing (ADR-024).
 from tests.test_chat_proxy import _FakeAsyncClient, _patch_async_client
@@ -308,6 +310,121 @@ def test_list_interactions_rejects_limit_over_max(client):
 def test_list_interactions_rejects_negative_offset(client):
     r = client.get("/interactions?offset=-1")
     assert r.status_code == 422
+
+
+# ───────────────────────────── /sessions ───────────────────────────────────
+
+
+def _seed_session(
+    *,
+    sid: str,
+    project: str = "p",
+    date: str = "2026-04-18",
+    summary: str = "summary",
+    key_points: str = "[]",
+    model: str = "qwen",
+    user_id: str = "user-1",
+    summarized_at: Any = None,
+) -> None:
+    from audittrace.db.models import SessionRecord as Row
+    from audittrace.dependencies import get_postgres_factory
+
+    pg = get_postgres_factory()
+    with pg.get_session_factory()() as db:
+        r = Row(
+            id=sid,
+            project=project,
+            date=date,
+            summary=summary,
+            key_points=key_points,
+            model=model,
+            user_id=user_id,
+            summarized_at=summarized_at,
+        )
+        db.add(r)
+        db.commit()
+
+
+def test_list_sessions_empty(client):
+    r = client.get("/sessions?project=nope&limit=5")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sessions"] == []
+    assert body["total"] == 0
+    assert body["limit"] == 5
+
+
+def test_list_sessions_returns_rows_with_full_shape(client):
+    from datetime import datetime
+
+    _seed_session(sid="s-A", project="alpha", date="2026-04-17", summary="day-1")
+    _seed_session(
+        sid="s-B",
+        project="alpha",
+        date="2026-04-18",
+        summary="day-2",
+        summarized_at=datetime(2026, 4, 18, 9, 0),
+    )
+    _seed_session(sid="s-C", project="other", date="2026-04-18", summary="elsewhere")
+
+    r = client.get("/sessions?project=alpha&limit=10")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+    # ORDER BY date DESC — newest first.
+    assert body["sessions"][0]["id"] == "s-B"
+    assert body["sessions"][1]["id"] == "s-A"
+    # Every documented field round-trips.
+    row = body["sessions"][0]
+    for key in (
+        "id",
+        "project",
+        "date",
+        "summary",
+        "key_points",
+        "model",
+        "user_id",
+        "summarized_at",
+    ):
+        assert key in row
+
+
+def test_list_sessions_summarised_filter(client):
+    from datetime import datetime
+
+    _seed_session(sid="s-done", project="filt", summarized_at=datetime(2026, 4, 18))
+    _seed_session(sid="s-todo", project="filt", summarized_at=None)
+
+    assert client.get("/sessions?project=filt&summarised=true").json()["total"] == 1
+    assert client.get("/sessions?project=filt&summarised=false").json()["total"] == 1
+    assert client.get("/sessions?project=filt").json()["total"] == 2
+
+
+def test_list_sessions_since_filter(client):
+    _seed_session(sid="s-old", project="since", date="2026-04-10")
+    _seed_session(sid="s-new", project="since", date="2026-04-18")
+    r = client.get("/sessions?project=since&since=2026-04-15")
+    assert r.json()["total"] == 1
+    assert r.json()["sessions"][0]["id"] == "s-new"
+
+
+def test_list_sessions_pagination(client):
+    for i in range(5):
+        _seed_session(
+            sid=f"s-p{i}",
+            project="page-sess",
+            date=f"2026-04-{10 + i:02d}",
+        )
+    r = client.get("/sessions?project=page-sess&limit=2&offset=0").json()
+    assert r["total"] == 5
+    assert len(r["sessions"]) == 2
+    r = client.get("/sessions?project=page-sess&limit=2&offset=4").json()
+    assert r["total"] == 5
+    assert len(r["sessions"]) == 1
+
+
+def test_list_sessions_rejects_limit_over_max(client):
+    assert client.get("/sessions?limit=10000").status_code == 422
 
 
 def test_create_interaction(client):

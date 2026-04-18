@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from audittrace.auth import require_scope, require_user
 from audittrace.db.models import InteractionRecord as InteractionRow
+from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
@@ -150,3 +151,102 @@ async def create_interaction(
     """
     # TODO: external audit-row ingestion (non-chat sources)
     return record.model_dump()
+
+
+# ─────────────────────────────── Sessions ─────────────────────────────────
+# Human-facing browser over the Layer-3 conversational memory. The LLM
+# reads the same layer via the `recall_recent_sessions` memory tool
+# (ADR-025), this is the counterpart for operators / auditors / dashboards.
+# RLS is the enforcement boundary; this handler relies on it the same way
+# ``list_interactions`` does — no explicit ``WHERE user_id = ...`` needed,
+# the ``after_begin`` listener sets ``app.current_user_id`` and the policy
+# on ``sessions`` filters to the caller's rows.
+
+
+def _session_row_to_dict(row: SessionRow) -> dict[str, Any]:
+    """Serialise a ``SessionRow`` to a plain dict for the REST response.
+
+    Returns every column — Luis's 2026-04-18 directive: Day 1
+    reconstructibility includes the session layer, not just interactions.
+    ``key_points`` is stored as JSON text; we don't parse it here — the
+    caller gets exactly what the summariser wrote.
+    """
+    return {
+        "id": row.id,
+        "project": row.project,
+        "date": row.date,
+        "summary": row.summary,
+        "key_points": row.key_points,
+        "model": row.model,
+        "user_id": row.user_id,
+        "summarized_at": (
+            row.summarized_at.isoformat() if row.summarized_at is not None else None
+        ),
+    }
+
+
+@router.get("/sessions")
+@log_call(logger=logger)
+async def list_sessions(
+    project: str | None = Query(None, description="Filter by project tag (ADR-029)."),
+    user_id: str | None = Query(
+        None,
+        description=(
+            "Filter by Keycloak sub. RLS already scopes results to the caller, "
+            "so this narrows *within* the caller's own rows."
+        ),
+    ),
+    since: str | None = Query(
+        None,
+        description=(
+            "ISO date string. Only sessions with ``date >= since`` are returned."
+        ),
+    ),
+    summarised: bool | None = Query(
+        None,
+        description=(
+            "true → only rows with ``summarized_at`` populated; "
+            "false → only un-summarised rows; omit → both."
+        ),
+    ),
+    limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
+    offset: int = Query(0, ge=0, description="Pagination offset."),
+    _auth: dict[str, Any] = Depends(require_scope("audittrace:audit")),
+    _user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """List sessions the caller is allowed to see (RLS-scoped).
+
+    Mirrors the shape of ``GET /interactions``:
+    ``{sessions: [...], total, limit, offset}``. Ordered by ``date``
+    DESC so the freshest sessions come first — matches how the
+    Langfuse and Grafana dashboards want to read the data.
+    """
+    try:
+        pg = get_postgres_factory()
+    except Exception as exc:
+        logger.error("Audit endpoint unavailable — PostgresFactory not registered")
+        raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
+
+    session_factory = pg.get_session_factory()
+    with session_factory() as db:
+        q = db.query(SessionRow)
+        if project is not None:
+            q = q.filter(SessionRow.project == project)
+        if user_id is not None:
+            q = q.filter(SessionRow.user_id == user_id)
+        if since is not None:
+            q = q.filter(SessionRow.date >= since)
+        if summarised is True:
+            q = q.filter(SessionRow.summarized_at.is_not(None))
+        elif summarised is False:
+            q = q.filter(SessionRow.summarized_at.is_(None))
+
+        total = q.count()
+        rows = q.order_by(SessionRow.date.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "sessions": [_session_row_to_dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
