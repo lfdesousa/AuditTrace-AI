@@ -1,11 +1,54 @@
 # =============================================================================
 # AuditTrace-AI — Helm values
 # =============================================================================
+#
+# ⚠️  SECURITY NOTICE — rotate all credentials before any production deploy.
+# ---------------------------------------------------------------------------
+# The `secrets.*` block at the bottom of this file is empty-by-default for
+# a reason: development installs commonly use the throwaway values below,
+# baked into repository test fixtures:
+#
+#   postgres.password                test-pg-pass
+#   postgres.appPassword             test-pg-pass
+#   summariser.password              test-summariser-pw
+#   chromadb.token                   test-chroma-token
+#   redis.password                   test-redis-pass
+#   minio.secretKey                  test-minio-key
+#   minio.kmsKey                     (dev-generated, committed for repeatability)
+#   keycloak.adminPassword           admin
+#
+# These strings appear in git history across `test-*` values files, chart
+# test fixtures, and this repository's CI workflow (`.github/workflows/
+# ci.yml`). They are safe in the local / dev context they're intended for;
+# they are unacceptable in any production cluster.
+#
+# Before any production install:
+#   1. Set `global.productionMode: true` below — the chart will refuse to
+#      render if ANY secret equals a known dev default.
+#   2. Provision all `secrets.*` values from your enterprise secret manager
+#      (Vault via External Secrets Operator, SOPS, Sealed Secrets, or CSI
+#      Secrets Store driver). Roadmap Phase 1.1 will ship first-class Vault
+#      integration (ADR-040 candidate, target 2026-05-16).
+#   3. Review `memoryServer.env.AUDITTRACE_LANGFUSE_PUBLIC_KEY` and the
+#      matching secret key — the dev defaults point at the local Langfuse
+#      instance; production must re-issue keys per tenant.
+#
+# This notice exists because regulated-industry security reviewers flag
+# credentials in git-history within 90 seconds of opening the repo.
+# Closing the gap visibly — with a production-mode gate enforced at
+# `helm template` time, not just a comment — is part of the stability
+# posture. See `audittrace.assertProductionSecrets` in
+# `templates/_helpers.tpl`.
+# ---------------------------------------------------------------------------
 
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
   hostNodeIP: "192.168.1.231"
+  # Set to true for production deploys. When true, the chart refuses to
+  # render if any `secrets.*` value matches a known dev default. See the
+  # SECURITY NOTICE above.
+  productionMode: false
 
 # -- Memory Server (our app) -------------------------------------------------
 memoryServer:
