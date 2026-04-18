@@ -30,6 +30,9 @@ spec:
             - name: prometheus
               containerPort: 8889
               protocol: TCP
+            - name: self-metrics
+              containerPort: 8888
+              protocol: TCP
           volumeMounts:
             - name: config
               mountPath: /etc/otel
