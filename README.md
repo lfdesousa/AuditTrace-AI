@@ -185,37 +185,70 @@ and review the diff like any other dependency bump.
 
 ## Architecture
 
-### Service Topology (Docker Compose)
+### Service Topology (Kubernetes)
 
 ```
-Client (HTTPS :443, Bearer JWT)
+Client (HTTPS :30952, Bearer JWT)
     |
     v
-+---------+     +------------------+     +--------------+
-| Traefik |---->| memory-server    |---->| PostgreSQL 16|
-| (TLS)   |     | (FastAPI +       |     | (RLS: audit- |
-+---------+     |  require_user +  |     |  trace_app   |
-      ^         |  tool-call loop) |     |  non-super)  |
-      |         +-----+----+------+      +--------------+
-      |               |    |
-      |               |    v
-+---------+           |  +--------------+     +--------------+
-| Keycloak|<----------+  | ChromaDB     |---->| embed-server |
-| (JWKS)  |              | (token auth  |     | (nomic, CPU) |
-+---------+              |  + scoped    |     +--------------+
-                         |  wrapper)    |            ^
-                         +--------------+     host.docker.internal
-                                ^                    |
-                                |             +--------------+
-                         +--------------+     | llama-server |
-                         | Redis 7      |     | (Qwen, ROCm) |
-                         |  audittrace: |     +--------------+
-                         |  token:*     |
-                         |  tool-result:*|
-                         +--------------+
++---------------------+
+| Istio Gateway       |  istio-ingress · TLS (SIMPLE) · NodePort 30952
+| + VirtualService    |  hosts: "*"  (audittrace namespace)
++----------+----------+
+           |
+===========|=== namespace: audittrace ====================================
+           |    PeerAuthentication  mTLS STRICT
+           |    Workload identity   SPIFFE/SVID
+           |    AuthorizationPolicy deny-all + 6 per-flow allow rules
+           v
++---------------------+    JWKS    +------------------+
+| memory-server       +----------->| Keycloak         |
+| FastAPI +           |            | OAuth2 Device    |
+| require_user +      |            | Flow (ADR-032)   |
+| tool-call loop      |            +------------------+
++-+--+--+--+--+--+----+
+  |  |  |  |  |  |
+  |  |  |  |  |  v
+  |  |  |  |  |  +----------------+
+  |  |  |  |  |  | PostgreSQL 16  |  RLS + audittrace_app
+  |  |  |  |  |  +----------------+  (NOSUPERUSER + NOBYPASSRLS)
+  |  |  |  |  v
+  |  |  |  |  +----------------+
+  |  |  |  |  | ChromaDB       |  token auth + UserScopedSemanticService
+  |  |  |  |  +----------------+
+  |  |  |  v
+  |  |  |  +----------------+
+  |  |  |  | Redis 7        |  token:* + tool-result:* (disjoint prefixes)
+  |  |  |  +----------------+
+  |  |  v
+  |  |  +----------------+
+  |  |  | MinIO          |  SSE-S3 KMS · episodic + procedural (ADR-027)
+  |  |  +----------------+
+  |  |
+  |  |  OTLP :4318
+  |  v
+  |  +--------------------+   traces  --> Tempo  (egress)
+  |  | OTel Collector     |
+  |  | (DaemonSet)        |   metrics --> Prometheus scrape :8889
+  |  +--------------------+
+  |
+  |  Langfuse SDK (LLM traces, separate from OTLP path)
+  +---> Langfuse                                            (egress)
+
+=== mesh egress: ServiceEntry + no-mTLS DestinationRule ==================
+
+External LLMs (host-resident, systemd-managed):
+  qwen-chat-llm      :11435   Qwen 3.6-35B-A3B     chat + tools
+  nomic-embed-text   :11436   nomic v1.5           embeddings
+  mistral-summariser :11437   Mistral 7B v0.3      ADR-030 summariser
+
+Observability sinks (sibling repo AiSovereignObservability, off-mesh):
+  Tempo (OTLP :14318)  ·  Prometheus  ·  Loki  ·  Grafana  ·  Langfuse
 ```
 
-Langfuse runs as a **sibling compose stack** on the shared `audittrace-net` network (ADR-021.2). Redis serves both the `TokenCache` (JWT hot path) and the `ToolResultCache` (memory-as-tools result cache) under disjoint key prefixes.
+The Istio Gateway terminates TLS on NodePort 30952 and fans out via a VirtualService. Inside the mesh, PeerAuthentication enforces STRICT mTLS and every flow has an explicit SPIFFE-identity allow in its AuthorizationPolicy — everything else is deny-all. External egress (LLMs + observability sinks) traverses a ServiceEntry paired with a no-mTLS DestinationRule, since the upstreams are systemd processes on the host, not mesh workloads. The OTel Collector runs in-mesh as a DaemonSet: it receives OTLP from memory-server and fans out traces to Tempo and metrics to a Prometheus scrape endpoint on :8889. Langfuse receives LLM traces via the Langfuse SDK (separate from OTLP). Redis serves both the `TokenCache` (JWT hot path) and the `ToolResultCache` (memory-as-tools result cache) under disjoint key prefixes.
+
+**Local development** uses the Docker Compose stack (`docker-compose.yml` + Traefik + sibling Langfuse stack). See [docs/guides/deployment-runbook.md](docs/guides/deployment-runbook.md) for the dev-mode topology and the production k8s bring-up.
 
 ### 4-Layer Memory
 
