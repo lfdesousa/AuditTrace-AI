@@ -415,6 +415,15 @@ def _persist_interaction(
             db.add(record)
             db.commit()
             db.refresh(record)
+            logger.info(
+                "interaction persisted id=%s user=%s status=%s project=%s model=%s duration_ms=%s",
+                record.id,
+                user_id,
+                status,
+                project,
+                model,
+                duration_ms,
+            )
             return record.id
         finally:
             db.close()
@@ -463,6 +472,11 @@ def _flush_pending_tool_calls(
                     )
                 )
             db.commit()
+            logger.info(
+                "tool_calls persisted count=%d interaction_id=%s",
+                len(pending),
+                interaction_id,
+            )
         finally:
             db.close()
     except Exception as exc:  # pragma: no cover - defensive logging only
