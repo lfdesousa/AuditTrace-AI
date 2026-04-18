@@ -140,3 +140,21 @@ Auto-provisioned on first boot:
 ### Neutral
 - Langfuse remains the trace backend — no migration, no duplication
 - llama-server metrics require `host.docker.internal` bridge (same as LLM proxy calls)
+
+## Amendment 2026-04-18 — k3s realisation
+
+The original decision assumed a single Docker Compose runtime. The production deployment now runs memory-server on k3s + Istio with STRICT mTLS and SPIFFE/SVID workload identity (see `charts/audittrace/` and `docs/guides/deployment-runbook.md`). The observability *backends* stay where they are — sibling Docker Compose stack in the `lfdesousa/AiSovereignObservability` repository — but the *telemetry shippers* (OTel Collector + Promtail) now have a second deployment profile:
+
+| Profile | OTel Collector | Promtail |
+|---|---|---|
+| Docker Compose dev | Container in observability-stack repo, Docker-socket discovery | Container in observability-stack, Docker-socket discovery |
+| k3s production | DaemonSet in the AuditTrace-AI Helm chart (`templates/observability/otel-collector-daemonset.yaml`) | DaemonSet in the AuditTrace-AI Helm chart (`templates/observability/promtail-daemonset.yaml`), Kubernetes pod-log discovery |
+
+The k3s DaemonSets egress to the same sibling backends over the cluster-external NodePort. This keeps the storage/query surface identical across profiles — the same dashboards, the same LogQL queries, the same retention — only the discovery mechanism differs because kubelet log layout and Docker socket are different substrates.
+
+This amendment does not revise the original decision; it records that ADR-028 now applies to two runtimes, not one. The sibling stack pattern (ADR-021.2) still holds: backends are deployed and operated independently from the application stack.
+
+### Amendment consequences
+- One more DaemonSet to reason about per k3s cluster (OTel Collector + Promtail) — counted in the Helm chart resource footprint.
+- Collector self-telemetry on `:8888/metrics` is scraped by the sibling Prometheus via NodePort `:30888` (added in the same change).
+- Nothing in the application code path changes. The OTLP endpoint is still `http://otel-collector:4318`; the name resolves inside whichever runtime is active.

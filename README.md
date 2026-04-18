@@ -357,31 +357,40 @@ The `audittrace-dev` client is the legacy path. Still the right choice for non-i
 
 ## Observability Stack (ADR-028)
 
-Sibling Docker Compose stack following the Langfuse pattern (ADR-021.2). Provides metrics aggregation, log search, and dashboards. Lives in its own repository at [lfdesousa/AiSovereignObservability](https://github.com/lfdesousa/AiSovereignObservability) — clone alongside this repo for the full observability surface.
+The **observability backends** (Langfuse, Tempo, Loki, Prometheus, Grafana) are a sibling Docker Compose stack — shared across deployment profiles and living in its own repository at [lfdesousa/AiSovereignObservability](https://github.com/lfdesousa/AiSovereignObservability). Clone alongside this repo.
+
+The **telemetry shippers** (OTel Collector, Promtail) run inside whichever runtime hosts memory-server:
+
+| Runtime | OTel Collector | Promtail (log shipper) |
+|---|---|---|
+| Docker Compose dev | Container in the observability-stack repo | Container in observability-stack, Docker-socket discovery |
+| k3s (production) | DaemonSet in the AuditTrace-AI Helm chart (`otel-collector-daemonset.yaml`) | DaemonSet in the AuditTrace-AI Helm chart (`promtail-daemonset.yaml`), Kubernetes pod-log discovery |
+
+Backends are the same in both cases; the shippers differ because their discovery mechanism differs.
 
 ```bash
-# Start the observability stack
+# Start the sibling backends stack
 ./scripts/setup-observability.sh
 
 # Stop
 ./scripts/setup-observability.sh --down
 ```
 
-| Service | URL | Purpose |
+| Backend | URL | Purpose |
 |---|---|---|
 | Grafana | `http://localhost:3001` (admin / audittrace) | Dashboards: latency percentiles, error rates, infra metrics, logs |
 | Prometheus | `http://localhost:19090` | Metrics storage + PromQL queries |
 | Loki | `http://localhost:3100` | Log aggregation + LogQL queries |
-| OTel Collector | `http://localhost:4318` | OTLP receiver (memory-server exports here) |
+| Tempo | `http://localhost:14318` (OTLP ingest) | Trace storage + service-map |
+| Langfuse | `http://localhost:3000` | LLM-specific observations (generations, tool calls) |
 
-**Data flow:**
-- Memory-server sends OTLP metrics/logs to OTel Collector, which fans out to Prometheus + Loki
-- Prometheus scrapes Traefik, llama-server, and MinIO natively
-- Promtail auto-discovers Docker containers and pushes logs to Loki
-- Langfuse retains exclusive ownership of LLM traces (SDK path, unchanged)
-- Grafana queries both Prometheus and Loki for the unified operations dashboard
+**Data flow (both runtimes):**
+- Memory-server emits OTLP traces + metrics to the in-runtime OTel Collector. The Collector fans traces out to Tempo + Langfuse and pushes metrics to Prometheus via a scrape endpoint on `:8889`.
+- The in-runtime Promtail ships pod/container stdout+stderr to Loki (label set: `namespace`, `pod`, `container` on k3s; `compose_service`, `container_name` on Docker Compose).
+- Langfuse also receives LLM-specific traces via the Langfuse SDK directly from memory-server (separate from the OTLP pipeline — ADR-014.4).
+- Grafana queries Prometheus + Loki + Tempo for the unified operations dashboard and the call-flow service map.
 
-**Pre-provisioned dashboard:** "Sovereign AI Operations" — P50/P95/P99 latency, error rates by type, llama-server tokens/sec, KV cache usage, MinIO API requests, container error logs.
+**Pre-provisioned dashboards:** "Sovereign AI Operations" (P50/P95/P99 latency, error rates, tokens/sec, KV cache, MinIO ops, container error logs) and "AuditTrace-AI — Call Flow" (Tempo service graph + recent traces).
 
 ## Memory Seeding (ADR-027)
 
