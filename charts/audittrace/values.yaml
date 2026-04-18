@@ -105,8 +105,6 @@ observability:
     tempoOtlpPort: 14318
     prometheusIP: "192.168.1.231"
     prometheusPort: 19090
-    prometheusIP: "192.168.1.100"
-    prometheusPort: 19090
 
 # -- TLS ----------------------------------------------------------------------
 tls:

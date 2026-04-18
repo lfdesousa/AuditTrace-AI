@@ -18,6 +18,11 @@ spec:
       protocol: TCP
       name: prometheus
       nodePort: 30889
+    - port: 8888
+      targetPort: self-metrics
+      protocol: TCP
+      name: self-metrics
+      nodePort: 30888
   selector:
     {{- include "audittrace.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: otel-collector
