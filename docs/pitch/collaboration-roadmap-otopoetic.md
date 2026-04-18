@@ -158,9 +158,11 @@ Each phase has a measurable exit criterion — something an external reviewer co
 
 ### Phase 5 — Research programme alignment (ongoing, in parallel)
 
-**Goal.** Keep an academic layer on top of the commercial platform. Four candidate research directions detailed in `docs/phd/research-demonstrator-framing.md`; at least one is already in early discussion with the University of Liverpool (Dr Karl-Rudolf Schewe). Research outputs reinforce the commercial positioning without distorting it.
+**Goal.** Keep an academic layer on top of the commercial platform. Four candidate research directions detailed in `docs/phd/research-demonstrator-framing.md`; at least one is already in early discussion with the University of Liverpool. Research outputs reinforce the commercial positioning without distorting it.
 
 Not on the critical path for the commercial roadmap, but included here because AI governance consultancies with an academic edge (yours, if I understand Otopoetic's model correctly) benefit structurally from a platform that has peer-reviewed backing.
+
+The Liverpool contact is Dr Sven Schewe (Department of Computer Science); discussion on an MPhil / PhD framing is scheduled to resume late April 2026 following Liverpool's ongoing academic-hire process.
 
 ---
 
