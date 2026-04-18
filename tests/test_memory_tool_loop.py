@@ -680,3 +680,182 @@ class TestScopeGate:
         assert len(pending) == 1
         assert pending[0].error is not None
         assert "scope" in pending[0].error.lower()
+
+
+class TestSpanEmission:
+    """Phase-2 commit 2.3: each memory tool invocation emits a child span
+    so Langfuse renders input/output per recall_* call and Tempo's
+    service-graph traces Postgres/Chroma/MinIO traffic back to the tool
+    that caused it."""
+
+    @pytest.fixture
+    def span_exporter(self, monkeypatch: pytest.MonkeyPatch):
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        from audittrace.routes import _memory_tool_loop
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        monkeypatch.setattr(_memory_tool_loop, "_tracer", provider.get_tracer("test"))
+        return exporter
+
+    @pytest.mark.asyncio
+    async def test_span_emitted_per_tool_invocation(
+        self, _populated_container, _fakeredis_cache, span_exporter
+    ):
+        """One memory tool call → exactly one memory_tool.<name> span with
+        input/output/user.id/tool.name attributes."""
+        user = sentinel_user_context()
+        fake = _SequencedClient(
+            [
+                _tool_call_response(
+                    "recall_decisions", '{"query": "cache"}', call_id="c1"
+                ),
+                _text_response("ok"),
+            ]
+        )
+        with _patch_async_client(fake):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-span-1",
+                max_iterations=5,
+            )
+        tool_spans = [
+            s
+            for s in span_exporter.get_finished_spans()
+            if s.name.startswith("memory_tool.")
+        ]
+        assert len(tool_spans) == 1, f"expected 1, got {len(tool_spans)}"
+        span = tool_spans[0]
+        assert span.name == "memory_tool.recall_decisions"
+        attrs = span.attributes or {}
+        assert attrs.get("tool.name") == "recall_decisions"
+        assert attrs.get("user.id") == user.user_id
+        assert attrs.get("langfuse.user.id") == user.user_id
+        # Input holds the serialised args (truncated but intact for small
+        # payloads).
+        input_val = attrs.get("input.value") or ""
+        assert "cache" in input_val
+        # Output populated with the tool result dict.
+        assert attrs.get("output.value"), "output.value must be set on success"
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_still_emits_span(
+        self, _populated_container, _fakeredis_cache, span_exporter
+    ):
+        """ADR-025 §Decision.8: cache hits skip the audit row, but the
+        span MUST still emit so Langfuse shows the latency of the cached
+        recall (else the flame-graph hides fast paths)."""
+        user = sentinel_user_context()
+
+        # Cold — populates cache, emits 1 span
+        with _patch_async_client(
+            _SequencedClient(
+                [
+                    _tool_call_response(
+                        "recall_decisions", '{"query": "cache"}', call_id="c1"
+                    ),
+                    _text_response("first"),
+                ]
+            )
+        ):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-cache-span",
+                max_iterations=5,
+            )
+
+        # Warm — cache hit, still emits 1 span with cache_hit=true
+        with _patch_async_client(
+            _SequencedClient(
+                [
+                    _tool_call_response(
+                        "recall_decisions", '{"query": "cache"}', call_id="c2"
+                    ),
+                    _text_response("second"),
+                ]
+            )
+        ):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-cache-span",
+                max_iterations=5,
+            )
+
+        tool_spans = [
+            s
+            for s in span_exporter.get_finished_spans()
+            if s.name.startswith("memory_tool.")
+        ]
+        # 2 spans total: one cold + one cache-hit
+        assert len(tool_spans) == 2
+        hit_spans = [
+            s for s in tool_spans if (s.attributes or {}).get("tool.cache_hit")
+        ]
+        assert len(hit_spans) == 1, (
+            "cache-hit span must carry tool.cache_hit=true for flame-graph"
+        )
+
+    @pytest.mark.asyncio
+    async def test_scope_denied_span_marked_error(
+        self, _populated_container, _fakeredis_cache, span_exporter
+    ):
+        """When the scope guard rejects a tool, the span should carry
+        ERROR status so Langfuse flags the invocation visually."""
+        from audittrace.identity import UserContext
+
+        user_no_scope = UserContext(
+            user_id="alice",
+            username="alice",
+            agent_type="opencode",
+            scopes=(),  # empty — no memory scopes
+            is_admin=False,
+        )
+        fake = _SequencedClient(
+            [
+                _tool_call_response("recall_decisions", '{"query": "x"}', call_id="c1"),
+                _text_response("fallback"),
+            ]
+        )
+        with _patch_async_client(fake):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user_no_scope,
+                session_id="sess-scope",
+                max_iterations=5,
+            )
+        tool_spans = [
+            s
+            for s in span_exporter.get_finished_spans()
+            if s.name == "memory_tool.recall_decisions"
+        ]
+        assert tool_spans, "tool span must be emitted even when denied"
+        assert tool_spans[0].status.status_code.name == "ERROR"
