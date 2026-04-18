@@ -432,10 +432,12 @@ async def _execute_memory_tool(
         span.set_attribute("sovereign.tool.duration_ms", duration_ms)
 
         if was_cache_hit:
-            logger.debug(
-                "memory tool cache HIT tool=%s session=%s — skipping audit row",
+            logger.info(
+                "memory_tool cache_hit=true tool=%s user=%s session=%s duration_ms=%d",
                 tool_name,
+                user_context.user_id,
                 session_id,
+                duration_ms,
             )
             return
 
@@ -448,6 +450,14 @@ async def _execute_memory_tool(
             # Truncated JSON summary for the audit row so the column stays
             # bounded even on huge result sets.
             summary = json.dumps(result)[:1000]
+        logger.info(
+            "memory_tool cache_hit=false tool=%s user=%s session=%s duration_ms=%d error=%s",
+            tool_name,
+            user_context.user_id,
+            session_id,
+            duration_ms,
+            error_text,
+        )
 
         pending.append(
             PendingToolCall(
