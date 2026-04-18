@@ -64,6 +64,7 @@ def _build_httpx_peer_service_map(settings: Any) -> dict[int, str]:
         ("llama_url", "qwen-chat-llm"),
         ("embed_url", "nomic-embed-server"),
         ("summarizer_url", "mistral-summariser-llm"),
+        ("langfuse_host", "langfuse"),
     ):
         raw = getattr(settings, attr, None)
         if not raw:
