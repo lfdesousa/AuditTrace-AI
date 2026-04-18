@@ -332,6 +332,8 @@ The `audittrace-dev` client is the legacy path. Still the right choice for non-i
 
 ### Roadmap
 
+> **See [`docs/roadmap.md`](docs/roadmap.md) for the full dated master roadmap** — phased through 2026-10-31, with honest risk renegotiation policy. The table below captures the completed-to-date subset; the master doc covers Phases 1–4 + research track.
+
 | Priority | Item | Description |
 |---|---|---|
 | ✅ Done | **Intelligent Memory Tool Routing** | Ambient context instructs the LLM to pick ONE tool per question. Validated with Qwen 3.6-35B-A3B. ADR-025 Accepted. |
