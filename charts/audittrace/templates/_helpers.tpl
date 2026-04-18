@@ -29,6 +29,59 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Production-secret hygiene gate.
+
+When .Values.global.productionMode is true, refuse to render the chart if
+any `secrets.*` field still matches a known dev default. The throwaway
+values live in test fixtures + this repository's CI workflow and must not
+reach a production cluster.
+
+Add a new entry whenever a new dev default is introduced; the tuple is
+(field dotted path, known-dev value).
+
+Called from templates/NOTES.txt so it evaluates on every `helm template`,
+`helm install`, and `helm upgrade`.
+*/}}
+{{- define "audittrace.assertProductionSecrets" -}}
+{{- if .Values.global.productionMode -}}
+  {{- $dev := dict
+      "secrets.postgres.password"    "test-pg-pass"
+      "secrets.postgres.appPassword" "test-pg-pass"
+      "secrets.summariser.password"  "test-summariser-pw"
+      "secrets.chromadb.token"       "test-chroma-token"
+      "secrets.redis.password"       "test-redis-pass"
+      "secrets.minio.secretKey"      "test-minio-key"
+      "secrets.keycloak.adminPassword" "admin"
+  -}}
+  {{- $violations := list -}}
+  {{- if eq (default "" .Values.secrets.postgres.password) (get $dev "secrets.postgres.password") -}}
+    {{- $violations = append $violations "secrets.postgres.password" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.postgres.appPassword) (get $dev "secrets.postgres.appPassword") -}}
+    {{- $violations = append $violations "secrets.postgres.appPassword" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.summariser.password) (get $dev "secrets.summariser.password") -}}
+    {{- $violations = append $violations "secrets.summariser.password" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.chromadb.token) (get $dev "secrets.chromadb.token") -}}
+    {{- $violations = append $violations "secrets.chromadb.token" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.redis.password) (get $dev "secrets.redis.password") -}}
+    {{- $violations = append $violations "secrets.redis.password" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.minio.secretKey) (get $dev "secrets.minio.secretKey") -}}
+    {{- $violations = append $violations "secrets.minio.secretKey" -}}
+  {{- end -}}
+  {{- if eq (default "" .Values.secrets.keycloak.adminPassword) (get $dev "secrets.keycloak.adminPassword") -}}
+    {{- $violations = append $violations "secrets.keycloak.adminPassword" -}}
+  {{- end -}}
+  {{- if gt (len $violations) 0 -}}
+    {{- fail (printf "global.productionMode=true but the following credentials still match known dev defaults: %s — rotate them via Vault / SOPS / Sealed Secrets before deploying. See values.yaml SECURITY NOTICE." (join ", " $violations)) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Construct the PostgreSQL connection URL for the app role.
 */}}
 {{- define "audittrace.postgresAppUrl" -}}

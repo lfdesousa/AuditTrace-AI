@@ -1,3 +1,5 @@
+{{- /* Gate: refuses to render if productionMode=true AND any dev default still present. */ -}}
+{{- include "audittrace.assertProductionSecrets" . -}}
 AuditTrace-AI deployed to namespace {{ .Release.Namespace }}.
 
 Memory server: https://{{ (index .Values.istio.gateway.hosts 0) }}/health
