@@ -63,7 +63,10 @@ AuditTrace-AI is organised around hardening that reconstructibility contract. Ev
 
 **Why this next.** The "runs on my machine" story becomes the "consultant-ports-knowledge-across-engagements" story only when memory can leave the device safely. This is the governance and scalability frontier and — based on external feedback — the real value proposition for enterprise deployments.
 
-### 2.1 — ADR-038 sync protocol specification (target 2026-05-30)
+### 2.1 — ADR-038 sync protocol specification (target 2026-05-30, joint authorship confirmed)
+
+The ADR number is reserved with an empty shell at `docs/ADR-038-memory-sync-protocol.md`; substantive content will be drafted jointly with an external governance reviewer (Otopoetic, confirmed 2026-04-18) rather than written unilaterally. Co-authorship rather than review-and-approve is the deliberate shape.
+
 - Signed envelope schema (row-shaped events for interactions / sessions / tool_calls; MinIO-to-MinIO replication for binary artefacts).
 - Idempotency keys, resumable-from-last-ack semantics, conflict resolution for mutable sessions vs immutable interactions.
 - Explicit consent ledger with per-category opt-in (chats vs traces vs summaries).
