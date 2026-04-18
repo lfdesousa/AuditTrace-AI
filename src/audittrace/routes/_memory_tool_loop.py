@@ -38,11 +38,22 @@ from datetime import datetime
 from typing import Any
 
 import httpx
+from opentelemetry import trace
 
 from audittrace.identity import UserContext
 from audittrace.tools import get_tool_by_name, invoke_tool
 
 logger = logging.getLogger(__name__)
+
+# Tracer used for per-tool child spans (ADR-025 Phase 5 / commit 2.3).
+# One explicit span per memory_tool invocation so Langfuse renders
+# input/output for every recall_* call, and service-graph shows
+# Postgres/Chroma/MinIO traffic attributed to the tool that caused it.
+_tracer = trace.get_tracer(__name__)
+
+# Attribute payloads are capped to keep Tempo/Langfuse storage bounded
+# without hiding the structure of either end of the call.
+_SPAN_ATTR_CAP = 4000
 
 
 # ──────────────────────────── PendingToolCall ───────────────────────────────
@@ -287,89 +298,110 @@ async def _execute_memory_tool(
     args = _parse_arguments(raw_args)
     call_id = tc.get("id", "")
 
-    tool = get_tool_by_name(tool_name)
-    if tool is None:
-        # Shouldn't happen — the caller partitioned by registry lookup
-        # already — but treat it as an error-shaped tool_result anyway.
-        _append_tool_result(
-            messages,
-            call_id,
-            tool_name,
-            {"error": f"unknown memory tool: {tool_name}"},
+    span_name = f"memory_tool.{tool_name}" if tool_name else "memory_tool.unknown"
+    with _tracer.start_as_current_span(span_name) as span:
+        # Langfuse-native + OTel-semconv user tagging so every child span
+        # is filterable by user.id in Tempo and appears under the user in
+        # Langfuse — completes the Phase-2 reconstructibility chain.
+        span.set_attribute("langfuse.user.id", user_context.user_id)
+        span.set_attribute("user.id", user_context.user_id)
+        span.set_attribute("tool.name", tool_name)
+        span.set_attribute("tool.call_id", call_id)
+        span.set_attribute(
+            "input.value", json.dumps(args, ensure_ascii=False)[:_SPAN_ATTR_CAP]
         )
-        pending.append(
-            PendingToolCall(
-                tool_name=tool_name,
-                user_id=user_context.user_id,
-                agent_type=user_context.agent_type,
-                args=json.dumps(args),
-                result_summary=None,
-                error=f"unknown memory tool: {tool_name}",
-                started_at=started,
-                duration_ms=int((time.perf_counter() - perf_start) * 1000),
-                granted_scope="",
-            )
-        )
-        return
 
-    # Defensive scope re-check. Admins bypass; non-admins must carry
-    # the tool's required_scope.
-    if not user_context.is_admin and tool.required_scope not in user_context.scopes:
-        err = (
-            f"scope denied: {tool.required_scope} not in user scopes "
-            f"for tool {tool_name}"
+        tool = get_tool_by_name(tool_name)
+        if tool is None:
+            # Shouldn't happen — the caller partitioned by registry lookup
+            # already — but treat it as an error-shaped tool_result anyway.
+            err = f"unknown memory tool: {tool_name}"
+            span.set_attribute("output.value", json.dumps({"error": err}))
+            span.set_status(trace.StatusCode.ERROR, err)
+            _append_tool_result(messages, call_id, tool_name, {"error": err})
+            pending.append(
+                PendingToolCall(
+                    tool_name=tool_name,
+                    user_id=user_context.user_id,
+                    agent_type=user_context.agent_type,
+                    args=json.dumps(args),
+                    result_summary=None,
+                    error=err,
+                    started_at=started,
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    granted_scope="",
+                )
+            )
+            return
+
+        # Defensive scope re-check. Admins bypass; non-admins must carry
+        # the tool's required_scope.
+        if not user_context.is_admin and tool.required_scope not in user_context.scopes:
+            err = (
+                f"scope denied: {tool.required_scope} not in user scopes "
+                f"for tool {tool_name}"
+            )
+            span.set_attribute("output.value", json.dumps({"error": err}))
+            span.set_status(trace.StatusCode.ERROR, err)
+            _append_tool_result(messages, call_id, tool_name, {"error": err})
+            pending.append(
+                PendingToolCall(
+                    tool_name=tool_name,
+                    user_id=user_context.user_id,
+                    agent_type=user_context.agent_type,
+                    args=json.dumps(args),
+                    result_summary=None,
+                    error=err,
+                    started_at=started,
+                    duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                    granted_scope=tool.required_scope,
+                )
+            )
+            return
+
+        # Dispatch through the cache-aware helper. was_cache_hit tells us
+        # whether to record an audit row (hits skip — ADR-025 §Decision.8).
+        result, was_cache_hit = await invoke_tool(user_context, tool, args, session_id)
+        _append_tool_result(messages, call_id, tool_name, result)
+
+        span.set_attribute("tool.cache_hit", was_cache_hit)
+        span.set_attribute(
+            "output.value", json.dumps(result, ensure_ascii=False)[:_SPAN_ATTR_CAP]
         )
-        _append_tool_result(messages, call_id, tool_name, {"error": err})
+        duration_ms = int((time.perf_counter() - perf_start) * 1000)
+        span.set_attribute("sovereign.tool.duration_ms", duration_ms)
+
+        if was_cache_hit:
+            logger.debug(
+                "memory tool cache HIT tool=%s session=%s — skipping audit row",
+                tool_name,
+                session_id,
+            )
+            return
+
+        error_text: str | None = None
+        summary: str | None = None
+        if "error" in result:
+            error_text = str(result.get("error"))
+            span.set_status(trace.StatusCode.ERROR, error_text)
+        else:
+            # Truncated JSON summary for the audit row so the column stays
+            # bounded even on huge result sets.
+            summary = json.dumps(result)[:1000]
+
         pending.append(
             PendingToolCall(
                 tool_name=tool_name,
                 user_id=user_context.user_id,
                 agent_type=user_context.agent_type,
                 args=json.dumps(args),
-                result_summary=None,
-                error=err,
+                result_summary=summary,
+                error=error_text,
                 started_at=started,
-                duration_ms=int((time.perf_counter() - perf_start) * 1000),
+                duration_ms=duration_ms,
                 granted_scope=tool.required_scope,
             )
         )
-        return
-
-    # Dispatch through the cache-aware helper. was_cache_hit tells us
-    # whether to record an audit row (hits skip — ADR-025 §Decision.8).
-    result, was_cache_hit = await invoke_tool(user_context, tool, args, session_id)
-    _append_tool_result(messages, call_id, tool_name, result)
-
-    if was_cache_hit:
-        logger.debug(
-            "memory tool cache HIT tool=%s session=%s — skipping audit row",
-            tool_name,
-            session_id,
-        )
-        return
-
-    error_text: str | None = None
-    summary: str | None = None
-    if "error" in result:
-        error_text = str(result.get("error"))
-    else:
-        # Truncated JSON summary for the audit row so the column stays
-        # bounded even on huge result sets.
-        summary = json.dumps(result)[:1000]
-
-    pending.append(
-        PendingToolCall(
-            tool_name=tool_name,
-            user_id=user_context.user_id,
-            agent_type=user_context.agent_type,
-            args=json.dumps(args),
-            result_summary=summary,
-            error=error_text,
-            started_at=started,
-            duration_ms=int((time.perf_counter() - perf_start) * 1000),
-            granted_scope=tool.required_scope,
-        )
-    )
 
 
 def _append_tool_result(
