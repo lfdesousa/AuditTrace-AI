@@ -523,6 +523,7 @@ the filter match count *for the caller*.
 - [ADR-034: Long-Running Generation](docs/ADR-034-long-running-generation.md)
 - [ADR-035: Package Rename](docs/ADR-035-package-rename.md)
 - [ADR-037: Agent Tool Audit Boundary](docs/ADR-037-agent-tool-audit-boundary.md)
+- [ADR-038: Cross-Device Memory Sync Protocol](docs/ADR-038-memory-sync-protocol.md) *(placeholder — joint draft with Otopoetic)*
 - [ADR-041: Product Boundary and Dependencies](docs/ADR-041-product-boundary-and-dependencies.md)
 
 ### Architecture Diagrams
