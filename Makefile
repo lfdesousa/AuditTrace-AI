@@ -51,17 +51,34 @@ test: ## Run all tests with per-file coverage gate
 	@.venv/bin/python scripts/check-no-skipped-tests.py
 	@echo "✅ Tests passed"
 
-test-rls-local: ## Run RLS integration tests against the k3s Postgres (port-forwards for you)
-	@echo "🔌 Port-forwarding audittrace-postgresql svc → localhost:15432 ..."
-	@KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} \
-	  kubectl -n audittrace port-forward svc/audittrace-postgresql 15432:5432 >/tmp/pgforward.log 2>&1 & \
-	  pf=$$!; trap "kill $$pf 2>/dev/null" EXIT; \
-	  sleep 3; \
-	  pw=$$(KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} \
-	    kubectl -n audittrace get secret audittrace-postgresql -o jsonpath='{.data.postgres-password}' | base64 -d); \
-	  AUDITTRACE_TEST_POSTGRES_URL="postgresql+psycopg2://postgres:$$pw@localhost:15432/audittrace" \
-	    .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov
-	@echo "✅ RLS integration tests passed"
+test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgres (NEVER production)
+	# Runs tests/test_rls_isolation.py against a throwaway postgres:16
+	# container on localhost:15432. CRITICALLY: does NOT port-forward the
+	# k3s production Postgres — the test file includes a positive test
+	# (test_alice_cannot_insert_as_bob) that deliberately provokes an RLS
+	# violation to prove WITH CHECK works. That violation gets logged as
+	# an ERROR by Postgres unconditionally, which would pollute production
+	# logs. An ephemeral container keeps the noise scoped.
+	@echo "🐳 Spinning up ephemeral test Postgres on :15432 ..."
+	@docker rm -f audittrace-test-pg >/dev/null 2>&1 || true
+	@docker run -d --rm --name audittrace-test-pg \
+	  -e POSTGRES_USER=postgres \
+	  -e POSTGRES_PASSWORD=test \
+	  -e POSTGRES_DB=audittrace \
+	  -p 15432:5432 \
+	  postgres:16 >/dev/null
+	@echo "⏳ Waiting for Postgres to accept connections ..."
+	@for i in 1 2 3 4 5 6 7 8; do \
+	  docker exec audittrace-test-pg pg_isready -U postgres >/dev/null 2>&1 && break ; \
+	  sleep 1 ; \
+	done
+	@AUDITTRACE_TEST_POSTGRES_URL="postgresql+psycopg2://postgres:test@localhost:15432/audittrace" \
+	  .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov ; \
+	  status=$$? ; \
+	  echo "🧹 Tearing down ephemeral test Postgres ..." ; \
+	  docker rm -f audittrace-test-pg >/dev/null 2>&1 ; \
+	  [ $$status -eq 0 ] || exit $$status
+	@echo "✅ RLS integration tests passed (ephemeral Postgres, no production pollution)"
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
