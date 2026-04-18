@@ -202,6 +202,13 @@ def test_list_interactions_returns_seeded_rows(client):
         "session_id",
         "model",
         "user_id",
+        # Migration 007 / ADR-033: failure-audit columns must also be
+        # exposed or the audit API shows every row as implicitly
+        # successful — masking real failures.
+        "status",
+        "failure_class",
+        "error_detail",
+        "duration_ms",
     ):
         assert key in row
 
@@ -224,6 +231,45 @@ def test_list_interactions_filters_by_session_source_user(client):
 
     r = client.get("/interactions?project=multi&user_id=u-B")
     assert r.json()["total"] == 1
+
+
+def test_list_interactions_exposes_failure_audit_columns(client):
+    """ADR-033 migration 007 added status/failure_class/error_detail/
+    duration_ms. The /interactions serialiser must surface them so the
+    audit browser can enumerate real failures."""
+    from audittrace.db.models import InteractionRecord as Row
+    from audittrace.dependencies import get_postgres_factory
+
+    pg = get_postgres_factory()
+    with pg.get_session_factory()() as db:
+        r = Row(
+            project="fail-vis",
+            question="q",
+            answer="",
+            session_id="s",
+            source="curl",
+            user_id="u",
+            timestamp="2026-04-18T09:00:00",
+            status="failed",
+            failure_class="proxy_timeout",
+            error_detail="upstream stalled for 300s",
+            duration_ms=2018,
+        )
+        db.add(r)
+        db.commit()
+
+    resp = client.get("/interactions?project=fail-vis&status=failed")
+    body = resp.json()
+    assert body["total"] == 1
+    row = body["interactions"][0]
+    assert row["status"] == "failed"
+    assert row["failure_class"] == "proxy_timeout"
+    assert row["error_detail"] == "upstream stalled for 300s"
+    assert row["duration_ms"] == 2018
+
+    # status filter is strict — 'success' must not leak failures.
+    resp_success = client.get("/interactions?project=fail-vis&status=success")
+    assert resp_success.json()["total"] == 0
 
 
 def test_list_interactions_filter_since(client):
