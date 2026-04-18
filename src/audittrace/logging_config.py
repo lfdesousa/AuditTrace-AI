@@ -374,18 +374,40 @@ def log_call(
                 pass
             if not include_input:
                 return
-            # ALWAYS emit input.value, even for self-only methods (no positional
-            # args after self) and no-arg free functions. The previous gate
-            # ``if payload:`` skipped these calls entirely, leaving Langfuse's
-            # Input panel rendering "undefined" for spans like
-            # FileEpisodicService.load(self) — confirmed via live trace.
-            # An empty ``{}`` is a meaningful display value ("called with no
-            # args"); ``undefined`` is actively misleading.
+            # Emit the richest payload we can so Langfuse's Input panel
+            # shows real content on every span — never "undefined".
+            # Method detection: args[0] is ``self`` only for BOUND methods.
+            # Module-level functions (e.g. _extract_query(payload)) have
+            # args[0] as the real first argument, so the old ``args[1:]``
+            # dropped it silently. Detect with the same heuristic
+            # _operation_name uses — args[0] is self if it's an instance
+            # of a non-builtin class.
+            starts_with_self = bool(
+                args
+                and hasattr(args[0], "__class__")
+                and not isinstance(args[0], type)
+                and args[0].__class__.__name__
+                not in (
+                    "str",
+                    "int",
+                    "dict",
+                    "list",
+                    "tuple",
+                    "float",
+                    "bool",
+                    "NoneType",
+                )
+            )
+            real_args = args[1:] if starts_with_self else args
             payload: dict[str, Any] = {}
-            if len(args) > 1:
-                payload["args"] = args[1:]
+            if real_args:
+                payload["args"] = real_args
             if kwargs:
                 payload["kwargs"] = kwargs
+            if not payload:
+                # No-arg call is a meaningful fact; tag it explicitly
+                # instead of writing "{}" which Langfuse renders as empty.
+                payload = {"called_with": "no arguments"}
             try:
                 telemetry.set_current_span_attributes(
                     {"input.value": _serialize_for_span(payload)}

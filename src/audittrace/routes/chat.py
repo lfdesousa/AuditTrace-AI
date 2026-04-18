@@ -614,12 +614,23 @@ def _build_memory_context_with_trace(
     )
     trace_id: str | None = None
     if _LANGFUSE_AVAILABLE:
+        client = None
         try:
             client = _lf_get_client()
             if client is not None:
                 trace_id = client.get_current_trace_id()
         except Exception:  # pragma: no cover
             trace_id = None
+        if client is not None:
+            try:
+                client.update_current_span(
+                    output={
+                        "memory_context_chars": len(memory_context or ""),
+                        "memory_context_preview": (memory_context or "")[:500],
+                    }
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
     return memory_context, trace_id
 
 
@@ -828,7 +839,7 @@ async def list_models(
         ) from exc
 
 
-@_lf_observe(name="sovereign-chat-request", capture_output=False)
+@_lf_observe(name="sovereign-chat-request")
 def _prepare_tools_mode_trace(
     payload: dict[str, Any],
     query: str,
@@ -863,12 +874,29 @@ def _prepare_tools_mode_trace(
     tools_for_user = tools_visible_to(user_context)
     trace_id: str | None = None
     if _LANGFUSE_AVAILABLE:
+        client = None
         try:
             client = _lf_get_client()
             if client is not None:
                 trace_id = client.get_current_trace_id()
         except Exception:  # pragma: no cover
             trace_id = None
+        # Best-effort span Output update — isolated in its own try so
+        # a client-side API incompatibility never breaks trace_id
+        # capture (which _record_langfuse_output depends on).
+        if client is not None:
+            try:
+                client.update_current_span(
+                    output={
+                        "tools_advertised": [
+                            (t.get("function") or {}).get("name", "?")
+                            for t in tools_for_user
+                        ],
+                        "tool_count": len(tools_for_user),
+                    }
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
     return tools_for_user, trace_id
 
 

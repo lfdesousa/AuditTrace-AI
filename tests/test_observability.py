@@ -198,8 +198,9 @@ def test_set_current_span_attributes_no_op_when_uninitialised(monkeypatch):
 
 def test_log_call_emits_input_for_self_only_methods(monkeypatch):
     """The @log_call aspect must emit ``input.value`` (as an OTel attribute)
-    even when a method is called with no positional args after self —
-    ``{}`` is a meaningful display value, ``undefined`` is misleading.
+    even when a method is called with no positional args after self. The
+    value must be a *meaningful* placeholder (Langfuse renders ``{}`` as
+    empty, so we write ``{"called_with": "no arguments"}`` instead).
     """
     fake_span = MagicMock()
     fake_span.is_recording.return_value = True
@@ -218,12 +219,13 @@ def test_log_call_emits_input_for_self_only_methods(monkeypatch):
     attrs_set = {
         call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
     }
-    assert attrs_set.get("input.value") == "{}", (
-        "input.value was not emitted for a self-only method — "
-        "the len(args) > 1 gate is back"
+    input_val = attrs_set.get("input.value", "")
+    assert "no arguments" in input_val, (
+        "self-only methods must render a meaningful placeholder in Langfuse, "
+        f"got {input_val!r}"
     )
     # Mirrored for Langfuse's Input panel
-    assert attrs_set.get("langfuse.observation.input") == "{}"
+    assert attrs_set.get("langfuse.observation.input") == input_val
 
 
 def test_log_call_emits_output_for_none_returning_function(monkeypatch):
