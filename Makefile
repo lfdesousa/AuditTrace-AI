@@ -144,8 +144,17 @@ k8s-install: k8s-deps ## Install the Helm chart on k3s
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
 	@helm install $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
 
-k8s-upgrade: ## Upgrade the Helm release
+k8s-upgrade: ## Upgrade the Helm release (passes values file explicitly — safe after chart structure changes)
 	@helm upgrade $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+
+k8s-rolling-image: ## Quick image-only update preserving user-supplied values (use for dev iteration; see runbook Scenario B)
+	@# --reset-then-reuse-values MERGES the chart's new defaults with prior user-supplied values.
+	@# --reuse-values would FAIL if the chart gained a new top-level block since last install.
+	@helm upgrade $(RELEASE) $(CHART_DIR) \
+	  --reset-then-reuse-values \
+	  --set memoryServer.image.tag=$(TAG) \
+	  -n $(NAMESPACE) \
+	  --wait --timeout 180s
 
 k8s-status: ## Show pod/service/Istio status
 	@echo "=== Pods ==="
