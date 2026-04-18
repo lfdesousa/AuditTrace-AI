@@ -54,22 +54,52 @@ def _init_langfuse_client() -> None:
         from langfuse.span_filter import is_default_export_span
 
         def _should_export_span(span: Any) -> bool:
-            """Extend Langfuse's default export filter.
+            """Langfuse export filter — ship only spans with signal.
 
-            Default behaviour accepts spans from the ``langfuse-sdk``
-            tracer, anything carrying ``gen_ai.*`` attributes, and known
-            LLM-instrumentor scopes. We additionally accept the
-            FastAPI server-root span for ``/v1/chat/completions`` — it
-            covers the full request wall time (including the tool-loop
-            httpx iterations to llama-server that otherwise leave no
-            langfuse-sdk breadcrumb). Without this, Langfuse's
-            ``latency`` field under-reports by the duration of the
-            final tool-loop iteration.
+            Pre-filter baseline saw 14,636 noise traces accumulated in
+            Langfuse (name empty, user None, input/output False) because
+            the default filter accepted every span from the known
+            LLM-instrumentor scopes, including FastAPI inbound + HTTPX
+            outbound auto-spans that carry none of our semantics.
+
+            Accept only spans that actually belong on a user's audit
+            timeline:
+              - langfuse-sdk-sourced spans (default path)
+              - spans with ``gen_ai.*`` semconv attributes (LLM calls)
+              - our app-emitted spans with ``user.id`` set (memory
+                services, tools, context builder — all Phase-2 tagged)
+              - the FastAPI root span for ``/v1/chat/completions``
+                so Langfuse's latency field matches wall time.
+
+            Every other OTel auto-span stays in Tempo (full traces
+            there are unchanged) but is dropped before Langfuse ingest.
             """
-            if is_default_export_span(span):
-                return True
             attrs = span.attributes or {}
-            return attrs.get("http.route") == "/v1/chat/completions"
+
+            # Keep the root chat-completions span so latency is accurate.
+            if attrs.get("http.route") == "/v1/chat/completions":
+                return True
+
+            # Keep anything carrying gen_ai semconv or our user.id tag —
+            # these are the spans that renders as useful observations in
+            # the Langfuse trace tree.
+            if attrs.get("user.id") or attrs.get("langfuse.user.id"):
+                return True
+            for key in attrs.keys():
+                if key.startswith("gen_ai.") or key.startswith("langfuse."):
+                    return True
+
+            # Otherwise, apply the default filter (langfuse-sdk scope) —
+            # do NOT accept the generic LLM-instrumentor scopes any more,
+            # so FastAPI + HTTPX auto-spans without our tagging get
+            # dropped before reaching Langfuse.
+            scope_name = ""
+            ils = getattr(span, "instrumentation_scope", None)
+            if ils is not None:
+                scope_name = getattr(ils, "name", "") or ""
+            if scope_name == "langfuse-sdk":
+                return bool(is_default_export_span(span))
+            return False
 
         _langfuse_client = Langfuse(
             public_key=public_key,
