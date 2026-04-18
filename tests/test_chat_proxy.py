@@ -828,6 +828,61 @@ class TestChatProxy:
         assert body["id"] == "trace-test-1"
         assert body["output"] == "hello"
         assert body["metadata"]["finish_reason"] == "stop"
+        # Phase 2.1: input + userId must be present so Langfuse UI stops
+        # rendering the trace as "undefined" (EU AI Act Art. 12 recon).
+        assert body.get("input") == [{"role": "user", "content": "Hi"}]
+        assert body.get("userId"), "userId must be set on the trace body"
+
+    def test_chat_proxy_langfuse_truncates_long_message_history(
+        self, client, monkeypatch
+    ):
+        """_LANGFUSE_INPUT_MESSAGE_CAP caps the ingested input at 50 turns.
+
+        A rogue or adversarial caller sending a million-message conversation
+        must not push that full transcript into Langfuse — keeping the cap
+        bounded protects the observability pipeline from payload bloat.
+        """
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+
+        long_messages = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(120)
+        ]
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+
+        with (
+            _patch_async_client(fake),
+            patch(
+                "audittrace.routes.chat._lf_get_client",
+                return_value=MagicMock(get_current_trace_id=lambda: "trace-cap-1"),
+            ),
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
+        ):
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": "qwen3.5-35b", "messages": long_messages},
+            )
+
+        config_mod.get_settings.cache_clear()
+
+        assert response.status_code == 200
+        ingestion_calls = [
+            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
+        ]
+        assert ingestion_calls
+        body = ingestion_calls[0]["json"]["batch"][0]["body"]
+        captured = body["input"]
+        assert len(captured) == 50
+        # The cap keeps the HEAD of the conversation (oldest turns) —
+        # consistent with how Langfuse renders "the first N messages the
+        # model saw" for reconstructibility, not the most-recent window.
+        assert captured[0] == {"role": "user", "content": "turn 0"}
+        assert captured[-1]["content"] == "turn 49"
 
     def test_chat_proxy_streams_error_on_upstream_status(self, client):
         """Streaming branch yields error chunk + DONE on upstream HTTP 4xx/5xx."""
