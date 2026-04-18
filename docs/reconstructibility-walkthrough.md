@@ -6,6 +6,46 @@
 
 ---
 
+## The shape of the audit trail
+
+```mermaid
+flowchart LR
+    User["User<br/>Keycloak sub"]
+    Gateway["Istio Gateway<br/>:30952 / mTLS"]
+    Server["memory-server<br/>FastAPI + tool loop"]
+    PG[("PostgreSQL<br/>interactions +<br/>sessions + tool_calls")]
+    Chroma[("ChromaDB<br/>semantic vectors")]
+    Minio[("MinIO<br/>episodic + procedural")]
+    Redis[("Redis<br/>token + tool cache")]
+    Kc["Keycloak<br/>JWKS + Device Flow"]
+    Qwen["Qwen 3.6-35B<br/>chat + tools"]
+
+    User -->|bearer JWT| Gateway
+    Gateway -->|SPIFFE mTLS| Server
+    Server -->|JWKS| Kc
+    Server -->|SELECT / INSERT| PG
+    Server -->|similarity search| Chroma
+    Server -->|GetObject| Minio
+    Server -->|GET / SETEX| Redis
+    Server -->|chat completions| Qwen
+
+    Server -. OTLP spans .-> OTel["OTel Collector<br/>DaemonSet"]
+    Server -. Langfuse SDK .-> Langfuse["Langfuse<br/>trace + observations"]
+    OTel --> Tempo["Tempo<br/>74 spans / trace"]
+    OTel --> Prom["Prometheus<br/>metrics"]
+    Server -.stdout.-> Promtail["Promtail DS"]
+    Promtail --> Loki["Loki<br/>structured logs"]
+
+    classDef store fill:#1f2937,stroke:#475569,color:#f1f5f9
+    classDef sink fill:#0c4a6e,stroke:#0369a1,color:#f0f9ff
+    class PG,Chroma,Minio,Redis store
+    class Langfuse,Tempo,Prom,Loki sink
+```
+
+Every arrow carries the same `trace_id` + `user_id` + `session_id`. The three solid-line arrows from `memory-server` to the four stores are the request path. The three dashed observability lines persist the request for audit.
+
+---
+
 ## Scenario
 
 A user fires one chat request against `POST /v1/chat/completions`. The prompt deliberately triggers two memory tools (`recall_decisions` and `recall_semantic`) so every layer wakes up.
@@ -110,62 +150,130 @@ The session row cross-references Hop 1 via the same `session_id`. The `key_point
 
 Langfuse stores the LLM view of the request: every tool call, every generation, every latency in the chain. Lookup is by `trace_id` — the same OpenTelemetry id that propagates through every span.
 
-```bash
-$ PK="pk-lf-..."
-$ SK="sk-lf-..."
-$ curl -s -u "$PK:$SK" \
-    "http://192.168.1.231:3000/api/public/traces?userId=$USER_SUB&limit=1&orderBy=timestamp.desc"
+### List view — "one trace per request, filterable by user"
+
+![Langfuse trace list filtered by user](images/reconstructibility/01-langfuse-trace-list.png)
+
+Every probe produces one trace; the list view shows `user`, `sessionId`, token counts, and latency at a glance. An auditor investigating a single user types the `sub` into the User filter and the list narrows to that user's activity only.
+
+### Trace tree — structural shape
+
+```mermaid
+flowchart TB
+    Root["POST /v1/chat/completions<br/>Input: messages  /  Output: answer"]
+    Auth["audittrace.auth.require_user<br/>JWT → UserContext"]
+    JWKS["audittrace.auth._fetch_jwks_keys"]
+    DI["di-context-builder"]
+    Extract["chat-extract-query"]
+    Merge["chat-merge-system"]
+    Prep["sovereign-chat-request<br/>tools advertised"]
+    LLM1["llm.chat.completions #1<br/>gen_ai.model + prompt + completion"]
+    LLM2["llm.chat.completions #2<br/>after decisions tool_result"]
+    LLM3["llm.chat.completions #3<br/>final answer"]
+    Tool1["memory_tool.recall_decisions<br/>input: args  /  output: result"]
+    Tool2["memory_tool.recall_semantic<br/>input: args  /  output: result"]
+    Chroma["memory-semantic-search<br/>ChromaDB query"]
+    S3a["S3EpisodicService.search"]
+    S3b["S3EpisodicService.load"]
+
+    Root --> Auth
+    Auth --> JWKS
+    Root --> DI
+    Root --> Extract
+    Root --> Merge
+    Root --> Prep
+    Prep --> S3a
+    Prep --> S3b
+    Prep --> LLM1
+    LLM1 --> Tool1
+    Prep --> LLM2
+    LLM2 --> Tool2
+    Tool2 --> Chroma
+    Prep --> LLM3
+
+    classDef llm fill:#065f46,stroke:#10b981,color:#ecfdf5
+    classDef tool fill:#5b21b6,stroke:#a78bfa,color:#f5f3ff
+    classDef store fill:#1f2937,stroke:#475569,color:#f1f5f9
+    classDef root fill:#0c4a6e,stroke:#38bdf8,color:#f0f9ff
+    class LLM1,LLM2,LLM3 llm
+    class Tool1,Tool2 tool
+    class Chroma,S3a,S3b store
+    class Root root
 ```
 
-```
-trace_id:   bf8373a8539e2d908e810adbcb00285d
-name:       POST /v1/chat/completions
-userId:     0b0cdd4d-04c3-428f-ab9d-37b47429c381
-sessionId:  curl-2026-04-18-8eb7151d4a63bfa79e8c88c53afae3e1
-input:      [{"role":"user","content":"Consult recall_decisions and recall_semantic ..."}]
-output:     "<think>\nThe semantic search returned..."
-observations: 20
-```
+And the same tree, rendered by Langfuse's Timeline view:
 
-Clicking into the trace in the Langfuse UI shows the tree:
+![Langfuse Timeline tree expanded](images/reconstructibility/02-langfuse-trace-tree.png)
 
-```
-POST /v1/chat/completions        ← root observation, input + output populated
-├── audittrace.auth.require_user  ← auth gate latency
-├── audittrace.auth._fetch_jwks_keys
-├── di-context-builder            ← DI resolution
-├── chat-extract-query
-├── chat-merge-system
-├── sovereign-chat-request        ← Langfuse-recognised parent observation
-├── llm.chat.completions          ← Generation #1, with gen_ai.request.model, prompt, completion
-│   └── memory_tool.recall_decisions   ← tool span #1, with input args + output result
-├── llm.chat.completions          ← Generation #2 (after tool result)
-│   └── memory_tool.recall_semantic    ← tool span #2
-│       └── memory-semantic-search     ← ChromaDB query
-├── llm.chat.completions          ← Generation #3 (final answer)
-└── S3EpisodicService.search      ← MinIO reads during ambient context build
-    S3EpisodicService.load
-```
+### The root observation — Input + Output populated
 
-Every span carries `langfuse.user.id = 0b0cdd4d…` (commit `8d32440`). Memory tool spans carry `input.value` (the args the model asked for), `output.value` (the truncated result the tool returned), and `tool.cache_hit`. LLM generation spans carry `gen_ai.request.model`, `gen_ai.response.completion`, `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens`.
+![Langfuse root observation detail, Input + Output non-empty](images/reconstructibility/03-langfuse-root-observation.png)
+
+The Input panel shows the full `messages` array the caller sent. The Output panel shows the model's completion. Before commit `92e7847` this panel rendered `undefined` on every click — the pitch-killer. It is now populated on every observation in the tree.
+
+### The Generation child — LLM reasoning preserved
+
+![Langfuse Generation card — model, prompt, completion, token usage](images/reconstructibility/04-langfuse-generation.png)
+
+Each `llm.chat.completions` child is tagged `langfuse.observation.type=generation` and carries `gen_ai.request.model`, the prompt preview, the completion, and prompt/completion token usage (commit `fa5198a` for tools-mode, `2ef15c3` for inject-mode).
+
+### The tool child — which memory layer fired, with what args, returning what
+
+![Langfuse memory_tool.recall_decisions observation](images/reconstructibility/05-langfuse-tool-call.png)
+
+The `memory_tool.recall_decisions` observation (commit `65a5965`) shows the tool's name, the JSON args the LLM passed, the truncated result the tool returned, and `tool.cache_hit: false` (the execution actually touched the episodic layer, it wasn't served from Redis).
 
 What this hop proves:
 
 - **Which memory layers fired** — two tool spans (`recall_decisions`, `recall_semantic`) are visible as distinct children, each with the tool arguments the model passed and the result the tool returned.
 - **How the model iterated** — three `llm.chat.completions` spans show the model round-tripped three times (initial question → after decisions result → after semantic result → final answer).
 - **What the LLM saw and produced** — input and output populated at both trace level and on the root observation.
+- **User attribution at every level** — every observation carries `langfuse.user.id` (commit `8d32440`) so the Langfuse user filter surfaces the whole tree, not just the root.
 
 ---
 
 ## Hop 4 — Tempo (full OTel call tree, every outbound edge)
 
-Tempo stores the same trace with **every** span the OTel SDK and auto-instrumentors emitted — including database queries, Redis SETEX, MinIO S3 calls, and every outbound HTTP. For this request: **74 spans** across the tree.
+Tempo stores the same trace with **every** span the OTel SDK and auto-instrumentors emitted — including database queries, Redis SETEX, MinIO S3 calls, and every outbound HTTP. For the probe in this walkthrough: **74 spans** (29 visible in the single-frame capture below; the rest are HTTP send/receive leaves collapsed under their parents).
 
-```bash
-$ curl -s "http://192.168.1.231:3200/api/traces/bf8373a8539e2d908e810adbcb00285d"
+### The flamegraph — one image, the whole call chain
+
+![Tempo trace flamegraph showing every span](images/reconstructibility/07-tempo-flamegraph.png)
+
+This is the image to put in the deck. It reads top-to-bottom as the request's life:
+
+1. **`audittrace.auth.require_user`** (12.98 ms) — JWT validated against Keycloak. The nested `audittrace.auth._fetch_jwks_keys` + `GET` + `SETEX` show the JWKS fetch + Redis-cache write the first time a new kid is seen.
+2. **`di-context-builder`** (156 μs), **`chat-extract-query`** (72 μs), **`chat-merge-system`** (121 μs), **`sovereign-chat-request`** (307 μs) — the proxy prep layer, all sub-millisecond.
+3. **`llm.chat.completions`** (1 m 3 s — the dominant bar) — nested `qwen-chat-llm POST` shows the actual outbound LLM call with the `peer.service=qwen-chat-llm` label. Everything else on the trace is microseconds; LLM inference is the only slow thing, and that's the trade-off the user is paying for.
+4. **Postgres writes** — `di-postgres-factory`, `db-postgres-session-factory`, `connect`, `SELECT audittrace` x3, `INSERT audittrace` — the audit-row persistence on the success path, all under 1 ms.
+5. **`langfuse POST`** (9 ms) — the explicit `/api/public/ingestion` call (commit `e7005e0`) that writes trace-level Input/Output to Langfuse.
+
+Every span carries `user.id` (commit `8d32440`), so `{ span.user.id = "<sub>" }` in TraceQL pulls only that user's activity out of Tempo.
+
+### The service map — eight edges, named
+
+![Tempo service map with 8 peer.service edges](images/reconstructibility/06-tempo-service-map.png)
+
+Tempo's metrics-generator derives a service graph from the spans' `peer.service` attributes. Every outbound edge memory-server makes is named, including the Langfuse ingestion edge (`peer.service=langfuse`, commit `93de0ca`):
+
+```mermaid
+flowchart LR
+    U["user"] --> S["audittrace-server"]
+    S --> PG["audittrace-postgresql"]
+    S --> CH["audittrace-chromadb"]
+    S --> R["audittrace-redis-master"]
+    S --> M["audittrace-minio"]
+    S --> K["audittrace-keycloak"]
+    S --> Q["qwen-chat-llm"]
+    S --> LF["langfuse"]
+
+    classDef server fill:#0c4a6e,stroke:#38bdf8,color:#f0f9ff
+    classDef peer fill:#1f2937,stroke:#475569,color:#f1f5f9
+    class S server
+    class PG,CH,R,M,K,Q,LF peer
 ```
 
-Inventory:
+Inventory for the probe:
 
 | Span name | Count | What it proves |
 |---|---:|---|
@@ -182,19 +290,6 @@ Inventory:
 | `INSERT audittrace` | 2 | `interactions` + `tool_calls` writes |
 | `SETEX` | 3 | Redis cache writes (token cache + tool-result cache) |
 | `POST` / `GET` / `connect` | 42 | Outbound HTTP (Qwen, nomic, Langfuse, Tempo, Loki) |
-
-The Tempo **service map** (generated by the metrics-generator from these spans) renders eight peer.service edges:
-
-```
-user                → audittrace-server
-audittrace-server   → audittrace-postgresql
-audittrace-server   → audittrace-chromadb
-audittrace-server   → audittrace-redis-master
-audittrace-server   → audittrace-minio
-audittrace-server   → audittrace-keycloak
-audittrace-server   → qwen-chat-llm
-audittrace-server   → langfuse          (named since commit 93de0ca)
-```
 
 ---
 
@@ -295,6 +390,35 @@ Every hop above carries the **same** user_id, session_id, and trace_id. This is 
 
 Per **ADR-037**, the agent's client-side tool execution is out of scope:
 
+```mermaid
+flowchart LR
+    subgraph Audited["✅ Inside the memory-server trust boundary"]
+        direction TB
+        Chat["/v1/chat/completions"]
+        Recall["recall_decisions<br/>recall_skills<br/>recall_recent_sessions<br/>recall_semantic"]
+        Stores["PostgreSQL / ChromaDB<br/>MinIO / Redis"]
+    end
+    subgraph NotAudited["❌ Outside — agent harness responsibility"]
+        direction TB
+        Bash["bash / shell"]
+        Read["read / write / edit"]
+        Grep["grep / glob"]
+        Web["web_fetch"]
+    end
+    User["User"] -->|JWT| Chat
+    Chat --> Recall
+    Recall --> Stores
+    User -. "local execution" .-> Bash
+    User -. "local execution" .-> Read
+    User -. "local execution" .-> Grep
+    User -. "local execution" .-> Web
+
+    classDef audited fill:#065f46,stroke:#10b981,color:#ecfdf5
+    classDef notaudited fill:#7f1d1d,stroke:#f87171,color:#fef2f2
+    class Chat,Recall,Stores audited
+    class Bash,Read,Grep,Web notaudited
+```
+
 - `bash`, `read`, `edit`, `write`, `grep`, `glob`, `web_fetch`, etc. — executed by the OpenCode / Claude Code / Continue harness on the user's machine, never reaching the memory-server.
 - The memory-server sees these only as literal text inside the model's response (rendered as `[tool_call] name(args)` in `interactions.answer`).
 
@@ -337,6 +461,14 @@ curl -s --get "http://192.168.1.231:3100/loki/api/v1/query_range" \
 ```
 
 Four hops, four API calls. Same `user_id` + `session_id` + `trace_id` across all of them.
+
+---
+
+## The operator view — "Sovereign AI Operations" dashboard
+
+When the auditor isn't drilling into a specific request, the Grafana dashboard shows the posture at a glance: latency percentiles, error rate by type, LLM tokens/sec, OTel Collector queue saturation, container logs. If any panel goes red, there's something to investigate — the dashboard is how the day-to-day operator knows the audit trail is intact.
+
+![Sovereign AI Operations dashboard, all panels green](images/reconstructibility/08-grafana-sovereign-ops.png)
 
 ---
 
