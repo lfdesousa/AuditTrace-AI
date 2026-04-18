@@ -523,9 +523,11 @@ the filter match count *for the caller*.
 - [ADR-034: Long-Running Generation](docs/ADR-034-long-running-generation.md)
 - [ADR-035: Package Rename](docs/ADR-035-package-rename.md)
 - [ADR-037: Agent Tool Audit Boundary](docs/ADR-037-agent-tool-audit-boundary.md)
+- [ADR-041: Product Boundary and Dependencies](docs/ADR-041-product-boundary-and-dependencies.md)
 
 ### Architecture Diagrams
 
+- [**Product boundary & dependencies**](docs/architecture/product-and-dependencies.md) — what AuditTrace-AI is (memory-server) and the eight market-standard dependencies it integrates with. Formal decision in ADR-041.
 - [C4 Workspace (Structurizr DSL)](docs/architecture/workspace.dsl)
 - [Sequence -- chat completions (inject mode)](docs/architecture/sequence-chat-completions.md)
 - [Sequence -- memory tool-call loop (tools mode)](docs/architecture/sequence-memory-tool-call.md)
