@@ -520,6 +520,7 @@ the filter match count *for the caller*.
 - [ADR-033: Three-Audience Error Envelope](docs/ADR-033-three-audience-error-envelope.md)
 - [ADR-034: Long-Running Generation](docs/ADR-034-long-running-generation.md)
 - [ADR-035: Package Rename](docs/ADR-035-package-rename.md)
+- [ADR-037: Agent Tool Audit Boundary](docs/ADR-037-agent-tool-audit-boundary.md)
 
 ### Architecture Diagrams
 
