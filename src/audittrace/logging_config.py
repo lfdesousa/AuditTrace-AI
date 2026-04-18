@@ -222,6 +222,49 @@ def _friendly_span_name(op: str) -> str:
     return op
 
 
+def _extract_user_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+    """Resolve the calling user's id for span tagging (Phase-2 recon).
+
+    Two sources, in precedence:
+      1. A ``UserContext`` positional or keyword argument on the decorated
+         call. Most memory-service methods accept it as the first positional
+         argument per ADR-026, so finding it is O(1).
+      2. The ``audittrace.db.rls._current_user_id`` ContextVar, which the
+         auth middleware binds on every authenticated request.
+
+    Returns ``None`` when neither yields an id (sentinel pre-auth calls,
+    unit tests without a request scope). Imports are local to avoid
+    a circular module dependency with ``audittrace.identity``/``db.rls``.
+    """
+    user_ctx_cls: Any = None
+    try:
+        from audittrace.identity import UserContext
+
+        user_ctx_cls = UserContext
+    except Exception:  # pragma: no cover - defensive: identity always importable
+        pass
+
+    if user_ctx_cls is not None:
+        for arg in args:
+            if isinstance(arg, user_ctx_cls):
+                uid = getattr(arg, "user_id", None)
+                if uid:
+                    return str(uid)
+        for value in kwargs.values():
+            if isinstance(value, user_ctx_cls):
+                uid = getattr(value, "user_id", None)
+                if uid:
+                    return str(uid)
+
+    try:
+        from audittrace.db.rls import current_user_id
+
+        result = current_user_id()
+        return str(result) if result is not None else None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _record_span_error(span: Any, exc: Exception) -> None:
     """Record an exception on the active span (OTel or Langfuse).
 
@@ -319,6 +362,14 @@ def log_call(
                 # view in the left panel when both are present.
                 span.set_attribute("langgraph_node", friendly)
                 span.set_attribute("langgraph_step", _next_step())
+                # Phase-2 reconstructibility: tag every span with the
+                # caller's Keycloak sub when resolvable. Without this the
+                # Langfuse dashboard cannot filter child observations by
+                # user and the EU AI Act Art. 12 trail stops at the root.
+                uid = _extract_user_id(args, kwargs)
+                if uid:
+                    span.set_attribute("langfuse.user.id", uid)
+                    span.set_attribute("user.id", uid)
             except Exception:  # pragma: no cover
                 pass
             if not include_input:
