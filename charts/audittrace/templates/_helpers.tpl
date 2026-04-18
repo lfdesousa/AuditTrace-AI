@@ -36,10 +36,24 @@ postgresql+psycopg2://audittrace_app:{{ .Values.secrets.postgres.appPassword }}@
 {{- end }}
 
 {{/*
-Construct the PostgreSQL connection URL for the owner role (summariser).
+PostgreSQL URL for the DEDICATED summariser role (ADR-026 §RLS posture,
+ADR-030 §Summariser). When manageRole is on, we provision an
+`audittrace_summariser` role with LOGIN NOSUPERUSER BYPASSRLS and
+minimum grants (SELECT on interactions, SELECT+INSERT+UPDATE on
+sessions, no tool_calls). The URL here must match the role the Job
+creates in templates/postgres/job-summariser-role.yaml.
+
+Falls back to the generic Bitnami `audittrace` owner role when
+manageRole is disabled — in that mode the operator is responsible
+for granting BYPASSRLS manually (or accepting the summariser will
+not cross users).
 */}}
 {{- define "audittrace.postgresOwnerUrl" -}}
+{{- if .Values.memoryServer.summariser.manageRole -}}
+postgresql+psycopg2://{{ .Values.memoryServer.summariser.roleName }}:{{ .Values.secrets.summariser.password }}@{{ .Release.Name }}-postgresql:5432/{{ .Values.postgresql.auth.database }}
+{{- else -}}
 postgresql+psycopg2://{{ .Values.postgresql.auth.username }}:{{ .Values.secrets.postgres.password }}@{{ .Release.Name }}-postgresql:5432/{{ .Values.postgresql.auth.database }}
+{{- end -}}
 {{- end }}
 
 {{/*
