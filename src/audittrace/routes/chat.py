@@ -1076,6 +1076,18 @@ async def _handle_tools_mode(
         input_messages=payload.get("messages"),
     )
 
+    # Tag the currently-active span (the FastAPI root observation) with
+    # the answer so the Langfuse observation-detail panel stops
+    # rendering "undefined" when the auditor clicks the root span.
+    try:
+        telemetry.set_current_span_attributes(
+            {
+                "langfuse.observation.output": str(answer_text)[:4000],
+            }
+        )
+    except Exception:  # pragma: no cover - defensive attribute write
+        pass
+
     # 6 — Return JSON or synthesised SSE
     if is_stream:
         return StreamingResponse(
@@ -1117,6 +1129,25 @@ async def chat_completions(
         ) from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise HTTPException(status_code=422, detail="messages: list required")
+
+    # Tag the ACTIVE FastAPI root span with Langfuse-native input so the
+    # observation detail panel shows the caller's messages instead of
+    # rendering "undefined". The trace-level input/output set via the
+    # ingestion API (commit e7005e0) populates the list-view card; this
+    # span-level tag populates the click-into observation panel. Both
+    # points need data for the UI to look consistent.
+    try:
+        telemetry.set_current_span_attributes(
+            {
+                "langfuse.observation.input": json.dumps(
+                    payload["messages"][-10:], ensure_ascii=False
+                )[:4000],
+                "user.id": user.user_id,
+                "langfuse.user.id": user.user_id,
+            }
+        )
+    except Exception:  # pragma: no cover - defensive attribute write
+        pass
 
     # ADR-029: tag every interaction with the caller's project. Precedence:
     # X-Project header → body.metadata.project → body.project → "default".
@@ -1504,6 +1535,15 @@ async def chat_completions(
             user_id=user.user_id,
             input_messages=payload.get("messages"),
         )
+        # Tag the root observation with the answer so clicking it in
+        # Langfuse shows real content instead of "undefined" (parity
+        # with the tools-mode branch above).
+        try:
+            telemetry.set_current_span_attributes(
+                {"langfuse.observation.output": str(answer)[:4000]}
+            )
+        except Exception:  # pragma: no cover - defensive attribute write
+            pass
     except Exception:  # pragma: no cover - capture is best-effort
         logger.exception("post-response capture failed")
     return body
