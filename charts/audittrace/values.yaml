@@ -98,6 +98,18 @@ observability:
       limits:
         cpu: 500m
         memory: 512Mi
+  promtail:
+    enabled: true
+    image:
+      repository: grafana/promtail
+      tag: "2.9.5"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
   external:
     langfuseIP: "192.168.1.231"
     langfusePort: 3000
@@ -105,6 +117,8 @@ observability:
     tempoOtlpPort: 14318
     prometheusIP: "192.168.1.231"
     prometheusPort: 19090
+    lokiIP: "192.168.1.231"
+    lokiPort: 3100
 
 # -- TLS ----------------------------------------------------------------------
 tls:
