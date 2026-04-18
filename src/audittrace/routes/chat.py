@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from opentelemetry import trace
 
 # Side-effect import so the four @register_memory_tool decorators run at
 # module import time — memory tools have to be in the registry before any
@@ -49,6 +50,8 @@ from audittrace.services.context_builder import (
     build_ambient_context,
 )
 from audittrace.tools import tools_visible_to
+
+_tracer = trace.get_tracer(__name__)
 
 # Failure taxonomy (ADR-033 seed). Stored verbatim in
 # ``interactions.failure_class``. Kept as module-level constants rather than
@@ -1370,13 +1373,58 @@ async def chat_completions(
     # ──────────────────────── Non-streaming branch ──────────────────────────
     ns_perf_start = time.perf_counter()
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=10.0, read=settings.llama_chunk_timeout, write=30.0, pool=10.0
+        # Wrap in a Langfuse-recognised generation span (parity with the
+        # tools-mode path in _memory_tool_loop.py). Nests inside the
+        # HTTPXClientInstrumentor span so Tempo's peer.service edge to
+        # qwen-chat-llm is preserved.
+        with _tracer.start_as_current_span("llm.chat.completions") as gen_span:
+            gen_span.set_attribute("langfuse.observation.type", "generation")
+            gen_span.set_attribute("openinference.span.kind", "LLM")
+            gen_span.set_attribute(
+                "gen_ai.request.model", proxy_payload.get("model", "")
             )
-        ) as client:
-            response = await client.post(llama_url, json=proxy_payload)
-        body = response.json()
+            gen_span.set_attribute("langfuse.user.id", user.user_id)
+            gen_span.set_attribute("user.id", user.user_id)
+            gen_span.set_attribute("audittrace.memory_mode", "inject")
+            try:
+                gen_span.set_attribute(
+                    "input.value",
+                    json.dumps(
+                        {"messages": proxy_payload.get("messages", [])[-10:]},
+                        ensure_ascii=False,
+                    )[:4000],
+                )
+            except Exception:  # pragma: no cover - defensive serialisation
+                pass
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=settings.llama_chunk_timeout,
+                    write=30.0,
+                    pool=10.0,
+                )
+            ) as client:
+                response = await client.post(llama_url, json=proxy_payload)
+            body = response.json()
+            try:
+                usage = body.get("usage", {}) or {}
+                gen_span.set_attribute(
+                    "gen_ai.usage.prompt_tokens",
+                    int(usage.get("prompt_tokens") or 0),
+                )
+                gen_span.set_attribute(
+                    "gen_ai.usage.completion_tokens",
+                    int(usage.get("completion_tokens") or 0),
+                )
+                choice_msg = (body.get("choices") or [{}])[0].get("message") or {}
+                completion = choice_msg.get("content") or ""
+                if completion:
+                    gen_span.set_attribute(
+                        "gen_ai.response.completion", str(completion)[:4000]
+                    )
+                    gen_span.set_attribute("output.value", str(completion)[:4000])
+            except Exception:  # pragma: no cover - defensive serialisation
+                pass
     except httpx.ConnectError as exc:
         _persist_interaction(
             project=project,
