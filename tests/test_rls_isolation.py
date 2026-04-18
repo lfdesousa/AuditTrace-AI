@@ -45,8 +45,10 @@ the session, so RLS actually applies to the test queries.
 
 from __future__ import annotations
 
+import os
 import socket
 from datetime import datetime
+from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -54,24 +56,68 @@ from sqlalchemy.orm import sessionmaker
 
 from audittrace.db.rls import install_rls_listener, set_current_user_id
 
-POSTGRES_HOST = "localhost"
-POSTGRES_PORT = 15432
 
+def _resolve_test_postgres_url() -> str | None:
+    """Pick a Postgres URL for the RLS integration tests.
 
-def _postgres_is_reachable() -> bool:
+    Priority:
+      1. ``AUDITTRACE_TEST_POSTGRES_URL`` env var — explicit, always wins.
+      2. Legacy docker-compose port ``localhost:15432`` with a password
+         from ``secrets/postgres_password.txt``. Kept so a developer who
+         still runs the sidecar compose postgres gets no skips.
+      3. Returns ``None`` when neither is viable — tests skip.
+
+    The URL must use the ``postgresql+psycopg2://`` scheme; SQLAlchemy
+    handles the rest. For the k3s-era stack, expose the in-cluster
+    Postgres locally with a port-forward and set the env var:
+
+        kubectl -n audittrace port-forward svc/audittrace-postgresql \\
+                15432:5432 &
+        export AUDITTRACE_TEST_POSTGRES_URL=\\
+            postgresql+psycopg2://postgres:<pw>@localhost:15432/audittrace
+    """
+    env_url = os.environ.get("AUDITTRACE_TEST_POSTGRES_URL")
+    if env_url:
+        return env_url
+
+    # Legacy docker-compose path.
     try:
-        with socket.create_connection((POSTGRES_HOST, POSTGRES_PORT), timeout=1):
-            return True
+        with socket.create_connection(("localhost", 15432), timeout=1):
+            pass
     except OSError:
-        return False
+        return None
+
+    from pathlib import Path
+
+    pw_file = Path(__file__).parent.parent / "secrets" / "postgres_password.txt"
+    if not pw_file.exists():
+        return None
+    pw = pw_file.read_text().strip()
+    return f"postgresql+psycopg2://sovereign:{pw}@localhost:15432/sovereign_ai"
+
+
+_RESOLVED_URL = _resolve_test_postgres_url()
+
+
+def _postgres_url_parts() -> tuple[str, int]:
+    """Parse ``_RESOLVED_URL`` into (host, port) for log / skip messages."""
+    if _RESOLVED_URL is None:
+        return ("?", 0)
+    parsed = urlparse(_RESOLVED_URL.replace("postgresql+psycopg2", "postgresql"))
+    return (parsed.hostname or "?", parsed.port or 0)
+
+
+POSTGRES_HOST, POSTGRES_PORT = _postgres_url_parts()
 
 
 pytestmark = pytest.mark.skipif(
-    not _postgres_is_reachable(),
+    _RESOLVED_URL is None,
     reason=(
-        "sovereign-postgres container not reachable on "
-        f"{POSTGRES_HOST}:{POSTGRES_PORT} — start the stack with "
-        "'docker compose up -d postgres' to run these tests."
+        "No test Postgres available. Set AUDITTRACE_TEST_POSTGRES_URL, or "
+        "start a compatible Postgres on localhost:15432 with a password at "
+        "secrets/postgres_password.txt. "
+        "For k3s: `kubectl -n audittrace port-forward svc/audittrace-postgresql "
+        "15432:5432 &` and export AUDITTRACE_TEST_POSTGRES_URL."
     ),
 )
 
@@ -81,22 +127,14 @@ pytestmark = pytest.mark.skipif(
 
 def _admin_engine():
     """Engine connected as the schema owner so fixture setup/teardown
-    can create and drop throwaway schemas. The password comes from
-    secrets/postgres_password.txt via the same convention as the
-    running stack."""
-    from pathlib import Path
-
-    pg_password_file = (
-        Path(__file__).parent.parent / "secrets" / "postgres_password.txt"
+    can create and drop throwaway schemas. Uses the URL resolved by
+    ``_resolve_test_postgres_url`` — so the same test file runs against
+    the docker-compose sidecar, a k3s port-forward, or a CI-provisioned
+    DB, determined by env."""
+    assert _RESOLVED_URL is not None, (
+        "pytestmark should have skipped the module when the URL is None"
     )
-    if not pg_password_file.exists():
-        pytest.skip("secrets/postgres_password.txt not found")
-    password = pg_password_file.read_text().strip()
-
-    return create_engine(
-        f"postgresql+psycopg2://sovereign:{password}@{POSTGRES_HOST}:{POSTGRES_PORT}/sovereign_ai",
-        pool_pre_ping=True,
-    )
+    return create_engine(_RESOLVED_URL, pool_pre_ping=True)
 
 
 _TEST_ROLE = "rls_test_role"

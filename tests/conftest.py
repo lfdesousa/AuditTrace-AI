@@ -15,7 +15,18 @@ from fastapi.testclient import TestClient
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.
 # This must run BEFORE importing audittrace.config so the .env-skip
 # logic in config._ENV_FILE sees AUDITTRACE_ENV=test.
-for _key in [k for k in os.environ if k.startswith("AUDITTRACE_")]:
+#
+# Exception: AUDITTRACE_TEST_POSTGRES_URL is test-only wiring (used by
+# tests/test_rls_isolation.py to pick a real Postgres instance over
+# the SQLite default). It's not app config, so it must survive the wipe —
+# otherwise CI and local-dev RLS integration tests silently fall back
+# to a stale compose URL and skip / fail.
+_TEST_ONLY_ALLOWLIST = {"AUDITTRACE_TEST_POSTGRES_URL"}
+for _key in [
+    k
+    for k in os.environ
+    if k.startswith("AUDITTRACE_") and k not in _TEST_ONLY_ALLOWLIST
+]:
     del os.environ[_key]
 os.environ["AUDITTRACE_ENV"] = "test"
 
