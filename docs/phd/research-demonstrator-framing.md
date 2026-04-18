@@ -1,4 +1,4 @@
-# AuditTrace-AI as a PhD research demonstrator — framing note for Dr. Schewe
+# AuditTrace-AI as a PhD research demonstrator — framing note for Dr Sven Schewe
 
 **Purpose.** This note sits between the formal paper and the running code. It names the research problem, proposes the evaluation protocol, places the contribution in the literature, and points to the implementation artefacts that demonstrate the framework is measurable today.
 
@@ -65,7 +65,7 @@ Four directions in which the demonstrator could drive a multi-year programme; an
 3. **Empirical reconstructibility at scale.** The N=100 eval is a start. A PhD-grade study would vary workload (N=10⁴+), user population (multi-tenant), and failure class (injection attacks, partial-failure scenarios) to characterise the reconstructibility envelope under adversarial conditions.
 4. **Audit-trail adversarial robustness.** Can a bad actor (malicious user, compromised agent client, curious insider) *degrade* reconstructibility without triggering any detectable signal? A PhD chapter on this would combine threat modelling with empirical red-teaming.
 
-I would welcome Dr. Schewe's guidance on which of these directions aligns best with Liverpool's current research strength, and on how the existing implementation could be shaped to maximise academic leverage.
+I would welcome Dr Schewe's guidance on which of these directions aligns best with Liverpool's current research strength, and on how the existing implementation could be shaped to maximise academic leverage.
 
 ## Suggested reading order for a reviewer
 

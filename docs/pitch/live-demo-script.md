@@ -144,7 +144,7 @@ Same shape as the 15-minute version, but extend three sections:
 
 **After Hop 3 — the evaluation framework (+4 min).** Open `docs/eval-memory-modes-*.md`. Walk through the N=100 eval methodology. Show the comparison between `inject` vs `tools` mode — latency, reliability, tool-selection accuracy. *"This is what a reconstructibility benchmark looks like when operationalised. Every number here is reproducible; the JSONL outputs are in the repository."*
 
-**After the trust boundary — the research framing (+5 min).** Open `docs/phd/research-demonstrator-framing.md`. Walk the reviewer through the four candidate PhD directions. Pause on direction 1 (formal specification of reconstructibility in PRISM-compatible temporal logic) if the audience is Liverpool / Dr. Schewe specifically — that connects to Liverpool's formal-methods tradition.
+**After the trust boundary — the research framing (+5 min).** Open `docs/phd/research-demonstrator-framing.md`. Walk the reviewer through the four candidate PhD directions. Pause on direction 1 (formal specification of reconstructibility in PRISM-compatible temporal logic) if the audience is Liverpool / Dr Sven Schewe specifically — that connects to Liverpool's formal-methods and verification tradition, which Dr Schewe's group works within.
 
 **Close on (3 min):**
 1. *"What's the right scope for a PhD thesis — one of the four directions, or a combination?"*
