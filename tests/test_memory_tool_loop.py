@@ -820,6 +820,56 @@ class TestSpanEmission:
         )
 
     @pytest.mark.asyncio
+    async def test_llm_call_wrapped_as_generation(
+        self, _populated_container, _fakeredis_cache, span_exporter
+    ):
+        """Phase 2.4: every round-trip to llama-server is wrapped in an
+        llm.chat.completions span with Langfuse-generation attributes,
+        so the UI renders it as a Generation (not a bare HTTP POST).
+        Two iterations = two generation spans."""
+        user = sentinel_user_context()
+        fake = _SequencedClient(
+            [
+                _tool_call_response(
+                    "recall_decisions", '{"query": "cache"}', call_id="c1"
+                ),
+                _text_response("ok"),
+            ]
+        )
+        with _patch_async_client(fake):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.6-35b-a3b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-gen",
+                max_iterations=5,
+            )
+        gen_spans = [
+            s
+            for s in span_exporter.get_finished_spans()
+            if s.name == "llm.chat.completions"
+        ]
+        assert len(gen_spans) == 2, (
+            f"expected 2 generation spans (2 llama round-trips), got {len(gen_spans)}"
+        )
+        first = gen_spans[0].attributes or {}
+        assert first.get("langfuse.observation.type") == "generation"
+        assert first.get("openinference.span.kind") == "LLM"
+        assert first.get("gen_ai.request.model") == "qwen3.6-35b-a3b"
+        assert first.get("user.id") == user.user_id
+        assert first.get("gen_ai.iteration") == 0
+        # First turn is a tool-calls response — output.value should say so.
+        assert "tool_calls" in str(first.get("output.value", ""))
+        # Second turn is the text answer — completion captured.
+        second = gen_spans[1].attributes or {}
+        assert second.get("gen_ai.response.completion") == "ok"
+        assert second.get("gen_ai.iteration") == 1
+
+    @pytest.mark.asyncio
     async def test_scope_denied_span_marked_error(
         self, _populated_container, _fakeredis_cache, span_exporter
     ):
