@@ -620,6 +620,9 @@ def _build_memory_context_with_trace(
     return memory_context, trace_id
 
 
+_LANGFUSE_INPUT_MESSAGE_CAP = 50
+
+
 async def _record_langfuse_output(
     trace_id: str | None,
     answer: str,
@@ -629,6 +632,8 @@ async def _record_langfuse_output(
     tool_calls: list[dict[str, Any]] | None,
     session_id: str | None,
     model: str | None,
+    user_id: str | None = None,
+    input_messages: list[dict[str, Any]] | None = None,
 ) -> None:
     """Update a Langfuse trace with the LLM output via the ingestion API.
 
@@ -636,6 +641,12 @@ async def _record_langfuse_output(
     context manager being open. The streaming generator runs *after* the
     ``@observe`` span has already exited, so context-based updates would land
     on a closed observation and never appear in the UI.
+
+    ``input_messages`` and ``user_id`` are the Phase-2 reconstructibility
+    additions (EU AI Act Art. 12): without them, Langfuse renders the trace
+    with Input/Output/User shown as "undefined" and the audit trail is
+    illegible. Messages are truncated at 50 turns (``_LANGFUSE_INPUT_MESSAGE_CAP``)
+    to keep payloads bounded.
 
     Async on purpose: a sync ``httpx.post`` here would block the event loop
     inside the streaming generator's tail and stall stream completion if
@@ -670,6 +681,10 @@ async def _record_langfuse_output(
         "output": answer,
         "metadata": metadata,
     }
+    if input_messages is not None:
+        body["input"] = input_messages[:_LANGFUSE_INPUT_MESSAGE_CAP]
+    if user_id:
+        body["userId"] = user_id
     if session_id:
         body["sessionId"] = session_id
     try:
@@ -1054,6 +1069,8 @@ async def _handle_tools_mode(
         tool_calls=final_tool_calls or None,
         session_id=session_id,
         model=response_model,
+        user_id=user.user_id,
+        input_messages=payload.get("messages"),
     )
 
     # 6 — Return JSON or synthesised SSE
@@ -1340,6 +1357,8 @@ async def chat_completions(
                 ),
                 session_id=session_id,
                 model=state.model or requested_model,
+                user_id=user.user_id,
+                input_messages=payload.get("messages"),
             )
 
         return StreamingResponse(
@@ -1434,6 +1453,8 @@ async def chat_completions(
             tool_calls=ns_tool_calls or None,
             session_id=session_id,
             model=body.get("model") or requested_model,
+            user_id=user.user_id,
+            input_messages=payload.get("messages"),
         )
     except Exception:  # pragma: no cover - capture is best-effort
         logger.exception("post-response capture failed")
