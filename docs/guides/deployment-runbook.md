@@ -332,3 +332,27 @@ istioctl proxy-config clusters -n audittrace deploy/audittrace-memory-server
 kubectl exec -n audittrace deploy/audittrace-redis -- redis-cli ping
 # Expected: connection refused (AuthorizationPolicy blocks non-SPIFFE sources)
 ```
+
+### Upgrading the release — which Helm flag when
+
+Two distinct upgrade scenarios appear in day-to-day work; picking the wrong flag surfaces as a cryptic `nil pointer evaluating interface {}.enabled` error.
+
+**Scenario A — values unchanged since last install (just re-deploying).**
+Pass your values file explicitly with `-f`. This is what `make k8s-upgrade` does:
+```bash
+helm upgrade $RELEASE $CHART_DIR -f $VALUES_FILE -n $NAMESPACE
+```
+
+**Scenario B — quick iteration: change ONE value (e.g., bump image tag) but keep everything else.**
+Use `--reset-then-reuse-values` (Helm ≥ 3.14) + `--set`. The reason plain `--reuse-values` is NOT the right answer here: it reuses only the *user-supplied* values from the prior release and ignores NEW default values added to `values.yaml` since then. The moment the chart grows a new top-level block (e.g., `memoryServer.summariser` added 2026-04-18), `--reuse-values` produces a deployment where the new defaults are missing and the templates error out. `--reset-then-reuse-values` merges the chart's new defaults with the prior user-supplied values, which is what an iterating operator actually wants:
+```bash
+helm upgrade $RELEASE $CHART_DIR \
+  --reset-then-reuse-values \
+  --set memoryServer.image.tag=$TAG \
+  -n $NAMESPACE
+```
+
+**Scenario C — structural chart changes AND you want to rewrite user values.**
+Pass a fresh values file with `-f` (Scenario A semantics). Helm always accepts the file as the authoritative source.
+
+**If you hit `nil pointer evaluating interface {}.enabled` or similar on a `helm upgrade`, assume Scenario B above was your intent — retry with `--reset-then-reuse-values`.**
