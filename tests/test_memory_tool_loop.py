@@ -595,7 +595,11 @@ class TestPendingAuditRows:
         self, _populated_container, _fakeredis_cache
     ):
         """An exploding handler still produces an audit row — the fact that
-        a tool was invoked is the auditable event, success or failure."""
+        a tool was invoked is the auditable event, success or failure. The
+        recorded error is the exception TYPE only; ``str(exc)`` is dropped
+        at the ``invoke_tool`` boundary to avoid echoing user query content
+        or inner-layer details through exception messages into the audit
+        row, the LLM reply, or the INFO log."""
         from dataclasses import replace
 
         from audittrace.tools import MEMORY_TOOL_REGISTRY, get_tool_by_name
@@ -603,7 +607,9 @@ class TestPendingAuditRows:
         tool = get_tool_by_name("recall_decisions")
 
         async def _exploding(user_context, args):
-            raise RuntimeError("episodic on fire")
+            # Message carries a user-query-shaped fragment to prove the
+            # redaction drops it before the audit row is written.
+            raise RuntimeError("episodic on fire — query=cache")
 
         MEMORY_TOOL_REGISTRY[tool.name] = replace(tool, handler=_exploding)
 
@@ -629,8 +635,9 @@ class TestPendingAuditRows:
                 max_iterations=5,
             )
         assert len(pending) == 1
-        assert pending[0].error is not None
-        assert "episodic on fire" in pending[0].error
+        assert pending[0].error == "RuntimeError"
+        assert "episodic on fire" not in (pending[0].error or "")
+        assert "query=cache" not in (pending[0].error or "")
 
 
 # ───────────────────────── Scope-gated dispatch ─────────────────────────────

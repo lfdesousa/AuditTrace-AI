@@ -282,3 +282,76 @@ def test_metrics_response_model():
     )
     assert response.chroma_collections == 5
     assert response.total_chunks == 1654
+
+
+# ─────────────────────── project PII guardrail (bug 4) ──────────────────────
+
+
+class TestProjectPiiGuardrail:
+    """The ``project`` field flows into INFO logs, audit rows, and Langfuse
+    trace attributes. A project name that looks like an email would turn
+    operational logs into personal-data repositories. These tests lock the
+    narrow PII guardrail on every model that accepts a project on input."""
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "P",
+            "test",
+            "AuditTrace",
+            "OtherProject",
+            "bratschi-pilot-2026",
+            "customer_deal_42",
+        ],
+    )
+    def test_legitimate_project_names_accepted(self, good: str) -> None:
+        """Mixed case, hyphens, underscores, digits, short identifiers —
+        all legitimate project names used across the existing test suite."""
+        assert (
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hi")],
+                project=good,
+            ).project
+            == good
+        )
+        assert ContextRequest(query="x", project=good).project == good
+        assert InteractionRecord(project=good, question="q", answer="a").project == good
+
+    def test_project_with_at_sign_rejected(self) -> None:
+        """Any ``@`` is assumed to be an email shape."""
+        with pytest.raises(ValueError, match="email"):
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hi")],
+                project="john.doe@bratschi.ch",
+            )
+        with pytest.raises(ValueError, match="email"):
+            SessionSaveRequest(project="a@b", interactions=[])
+
+    def test_project_with_control_chars_rejected(self) -> None:
+        """Tabs / newlines / NULs would corrupt log parsers downstream."""
+        with pytest.raises(ValueError, match="control"):
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hi")],
+                project="proj\x00ect",
+            )
+        with pytest.raises(ValueError, match="control"):
+            InteractionRecord(project="line\nbreak", question="q", answer="a")
+
+    def test_project_too_long_rejected(self) -> None:
+        """256-char cap keeps the audit row bounded."""
+        with pytest.raises(ValueError, match="too long"):
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hi")],
+                project="x" * 257,
+            )
+
+    def test_none_project_still_allowed_where_optional(self) -> None:
+        """ChatRequest + ContextRequest accept None; guardrail must be inert."""
+        assert (
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hi")],
+                project=None,
+            ).project
+            is None
+        )
+        assert ContextRequest(query="x", project=None).project is None

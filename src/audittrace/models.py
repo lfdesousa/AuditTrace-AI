@@ -1,7 +1,29 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _reject_project_pii(value: str | None) -> str | None:
+    """Reject obviously-PII project names before they reach logs + audit rows.
+
+    The ``project`` field flows into INFO logs, audit rows, Langfuse trace
+    attributes, and the context string sent to the LLM. Customer-facing
+    deployments sometimes let operators invent project names freely; this
+    guardrail catches the shapes that would turn a project name into
+    personal data under GDPR (emails most commonly). It is intentionally
+    narrow — slug conventions belong in the operator runbook, not here —
+    so it does not break legitimate mixed-case or short identifiers.
+    """
+    if value is None:
+        return None
+    if "@" in value:
+        raise ValueError("project must not contain '@' (looks like an email address)")
+    if any(ord(c) < 32 for c in value):
+        raise ValueError("project must not contain control characters")
+    if len(value) > 256:
+        raise ValueError("project is too long (max 256 characters)")
+    return value
 
 
 class ChatMessage(BaseModel):
@@ -28,6 +50,8 @@ class ChatRequest(BaseModel):
         default=None, description="Query for memory retrieval"
     )
     project: str | None = Field(default=None, description="Project for memory context")
+
+    _validate_project = field_validator("project")(_reject_project_pii)
 
 
 class ChatChoice(BaseModel):
@@ -59,6 +83,8 @@ class ContextRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=100, description="Max results")
     k: int = Field(default=10, ge=1, le=100, description="NN search k-nearest")
 
+    _validate_project = field_validator("project")(_reject_project_pii)
+
 
 class ContextResponse(BaseModel):
     """Response schema for /context endpoint (raw ChromaDB results)."""
@@ -81,12 +107,15 @@ class ContextBuildResponse(BaseModel):
     project: str | None = None
     retrieved_at: datetime = Field(default_factory=datetime.now)
 
+    _validate_project = field_validator("project")(_reject_project_pii)
+
 
 class InteractionRecord(BaseModel):
     """Schema for interaction audit records."""
 
     id: int | None = None
     project: str
+    _validate_project = field_validator("project")(_reject_project_pii)
     source: str = "unknown"
     question: str
     answer: str
@@ -108,6 +137,8 @@ class SessionSaveRequest(BaseModel):
     metadata: dict[str, Any] | None = Field(
         default=None, description="Session metadata"
     )
+
+    _validate_project = field_validator("project")(_reject_project_pii)
 
 
 class SessionSummaryRequest(BaseModel):
@@ -135,6 +166,8 @@ class SessionSummaryRequest(BaseModel):
             "summarising a chat the LLM participated in."
         ),
     )
+
+    _validate_project = field_validator("project")(_reject_project_pii)
 
 
 class SessionSummaryResponse(BaseModel):
