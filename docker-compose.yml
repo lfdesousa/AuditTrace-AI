@@ -228,7 +228,7 @@ services:
     # Redis (which lives in the sibling Langfuse compose stack). Keeping
     # the two decoupled avoids cross-system coupling and lets each
     # scale independently.
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: audittrace-redis
     command:
       - redis-server
