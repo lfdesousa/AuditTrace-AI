@@ -11,6 +11,20 @@ spec:
   gateways:
     - {{ .Values.istio.gateway.name }}
   http:
+    # Admin ingest endpoint — rebuilds ChromaDB collections from every
+    # document in MinIO. On a populated bucket this exceeds Istio's
+    # 15 s gateway default and the request gets cut off mid-index. Pin
+    # a generous timeout for this route only; other routes keep the
+    # default so a runaway is still bounded.
+    - match:
+        - uri:
+            prefix: /memory/index
+      timeout: 300s
+      route:
+        - destination:
+            host: {{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.memoryServer.port }}
     # Catch-all route — Keycloak VirtualService has higher-priority
     # prefix matches for /realms and /admin, so this handles everything else.
     - route:

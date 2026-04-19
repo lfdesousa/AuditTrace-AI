@@ -296,11 +296,21 @@ class TestErrorHandling:
         self, _populated_container, _fakeredis_cache, monkeypatch
     ):
         """A handler that raises unexpectedly must not crash the loop —
-        the invoke helper catches and returns {'error': ...}."""
+        the invoke helper catches and returns {'error': ExceptionType}.
+
+        The error payload is the exception TYPE name only. str(exc) is
+        intentionally dropped because it can carry user query content
+        (SQL bind values, ChromaDB query strings) when an inner layer
+        echoes parameters — and this payload flows into the LLM response,
+        the audit row, and INFO logs, none of which may contain user
+        content from a regulated-industry deployment."""
         tool = get_tool_by_name("recall_decisions")
 
         async def _exploding(user_context, args):
-            raise RuntimeError("episodic layer is on fire")
+            # The message contains both an inner identifier ("episodic layer")
+            # AND a user-query-shaped fragment ("cache"). Neither may appear
+            # in the returned error payload.
+            raise RuntimeError("episodic layer is on fire while running query=cache")
 
         # Re-register under the same name with the exploding handler.
         object.__setattr__(tool, "handler", _exploding)
@@ -313,8 +323,9 @@ class TestErrorHandling:
             {"query": "cache"},
             session_id="sess-1",
         )
-        assert "error" in result
-        assert "episodic layer is on fire" in result["error"]
+        assert result == {"error": "RuntimeError"}
+        assert "episodic layer" not in result["error"]
+        assert "cache" not in result["error"]
         assert was_cache_hit is False
         assert _fakeredis_cache.size() == 0  # errors never cached
 
