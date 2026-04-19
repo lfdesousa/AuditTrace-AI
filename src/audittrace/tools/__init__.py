@@ -361,9 +361,15 @@ async def invoke_tool(
     try:
         result = await tool.handler(user_context, args)
     except Exception as exc:
+        # Keep the full stacktrace server-side (ops has it) but return
+        # only the exception TYPE to the LLM / audit row / INFO log.
+        # str(exc) can carry user query content when the inner layer
+        # echoes parameters (SQL bind values, ChromaDB query strings).
+        # Regulated-industry deployments must not have user content leak
+        # through a tool-error path.
         logger.exception("memory tool handler %r raised", tool.name)
         return (
-            {"error": f"{type(exc).__name__}: {exc}"},
+            {"error": exc.__class__.__name__},
             False,
         )
 
