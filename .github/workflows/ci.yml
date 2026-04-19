@@ -44,7 +44,7 @@ jobs:
       AUDITTRACE_TEST_POSTGRES_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/audittrace"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v6
