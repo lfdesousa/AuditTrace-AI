@@ -18,6 +18,10 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 > **Academic trajectory:** This research is under discussion with the University of Liverpool Department of Computer Science as a potential PhD programme, building on the author's MSc in Big Data Analytics (Liverpool, 2022).
 
 [![CI](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/github-code-scanning/codeql)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 ## Features
 
