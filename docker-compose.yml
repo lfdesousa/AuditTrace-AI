@@ -161,7 +161,7 @@ services:
     restart: unless-stopped
 
   chromadb:
-    image: chromadb/chroma:1.5.7
+    image: chromadb/chroma:1.5.8
     container_name: audittrace-chromadb
     ports:
       - "18000:8000"
