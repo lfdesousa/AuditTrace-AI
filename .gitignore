@@ -74,6 +74,10 @@ Thumbs.db
 # Local agent config (your IP)
 .opencode/
 
+# Project-local CLAUDE.md — personal orientation file for Claude Code sessions,
+# not a shared project artefact. AGENTS.md is the shared equivalent.
+/CLAUDE.md
+
 # Personal skill library (your IP) — seeded into procedural memory at runtime,
 # must not be committed. SKILL-memory-commands.md is project-local, keep it.
 memory/procedural/SKILL-*.md
