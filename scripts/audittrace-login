@@ -61,12 +61,18 @@ require() {
 require curl
 require jq
 
-# Self-signed mkcert TLS is the dev default; auto-bypass for localhost
-# unless the operator opts in via CURL_VERIFY=1.
+# Self-signed mkcert TLS is the dev default; auto-bypass for local dev
+# hostnames unless the operator opts in via CURL_VERIFY=1. Covers both
+# the docker-compose-era default (localhost) and the k3s Istio gateway
+# hostname (audittrace.local).
 CURL_OPTS=()
-if [[ "$KEYCLOAK_BASE" == https://localhost* ]] && [[ "${CURL_VERIFY:-0}" != "1" ]]; then
-  CURL_OPTS+=("-k")
-fi
+case "$KEYCLOAK_BASE" in
+  https://localhost*|https://audittrace.local*)
+    if [[ "${CURL_VERIFY:-0}" != "1" ]]; then
+      CURL_OPTS+=("-k")
+    fi
+    ;;
+esac
 
 log() { echo "[audittrace-login] $*" >&2; }
 
