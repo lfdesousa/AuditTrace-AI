@@ -16,7 +16,7 @@ data:
       filename: /run/promtail/positions.yaml
 
     clients:
-      - url: http://{{ .Values.observability.external.lokiIP }}:{{ .Values.observability.external.lokiPort }}/loki/api/v1/push
+      - url: http://{{ .Values.observability.external.lokiIP | default .Values.global.hostNodeIP }}:{{ .Values.observability.external.lokiPort | default 3100 }}/loki/api/v1/push
 
     scrape_configs:
       - job_name: kubernetes-pods

@@ -64,6 +64,13 @@ spec:
               value: "http://{{ .Release.Name }}-llm-summarizer:{{ .Values.externalLLM.summarizer.port }}/v1"
             - name: AUDITTRACE_OTLP_ENDPOINT
               value: "http://{{ .Release.Name }}-otel-collector:4318"
+            # AUDITTRACE_LANGFUSE_HOST is built at render time from
+            # observability.external.langfuseIP (optional explicit override)
+            # with a fallback to global.hostNodeIP — the cni0 bridge IP
+            # that reaches the laptop host regardless of upstream network.
+            # See ADR-045 §"Pod → host pattern".
+            - name: AUDITTRACE_LANGFUSE_HOST
+              value: "http://{{ .Values.observability.external.langfuseIP | default .Values.global.hostNodeIP }}:{{ .Values.observability.external.langfusePort | default 3000 }}"
             # ── Secret-sourced ────────────────────────────────────────
             - name: AUDITTRACE_CHROMA_TOKEN
               valueFrom:

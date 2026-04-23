@@ -21,8 +21,8 @@ metadata:
     {{- include "audittrace.labels" . | nindent 4 }}
 subsets:
   - addresses:
-      - ip: {{ .Values.observability.external.langfuseIP }}
+      - ip: {{ .Values.observability.external.langfuseIP | default .Values.global.hostNodeIP }}
     ports:
-      - port: {{ .Values.observability.external.langfusePort }}
+      - port: {{ .Values.observability.external.langfusePort | default 3000 }}
         protocol: TCP
         name: http
