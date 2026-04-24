@@ -15,7 +15,12 @@ set -euo pipefail
 LLAMA_BIN="${LLAMA_BIN:-$HOME/opt/llamacpp/llama-server}"
 MODEL_PATH="${MODEL_PATH:-$HOME/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf}"
 PORT="${PORT:-11437}"
-CTX_SIZE="${CTX_SIZE:-16384}"
+# 32768 matches Mistral-7B-Instruct-v0.3's trained ctx window (n_ctx_train).
+# 16384 was the previous default; it truncated long OpenCode sessions (>~60
+# turns) and caused the summariser to hit 400 Bad Request in a 5-min retry
+# loop — see docs/backlog/10-summariser-preflight-token-overflow.md.
+# Q4 KV cache cost at 32768 ≈ 1 GB, well within laptop budget.
+CTX_SIZE="${CTX_SIZE:-32768}"
 ALIAS="${ALIAS:-mistral-7b-summarizer}"
 # GPU_LAYERS = how many of Mistral's ~33 layers to offload to the iGPU.
 # 10 = partial offload (recommended default for single-iGPU boxes such
