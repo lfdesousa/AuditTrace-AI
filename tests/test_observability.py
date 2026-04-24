@@ -102,12 +102,24 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
             attributes={"http.route": "/v1/chat/completions"},
             instrumentation_scope=langfuse_scope,
         )
-        health_span = MagicMock(
+        # Two flavours of probe span, corresponding to the two emitters:
+        # FastAPI auto-instrumentor (http.route) and the @log_call aspect
+        # (sovereign.operation). Production's actual leak was the second
+        # — the first is belt-and-suspenders.
+        health_fastapi = MagicMock(
             attributes={"http.route": "/health"},
             instrumentation_scope=langfuse_scope,
         )
+        health_log_call = MagicMock(
+            attributes={
+                "sovereign.operation": "audittrace.routes.health.health_check",
+            },
+            instrumentation_scope=langfuse_scope,
+        )
         metrics_span = MagicMock(
-            attributes={"http.route": "/metrics"},
+            attributes={
+                "sovereign.operation": "audittrace.routes.health.metrics",
+            },
             instrumentation_scope=langfuse_scope,
         )
         user_tagged = MagicMock(
@@ -134,11 +146,15 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
         )
 
         assert filter_fn(chat_root) is True
-        assert filter_fn(health_span) is False, (
-            "liveness/readiness probes on the langfuse-sdk scope must "
-            "not reach Langfuse — the denylist drops them before the "
-            "is_default_export_span accept branch even when the predicate "
-            "returns True"
+        assert filter_fn(health_fastapi) is False, (
+            "liveness/readiness FastAPI auto-spans carrying "
+            "http.route='/health' must not reach Langfuse"
+        )
+        assert filter_fn(health_log_call) is False, (
+            "@log_call inner spans carrying "
+            "sovereign.operation='audittrace.routes.health.health_check' "
+            "must not reach Langfuse — this is the production path that "
+            "actually leaked, FastAPI-scoped spans don't make it here"
         )
         assert filter_fn(metrics_span) is False
         assert filter_fn(user_tagged) is True
