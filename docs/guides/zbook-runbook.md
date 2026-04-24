@@ -139,8 +139,20 @@ kubectl -n audittrace create secret tls audittrace-tls \
 
 helm upgrade --install audittrace ./charts/audittrace \
   -n audittrace \
-  --set global.hostNodeIP=$(./scripts/detect-k3s-bridge.sh)
+  --set global.hostNodeIP=$(./scripts/detect-k3s-bridge.sh) \
+  --set secrets.postgres.password=test-pg-pass \
+  --set secrets.postgres.appPassword=test-pg-pass \
+  --set secrets.summariser.password=test-summariser-pw \
+  --set secrets.chromadb.token=test-chroma-token \
+  --set secrets.redis.password=test-redis-pass \
+  --set secrets.minio.secretKey=test-minio-key
 ```
+
+> The six `secrets.*` values above are the repo-wide dev defaults (see the
+> SECURITY NOTICE at the top of `charts/audittrace/values.yaml`). They are
+> *only* safe for laptop / dev installs. Any production deploy sets
+> `global.productionMode=true` and provisions these from a secret manager
+> (ADR-040 Vault integration, target 2026-05-16).
 
 Wait for Pods:
 
