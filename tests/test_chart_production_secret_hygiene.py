@@ -35,6 +35,14 @@ def _helm_template(extra_sets: list[str] | None = None) -> subprocess.CompletedP
         "audittrace",
         "--set",
         "secrets.summariser.password=dummy-pw-for-render",
+        # MinIO secret + KMS key are render-time `required` (see
+        # templates/secrets/secret-minio.yaml + ADR-045 PM-1). Tests
+        # that explicitly want to observe those flags override them
+        # further down via `extra_sets`.
+        "--set",
+        "secrets.minio.secretKey=dummy-minio-secret-for-render",
+        "--set",
+        "secrets.minio.kmsKey=dummy-minio-kms-for-render",
     ]
     if extra_sets:
         for kv in extra_sets:

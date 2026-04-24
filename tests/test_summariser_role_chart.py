@@ -44,7 +44,16 @@ def _find(resources: list[dict], kind: str, name: str) -> dict | None:
 @pytest.fixture(scope="module")
 def rendered() -> list[dict]:
     # Password must be provided for manageRole=true path; use a dummy.
-    return _render(["--set", "secrets.summariser.password=dummy-pw-for-render"])
+    return _render(
+        [
+            "--set",
+            "secrets.summariser.password=dummy-pw-for-render",
+            "--set",
+            "secrets.minio.secretKey=dummy-minio-secret-for-render",
+            "--set",
+            "secrets.minio.kmsKey=dummy-minio-kms-for-render",
+        ]
+    )
 
 
 def test_summariser_role_job_is_rendered_and_is_a_helm_hook(
@@ -105,7 +114,16 @@ def test_summariser_role_has_minimum_grants(rendered: list[dict]) -> None:
 def test_summariser_role_not_rendered_when_disabled() -> None:
     """manageRole=false must produce no Job + no Secret + no ConfigMap
     so external role-management workflows (Terraform, dbmate) can own it."""
-    resources = _render(["--set", "memoryServer.summariser.manageRole=false"])
+    resources = _render(
+        [
+            "--set",
+            "memoryServer.summariser.manageRole=false",
+            "--set",
+            "secrets.minio.secretKey=dummy-minio-secret-for-render",
+            "--set",
+            "secrets.minio.kmsKey=dummy-minio-kms-for-render",
+        ]
+    )
     assert _find(resources, "Job", "audittrace-ensure-summariser-role") is None
     assert _find(resources, "Secret", "audittrace-summariser-db") is None
     assert _find(resources, "ConfigMap", "audittrace-ensure-summariser-sql") is None
