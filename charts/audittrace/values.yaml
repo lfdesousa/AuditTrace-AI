@@ -44,7 +44,13 @@
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
-  hostNodeIP: "192.168.1.231"
+  # Address at which k3s Pods reach the host. Default is the flannel cni0
+  # bridge gateway, which is stable regardless of upstream network state
+  # (WiFi / hotspot / airplane). Auto-detect at install time with
+  # scripts/detect-k3s-bridge.sh and inject via --set global.hostNodeIP=.
+  # Used as the fallback for externalLLM.hostIP and every
+  # observability.external.*IP — see ADR-045.
+  hostNodeIP: "10.42.0.1"
   # Set to true for production deploys. When true, the chart refuses to
   # render if any `secrets.*` value matches a known dev default. See the
   # SECURITY NOTICE above.
@@ -107,7 +113,10 @@ memoryServer:
     AUDITTRACE_TOOLS_CONFIG_PATH: "tools.toml"
     AUDITTRACE_METRICS_ENABLED: "true"
     AUDITTRACE_LANGFUSE_ENABLED: "true"
-    AUDITTRACE_LANGFUSE_HOST: "http://192.168.1.231:3000"
+    # AUDITTRACE_LANGFUSE_HOST is injected by templates/memory-server/
+    # deployment.yaml using global.hostNodeIP + observability.external.
+    # langfusePort so it resolves correctly on any network. Do not add
+    # it here.
     AUDITTRACE_LANGFUSE_PUBLIC_KEY: "pk-lf-b3fb3a7e-b447-41c3-941e-c798ac006c58"
     AUDITTRACE_LANGFUSE_SECRET_KEY: "sk-lf-507779bd-f2b9-4bd2-9e05-71361840c1ba"
     AUDITTRACE_SUMMARIZER_ENABLED: "true"
@@ -120,8 +129,12 @@ memoryServer:
     OTEL_RESOURCE_ATTRIBUTES: "service.namespace=audittrace,service.version=1.0.0,deployment.environment=local"
 
 # -- External LLM (host-network endpoints) -----------------------------------
+# hostIP is optional. When empty, templates fall back to global.hostNodeIP,
+# which reaches the laptop host via the k3s cni0 bridge — the pattern that
+# works on any network. Override explicitly only if llama.cpp runs on a
+# different host (e.g. a separate workstation on your LAN). See ADR-045.
 externalLLM:
-  hostIP: "192.168.1.100"
+  hostIP: ""
   chat:
     name: llm-chat
     port: 11435
@@ -173,13 +186,17 @@ observability:
         cpu: 200m
         memory: 256Mi
   external:
-    langfuseIP: "192.168.1.231"
+    # *IP fields are optional. When empty, every consumer falls back to
+    # global.hostNodeIP (the k3s cni0 bridge → laptop host). Override
+    # explicitly only when egressing to a separate obs host on your LAN.
+    # See ADR-045 + ADR-028 amendment.
+    langfuseIP: ""
     langfusePort: 3000
-    tempoIP: "192.168.1.231"
+    tempoIP: ""
     tempoOtlpPort: 14318
-    prometheusIP: "192.168.1.231"
+    prometheusIP: ""
     prometheusPort: 19090
-    lokiIP: "192.168.1.231"
+    lokiIP: ""
     lokiPort: 3100
 
 # -- TLS ----------------------------------------------------------------------

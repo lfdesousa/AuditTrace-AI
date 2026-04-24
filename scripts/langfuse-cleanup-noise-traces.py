@@ -57,7 +57,13 @@ from typing import Any
 
 import httpx
 
-LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://192.168.1.231:3000")
+LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST")
+if not LANGFUSE_HOST:
+    sys.exit(
+        "LANGFUSE_HOST env var is required (e.g. http://localhost:3000 or "
+        "http://10.42.0.1:3000 on the laptop). No LAN-specific default is "
+        "baked in — see ADR-045."
+    )
 
 
 def _resolve_credentials() -> tuple[str, str]:

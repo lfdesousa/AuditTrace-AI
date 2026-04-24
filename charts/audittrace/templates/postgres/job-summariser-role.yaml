@@ -32,7 +32,15 @@ metadata:
     "helm.sh/hook-weight": "10"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 3
+  # backoffLimit was 3 → raised to 12 after the 2026-04-24 outage. During
+  # a `helm upgrade` that also rolls audittrace-postgresql-0 (e.g. because
+  # an unrelated chart change nudges the StatefulSet), the hook started
+  # before Postgres accepted connections and exhausted 3 retries in under
+  # 30 s. Combined with the pre-run pg_isready wait-loop below, 12 is
+  # plenty: 12 × 10 s backoff ≈ 2 min of hook retries, and each hook
+  # invocation waits up to 2 min for pg_isready. See ADR-045 §Verification
+  # postmortem.
+  backoffLimit: 12
   template:
     metadata:
       labels:
@@ -78,6 +86,27 @@ spec:
             - -c
             - |
               set -euo pipefail
+              # Wait for Postgres to accept connections before running the
+              # role SQL. During a `helm upgrade` the audittrace-postgresql
+              # StatefulSet may roll (re-binding its PVC, re-initialising
+              # the sidecar), and the hook can land in the gap between
+              # termination and the new pod being Ready. Without this loop
+              # the hook fails fast on connection-refused and burns its
+              # backoffLimit. 60 iterations × 2 s = 120 s of patience —
+              # well beyond a typical Bitnami Postgres roll. See ADR-045
+              # §Verification postmortem.
+              echo "waiting for Postgres at ${PGHOST}:${PGPORT} ..."
+              for i in $(seq 1 60); do
+                if pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; then
+                  echo "Postgres is ready after ${i} attempt(s)."
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "Postgres did not become ready within 120 s." >&2
+                  exit 1
+                fi
+                sleep 2
+              done
               echo "ensuring dedicated summariser role with minimum privileges..."
               # Expand the password into a psql variable so the SQL file
               # stays static and safely quoted at the SQL layer (%L).

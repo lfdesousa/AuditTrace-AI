@@ -21,7 +21,7 @@ metadata:
     {{- include "audittrace.labels" . | nindent 4 }}
 subsets:
   - addresses:
-      - ip: {{ .Values.externalLLM.hostIP }}
+      - ip: {{ .Values.externalLLM.hostIP | default .Values.global.hostNodeIP }}
     ports:
       - port: {{ .Values.externalLLM.chat.port }}
         protocol: TCP

@@ -65,10 +65,15 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
     import sys
 
     monkeypatch.setitem(sys.modules, "langfuse", MagicMock(Langfuse=fake_lf_class))
+    # is_default_export_span mocked to ACCEPT (return True) so we actually
+    # prove the denylist bites BEFORE the is_default_export_span accept
+    # branch. Production's real is_default_export_span accepts any span
+    # with a non-empty name, which is why /health (span name "health-check")
+    # was leaking. Matching that behaviour in the test is the whole point.
     monkeypatch.setitem(
         sys.modules,
         "langfuse.span_filter",
-        MagicMock(is_default_export_span=lambda span: False),
+        MagicMock(is_default_export_span=lambda span: True),
     )
 
     try:
@@ -80,13 +85,82 @@ def test_init_langfuse_client_initialises_when_env_set(monkeypatch):
         assert call_kwargs["secret_key"] == "sk-test"
         assert call_kwargs["host"] == "http://lf.test"
         assert call_kwargs["tracing_enabled"] is True
-        # should_export_span is our custom filter — accepts the FastAPI
-        # /v1/chat/completions root span on top of Langfuse's defaults.
+        # should_export_span is our custom filter. Exercise every branch
+        # with a realistic instrumentation_scope — a previous version of
+        # this test left scope unset, which hid the "/health under
+        # langfuse-sdk scope leaks" regression (see
+        # project_langfuse_ux_regression).
         filter_fn = call_kwargs["should_export_span"]
-        chat_root = MagicMock(attributes={"http.route": "/v1/chat/completions"})
-        other_span = MagicMock(attributes={"http.route": "/health"})
+
+        langfuse_scope = MagicMock()
+        langfuse_scope.name = "langfuse-sdk"
+
+        other_scope = MagicMock()
+        other_scope.name = "httpx"
+
+        chat_root = MagicMock(
+            attributes={"http.route": "/v1/chat/completions"},
+            instrumentation_scope=langfuse_scope,
+        )
+        # Two flavours of probe span, corresponding to the two emitters:
+        # FastAPI auto-instrumentor (http.route) and the @log_call aspect
+        # (sovereign.operation). Production's actual leak was the second
+        # — the first is belt-and-suspenders.
+        health_fastapi = MagicMock(
+            attributes={"http.route": "/health"},
+            instrumentation_scope=langfuse_scope,
+        )
+        health_log_call = MagicMock(
+            attributes={
+                "sovereign.operation": "audittrace.routes.health.health_check",
+            },
+            instrumentation_scope=langfuse_scope,
+        )
+        metrics_span = MagicMock(
+            attributes={
+                "sovereign.operation": "audittrace.routes.health.metrics",
+            },
+            instrumentation_scope=langfuse_scope,
+        )
+        user_tagged = MagicMock(
+            attributes={"user.id": "alice-42", "http.route": "/somepath"},
+            instrumentation_scope=langfuse_scope,
+        )
+        gen_ai_tagged = MagicMock(
+            attributes={"gen_ai.system": "llama.cpp", "http.route": "/other"},
+            instrumentation_scope=langfuse_scope,
+        )
+        # Bare langfuse-sdk-scoped span (no user tag, no gen_ai attrs) —
+        # should reach the is_default_export_span accept branch and pass
+        # because the mock returns True there.
+        bare_langfuse = MagicMock(
+            attributes={"http.route": "/audit/something"},
+            instrumentation_scope=langfuse_scope,
+        )
+        # Span under a non-langfuse-sdk scope (e.g. httpx auto-span)
+        # with no tagging — must be rejected. Guards ADR-045 PM's
+        # intent that generic auto-spans stay Tempo-only.
+        other_scope_span = MagicMock(
+            attributes={"http.route": "/audit/something"},
+            instrumentation_scope=other_scope,
+        )
+
         assert filter_fn(chat_root) is True
-        assert filter_fn(other_span) is False
+        assert filter_fn(health_fastapi) is False, (
+            "liveness/readiness FastAPI auto-spans carrying "
+            "http.route='/health' must not reach Langfuse"
+        )
+        assert filter_fn(health_log_call) is False, (
+            "@log_call inner spans carrying "
+            "sovereign.operation='audittrace.routes.health.health_check' "
+            "must not reach Langfuse — this is the production path that "
+            "actually leaked, FastAPI-scoped spans don't make it here"
+        )
+        assert filter_fn(metrics_span) is False
+        assert filter_fn(user_tagged) is True
+        assert filter_fn(gen_ai_tagged) is True
+        assert filter_fn(bare_langfuse) is True
+        assert filter_fn(other_scope_span) is False
         # Second call must early-return (idempotent guard at line 41-42)
         telemetry._init_langfuse_client()
         assert fake_lf_class.call_count == 1
