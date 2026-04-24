@@ -39,8 +39,18 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-secret
                   key: root-password
+            # Pulled from a Secret so the base64 key never lands in the
+            # rendered StatefulSet spec. The "audittrace-key:" prefix is
+            # baked into the Secret's `kms-master-key` value. The pre-fix
+            # inline-value pattern silently rendered "audittrace-key:"
+            # (empty-after-colon) when kmsKey was blank and fatal-ed MinIO
+            # at startup with "kms: invalid key length 0" during the
+            # 2026-04-24 outage. See ADR-045 §Verification postmortem.
             - name: MINIO_KMS_SECRET_KEY
-              value: "audittrace-key:{{ .Values.secrets.minio.kmsKey }}"
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-secret
+                  key: kms-master-key
           ports:
             - name: api
               containerPort: 9000
