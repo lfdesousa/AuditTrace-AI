@@ -204,6 +204,62 @@ callout explaining the committed-dev-key posture.
 runbook's command set in the same commit. Runbook drift is treated as
 a chart bug, not a docs bug.
 
+### PM-4 — `nmcli networking off` is not airplane-mode simulation
+
+Discovered during the first Phase 4 (airplane smoke) attempt on
+2026-04-24. The rehearsal intent was "external network completely
+gone, laptop-first stack still works" — a
+`feedback_demo_rehearsal_non_home_network` gate for the 20 May
+Bratschi pitch.
+
+`sudo nmcli networking off` looked like the cleanest single-command
+cut. It isn't: NetworkManager brings down *every* interface it knows
+about, including ones it treats as "externally managed" — the k3s
+flannel `cni0` bridge and the three Docker bridges
+(`docker0`, `br-<compose>…`). The bridges come back `UP` when
+`nmcli networking on` runs, but **without their IPs**, because NM
+never re-applies the address that flannel / Docker installed out of
+band.
+
+Observed cascade during the 2026-04-24 incident:
+- `cni0` stays UP but loses `10.42.0.1/24`. The pod-to-host path and
+  the 10.42.0.0/24 connected route both vanish. Kubelet can't reach
+  pod IPs on the sidecar's 15020/15021 ports; every pod's liveness
+  and readiness probes start failing.
+- The three Docker bridges lose their `172.17.0.1 / 172.18.0.1 /
+  172.19.0.1` IPs. Docker-proxy listeners on the host keep
+  `accept()`ing, but the forward leg to the container IP has no
+  route, so every connection to `localhost:3000` / `:3001` / `:5000`
+  resets.
+- `memory-server` gets scheduled → tries to pull
+  `localhost:5000/audittrace/memory-server:latest` → container-proxy
+  forward fails → `ImagePullBackOff`.
+- 30 min+ of chasing effects before the root cause (cni0/docker
+  bridges both lost their IPs) surfaces.
+
+**Fix / workaround (for operators):**
+- To simulate airplane, use the *interface-level* cut that leaves
+  flannel and Docker alone:
+    ```
+    sudo rfkill block wifi bluetooth
+    sudo ip link set <ethN> down      # e.g. enxa0cec8afb44d
+    ```
+  `ip route show default` must return empty before testing.
+- If you do land in the nmcli trap:
+    ```
+    sudo ip addr add 10.42.0.1/24 dev cni0
+    sudo systemctl restart docker     # restores docker bridges + iptables
+    kubectl -n audittrace delete pods -l app.kubernetes.io/component=memory-server
+    ```
+  k3s restart is a heavier alternative; `ip addr add` on cni0 plus
+  a docker restart is faster.
+
+**Class.** External interfaces only in any "off-LAN" simulation.
+Never touch the management layer. The runbook's
+§Airplane-mode smoke has a warning box repeating this rule;
+`scripts/phase4-airplane-test.sh` aborts fast if `default route`
+is not empty, which is the only reliable "the cut took" check.
+
 ## References
 
 - ADR-028 (observability aggregation stack) — this ADR amends the
