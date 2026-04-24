@@ -27,4 +27,19 @@ spec:
             host: {{ .Release.Name }}-keycloak.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: 8080
+    # Keycloak 24+ admin UI loads its versioned JS/CSS modules from
+    # /resources/<build-id>/admin/keycloak.v2/... — same for the
+    # account console and future LibreChat (ADR-042) OIDC flows. Without
+    # this match, Istio routes /resources/* into the memory-server's
+    # catch-all and FastAPI returns {"detail":"Not Found"} with
+    # content-type: application/json, which the browser blocks under
+    # MIME-type sniffing ("Loading the Admin UI" hangs forever).
+    - match:
+        - uri:
+            prefix: /resources
+      route:
+        - destination:
+            host: {{ .Release.Name }}-keycloak.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: 8080
 {{- end }}
