@@ -184,19 +184,53 @@ appear with `user_id`, `session_id`, `trace_id` set.
 
 ### Airplane-mode smoke
 
+> ⚠️  **Never use `nmcli networking off` for this test.** NetworkManager
+> takes down every interface it knows, including the flannel `cni0`
+> bridge and the Docker compose bridges. The bridges come back `UP`
+> when you turn networking on again, but *without their IPs* —
+> kubelet can no longer reach pod IPs, the Docker-proxy forward leg
+> breaks, and the whole stack silently bricks. See ADR-045 §PM-4 for
+> the full cascade. Always use the *interface-level* cut below.
+
+The cut needs to drop every path out of the laptop. On a box with
+both WiFi and a wired uplink, rfkill alone isn't enough (it only
+touches radios); you must also bring the ethernet interface down.
+
 ```bash
-sudo rfkill block all      # turn off WiFi / Bluetooth / cellular
-sleep 3
-ping -c1 -W1 8.8.8.8 && echo 'UNEXPECTED: still online'
+# 1. Identify your live uplink (look for 'default via ... dev X').
+ip route show default
 
-# Run the exact same commands as "Online smoke" above. Everything should
-# still work because no call path leaves the laptop.
+# 2. Cut. Replace enxa0cec8afb44d with your own interface name.
+sudo rfkill block wifi bluetooth
+sudo ip link set enxa0cec8afb44d down
 
-sudo rfkill unblock all    # restore when done
+# 3. Verify — all three must be true before you trust the result.
+[ -z "$(ip route show default)" ]        && echo "no default route ✓"
+! ping -c1 -W2 8.8.8.8 >/dev/null 2>&1    && echo "no external reach ✓"
+ping -c1 -W2 10.42.0.1  >/dev/null 2>&1   && echo "cni0 alive ✓"
+
+# 4. Run the smoke script — aborts fast if the cut didn't take.
+bash scripts/phase4-airplane-test.sh
+
+# 5. Restore.
+sudo ip link set enxa0cec8afb44d up
+sudo rfkill unblock all
 ```
 
-Capture evidence to `tmp/evidence/zbook-$(date +%F).log` per
+Evidence is written to `tmp/evidence/zbook-$(date +%F).log` per
 `feedback_test_and_evidence`.
+
+**If you accidentally ran `nmcli networking off`** and the cluster
+looks bricked (pods in CrashLoop / ImagePullBackOff, dashboards
+return connection reset), restore with:
+
+```bash
+sudo ip addr add 10.42.0.1/24 dev cni0      # restore flannel IP
+sudo systemctl restart docker               # restore Docker bridges + iptables
+kubectl -n audittrace delete pods -l app.kubernetes.io/component=memory-server
+```
+
+then wait ~90 s for pods to re-converge.
 
 ## Overrides for the home-workstation case
 
