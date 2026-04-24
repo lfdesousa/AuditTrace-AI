@@ -27,6 +27,16 @@ _duration_histogram = None
 _error_counter = None
 _langfuse_client: Any | None = None
 
+# Probe routes we never want to ship to the Langfuse audit tier.
+# Kubelet/Docker liveness+readiness hit /health at ~20 req/min per replica
+# and /metrics is admin-only telemetry; neither carries user identity or
+# reconstructibility signal. They remain fully instrumented in Tempo
+# (ADR-028) and in the operation-duration histogram — we just drop them
+# at the Langfuse export boundary. Re-opened 2026-04-18 (85872db) when
+# the langfuse-sdk scope started accepting every non-empty-name span;
+# closed again 2026-04-24. See ADR-045 + project_langfuse_ux_regression.
+_LANGFUSE_PROBE_DENYLIST = frozenset({"/health", "/metrics"})
+
 
 def _init_langfuse_client() -> None:
     """Best-effort init of the Langfuse SDK client.
@@ -75,6 +85,15 @@ def _init_langfuse_client() -> None:
             there are unchanged) but is dropped before Langfuse ingest.
             """
             attrs = span.attributes or {}
+
+            # Probe routes (liveness/readiness/admin-metrics) never belong
+            # in Langfuse. They carry a span name but no user identity,
+            # so Langfuse's is_default_export_span lets them through on
+            # the langfuse-sdk scope branch further down. Drop them up
+            # front. Tempo still records them in full. See the module-
+            # level _LANGFUSE_PROBE_DENYLIST comment for background.
+            if attrs.get("http.route") in _LANGFUSE_PROBE_DENYLIST:
+                return False
 
             # Keep the root chat-completions span so latency is accurate.
             if attrs.get("http.route") == "/v1/chat/completions":
