@@ -134,6 +134,76 @@ Four gates, in order:
    https://audittrace.local/v1/chat/completions -d '{...}'`. Evidence
    captured per `feedback_test_and_evidence`.
 
+## Verification postmortem (2026-04-24)
+
+The first end-to-end verification of the laptop-first chart — a
+`helm upgrade` from the rev-36 (pre-ADR) chart to the rev-37 (post-ADR)
+chart on a live cluster holding 133 interactions + 51 sessions — failed
+on two chart-internal fault classes that had nothing to do with the
+laptop-first IP work but that **the IP work's `--set` flag set was the
+first command to surface**. Both are now fixed on this branch. Three
+rules captured:
+
+### PM-1 — `required` guards belong on every render-time secret
+
+The MinIO StatefulSet used to render `MINIO_KMS_SECRET_KEY` inline as
+`"audittrace-key:{{ .Values.secrets.minio.kmsKey }}"`. When `kmsKey`
+was left blank — exactly what an operator who followed the bring-up
+runbook verbatim did — the Pod spec contained `audittrace-key:`
+(trailing colon, no key) and MinIO fatal-ed at startup with
+`"kms: invalid key length 0"`. The failure mode was silent at
+`helm template` time (no error) and loud at runtime (CrashLoopBackOff
++ a PVC-encryption alarm).
+
+**Fix.** (a) Add a `required` guard in
+`charts/audittrace/templates/secrets/secret-minio.yaml` on
+`secrets.minio.secretKey` and `secrets.minio.kmsKey` so `helm template`
+fails with an actionable message. (b) Move the KMS value off the
+StatefulSet's `.env[].value` (plaintext in spec) and onto
+`.env[].valueFrom.secretKeyRef` so the base64 key only ever lives in
+the Secret. (c) Bake the `audittrace-key:` prefix inside the Secret's
+stringData so consumers pull a ready-to-use value.
+
+**Class.** Every other `secrets.*` required at runtime gets the same
+audit on the next chart-wide pass. The rule: **if the chart renders a
+secret value, the template must `required`-guard it or carry a
+documented default. Silent `""` is never acceptable.**
+
+### PM-2 — post-upgrade hooks that touch Postgres must wait for it
+
+`audittrace-ensure-summariser-role` is a post-upgrade Helm hook that
+runs `psql` against the in-cluster Postgres to re-ensure the dedicated
+summariser role. During the failed rev-37 upgrade the
+`audittrace-postgresql-0` StatefulSet also rolled (cause: an unrelated
+spec-equivalent change triggered a rolling update). The hook started
+in the gap between Postgres termination and the new pod becoming
+Ready; its three allowed attempts all hit `connection refused` inside
+~30 s; `BackoffLimitExceeded` failed the release.
+
+**Fix.** (a) Add a `pg_isready` wait-loop at the top of the hook's
+bash command (60 × 2 s = 120 s patience). (b) Raise `backoffLimit`
+from 3 to 12 so the outer retry budget also tolerates a Postgres roll.
+
+**Class.** Any future chart hook that depends on a rolled workload
+gets the same pattern: wait explicitly for the dependency, don't
+rely on the default backoffLimit.
+
+### PM-3 — runbook verbatim-command is a contract
+
+The Daily bring-up snippet in `docs/guides/zbook-runbook.md`
+initially omitted every `secrets.*` flag. A first patch (commit
+bb417d2) added six. The MinIO failure exposed that one was still
+missing: `--set-file secrets.minio.kmsKey=secrets/minio_kms_key.txt`.
+The chart now enforces the missing flag at `helm template` time, but
+the runbook is what an operator reads; the two must match.
+
+**Fix.** Add the seventh flag to the Daily bring-up snippet and a
+callout explaining the committed-dev-key posture.
+
+**Class.** Any change to the chart's `required` guards updates the
+runbook's command set in the same commit. Runbook drift is treated as
+a chart bug, not a docs bug.
+
 ## References
 
 - ADR-028 (observability aggregation stack) — this ADR amends the
@@ -146,3 +216,7 @@ Four gates, in order:
   BFF runs as a sibling compose per the rule above, with
   `extra_hosts: ["audittrace.local:host-gateway"]`.
 - `docs/guides/zbook-runbook.md` — operator-facing companion.
+- PM-1 fix: `charts/audittrace/templates/secrets/secret-minio.yaml`,
+  `charts/audittrace/templates/minio/statefulset.yaml`.
+- PM-2 fix: `charts/audittrace/templates/postgres/job-summariser-role.yaml`.
+- PM-3 fix: `docs/guides/zbook-runbook.md` §Daily bring-up.
