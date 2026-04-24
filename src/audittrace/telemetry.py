@@ -35,7 +35,20 @@ _langfuse_client: Any | None = None
 # at the Langfuse export boundary. Re-opened 2026-04-18 (85872db) when
 # the langfuse-sdk scope started accepting every non-empty-name span;
 # closed again 2026-04-24. See ADR-045 + project_langfuse_ux_regression.
+#
+# Two signals match the same spans depending on who emitted them:
+#   - ``http.route``: set by the FastAPI auto-instrumentor on the outer
+#     inbound span. Belt-and-suspenders — that scope is not langfuse-sdk
+#     so the later scope check already rejects it, but keep this check
+#     for defence-in-depth if a future change widens the scope accept.
+#   - ``sovereign.operation``: set by the ``@log_call`` aspect on the
+#     inner span. This IS the span Langfuse sees today (scope=langfuse-
+#     sdk, name=health-check) — the production path that actually
+#     leaked. Matching on the operation prefix catches both
+#     ``audittrace.routes.health.health_check`` and
+#     ``audittrace.routes.health.metrics`` from the same file.
 _LANGFUSE_PROBE_DENYLIST = frozenset({"/health", "/metrics"})
+_LANGFUSE_PROBE_OPERATION_PREFIX = "audittrace.routes.health."
 
 
 def _init_langfuse_client() -> None:
@@ -90,9 +103,13 @@ def _init_langfuse_client() -> None:
             # in Langfuse. They carry a span name but no user identity,
             # so Langfuse's is_default_export_span lets them through on
             # the langfuse-sdk scope branch further down. Drop them up
-            # front. Tempo still records them in full. See the module-
-            # level _LANGFUSE_PROBE_DENYLIST comment for background.
+            # front via either of two signals. Tempo still records them
+            # in full. See the module-level _LANGFUSE_PROBE_DENYLIST
+            # comment for background.
             if attrs.get("http.route") in _LANGFUSE_PROBE_DENYLIST:
+                return False
+            op = attrs.get("sovereign.operation", "")
+            if isinstance(op, str) and op.startswith(_LANGFUSE_PROBE_OPERATION_PREFIX):
                 return False
 
             # Keep the root chat-completions span so latency is accurate.
