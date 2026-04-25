@@ -36,15 +36,15 @@ set -euo pipefail
 # can stay in `docs/pitch/` and `docs/phd/`; the EXCLUDED_PATHS section
 # below permits exactly those subtrees.
 FORBIDDEN_PATTERNS=(
-  # Private customer names
+  # Customer / counterparty names (extend as the engagement matrix
+  # evolves; each entry is a name segment that should not appear
+  # anywhere in the public repo).
   'poc-customer'
   'nicola[. ]?gr[uü]tter'
-  # Email domains that imply private counterparty contact
   '@poc-customer\.ch'
-  # Real-people names of non-publicly-approaching parties
-  'federico'                         # ContextShield context
-  'flavio'                           # ContextShield context
-  # Commercial pricing — CHF figures attached to pilot/day-rate language
+  'federico'
+  'flavio'
+  # Commercial pricing language
   '\bCHF[[:space:]]+[0-9]'
   '\bday[[:space:]]rate'
   '\bspending[[:space:]]cap'
@@ -145,9 +145,9 @@ if [[ $violations -gt 0 ]]; then
   echo "     public RFP, etc.) and the file belongs in docs/pitch/ or"
   echo "     docs/phd/, move it there — those subtrees are exempt."
   echo "  3. If the pattern is a genuine false positive (e.g. an"
-  echo "     unrelated technical 'flavio' that has nothing to do with"
-  echo "     the ContextShield context), open a discussion before"
-  echo "     loosening the pattern in this script."
+  echo "     unrelated technical token coincidentally matching a"
+  echo "     forbidden word), open a discussion before loosening the"
+  echo "     pattern in this script."
   echo ""
   echo "Do NOT bypass this hook with --no-verify. The check exists"
   echo "because PII / pricing / customer names have leaked twice."
