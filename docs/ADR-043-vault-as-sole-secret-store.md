@@ -224,22 +224,43 @@ A Helm post-install hook job seeds initial secrets into Vault:
 5. Subsequent operations use Vault's API for rotation; Helm never
    sees secret values again.
 
-### §9. Bitnami subchart auth — `existingSecret` rendered by Vault Agent
+### §9. Bitnami subchart auth — deferred to M1+ (External Secrets Operator)
 
-Postgres and Redis Bitnami subcharts ship with `auth.existingSecret`
-support. When `vault.enabled=true`:
+Postgres and Redis Bitnami subcharts continue to source their root
+passwords from `values.yaml` (`postgresql.auth.password`,
+`redis.auth.password`) in M1. The Bitnami StatefulSet renders its
+own K8s `Secret` from those values at install time, and the
+subchart's pod consumes it via the upstream chart's
+`valueFrom.secretKeyRef` wiring.
 
-- A small Vault-Agent-Injector-annotated init manifest renders a
-  `Secret` resource with the password at the path Bitnami expects.
-- The subchart `auth.existingSecret` points at that Secret.
-- The Secret is owned by the Vault Agent rendering, refreshed on
-  rotation.
+This is a deliberate M1 scope reduction. Cleanly migrating Bitnami
+subcharts to Vault requires either:
 
-Alternatively the subcharts' postgres init / redis init pods are
-patched directly with Vault Agent annotations and read the secret
-from a file. Default: **rendered Secret approach** — cleaner, fewer
-moving parts, no patching of upstream init logic. Decision finalised
-during implementation.
+- **External Secrets Operator (ESO)** — a separate controller that
+  syncs Vault → K8s Secret. The Bitnami subchart points at the
+  synced Secret via `auth.existingSecret`. Robust, but adds another
+  cluster-level dependency.
+- **Pre-install Helm hook Job that fetches from Vault** — the Job
+  runs as a Vault-Agent-annotated pod, reads the secret, creates the
+  K8s Secret, completes. The Bitnami subchart points at it via
+  `auth.existingSecret`. Brittle around upgrade ordering and
+  Vault-availability windows.
+
+Both alternatives are larger than M1 should bear. **Trade-off
+accepted:** postgres + redis passwords remain in `values.yaml` /
+K8s Secrets in M1; the AuditTrace-owned workloads (memory-server,
+Keycloak, MinIO, summariser-job) move fully to Vault. The M1+
+follow-up — likely ESO — closes the postgres + redis gap before
+production deploy.
+
+The KV path `kv/audittrace/postgres/superuser` (used by the
+summariser-role Job's `PGPASSWORD`) and `kv/audittrace/postgres/app`
+(used by memory-server's URL assembly) **are** managed by Vault in
+M1; the Bitnami subchart's own perception of those passwords still
+reads from `values.yaml`, so during M1 the operator must keep both
+paths in sync (Vault and `values.yaml.postgresql.auth.password`).
+Documented as an operational requirement in
+`~/work/audittrace-private/runbooks/02-vault-unseal.md`.
 
 ## Consequences
 

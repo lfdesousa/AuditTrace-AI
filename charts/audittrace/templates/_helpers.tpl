@@ -122,3 +122,90 @@ Keycloak JWKS URL.
 {{- define "audittrace.keycloakJwksUrl" -}}
 http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-connect/certs
 {{- end }}
+
+{{/*
+Vault Agent Injector annotations — memory-server (ADR-043 §4).
+Emits /vault/secrets/env as shell-sourceable exports for the four
+secret-sourced env vars the memory-server consumes (postgres URL,
+summariser URL, redis pw, chromadb token, minio secret key).
+
+The {{ "{{" }} ... {{ "}}" }} escape sequences emit Vault Agent
+template syntax through Helm without interpolation; the literal
+braces survive into the rendered annotation so Vault Agent itself
+processes them at sidecar startup.
+*/}}
+{{- define "audittrace.vaultAnnotations.memoryServer" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "audittrace-server"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/postgres/app"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{- with secret \"kv/data/audittrace/postgres/app\" -}}" }}
+  export AUDITTRACE_POSTGRES_URL='postgresql+psycopg2://audittrace_app:{{ "{{ .Data.data.password }}" }}@{{ .Release.Name }}-postgresql:5432/{{ .Values.postgresql.auth.database }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/summariser/db\" -}}" }}
+  export AUDITTRACE_SUMMARIZER_POSTGRES_URL='postgresql+psycopg2://{{ .Values.memoryServer.summariser.roleName }}:{{ "{{ .Data.data.password }}" }}@{{ .Release.Name }}-postgresql:5432/{{ .Values.postgresql.auth.database }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/redis/main\" -}}" }}
+  export AUDITTRACE_REDIS_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/chromadb/main\" -}}" }}
+  export AUDITTRACE_CHROMA_TOKEN='{{ "{{ .Data.data.token }}" }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/minio/root\" -}}" }}
+  export AUDITTRACE_MINIO_SECRET_KEY='{{ "{{ .Data.data.secret_key }}" }}'
+  {{ "{{- end -}}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — Keycloak (ADR-043 §4).
+Emits exports for KEYCLOAK_ADMIN_PASSWORD + KC_DB_PASSWORD.
+*/}}
+{{- define "audittrace.vaultAnnotations.keycloak" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "keycloak"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/keycloak/admin"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{- with secret \"kv/data/audittrace/keycloak/admin\" -}}" }}
+  export KEYCLOAK_ADMIN_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/postgres/app\" -}}" }}
+  export KC_DB_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{- end -}}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — MinIO (ADR-043 §4).
+Emits exports for MINIO_ROOT_PASSWORD + MINIO_KMS_SECRET_KEY.
+*/}}
+{{- define "audittrace.vaultAnnotations.minio" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "minio"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/minio/root"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{- with secret \"kv/data/audittrace/minio/root\" -}}" }}
+  export MINIO_ROOT_PASSWORD='{{ "{{ .Data.data.secret_key }}" }}'
+  export MINIO_KMS_SECRET_KEY='{{ "{{ .Data.data.kms_master_key }}" }}'
+  {{ "{{- end -}}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — summariser-role-creation Job (ADR-043 §4).
+Emits exports for PGPASSWORD + SUMMARISER_PASSWORD. Bound to a 1h-TTL
+role so the Job's identity is short-lived.
+*/}}
+{{- define "audittrace.vaultAnnotations.summariserJob" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "summariser-job"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/summariser/db"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{- with secret \"kv/data/audittrace/postgres/superuser\" -}}" }}
+  export PGPASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{- end -}}" }}
+  {{ "{{- with secret \"kv/data/audittrace/summariser/db\" -}}" }}
+  export SUMMARISER_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{- end -}}" }}
+{{- end }}

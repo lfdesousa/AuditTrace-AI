@@ -52,6 +52,10 @@ spec:
         # a SPIFFE identity; native-sidecar semantics let the sidecar
         # terminate with the main container so the Job actually completes.
         sidecar.istio.io/inject: "true"
+      annotations:
+        {{- if .Values.vault.enabled }}
+        {{- include "audittrace.vaultAnnotations.summariserJob" . | nindent 8 }}
+        {{- end }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: default
@@ -67,6 +71,10 @@ spec:
               value: "{{ .Values.postgresql.auth.database | default "audittrace" }}"
             - name: PGUSER
               value: "postgres"
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch — K8s Secret. When vault.enabled=true
+            # PGPASSWORD + SUMMARISER_PASSWORD come from /vault/secrets/env
+            # (sourced in the wrapper command below; see ADR-043 §4).
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
@@ -77,6 +85,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-summariser-db
                   key: password
+            {{- end }}
           volumeMounts:
             - name: sql
               mountPath: /work
@@ -86,6 +95,12 @@ spec:
             - -c
             - |
               set -euo pipefail
+              {{- if .Values.vault.enabled }}
+              # Vault Agent renders /vault/secrets/env with PGPASSWORD +
+              # SUMMARISER_PASSWORD exports (ADR-043 §4). Source before any
+              # `psql`/`pg_isready` invocation that needs them.
+              set -a; . /vault/secrets/env; set +a
+              {{- end }}
               # Wait for Postgres to accept connections before running the
               # role SQL. During a `helm upgrade` the audittrace-postgresql
               # StatefulSet may roll (re-binding its PVC, re-initialising

@@ -18,17 +18,29 @@ spec:
         {{- include "audittrace.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: keycloak
         sidecar.istio.io/inject: "true"
+      {{- if .Values.vault.enabled }}
+      annotations:
+        {{- include "audittrace.vaultAnnotations.keycloak" . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- if .Values.vault.enabled }}
+      serviceAccountName: {{ .Release.Name }}-keycloak
+      {{- end }}
       containers:
         - name: keycloak
           image: "{{ .Values.keycloak.image.repository }}:{{ .Values.keycloak.image.tag }}"
           imagePullPolicy: IfNotPresent
+          {{- if .Values.vault.enabled }}
+          command: ["/bin/sh", "-c"]
+          args: ["set -a; . /vault/secrets/env; set +a; exec /opt/keycloak/bin/kc.sh start-dev --import-realm --health-enabled=true"]
+          {{- else }}
           command:
             - /opt/keycloak/bin/kc.sh
           args:
             - start-dev
             - --import-realm
             - --health-enabled=true
+          {{- end }}
           env:
             - name: KC_DB
               value: postgres
@@ -36,18 +48,22 @@ spec:
               value: "jdbc:postgresql://{{ .Release.Name }}-postgresql:5432/keycloak"
             - name: KC_DB_USERNAME
               value: {{ .Values.postgresql.auth.username | quote }}
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch. When vault.enabled=true these
+            # land at runtime via /vault/secrets/env (ADR-043 §4).
             - name: KC_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-postgresql
                   key: password
-            - name: KEYCLOAK_ADMIN
-              value: "admin"
             - name: KEYCLOAK_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-keycloak-secret
                   key: admin-password
+            {{- end }}
+            - name: KEYCLOAK_ADMIN
+              value: "admin"
             - name: KC_HOSTNAME_URL
               value: {{ .Values.keycloak.hostnameUrl | quote }}
             - name: KC_HOSTNAME_ADMIN_URL

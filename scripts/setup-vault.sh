@@ -149,6 +149,7 @@ seed_kv() {
   echo "  ✓ ${KV_MOUNT}/audittrace/${path}"
 }
 
+seed_kv postgres/superuser password=postgres_password.txt
 seed_kv postgres/app password=postgres_password.txt
 seed_kv summariser/db password=postgres_password.txt
 seed_kv redis/main password=redis_password.txt
