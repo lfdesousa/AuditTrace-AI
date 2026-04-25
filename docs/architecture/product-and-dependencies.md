@@ -126,7 +126,7 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 |---|---|
 | **Role** | Language-model inference for chat completions, embeddings generation, and session summarisation. Three distinct model endpoints today. |
 | **Interface** | OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` (or equivalent) — the same contract the memory-server exposes outward, consumed inward from upstream. |
-| **Default (dev)** | Three llama-server (llama.cpp) instances on the host, OS-managed systemd services: Qwen 3.6-35B-A3B for chat, nomic-embed-text v1.5 for embeddings, Mistral 7B Instruct v0.3 for session summarisation. |
+| **Default (dev)** | Three llama-server (llama.cpp) instances on the host, OS-managed systemd services: Qwen 3.6-27B-Q4_K_M for chat (swapped from 35B-A3B 2026-04-24 — the Q8_0 variant fails to load on gfx1151), nomic-embed-text v1.5 for embeddings, Mistral 7B Instruct v0.3 for session summarisation. |
 | **Production alternatives** | vLLM for high-throughput serving, NVIDIA Triton Inference Server, TGI (Text Generation Inference), Ollama, or any OpenAI-compatible cloud provider *if the sovereignty constraint permits external inference* (it usually does not for regulated customers). |
 | **Minimum security posture** | No internet egress for the sovereignty story. TLS in transit. Token-authenticated inbound (when the inference stack supports it — llama.cpp does not by default; vLLM does). |
 | **Current gap** | Hardware-profile validation matrix is limited to AMD Ryzen AI MAX+ on Linux. Apple Silicon and NVIDIA laptop profiles claimed as hardware-agnostic but empirically unproven. *Addressed by roadmap Phase 1.4, target 2026-05-16.* |

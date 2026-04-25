@@ -169,12 +169,84 @@ The K8s API server has zero visibility into the secret values now;
 all auditable events live in Vault's audit device. This is what the
 "sterile `kubectl describe`" claim in ADR-043 §Consequences refers to.
 
+## Istio mesh posture (PM-6 / PM-7 from ADR-043 §Postmortem)
+
+**Vault stays inside the mesh.** Both `audittrace-vault-0` and
+`audittrace-vault-agent-injector` pods run with Istio sidecars
+under the namespace's STRICT mTLS PeerAuthentication. Workload
+→ Vault traffic on `:8200` is mTLS-protected end-to-end.
+
+Only **one** path bypasses Istio interception, and it is scoped
+to the single port that needs it:
+
+```mermaid
+flowchart LR
+    K8sAPI["K8s API Server\n(out of mesh, K8s TLS)"]
+    Webhook["Vault Agent Injector\n:8080 webhook listener\n(istio-proxy bypasses 8080)"]
+    InjectorOther["Vault Agent Injector\nother ports\n(istio-proxy intercepts)"]
+    VaultSrv["Vault Server\n:8200 KV + auth\n(istio-proxy intercepts)"]
+    Workload["Workload pods\n(memory-server, keycloak,\nminio, summariser-job)"]
+
+    K8sAPI -.->|"plaintext TLS\nMutatingWebhook call"| Webhook
+    InjectorOther -->|mTLS via Istio| K8sAPI
+    Workload <-->|mTLS via Istio| VaultSrv
+    VaultSrv -->|mTLS via Istio passthrough| K8sAPI
+
+    classDef mesh fill:#065f46,stroke:#10b981,color:#ecfdf5
+    classDef bypass fill:#7c2d12,stroke:#f97316,color:#fff7ed
+    classDef external fill:#1f2937,stroke:#64748b,color:#f1f5f9
+    class VaultSrv,InjectorOther,Workload mesh
+    class Webhook bypass
+    class K8sAPI external
+```
+
+The annotation that pins this posture lives in
+`charts/audittrace/values.yaml`:
+```yaml
+vault:
+  injector:
+    annotations:
+      traffic.sidecar.istio.io/excludeInboundPorts: "8080"
+```
+There is no equivalent override on `vault.server` — the namespace's
+STRICT mTLS injection puts Vault server fully in the mesh.
+
+**AuthorizationPolicy on Vault server :8200**
+(`templates/istio/authorizationpolicy-vault.yaml`) limits inbound
+mesh peers to exactly four ServiceAccounts:
+
+| ServiceAccount | Vault role | What it reads |
+|---|---|---|
+| `memory-server` | `audittrace-server` | postgres/*, summariser/*, redis/*, chromadb/*, minio/* |
+| `audittrace-keycloak` | `keycloak` | keycloak/*, postgres/* |
+| `audittrace-minio` | `minio` | minio/* |
+| `default` (summariser-role-creation Job) | `summariser-job` | postgres/*, summariser/* |
+
+A pod that gains a mesh identity but is not in this allow-list
+cannot reach Vault, even if it knows the API path. This closes the
+"any in-mesh peer can read secrets" gap that the wholesale Istio
+bypass had hidden.
+
+**TokenReview JWT — never cached** (PM-7). Vault's kubernetes
+auth backend has its `token_reviewer_jwt` deliberately unset. On
+every TokenReview call, Vault reads
+`/var/run/secrets/kubernetes.io/serviceaccount/token` from the
+Vault server pod's filesystem. K8s rotates that file automatically.
+The cached-JWT staleness gap (which 403s every fresh login after
+any vault-0 recreate) does not exist in this deployment.
+
 ## See also
 
-- ADR-043 — decision record, all numbered sections referenced above
+- ADR-043 — decision record, all numbered sections referenced above,
+  plus the full §Postmortem PM-1..PM-7 captured 2026-04-25 from the
+  first live install
 - `scripts/setup-vault.sh` — the operator-run script implementing the
   second diagram
 - `charts/audittrace/templates/vault/configmap-policies.yaml` — the
   ConfigMap the script reads
+- `charts/audittrace/templates/istio/authorizationpolicy-vault.yaml` —
+  the four-SA allow-list on Vault server :8200
+- `feedback_no_security_control_shortcuts` (memory) — the durable
+  rule against PM-6's wrong-fix pattern
 - `~/work/audittrace-private/runbooks/02-vault-unseal.md` — the
   operator's break-glass runbook (private)
