@@ -10,6 +10,23 @@
 # ~/work/audittrace-private/ or ~/work/pitch-private/, NEVER in this
 # repository.
 #
+# Two sources of forbidden patterns:
+#
+#   1. **Hardcoded generic patterns** in this script — currency-with-
+#      figure shapes, day-rate language, spending-cap language. These
+#      are not customer-specific so they live in the public repo.
+#
+#   2. **Operator-local customer names** in
+#      ${AUDITTRACE_PRIVATE_DIR}/forbidden-patterns.txt
+#      (default ~/work/audittrace-private/forbidden-patterns.txt).
+#      Each line is one regex (POSIX extended, case-insensitive).
+#      The file lives OUTSIDE the public repo, so the customer-name
+#      list never touches Git history.
+#
+#      If the file is missing, the gate still runs the hardcoded
+#      generic patterns and prints a warning so the operator knows
+#      the customer-name layer is not active.
+#
 # Run automatically as a `pre-commit` hook (see .pre-commit-config.yaml).
 # Exit 0 if clean, 1 if any forbidden pattern is found in the staged
 # changes.
@@ -17,58 +34,43 @@
 # Usage (manual / debugging):
 #     ./scripts/check-no-private-content.sh        # scans staged files
 #     SCAN_ALL=1 ./scripts/check-no-private-content.sh   # scans the whole repo
-#
-# Adding a new forbidden pattern: edit FORBIDDEN_PATTERNS below. Keep
-# the patterns case-insensitive and as specific as possible to avoid
-# false positives.
-#
-# Adding an exception: edit EXCLUDED_PATHS below. Vendored upstream
-# content (docs/reference/openai/*) is already exempt — that file is
-# OpenAI's, not ours, and rewriting it would break the byte-for-byte
-# diff against upstream.
 
 set -euo pipefail
 
-# ----- Forbidden patterns (case-insensitive) -----
-# Customer / counterparty names that have NOT publicly approached.
-# Add or remove names as the engagement matrix evolves. Names of
-# parties who DID approach publicly (per feedback_pitch_public_vs_private)
-# can stay in `docs/pitch/` and `docs/phd/`; the EXCLUDED_PATHS section
-# below permits exactly those subtrees.
-FORBIDDEN_PATTERNS=(
-  # Customer / counterparty names (extend as the engagement matrix
-  # evolves; each entry is a name segment that should not appear
-  # anywhere in the public repo).
-  'poc-customer'
-  'nicola[. ]?gr[uü]tter'
-  '@poc-customer\.ch'
-  'federico'
-  'flavio'
-  # Commercial pricing language
+# ----- Hardcoded generic patterns (case-insensitive) -----
+# Not customer-specific — safe for the public repo.
+GENERIC_PATTERNS=(
   '\bCHF[[:space:]]+[0-9]'
+  '\bUSD[[:space:]]+[0-9]'
+  '\bEUR[[:space:]]+[0-9]'
+  '\bGBP[[:space:]]+[0-9]'
   '\bday[[:space:]]rate'
   '\bspending[[:space:]]cap'
-  # NB: home-LAN IP addresses (e.g. 192.168.x.y) are intentionally NOT
-  # in this list. They appear in operational documentation (ADR-045,
-  # zbook-runbook, the deployment-runbook) by design, as user-overridable
-  # defaults. Adding them here would generate noise without preventing
-  # any commercial leak.
 )
+
+# ----- Operator-local customer name list -----
+PRIVATE_DIR="${AUDITTRACE_PRIVATE_DIR:-$HOME/work/audittrace-private}"
+LOCAL_PATTERN_FILE="${PRIVATE_DIR}/forbidden-patterns.txt"
+
+LOCAL_PATTERNS=()
+if [[ -f "${LOCAL_PATTERN_FILE}" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    LOCAL_PATTERNS+=("$line")
+  done < "${LOCAL_PATTERN_FILE}"
+fi
 
 # ----- Path exceptions -----
-# Vendored content + the explicit public-pitch destination + the
-# private-data marker file (the gate ITSELF must mention some patterns
-# in its own list).
 EXCLUDED_PATHS=(
-  '^docs/reference/openai/'           # OpenAI's spec — vendored
-  '^docs/pitch/'                       # explicitly public pitch destination
-  '^docs/phd/'                         # explicitly public phd framing
-  '^charts/audittrace/charts/'         # vendored Helm subchart tarballs
-  '^scripts/check-no-private-content\.sh$'   # this file itself
-  '^\.pre-commit-config\.yaml$'        # config that wires this script in
+  '^docs/reference/openai/'
+  '^docs/pitch/'
+  '^docs/phd/'
+  '^charts/audittrace/charts/'
+  '^scripts/check-no-private-content\.sh$'
+  '^\.pre-commit-config\.yaml$'
 )
 
-# ----- File-type filter (only text formats this gate cares about) -----
 INCLUDED_EXTENSIONS=(
   md py yaml yml sh json toml tpl dsl tf hcl ini env conf
 )
@@ -88,9 +90,7 @@ fi
 # ----- Filter to relevant files -----
 RELEVANT=()
 for f in "${FILES[@]}"; do
-  # Skip non-existent (e.g. deleted) files
   [[ ! -f "$f" ]] && continue
-  # Skip excluded paths
   skip=0
   for excl in "${EXCLUDED_PATHS[@]}"; do
     if [[ "$f" =~ $excl ]]; then
@@ -99,7 +99,6 @@ for f in "${FILES[@]}"; do
     fi
   done
   [[ $skip -eq 1 ]] && continue
-  # Keep only included extensions
   ext="${f##*.}"
   match=0
   for inc in "${INCLUDED_EXTENSIONS[@]}"; do
@@ -115,9 +114,25 @@ if [[ ${#RELEVANT[@]} -eq 0 ]]; then
   exit 0
 fi
 
+# ----- Warn if the operator-local file is missing -----
+if [[ ! -f "${LOCAL_PATTERN_FILE}" ]]; then
+  echo "⚠  Operator-local pattern file missing: ${LOCAL_PATTERN_FILE}"
+  echo "   The customer-name layer of this gate is INACTIVE on this machine."
+  echo "   Generic patterns (currency / day-rate / spending-cap) are still"
+  echo "   enforced. To activate the customer-name layer, create the file"
+  echo "   with one regex per line. Example:"
+  echo "       acmecorp"
+  echo "       jane[. ]?doe"
+  echo "       @acmecorp\\.com"
+  echo ""
+fi
+
 # ----- Apply forbidden-pattern grep -----
 violations=0
-for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
+
+apply_pattern() {
+  local pattern="$1"
+  local hits
   hits=$(grep -niE "$pattern" "${RELEVANT[@]}" 2>/dev/null || true)
   if [[ -n "$hits" ]]; then
     if [[ $violations -eq 0 ]]; then
@@ -134,6 +149,14 @@ for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
     echo ""
     violations=$((violations + 1))
   fi
+}
+
+for pattern in "${GENERIC_PATTERNS[@]}"; do
+  apply_pattern "$pattern"
+done
+
+for pattern in "${LOCAL_PATTERNS[@]}"; do
+  apply_pattern "$pattern"
 done
 
 if [[ $violations -gt 0 ]]; then
@@ -144,10 +167,10 @@ if [[ $violations -gt 0 ]]; then
   echo "  2. If the named party approached publicly (LinkedIn post,"
   echo "     public RFP, etc.) and the file belongs in docs/pitch/ or"
   echo "     docs/phd/, move it there — those subtrees are exempt."
-  echo "  3. If the pattern is a genuine false positive (e.g. an"
-  echo "     unrelated technical token coincidentally matching a"
-  echo "     forbidden word), open a discussion before loosening the"
-  echo "     pattern in this script."
+  echo "  3. If the pattern is a genuine false positive, open a"
+  echo "     discussion before loosening the pattern. Generic patterns"
+  echo "     live in this script; customer-name patterns live in"
+  echo "     \${AUDITTRACE_PRIVATE_DIR}/forbidden-patterns.txt."
   echo ""
   echo "Do NOT bypass this hook with --no-verify. The check exists"
   echo "because PII / pricing / customer names have leaked twice."
