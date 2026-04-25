@@ -379,9 +379,13 @@ vault:
       enabled: true
       size: 10Gi
       storageClass: local-path
+    # NB: do not set serviceAccount.name. The upstream Vault chart's
+    # ClusterRoleBinding (audittrace-vault-server-binding) targets a
+    # release-prefixed name; an override here breaks the auth-delegator
+    # path required by the kubernetes auth backend's TokenReview calls.
+    # ADR-043 hot-fix 2026-04-25: caught at first live install.
     serviceAccount:
       create: true
-      name: vault
     resources:
       requests:
         cpu: 100m
@@ -394,6 +398,16 @@ vault:
     # Vault Agent Injector sidecar — required for the file-mount secret
     # delivery pattern (ADR-043 §4).
     enabled: true
+    # Pod-level annotations. The mutating webhook listens on :8080 and
+    # is invoked by the K8s API server, which is OUT of the Istio mesh
+    # and does not speak Istio mTLS. We keep the Istio sidecar on the
+    # injector pod (so its own outbound calls are mTLS-protected) and
+    # exclude ONLY the inbound :8080 from Istio interception. Without
+    # this, the K8s API → webhook TLS handshake fails (127.0.0.6 EOF)
+    # and the mutating admission silently no-ops because the upstream
+    # chart's MutatingWebhookConfiguration has failurePolicy: Ignore.
+    annotations:
+      traffic.sidecar.istio.io/excludeInboundPorts: "8080"
     resources:
       requests:
         cpu: 50m

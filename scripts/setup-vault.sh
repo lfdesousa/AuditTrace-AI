@@ -40,19 +40,19 @@ if [[ -z "${VAULT_TOKEN:-}" ]]; then
   exit 1
 fi
 
-# kubectl exec helpers — keep VAULT_TOKEN inside the pod's env, not in
-# command-line args (would show up in `ps`).
+# kubectl exec helpers. kubectl has no --env flag, so we use the busybox
+# `env` builtin inside the pod to set VAULT_TOKEN before invoking vault.
+# The token is visible inside the pod's process table briefly; acceptable
+# trade-off given vault-0 is an isolated pod with no other tenants.
 vault_exec() {
-  kubectl -n "${NAMESPACE}" exec -i \
-    --env="VAULT_TOKEN=${VAULT_TOKEN}" \
-    "${VAULT_POD}" -- vault "$@"
+  kubectl -n "${NAMESPACE}" exec -i "${VAULT_POD}" -- \
+    env "VAULT_TOKEN=${VAULT_TOKEN}" vault "$@"
 }
 
 vault_exec_stdin() {
   # Pass stdin through to the vault CLI.
-  kubectl -n "${NAMESPACE}" exec -i \
-    --env="VAULT_TOKEN=${VAULT_TOKEN}" \
-    "${VAULT_POD}" -- vault "$@"
+  kubectl -n "${NAMESPACE}" exec -i "${VAULT_POD}" -- \
+    env "VAULT_TOKEN=${VAULT_TOKEN}" vault "$@"
 }
 
 # Read a key from the policies ConfigMap.
@@ -100,15 +100,30 @@ else
 fi
 
 # --- 3. Configure Kubernetes auth method -----------------------------
-# The Vault SA's projected token is automatically mounted by the upstream
-# chart at /var/run/secrets/kubernetes.io/serviceaccount/token.
+# IMPORTANT: We deliberately DO NOT pass token_reviewer_jwt. When that
+# field is unset, Vault's kubernetes auth backend reads the projected
+# SA token from /var/run/secrets/kubernetes.io/serviceaccount/token on
+# every TokenReview call. Kubernetes auto-rotates that file, so the
+# token is always fresh. The alternative — passing the file content
+# at config-write time — captures a SNAPSHOT of the JWT that becomes
+# stale as soon as vault-0 is recreated (or even just rolls), and
+# every kubernetes-auth login then 403s with "permission denied"
+# until an operator re-runs this script.
+#
+# Verified 2026-04-25 on the live cluster: with token_reviewer_jwt
+# unset, vault-0 can be deleted and recreated without breaking auth
+# for any workload. setup-vault.sh becomes a one-time install step.
+#
+# (If a deployment ALREADY has a stale token_reviewer_jwt cached
+# from a previous run of an older script version, this same write
+# clears it: omitting the field on a write replaces the field with
+# its default — empty — which sets token_reviewer_jwt_set=false.)
 echo "▶ Configuring kubernetes auth method..."
 vault_exec write auth/kubernetes/config \
   kubernetes_host="https://kubernetes.default.svc" \
-  token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token \
   kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
   >/dev/null
-echo "  ✓ configured"
+echo "  ✓ configured (token_reviewer_jwt left unset — Vault reads SA token live)"
 
 # --- 4. Apply policies -----------------------------------------------
 echo "▶ Applying policies..."

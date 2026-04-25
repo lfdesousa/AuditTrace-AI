@@ -16,6 +16,12 @@ spec:
             principals:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
+              {{- if .Values.vault.enabled }}
+              # When vault.enabled=true, Keycloak runs under its own SA so
+              # Vault Agent can fetch kv/audittrace/keycloak/* + postgres/*
+              # (ADR-043 §2). Postgres mTLS must allow that SA.
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-keycloak"
+              {{- end }}
       to:
         - operation:
             ports: ["5432"]
