@@ -121,6 +121,86 @@ sequenceDiagram
     KC-->>CI: {"access_token": "<RS256 JWT>", "token_type": "Bearer", "expires_in": 300}
 ```
 
+## Federated login via brokered IdP (ADR-044) — for human users with an organisational IdP
+
+When a deployment is configured with one or more brokered identity
+providers (`scripts/setup-idp-federation.sh` per ADR-044 §7), the
+human's login surface includes a "Sign in with <IdP>" button on the
+Keycloak login page. The user authenticates against their own
+employer's IdP; Keycloak brokers the result into a shadow user in
+the `audittrace` realm and issues its own JWT — signed with the
+realm key, audience-mapped to `audittrace-server`.
+
+Critical invariant: **the memory-server never talks to the upstream
+IdP.** Every JWT it validates is signed by the audittrace realm; the
+multi-issuer logic from ADR-032 §2 covers brokered tokens unchanged
+because the brokered JWT's `iss` is the realm's own issuer.
+
+```mermaid
+sequenceDiagram
+    participant User as Human User
+    participant Browser as Browser
+    participant KC as Keycloak\n(audittrace realm,\nbroker)
+    participant IdP as Organisational IdP\n(Entra / Okta /\nGoogle Workspace / ...)
+    participant App as memory-server\n(/v1/chat/completions)
+
+    Note over User,KC: First-time federated login (JIT provisioning)
+
+    User->>Browser: Open https://audittrace.local/...
+    Browser->>KC: GET /realms/audittrace/protocol/openid-connect/auth\n?client_id=audittrace-webui\n&redirect_uri=...\n&response_type=code\n&scope=openid&...
+    KC-->>Browser: 200 — login page with "Sign in with <alias>" button
+
+    User->>Browser: clicks "Sign in with <alias>"
+    Browser->>KC: GET /realms/audittrace/broker/<alias>/login
+    KC->>KC: build PKCE challenge (S256)\nlookup IdP config from realm
+    KC-->>Browser: 302 → upstream IdP authorize URL\n(state, nonce, code_challenge)
+
+    Browser->>IdP: GET /authorize\n(client_id=keycloak-as-IdP-client,\nstate, nonce, code_challenge)
+    IdP->>User: presents IdP-side login (UPN, MFA, etc.)
+    User->>IdP: completes auth
+    IdP-->>Browser: 302 → Keycloak broker callback URL\n?code=<authz code>&state=...
+
+    Browser->>KC: GET /realms/audittrace/broker/<alias>/endpoint\n?code=<authz code>&state=...
+    KC->>IdP: POST /token\ngrant_type=authorization_code\ncode=<authz code>\nclient_secret=$(vault kv get .../idp/<alias>/client_secret)\ncode_verifier=...
+    IdP-->>KC: {id_token, access_token}
+
+    Note over KC: Validate signature against upstream JWKS\n(useJwksUrl=true, validateSignature=true,\nstoreToken=false)
+    KC->>KC: extract claims (sub/email/preferred_username/groups)
+    KC->>KC: apply attribute mappers per ADR-044 §4\n(Entra: collapse oid → federation key)
+
+    alt First time this upstream user logs in
+        KC->>KC: JIT provisioning: create shadow user in realm\nbound to upstream sub via federation key
+    else Returning user
+        KC->>KC: syncMode=FORCE — refresh shadow user attributes\n(group memberships re-synced from upstream)
+    end
+
+    KC->>KC: mint Keycloak-signed JWT\n(iss = audittrace realm,\nsub = realm shadow-user UUID,\naud = audittrace-server,\nscopes from realm-role mapping)
+    KC-->>Browser: 302 → original redirect_uri?code=<realm authz code>
+
+    Note over Browser: Continues with the audittrace-webui Auth Code\nflow per ADR-042 — Browser ↔ LibreChat session cookie,\nLibreChat ↔ Keycloak, Bearer JWT to memory-server.
+
+    Browser->>App: (eventually) request with Bearer <realm JWT>
+    App->>App: require_user — validate against realm JWKS\n(multi-issuer path from ADR-032 §2,\nbrokered iss = realm iss, no extras needed)
+    App-->>Browser: 200 OK with user_id = realm shadow-user UUID
+```
+
+Two operational outcomes worth highlighting:
+
+- **Deprovisioning is upstream-controlled.** When the customer
+  removes an employee from their IdP, the next login attempt fails
+  at the upstream `/authorize` step. The Keycloak shadow user
+  remains in the realm but stops being usable — a customer-side
+  audit can scrub stale shadows on their own cadence.
+- **Group changes propagate on next login.** `syncMode=FORCE` means
+  Keycloak re-fetches the upstream attributes on every brokered
+  login, including group memberships. Realm-role mappings re-evaluate;
+  scopes change accordingly. No long-lived stale shadow.
+
+The next two sections describe what happens AFTER the JWT lands at
+the memory-server. They apply identically whether the JWT came from
+Device Flow, `client_credentials`, or a brokered login — the
+audience mapper and the `iss` claim are the same.
+
 ## Identity resolution at the proxy (the §15 hot/cold path)
 
 Every authenticated request flows through `require_user`. Hot path is a

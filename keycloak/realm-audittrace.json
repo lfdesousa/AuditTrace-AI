@@ -210,6 +210,8 @@
       ]
     }
   ],
+  "identityProviders": [],
+  "identityProviderMappers": [],
   "users": [
     {
       "username": "luis",
