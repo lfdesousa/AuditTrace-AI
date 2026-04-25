@@ -19,11 +19,22 @@ spec:
         {{- include "audittrace.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: minio
         sidecar.istio.io/inject: "true"
+      {{- if .Values.vault.enabled }}
+      annotations:
+        {{- include "audittrace.vaultAnnotations.minio" . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- if .Values.vault.enabled }}
+      serviceAccountName: {{ .Release.Name }}-minio
+      {{- end }}
       containers:
         - name: minio
           image: "{{ .Values.minio.image.repository }}:{{ .Values.minio.image.tag }}"
           imagePullPolicy: IfNotPresent
+          {{- if .Values.vault.enabled }}
+          command: ["/bin/sh", "-c"]
+          args: ["set -a; . /vault/secrets/env; set +a; exec minio server /data --console-address :9001"]
+          {{- else }}
           command:
             - minio
           args:
@@ -31,26 +42,27 @@ spec:
             - /data
             - --console-address
             - ":9001"
+          {{- end }}
           env:
             - name: MINIO_ROOT_USER
               value: {{ .Values.minio.auth.rootUser | quote }}
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch — K8s Secret. When vault.enabled=true
+            # these come from /vault/secrets/env at runtime (ADR-043 §4).
+            # The "audittrace-key:" prefix is baked into the Secret's
+            # kms-master-key value (mitigation for the 2026-04-24 outage —
+            # ADR-045 PM-1).
             - name: MINIO_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-secret
                   key: root-password
-            # Pulled from a Secret so the base64 key never lands in the
-            # rendered StatefulSet spec. The "audittrace-key:" prefix is
-            # baked into the Secret's `kms-master-key` value. The pre-fix
-            # inline-value pattern silently rendered "audittrace-key:"
-            # (empty-after-colon) when kmsKey was blank and fatal-ed MinIO
-            # at startup with "kms: invalid key length 0" during the
-            # 2026-04-24 outage. See ADR-045 §Verification postmortem.
             - name: MINIO_KMS_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-secret
                   key: kms-master-key
+            {{- end }}
           ports:
             - name: api
               containerPort: 9000

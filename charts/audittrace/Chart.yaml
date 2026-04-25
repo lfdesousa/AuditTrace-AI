@@ -22,3 +22,11 @@ dependencies:
     version: "~19"
     repository: https://charts.bitnami.com/bitnami
     condition: redis.enabled
+  - name: chromadb
+    version: "1.5.7"
+    repository: ""
+    condition: chromadb.enabled
+  - name: vault
+    version: "~0.30"
+    repository: https://helm.releases.hashicorp.com
+    condition: vault.enabled

@@ -25,6 +25,19 @@ spec:
             host: {{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: {{ .Values.memoryServer.port }}
+    # /v1/chat/completions — long-running generation (ADR-034). Client
+    # timeout is 1800s, per-chunk idle is 120s. The Istio default 300s
+    # was killing legitimate long reasoning runs (20/100 504s in the
+    # 2026-04-24 N=100 27B-Q4 eval). Match ADR-034's overall ceiling.
+    - match:
+        - uri:
+            prefix: /v1/chat/completions
+      timeout: 1800s
+      route:
+        - destination:
+            host: {{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.memoryServer.port }}
     # Catch-all route — Keycloak VirtualService has higher-priority
     # prefix matches for /realms and /admin, so this handles everything else.
     - route:

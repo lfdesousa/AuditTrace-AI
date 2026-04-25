@@ -11,7 +11,10 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         humanUser = person "Human User" "Browser-capable human authenticating via OAuth2 Device Flow (RFC 8628, ADR-032) so every agent request carries a real Keycloak sub on the audit trail instead of the flat dev-client identity"
 
         // External systems
-        llamaServer = softwareSystem "Chat LLM Server" "Qwen3.5-35B-A3B Q4_K_M on :11435 — chat + tool-loop reasoning (GPU, ROCm)" {
+        vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (KV v2 + K8s auth) — replaces env-var/Secret-rendered passwords for production deploys (ADR-043). Sub-chart bundled by deliberate ADR-045 §Rule 1 exception." {
+            tags "External"
+        }
+        llamaServer = softwareSystem "Chat LLM Server" "Qwen 3.6-27B-Q4_K_M on :11435 — chat + tool-loop reasoning (GPU, ROCm)" {
             tags "External"
         }
         embedServer = softwareSystem "Embedding Server" "nomic-embed-text v1.5 Q8_0 on :11436 — 768-dim embeddings (CPU)" {
@@ -90,6 +93,8 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         memoryServer.api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
         memoryServer.api -> langfuse "Exports traces via Langfuse SDK (ADR-024)" "HTTP/OTLP"
         memoryServer.api -> observability "Exports metrics + logs via OTLP to OTel Collector (ADR-028)" "HTTP/OTLP"
+        memoryServer.api -> vault "Reads dependency creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
+        keycloak -> vault "Reads admin password + DB creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
 
         // Relationships — identity layer (DESIGN §15)
         memoryServer.api.chatRoute -> memoryServer.api.requireUser "depends on (Phase 5 cutover)"
@@ -197,11 +202,16 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                     deploymentNode "otel-collector DaemonSet" "OTLP receiver → Prometheus + Loki fan-out" "otel-contrib" {
                         otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver → Prometheus + Loki fan-out (mesh-local)" "otel-contrib"
                     }
+
+                    deploymentNode "vault StatefulSet" "Single-node, file-backend, manual-unseal POC posture (ADR-043). Bundled in-cluster by deliberate ADR-045 §Rule 1 exception." "HashiCorp Vault 1.x" {
+                        vaultServerInstance = infrastructureNode "vault-server" "KV v2 at kv/audittrace/* + Kubernetes auth method" "Vault server"
+                        vaultInjectorInstance = infrastructureNode "vault-agent-injector" "Mutating webhook — injects Agent sidecars on workloads carrying vault.hashicorp.com/* annotations" "vault-k8s"
+                    }
                 }
             }
 
             deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU (three model processes, separate ports)" "Linux / ROCm" {
-                llamaInstance = infrastructureNode "chat-llama-server" "Qwen3.5-35B-A3B Q4_K_M on :11435 (GPU)" "llama.cpp / ROCm"
+                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-27B-Q4_K_M on :11435 (GPU)" "llama.cpp / ROCm"
                 embedInstance = infrastructureNode "embed-server" "nomic-embed-text v1.5 Q8_0 on :11436 (CPU)" "llama.cpp / CPU"
                 summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
             }
@@ -213,6 +223,8 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             // Deployment relationships
             ingressInstance -> apiInstance "HTTPS → HTTP proxy (mTLS via Istio sidecar)"
             ingressInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
+            apiInstance -> vaultServerInstance "Reads dependency creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
+            keycloakInstance -> vaultServerInstance "Reads admin pw + DB creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
             apiInstance -> keycloakInstance "JWKS fetch (cached)" "HTTP/JSON"
             apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
             apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"

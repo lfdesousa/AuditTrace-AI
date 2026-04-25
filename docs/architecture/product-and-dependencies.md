@@ -60,10 +60,10 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 |---|---|
 | **Role** | Authenticate human agents (OAuth2 Device Flow, RFC 8628) and service clients (`client_credentials`). Issue JWTs that carry the user's `sub`, scopes, and `aud`. |
 | **Interface** | OIDC-compliant issuer + JWKS endpoint + Device Flow endpoints. Standard since ~2019. |
-| **Default (dev)** | Bitnami Keycloak subchart bundled in the Helm umbrella. |
+| **Default (dev)** | Keycloak bundled in the Helm umbrella (hand-templated, not a Bitnami subchart). |
 | **Production alternatives** | Any OIDC-compliant IdP: Keycloak self-hosted, Okta, Microsoft Entra ID, Google Workspace, Ping Identity, Auth0. The enterprise's existing IdP federated via Keycloak brokering (preferred pattern — keeps AuditTrace-AI out of the employee-account lifecycle). |
 | **Minimum security posture** | RS256 or ES256 signing, JWKS rotation with published cache TTL, `aud` claim validation enforced, `exp` claim enforced. |
-| **Current gap** | Self-hosted Keycloak only. No brokering to enterprise IdPs yet. *Addressed by roadmap Phase 1.2 (ADR-039), target 2026-05-16.* |
+| **Current gap** | Self-hosted Keycloak only. No brokering to enterprise IdPs yet. *Addressed by ADR-044 (M2 milestone), target 2026-05-02.* |
 
 ### 2. PostgreSQL (RLS-capable, HA)
 
@@ -118,7 +118,7 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 | **Default (dev)** | Plain Kubernetes Secrets with values passed via Helm values. Explicitly dev-only. |
 | **Production alternatives** | HashiCorp Vault with Agent Injector sidecar, External Secrets Operator with AWS Secrets Manager / Azure Key Vault / GCP Secret Manager back-end, Mozilla SOPS with age or GPG, Sealed Secrets controller, Bitnami Secrets Manager integration. |
 | **Minimum security posture** | Secrets never logged, never in Helm values in production, rotatable without container rebuild, audit trail on secret access (the vault's responsibility, not ours). |
-| **Current gap** | No Vault integration yet. *Addressed by roadmap Phase 1.1 (ADR-040), target 2026-05-16.* |
+| **Current gap** | Vault integration shipping in M1 per ADR-043 (Proposed 2026-04-25): in-cluster sub-chart + KV v2 + Kubernetes auth + Vault Agent Injector pattern. Workload migrations land alongside. |
 
 ### 7. LLM Inference Endpoint
 
@@ -203,12 +203,12 @@ This framing — not a platform, not a suite, one well-scoped component with eig
 
 The six gaps above, mapped to roadmap phases:
 
-| # | Dependency | Gap | Roadmap phase | Target |
+| # | Dependency | Gap | Milestone | Target |
 |---|---|---|---|---|
-| 1 | IdP | No enterprise federation | 1.2 (ADR-039) | 2026-05-16 |
-| 2 | PostgreSQL | Single-writer | 1.3 | 2026-05-16 |
-| 3 | Secret Manager | No Vault integration | 1.1 (ADR-040) | 2026-05-16 |
-| 4 | LLM Inference | Hardware profile unproven beyond Ryzen AI | 1.4 | 2026-05-16 |
+| 1 | IdP | No enterprise federation | M2 (ADR-044) | 2026-05-02 |
+| 2 | PostgreSQL | Single-writer | post-POC | TBD |
+| 3 | Secret Manager | Vault integration shipping in M1 | M1 (ADR-043) | 2026-04-25 |
+| 4 | LLM Inference | Hardware profile unproven beyond Ryzen AI | M4 | 2026-05-12 |
 | 5 | Vector DB | No pgvector alternative port | Scoped; not time-bound | — |
 | 6 | Observability | No "integration guide per major platform" | Documentation, ongoing | — |
 
