@@ -314,3 +314,99 @@ secrets:
     kmsKey: ""
   keycloak:
     adminPassword: "admin"
+
+# -- Vault (ADR-043) ---------------------------------------------------------
+# When vault.enabled=true, secrets are sourced from in-cluster Vault via the
+# Vault Agent Injector sidecar pattern. The legacy `secrets.*` plaintext keys
+# above are ignored. Production posture (global.productionMode=true) requires
+# vault.enabled=true.
+#
+# The dev/laptop-first profile keeps vault.enabled=false; the chart renders
+# identically to the pre-ADR-043 era. ADR-045 §Rule 1 exception is bounded
+# to this single dependency.
+vault:
+  enabled: false
+
+  # Audittrace-specific Vault wiring (consumed by our templates/vault/* and
+  # workload Vault Agent annotations — NOT passed to the upstream sub-chart).
+  audittrace:
+    # KV v2 mount + path prefix. Per ADR-043 §5: kv/audittrace/<service>/<key>.
+    kvMount: kv
+    pathPrefix: audittrace
+    # Vault Agent Injector image + version pin (matches the sub-chart's
+    # injector when vault.enabled=true).
+    injector:
+      image: hashicorp/vault-k8s
+      tag: 1.4.2
+    # Bootstrap-only values. Operator supplies these once on first install
+    # via --set-file; subsequent installs MUST omit them. The chart errors
+    # out if both vault.enabled=true and bootstrap.* are present after
+    # Vault is initialised. See ADR-043 §8.
+    bootstrap:
+      postgres:
+        password: ""
+        appPassword: ""
+      summariser:
+        password: ""
+      chromadb:
+        token: ""
+      redis:
+        password: ""
+      minio:
+        secretKey: ""
+        kmsKey: ""
+      keycloak:
+        adminPassword: ""
+
+  # Upstream sub-chart values (hashicorp/vault chart 0.30.x). Single-node
+  # file backend, manual unseal at boot per ADR-043 §7.
+  server:
+    dev:
+      enabled: false
+    standalone:
+      enabled: true
+      config: |
+        ui = true
+        listener "tcp" {
+          tls_disable = 1
+          address     = "[::]:8200"
+          cluster_address = "[::]:8201"
+        }
+        storage "file" {
+          path = "/vault/data"
+        }
+    dataStorage:
+      enabled: true
+      size: 10Gi
+      storageClass: local-path
+    serviceAccount:
+      create: true
+      name: vault
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  injector:
+    # Vault Agent Injector sidecar — required for the file-mount secret
+    # delivery pattern (ADR-043 §4).
+    enabled: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
+  # CSI driver not used; we deliver via Agent Injector.
+  csi:
+    enabled: false
+
+  # UI enabled for POC operator convenience. Production deploys turn off.
+  ui:
+    enabled: true
+    serviceType: ClusterIP

@@ -19,6 +19,9 @@ spec:
         sidecar.istio.io/inject: "true"
       annotations:
         proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+        {{- if .Values.vault.enabled }}
+        {{- include "audittrace.vaultAnnotations.memoryServer" . | nindent 8 }}
+        {{- end }}
     spec:
       {{- if .Values.memoryServer.serviceAccount.create }}
       serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}
@@ -27,6 +30,13 @@ spec:
         - name: memory-server
           image: "{{ .Values.memoryServer.image.repository }}:{{ .Values.memoryServer.image.tag }}"
           imagePullPolicy: {{ .Values.memoryServer.image.pullPolicy }}
+          {{- if .Values.vault.enabled }}
+          # Source Vault Agent-rendered env file before exec'ing the
+          # entrypoint. Secrets land at /vault/secrets/env (ADR-043 §4).
+          # See sequence-vault-injection.md for the boot sequence.
+          command: ["/bin/sh", "-c"]
+          args: ["set -a; . /vault/secrets/env; set +a; exec /app/scripts/entrypoint.sh"]
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.memoryServer.port }}
@@ -37,11 +47,15 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
-            # ── Computed service URLs ─────────────────────────────────
+            {{- if not .Values.vault.enabled }}
+            # ── Computed service URLs (vault.enabled=false branch) ────
+            # When vault.enabled=true these are set at runtime by the
+            # Vault Agent-rendered /vault/secrets/env (see ADR-043).
             - name: AUDITTRACE_POSTGRES_URL
               value: {{ include "audittrace.postgresAppUrl" . | quote }}
             - name: AUDITTRACE_SUMMARIZER_POSTGRES_URL
               value: {{ include "audittrace.postgresOwnerUrl" . | quote }}
+            {{- end }}
             - name: AUDITTRACE_CHROMA_URL
               value: "http://{{ .Release.Name }}-chromadb:8000"
             - name: AUDITTRACE_REDIS_URL
@@ -72,6 +86,10 @@ spec:
             - name: AUDITTRACE_LANGFUSE_HOST
               value: "http://{{ .Values.observability.external.langfuseIP | default .Values.global.hostNodeIP }}:{{ .Values.observability.external.langfusePort | default 3000 }}"
             # ── Secret-sourced ────────────────────────────────────────
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch: K8s Secrets via valueFrom.
+            # When vault.enabled=true these env vars are set at runtime
+            # by Vault Agent (see ADR-043 §4 + the helper).
             - name: AUDITTRACE_CHROMA_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -82,13 +100,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-redis
                   key: redis-password
-            - name: AUDITTRACE_MINIO_ACCESS_KEY
-              value: "minioadmin"
             - name: AUDITTRACE_MINIO_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-secret
                   key: root-password
+            {{- end }}
+            - name: AUDITTRACE_MINIO_ACCESS_KEY
+              value: "minioadmin"
           livenessProbe:
             httpGet:
               path: /health
