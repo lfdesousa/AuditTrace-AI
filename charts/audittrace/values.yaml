@@ -379,9 +379,13 @@ vault:
       enabled: true
       size: 10Gi
       storageClass: local-path
+    # NB: do not set serviceAccount.name. The upstream Vault chart's
+    # ClusterRoleBinding (audittrace-vault-server-binding) targets a
+    # release-prefixed name; an override here breaks the auth-delegator
+    # path required by the kubernetes auth backend's TokenReview calls.
+    # ADR-043 hot-fix 2026-04-25: caught at first live install.
     serviceAccount:
       create: true
-      name: vault
     resources:
       requests:
         cpu: 100m
