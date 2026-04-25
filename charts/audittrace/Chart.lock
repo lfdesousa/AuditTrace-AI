@@ -5,5 +5,11 @@ dependencies:
 - name: redis
   repository: https://charts.bitnami.com/bitnami
   version: 19.6.4
-digest: sha256:2574ac6aa32157a55deb018bb27ffe69822937e7f30e3ab276adaecdd8488b62
-generated: "2026-04-17T15:20:35.18222386+02:00"
+- name: chromadb
+  repository: ""
+  version: 1.5.7
+- name: vault
+  repository: https://helm.releases.hashicorp.com
+  version: 0.30.1
+digest: sha256:a5425c2c45f97f2d3ce888c14eba197e5943940837d0be839aebd7220b2bdbd7
+generated: "2026-04-25T11:45:04.195578577+02:00"
