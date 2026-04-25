@@ -40,19 +40,19 @@ if [[ -z "${VAULT_TOKEN:-}" ]]; then
   exit 1
 fi
 
-# kubectl exec helpers — keep VAULT_TOKEN inside the pod's env, not in
-# command-line args (would show up in `ps`).
+# kubectl exec helpers. kubectl has no --env flag, so we use the busybox
+# `env` builtin inside the pod to set VAULT_TOKEN before invoking vault.
+# The token is visible inside the pod's process table briefly; acceptable
+# trade-off given vault-0 is an isolated pod with no other tenants.
 vault_exec() {
-  kubectl -n "${NAMESPACE}" exec -i \
-    --env="VAULT_TOKEN=${VAULT_TOKEN}" \
-    "${VAULT_POD}" -- vault "$@"
+  kubectl -n "${NAMESPACE}" exec -i "${VAULT_POD}" -- \
+    env "VAULT_TOKEN=${VAULT_TOKEN}" vault "$@"
 }
 
 vault_exec_stdin() {
   # Pass stdin through to the vault CLI.
-  kubectl -n "${NAMESPACE}" exec -i \
-    --env="VAULT_TOKEN=${VAULT_TOKEN}" \
-    "${VAULT_POD}" -- vault "$@"
+  kubectl -n "${NAMESPACE}" exec -i "${VAULT_POD}" -- \
+    env "VAULT_TOKEN=${VAULT_TOKEN}" vault "$@"
 }
 
 # Read a key from the policies ConfigMap.

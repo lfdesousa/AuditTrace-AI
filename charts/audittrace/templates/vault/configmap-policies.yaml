@@ -24,8 +24,14 @@ data:
   # data wrapper); list operations use `kv/metadata/<path>`.
 
   audittrace-server.hcl: |
-    # memory-server reads its dependency credentials.
+    # memory-server reads its dependency credentials. Summariser path
+    # is included because memory-server assembles the summariser DB URL
+    # alongside the app DB URL in /vault/secrets/env (see
+    # audittrace.vaultAnnotations.memoryServer helper).
     path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/postgres/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/summariser/*" {
       capabilities = ["read"]
     }
     path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/redis/*" {
@@ -74,24 +80,28 @@ data:
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=audittrace-server
     ttl=24h
+    audience=https://kubernetes.default.svc.cluster.local
 
   role-keycloak.env: |
     bound_service_account_names={{ .Release.Name }}-keycloak
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=keycloak
     ttl=24h
+    audience=https://kubernetes.default.svc.cluster.local
 
   role-minio.env: |
     bound_service_account_names={{ .Release.Name }}-minio
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=minio
     ttl=24h
+    audience=https://kubernetes.default.svc.cluster.local
 
   role-summariser-job.env: |
     bound_service_account_names=default
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=summariser-job
     ttl=1h
+    audience=https://kubernetes.default.svc.cluster.local
 
   # ----- KV mount layout ----------------------------------------------
   # Helps the script know which paths to enable / pre-create.
