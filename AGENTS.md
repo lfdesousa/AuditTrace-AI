@@ -120,6 +120,21 @@ uvicorn sovereign_memory.server:app --reload
 - **Typecheck:** `mypy --strict` (ignores missing imports)
 - **pre-commit:** hooks for ruff, ruff-format, black, mypy
 
+## Privacy: no private/legal content in the public repo
+A pre-commit hook (`scripts/check-no-private-content.sh`, wired in
+`.pre-commit-config.yaml`) flags forbidden patterns before they can
+land. Forbidden: customer / counterparty names of non-publicly-
+approaching parties, contact details (email domains tied to those
+parties), and commercial pricing patterns (currency-with-figure,
+billing-cadence language, spending-cap language).
+Path exceptions: `docs/pitch/`, `docs/phd/`, vendored content under
+`docs/reference/`, and the gate script itself.
+
+If the gate fires: fix the content, don't bypass the hook. Move the
+substance to `~/work/audittrace-private/` or `~/work/pitch-private/`
+and reference it generically. Adding new private parties: extend
+`FORBIDDEN_PATTERNS` in the gate script.
+
 ## Commit Messages
 Conventional Commits. Types: `feat`, `fix`, `docs`, `style`, `refactor`,
 `test`, `chore`, `perf`, `ci`, `build`, `revert`.

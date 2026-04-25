@@ -17,8 +17,8 @@ addresses:
 - `192.168.1.100` — the home workstation running llama.cpp.
 
 These IPs only resolve on the home network. A laptop install fails on
-phone hotspot, on a train, or in airplane mode. The upcoming customer
-Call 2 rehearsal gate (per `feedback_demo_rehearsal_non_home_network`)
+phone hotspot, on a train, or in airplane mode. The off-LAN customer-
+demo rehearsal gate (per `feedback_demo_rehearsal_non_home_network`)
 cannot pass with this posture.
 
 The initial diagnosis — "remote reach gap, add Tailscale" — was the
@@ -102,7 +102,7 @@ environment-dependent DNS trickery.
   composes, the reconstructibility walkthrough is unreachable — even
   though trace data at the Postgres + stdout layer is still intact.
   This is not a regression (it matches current behaviour); it is a
-  known constraint the customer-demo rehearsal must respect.
+  known constraint any customer-demo rehearsal must respect.
 
 ### Explicit non-decisions
 
@@ -209,8 +209,8 @@ a chart bug, not a docs bug.
 Discovered during the first Phase 4 (airplane smoke) attempt on
 2026-04-24. The rehearsal intent was "external network completely
 gone, laptop-first stack still works" — a
-`feedback_demo_rehearsal_non_home_network` gate for the 20 May
-customer pitch.
+`feedback_demo_rehearsal_non_home_network` gate for any upcoming
+customer demo.
 
 `sudo nmcli networking off` looked like the cleanest single-command
 cut. It isn't: NetworkManager brings down *every* interface it knows

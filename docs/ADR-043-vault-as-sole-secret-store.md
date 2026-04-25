@@ -42,10 +42,10 @@ deployment:
    today, each is fragile, and the env-and-Secret leg can silently
    diverge from the in-DB password without anyone noticing. A central
    secret store with an audited rotation API closes this.
-3. **The POC milestone schedule.** M1 (this ADR) is the
-   prerequisite for M2 (external IdP federation) and M3 (LibreChat
-   confidential client + secret-in-Vault per ADR-042 §2). Ships before
-   2026-05-09 or M3 cannot ship.
+3. **The POC milestone schedule.** M1 (this ADR) is the prerequisite
+   for M2 (external IdP federation) and M3 (LibreChat confidential
+   client + secret-in-Vault per ADR-042 §2). Ships before 2026-05-09
+   or M3 cannot ship.
 
 The decision below picks one production secret store and commits to it.
 
@@ -65,8 +65,8 @@ per-deployment exception:
 - Vault is product-shape enough to bundle for a single-operator POC
   deployment. Pulling Vault out into a sibling stack later is cheap
   (re-target the auth endpoint).
-- regulated-tier production targets in-cluster Vault anyway (own
-  cluster, own Vault, our chart consumes it).
+- Regulated-tier production targets typically run in-cluster Vault
+  anyway (own cluster, own Vault, our chart consumes it).
 - The laptop-first dev profile keeps `vault.enabled=false` and the
   legacy plain-`Secret` path; no laptop-first regression.
 
@@ -307,8 +307,8 @@ Documented as an operational requirement in
 
 ### Architecture documentation impact
 
-Per the private POC roadmap §"architecture documentation in lock-step"
-rule, this ADR's PR includes:
+Per the cross-cutting "architecture documentation in lock-step" rule
+(specified in the private POC roadmap), this ADR's PR includes:
 
 - **`docs/architecture/workspace.dsl`** — new container `vault` in the
   audittrace namespace; new arrow from every dependency-consuming
