@@ -1,0 +1,102 @@
+{{- if .Values.vault.enabled }}
+# Vault policy + role definitions, declared in-cluster as a ConfigMap
+# so scripts/setup-vault.sh can apply them idempotently after Vault is
+# unsealed. Per ADR-043 §5 + §8.
+#
+# This ConfigMap is data only — it does NOT configure Vault on its own.
+# The bootstrap workflow is:
+#   1. helm install with vault.enabled=true (deploys Vault server)
+#   2. operator runs `vault operator init` + unseal (manual — POC posture
+#      per ADR-043 §7)
+#   3. operator runs scripts/setup-vault.sh, which reads this ConfigMap
+#      and applies via the vault CLI inside the audittrace-vault-0 pod
+#   4. helm upgrade — workloads now consume secrets via Vault Agent
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-vault-policies
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  # ----- Policies (HCL) ------------------------------------------------
+  # Each policy grants read-only access to the KV-v2 paths owned by
+  # one workload. KV v2 reads go through `kv/data/<path>` (the v2
+  # data wrapper); list operations use `kv/metadata/<path>`.
+
+  audittrace-server.hcl: |
+    # memory-server reads its dependency credentials.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/postgres/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/redis/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/chromadb/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/minio/*" {
+      capabilities = ["read"]
+    }
+
+  keycloak.hcl: |
+    # Keycloak reads its admin password + the postgres app-user creds
+    # for its own DB schema.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/keycloak/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/postgres/*" {
+      capabilities = ["read"]
+    }
+
+  minio.hcl: |
+    # MinIO reads its root password + KMS master key.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/minio/*" {
+      capabilities = ["read"]
+    }
+
+  summariser-job.hcl: |
+    # Post-install summariser-role-creation job needs the postgres
+    # superuser pw + the summariser role's own password.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/postgres/*" {
+      capabilities = ["read"]
+    }
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/summariser/*" {
+      capabilities = ["read"]
+    }
+
+  # ----- Role bindings (Kubernetes auth) -------------------------------
+  # Each role maps "ServiceAccount in namespace" → policy. Consumed by
+  # scripts/setup-vault.sh which calls `vault write auth/kubernetes/role/<name>`.
+  # Format: one line per field, easy to parse from shell.
+
+  role-audittrace-server.env: |
+    bound_service_account_names={{ .Values.memoryServer.serviceAccount.name }}
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=audittrace-server
+    ttl=24h
+
+  role-keycloak.env: |
+    bound_service_account_names={{ .Release.Name }}-keycloak
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=keycloak
+    ttl=24h
+
+  role-minio.env: |
+    bound_service_account_names={{ .Release.Name }}-minio
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=minio
+    ttl=24h
+
+  role-summariser-job.env: |
+    bound_service_account_names=default
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=summariser-job
+    ttl=1h
+
+  # ----- KV mount layout ----------------------------------------------
+  # Helps the script know which paths to enable / pre-create.
+  kv-mount.env: |
+    mount={{ .Values.vault.audittrace.kvMount }}
+    type=kv-v2
+    description=AuditTrace-AI application secrets (ADR-043)
+{{- end }}
