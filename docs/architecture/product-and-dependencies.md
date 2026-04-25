@@ -63,7 +63,7 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 | **Default (dev)** | Keycloak bundled in the Helm umbrella (hand-templated, not a Bitnami subchart). |
 | **Production alternatives** | Any OIDC-compliant IdP: Keycloak self-hosted, Okta, Microsoft Entra ID, Google Workspace, Ping Identity, Auth0. The enterprise's existing IdP federated via Keycloak brokering (preferred pattern — keeps AuditTrace-AI out of the employee-account lifecycle). |
 | **Minimum security posture** | RS256 or ES256 signing, JWKS rotation with published cache TTL, `aud` claim validation enforced, `exp` claim enforced. |
-| **Current gap** | Self-hosted Keycloak only. No brokering to enterprise IdPs yet. *Addressed by ADR-044 (M2 milestone), target 2026-05-02.* |
+| **Current gap** | Self-hosted Keycloak only by default. *Addressed by ADR-044 (M2): Keycloak brokers OIDC IdPs (Entra, Okta, Google Workspace, generic OIDC) via the realm's `identityProviders` array. Operator runs `scripts/setup-idp-federation.sh` post-install per deployment. No memory-server code changes — ADR-032 §2 multi-issuer path covers brokered tokens unchanged.* |
 
 ### 2. PostgreSQL (RLS-capable, HA)
 

@@ -26,7 +26,10 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         langfuse = softwareSystem "Langfuse" "Observability — traces, spans, metrics (sibling stack)" {
             tags "External"
         }
-        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; audittrace-dev serves the CI / smoke-test path." {
+        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; audittrace-dev serves the CI / smoke-test path. In M2+ deployments brokers to an Organisational IdP (ADR-044) via OIDC; the broker shadow user is the realm's identity, the realm key is the JWT signer." {
+            tags "External"
+        }
+        organisationalIdP = softwareSystem "Organisational IdP" "Customer-side OIDC issuer (Microsoft Entra ID, Okta, Google Workspace, Ping Identity, Auth0, ...). Source-of-truth for employee identity, group membership, MFA, and deprovisioning. Brokered through Keycloak per ADR-044; never directly contacted by memory-server. Optional dependency — laptop-first / POC deployments run with Keycloak as the only IdP." {
             tags "External"
         }
         observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
@@ -85,6 +88,8 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
 
         // Relationships — system level
         humanUser -> keycloak "Interactive Device Flow login via browser (client_id=audittrace-opencode) — ADR-032" "HTTPS/OIDC"
+        humanUser -> organisationalIdP "Interactive login via the customer's existing IdP — only when M2 brokering is configured (ADR-044). Sees the upstream IdP's login UI; lands as a Keycloak shadow user via JIT provisioning." "HTTPS/OIDC"
+        keycloak -> organisationalIdP "OIDC broker handshake — discovery, signature validation against upstream JWKS, attribute mapping per ADR-044 §4. Keycloak signs the downstream JWT with its own realm key; storeToken=false." "HTTPS/OIDC"
         humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
         agent -> keycloak "Token refresh + service-account client_credentials (audittrace-dev)" "HTTPS/OIDC"
         agent -> memoryServer.api "POST /v1/chat/completions (Bearer JWT)" "HTTPS/JSON"
