@@ -5,10 +5,12 @@
 > inject-mode path see `sequence-chat-completions.md`.
 >
 > Status: ADR-025 is **Accepted** (2026-04-12). The flow below matches
-> the deployed code. Live-verified: Qwen3.5-35B-A3B selectively calls
-> individual memory tools based on the question intent — the ambient
-> context includes selection rules that guide the LLM to pick the most
-> relevant tool instead of blast-calling all four.
+> the deployed code. Live-verified on Qwen3.5-35B-A3B (2026-04-12) and
+> re-verified on Qwen 3.6-27B-Q4_K_M (2026-04-24, the current default
+> chat model): selectively calls individual memory tools based on the
+> question intent — the ambient context includes selection rules that
+> guide the LLM to pick the most relevant tool instead of blast-calling
+> all four.
 
 ## What makes tools-mode different
 

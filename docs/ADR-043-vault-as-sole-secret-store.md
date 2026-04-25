@@ -42,10 +42,10 @@ deployment:
    today, each is fragile, and the env-and-Secret leg can silently
    diverge from the in-DB password without anyone noticing. A central
    secret store with an audited rotation API closes this.
-3. **The POC milestone schedule.** M1 (this ADR) is the
-   prerequisite for M2 (external IdP federation) and M3 (LibreChat
-   confidential client + secret-in-Vault per ADR-042 §2). Ships before
-   2026-05-09 or M3 cannot ship.
+3. **The POC milestone schedule.** M1 (this ADR) is the prerequisite
+   for M2 (external IdP federation) and M3 (LibreChat confidential
+   client + secret-in-Vault per ADR-042 §2). Ships before 2026-05-09
+   or M3 cannot ship.
 
 The decision below picks one production secret store and commits to it.
 
@@ -65,8 +65,8 @@ per-deployment exception:
 - Vault is product-shape enough to bundle for a single-operator POC
   deployment. Pulling Vault out into a sibling stack later is cheap
   (re-target the auth endpoint).
-- regulated-tier production targets in-cluster Vault anyway (own
-  cluster, own Vault, our chart consumes it).
+- Regulated-tier production targets typically run in-cluster Vault
+  anyway (own cluster, own Vault, our chart consumes it).
 - The laptop-first dev profile keeps `vault.enabled=false` and the
   legacy plain-`Secret` path; no laptop-first regression.
 
@@ -307,8 +307,8 @@ Documented as an operational requirement in
 
 ### Architecture documentation impact
 
-Per the private POC roadmap §"architecture documentation in lock-step"
-rule, this ADR's PR includes:
+Per the cross-cutting "architecture documentation in lock-step" rule
+(specified in the private POC roadmap), this ADR's PR includes:
 
 - **`docs/architecture/workspace.dsl`** — new container `vault` in the
   audittrace namespace; new arrow from every dependency-consuming
@@ -351,3 +351,158 @@ rule, this ADR's PR includes:
 - **ADR-045 §Rule 1 amendment** — note the Vault exception in
   ADR-045 itself so the rule remains internally consistent. Follow-up
   edit on ADR-045's PR or a small standalone PR.
+
+## Postmortem — first live install (2026-04-25)
+
+Seven distinct quiet bugs surfaced during the first end-to-end
+`helm upgrade --set vault.enabled=true` on the laptop k3s cluster.
+Each is recorded as a durable rule so the next operator install (and
+any future `audittrace.com`-scale hardening) does not re-walk the
+same minefield. Pattern matches ADR-045's PM-1..PM-4 — discoveries
+that only happen under live conditions become rules in the chart.
+
+### PM-1 — `kubectl exec` has no `--env` flag
+
+`scripts/setup-vault.sh` v1 used `kubectl exec --env=VAULT_TOKEN=…
+POD -- vault …`. That flag does not exist. The kubectl invocation
+failed silently (the script's `vault status` check redirected stderr
+to /dev/null and returned an empty status; the script then bailed
+with a misleading "Vault not reachable" message).
+
+**Rule:** to pass an env var into a `kubectl exec` invocation, use
+the busybox `env` builtin inside the pod:
+```
+kubectl exec POD -- env VAR=value command …
+```
+The token appears briefly in the pod's process table; acceptable for
+vault-0 (no other tenants).
+
+### PM-2 — overriding `vault.server.serviceAccount.name` breaks auth-delegator
+
+The upstream `hashicorp/vault` chart creates the Vault server's
+ClusterRoleBinding `<release>-vault-server-binding → system:auth-
+delegator` with the binding subject hardcoded to a release-prefixed
+SA name. Setting `vault.server.serviceAccount.name: vault` (an
+override I introduced for "tidiness") created the SA as `vault`, but
+the binding still targeted `audittrace-vault`. The mismatch silently
+disabled TokenReview, and every kubernetes-auth login 403'd.
+
+**Rule:** never override `vault.server.serviceAccount.name`. Use the
+upstream-default release-prefixed name. Same trap likely lurks for
+other chart values whose names are referenced indirectly by sibling
+templates — when in doubt, keep the upstream defaults.
+
+### PM-3 — Vault Agent template trim markers eat newlines
+
+The Helm helper for Vault Agent annotations rendered Vault template
+syntax via `{{ "{{- with secret \"…\" -}}" }} … {{ "{{- end -}}" }}`.
+The `{{-` and `-}}` trim markers strip leading and trailing whitespace
+respectively. The result: chained `{{- end -}}{{- with -}}` blocks
+produced a single line of output:
+```
+export A='…'export B='…'export C='…'
+```
+The shell parsed `export A='…'export …` as a single variable
+assignment with a malformed value. First visible symptom: memory-
+server tried to connect to a database called `audittraceexport`.
+
+**Rule:** in Vault Agent templates rendered through Helm, do not
+use trim markers on the `with`/`end` pairs. Plain `{{ with secret
+"…" }} … {{ end }}` preserves the surrounding newlines so each
+`export` lands on its own line. The shell-source contract of the
+agent's env file requires newlines.
+
+### PM-4 — Vault Agent does not bake operator-supplied prefixes
+
+The pre-Vault `templates/secrets/secret-minio.yaml` baked the
+`audittrace-key:` prefix into the rendered Secret value via
+`printf "audittrace-key:%s"`. When MinIO moved to Vault Agent
+file-mount sourcing, the agent template emitted `{{ .Data.data.
+kms_master_key }}` raw. MinIO got the key without prefix and
+fatal-ed with `kms: invalid secret key format`.
+
+**Rule:** when migrating a value from a `printf`-decorated K8s
+Secret to a Vault Agent template, re-apply the same string
+decoration in the template. Test the rendered output against the
+consumer's expected format before a workload sees it. The Vault
+KV path stores the raw value; the call-site formatting belongs in
+the template.
+
+### PM-5 — workload-on-Vault triggers AuthorizationPolicy gaps
+
+Vault-enabled deploys give Keycloak (and MinIO) their own
+ServiceAccounts so the Vault Agent can fetch their KV paths. Those
+new SAs are not in pre-existing AuthorizationPolicies. In the
+audittrace namespace's STRICT mTLS posture, Postgres rejected
+Keycloak's JDBC connection because `audittrace-keycloak` was not
+in the postgres AP allow-list.
+
+**Rule:** when introducing a new ServiceAccount for a workload that
+talks to in-mesh dependencies, audit every AuthorizationPolicy that
+selects on the dependencies and add the new SA principal under the
+appropriate `{{- if .Values.vault.enabled }}` gate. Workload SAs
+gained by enabling a feature flag must be reflected in mesh policy
+in the same flag.
+
+### PM-6 — never disable a security control to fix a connectivity error
+
+The Vault Agent Injector's mutating webhook on :8080 is invoked by
+the K8s API server, which is not in the mesh and does not speak
+Istio mTLS. With STRICT mTLS, the inbound TLS handshake to the
+injector pod failed (`127.0.0.6 EOF` in the injector logs), and
+the upstream `MutatingWebhookConfiguration`'s `failurePolicy: Ignore`
+caused the admission to silently no-op — workloads came up with
+no Vault Agent sidecar.
+
+The wrong fix: I disabled Istio sidecar injection wholesale on both
+Vault server AND injector via `sidecar.istio.io/inject: "false"`.
+That made the symptom go away. It also dropped Vault server out of
+the mesh entirely, which silently downgraded every workload→Vault
+secret read to plaintext (Istio's no-DestinationRule outbound
+default to a non-mesh target).
+
+The right fix: keep both Vault pods in the mesh; add
+`traffic.sidecar.istio.io/excludeInboundPorts: "8080"` ONLY on the
+injector pod. The webhook port skips Istio interception; everything
+else (Vault server :8200, workload→Vault, Vault→K8s API) keeps full
+mTLS. Plus a new `AuthorizationPolicy` on Vault server :8200 limits
+mesh peers that can reach it to the four workload SAs.
+
+**Rule:** never disable mTLS / AuthorizationPolicy / NetworkPolicy /
+RBAC to fix a connectivity error. Find the minimum-scope bypass.
+Captured durably as `feedback_no_security_control_shortcuts`.
+
+### PM-7 — `token_reviewer_jwt` goes stale across vault-0 restarts
+
+`scripts/setup-vault.sh` v1 wrote
+`token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token`
+to `auth/kubernetes/config`. That captures a snapshot of the SA
+token at script-execution time. Vault stores it and uses it for
+every TokenReview call. When `audittrace-vault-0` is recreated
+(any helm upgrade that touches the StatefulSet, any node failure,
+any rollout restart), the stored JWT belongs to a previous pod
+identity. K8s rejects it on the next TokenReview. Every fresh
+kubernetes-auth login then 403s with "permission denied" — even
+though cluster RBAC, PeerAuthentication, and Vault role bindings
+are all correct.
+
+The failure is invisible until a new workload pod tries to log in:
+existing workload Vault tokens keep working (renewal goes through
+`auth/token/renew-self`, no TokenReview needed).
+
+**Rule:** omit `token_reviewer_jwt` from
+`vault write auth/kubernetes/config`. Vault's kubernetes auth
+backend then reads `/var/run/secrets/kubernetes.io/serviceaccount/
+token` from the Vault pod on every TokenReview call. K8s auto-
+rotates that file. setup-vault.sh becomes a true one-time install
+step — no re-run needed when vault-0 rolls.
+
+### Architecture documentation impact (postmortem update)
+
+This postmortem section's PR also updates
+`docs/architecture/sequence-vault-injection.md` with a new
+"In-mesh discipline" subsection capturing the PM-6 + PM-7 rules
+visually: Vault stays in the mesh; only the injector's :8080 port
+bypasses interception; an AuthorizationPolicy enforces the four-SA
+allow-list on :8200; the kubernetes auth backend reads its
+TokenReviewer JWT live, never from cache.
