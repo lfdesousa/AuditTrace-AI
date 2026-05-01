@@ -14,7 +14,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (KV v2 + K8s auth) — replaces env-var/Secret-rendered passwords for production deploys (ADR-043). Sub-chart bundled by deliberate ADR-045 §Rule 1 exception." {
             tags "External"
         }
-        llamaServer = softwareSystem "Chat LLM Server" "Qwen 3.6-27B-Q4_K_M on :11435 — chat + tool-loop reasoning (GPU, ROCm)" {
+        llamaServer = softwareSystem "Chat LLM Server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE, ~3B active per token) on :11435 — chat + tool-loop reasoning (GPU, ROCm). MoE prompt-eval is materially faster than dense 27B Q4 on consumer GPU at the 5–15K-token prompts OpenCode produces, which is why we swapped back from 27B on 2026-05-01." {
             tags "External"
         }
         embedServer = softwareSystem "Embedding Server" "nomic-embed-text v1.5 Q8_0 on :11436 — 768-dim embeddings (CPU)" {
@@ -33,6 +33,9 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             tags "External"
         }
         observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
+            tags "External"
+        }
+        opencodeProxy = softwareSystem "OpenCode TLS Proxy" "Caddy 2.6 reverse proxy on 127.0.0.1:11434 — listens plain HTTP on loopback, forwards over verified TLS to Istio Gateway (cert pinned to ~/.config/audittrace/ca.crt). Workaround for Bun 1.3.x: OpenCode's compiled-binary fetch() does not honour NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / OS trust store, so the loopback hop is the minimum-scope way to keep TLS verification on without disabling it globally. Loopback hop is plain but JWT still authenticates, so identity guarantees are preserved. Removed once Bun fixes upstream." {
             tags "External"
         }
 
@@ -92,7 +95,9 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         keycloak -> organisationalIdP "OIDC broker handshake — discovery, signature validation against upstream JWKS, attribute mapping per ADR-044 §4. Keycloak signs the downstream JWT with its own realm key; storeToken=false." "HTTPS/OIDC"
         humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
         agent -> keycloak "Token refresh + service-account client_credentials (audittrace-dev)" "HTTPS/OIDC"
-        agent -> memoryServer.api "POST /v1/chat/completions (Bearer JWT)" "HTTPS/JSON"
+        agent -> opencodeProxy "OpenCode-only path: POST /v1/chat/completions (Bearer JWT) — plain HTTP on 127.0.0.1:11434" "HTTP/JSON"
+        opencodeProxy -> memoryServer.api "Forwards over verified TLS, Host=audittrace.local, cert pinned to local CA bundle" "HTTPS/JSON"
+        agent -> memoryServer.api "Direct path for non-OpenCode clients (Continue, Roo Code, curl) — full TLS at the client" "HTTPS/JSON"
         architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
         memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
         memoryServer.api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
@@ -216,9 +221,11 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             }
 
             deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU (three model processes, separate ports)" "Linux / ROCm" {
-                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-27B-Q4_K_M on :11435 (GPU)" "llama.cpp / ROCm"
+                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE) on :11435 (GPU)" "llama.cpp / ROCm"
                 embedInstance = infrastructureNode "embed-server" "nomic-embed-text v1.5 Q8_0 on :11436 (CPU)" "llama.cpp / CPU"
                 summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
+                opencodeProxyInstance = infrastructureNode "audittrace-opencode-proxy" "Caddy 2.6 reverse proxy on 127.0.0.1:11434, systemd-managed, TLS-verified upstream to Istio Gateway. Bun 1.3.x fetch-trust workaround." "Caddy 2.6"
+                vaultUnsealInstance = infrastructureNode "audittrace-vault-auto-unseal" "Boot-time idempotent Vault unseal (systemd oneshot, retry-on-failure). Reads keys from ~/work/audittrace-private/runbooks/vault-init-*.json (mode 600). Production successor: KMS auto-unseal (M3+)." "systemd + bash"
             }
 
             deploymentNode "Langfuse Stack" "Sibling compose — shared network (ADR-021.2)" "Docker Compose" {
@@ -226,6 +233,8 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             }
 
             // Deployment relationships
+            opencodeProxyInstance -> ingressInstance "Forwards OpenCode requests with Host=audittrace.local, cert-pinned" "HTTPS/JSON"
+            vaultUnsealInstance -> vaultServerInstance "Posts unseal keys at boot via kubectl exec" "HTTP/Vault API"
             ingressInstance -> apiInstance "HTTPS → HTTP proxy (mTLS via Istio sidecar)"
             ingressInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
             apiInstance -> vaultServerInstance "Reads dependency creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"

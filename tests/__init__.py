@@ -1,1 +1,1 @@
-"""Tests for sovereign-memory-server."""
+"""Tests for audittrace-server."""

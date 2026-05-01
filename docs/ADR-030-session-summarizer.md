@@ -101,16 +101,16 @@ containers and additional agents.
 
 ### §2. Settings
 
-New entries on `Settings` in `src/sovereign_memory/config.py`:
+New entries on `Settings` in `src/audittrace/config.py`:
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `SOVEREIGN_SUMMARIZER_URL` | `${SOVEREIGN_LLAMA_URL}` | OpenAI-compat base URL for the summariser model. Falls back to the Qwen endpoint when the dedicated Mistral server is not running, so the feature degrades rather than crashes. |
-| `SOVEREIGN_SUMMARIZER_MODEL` | `mistral-7b-summarizer` | Model alias sent in the `model` field of the chat-completions request. Must match the `--alias` on the llama-server process. |
-| `SOVEREIGN_SUMMARIZER_ENABLED` | `True` | Kill switch. Set to `False` to disable the background loop without removing config. |
-| `SOVEREIGN_SUMMARIZER_IDLE_MINUTES` | `15` | Minimum idle window before a session is eligible for summarisation. Chosen as a trade-off: short enough that today's sessions get summarised before tomorrow's work starts, long enough that we do not summarise mid-conversation. |
-| `SOVEREIGN_SUMMARIZER_INTERVAL_MINUTES` | `5` | Wake cadence for the background loop. |
-| `SOVEREIGN_SUMMARIZER_MAX_PER_CYCLE` | `10` | Upper bound on sessions processed per wake. Protects against a first-run spike when there are thousands of unsummarised sessions. |
+| `AUDITTRACE_SUMMARIZER_URL` | `${AUDITTRACE_LLAMA_URL}` | OpenAI-compat base URL for the summariser model. Falls back to the Qwen endpoint when the dedicated Mistral server is not running, so the feature degrades rather than crashes. |
+| `AUDITTRACE_SUMMARIZER_MODEL` | `mistral-7b-summarizer` | Model alias sent in the `model` field of the chat-completions request. Must match the `--alias` on the llama-server process. |
+| `AUDITTRACE_SUMMARIZER_ENABLED` | `True` | Kill switch. Set to `False` to disable the background loop without removing config. |
+| `AUDITTRACE_SUMMARIZER_IDLE_MINUTES` | `15` | Minimum idle window before a session is eligible for summarisation. Chosen as a trade-off: short enough that today's sessions get summarised before tomorrow's work starts, long enough that we do not summarise mid-conversation. |
+| `AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES` | `5` | Wake cadence for the background loop. |
+| `AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE` | `10` | Upper bound on sessions processed per wake. Protects against a first-run spike when there are thousands of unsummarised sessions. |
 
 ### §3. Part 1 — hybrid `recall_recent_sessions`
 
@@ -139,7 +139,7 @@ in lockstep with Part 2.
 
 ### §4. Part 2 — summariser loop
 
-New module `src/sovereign_memory/services/session_summarizer.py`.
+New module `src/audittrace/services/session_summarizer.py`.
 Started from `server.py::lifespan` as an `asyncio.create_task(...)`
 alongside the existing tracing setup, guarded by
 `settings.sovereign_summarizer_enabled`.
@@ -291,7 +291,7 @@ component wired to the `conversationalSvc`).
 - **Smaller summariser alternatives** — documented here so we can
   swap without re-opening the ADR when memory pressure rises or
   sovereignty requirements tighten. Every option below is a single
-  env-var change (`SOVEREIGN_SUMMARIZER_URL` / `SOVEREIGN_SUMMARIZER_MODEL`)
+  env-var change (`AUDITTRACE_SUMMARIZER_URL` / `AUDITTRACE_SUMMARIZER_MODEL`)
   plus a new llama-server process on `:11437`. Grammar-constrained
   decoding guarantees valid JSON regardless of model size, so the
   trade-off is purely about summary *content* quality.

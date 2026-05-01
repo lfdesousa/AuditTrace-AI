@@ -6,7 +6,7 @@ priority: P4
 
 ## Context
 
-`src/sovereign_memory/routes/chat.py:_compute_session_id` truncates a
+`src/audittrace/routes/chat.py:_compute_session_id` truncates a
 SHA-256 digest to its first 16 hex characters (= 64 bits of entropy):
 
 ```python

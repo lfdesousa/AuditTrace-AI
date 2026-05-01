@@ -1,5 +1,20 @@
 # Sequence Diagram: /v1/chat/completions
 
+> **Updated 2026-05-01** — added the **OpenCode TLS proxy hop** (Caddy
+> reverse proxy on 127.0.0.1:11434). OpenCode 1.14.x is a Bun-compiled
+> single-file binary, and Bun 1.3.x's native `fetch()` does not honour
+> NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / OS trust store, so it cannot
+> verify our self-signed `audittrace.local` cert. Rather than disable
+> verification globally (`NODE_TLS_REJECT_UNAUTHORIZED=0`) we run a
+> loopback proxy that listens plain HTTP and forwards over verified
+> TLS to Istio Gateway. JWT auth is unchanged — the loopback hop is
+> not authenticated by TLS but every request still carries the bearer
+> JWT and audittrace verifies it. Other clients (curl, Continue, Roo
+> Code) continue to use the direct TLS path. The `llama_chunk_timeout`
+> default also bumped from 120s → 600s to accommodate first-chunk
+> latency on 27B Q4 + consumer GPU when prompt eval exceeds the
+> previous bound (ADR-034 idle-timeout knob, see `config.py`).
+>
 > **Updated 2026-04-11** for ADR-024 (raw-dict pass-through, async streaming,
 > tool-call accumulation, Langfuse trace decoupling) and DESIGN §15
 > (Keycloak-delegated identity via `require_user`). The handler is no
@@ -48,6 +63,7 @@ The chat completions endpoint (inject mode):
 ```mermaid
 sequenceDiagram
     participant Agent as Coding Agent
+    participant Caddy as audittrace-opencode-proxy<br/>(Caddy on 127.0.0.1:11434,<br/>OpenCode-only path)
     participant Gateway as Istio Gateway (TLS)
     participant Auth as require_user
     participant Cache as TokenCache (Redis)
@@ -58,7 +74,13 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant LF as Langfuse\n(ingestion API)
 
-    Agent->>Gateway: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\n{messages, model, tools, tool_choice, stream: true}
+    alt OpenCode (Bun fetch — cannot verify self-signed cert)
+        Agent->>Caddy: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\nbaseURL=http://127.0.0.1:11434/v1
+        Note over Caddy: Cert pinned to ~/.config/audittrace/ca.crt;<br/>Host header rewritten to audittrace.local;<br/>flush_interval=-1 for SSE streaming
+        Caddy->>Gateway: Forward over verified TLS\n(SNI=audittrace.local, JWT preserved)
+    else Other clients (curl, Continue, Roo Code)
+        Agent->>Gateway: POST /v1/chat/completions\nAuthorization: Bearer <JWT>\n{messages, model, tools, tool_choice, stream: true}
+    end
     Gateway->>Auth: TLS terminated → HTTP (mTLS via Envoy sidecar)
 
     Auth->>Cache: get(sha256(token))
@@ -194,6 +216,16 @@ sequenceDiagram
 
 ## What changed since the previous version of this doc
 
+- **2026-05-01 — OpenCode TLS proxy hop**: new `Caddy` participant on
+  the OpenCode path. Streaming SSE responses flow back along the same
+  hop in reverse (Gateway → Caddy → Agent) — the proxy is fully
+  transparent at the HTTP layer and only changes the TLS posture.
+  Idle timeout `llama_chunk_timeout` default also bumped from 120s
+  → 600s (10 min) to accommodate first-chunk delay on 27B Q4 + consumer
+  GPU when OpenCode's tool-laden ~5K-token prompt exceeds the previous
+  bound during prompt eval. Once Bun ships the `NODE_EXTRA_CA_CERTS`
+  fix for `fetch()`, the proxy + OpenCode-baseURL change can be
+  reverted in a single commit.
 - **ADR-024**: raw dict pass-through, async streaming with
   `httpx.AsyncClient.stream()`, tool_calls accumulation, `@observe`
   trace_id capture, post-stream Langfuse update via ingestion API.

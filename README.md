@@ -352,7 +352,7 @@ The `audittrace-dev` client is the legacy path. Still the right choice for non-i
 | ✅ Done | **Qwen 3.6-35B-A3B Upgrade** | DeltaNet linear attention, ~2x throughput vs 3.5, native thinking mode on/off. |
 | ✅ Done | **Auth Fully Enabled** | Both `AUDITTRACE_AUTH_ENABLED` and `AUDITTRACE_AUTH_REQUIRED` active. Per-route scope enforcement. |
 | ✅ Done | **Backlog Cleared** | All 7 tech-debt items resolved: streaming generator decomposed, step counter scoped per-trace, session ID hash widened, empty stubs deleted, dev compose overlay added. |
-| ✅ Done | **Package Rename** | `sovereign_memory` → `audittrace`, `SOVEREIGN_*` → `AUDITTRACE_*`, all containers/DB/realm/scopes aligned (ADR-035). |
+| ✅ Done | **Package Rename** | `audittrace` → `audittrace`, `AUDITTRACE_*` → `AUDITTRACE_*`, all containers/DB/realm/scopes aligned (ADR-035). |
 | ✅ Done | **N=100 Eval Sweep** | Full 100 probes × 2 modes with 30-min client timeout. Validates Qwen 3.6 + ADR-034 per-chunk idle timeout. |
 | ✅ Done | **Kubernetes + Istio ZTA** | k3s + Istio mTLS + SPIFFE/SVID workload identity. Helm chart + deny-all AuthorizationPolicies. The v1.0 milestone. |
 | ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |

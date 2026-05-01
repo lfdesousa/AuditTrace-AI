@@ -430,3 +430,71 @@ class TestAmbientContext:
         ctx = build_ambient_context(non_admin, project="P", tools_visible=[])
         # The profile line must not claim admin status for a non-admin
         assert "admin" not in ctx.lower() or "not admin" in ctx.lower()
+
+
+class TestNamingConventionInjection:
+    """ADR-035 amendment 2026-05-01 — the rename mapping must appear in
+    every assembled system prompt so the LLM never repeats stale
+    SOVEREIGN_* / sovereign_memory names from legacy doc retrievals.
+    Pinned in tests so a future edit to context_builder doesn't silently
+    drop it."""
+
+    def test_inject_mode_includes_naming_note(self, user_context):
+        """build_system_context_with_stats (inject mode) carries the
+        naming note even when no query is provided — so a /context
+        request without a query still warns the LLM about old names."""
+        empty = DefaultContextBuilder(
+            episodic=MockEpisodicService(),
+            procedural=MockProceduralService(),
+            conversational=MockConversationalService(),
+            semantic=MockSemanticService(),
+        )
+        ctx, _ = empty.build_system_context_with_stats(
+            user_context, project="P", query=None
+        )
+        assert "SOVEREIGN_*" in ctx and "AUDITTRACE_*" in ctx
+        assert "src/sovereign_memory/" in ctx
+        assert "sovereign.component" in ctx  # explicit "kept as-is" exception
+
+    def test_ambient_mode_includes_naming_note(self, user_context):
+        """build_ambient_context (tools mode, the default) carries the
+        same mapping. Tools-mode is the path most users hit."""
+        from audittrace.services.context_builder import build_ambient_context
+
+        ctx = build_ambient_context(user_context, project="P", tools_visible=[])
+        assert "SOVEREIGN_*" in ctx and "AUDITTRACE_*" in ctx
+        assert "src/sovereign_memory/" in ctx
+        assert "sovereign.component" in ctx
+
+    def test_naming_note_does_not_blow_ambient_budget(self, user_context):
+        """Note + 4-tool ambient context still under the 280-word budget
+        (ADR-025 §Decision.1). If a future expansion bumps this, also
+        bump _AMBIENT_BUDGET_WORDS in lockstep."""
+        from audittrace.services.context_builder import build_ambient_context
+
+        four_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": (
+                        "Recall something with a somewhat longer description "
+                        "that approximates what the real tool definitions will "
+                        "carry in production so the budget test is realistic."
+                    ),
+                    "parameters": {},
+                },
+            }
+            for name in (
+                "recall_decisions",
+                "recall_skills",
+                "recall_recent_sessions",
+                "recall_semantic",
+            )
+        ]
+        ctx = build_ambient_context(
+            user_context, project="AuditTrace", tools_visible=four_tools
+        )
+        assert len(ctx.split()) <= 280, (
+            f"naming note pushed ambient context over 280 words: {len(ctx.split())}"
+        )

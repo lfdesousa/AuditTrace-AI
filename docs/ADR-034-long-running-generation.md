@@ -8,7 +8,7 @@
 ## Context
 
 On 2026-04-15 a production chat request ran for exactly 5 minutes and was
-killed by `SOVEREIGN_LLAMA_PROXY_TIMEOUT=300`, surfacing as an HTTP 500
+killed by `AUDITTRACE_LLAMA_PROXY_TIMEOUT=300`, surfacing as an HTTP 500
 (before ADR-033's error envelope fix). Luis waited out a similar request
 and discovered it was valid Qwen `<think>` reasoning — the model was
 deliberating on a complex architectural prompt for approximately 15
@@ -41,7 +41,7 @@ Three problems required simultaneous resolution:
 
 ### Alternatives considered
 
-- **Increase `SOVEREIGN_LLAMA_PROXY_TIMEOUT` to 900s.** Band-aid.
+- **Increase `AUDITTRACE_LLAMA_PROXY_TIMEOUT` to 900s.** Band-aid.
   Delays the failure without fixing the architecture, wastes resources
   on genuinely stalled connections.
 
@@ -58,7 +58,7 @@ Three changes, shipped as independent commits for reviewability:
 
 Replace the flat total timeout with a per-chunk idle timeout. The
 streaming path uses `asyncio.wait()` with a persistent `__anext__`
-task: if no SSE line arrives within `SOVEREIGN_LLAMA_CHUNK_TIMEOUT`
+task: if no SSE line arrives within `AUDITTRACE_LLAMA_CHUNK_TIMEOUT`
 (default 120s), the stream is considered stalled and `httpx.ReadTimeout`
 is raised — triggering the existing ADR-033 error envelope and audit
 trail. As long as tokens keep flowing, the stream stays alive
@@ -80,14 +80,14 @@ Non-streaming and tool-loop paths use the same granular Timeout with
 
 ### §2. SSE keep-alive comment frames
 
-When `SOVEREIGN_SSE_KEEPALIVE_INTERVAL` > 0 (default 15s), the idle
+When `AUDITTRACE_SSE_KEEPALIVE_INTERVAL` > 0 (default 15s), the idle
 timeout helper yields `None` every *keepalive_interval* seconds during
 quiet periods. The streaming generator converts `None` yields to
 `: keep-alive\n\n` — an SSE comment frame (RFC 8895 §9.2.3) that is
 invisible to JSON parsers, ignored by conformant SSE clients, and
 keeps the TCP connection alive through reverse proxies.
 
-After `SOVEREIGN_LLAMA_CHUNK_TIMEOUT` total silence (accumulated across
+After `AUDITTRACE_LLAMA_CHUNK_TIMEOUT` total silence (accumulated across
 keep-alive cycles), `httpx.ReadTimeout` is raised. A real data line
 arriving between keep-alive cycles resets the idle clock.
 
@@ -111,9 +111,9 @@ request body are preserved (the helper uses `setdefault`).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SOVEREIGN_LLAMA_CHUNK_TIMEOUT` | 120 | Per-chunk idle timeout (seconds). Stream stalls beyond this trigger 504. |
-| `SOVEREIGN_SSE_KEEPALIVE_INTERVAL` | 15 | Keep-alive comment frame interval (seconds). 0 disables. |
-| `SOVEREIGN_LLAMA_PROXY_TIMEOUT` | 120 | **Deprecated.** Retained in config for backward compatibility; no longer referenced by hot paths. |
+| `AUDITTRACE_LLAMA_CHUNK_TIMEOUT` | 120 | Per-chunk idle timeout (seconds). Stream stalls beyond this trigger 504. |
+| `AUDITTRACE_SSE_KEEPALIVE_INTERVAL` | 15 | Keep-alive comment frame interval (seconds). 0 disables. |
+| `AUDITTRACE_LLAMA_PROXY_TIMEOUT` | 120 | **Deprecated.** Retained in config for backward compatibility; no longer referenced by hot paths. |
 
 ## Consequences
 
@@ -138,8 +138,8 @@ request body are preserved (the helper uses `setdefault`).
 - The per-chunk idle timeout model is more complex than a flat timeout.
   The `asyncio.wait()` + persistent `__anext__` task pattern requires
   careful cleanup in the `finally` block to avoid leaked tasks.
-- `SOVEREIGN_LLAMA_PROXY_TIMEOUT` is now a no-op in the hot paths.
-  Operators who tuned it must migrate to `SOVEREIGN_LLAMA_CHUNK_TIMEOUT`.
+- `AUDITTRACE_LLAMA_PROXY_TIMEOUT` is now a no-op in the hot paths.
+  Operators who tuned it must migrate to `AUDITTRACE_LLAMA_CHUNK_TIMEOUT`.
   The old variable remains in config to avoid startup errors on
   existing `.env` files.
 - Clients that stream raw bytes (not SSE-aware parsers) will see

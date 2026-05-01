@@ -6,7 +6,7 @@ priority: P3
 
 ## Context
 
-`src/sovereign_memory/logging_config.py:_langgraph_step_counter` is a single
+`src/audittrace/logging_config.py:_langgraph_step_counter` is a single
 process-global `itertools.count(1)` whose value is written into every span's
 `langgraph_step` attribute (via metadata at `start_as_current_observation`
 time and as an OTel `set_attribute`).

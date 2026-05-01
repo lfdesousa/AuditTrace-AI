@@ -27,12 +27,12 @@ This structure is not:
 Adopt a production-grade Python package structure following Julien Danjou's patterns:
 
 ```
-sovereign-memory-server/
+audittrace-server/
 ├── pyproject.toml              # Modern packaging (PEP 621)
 ├── Dockerfile                  # Multi-stage, non-root user
 ├── .env.example                # All configuration documented
 ├── src/
-│   └── sovereign_memory/
+│   └── audittrace/
 │       ├── __init__.py
 │       ├── server.py           # FastAPI app factory
 │       ├── config.py           # Pydantic settings (12-factor)
@@ -78,7 +78,7 @@ sovereign-memory-server/
 
 3. **Pydantic settings** (`config.py`)
    - 12-factor architecture: environment variables
-   - `SOVEREIGN_` prefix for all config
+   - `AUDITTRACE_` prefix for all config
    - `lru_cache` on `get_settings()` for singleton pattern
    - Zero hardcoded values
 
@@ -107,7 +107,7 @@ sovereign-memory-server/
 ## Consequences
 
 ### Positive
-- ✅ Publishable as `pip install sovereign-memory-server`
+- ✅ Publishable as `pip install audittrace-server`
 - ✅ Testable components in isolation
 - ✅ Clear separation of concerns
 - ✅ Compliant with Julien Danjou Python engineering standards
@@ -121,8 +121,8 @@ sovereign-memory-server/
 - 📝 Requires migration from SQLite to PostgreSQL for Phase 1
 
 ### Neutral
-- 🔄 Import paths change from `langchain_server` to `sovereign_memory.server`
-- 🔄 Configuration now uses `SOVEREIGN_` prefix instead of bare variables
+- 🔄 Import paths change from `langchain_server` to `audittrace.server`
+- 🔄 Configuration now uses `AUDITTRACE_` prefix instead of bare variables
 
 ## Migration Plan
 

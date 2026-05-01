@@ -68,7 +68,7 @@ Table widget showing the most common questions asked.
 1. **+ Add Widget** → **Table**
 2. Configuration:
    - **Data source:** Traces
-   - **Filter:** `name = sovereign_memory.routes.chat.chat_completions`
+   - **Filter:** `name = audittrace.routes.chat.chat_completions`
    - **Columns:** timestamp, `sovereign.source`, `sovereign.memory.query`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, latency
    - **Sort:** timestamp DESC
    - **Limit:** 50

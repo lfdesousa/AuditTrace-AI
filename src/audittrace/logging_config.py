@@ -1,4 +1,4 @@
-"""Logging configuration for sovereign-memory-server.
+"""Logging configuration for audittrace-server.
 
 Inspired by FluentPython (Luciano Ramalho) - logging as an aspect.
 All logs go to stdout, no file logging.

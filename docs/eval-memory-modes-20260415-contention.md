@@ -5,7 +5,7 @@
 **Related:** [ADR-030](ADR-030-session-summarizer.md), companion clean baseline [eval-memory-modes-20260415-clean.md](eval-memory-modes-20260415-clean.md)
 **Raw data:** `tmp/eval-memory-modes-20260415T121903Z.jsonl`
 **Script:** `scripts/eval-memory-modes.py --n-per-mode 10`
-**Stack under test:** AuditTrace-AI at commit `a92bf9f`. **Mistral 7B Instruct v0.3 running on `:11437` at `--n-gpu-layers 10`** (partial offload), summariser worker enabled (`SOVEREIGN_SUMMARIZER_ENABLED=true`). Otherwise identical to the clean baseline run from 12:08 CEST.
+**Stack under test:** AuditTrace-AI at commit `a92bf9f`. **Mistral 7B Instruct v0.3 running on `:11437` at `--n-gpu-layers 10`** (partial offload), summariser worker enabled (`AUDITTRACE_SUMMARIZER_ENABLED=true`). Otherwise identical to the clean baseline run from 12:08 CEST.
 
 ## TL;DR
 
@@ -91,7 +91,7 @@ This explains the asymmetry: tools moved by ~5 s (noise), inject moved by ~50 s 
 ## What this run also confirms (positively)
 
 - **Hybrid `recall_recent_sessions` is being used by the model.** Probe 7 of contention tools called `recall_recent_sessions` alongside other tools. The Part 1 hybrid recall path is live in production and being selected by the LLM as designed.
-- **`recall_skills` was invoked** on probe 7 (the eval prompt was *"Why is SOVEREIGN_MEMORY_MODE a kill switch?"* — the model went looking for Sovereignty / IAM skills). Tool registry routing is working across all four memory tools.
+- **`recall_skills` was invoked** on probe 7 (the eval prompt was *"Why is AUDITTRACE_MEMORY_MODE a kill switch?"* — the model went looking for Sovereignty / IAM skills). Tool registry routing is working across all four memory tools.
 - **The exit-condition cherry-pick still didn't fire** — varied args throughout. Pending a noisier-category re-run (analytical "why X" probes from 2026-04-14 night) to validate empirically.
 - **Summariser DID NOT fire any cycle during the eval window.** Its 5-min wake interval came up four times during the ~35-min eval, but the eligibility query found 0 sessions because all interactions were younger than the 15-min idle threshold. So **today's contention measurement is for Mistral residency only, not concurrent generation.**
 

@@ -74,7 +74,7 @@ Qwen 3.5, not a genuine capability gap.
 | Winner | Inject (decisively) | **Tools (decisively)** |
 
 The 80% error rate on Qwen 3.5 tools-mode ambiguous probes was entirely
-caused by the flat 300s `SOVEREIGN_LLAMA_PROXY_TIMEOUT` killing valid
+caused by the flat 300s `AUDITTRACE_LLAMA_PROXY_TIMEOUT` killing valid
 `<think>` reasoning mid-stream. With ADR-034's per-chunk idle timeout,
 those same prompt shapes complete successfully — and faster than inject.
 

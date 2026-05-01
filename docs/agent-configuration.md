@@ -25,7 +25,7 @@ read the system trust store. Some tools bundle their own — see notes per agent
 **File:** `~/.config/opencode/config.json`
 
 Since ADR-026 Phase 5b the memory-server defaults to
-`SOVEREIGN_AUTH_REQUIRED=true`, which means every request must carry
+`AUDITTRACE_AUTH_REQUIRED=true`, which means every request must carry
 a valid Keycloak JWT in the `Authorization: Bearer` header. The
 `@ai-sdk/openai-compatible` provider maps its `apiKey` field to exactly
 that header, so we reuse it as the JWT carrier.
@@ -50,7 +50,7 @@ once per workday.
 > **Why not Traefik HTTPS + `apiKey` from the host?** Keycloak's
 > issuer is `http://keycloak:8080/realms/sovereign-ai` (the internal
 > docker-network hostname the memory-server trusts). Running the mint
-> script from inside the sovereign-ai-net via `docker exec` guarantees
+> script from inside the audittrace-net via `docker exec` guarantees
 > the JWT's `iss` claim matches what `require_user` validates. A
 > host-side mint against `localhost` or Traefik would produce a token
 > with a different issuer that the memory-server would reject.
@@ -156,11 +156,11 @@ Add this to your `~/.zshrc` to make it permanent.
 ### Bypass mode (emergency)
 
 If Keycloak is down or you need to debug without auth, flip the
-memory-server env back to `SOVEREIGN_AUTH_REQUIRED=false` for the
+memory-server env back to `AUDITTRACE_AUTH_REQUIRED=false` for the
 duration of the debug session:
 
 ```bash
-SOVEREIGN_AUTH_REQUIRED=false docker compose up -d --force-recreate memory-server
+AUDITTRACE_AUTH_REQUIRED=false docker compose up -d --force-recreate memory-server
 ```
 
 The sentinel `UserContext` takes over and requests without JWTs
@@ -256,7 +256,7 @@ If memory augmentation works, the answer should reference KV cache compression
 ## Authentication (ADR-022, ADR-023, ADR-026)
 
 **Current default since ADR-026 Phase 5b:**
-`SOVEREIGN_AUTH_REQUIRED=true` — every request needs a valid
+`AUDITTRACE_AUTH_REQUIRED=true` — every request needs a valid
 Keycloak JWT in `Authorization: Bearer <jwt>`. See the per-agent
 sections above for how to plug a token into each client.
 
@@ -264,8 +264,8 @@ sections above for how to plug a token into each client.
 
 | Flag | Purpose | Default |
 |---|---|---|
-| `SOVEREIGN_AUTH_ENABLED` | Legacy `require_scope` gate (ADR-022, ADR-023). Gates specific scope strings per route | `false` |
-| `SOVEREIGN_AUTH_REQUIRED` | New `require_user` gate (ADR-026 §15). Validates JWT against JWKS, populates `UserContext`, pushes `app.current_user_id` into Postgres RLS | **`true`** |
+| `AUDITTRACE_AUTH_ENABLED` | Legacy `require_scope` gate (ADR-022, ADR-023). Gates specific scope strings per route | `false` |
+| `AUDITTRACE_AUTH_REQUIRED` | New `require_user` gate (ADR-026 §15). Validates JWT against JWKS, populates `UserContext`, pushes `app.current_user_id` into Postgres RLS | **`true`** |
 
 The two are independent but today both live on the memory-server;
 `require_user` is the authoritative path for per-user identity.

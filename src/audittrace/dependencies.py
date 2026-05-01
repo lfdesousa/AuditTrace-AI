@@ -1,4 +1,4 @@
-"""Dependency injection for sovereign-memory-server.
+"""Dependency injection for audittrace-server.
 
 ADR-020: PostgreSQL replaces SQLite. ChromaDB is server-mode only.
 No file-based databases from this point forward.

@@ -27,7 +27,7 @@ authentication.
 - **Auth:** `CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider`
 - **Token:** Via `CHROMA_SERVER_AUTHN_CREDENTIALS` environment variable
 - **Storage:** Named Docker volume `chroma_data`
-- **Network:** `sovereign-ai-net` (shared with memory-server)
+- **Network:** `audittrace-net` (shared with memory-server)
 - **Health check:** `GET /api/v1/heartbeat`
 
 ### Client Connection

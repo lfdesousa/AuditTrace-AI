@@ -6,7 +6,7 @@ priority: P4
 
 ## Context
 
-`src/sovereign_memory/` contains five files that exist only as empty
+`src/audittrace/` contains five files that exist only as empty
 placeholders, forward-declared during Phase 0:
 
 - `auth.py` (NOTE: distinct from `routes/auth.py` if applicable)
@@ -42,5 +42,5 @@ Recommendation: delete. YAGNI applies to scaffolding too.
 
 - All five files either deleted or contain real content
 - No imports break (`pytest` + `ruff check` clean)
-- `python -c "import sovereign_memory.auth"` etc. either works or fails
+- `python -c "import audittrace.auth"` etc. either works or fails
   with a clear `ModuleNotFoundError`

@@ -142,9 +142,9 @@ def main() -> None:
         )
 
     # Read connection parameters from environment or .env file
-    url = os.environ.get("SOVEREIGN_MINIO_URL", "http://localhost:19000")
-    access_key = os.environ.get("SOVEREIGN_MINIO_ACCESS_KEY", "minioadmin")
-    secret_key = os.environ.get("SOVEREIGN_MINIO_SECRET_KEY", "")
+    url = os.environ.get("AUDITTRACE_MINIO_URL", "http://localhost:19000")
+    access_key = os.environ.get("AUDITTRACE_MINIO_ACCESS_KEY", "minioadmin")
+    secret_key = os.environ.get("AUDITTRACE_MINIO_SECRET_KEY", "")
 
     if not secret_key:
         # Try reading from secrets file
@@ -153,14 +153,14 @@ def main() -> None:
             secret_key = secrets_file.read_text().strip()
         else:
             logger.error(
-                "SOVEREIGN_MINIO_SECRET_KEY not set and %s not found. "
+                "AUDITTRACE_MINIO_SECRET_KEY not set and %s not found. "
                 "Run scripts/setup-secrets.sh first.",
                 secrets_file,
             )
             sys.exit(1)
 
-    shared_bucket = os.environ.get("SOVEREIGN_MINIO_SHARED_BUCKET", "memory-shared")
-    private_bucket = os.environ.get("SOVEREIGN_MINIO_PRIVATE_BUCKET", "memory-private")
+    shared_bucket = os.environ.get("AUDITTRACE_MINIO_SHARED_BUCKET", "memory-shared")
+    private_bucket = os.environ.get("AUDITTRACE_MINIO_PRIVATE_BUCKET", "memory-private")
 
     client = _get_minio_client(url, access_key, secret_key)
 

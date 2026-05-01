@@ -140,7 +140,7 @@ Verify your identity is attached (scenario 10 has the full audit-row
 check):
 
 ```bash
-docker compose exec -T postgres psql -U sovereign -d sovereign_ai \
+docker compose exec -T postgres psql -U sovereign -d audittrace \
   -c "SELECT user_id, project, substring(question, 1, 50) AS q
       FROM interactions
       ORDER BY id DESC LIMIT 3;"
@@ -294,7 +294,7 @@ CURL_VERIFY=1 \
   a real CA-signed cert.
 
 **Honest caveat about remote hosts:** `tokens.json` is per-host and
-the memory-server's `SOVEREIGN_KEYCLOAK_ISSUER_EXTRAS` list ships
+the memory-server's `AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS` list ships
 with only the `localhost` variants. If the other Keycloak emits
 `iss=https://keycloak.staging.example.com/realms/sovereign-ai`,
 your memory-server will reject tokens from it until you extend the
@@ -357,7 +357,7 @@ jq -r .access_token ~/.config/audittrace/tokens.json \
 
 Expected:
 - `iss`: `https://localhost/realms/sovereign-ai` (Traefik-fronted form)
-- `aud`: `sovereign-memory-server` (the audience mapper's output)
+- `aud`: `audittrace-server` (the audience mapper's output)
 - `sub`: a UUID (your real Keycloak id) — NOT
   `dev-client@audittrace-ai` or similar
 - `scope`: contains the four `memory:*` scopes and `sovereign-ai:query`
@@ -376,7 +376,7 @@ curl -sk -X POST https://localhost/v1/chat/completions \
 
 ```bash
 # 3. Check the audit trail — the row should carry YOUR sub
-docker compose exec -T postgres psql -U sovereign -d sovereign_ai -c "
+docker compose exec -T postgres psql -U sovereign -d audittrace -c "
 SELECT user_id, project, substring(question, 1, 60) AS q
 FROM interactions
 ORDER BY id DESC LIMIT 1;"
@@ -396,7 +396,7 @@ hybrid recall, audit trail) is working as designed.
 | `curl: (22) The requested URL returned error: 404` on device-auth endpoint | `KEYCLOAK_BASE` points at Traefik's dashboard (`:8080`), not Keycloak (`:443` via Traefik) | Use the default `KEYCLOAK_BASE=https://localhost` (set in commit 129853d) or override explicitly |
 | `curl: (60) SSL certificate problem: self-signed certificate` | mkcert CA not in curl's trust store | Default `-k` covers it on localhost. For CA-signed remote hosts set `CURL_VERIFY=1` explicitly |
 | Browser: "Firefox can't connect to localhost" after entering the code | Keycloak renders redirect URLs as `http://localhost/...` (no HTTPS awareness) | Check `docker-compose.yml` sets `KC_HOSTNAME_URL=https://localhost` + `KC_PROXY=edge` on the keycloak service (fixed in commit 5d0ed5e) |
-| `401 Unauthorized: {"detail":"Invalid or expired token"}` on chat requests | Memory-server rejects the token's `iss` claim | Verify `SOVEREIGN_KEYCLOAK_ISSUER_EXTRAS` env on the memory-server container includes the issuer your token carries. `docker compose exec memory-server env \| grep KEYCLOAK` |
+| `401 Unauthorized: {"detail":"Invalid or expired token"}` on chat requests | Memory-server rejects the token's `iss` claim | Verify `AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS` env on the memory-server container includes the issuer your token carries. `docker compose exec memory-server env \| grep KEYCLOAK` |
 | `401 Unauthorized` from OpenCode specifically, but direct `curl` with the same token works | Stale `options.apiKey` in the OpenCode config still carries an old token — `@ai-sdk/openai-compatible` builds Authorization from apiKey and that wins over any `headers.Authorization` we inject | `scripts/opencode-wrapper.sh` writes apiKey directly (fixed in commit `537ddd8`). On older wrapper, either re-run the wrapper or manually: `jq '.provider \|= with_entries(.value.options.apiKey = "<fresh-token>" \| .value.options.headers \|= del(.Authorization))' ~/.config/opencode/config.json` |
 | OpenCode 401 persists after wrapper rewrites the config | OpenCode cached the apiKey at session start and didn't re-read the config | Quit OpenCode fully and relaunch — the config is only read at startup |
 | Browser shows login page but "invalid username or password" | Password reset needed | Scenario 9 (admin reset) |

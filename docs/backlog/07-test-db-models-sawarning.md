@@ -11,7 +11,7 @@ emits a SQLAlchemy warning visible in the test output:
 
 ```
 SAWarning: New instance <SessionRecord at 0x...> with identity key
-(<class 'sovereign_memory.db.models.SessionRecord'>, ('dup_id',), None)
+(<class 'audittrace.db.models.SessionRecord'>, ('dup_id',), None)
 conflicts with persistent instance <SessionRecord at 0x...>
 ```
 

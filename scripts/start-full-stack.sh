@@ -29,7 +29,7 @@ fi
 
 # 3. Create shared Docker network
 echo "[1/5] Creating Docker network..."
-docker network create sovereign-ai-net 2>/dev/null || echo "  Network sovereign-ai-net exists"
+docker network create audittrace-net 2>/dev/null || echo "  Network audittrace-net exists"
 
 # 4. Start Langfuse sibling (if set up)
 LANGFUSE_DIR="${PROJECT_DIR}/../langfuse"

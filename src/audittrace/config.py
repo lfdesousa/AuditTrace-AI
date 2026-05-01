@@ -95,7 +95,12 @@ class Settings(BaseSettings):
     adr_dir: str = "./memory/episodic"
     skill_dir: str = "./memory/procedural"
     llama_proxy_timeout: int = 120  # seconds — DEPRECATED: use llama_chunk_timeout
-    llama_chunk_timeout: int = 120  # seconds — per-chunk idle timeout (ADR-034)
+    llama_chunk_timeout: int = 600  # seconds — per-chunk idle timeout (ADR-034).
+    # 600s accommodates first-chunk delay on 27B Q4 + consumer GPU,
+    # where prompt eval for ~5K-token prompts (e.g. OpenCode's tool-laden
+    # system prompt) routinely exceeds 120s before the first token streams.
+    # Once tokens flow, idle resets per chunk, so this only bounds initial
+    # prompt eval + any genuine upstream hang.
     sse_keepalive_interval: int = 15  # seconds — SSE keep-alive interval (ADR-034)
 
     # MinIO / S3 object storage (ADR-027) — replaces filesystem bind mounts.

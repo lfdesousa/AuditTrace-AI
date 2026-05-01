@@ -1,4 +1,4 @@
-"""Authentication middleware for sovereign-memory-server.
+"""Authentication middleware for audittrace-server.
 
 Two FastAPI dependencies live here, both backed by the same Keycloak
 JWKS validation logic:

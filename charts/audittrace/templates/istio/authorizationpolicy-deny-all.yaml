@@ -1,5 +1,5 @@
 {{- if and .Values.istio.enabled .Values.istio.defaultDenyAll }}
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: {{ .Release.Name }}-deny-all

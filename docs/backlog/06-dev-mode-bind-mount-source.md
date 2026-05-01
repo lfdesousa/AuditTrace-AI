@@ -25,7 +25,7 @@ Add a `docker-compose.dev.yml` overlay that:
 2. Bind-mounts `./pyproject.toml:/app/pyproject.toml:ro` (in case deps change
    — though dep changes still need a rebuild)
 3. Overrides the entrypoint to launch uvicorn with `--reload --reload-dir /app/src`
-4. Sets `SOVEREIGN_LOG_LEVEL=DEBUG`
+4. Sets `AUDITTRACE_LOG_LEVEL=DEBUG`
 
 Usage:
 

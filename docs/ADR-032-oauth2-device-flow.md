@@ -21,7 +21,7 @@ coding agent) against AuditTrace-AI today is painful:
    Keycloak emits the `iss` claim matching the hostname of the
    incoming request, and only the internal `http://keycloak:8080`
    URL matches the memory-server's configured
-   `SOVEREIGN_KEYCLOAK_ISSUER`). Running from the host fails with
+   `AUDITTRACE_KEYCLOAK_ISSUER`). Running from the host fails with
    `Could not resolve host: keycloak` — confirmed in a live session
    on 2026-04-15.
 3. **Access tokens are short-lived.** Every expired token means
@@ -56,7 +56,7 @@ A new client in the `sovereign-ai` realm, configured as:
 - `defaultClientScopes`: the full `memory:*` quadruple + `sovereign-ai:query`
   + `sovereign-ai:context` + `sovereign-ai:audit`. No admin scopes —
   admin operations keep using the separate admin-client.
-- Audience mapper `aud=sovereign-memory-server` — identical to the
+- Audience mapper `aud=audittrace-server` — identical to the
   dev client, so our existing JWT validation path accepts the token
   without modification.
 

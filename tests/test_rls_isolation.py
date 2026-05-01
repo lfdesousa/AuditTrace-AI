@@ -13,7 +13,7 @@ is skipped with a clear reason so CI environments without the stack
 up don't see red tests.
 
 **Isolation:** every test creates a fresh throwaway schema and runs
-the full migration chain inside it, so the live ``sovereign_ai``
+the full migration chain inside it, so the live ``audittrace``
 database is never touched. Teardown drops the schema. This keeps the
 tests hermetic and lets them run repeatedly without leaking state.
 
@@ -93,7 +93,7 @@ def _resolve_test_postgres_url() -> str | None:
     if not pw_file.exists():
         return None
     pw = pw_file.read_text().strip()
-    return f"postgresql+psycopg2://sovereign:{pw}@localhost:15432/sovereign_ai"
+    return f"postgresql+psycopg2://audittrace:{pw}@localhost:15432/audittrace"
 
 
 _RESOLVED_URL = _resolve_test_postgres_url()

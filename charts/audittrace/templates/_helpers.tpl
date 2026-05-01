@@ -192,6 +192,44 @@ vault.hashicorp.com/agent-inject-template-env: |
 {{- end }}
 
 {{/*
+Vault Agent Injector annotations — RLS integration test Pod (ADR-043 §4).
+Emits export for POSTGRES_SUPERUSER_PASSWORD sourced from
+kv/audittrace/postgres/superuser. The Pod reuses the audittrace-server
+Vault role since that policy already grants read on postgres/*.
+*/}}
+{{- define "audittrace.vaultAnnotations.tests" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "audittrace-server"
+vault.hashicorp.com/agent-inject-status: "update"
+# Run as init container only — no long-lived sidecar renewal. The test
+# Pod is short-lived; once the tests finish we want vault-agent to exit
+# so the Pod can terminate cleanly. Without this `helm test` hangs at
+# 2/3 NotReady forever.
+vault.hashicorp.com/agent-pre-populate-only: "true"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/postgres/superuser"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/postgres/superuser\" }}" }}
+  export POSTGRES_SUPERUSER_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — ChromaDB (ADR-043 §4).
+Emits export for CHROMA_SERVER_AUTHN_CREDENTIALS sourced from
+kv/audittrace/chromadb/main.token.
+*/}}
+{{- define "audittrace.vaultAnnotations.chromadb" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "chromadb"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/chromadb/main"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
+  export CHROMA_SERVER_AUTHN_CREDENTIALS='{{ "{{ .Data.data.token }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
 Vault Agent Injector annotations — summariser-role-creation Job (ADR-043 §4).
 Emits exports for PGPASSWORD + SUMMARISER_PASSWORD. Bound to a 1h-TTL
 role so the Job's identity is short-lived.

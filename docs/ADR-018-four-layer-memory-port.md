@@ -1,4 +1,4 @@
-# ADR-018: Port 4-Layer Memory Architecture to sovereign-memory-server
+# ADR-018: Port 4-Layer Memory Architecture to audittrace-server
 
 Date: 2026-04-10
 
@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-The sovereign-memory-server was a Phase 0 skeleton with clean architecture
+The audittrace-server was a Phase 0 skeleton with clean architecture
 (DI container, factory pattern, @log_call observability, 90% test coverage)
 but only implemented Layer 4 (ChromaDB semantic search) of the advertised
 4-tier memory architecture. The `/v1/chat/completions` endpoint returned a
@@ -26,7 +26,7 @@ The port needed to preserve the existing architectural patterns:
 
 ## Decision
 
-Port all 4 memory layers into sovereign-memory-server as separate service
+Port all 4 memory layers into audittrace-server as separate service
 classes following the existing ABC + implementation + mock pattern:
 
 **Layer 1 — Episodic:** `FileEpisodicService` reads `ADR-*.md` files from
@@ -57,7 +57,7 @@ The response is passed through unchanged — full OpenAI API compatibility.
 `create_test_container()` for testing.
 
 Configuration paths (`adr_dir`, `skill_dir`, `sessions_db`,
-`llama_proxy_timeout`) added to `Settings` with `SOVEREIGN_` prefix.
+`llama_proxy_timeout`) added to `Settings` with `AUDITTRACE_` prefix.
 
 ## Consequences
 
@@ -81,11 +81,11 @@ Configuration paths (`adr_dir`, `skill_dir`, `sessions_db`,
 ## Files Changed
 
 ### New (12 files)
-- `src/sovereign_memory/services/episodic.py`
-- `src/sovereign_memory/services/procedural.py`
-- `src/sovereign_memory/services/conversational.py`
-- `src/sovereign_memory/services/semantic.py`
-- `src/sovereign_memory/services/context_builder.py`
+- `src/audittrace/services/episodic.py`
+- `src/audittrace/services/procedural.py`
+- `src/audittrace/services/conversational.py`
+- `src/audittrace/services/semantic.py`
+- `src/audittrace/services/context_builder.py`
 - `tests/test_episodic_service.py`
 - `tests/test_procedural_service.py`
 - `tests/test_conversational_service.py`
@@ -95,15 +95,15 @@ Configuration paths (`adr_dir`, `skill_dir`, `sessions_db`,
 - `docs/ADR-018-four-layer-memory-port.md`
 
 ### Modified (5 files)
-- `src/sovereign_memory/config.py` — 4-layer path settings
-- `src/sovereign_memory/models.py` — `ContextBuildResponse`, `project` on `ChatRequest`
-- `src/sovereign_memory/dependencies.py` — register all layer services + getters
-- `src/sovereign_memory/routes/chat.py` — memory augmentation + httpx proxy
-- `src/sovereign_memory/routes/context.py` — wire ContextBuilderService
+- `src/audittrace/config.py` — 4-layer path settings
+- `src/audittrace/models.py` — `ContextBuildResponse`, `project` on `ChatRequest`
+- `src/audittrace/dependencies.py` — register all layer services + getters
+- `src/audittrace/routes/chat.py` — memory augmentation + httpx proxy
+- `src/audittrace/routes/context.py` — wire ContextBuilderService
 
 ## References
 
 - ADR-017 (predecessor project): 4-layer memory activation + cap removal
 - ADR-016 (predecessor project): Memory bus bandwidth optimisation
-- ADR-014.2: Logging and DI pattern (sovereign-memory-server)
-- ADR-014.4: Observability logging + OTel (sovereign-memory-server)
+- ADR-014.2: Logging and DI pattern (audittrace-server)
+- ADR-014.4: Observability logging + OTel (audittrace-server)

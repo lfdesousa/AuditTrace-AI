@@ -33,15 +33,15 @@ File-based databases also lack:
 ### Security Model
 
 **PostgreSQL:**
-- Dedicated `sovereign_app` role with least-privilege grants.
+- Dedicated `audittrace_app` role with least-privilege grants.
 - Permissions: `CONNECT`, `USAGE` on schema, `SELECT/INSERT/UPDATE/DELETE` on tables.
 - No `CREATE`, `DROP`, `ALTER`, or superuser privileges for the application user.
-- Password via `SOVEREIGN_POSTGRES_PASSWORD` environment variable.
+- Password via `AUDITTRACE_POSTGRES_PASSWORD` environment variable.
 - Listens only on Docker internal network in production.
 
 **ChromaDB:**
 - Token-based authentication via `CHROMA_SERVER_AUTHN_CREDENTIALS`.
-- Token provided via `SOVEREIGN_CHROMA_TOKEN` environment variable.
+- Token provided via `AUDITTRACE_CHROMA_TOKEN` environment variable.
 - `Authorization: Bearer <token>` header on all HTTP requests.
 - Listens only on Docker internal network in production.
 
