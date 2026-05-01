@@ -1,0 +1,21 @@
+[Unit]
+Description=AuditTrace-AI OpenCode TLS-stripping reverse proxy (Caddy)
+Documentation=file:///home/lfdesousa/work/audittrace-private/runbooks/08-opencode-tls-proxy.md
+After=k3s.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+ExecStart=/usr/bin/caddy run \
+	--config /home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-opencode-proxy.Caddyfile \
+	--adapter caddyfile
+Restart=on-failure
+RestartSec=10s
+# Caddy emits its own structured logs to stderr; let journald capture.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,7 @@ priority: P3
 
 ## Context
 
-`src/sovereign_memory/routes/chat.py:_iter_and_capture` (the streaming
+`src/audittrace/routes/chat.py:_iter_and_capture` (the streaming
 generator inside `chat_completions`) is ~130 lines and bundles five distinct
 concerns:
 

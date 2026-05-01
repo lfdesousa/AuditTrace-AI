@@ -1,6 +1,0 @@
-apiVersion: v2
-name: chromadb
-description: ChromaDB vector database (minimal subchart)
-type: application
-version: 1.5.7
-appVersion: "1.5.7"

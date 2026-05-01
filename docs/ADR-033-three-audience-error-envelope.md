@@ -66,7 +66,7 @@ tolerance.
     "param":                null,
     "code":                 "proxy_timeout",
     "status":               504,
-    "operator_hint":        "Check Loki for trace abc123def; review SOVEREIGN_LLAMA_PROXY_TIMEOUT (currently 300s).",
+    "operator_hint":        "Check Loki for trace abc123def; review AUDITTRACE_LLAMA_PROXY_TIMEOUT (currently 300s).",
     "trace_id":             "abc123def456789",
     "user_facing_message":  "The model is taking longer than expected. Please try again."
   }

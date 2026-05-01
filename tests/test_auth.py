@@ -34,7 +34,7 @@ TEST_PUBLIC_PEM = _test_public_key.public_bytes(
 ).decode()
 
 TEST_ISSUER = "http://keycloak:8080/realms/audittrace"
-TEST_AUDIENCE = "sovereign-memory-server"
+TEST_AUDIENCE = "audittrace-server"
 
 
 def _make_token(

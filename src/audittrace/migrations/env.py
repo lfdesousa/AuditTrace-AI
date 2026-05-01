@@ -1,6 +1,6 @@
 """Alembic migration environment — ADR-020.
 
-Reads database_url from sovereign-memory-server Settings (12-factor).
+Reads database_url from audittrace-server Settings (12-factor).
 Falls back to alembic.ini sqlalchemy.url if Settings not available.
 """
 

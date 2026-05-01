@@ -31,7 +31,7 @@ ADR-025 (memory-as-tools)
 > superseded by §15 (Keycloak delegation). The PAT model was a
 > reasonable bootstrap but the wrong long-term seam for an enterprise
 > architecture. Identity is now delegated entirely to Keycloak;
-> sovereign-memory-server holds no `users` table. The superseded
+> audittrace-server holds no `users` table. The superseded
 > sections are retained for the historical record.
 
 This is the actionable follow-on to `BRAINSTORM-memory-as-tools.md` §13.5.
@@ -124,7 +124,7 @@ brainstorm: cheap to do early, expensive to retrofit later.
          │ Authorization: Bearer smk_xxxxxxx...
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│              sovereign-memory-server                      │
+│              audittrace-server                      │
 │                                                           │
 │  ┌──────────────────────────────────────┐                │
 │  │ auth middleware (require_user)        │                │
@@ -616,11 +616,11 @@ end of every phase, just with progressively more identity awareness.
 
 ### Phase 1 — UserContext + auth middleware (1 day)
 
-- New module `src/sovereign_memory/auth/identity.py` defining
+- New module `src/audittrace/auth/identity.py` defining
   `UserContext` dataclass + `require_user` dependency
 - Middleware reads PAT from Authorization header, looks up, returns
   `UserContext`
-- A `SOVEREIGN_AUTH_REQUIRED=false` env defaults the dependency to a
+- A `AUDITTRACE_AUTH_REQUIRED=false` env defaults the dependency to a
   hardcoded "luis" UserContext for backwards compatibility during the
   migration; flipped to `true` at the end of Phase 5
 
@@ -641,7 +641,7 @@ suite green.
 
 ### Phase 3 — Tool registry filter (1-2 days)
 
-- New module `src/sovereign_memory/tools/registry.py` with
+- New module `src/audittrace/tools/registry.py` with
   `MEMORY_TOOL_REGISTRY` and `tools_visible_to(user)` function
 - Tool handlers receive `UserContext` and call `require_scope` defensively
 - Scope vocabulary documented in `docs/architecture/scopes.md`
@@ -669,7 +669,7 @@ this phase scaffolds it).
 - Run them; expect to find at least one bug they catch (the test
   exists for that reason)
 - Fix what they find
-- Flip `SOVEREIGN_AUTH_REQUIRED=true`
+- Flip `AUDITTRACE_AUTH_REQUIRED=true`
 - End-to-end smoke test from OpenCode with the new PAT
 
 **Test gate:** TestCrossUserIsolation passes, OpenCode round-trip works.
@@ -874,7 +874,7 @@ review, the architectural seam was challenged and corrected (see §15).
   FK to a plain Keycloak `sub` string
 - `interactions.user_id` and `sessions.user_id` — kept, same shape
   change
-- The bypass mode env var pattern (`SOVEREIGN_AUTH_REQUIRED=false`) —
+- The bypass mode env var pattern (`AUDITTRACE_AUTH_REQUIRED=false`) —
   kept for backwards compat during the migration window
 - All quality discipline (test-first, per-file 90% gate, lint clean,
   TDD red→green) — non-negotiable, unchanged
@@ -915,7 +915,7 @@ designing local identity interfaces. The architectural seam is moved.
   memory layers, the in-memory token cache for performance.
 
 This split means we never duplicate user state. Adding/removing/
-disabling a user is a single Keycloak operation; sovereign-memory-server
+disabling a user is a single Keycloak operation; audittrace-server
 finds out about it via the next token validation that fails, with
 bounded latency (the cache TTL).
 
@@ -941,7 +941,7 @@ bounded latency (the cache TTL).
          │
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│              sovereign-memory-server                      │
+│              audittrace-server                      │
 │                                                           │
 │  ┌──────────────────────────────────────────────────┐   │
 │  │ require_user (FastAPI dependency)                │   │
@@ -1026,7 +1026,7 @@ references to whatever Keycloak says is the subject.
 
 > **Revised 2026-04-11:** the cache lives in **Redis**, not in
 > Python process memory. In-memory was rejected because:
-> 1. It does not scale beyond a single sovereign-memory-server process
+> 1. It does not scale beyond a single audittrace-server process
 > 2. Horizontal scaling (which is on the enterprise roadmap) requires
 >    a shared cache from day one — retrofitting later means every
 >    process has its own cache state, leading to inconsistent
@@ -1050,7 +1050,7 @@ class TokenCache:
 
     Thread-safe by virtue of Redis itself — no in-process locks needed.
     Survives process restart (the Redis container persists across
-    sovereign-memory-server restarts).
+    audittrace-server restarts).
 
     Phase 8+ horizontal scaling: just point N processes at the same
     Redis. No code change.
@@ -1066,7 +1066,7 @@ class TokenCache:
     def size(self) -> int: ...    # observability — approximate via SCAN
 ```
 
-**Default TTL:** 5 minutes (`SOVEREIGN_TOKEN_CACHE_TTL_SECONDS=300`),
+**Default TTL:** 5 minutes (`AUDITTRACE_TOKEN_CACHE_TTL_SECONDS=300`),
 overridable per-call (the cold path uses `min(jwt.exp - now, default_ttl)`
 so the cache never holds an entry longer than the JWT itself is valid).
 
@@ -1108,9 +1108,9 @@ redis_password: str | None = None
 token_cache_ttl_seconds: int = 300
 ```
 
-`SOVEREIGN_REDIS_PASSWORD` is read from the secrets file at startup,
-same pattern as `SOVEREIGN_POSTGRES_PASSWORD` and
-`SOVEREIGN_CHROMA_TOKEN`. The new secret file is
+`AUDITTRACE_REDIS_PASSWORD` is read from the secrets file at startup,
+same pattern as `AUDITTRACE_POSTGRES_PASSWORD` and
+`AUDITTRACE_CHROMA_TOKEN`. The new secret file is
 `secrets/redis_password.txt`.
 
 ### 15.4b docker-compose additions
@@ -1124,19 +1124,19 @@ services:
     command:
       - redis-server
       - --requirepass
-      - ${SOVEREIGN_REDIS_PASSWORD}
+      - ${AUDITTRACE_REDIS_PASSWORD}
       - --appendonly
       - "no"  # token cache is ephemeral by design
     volumes:
       - sovereign-redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "$$SOVEREIGN_REDIS_PASSWORD", "ping"]
+      test: ["CMD", "redis-cli", "-a", "$$AUDITTRACE_REDIS_PASSWORD", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - sovereign-ai-net
+      - audittrace-net
 
   memory-server:
     depends_on:
@@ -1144,8 +1144,8 @@ services:
         condition: service_healthy
       # ... existing dependencies
     environment:
-      - SOVEREIGN_REDIS_URL=redis://redis:6379/0
-      - SOVEREIGN_REDIS_PASSWORD=${SOVEREIGN_REDIS_PASSWORD}
+      - AUDITTRACE_REDIS_URL=redis://redis:6379/0
+      - AUDITTRACE_REDIS_PASSWORD=${AUDITTRACE_REDIS_PASSWORD}
       # ... existing env
 
 volumes:
@@ -1155,7 +1155,7 @@ volumes:
 The volume exists so a container restart doesn't blow away the cache,
 but `--appendonly no` means we don't write a durable AOF — token
 caches are ephemeral by definition; if Redis itself dies, every
-sovereign-memory-server instance falls back to JWT validation on the
+audittrace-server instance falls back to JWT validation on the
 cold path and re-populates within seconds.
 
 ### 15.5 What the JWT carries (Phase 1, JWS)
@@ -1245,7 +1245,7 @@ config flag — we get there by changing one validation call, not by
 re-architecting.
 
 **D6 (new).** Identity is delegated entirely to Keycloak.
-sovereign-memory-server holds **no** local users table, no roles
+audittrace-server holds **no** local users table, no roles
 table, no token table. Caching is in-process memory only.
 
 **D7 (new).** The `auth_enabled` setting (existing, JWT path) is the
@@ -1263,12 +1263,12 @@ checks for scopes via `is_admin_scope` and a future
 ### 15.9 Open questions that remain
 
 1. **Cache TTL default — 5 min, 1 min, or env-configurable?** I'd
-   default to 5 min and add `SOVEREIGN_TOKEN_CACHE_TTL_SECONDS` as an
+   default to 5 min and add `AUDITTRACE_TOKEN_CACHE_TTL_SECONDS` as an
    override. Unanswered.
 
 2. **JWT issuer / audience for the dev environment.** We need a
    Keycloak realm running locally with a client configured for
-   sovereign-memory-server, and OpenCode needs to know the device-flow
+   audittrace-server, and OpenCode needs to know the device-flow
    endpoint. ADR-022/023 already wired the server side; the client
    side (OpenCode `opencode auth login` flow) is the missing piece.
 
@@ -1297,9 +1297,9 @@ checks for scopes via `is_admin_scope` and a future
 | Phase 0 — schema (users, pat_tokens, etc.) | Superseded by migration 004 | ✅ **Done.** `c5de424` then dropped via `e9b8799` / migration 004. |
 | Phase 1 — `require_user` PAT | Replaced — JWT validation + Redis cache | ✅ **Done.** `e9b8799` refactor. Live-verified in Phase 7a smoke test (9c8af21). |
 | Phase 2 — `UserContext` plumbing through services | Plumbing target unchanged | ✅ **Done.** Seven atomic commits `afb0c5d..5857d46` on 2026-04-11 morning. 313 → 321 tests. Cross-user isolation tests at the service layer included. |
-| Phase 3 — tool registry filter | Filters by `user.scopes`, source-agnostic | ✅ **Done as part of ADR-025** (memory-as-tools). `tools_visible_to(user_context)` in `src/sovereign_memory/tools/__init__.py`, scope enforced at tool advertisement (`c8d469e`) AND defensively at dispatch (`74ac439`). Live-verified in Phase 7a (audit row landed with `granted_scope=memory:episodic:read`). |
-| Phase 4 — RLS + ChromaDB wrapper | `user_id` column is a Keycloak sub string, RLS still works on string equality | ✅ **Done 2026-04-11 evening.** Alembic migration `005_enable_rls_policies` + ContextVar + SQLAlchemy `after_begin` listener (`db/rls.py`) + `UserScopedSemanticService` thin wrapper + non-superuser `sovereign_app` role + init script. Two commits: `fb005a0` (infra + tests) and `f0f88ce` (sovereign_app + live verification). RLS live-biting against the running stack — 3-way proof documented in §16. Soft follow-up: per-request wrapper wiring in `dependencies.py`. |
-| Phase 5 — cross-user isolation tests + flag flip | Tests use generated JWTs with different `sub`s | ✅ **Done 2026-04-11 evening.** Phase 5a consolidated `TestCrossUserIsolation` class (`e745b32`) runs alice + bob across every layer in one file (10 cases). Phase 5b flipped `SOVEREIGN_AUTH_REQUIRED=true` as the docker-compose default (`c0243e0`); conftest env-wipe keeps the Python suite in bypass mode so the 421 existing tests are unaffected. Live-verified: no-auth → 401, real JWT → 200, interaction row persists with the Keycloak service account sub. |
+| Phase 3 — tool registry filter | Filters by `user.scopes`, source-agnostic | ✅ **Done as part of ADR-025** (memory-as-tools). `tools_visible_to(user_context)` in `src/audittrace/tools/__init__.py`, scope enforced at tool advertisement (`c8d469e`) AND defensively at dispatch (`74ac439`). Live-verified in Phase 7a (audit row landed with `granted_scope=memory:episodic:read`). |
+| Phase 4 — RLS + ChromaDB wrapper | `user_id` column is a Keycloak sub string, RLS still works on string equality | ✅ **Done 2026-04-11 evening.** Alembic migration `005_enable_rls_policies` + ContextVar + SQLAlchemy `after_begin` listener (`db/rls.py`) + `UserScopedSemanticService` thin wrapper + non-superuser `audittrace_app` role + init script. Two commits: `fb005a0` (infra + tests) and `f0f88ce` (audittrace_app + live verification). RLS live-biting against the running stack — 3-way proof documented in §16. Soft follow-up: per-request wrapper wiring in `dependencies.py`. |
+| Phase 5 — cross-user isolation tests + flag flip | Tests use generated JWTs with different `sub`s | ✅ **Done 2026-04-11 evening.** Phase 5a consolidated `TestCrossUserIsolation` class (`e745b32`) runs alice + bob across every layer in one file (10 cases). Phase 5b flipped `AUDITTRACE_AUTH_REQUIRED=true` as the docker-compose default (`c0243e0`); conftest env-wipe keeps the Python suite in bypass mode so the 421 existing tests are unaffected. Live-verified: no-auth → 401, real JWT → 200, interaction row persists with the Keycloak service account sub. |
 | Phase 6 — ADR-026 | The ADR captures §15 as the canonical decision | ✅ **Done 2026-04-11 evening.** This file was promoted from `docs/architecture/DESIGN-multi-user-identity.md` to `docs/ADR-026-multi-user-identity.md` with `Status: Accepted`. Cross-refs across 19 files updated via `git mv` + global find-replace. You are reading the accepted ADR. |
 | Phase 7 — OAuth2 device flow | Already covered by §15 | ✅ **Done 2026-04-11 evening** (dev client path). New `sovereign-memory-dev` Keycloak client (client-secret + service account + audience mapper), `scripts/mint-dev-jwt.sh` helper, realm JSON mirrors the running realm. Device flow for human auth + OpenCode token configuration docs remain as Phase 8+ operator work, but the Phase 5b flag flip did not need them — the dev client is enough for curl / Bruno / ad-hoc dogfooding. |
 | Phase 8+ — Continue / Roo Code / VSCode native auth | Same JWT shape, different acquisition flow per client | ⏳ **Deferred.** |
@@ -1407,7 +1407,7 @@ evening, 2 commits after the doc reality-check):
 |---|---|
 | `952c242` | `docs(arch)` — reality-check DESIGN + BRAINSTORM against what actually shipped |
 | `fb005a0` | `feat(rls)` — Phase 4 infrastructure: Alembic migration 005 RLS policies (ENABLE + FORCE on interactions/sessions/tool_calls), `db/rls.py` (ContextVar + after_begin listener), `UserScopedSemanticService` thin wrapper, `require_user` populates the ContextVar on all paths, `server.py` lifespan installs the listener. 20 new tests across `test_rls.py` (15 unit), `test_rls_isolation.py` (5 integration against real Postgres with a non-superuser test role via `SET ROLE`), and `test_semantic_service.py::TestUserScopedSemanticService` (5 wrapper cases). |
-| `f0f88ce` | `feat(stack)` — non-superuser `sovereign_app` role completes Phase 4 in the running stack. New `scripts/init-sovereign-app-role.sh` (idempotent, docker-entrypoint-initdb.d compatible, password rotation aware), docker-compose wiring memory-server as `sovereign_app` with sovereign_app_password fallback. RLS live-verified 3-way: no-GUC sovereign_app = 0 rows, GUC-sentinel sovereign_app = 1 row, superuser sovereign = 945 rows. |
+| `f0f88ce` | `feat(stack)` — non-superuser `audittrace_app` role completes Phase 4 in the running stack. New `scripts/init-sovereign-app-role.sh` (idempotent, docker-entrypoint-initdb.d compatible, password rotation aware), docker-compose wiring memory-server as `audittrace_app` with audittrace_app_password fallback. RLS live-verified 3-way: no-GUC audittrace_app = 0 rows, GUC-sentinel audittrace_app = 1 row, superuser sovereign = 945 rows. |
 
 ### 16.2 Live verification
 
@@ -1427,7 +1427,7 @@ piece of the multi-user pipeline was verified live:
   proxy dispatched via the loop, real ADR-009 content flowed from the
   filesystem through the handler into the model's final answer
 - The `sovereign-redis` container was **verified for the first time**
-  — a papercut (`.env` was missing `SOVEREIGN_REDIS_PASSWORD`) was
+  — a papercut (`.env` was missing `AUDITTRACE_REDIS_PASSWORD`) was
   found and fixed during the smoke test. See the session doc.
 
 **Phase 4 live verification** (2026-04-11 evening, after ADR-025 Phase
@@ -1439,22 +1439,22 @@ this time at the infrastructure layer:
 - `pg_class.relrowsecurity` + `relforcerowsecurity` confirmed true
   on all three tables (`interactions`, `sessions`, `tool_calls`).
 - `pg_policies` shows `tenant_isolation_<table>` for each.
-- Non-superuser `sovereign_app` role created via
+- Non-superuser `audittrace_app` role created via
   `scripts/init-sovereign-app-role.sh`, ownership of the three
   tables + `interactions_id_seq` transferred from `sovereign`.
-- Memory-server restarted with the new `sovereign_app` connection
+- Memory-server restarted with the new `audittrace_app` connection
   URL; chat completion (`POST /v1/chat/completions`) returned 200
   and wrote interaction row #945 under `project=phase4-smoke`.
 - **3-way RLS proof against the live DB:**
-  - `sovereign_app` with no GUC set → `SELECT COUNT(*) FROM interactions` → **0 rows**
-  - `sovereign_app` with GUC=SENTINEL_SUBJECT + `project='phase4-smoke'` → **1 row**
+  - `audittrace_app` with no GUC set → `SELECT COUNT(*) FROM interactions` → **0 rows**
+  - `audittrace_app` with GUC=SENTINEL_SUBJECT + `project='phase4-smoke'` → **1 row**
   - `sovereign` (superuser, bypasses RLS) → **945 rows**
 
 The 0-row result with no GUC proves RLS is biting — without it,
 the non-superuser would have seen all rows it owns. The 1-row
 result with GUC matches the single row the chat completion just
 wrote. The 945-row superuser count confirms the historical data is
-still there, just filtered out of sovereign_app's view. Every
+still there, just filtered out of audittrace_app's view. Every
 chat request now routes through a fully defense-in-depth multi-user
 pipeline: Phase 2 service-layer filter + Phase 4 Postgres RLS +
 Phase 4 ChromaDB wrapper.
@@ -1474,7 +1474,7 @@ but not blocking the Accepted status of this ADR.
   is ready for daily use
 
 This is the "real" multi-user — a human typing credentials into
-Keycloak once and getting a JWT that sovereign-memory-server
+Keycloak once and getting a JWT that audittrace-server
 validates on every subsequent OpenCode invocation. The Phase 7
 dev client path (service-account via client-credentials grant) is
 enough for curl + Bruno + ad-hoc dogfooding; real humans using
@@ -1510,13 +1510,13 @@ Not blocking, but documented so they don't come back and bite:
    Follow-up: make the script idempotently append to `.env`.
 2. **OTel exporter to Langfuse via `host.docker.internal:3000`** is
    refused from inside the memory-server container. Cross-compose-
-   network issue between `sovereign-ai-net` and `langfuse_default`.
+   network issue between `audittrace-net` and `langfuse_default`.
    Not blocking the multi-user path but worth fixing before canary.
 3. **`POSTGRES_USER` creates a Postgres superuser by default.**
    Discovered during Phase 4: the `sovereign` role in the docker-
    compose stack is a superuser, which means it bypasses RLS
    regardless of FORCE ROW LEVEL SECURITY. Fixed by introducing
-   `sovereign_app` as a non-superuser role (commit `f0f88ce`) and
+   `audittrace_app` as a non-superuser role (commit `f0f88ce`) and
    connecting the memory-server as that role. This is a general
    Phase 4 finding relevant to anyone deploying a Postgres app
    that relies on RLS.
@@ -1531,7 +1531,7 @@ Phase 7 could slot in between without blocking). Final sequence:
 
 1. **Phase 4 — RLS + ChromaDB wrapper** (`fb005a0`, `f0f88ce`) —
    Postgres RLS policies, SQLAlchemy listener, UserScopedSemantic-
-   Service thin wrapper, non-superuser sovereign_app role.
+   Service thin wrapper, non-superuser audittrace_app role.
 2. **Phase 4 follow-up — per-request wrapper wiring** (`ca0f58b`) —
    `get_context_builder(user)` returns a per-request builder with
    the semantic layer bound to the caller's UserContext.
@@ -1541,7 +1541,7 @@ Phase 7 could slot in between without blocking). Final sequence:
    new `sovereign-memory-dev` client with client-secret auth +
    audience mapper, realm JSON mirrored, helper script wired for
    the `docker exec` pattern.
-5. **Phase 5b — flip `SOVEREIGN_AUTH_REQUIRED=true`** (`c0243e0`) —
+5. **Phase 5b — flip `AUDITTRACE_AUTH_REQUIRED=true`** (`c0243e0`) —
    merged into the Phase 7 commit because the two changes were
    coupled (flag flip requires the JWT source). Python test suite
    unaffected (conftest env-wipe keeps bypass mode for tests).
@@ -1579,7 +1579,7 @@ in `logging_config.py`.
    test that every layer is isolated end-to-end.
 3. **Phase 7 — Keycloak operator setup** before Phase 5b because
    the flag flip breaks existing workflows without a real JWT source.
-4. **Phase 5b — flip `SOVEREIGN_AUTH_REQUIRED=true`** with the JWT
+4. **Phase 5b — flip `AUDITTRACE_AUTH_REQUIRED=true`** with the JWT
    minting helper from Phase 7 in hand.
 5. **Phase 6 — promote this doc to ADR-026** once all of the above
    are green.

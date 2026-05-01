@@ -70,6 +70,13 @@ data:
       capabilities = ["read"]
     }
 
+  chromadb.hcl: |
+    # ChromaDB reads its own auth token (CHROMA_SERVER_AUTHN_CREDENTIALS)
+    # via Vault Agent injection at boot.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/chromadb/*" {
+      capabilities = ["read"]
+    }
+
   # ----- Role bindings (Kubernetes auth) -------------------------------
   # Each role maps "ServiceAccount in namespace" → policy. Consumed by
   # scripts/setup-vault.sh which calls `vault write auth/kubernetes/role/<name>`.
@@ -101,6 +108,13 @@ data:
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=summariser-job
     ttl=1h
+    audience=https://kubernetes.default.svc.cluster.local
+
+  role-chromadb.env: |
+    bound_service_account_names={{ .Release.Name }}-chromadb
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=chromadb
+    ttl=24h
     audience=https://kubernetes.default.svc.cluster.local
 
   # ----- KV mount layout ----------------------------------------------

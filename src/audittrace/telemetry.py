@@ -1,4 +1,4 @@
-"""OpenTelemetry bootstrap for sovereign-memory-server (ADR-014.4).
+"""OpenTelemetry bootstrap for audittrace-server (ADR-014.4).
 
 Provides a single aspect-friendly API (`start_span`, `record_operation`)
 that the `@log_call` decorator uses to emit spans and histogram metrics

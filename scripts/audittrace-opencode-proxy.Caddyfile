@@ -1,0 +1,66 @@
+# AuditTrace-AI OpenCode TLS-stripping reverse proxy.
+#
+# Why this exists: OpenCode (1.14.x) is a Bun-compiled single-file
+# binary. Bun's native fetch() (used by @ai-sdk/openai-compatible) does
+# not honor NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, or the OS trust store
+# in 1.3.x — only the node:tls compatibility shim does. As a result,
+# OpenCode cannot verify our self-signed audittrace.local cert and
+# fails with "unable to verify the first certificate".
+#
+# Rather than disabling TLS verification globally
+# (NODE_TLS_REJECT_UNAUTHORIZED=0), we run this loopback proxy:
+#   - listens HTTP on 127.0.0.1:11434 (no TLS on the OpenCode hop —
+#     loopback, no untrusted local processes, JWT still authenticates)
+#   - forwards over verified TLS to the cluster Istio Gateway, pinning
+#     trust to /home/lfdesousa/.config/audittrace/ca.crt so a rotated
+#     gateway cert fails loudly rather than silently trusting whatever
+#     the OS bundle accepts.
+#
+# Production successor: when Bun ships a fix for NODE_EXTRA_CA_CERTS in
+# fetch(), delete this proxy + unit and revert the OpenCode baseURL to
+# https://audittrace.local:30952.
+
+{
+	admin off
+	auto_https off
+	log {
+		output stderr
+		format console
+		level INFO
+	}
+}
+
+:11434 {
+	bind 127.0.0.1
+
+	reverse_proxy https://audittrace.local:30952 {
+		# Stream SSE chat completions immediately, no buffering.
+		flush_interval -1
+
+		# Pin trust to the audittrace cert specifically (not whatever's
+		# in the OS bundle) so a rotated gateway cert fails loudly.
+		# The presence of tls_* subdirectives + the https:// upstream
+		# scheme is what enables TLS in Caddy 2.6 — no explicit `tls`
+		# keyword needed (and including it conflicts with the URL
+		# scheme parsing).
+		transport http {
+			tls_server_name audittrace.local
+			tls_trusted_ca_certs /home/lfdesousa/.config/audittrace/ca.crt
+			dial_timeout 10s
+			# In ADR-025 tools-mode (default since v0.3.0) audittrace
+			# runs the memory tool-call loop NON-STREAMING before
+			# opening the SSE stream back to the client — so this
+			# timeout runs during tool-loop time, not stream-body time.
+			# 27B Q4 + up to AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS
+			# iterations can cumulatively exceed 5 min on consumer GPU.
+			# audittrace-server enforces its own per-iteration timeout
+			# (llama_chunk_timeout=600s) so a real hang surfaces there;
+			# Caddy doesn't need a tighter safety net.
+			response_header_timeout 30m
+		}
+
+		# Istio's VirtualService routes on Host header; make sure we
+		# present audittrace.local even when the dial host differs.
+		header_up Host audittrace.local
+	}
+}

@@ -1,0 +1,30 @@
+[Unit]
+Description=AuditTrace-AI Vault auto-unseal at boot
+Documentation=file:///home/lfdesousa/work/audittrace-private/runbooks/07-vault-auto-unseal.md
+After=k3s.service network-online.target
+Wants=network-online.target
+Requires=k3s.service
+# Allow up to 5 retries within 5 minutes — k3s API server and Vault
+# pod can take longer than the unit's 180s TimeoutStartSec on a slow
+# boot, and the script itself is idempotent.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=lfdesousa
+Group=lfdesousa
+Environment=KUBECONFIG=/home/lfdesousa/.kube/config
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-vault-auto-unseal.sh
+# RemainAfterExit so `systemctl status` reports active after the
+# oneshot completes — useful for debugging.
+RemainAfterExit=yes
+# Retry on transient cluster-startup failures. The script is
+# idempotent (checks 'already unsealed' and exits 0), so retrying
+# after a successful unseal is safe.
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=180s
+
+[Install]
+WantedBy=multi-user.target

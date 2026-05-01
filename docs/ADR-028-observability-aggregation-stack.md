@@ -21,7 +21,7 @@ Keycloak restart overnight?".
 
 Deploy **Prometheus** (metrics), **Grafana** (dashboards), **Loki** (logs), and
 an **OpenTelemetry Collector** (bridge) as a sibling Docker Compose stack.
-Follow the ADR-021.2 pattern: separate directory, shared `sovereign-ai-net`
+Follow the ADR-021.2 pattern: separate directory, shared `audittrace-net`
 network, independent lifecycle from the application stack.
 
 ### §1. Architecture — OTel Collector as central hub
@@ -98,7 +98,7 @@ remote write).
 ### §4. Log aggregation
 
 Promtail attaches to the Docker socket and scrapes stdout/stderr from all
-containers on `sovereign-ai-net`. Labels are auto-extracted from Docker
+containers on `audittrace-net`. Labels are auto-extracted from Docker
 metadata: `container_name`, `compose_service`, `compose_project`. The
 memory-server's `StructuredFormatter` emits JSON lines at DEBUG level,
 which Loki indexes for full-text search + structured field extraction.
@@ -130,7 +130,7 @@ Auto-provisioned on first boot:
 - Sibling stack pattern proven by Langfuse — same operational model
 - OTel Collector decouples export format from backends — future-proof
 - Promtail auto-discovers containers — zero config per new service
-- `SOVEREIGN_METRICS_ENABLED=true` is now safe (collector accepts metrics, unlike Langfuse)
+- `AUDITTRACE_METRICS_ENABLED=true` is now safe (collector accepts metrics, unlike Langfuse)
 
 ### Negative
 - 5 additional containers (~500MB RAM total at idle)

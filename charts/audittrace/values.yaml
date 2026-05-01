@@ -106,7 +106,11 @@ memoryServer:
     AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS: "900"
     AUDITTRACE_TOKEN_CACHE_TTL_SECONDS: "300"
     AUDITTRACE_LLAMA_PROXY_TIMEOUT: "300"
-    AUDITTRACE_LLAMA_CHUNK_TIMEOUT: "120"
+    # 600s = 10 min: accommodates first-token delay on 27B Q4 + consumer
+    # GPU where prompt eval for OpenCode's tool-laden ~5K-token prompt
+    # exceeds 120s. ADR-034: idle timer resets per chunk, so this only
+    # bounds initial prompt eval + any genuine upstream hang.
+    AUDITTRACE_LLAMA_CHUNK_TIMEOUT: "600"
     AUDITTRACE_SSE_KEEPALIVE_INTERVAL: "15"
     AUDITTRACE_MINIO_SHARED_BUCKET: "memory-shared"
     AUDITTRACE_MINIO_PRIVATE_BUCKET: "memory-private"
@@ -293,6 +297,26 @@ chromadb:
     limits:
       cpu: 1000m
       memory: 2Gi
+
+# -- Tests (helm test) -------------------------------------------------------
+# Chart-managed `helm test` hook. Runs the RLS integration suite inside
+# the cluster via the real Vault Agent + Istio mTLS path. Image built
+# from the Dockerfile's `tests` target. Triggered by `helm test audittrace`
+# (or `make test-integration`). Disabled by default to keep dev installs
+# clean; flip to true on the laptop / CI deploy when you need it.
+tests:
+  enabled: true
+  image:
+    repository: localhost:5000/audittrace/tests
+    tag: latest
+    pullPolicy: Always
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 # -- Secrets (override via --set or external secret manager) ------------------
 secrets:

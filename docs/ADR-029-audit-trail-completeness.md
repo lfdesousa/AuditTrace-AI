@@ -63,7 +63,7 @@ source detection. Per-project ACLs (scoping memory recall, billing) would
 require cross-checking against a JWT claim; that is out of scope for this
 ADR.
 
-**Implementation** (`src/sovereign_memory/routes/chat.py`):
+**Implementation** (`src/audittrace/routes/chat.py`):
 
 ```python
 def _resolve_project(request: Request, payload: dict[str, Any]) -> str:
@@ -129,7 +129,7 @@ metrics_generator_processor_service_graphs_peer_attributes:
   - peer.service
   - server.address   # httpx + urllib3 — clean host-name labels
   - net.peer.name    # redis (DB semconv, independent migration track)
-  - db.name          # postgres, via SQLAlchemy (→ 'sovereign_ai')
+  - db.name          # postgres, via SQLAlchemy (→ 'audittrace')
 ```
 
 The previous `http.url` entry was dropped — full-URL labels are replaced by
@@ -146,7 +146,7 @@ inside the memory-server container — urllib3 spans carry `http.url` and
 service-graph edge.
 
 Back-filled via a `request_hook` wired into `URLLib3Instrumentor` in
-`src/sovereign_memory/server.py::lifespan`:
+`src/audittrace/server.py::lifespan`:
 
 ```python
 def _urllib3_set_server_address(span, _instance, request_info) -> None:
@@ -179,13 +179,13 @@ Probed live against the running stack on 2026-04-14:
 ```text
 $ curl -s 'http://localhost:19090/api/v1/query?query=traces_service_graph_request_total' \
     | jq -r '.data.result[] | "\(.metric.client) -> \(.metric.server) [\(.metric.connection_type)]"'
-user                      -> sovereign-memory-server [virtual_node]
-sovereign-memory-server   -> chromadb                [virtual_node]
-sovereign-memory-server   -> redis                   [virtual_node]
-sovereign-memory-server   -> keycloak                [virtual_node]
-sovereign-memory-server   -> postgres                [database]
-sovereign-memory-server   -> host.docker.internal    [virtual_node]   # ← llama-server on host
-sovereign-memory-server   -> minio                   [virtual_node]   # ← NEW
+user                      -> audittrace-server [virtual_node]
+audittrace-server   -> chromadb                [virtual_node]
+audittrace-server   -> redis                   [virtual_node]
+audittrace-server   -> keycloak                [virtual_node]
+audittrace-server   -> postgres                [database]
+audittrace-server   -> host.docker.internal    [virtual_node]   # ← llama-server on host
+audittrace-server   -> minio                   [virtual_node]   # ← NEW
 ```
 
 All six outbound edges render with clean host-name labels. Project tagging

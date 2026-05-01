@@ -1,0 +1,50 @@
+{{- if and .Values.tests.enabled .Values.vault.enabled }}
+# Helm test Pod — runs the RLS integration suite against the in-cluster
+# Postgres via the real Vault Agent + Istio mTLS path. Triggered by
+# `helm test audittrace`. Reuses memory-server's ServiceAccount so the
+# pod inherits the audittrace-server Vault role + the AP allow-lists
+# already wired up for memory-server (no chart drift).
+#
+# WARNING: ADR-043 §"test integration" — the test_alice_cannot_insert_as_bob
+# case deliberately provokes an RLS WITH CHECK violation, which Postgres
+# logs as ERROR. Running this against the production cluster pollutes
+# Postgres logs accordingly. For pollution-free runs use `make test-rls-local`
+# (ephemeral Docker Postgres).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-rls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tests
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- include "audittrace.vaultAnnotations.tests" . | nindent 4 }}
+spec:
+  serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}
+  restartPolicy: Never
+  containers:
+    - name: tests
+      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}"
+      imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -a
+          . /vault/secrets/env
+          set +a
+          export AUDITTRACE_TEST_POSTGRES_URL="postgresql+psycopg2://postgres:${POSTGRES_SUPERUSER_PASSWORD}@{{ .Release.Name }}-postgresql:5432/audittrace"
+          # Disable pytest cache writes since the image fs is read-only here.
+          pytest tests/test_rls_isolation.py -v --no-cov -p no:cacheprovider
+          rc=$?
+          # Tell istio-proxy to exit so the Pod terminates cleanly (helm test
+          # waits for all containers). Without this the Pod hangs at 2/3
+          # NotReady forever and helm test reports Failed even on test pass.
+          curl -fsS -X POST http://localhost:15020/quitquitquit || true
+          exit $rc
+      resources:
+        {{- toYaml .Values.tests.resources | nindent 8 }}
+{{- end }}

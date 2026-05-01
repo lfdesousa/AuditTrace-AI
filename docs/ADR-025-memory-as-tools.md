@@ -107,7 +107,7 @@ This is the only pattern that:
   the parent chat span
 
 The tool-call loop obeys a **configurable hard iteration cap**
-(`SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS`, default `5`). Beyond the cap
+(`AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS`, default `5`). Beyond the cap
 the proxy returns whatever text the model has accumulated and logs a warning
 at `logging.WARNING` level.
 
@@ -116,7 +116,7 @@ at `logging.WARNING` level.
 Tools register at import time via a decorator:
 
 ```python
-# src/sovereign_memory/tools/__init__.py
+# src/audittrace/tools/__init__.py
 
 @register_memory_tool(
     name="recall_decisions",
@@ -171,7 +171,7 @@ which returns the OpenAI-spec tool definitions scoped to the caller.
 A single env var controls the full behaviour:
 
 ```
-SOVEREIGN_MEMORY_MODE={inject|tools}    # default: inject during rollout
+AUDITTRACE_MEMORY_MODE={inject|tools}    # default: inject during rollout
 ```
 
 - `inject` — current behaviour; 4 layers fired up front, memory merged into
@@ -253,7 +253,7 @@ deployed for `TokenCache`; it is the obvious substrate.
 - **Key:** `sovereign:tool-result:<sha256(session_id|tool_name|canonical_args_json)>`
 - **Value:** JSON-encoded result dict (the canonical `{matches, total,
   truncated}` shape)
-- **TTL:** `SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS`, default `900` (15
+- **TTL:** `AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS`, default `900` (15
   minutes). Set to `0` to disable caching globally.
 - **Namespace disjoint** from `sovereign:token:` — the same Redis
   instance is shared but key prefixes never collide.
@@ -329,7 +329,7 @@ infrastructure.
   ambient profile. The mode flip gives us the A/B toggle to measure this
   on real traffic.
 - **Smaller / non-tool-calling models degrade.** If we ever swap to a model
-  that tool-calls poorly, `SOVEREIGN_MEMORY_MODE=inject` is the escape hatch.
+  that tool-calls poorly, `AUDITTRACE_MEMORY_MODE=inject` is the escape hatch.
 - **Synchronous audit writes.** A DB hiccup on the `tool_calls` write can
   briefly stall a tool-call response. Acceptable for now; async persistence
   ADR takes this up later.
@@ -367,17 +367,17 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
 
 - New `docs/ADR-025-memory-as-tools.md` (this file) — Proposed status.
 - Draft config keys in `config.py:Settings`, all with tests:
-  - `SOVEREIGN_MEMORY_MODE` (default `inject`)
-  - `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` (default `5`)
-  - `SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS` (default `900`; `0` disables)
-  - `SOVEREIGN_TOOLS_CONFIG_PATH` (default `tools.toml` at repo root)
+  - `AUDITTRACE_MEMORY_MODE` (default `inject`)
+  - `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS` (default `5`)
+  - `AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS` (default `900`; `0` disables)
+  - `AUDITTRACE_TOOLS_CONFIG_PATH` (default `tools.toml` at repo root)
 - Drop `langchain>=0.1.0` and `langchain-community>=0.0.10` from
   `pyproject.toml`; keep `langchain-core` for the `Document` import.
   Regenerate `requirements.txt`. Verify `make test` still green.
 
 ### Phase 1 — Tool registry primitives (1 day)
 
-- New module `src/sovereign_memory/tools/__init__.py`:
+- New module `src/audittrace/tools/__init__.py`:
   - `MemoryTool` frozen dataclass
   - `MEMORY_TOOL_REGISTRY: dict[str, MemoryTool]`
   - `register_memory_tool(...)` decorator
@@ -392,7 +392,7 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
 
 ### Phase 2 — Four memory tool handlers + ToolResultCache (1.5 days)
 
-- New module `src/sovereign_memory/tools/memory_handlers.py`:
+- New module `src/audittrace/tools/memory_handlers.py`:
   - `recall_decisions` wraps `EpisodicService.search`
   - `recall_skills` wraps `ProceduralService.search`
   - `recall_recent_sessions` wraps `ConversationalService.load_sessions`
@@ -417,14 +417,14 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
 
 ### Phase 3 — Ambient context generator (0.5 days)
 
-- New helper in `src/sovereign_memory/services/context_builder.py`:
+- New helper in `src/audittrace/services/context_builder.py`:
   `build_ambient_context(user_context, project, tools_visible) -> str`
 - Hard token budget via naive split (`len(text.split()) * 1.3 <= 200`).
 - New tests in `tests/test_context_builder.py`.
 
 ### Phase 4 — Tool-call loop in chat.py (2 days)
 
-- New helper `src/sovereign_memory/routes/_memory_tool_loop.py`:
+- New helper `src/audittrace/routes/_memory_tool_loop.py`:
   - `run_tool_call_loop(payload, user_context, max_iter) -> (final_body, iterations)`
   - Hand-written async: non-streamed first round, loop until no more
     `tool_calls`, final round streamed back to caller
@@ -460,7 +460,7 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
 
 ### Phase 7 — Cutover ✅ (2026-04-12)
 
-- `SOVEREIGN_MEMORY_MODE=tools` is the default in the deployed stack.
+- `AUDITTRACE_MEMORY_MODE=tools` is the default in the deployed stack.
 - Dogfooding via OpenCode confirmed: Qwen3.5-35B-A3B selectively calls
   only the relevant memory tool per question (e.g. `recall_decisions`
   for ADR queries) instead of blast-calling all 4 tools.
@@ -469,7 +469,7 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
   proxy-side classifier needed. The LLM reads the selection rules and
   makes its own routing decision.
 - The `inject` path is retained as a feature flag for model swapping
-  and fallback (`SOVEREIGN_MEMORY_MODE=inject`).
+  and fallback (`AUDITTRACE_MEMORY_MODE=inject`).
 
 ### Phase 8 — ADR status flip ✅ (2026-04-12)
 
@@ -491,7 +491,7 @@ Sequenced so each phase is atomic, testable, and leaves the tree green.
    `tomllib` in the stdlib and the project already uses TOML for
    `pyproject.toml` — no new parser, no new dependency.
 2. **Config override file location:** Repo-local `tools.toml` at the
-   project root, overridable by the `SOVEREIGN_TOOLS_CONFIG_PATH` env
+   project root, overridable by the `AUDITTRACE_TOOLS_CONFIG_PATH` env
    var for operators who deploy from immutable images.
 3. **Per-conversation tool result caching:** **In scope for this ADR.**
    The sovereign-redis container from DESIGN §15 makes it cheap — one

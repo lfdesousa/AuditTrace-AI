@@ -12,7 +12,7 @@ providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
-    network: sovereign-ai-net
+    network: audittrace-net
   file:
     filename: /etc/traefik/dynamic.yml
     watch: true

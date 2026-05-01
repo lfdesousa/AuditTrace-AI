@@ -3,20 +3,21 @@
 # Without this, any pod with a mesh identity could reach Vault — including
 # pods accidentally placed in the namespace by misconfigured tooling. Per
 # ADR-043 §"Vault-in-mesh discipline": Vault stays inside the Istio mesh,
-# AND the only mesh peers allowed to reach :8200 are the four workload SAs
+# AND the only mesh peers allowed to reach :8200 are the workload SAs
 # whose Vault Agent sidecars need it.
 #
-# The four allowed SAs map 1:1 with the kubernetes-auth roles in
+# The allowed SAs map 1:1 with the kubernetes-auth roles in
 # templates/vault/configmap-policies.yaml:
-#   - memory-server      → role audittrace-server
+#   - memory-server       → role audittrace-server
 #   - audittrace-keycloak → role keycloak
 #   - audittrace-minio    → role minio
+#   - audittrace-chromadb → role chromadb
 #   - default             → role summariser-job (the post-install hook Job)
 #
 # The Vault Agent Injector itself does NOT reach :8200 — it only patches
 # pod specs at admission time. So the injector SA is intentionally absent
 # from this allow-list.
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: {{ .Release.Name }}-allow-vault
@@ -34,6 +35,7 @@ spec:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-keycloak"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-minio"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-chromadb"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
       to:
         - operation:

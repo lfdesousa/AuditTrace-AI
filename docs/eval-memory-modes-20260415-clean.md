@@ -5,7 +5,7 @@
 **Related:** [ADR-025](ADR-025-memory-as-tools.md) (memory-as-tools), [ADR-030](ADR-030-session-summarizer.md) (session summariser), prior baseline [eval-memory-modes-20260414.md](eval-memory-modes-20260414.md)
 **Raw data:** `tmp/eval-memory-modes-20260415T110845Z.jsonl`
 **Script:** `scripts/eval-memory-modes.py --n-per-mode 10`
-**Stack under test:** AuditTrace-AI at commit `1a82eed` (ADR-030 Parts 1+2 merged + RLS owner-role fix). **Mistral summariser endpoint stopped + `SOVEREIGN_SUMMARIZER_ENABLED=false`** so the only resident GPU model is Qwen — apples-to-apples against the 2026-04-14 baseline that pre-dated Mistral.
+**Stack under test:** AuditTrace-AI at commit `1a82eed` (ADR-030 Parts 1+2 merged + RLS owner-role fix). **Mistral summariser endpoint stopped + `AUDITTRACE_SUMMARIZER_ENABLED=false`** so the only resident GPU model is Qwen — apples-to-apples against the 2026-04-14 baseline that pre-dated Mistral.
 
 ## TL;DR
 
@@ -17,7 +17,7 @@
 
 **The exit-condition cherry-pick (commit `e18800c`) didn't fire on this category.** Every probe today used *varied* tool args across iterations, so the signature-equality check never matched. Defensive architecture, no observed effect on this dataset. Worth re-running on a category where 2026-04-14 showed pathological repeat patterns (analytical "why X" probes) before judging.
 
-**Recommendation: keep `SOVEREIGN_MEMORY_MODE=tools` as the default.** Re-measure after standing Mistral back up with `--n-gpu-layers 10` (partial offload) + summariser re-enabled to quantify the contention budget — that's the next eval doc.
+**Recommendation: keep `AUDITTRACE_MEMORY_MODE=tools` as the default.** Re-measure after standing Mistral back up with `--n-gpu-layers 10` (partial offload) + summariser re-enabled to quantify the contention budget — that's the next eval doc.
 
 ---
 
@@ -50,7 +50,7 @@ Notable: today's tools-mode prompt tokens are *lower* than yesterday (4 513 vs 8
 | 4 | What ADRs cover multi-user identity? | 76.7 s | 1 (recall_decisions) | ✓ |
 | 5 | Which ADR documents the four-layer memory port? | 65.2 s | 1 (recall_decisions) | ✓ |
 | 6 | What decision did we make about KV cache compression? | 50.2 s | 2 (decisions + semantic) | ✓ |
-| 7 | Why is SOVEREIGN_MEMORY_MODE a kill switch? | 91.4 s | 4 (mix + recent_sessions) | ✓ |
+| 7 | Why is AUDITTRACE_MEMORY_MODE a kill switch? | 91.4 s | 4 (mix + recent_sessions) | ✓ |
 | 8 | Recall the reasoning behind transparent proxy augmentation. | 123.9 s | 10 (mix) | ✓ |
 | 9 | What architectural choice did ADR-018 settle? | 44.4 s | 1 (recall_decisions) | ✓ |
 | 10 | Which ADR covers full agentic trace capture? | 101.7 s | 2 (decisions×2) | ✓ |
@@ -67,7 +67,7 @@ Latency distribution (sorted): **[44.4, 50.2, 65.2, 76.7, 91.4, 101.7, 123.9, 16
 | 4 | What ADRs cover multi-user identity? | 180.1 s | **TIMEOUT** |
 | 5 | Which ADR documents the four-layer memory port? | 88.2 s | ✓ |
 | 6 | What decision did we make about KV cache compression? | 82.0 s | ✓ |
-| 7 | Why is SOVEREIGN_MEMORY_MODE a kill switch? | 180.0 s | **TIMEOUT** |
+| 7 | Why is AUDITTRACE_MEMORY_MODE a kill switch? | 180.0 s | **TIMEOUT** |
 | 8 | Recall the reasoning behind transparent proxy augmentation. | 180.1 s | **TIMEOUT** |
 | 9 | What architectural choice did ADR-018 settle? | 140.7 s | ✓ |
 | 10 | Which ADR covers full agentic trace capture? | 180.1 s | **TIMEOUT** |
@@ -100,11 +100,11 @@ The tool-selection accuracy of 90 % on tools mode (9/10 — the timeout dropped 
 
 - **N=10, single category.** The full 100×6 sweep flagged in ADR-025 is still pending. This is a smoke that validates the code lineage is sound; conclusions about *headline performance* should wait for the larger run.
 - **Cold-start effect dominates the early probes.** Probes 1, 2, 3 in tools (174, 168, 180 s) — heavy. Probes 4–10 normalised to 44–124 s. Yesterday's baseline had a warmer cache at run start (re-run that container had been up longer). A controlled cold/warm split would isolate this.
-- **180 s timeout is the eval client, not the proxy.** `SOVEREIGN_LLAMA_PROXY_TIMEOUT=300` so the proxy itself accepts up to 5 min. Bumping the eval client timeout would convert today's timeouts to slow successes — useful data but doesn't help the user-facing latency story.
+- **180 s timeout is the eval client, not the proxy.** `AUDITTRACE_LLAMA_PROXY_TIMEOUT=300` so the proxy itself accepts up to 5 min. Bumping the eval client timeout would convert today's timeouts to slow successes — useful data but doesn't help the user-facing latency story.
 - **Tool-args field is `None` in the JSONL** — not a regression of the harness, just a data quirk where the audit row's args column was sparse during this run. Doesn't affect the conclusions.
 
 ---
 
 ## Next: the contention measurement (next eval doc)
 
-Restart Mistral with `--n-gpu-layers 10` (partial offload), re-enable summariser (`SOVEREIGN_SUMMARIZER_ENABLED=true`), restart memory-server, re-run `--n-per-mode 10`. The delta between *this clean baseline* and *that contention run* is the answer to "what does running the third model alongside Qwen on a single iGPU cost us?". That number is what we either accept ("X seconds per probe — fine") or push back on ("too much, drop to `--n-gpu-layers 0`"). Doc lands as `eval-memory-modes-20260415-contention.md`.
+Restart Mistral with `--n-gpu-layers 10` (partial offload), re-enable summariser (`AUDITTRACE_SUMMARIZER_ENABLED=true`), restart memory-server, re-run `--n-per-mode 10`. The delta between *this clean baseline* and *that contention run* is the answer to "what does running the third model alongside Qwen on a single iGPU cost us?". That number is what we either accept ("X seconds per probe — fine") or push back on ("too much, drop to `--n-gpu-layers 0`"). Doc lands as `eval-memory-modes-20260415-contention.md`.

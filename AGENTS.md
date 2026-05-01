@@ -3,7 +3,7 @@
 ## Identity
 - **Python 3.12+** FastAPI service
 - **Author:** Luis Filipe de Sousa
-- **Entry point:** `src/sovereign_memory/server.py` → `app = create_app()`
+- **Entry point:** `src/audittrace/server.py` → `app = create_app()`
 - **CLI:** `audittrace` entry point calls `main()` → `uvicorn.run()`
 
 ## Setup & Workflow
@@ -22,7 +22,7 @@ make format
 
 # Run server (dev, without Docker)
 source .venv/bin/activate
-uvicorn sovereign_memory.server:app --reload
+uvicorn audittrace.server:app --reload
 ```
 
 ## Test Strategy
@@ -31,10 +31,10 @@ uvicorn sovereign_memory.server:app --reload
 - **421 tests** across 25+ files. Session-scoped `configure_observability`
   sets DEBUG logging + no-op OTel. Per-test `_reset_global_container`
   autouse fixture isolates DI state.
-- **Env isolation:** `tests/conftest.py` clears every `SOVEREIGN_*` env var
-  at collection time and sets `SOVEREIGN_ENV=test` so the suite runs in
+- **Env isolation:** `tests/conftest.py` clears every `AUDITTRACE_*` env var
+  at collection time and sets `AUDITTRACE_ENV=test` so the suite runs in
   bypass mode with the sentinel `UserContext`, regardless of the docker-
-  compose default (which is now `SOVEREIGN_AUTH_REQUIRED=true`).
+  compose default (which is now `AUDITTRACE_AUTH_REQUIRED=true`).
 - **Cross-user isolation:** `tests/test_cross_user_isolation.py` runs
   alice + bob across every memory layer in one authoritative file.
 - **RLS integration:** `tests/test_rls_isolation.py` connects to the
@@ -42,7 +42,7 @@ uvicorn sovereign_memory.server:app --reload
   verifies the migration-005 RLS policies bite. Skips-if-unreachable.
 
 ## Architecture
-- **Package:** `sovereign_memory/` under `src/` (Julien Danjou style)
+- **Package:** `audittrace/` under `src/` (Julien Danjou style)
 - **Factory pattern:** DB factory in `dependencies.py` with
   `create_test_container()` for tests
 - **Dependency injection:** Global `container` module-level variable,
@@ -53,7 +53,7 @@ uvicorn sovereign_memory.server:app --reload
   spans, histograms to stdout only. Defensive `record_exception` so
   `LangfuseSpan` instances don't crash the request path on
   `HTTPException`.
-- **OTel:** No-op by default; set `SOVEREIGN_OTLP_ENDPOINT` to enable export
+- **OTel:** No-op by default; set `AUDITTRACE_OTLP_ENDPOINT` to enable export
 - **Routes:** `/v1/chat/completions`, `/v1/models`, `/context`,
   `/interactions`, `/session/save`, `/session/summary`, `/health`,
   `/metrics`
@@ -66,7 +66,7 @@ uvicorn sovereign_memory.server:app --reload
   service method as the first positional argument.
 - **Postgres RLS** — migration 005 enables + forces RLS on
   `interactions`, `sessions`, `tool_calls`. Non-superuser
-  `sovereign_app` role is what the memory-server connects as (created
+  `audittrace_app` role is what the memory-server connects as (created
   via `scripts/init-sovereign-app-role.sh`).
 - **`db/rls.py`** — ContextVar + SQLAlchemy `after_begin` listener
   emits `set_config('app.current_user_id', :uid, true)` per
@@ -76,21 +76,21 @@ uvicorn sovereign_memory.server:app --reload
   construction for the ChromaDB seam.
 
 ## Memory-as-tools (ADR-025)
-- **Kill switch:** `SOVEREIGN_MEMORY_MODE={inject|tools}`. Default is
+- **Kill switch:** `AUDITTRACE_MEMORY_MODE={inject|tools}`. Default is
   `inject` in process code; docker-compose can override.
-- **Registry:** `src/sovereign_memory/tools/__init__.py` — dynamic,
+- **Registry:** `src/audittrace/tools/__init__.py` — dynamic,
   decorator-based, optional TOML overlay for per-tool config.
-- **Handlers:** `src/sovereign_memory/tools/memory_handlers.py` —
+- **Handlers:** `src/audittrace/tools/memory_handlers.py` —
   `recall_decisions`, `recall_skills`, `recall_recent_sessions`,
   `recall_semantic`. Each wraps an existing service and normalises
   results to `{matches, total, truncated}`.
-- **Cache:** `src/sovereign_memory/tools/cache.py` — `ToolResultCache`,
+- **Cache:** `src/audittrace/tools/cache.py` — `ToolResultCache`,
   Redis under `sovereign:tool-result:*` (disjoint from
   `sovereign:token:*`). Cache hits skip the `ToolCall` audit row
   (§Decision.8).
-- **Loop:** `src/sovereign_memory/routes/_memory_tool_loop.py` —
+- **Loop:** `src/audittrace/routes/_memory_tool_loop.py` —
   proxy-internal non-streaming round-trip, bounded by
-  `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` (default 5). Defensive
+  `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS` (default 5). Defensive
   scope re-check at dispatch time so stale `tool_calls` after a scope
   revocation still get rejected.
 - **No Langchain.** `langchain` and `langchain-community` deps were
@@ -101,18 +101,18 @@ uvicorn sovereign_memory.server:app --reload
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SOVEREIGN_HOST` | `0.0.0.0` | Bind address |
-| `SOVEREIGN_PORT` | `8765` | Server port |
-| `SOVEREIGN_LLAMA_URL` | `http://host.docker.internal:11435/v1` | LLM endpoint |
-| `SOVEREIGN_OTLP_ENDPOINT` | `` | OTLP/HTTP collector (no-op when empty) |
-| `SOVEREIGN_LANGFUSE_ENABLED` | `false` | Langfuse integration |
-| `SOVEREIGN_AUTH_ENABLED` | `false` | Legacy `require_scope` gate |
-| `SOVEREIGN_AUTH_REQUIRED` | `true` (docker-compose default) | Keycloak `require_user` gate; conftest wipes for tests |
-| `SOVEREIGN_MEMORY_MODE` | `inject` | `inject` / `tools` — memory-as-tools kill switch |
-| `SOVEREIGN_MEMORY_TOOL_LOOP_MAX_ITERATIONS` | `5` | Hard cap for the tool-call loop |
-| `SOVEREIGN_MEMORY_TOOL_CACHE_TTL_SECONDS` | `900` | `0` disables the Redis tool result cache |
-| `SOVEREIGN_REDIS_URL` | `redis://redis:6379/0` | Shared between TokenCache + ToolResultCache |
-| `SOVEREIGN_REDIS_PASSWORD` | — | Required — generate via `scripts/setup-secrets.sh` |
+| `AUDITTRACE_HOST` | `0.0.0.0` | Bind address |
+| `AUDITTRACE_PORT` | `8765` | Server port |
+| `AUDITTRACE_LLAMA_URL` | `http://host.docker.internal:11435/v1` | LLM endpoint |
+| `AUDITTRACE_OTLP_ENDPOINT` | `` | OTLP/HTTP collector (no-op when empty) |
+| `AUDITTRACE_LANGFUSE_ENABLED` | `false` | Langfuse integration |
+| `AUDITTRACE_AUTH_ENABLED` | `false` | Legacy `require_scope` gate |
+| `AUDITTRACE_AUTH_REQUIRED` | `true` (docker-compose default) | Keycloak `require_user` gate; conftest wipes for tests |
+| `AUDITTRACE_MEMORY_MODE` | `inject` | `inject` / `tools` — memory-as-tools kill switch |
+| `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS` | `5` | Hard cap for the tool-call loop |
+| `AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS` | `900` | `0` disables the Redis tool result cache |
+| `AUDITTRACE_REDIS_URL` | `redis://redis:6379/0` | Shared between TokenCache + ToolResultCache |
+| `AUDITTRACE_REDIS_PASSWORD` | — | Required — generate via `scripts/setup-secrets.sh` |
 
 ## Code Style
 - **Formatter:** `ruff format` (line-length 88, py312 target)
@@ -146,7 +146,7 @@ Examples:
 
 ## Docker
 - **Image:** Multi-stage build, non-root user
-- **Network:** `sovereign-ai-net` (external, `docker network create` at setup)
+- **Network:** `audittrace-net` (external, `docker network create` at setup)
 - **Health check:** `scripts/healthcheck.sh` → `curl http://localhost:8765/health`
 - **Stack:** memory-server + PostgreSQL 16 + ChromaDB + Redis 7 +
   Keycloak 24 + Traefik v3
@@ -163,7 +163,7 @@ Examples:
 - **Async persistence:** `_persist_interaction` and
   `_flush_pending_tool_calls` are still synchronous (ADR deferred).
 - **Superuser bypass:** in dev, if you connect as the `sovereign`
-  superuser role you bypass RLS entirely. Use `sovereign_app` (created
+  superuser role you bypass RLS entirely. Use `audittrace_app` (created
   via `scripts/init-sovereign-app-role.sh`) for anything where
   isolation matters.
 

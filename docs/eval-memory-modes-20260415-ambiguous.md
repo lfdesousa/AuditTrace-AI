@@ -100,7 +100,7 @@ The real failure mode is "model makes 10 *distinct* calls exploring different an
 
 This eval motivates a proper design doc on **per-request memory-mode routing**. Sketch:
 
-- Retain `SOVEREIGN_MEMORY_MODE` as the global default.
+- Retain `AUDITTRACE_MEMORY_MODE` as the global default.
 - Accept `X-Memory-Mode: tools|inject|auto` header on `/v1/chat/completions`, symmetric with `X-Project` (ADR-029).
 - When `auto` (or unset), run a **classifier**:
   - Fast path: regex heuristic on the last user message (`^(why|how has|explain|recap|what should|describe)\b` → `inject`; else `tools`).

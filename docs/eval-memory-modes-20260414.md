@@ -21,7 +21,7 @@ Tools mode wins despite the counter-intuitive token accounting (tools uses ~3.5�
 
 **The dominant cost signal is the bimodal tool iteration distribution**: half the probes resolve in 1-4 iterations (25-71 s wall); the other half blow up to 8-10 iterations (93-140 s wall). Tightening exit conditions (LangGraph-style "if two consecutive calls returned identical snippets, stop") should collapse the tail without harming the fast path. That is the next optimisation to earn.
 
-**Recommendation: keep `SOVEREIGN_MEMORY_MODE=tools` as the default.** Evidence supports it; re-measure after the exit-condition fix and after ADR-030 lands (which changes `recall_recent_sessions` economics and needs its own re-evaluation).
+**Recommendation: keep `AUDITTRACE_MEMORY_MODE=tools` as the default.** Evidence supports it; re-measure after the exit-condition fix and after ADR-030 lands (which changes `recall_recent_sessions` economics and needs its own re-evaluation).
 
 ---
 
@@ -29,7 +29,7 @@ Tools mode wins despite the counter-intuitive token accounting (tools uses ~3.5�
 
 - **Script**: `scripts/eval-memory-modes.py --n-per-mode 10` (the shipped harness).
 - **Dataset**: 10 probes per mode, all drawn from the `decisions` category. Every probe targets a question where the expected tool is `recall_decisions` (ADR lookups). Examples: *"What did ADR-025 decide about memory-as-tools?"*, *"Which ADR documents the four-layer memory port?"*, *"Why did we reject LangChain for the tool-call loop?"*.
-- **Harness behaviour**: for each mode, writes `SOVEREIGN_MEMORY_MODE` into `.env`, recreates the `memory-server` container, waits for `/health`, runs the 10 probes sequentially, records JSONL. `try/finally` restores the original `.env` on exit (even on Ctrl-C).
+- **Harness behaviour**: for each mode, writes `AUDITTRACE_MEMORY_MODE` into `.env`, recreates the `memory-server` container, waits for `/health`, runs the 10 probes sequentially, records JSONL. `try/finally` restores the original `.env` on exit (even on Ctrl-C).
 - **Sequential by design**: the hardware cannot take parallel LLM requests; concurrency would contaminate the latency signal. One probe at a time.
 - **Stack under test**: AuditTrace-AI at commit `686d9a3` (tools-mode default, ADR-025 tool loop with max 10 iterations per probe, ADR-029 project tagging, memory-server built with urllib3 + HTTP semconv opt-in).
 - **Mode ordering**: tools first, then inject. The flip costs one container recreate (~6 s warm-up) plus a full restart.
@@ -48,7 +48,7 @@ Tools mode wins despite the counter-intuitive token accounting (tools uses ~3.5�
 | 7 | Recall the reasoning behind transparent proxy augmentation. |
 | 8 | Which ADR covers full agentic trace capture? |
 | 9 | What architectural choice did ADR-018 settle? |
-| 10 | Why is `SOVEREIGN_MEMORY_MODE` a kill switch? |
+| 10 | Why is `AUDITTRACE_MEMORY_MODE` a kill switch? |
 
 ---
 
@@ -97,7 +97,7 @@ Strongly bimodal. The breakdown mapping probes → iterations:
 |---|---|
 | 1 | *"What ADRs cover multi-user identity?"* · *"Which ADR documents the four-layer memory port?"* · *"What architectural choice did ADR-018 settle?"* |
 | 2-4 | *"What decision did we make about KV cache compression?"* · *"Summarise ADR-024 on proxy pass-through."* |
-| 8-10 | *"Recall the reasoning behind transparent proxy augmentation."* · *"What did ADR-025 decide about memory-as-tools?"* · *"Why did we reject LangChain for the tool-call loop?"* · *"Why is SOVEREIGN_MEMORY_MODE a kill switch?"* · *"Which ADR covers full agentic trace capture?"* |
+| 8-10 | *"Recall the reasoning behind transparent proxy augmentation."* · *"What did ADR-025 decide about memory-as-tools?"* · *"Why did we reject LangChain for the tool-call loop?"* · *"Why is AUDITTRACE_MEMORY_MODE a kill switch?"* · *"Which ADR covers full agentic trace capture?"* |
 
 Clear pattern: **factual lookups stop after one tool call; open-ended "why" / "reasoning" questions iterate 8-10 times**. The model keeps fishing for more context to back up an analytical answer.
 
@@ -108,7 +108,7 @@ Clear pattern: **factual lookups stop after one tool call; open-ended "why" / "r
 ### §5. Errors
 
 - **tools**: 0 / 10.
-- **inject**: 1 / 10 — probe 10 *"Why is SOVEREIGN_MEMORY_MODE a kill switch?"* timed out at 180 s (the configured `SOVEREIGN_LLAMA_PROXY_TIMEOUT` ceiling). `http_status = None`, no response body. This is the open-ended analytical question biting inject specifically: full 4-layer context plus a long synthesis attempt overran the streaming budget.
+- **inject**: 1 / 10 — probe 10 *"Why is AUDITTRACE_MEMORY_MODE a kill switch?"* timed out at 180 s (the configured `AUDITTRACE_LLAMA_PROXY_TIMEOUT` ceiling). `http_status = None`, no response body. This is the open-ended analytical question biting inject specifically: full 4-layer context plus a long synthesis attempt overran the streaming budget.
 
 ---
 
@@ -145,7 +145,7 @@ In both modes the same underlying question type (open-ended / analytical) produc
 
 ### Reliability
 
-Tools mode completed every probe. Inject failed 10 % of them on a workload it should handle well. The error is specifically the timeout; bumping `SOVEREIGN_LLAMA_PROXY_TIMEOUT` to 300 s would likely recover the probe, but that is a band-aid — the root cause is an unbounded completion on an analytical question. Tools mode's iteration cap acts as an implicit completion budget per round-trip; inject has none.
+Tools mode completed every probe. Inject failed 10 % of them on a workload it should handle well. The error is specifically the timeout; bumping `AUDITTRACE_LLAMA_PROXY_TIMEOUT` to 300 s would likely recover the probe, but that is a band-aid — the root cause is an unbounded completion on an analytical question. Tools mode's iteration cap acts as an implicit completion budget per round-trip; inject has none.
 
 ### Tool selection accuracy is a genuine result
 
@@ -157,8 +157,8 @@ The follow-up tool calls (`recall_semantic` after `recall_decisions`) do not *re
 
 ## Recommendations
 
-1. **Keep `SOVEREIGN_MEMORY_MODE=tools` as the default.** Data supports it on every headline metric that matters for this workload (latency mean, p95, error rate, tool selection). The median win for inject is an artefact of the bimodal distribution, not a structural advantage.
-2. **Tighten the tools-mode iteration tail.** Cherry-pick LangGraph's exit-condition pattern into `src/sovereign_memory/routes/_memory_tool_loop.py`:
+1. **Keep `AUDITTRACE_MEMORY_MODE=tools` as the default.** Data supports it on every headline metric that matters for this workload (latency mean, p95, error rate, tool selection). The median win for inject is an artefact of the bimodal distribution, not a structural advantage.
+2. **Tighten the tools-mode iteration tail.** Cherry-pick LangGraph's exit-condition pattern into `src/audittrace/routes/_memory_tool_loop.py`:
     - If two consecutive tool calls return payloads with > N % content overlap, force-terminate and make the model answer from what it has.
     - If the same tool was called three times in a row with the same arguments, force-terminate.
     - Optional: cap `max_tokens` for intermediate iterations (e.g., 512) so tail iterations can't balloon completion cost; keep the last turn uncapped.
@@ -169,7 +169,7 @@ The follow-up tool calls (`recall_semantic` after `recall_decisions`) do not *re
 
 4. **Re-measure after each change.** This harness is the measurement. Re-run `--n-per-mode 10` after the exit-condition fix; compare to this baseline. This file should be dated and preserved; follow-ups should be new files (`docs/eval-memory-modes-YYYYMMDD.md`), so the decision trail is clear.
 
-5. **Bump `SOVEREIGN_LLAMA_PROXY_TIMEOUT` to 300 s** to eliminate inject's 180 s timeout cliff, but track that as a workaround, not a fix. The underlying open-ended-completion cost is still there.
+5. **Bump `AUDITTRACE_LLAMA_PROXY_TIMEOUT` to 300 s** to eliminate inject's 180 s timeout cliff, but track that as a workaround, not a fix. The underlying open-ended-completion cost is still there.
 
 ---
 

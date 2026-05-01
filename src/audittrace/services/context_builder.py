@@ -29,6 +29,37 @@ from audittrace.services.semantic import SemanticService
 logger = logging.getLogger(__name__)
 
 
+# ─── Naming-convention note (ADR-035 amendment, 2026-05-01) ──────────────
+#
+# The project was renamed sovereign-memory-server → audittrace-server on
+# 2026-04-17. ADR-035 originally said "ADR documents — historical records
+# kept as-is" and so the corpus served by the memory layer kept the OLD
+# names; the LLM faithfully repeated them. To stop OpenCode answering
+# with stale names while keeping retrieval-shape neutral, this note is
+# injected into EVERY assembled system prompt — both inject mode (the
+# 4-layer aggregator below) and tools mode (build_ambient_context) — so
+# the LLM always sees the mapping regardless of which docs got retrieved.
+#
+# Removal trigger: once seed-memory.py has reseeded MinIO with corrected
+# ADRs AND we have evidence (eval) that the LLM no longer cites stale
+# names without this note, this constant + its two injection sites can be
+# deleted in one commit. Keep it short — the ambient-context word budget
+# (_AMBIENT_BUDGET_WORDS, pinned by test) is 280 words.
+NAMING_CONVENTION_NOTE = (
+    "## Names\n"
+    "Project renamed sovereign-memory-server → audittrace-server "
+    "2026-04-17 (ADR-035). Old → current: "
+    "`SOVEREIGN_*` → `AUDITTRACE_*`, "
+    "`src/sovereign_memory/` → `src/audittrace/`, "
+    "`sovereign-memory-server` → `audittrace-server`, "
+    "`sovereign_ai` (DB) → `audittrace`. "
+    "Use **current** names in answers. "
+    "Exceptions kept as-is per ADR-035: OTel attributes "
+    "`sovereign.component` / `sovereign.operation.*`, and the TLS cert "
+    "filename `certs/sovereign.pem`."
+)
+
+
 class ContextBuilderService(ABC):
     """Abstract context builder — aggregates all 4 memory layers."""
 
@@ -98,6 +129,11 @@ class DefaultContextBuilder(ContextBuilderService):
             "You are working with a Solutions Architect specialised in IAM/OAuth2. "
             f"Current project: **{project or 'unspecified'}**."
         )
+
+        # Naming convention (ADR-035 amendment) — always present so the LLM
+        # never repeats stale SOVEREIGN_* / sovereign_memory names from
+        # legacy doc retrievals. See module-level NAMING_CONVENTION_NOTE.
+        sections.append(NAMING_CONVENTION_NOTE)
 
         if not query:
             return "\n\n---\n\n".join(sections), layer_stats
@@ -228,6 +264,12 @@ def build_ambient_context(
         f"You are working with {user_context.username} (role: {role_label}). "
         f"Current project: {project_label}. Date: {today_iso}."
     )
+
+    # Naming convention (ADR-035 amendment) — always present so the LLM
+    # never repeats stale SOVEREIGN_* / sovereign_memory names from
+    # legacy doc retrievals. See module-level NAMING_CONVENTION_NOTE.
+    lines.append("")
+    lines.append(NAMING_CONVENTION_NOTE)
 
     if tools_visible:
         lines.append("")

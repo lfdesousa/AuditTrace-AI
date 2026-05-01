@@ -1,4 +1,4 @@
-# Requirements for sovereign-memory-server
+# Requirements for audittrace-server
 # Generated from pyproject.toml dependencies
 
 fastapi>=0.109.0

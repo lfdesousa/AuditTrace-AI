@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models for sovereign-memory-server.
+"""SQLAlchemy ORM models for audittrace-server.
 
 ADR-020: PostgreSQL (production) and SQLite-in-memory (tests) via the
 same declarative models.
