@@ -172,3 +172,126 @@ def test_mock_collection_count_with_where_filter():
     assert collection.count() == 3
     assert collection.count(where={"k": "1"}) == 2
     assert collection.count(where={"k": "no-match"}) == 0
+
+
+# ── HTTPChromaDBFactory startup-race retry ───────────────────────────────────
+#
+# Mirrors the Istio-sidecar startup race: chromadb's SDK wraps Envoy 503
+# responses as ValueError("no healthy upstream") inside HttpClient.__init__.
+# Pattern follows TestJWKSFetchRetry in tests/test_auth.py — same shape of
+# transient-failure-with-exponential-backoff lives in audittrace.auth.
+
+
+def test_http_factory_succeeds_on_second_attempt(monkeypatch):
+    """First call fails, second succeeds — must return the client without raising."""
+    import pytest  # noqa: F401  (kept for parity with the auth tests)
+
+    from audittrace.db import factory as factory_mod
+
+    sentinel = object()
+    calls: list[int] = []
+
+    def fake_http_client(**_kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) < 2:
+            raise ValueError("no healthy upstream")
+        return sentinel
+
+    monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(factory_mod.time, "sleep", sleep_calls.append)
+
+    f = HTTPChromaDBFactory(url="http://chroma:8000")
+    client = f.get_client()
+
+    assert client is sentinel
+    assert len(calls) == 2
+    assert sleep_calls == [2.0]  # one backoff before the successful retry
+
+
+def test_http_factory_exhausts_retries_and_reraises(monkeypatch):
+    """All attempts fail — last ValueError must propagate after 4 total calls."""
+    import pytest
+
+    from audittrace.db import factory as factory_mod
+
+    calls: list[int] = []
+
+    def fake_http_client(**_kwargs):
+        calls.append(len(calls) + 1)
+        raise ValueError("no healthy upstream")
+
+    monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
+    monkeypatch.setattr(factory_mod.time, "sleep", lambda _delay: None)
+
+    f = HTTPChromaDBFactory(url="http://chroma:8000")
+    with pytest.raises(ValueError, match="no healthy upstream"):
+        f.get_client()
+
+    # 1 initial + _CHROMADB_CONNECT_RETRIES retries = 4 total calls
+    assert len(calls) == factory_mod._CHROMADB_CONNECT_RETRIES + 1
+
+
+def test_http_factory_backoff_delays_are_exponential(monkeypatch):
+    """Sleep delays must follow 2^(attempt+1): 2, 4, 8."""
+    import pytest
+
+    from audittrace.db import factory as factory_mod
+
+    def fake_http_client(**_kwargs):
+        raise ValueError("no healthy upstream")
+
+    monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(factory_mod.time, "sleep", sleep_calls.append)
+
+    f = HTTPChromaDBFactory(url="http://chroma:8000")
+    with pytest.raises(ValueError):
+        f.get_client()
+
+    assert sleep_calls == [2.0, 4.0, 8.0]
+
+
+def test_http_factory_succeeds_immediately_without_sleep(monkeypatch):
+    """Happy path — single call returns client, no backoff."""
+    from audittrace.db import factory as factory_mod
+
+    sentinel = object()
+
+    def fake_http_client(**_kwargs):
+        return sentinel
+
+    monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(factory_mod.time, "sleep", sleep_calls.append)
+
+    f = HTTPChromaDBFactory(url="http://chroma:8000")
+    client = f.get_client()
+
+    assert client is sentinel
+    assert sleep_calls == []
+
+
+def test_http_factory_retries_on_connection_error(monkeypatch):
+    """ConnectionError (defensive catch alongside ValueError) must also retry."""
+    import pytest  # noqa: F401
+
+    from audittrace.db import factory as factory_mod
+
+    sentinel = object()
+    calls: list[int] = []
+
+    def fake_http_client(**_kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) < 2:
+            raise ConnectionError("connection refused")
+        return sentinel
+
+    monkeypatch.setattr(factory_mod.chromadb, "HttpClient", fake_http_client)
+    monkeypatch.setattr(factory_mod.time, "sleep", lambda _delay: None)
+
+    f = HTTPChromaDBFactory(url="http://chroma:8000")
+    client = f.get_client()
+
+    assert client is sentinel
+    assert len(calls) == 2
