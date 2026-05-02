@@ -208,6 +208,56 @@
           }
         }
       ]
+    },
+    {
+      "description": "Public client for first-party browser UIs (LibreChat, future audit dashboards). OAuth2 Authorization Code + PKCE per ADR-042. Used as the chat-flow client for ADR-044 live federation evidence.",
+      "clientId": "audittrace-webui",
+      "name": "AuditTrace Web UI (browser auth-code flow + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "https://audittrace.local/oauth2/callback",
+        "https://audittrace.local/*",
+        "https://audittrace.local:30952/oauth2/callback",
+        "https://audittrace.local:30952/*",
+        "http://localhost:8765/*"
+      ],
+      "webOrigins": [
+        "https://audittrace.local",
+        "https://audittrace.local:30952",
+        "http://localhost:8765"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://audittrace.local/*"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "identityProviders": [],
