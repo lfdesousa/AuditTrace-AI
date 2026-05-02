@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuditTrace WebUI — minimalist OIDC + chat probe</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --fg: #d8e1ec;
+      --muted: #8b96a3;
+      --accent: #6cb1ff;
+      --ok: #5cd180;
+      --err: #ff7a8a;
+      --panel: #1a1f29;
+      --border: #2c3340;
+    }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+      margin: 0;
+      padding: 24px;
+      max-width: 1100px;
+      margin-inline: auto;
+    }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 28px 0 8px; }
+    .subtitle { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    button {
+      background: var(--accent);
+      color: #061018;
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 14px;
+      margin-right: 8px;
+    }
+    button:hover { filter: brightness(1.1); }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--border); }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+    input, textarea {
+      background: #0a0d12;
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    pre {
+      background: #0a0d12;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 12px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin: 0;
+    }
+    .ok { color: var(--ok); }
+    .err { color: var(--err); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 720px) { .row { grid-template-columns: 1fr; } }
+    .chip {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: #2c3340;
+      color: var(--fg);
+      font-size: 11px;
+      margin-right: 6px;
+    }
+    .chip.ok { background: #1f3a26; color: var(--ok); }
+    .chip.err { background: #3a1f25; color: var(--err); }
+  </style>
+</head>
+<body>
+  <h1>AuditTrace WebUI <span class="chip">minimalist</span></h1>
+  <p class="subtitle">OIDC Authorization Code + PKCE → JWT → <code>/v1/chat/completions</code> probe.
+    Used as the live-evidence harness for ADR-044 (External IdP federation) — see <code>webui/README.md</code>.</p>
+
+  <div class="panel">
+    <h2>Configuration</h2>
+    <label>Issuer (Keycloak realm base URL — without trailing slash)</label>
+    <input id="issuer" value="https://audittrace.local:30952/realms/audittrace">
+    <label>Client ID</label>
+    <input id="clientId" value="audittrace-webui">
+    <label>Redirect URI</label>
+    <input id="redirectUri" value="http://localhost:8765/">
+    <label>Scopes (space-separated)</label>
+    <input id="scopes" value="openid audittrace:query audittrace:audit memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read">
+    <label>Identity provider hint (Keycloak <code>kc_idp_hint</code> — pre-selects an IdP at login). Leave blank to show Keycloak's chooser.</label>
+    <input id="idpHint" value="google-test" placeholder="e.g. google-test, entra-acme">
+    <label>Memory-server base URL (where /v1/chat/completions lives)</label>
+    <input id="apiBase" value="https://audittrace.local:30952">
+    <p style="margin-top: 12px;">
+      <button id="loginBtn">Sign in</button>
+      <button id="logoutBtn" class="secondary">Clear session</button>
+    </p>
+  </div>
+
+  <div class="panel" id="tokenPanel" style="display:none;">
+    <h2>Tokens <span id="tokenStatus" class="chip ok">received</span></h2>
+    <label>Access token (JWT)</label>
+    <textarea id="accessToken" readonly></textarea>
+    <label>Decoded claims</label>
+    <pre id="decodedClaims">—</pre>
+  </div>
+
+  <div class="panel" id="chatPanel" style="display:none;">
+    <h2>Chat probe</h2>
+    <label>Prompt</label>
+    <textarea id="prompt">Reply with the single word: federated</textarea>
+    <p>
+      <button id="chatBtn">Send /v1/chat/completions</button>
+    </p>
+    <h2 style="margin-top: 18px;">Response</h2>
+    <pre id="chatResponse">—</pre>
+  </div>
+
+  <div class="panel">
+    <h2>Activity log</h2>
+    <pre id="log">—</pre>
+  </div>
+
+<script>
+'use strict';
+
+// ── Tiny crypto helpers (Web Crypto API) ────────────────────────────────────
+const enc = new TextEncoder();
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function rand(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return b64url(a);
+}
+async function sha256(s) {
+  return b64url(await crypto.subtle.digest('SHA-256', enc.encode(s)));
+}
+
+// ── Activity log ─────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+let logBuf = [];
+function log(level, msg, extra) {
+  const ts = new Date().toISOString().slice(11, 19);
+  const line = `[${ts}] ${level.toUpperCase()} ${msg}` + (extra ? ` — ${extra}` : '');
+  logBuf.push(line);
+  logEl.textContent = logBuf.slice(-30).join('\n');
+}
+
+// ── Config + state ──────────────────────────────────────────────────────────
+function cfg() {
+  return {
+    issuer:     $('issuer').value.replace(/\/+$/, ''),
+    clientId:   $('clientId').value,
+    redirect:   $('redirectUri').value,
+    scopes:     $('scopes').value,
+    idpHint:    $('idpHint').value.trim(),
+    apiBase:    $('apiBase').value.replace(/\/+$/, ''),
+  };
+}
+
+const SS = sessionStorage;
+
+// ── Phase 1: kick off auth code + PKCE ──────────────────────────────────────
+$('loginBtn').addEventListener('click', async () => {
+  const c = cfg();
+  const verifier = rand(48);
+  const challenge = await sha256(verifier);
+  const state = rand(16);
+  SS.setItem('pkce_verifier', verifier);
+  SS.setItem('oidc_state', state);
+  SS.setItem('cfg', JSON.stringify(c));
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: c.clientId,
+    redirect_uri: c.redirect,
+    scope: c.scopes,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+  });
+  if (c.idpHint) params.set('kc_idp_hint', c.idpHint);
+
+  log('info', 'redirecting to Keycloak authorize endpoint', `idp_hint=${c.idpHint || '(none)'}`);
+  window.location.href = `${c.issuer}/protocol/openid-connect/auth?${params}`;
+});
+
+// ── Phase 2: handle callback ─────────────────────────────────────────────────
+async function handleCallback() {
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+  const err = url.searchParams.get('error');
+  if (err) {
+    log('err', 'authorize endpoint returned error', `${err}: ${url.searchParams.get('error_description') || ''}`);
+    return;
+  }
+  if (!code) return;
+  if (state !== SS.getItem('oidc_state')) {
+    log('err', 'state mismatch — possible CSRF', `expected=${SS.getItem('oidc_state')} got=${state}`);
+    return;
+  }
+  const c = JSON.parse(SS.getItem('cfg'));
+  Object.assign($('issuer'), { value: c.issuer });
+  Object.assign($('clientId'), { value: c.clientId });
+  Object.assign($('redirectUri'), { value: c.redirect });
+  Object.assign($('scopes'), { value: c.scopes });
+  Object.assign($('idpHint'), { value: c.idpHint });
+  Object.assign($('apiBase'), { value: c.apiBase });
+
+  const verifier = SS.getItem('pkce_verifier');
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    client_id: c.clientId,
+    code,
+    redirect_uri: c.redirect,
+    code_verifier: verifier,
+  });
+
+  log('info', 'exchanging auth code for token at /token endpoint');
+  const r = await fetch(`${c.issuer}/protocol/openid-connect/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const data = await r.json();
+  if (!r.ok) {
+    log('err', `token endpoint returned ${r.status}`, JSON.stringify(data));
+    return;
+  }
+  SS.setItem('access_token', data.access_token);
+  showToken(data.access_token);
+  // Strip the auth code from the URL so a refresh doesn't retry
+  history.replaceState({}, '', c.redirect);
+}
+
+// ── Phase 3: show + decode token ────────────────────────────────────────────
+function decodeJwt(jwt) {
+  const parts = jwt.split('.');
+  if (parts.length < 2) return null;
+  const pad = (s) => s + '='.repeat((4 - s.length % 4) % 4);
+  return JSON.parse(atob(pad(parts[1].replace(/-/g, '+').replace(/_/g, '/'))));
+}
+function showToken(token) {
+  $('tokenPanel').style.display = '';
+  $('chatPanel').style.display = '';
+  $('accessToken').value = token;
+  const claims = decodeJwt(token);
+  $('decodedClaims').textContent = JSON.stringify(claims, null, 2);
+  log('ok', 'token received', `sub=${claims.sub} iss=${claims.iss}`);
+}
+
+// ── Phase 4: chat probe ──────────────────────────────────────────────────────
+$('chatBtn').addEventListener('click', async () => {
+  const token = SS.getItem('access_token');
+  if (!token) { log('err', 'no token — sign in first'); return; }
+  const c = cfg();
+  $('chatBtn').disabled = true;
+  $('chatResponse').textContent = '— in flight —';
+  log('info', 'POST /v1/chat/completions');
+  try {
+    const r = await fetch(`${c.apiBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'audittrace-default',
+        messages: [{ role: 'user', content: $('prompt').value }],
+        stream: false,
+        max_tokens: 80,
+      }),
+    });
+    const data = await r.json();
+    $('chatResponse').textContent = JSON.stringify(data, null, 2);
+    log(r.ok ? 'ok' : 'err', `chat HTTP ${r.status}`,
+        r.ok ? `model=${data.model || '?'}` : (data.error?.message || ''));
+  } catch (e) {
+    log('err', 'chat fetch threw', String(e));
+    $('chatResponse').textContent = String(e);
+  }
+  $('chatBtn').disabled = false;
+});
+
+// ── Logout / clear ───────────────────────────────────────────────────────────
+$('logoutBtn').addEventListener('click', () => {
+  SS.clear();
+  $('tokenPanel').style.display = 'none';
+  $('chatPanel').style.display = 'none';
+  log('info', 'session cleared');
+});
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+const existing = SS.getItem('access_token');
+if (existing) showToken(existing);
+log('info', 'webui ready', `now=${new Date().toISOString()}`);
+handleCallback();
+</script>
+</body>
+</html>
