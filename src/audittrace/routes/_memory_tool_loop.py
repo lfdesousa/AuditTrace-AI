@@ -179,13 +179,22 @@ def _tool_call_signatures(
 #                          [json.exception.parse_error.101] ..."}}
 #
 # This is a model-side flake (the same prompt usually succeeds on retry,
-# observed 2026-05-02 during M2 live evidence run). Treat it as
-# transient — retry once before surfacing the failure.
+# observed 2026-05-02 during M2 live evidence run). Recovery strategy:
+#
+#   1. Up to ``_TOOL_PARSE_ERROR_RETRIES`` retries with the same payload —
+#      the model is non-deterministic, so a fresh roll often works.
+#   2. If retries exhaust, ONE final attempt with ``tools`` stripped from
+#      the payload — graceful degradation: the model answers in plain
+#      text (no memory tool calls this turn), the user gets a real
+#      answer instead of a 502.
+#   3. If THAT also fails, the upstream is genuinely broken — surface
+#      ``raise_for_status`` so chat.py's existing handler produces the
+#      clean 502 + failed audit row + ADR-033 envelope.
 _TOOL_PARSE_ERROR_MARKERS = (
     "json.exception.parse_error",
     "Failed to parse tool call arguments",
 )
-_TOOL_PARSE_ERROR_RETRIES = 1  # one extra attempt after the initial POST
+_TOOL_PARSE_ERROR_RETRIES = 1  # one extra attempt before falling back to no-tools
 
 
 def _is_tool_parse_error_500(response: httpx.Response) -> bool:
@@ -206,23 +215,75 @@ def _is_tool_parse_error_500(response: httpx.Response) -> bool:
     return any(marker in msg for marker in _TOOL_PARSE_ERROR_MARKERS)
 
 
+def _strip_tools_for_fallback(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a sanitised payload safe to re-send to llama-server when the
+    tool-call path is poisoned.
+
+    Three sources of the parse_error.101 failure pattern are removed:
+
+    1. ``tools`` + ``tool_choice`` — without tool definitions the model
+       cannot emit a fresh ``<tool_call>`` block, sidestepping the bug.
+    2. Prior assistant ``tool_calls`` — the previous iteration's
+       malformed ``arguments`` string is still in the conversation
+       history; llama-server's chat template re-serialises it on every
+       request and chokes on the bad JSON. Removing the ``tool_calls``
+       array (keeping the assistant's text content if any) cleans it.
+    3. Prior ``tool`` role messages — only meaningful when paired with
+       a tool_call; drop them so the conversation reads as plain text.
+
+    Result: the model sees the original user question + any earlier
+    plain-text turns, answers in plain text. Memory recall is lost for
+    THIS turn (acceptable cost — the alternative is a 502).
+    """
+    fallback = dict(payload)
+    fallback.pop("tools", None)
+    fallback.pop("tool_choice", None)
+    sanitised_messages: list[dict[str, Any]] = []
+    for msg in fallback.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            continue  # drop tool-result messages
+        if role == "assistant" and msg.get("tool_calls"):
+            # Keep the assistant's text (if any), drop the broken tool_calls.
+            cleaned = {k: v for k, v in msg.items() if k != "tool_calls"}
+            if cleaned.get("content") is None:
+                cleaned["content"] = ""
+            sanitised_messages.append(cleaned)
+            continue
+        sanitised_messages.append(msg)
+    fallback["messages"] = sanitised_messages
+    return fallback
+
+
 async def _post_with_tool_parse_retry(
     client: httpx.AsyncClient,
     url: str,
     payload: dict[str, Any],
 ) -> httpx.Response:
-    """POST to llama-server, retry once on the tool-parse-500 pattern.
+    """POST to llama-server with retries + non-tools fallback for the
+    Qwen tool-args-malformed-JSON 500.
 
-    On a non-retryable failure (any 5xx that isn't the tool-parse pattern,
-    any 4xx) ``response.raise_for_status()`` is called so the existing
-    ``httpx.HTTPStatusError`` handler in ``chat.py`` produces a clean
-    ADR-033 envelope + failed audit row.
+    Strategy:
+      1. Retry up to ``_TOOL_PARSE_ERROR_RETRIES`` times with the same
+         payload (model is non-deterministic; a fresh roll usually works).
+      2. If retries exhaust: ONE more attempt with ``tools`` stripped —
+         graceful degradation, the user gets a plain-text answer instead
+         of a 502.
+      3. If THAT also fails: ``raise_for_status`` so chat.py's existing
+         ``httpx.HTTPStatusError`` handler emits a clean 502 + failed
+         audit row + ADR-033 envelope.
+
+    Non-parse-error 5xx (e.g. OOM, segfault) and 4xx are NOT retried —
+    those are real upstream errors and retrying could amplify the damage.
     """
     response = await client.post(url, json=payload)
     if response.status_code < 500:
         return response
 
     if _is_tool_parse_error_500(response):
+        # Phase 1: same-payload retries (model rolls fresh tokens each time).
         for attempt in range(_TOOL_PARSE_ERROR_RETRIES):
             logger.warning(
                 "llama-server tool-call parse error (HTTP %d) — "
@@ -235,10 +296,30 @@ async def _post_with_tool_parse_retry(
             if response.status_code < 500:
                 return response
             if not _is_tool_parse_error_500(response):
-                break  # different failure class — don't retry
+                break  # different failure class — don't keep retrying
 
-    # Persistent failure — surface as HTTPStatusError so the chat.py
-    # caller's existing handler produces a clean 502 + failed audit row.
+        # Phase 2: non-tools fallback. Strip ``tools`` so the model
+        # cannot emit a tool_call block at all — sidesteps the parse
+        # error entirely. This degrades the answer (no memory recall
+        # this turn) but the user gets a usable response instead of a
+        # 502. The caller's loop sees a final body with content (no
+        # tool_calls) and exits cleanly with status=success.
+        if _is_tool_parse_error_500(response):
+            logger.warning(
+                "llama-server tool-call parse error persistent after %d "
+                "retries — falling back to non-tools mode (memory tools "
+                "disabled for this turn; user gets a degraded but valid "
+                "answer)",
+                _TOOL_PARSE_ERROR_RETRIES,
+            )
+            fallback_payload = _strip_tools_for_fallback(payload)
+            response = await client.post(url, json=fallback_payload)
+            if response.status_code < 500:
+                return response
+
+    # Persistent failure even after fallback — genuinely broken upstream.
+    # Surface as HTTPStatusError so chat.py's caller produces a clean
+    # 502 + failed audit row.
     response.raise_for_status()
     return response  # unreachable, raise_for_status raised
 

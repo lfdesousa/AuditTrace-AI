@@ -984,12 +984,12 @@ _TOOL_PARSE_500_BODY = {
 
 class TestToolParseErrorRetry:
     @pytest.mark.asyncio
-    async def test_retries_once_then_succeeds(
+    async def test_succeeds_on_second_attempt(
         self, _populated_container, _fakeredis_cache
     ):
-        """First POST returns the tool-parse 500; second POST returns the
-        same prompt's text response. Loop completes successfully — exactly
-        TWO POSTs, no audit-row noise."""
+        """First POST returns tool-parse 500; second POST succeeds. The
+        retry path catches it on the first retry — exactly TWO POSTs,
+        clean success, no fallback needed."""
         user = sentinel_user_context()
         fake = _SeqStatusClient(
             [
@@ -1006,10 +1006,10 @@ class TestToolParseErrorRetry:
                     "tools": [],
                 },
                 user_context=user,
-                session_id="sess-retry-1",
+                session_id="sess-retry-succ",
                 max_iterations=5,
             )
-        assert len(fake.post_calls) == 2  # one fail + one retry
+        assert len(fake.post_calls) == 2
         assert (
             final_body["choices"][0]["message"]["content"]
             == "Recovered after one retry."
@@ -1017,32 +1017,106 @@ class TestToolParseErrorRetry:
         assert pending == []
 
     @pytest.mark.asyncio
-    async def test_retries_exhausted_raises_http_status(
+    async def test_retries_exhaust_then_fallback_succeeds(
         self, _populated_container, _fakeredis_cache
     ):
-        """Both POSTs return tool-parse 500. The loop must give up and
-        raise ``httpx.HTTPStatusError`` so the chat handler's existing
-        upstream-error path produces a 502 + failed audit row."""
+        """Both same-payload attempts fail with tool-parse 500. The
+        sanitising fallback (3rd call) strips ``tools``/``tool_choice``
+        AND scrubs the message history (drops broken assistant tool_calls
+        + tool result messages) so llama-server's chat template can
+        process the conversation. User gets a real answer instead of a 502."""
         user = sentinel_user_context()
         fake = _SeqStatusClient(
             [
-                (500, _TOOL_PARSE_500_BODY),
-                (500, _TOOL_PARSE_500_BODY),
+                (500, _TOOL_PARSE_500_BODY),  # initial
+                (500, _TOOL_PARSE_500_BODY),  # retry 1
+                (200, _text_response("Plain text answer (no tools used).")),
             ]
         )
+        # Realistic poisoned payload: an earlier iteration emitted a
+        # broken assistant tool_call + we appended a tool_result error.
+        poisoned_payload = {
+            "model": "qwen3.5-35b",
+            "messages": [
+                {"role": "user", "content": "ADR-025?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_broken",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_decisions",
+                                "arguments": '{"query": "ADR-025',  # missing close
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_broken",
+                    "content": '{"error": "..."}',
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "tool_choice": "auto",
+        }
+        with _patch_async_client(fake):
+            final_body, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload=poisoned_payload,
+                user_context=user,
+                session_id="sess-retry-fallback",
+                max_iterations=5,
+            )
+        # 3 POSTs total: 1 initial + 1 retry + 1 fallback.
+        assert len(fake.post_calls) == 3
+        # First 2 had `tools` AND the broken history.
+        for call in fake.post_calls[:2]:
+            assert "tools" in call["json"]
+        # Fallback strips tools + sanitises messages.
+        fb = fake.post_calls[2]["json"]
+        assert "tools" not in fb
+        assert "tool_choice" not in fb
+        # No `tool` role messages.
+        assert all(m.get("role") != "tool" for m in fb["messages"])
+        # No assistant message with tool_calls.
+        for m in fb["messages"]:
+            if m.get("role") == "assistant":
+                assert "tool_calls" not in m, (
+                    "broken historical tool_calls must be removed for fallback"
+                )
+        # User gets a real answer.
+        assert (
+            final_body["choices"][0]["message"]["content"]
+            == "Plain text answer (no tools used)."
+        )
+        assert pending == []
+
+    @pytest.mark.asyncio
+    async def test_full_exhaust_including_fallback_raises(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """All 3 attempts fail (2 with-tools + 1 fallback). The upstream
+        is genuinely broken — surface ``httpx.HTTPStatusError`` so the
+        chat.py handler emits a clean 502 + failed audit row."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient([(500, _TOOL_PARSE_500_BODY)] * 3)
         with _patch_async_client(fake), pytest.raises(httpx.HTTPStatusError):
             await run_memory_tool_loop(
                 llama_url="http://llama/chat/completions",
                 payload={
                     "model": "qwen3.5-35b",
                     "messages": [{"role": "user", "content": "ADR-025?"}],
-                    "tools": [],
+                    "tools": [{"type": "function", "function": {"name": "x"}}],
                 },
                 user_context=user,
-                session_id="sess-retry-2",
+                session_id="sess-retry-full-fail",
                 max_iterations=5,
             )
-        assert len(fake.post_calls) == 2  # initial + one retry, no third
+        # 1 initial + 1 retry + 1 fallback = 3 attempts max.
+        assert len(fake.post_calls) == 3
 
     @pytest.mark.asyncio
     async def test_non_parse_500_not_retried(
