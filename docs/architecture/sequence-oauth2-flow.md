@@ -196,6 +196,16 @@ Two operational outcomes worth highlighting:
   login, including group memberships. Realm-role mappings re-evaluate;
   scopes change accordingly. No long-lived stale shadow.
 
+> **Live evidence — 2026-05-02.** This sequence was validated
+> end-to-end against a real Google Workspace tenant
+> (`@allaboutdata.eu`). The federated user landed as Keycloak shadow
+> user `9e7a8d0f-3b5c-4a78-9833-4d241ebd6027`; the resulting JWT
+> (`iss=https://audittrace.allaboutdata.eu:30952/realms/audittrace`)
+> was accepted by `require_user` via the multi-issuer path; the
+> chat completion returned 200; Postgres `interactions` rows
+> persisted with the federated `sub` as `user_id`. M2 milestone
+> closed; ADR-044 status: Accepted.
+
 The next two sections describe what happens AFTER the JWT lands at
 the memory-server. They apply identically whether the JWT came from
 Device Flow, `client_credentials`, or a brokered login — the

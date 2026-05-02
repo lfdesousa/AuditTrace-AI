@@ -93,7 +93,7 @@
   <div class="panel">
     <h2>Configuration</h2>
     <label>Issuer (Keycloak realm base URL — without trailing slash)</label>
-    <input id="issuer" value="https://audittrace.local:30952/realms/audittrace">
+    <input id="issuer" value="https://audittrace.allaboutdata.eu:30952/realms/audittrace">
     <label>Client ID</label>
     <input id="clientId" value="audittrace-webui">
     <label>Redirect URI</label>
@@ -103,7 +103,7 @@
     <label>Identity provider hint (Keycloak <code>kc_idp_hint</code> — pre-selects an IdP at login). Leave blank to show Keycloak's chooser.</label>
     <input id="idpHint" value="google-test" placeholder="e.g. google-test, entra-acme">
     <label>Memory-server base URL (where /v1/chat/completions lives)</label>
-    <input id="apiBase" value="https://audittrace.local:30952">
+    <input id="apiBase" value="https://audittrace.allaboutdata.eu:30952">
     <p style="margin-top: 12px;">
       <button id="loginBtn">Sign in</button>
       <button id="logoutBtn" class="secondary">Clear session</button>
@@ -175,7 +175,20 @@ function cfg() {
   };
 }
 
-const SS = sessionStorage;
+// Use localStorage instead of sessionStorage — Firefox strict tracking protection
+// can wipe sessionStorage on cross-origin redirects (the OAuth flow round-trips
+// through Keycloak + Google), causing state-mismatch errors on return.
+// localStorage survives those redirects.
+const SS = localStorage;
+const SS_NS = 'audittrace-webui:';
+// Wrap so all keys are namespaced (avoid colliding with other localStorage usage)
+const SS_get = (k) => localStorage.getItem(SS_NS + k);
+const SS_set = (k, v) => localStorage.setItem(SS_NS + k, v);
+const SS_clear = () => {
+  for (const k of Object.keys(localStorage)) {
+    if (k.startsWith(SS_NS)) localStorage.removeItem(k);
+  }
+};
 
 // ── Phase 1: kick off auth code + PKCE ──────────────────────────────────────
 $('loginBtn').addEventListener('click', async () => {
@@ -183,9 +196,9 @@ $('loginBtn').addEventListener('click', async () => {
   const verifier = rand(48);
   const challenge = await sha256(verifier);
   const state = rand(16);
-  SS.setItem('pkce_verifier', verifier);
-  SS.setItem('oidc_state', state);
-  SS.setItem('cfg', JSON.stringify(c));
+  SS_set('pkce_verifier', verifier);
+  SS_set('oidc_state', state);
+  SS_set('cfg', JSON.stringify(c));
 
   const params = new URLSearchParams({
     response_type: 'code',
@@ -213,11 +226,11 @@ async function handleCallback() {
     return;
   }
   if (!code) return;
-  if (state !== SS.getItem('oidc_state')) {
-    log('err', 'state mismatch — possible CSRF', `expected=${SS.getItem('oidc_state')} got=${state}`);
+  if (state !== SS_get('oidc_state')) {
+    log('err', 'state mismatch — possible CSRF', `expected=${SS_get('oidc_state')} got=${state}`);
     return;
   }
-  const c = JSON.parse(SS.getItem('cfg'));
+  const c = JSON.parse(SS_get('cfg'));
   Object.assign($('issuer'), { value: c.issuer });
   Object.assign($('clientId'), { value: c.clientId });
   Object.assign($('redirectUri'), { value: c.redirect });
@@ -225,7 +238,7 @@ async function handleCallback() {
   Object.assign($('idpHint'), { value: c.idpHint });
   Object.assign($('apiBase'), { value: c.apiBase });
 
-  const verifier = SS.getItem('pkce_verifier');
+  const verifier = SS_get('pkce_verifier');
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: c.clientId,
@@ -245,7 +258,7 @@ async function handleCallback() {
     log('err', `token endpoint returned ${r.status}`, JSON.stringify(data));
     return;
   }
-  SS.setItem('access_token', data.access_token);
+  SS_set('access_token', data.access_token);
   showToken(data.access_token);
   // Strip the auth code from the URL so a refresh doesn't retry
   history.replaceState({}, '', c.redirect);
@@ -269,7 +282,7 @@ function showToken(token) {
 
 // ── Phase 4: chat probe ──────────────────────────────────────────────────────
 $('chatBtn').addEventListener('click', async () => {
-  const token = SS.getItem('access_token');
+  const token = SS_get('access_token');
   if (!token) { log('err', 'no token — sign in first'); return; }
   const c = cfg();
   $('chatBtn').disabled = true;
@@ -302,14 +315,14 @@ $('chatBtn').addEventListener('click', async () => {
 
 // ── Logout / clear ───────────────────────────────────────────────────────────
 $('logoutBtn').addEventListener('click', () => {
-  SS.clear();
+  SS_clear();
   $('tokenPanel').style.display = 'none';
   $('chatPanel').style.display = 'none';
   log('info', 'session cleared');
 });
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
-const existing = SS.getItem('access_token');
+const existing = SS_get('access_token');
 if (existing) showToken(existing);
 log('info', 'webui ready', `now=${new Date().toISOString()}`);
 handleCallback();

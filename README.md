@@ -373,7 +373,7 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | ✅ Done | **Vault as sole secret store** | HashiCorp Vault production-only secret store (ADR-043). Vault Agent injector renders pod-local secrets. Auto-unseal at boot. |
 | ✅ Done | **OIDC Auth Code + PKCE for browser UIs** | BFF-first first-party auth flow (ADR-042). Confidential clients only. |
 | ✅ Done | **Laptop-first deploy** | Chart deploys on a single-node k3s without LAN-IP hardcodes (ADR-045). Demo-ready off-LAN. |
-| 🟡 In progress | **External IdP federation (ADR-044)** | Keycloak brokering to Google Workspace / Okta / EntraID. Realm + provisioner script + diagrams shipped 2026-04-26; M2 live evidence in flight. |
+| ✅ Done | **External IdP federation (ADR-044)** | Keycloak brokering to Google Workspace / Okta / EntraID. Realm + provisioner + diagrams shipped 2026-04-26. M2 live evidence captured 2026-05-02 against a real Google Workspace tenant — federated user → Keycloak shadow → JWT (`iss=audittrace.allaboutdata.eu:30952`) → `/v1/chat/completions` 200 → audit row `interactions.user_id` = federated `sub`. ADR-044 status flipped to Accepted. |
 | ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |
 | 🟡 Planned | **Async Persistence** | Non-blocking audit row writes. |
 

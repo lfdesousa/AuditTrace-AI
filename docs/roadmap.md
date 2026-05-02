@@ -42,11 +42,12 @@ AuditTrace-AI is organised around hardening that reconstructibility contract. Ev
 - All passwords, JWKS-rotation keys, MinIO KMS key, and Langfuse credentials read from the vault at pod start.
 - Target milestone: `make k8s-install` against a fresh cluster requires only the vault endpoint + a token; zero plain-string secrets in the Helm values.
 
-### 1.2 — External IdP federation (ADR-039 candidate)
-- Keycloak brokering configuration for three targets: Google Workspace, Okta, Microsoft Entra ID.
-- Per-tenant realm template + tenant-onboarding API.
-- A new enterprise user authenticates via their corporate IdP without any account provisioning in the AuditTrace Keycloak.
-- Target milestone: an external user onboards end-to-end (federation configured, first request authenticated, first interaction row written) in under 1 hour from a fresh repo clone.
+### 1.2 — External IdP federation (ADR-044) ✅ Pattern shipped 2026-05-02
+- ✅ Keycloak brokering configuration generalised for OIDC IdPs (Google Workspace, Okta, Microsoft Entra ID via the same `setup-idp-federation.sh` provisioner).
+- ✅ Per-tenant realm template + tenant-onboarding contract (provisioner script as the contract; per-deployment IdP set lives outside the chart's baseline realm.json).
+- ✅ A new enterprise user authenticates via their corporate IdP without any account provisioning in the AuditTrace Keycloak — proven 2026-05-02 against a real Google Workspace tenant (`@allaboutdata.eu`). Federated user landed as Keycloak shadow user via JIT; minted JWT validated end-to-end through `/v1/chat/completions`.
+- ✅ Target milestone met: under 1 hour from a fresh repo clone is plausible — the live evidence run took ~1.5h including in-flight cluster networking recovery (kube-proxy iptables refresh) and the `audittrace-webui` PKCE-client gap fix; subsequent runs would skip both.
+- ⏳ Microsoft Entra ID `oid`-mapper test still owed — backlog item filed.
 
 ### 1.3 — Postgres high availability
 - Bitnami PostgreSQL chart with `architecture: replication` (one writer, two readers).

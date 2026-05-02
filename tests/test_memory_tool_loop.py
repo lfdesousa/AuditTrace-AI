@@ -27,6 +27,7 @@ Cache hits skip the pending audit row entirely — ADR-025 §Decision.8.
 from __future__ import annotations
 
 import fakeredis
+import httpx
 import pytest
 
 # Side-effect import — decorators populate MEMORY_TOOL_REGISTRY.
@@ -916,3 +917,265 @@ class TestSpanEmission:
         ]
         assert tool_spans, "tool span must be emitted even when denied"
         assert tool_spans[0].status.status_code.name == "ERROR"
+
+
+# ─────────────────────── Tool-parse 500 retry behaviour ─────────────────────
+#
+# llama.cpp occasionally returns HTTP 500 with
+#   {"error": {"message": "Failed to parse tool call arguments as JSON: \
+#                          [json.exception.parse_error.101] ..."}}
+# when a tool-calling model (Qwen, Hermes, ...) emits malformed JSON inside
+# its <tool_call> block. This is a model-side flake — observed during the
+# 2026-05-02 M2 live evidence run; the same prompt usually succeeds on the
+# next attempt. The loop retries once before surfacing the failure.
+
+
+class _SeqStatusClient(_FakeAsyncClient):
+    """Like ``_SequencedClient`` but each entry can specify a status code.
+
+    ``responses`` is a list of ``(status_code, body_dict)`` tuples; the first
+    POST returns ``responses[0]``, the second ``responses[1]``, etc.
+    """
+
+    def __init__(self, responses: list[tuple[int, dict]]):
+        super().__init__()
+        self._responses = responses
+        self._i = 0
+
+    async def post(self, url, json=None, **kwargs):
+        from unittest.mock import MagicMock
+
+        self.last_post_url = url
+        self.last_post_json = json
+        self.post_calls.append({"url": url, "json": json, "kwargs": kwargs})
+        status, body = self._responses[min(self._i, len(self._responses) - 1)]
+        self._i += 1
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = body
+
+        def _raise() -> None:
+            if status >= 400:
+                import httpx as _httpx
+
+                raise _httpx.HTTPStatusError(
+                    f"HTTP {status}",
+                    request=MagicMock(),
+                    response=resp,
+                )
+
+        resp.raise_for_status.side_effect = _raise
+        return resp
+
+
+_TOOL_PARSE_500_BODY = {
+    "error": {
+        "code": 500,
+        "type": "server_error",
+        "message": (
+            "Failed to parse tool call arguments as JSON: "
+            "[json.exception.parse_error.101] parse error at line 1, column 18: "
+            "syntax error while parsing value - invalid string: missing closing "
+            "quote; last read: '\"ADR-025'"
+        ),
+    }
+}
+
+
+class TestToolParseErrorRetry:
+    @pytest.mark.asyncio
+    async def test_succeeds_on_second_attempt(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """First POST returns tool-parse 500; second POST succeeds. The
+        retry path catches it on the first retry — exactly TWO POSTs,
+        clean success, no fallback needed."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient(
+            [
+                (500, _TOOL_PARSE_500_BODY),
+                (200, _text_response("Recovered after one retry.")),
+            ]
+        )
+        with _patch_async_client(fake):
+            final_body, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "ADR-025?"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-retry-succ",
+                max_iterations=5,
+            )
+        assert len(fake.post_calls) == 2
+        assert (
+            final_body["choices"][0]["message"]["content"]
+            == "Recovered after one retry."
+        )
+        assert pending == []
+
+    @pytest.mark.asyncio
+    async def test_retries_exhaust_then_fallback_succeeds(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Both same-payload attempts fail with tool-parse 500. The
+        sanitising fallback (3rd call) strips ``tools``/``tool_choice``
+        AND scrubs the message history (drops broken assistant tool_calls
+        + tool result messages) so llama-server's chat template can
+        process the conversation. User gets a real answer instead of a 502."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient(
+            [
+                (500, _TOOL_PARSE_500_BODY),  # initial
+                (500, _TOOL_PARSE_500_BODY),  # retry 1
+                (200, _text_response("Plain text answer (no tools used).")),
+            ]
+        )
+        # Realistic poisoned payload: an earlier iteration emitted a
+        # broken assistant tool_call + we appended a tool_result error.
+        poisoned_payload = {
+            "model": "qwen3.5-35b",
+            "messages": [
+                {"role": "user", "content": "ADR-025?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_broken",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_decisions",
+                                "arguments": '{"query": "ADR-025',  # missing close
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_broken",
+                    "content": '{"error": "..."}',
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "tool_choice": "auto",
+        }
+        with _patch_async_client(fake):
+            final_body, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload=poisoned_payload,
+                user_context=user,
+                session_id="sess-retry-fallback",
+                max_iterations=5,
+            )
+        # 3 POSTs total: 1 initial + 1 retry + 1 fallback.
+        assert len(fake.post_calls) == 3
+        # First 2 had `tools` AND the broken history.
+        for call in fake.post_calls[:2]:
+            assert "tools" in call["json"]
+        # Fallback strips tools + sanitises messages.
+        fb = fake.post_calls[2]["json"]
+        assert "tools" not in fb
+        assert "tool_choice" not in fb
+        # No `tool` role messages.
+        assert all(m.get("role") != "tool" for m in fb["messages"])
+        # No assistant message with tool_calls.
+        for m in fb["messages"]:
+            if m.get("role") == "assistant":
+                assert "tool_calls" not in m, (
+                    "broken historical tool_calls must be removed for fallback"
+                )
+        # User gets a real answer.
+        assert (
+            final_body["choices"][0]["message"]["content"]
+            == "Plain text answer (no tools used)."
+        )
+        assert pending == []
+
+    @pytest.mark.asyncio
+    async def test_full_exhaust_including_fallback_raises(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """All 3 attempts fail (2 with-tools + 1 fallback). The upstream
+        is genuinely broken — surface ``httpx.HTTPStatusError`` so the
+        chat.py handler emits a clean 502 + failed audit row."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient([(500, _TOOL_PARSE_500_BODY)] * 3)
+        with _patch_async_client(fake), pytest.raises(httpx.HTTPStatusError):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "ADR-025?"}],
+                    "tools": [{"type": "function", "function": {"name": "x"}}],
+                },
+                user_context=user,
+                session_id="sess-retry-full-fail",
+                max_iterations=5,
+            )
+        # 1 initial + 1 retry + 1 fallback = 3 attempts max.
+        assert len(fake.post_calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_non_parse_500_not_retried(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """A 500 whose body is NOT a tool-parse error must NOT be retried —
+        the upstream is reporting a different failure class (out of memory,
+        crash, etc.) and retrying could amplify the problem."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient(
+            [
+                (
+                    500,
+                    {"error": {"message": "out of memory; aborted"}},
+                ),
+            ]
+        )
+        with _patch_async_client(fake), pytest.raises(httpx.HTTPStatusError):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "anything"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-retry-3",
+                max_iterations=5,
+            )
+        assert len(fake.post_calls) == 1  # no retry on non-parse 500
+
+    @pytest.mark.asyncio
+    async def test_4xx_passes_through_unchanged(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """A 4xx response (e.g., bad request) goes back unmodified — NOT a
+        server failure, so the loop returns it as if it were the final body
+        for the caller to inspect."""
+        # Note: 4xx with no `choices` field will be returned as-is per the
+        # existing exit condition (no tool_calls in body → final answer).
+        user = sentinel_user_context()
+        fake = _SeqStatusClient(
+            [
+                (400, {"error": {"message": "bad request payload"}}),
+            ]
+        )
+        # Should NOT raise — 4xx is a client/upstream concern, not the
+        # transient model flake we retry on.
+        with _patch_async_client(fake):
+            final_body, _ = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-retry-4",
+                max_iterations=5,
+            )
+        assert final_body == {"error": {"message": "bad request payload"}}
+        assert len(fake.post_calls) == 1

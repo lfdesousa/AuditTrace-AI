@@ -1,7 +1,7 @@
 # ADR-044: External IdP federation via Keycloak brokering
 
-**Status:** Proposed
-**Date:** 2026-04-26
+**Status:** Accepted (2026-05-02 — live evidence captured)
+**Date:** 2026-04-26 (proposed) · 2026-05-02 (accepted)
 **Deciders:** Luis Filipe de Sousa
 **Related:** ADR-022 (Keycloak realm), ADR-023 (JWT validation + JWKS
 caching), ADR-026 (multi-user identity), ADR-032 (OAuth2 Device Flow
@@ -380,3 +380,61 @@ rule, this ADR's PR includes:
   Entra-specific JWKS rotation cadence quirk would be a
   `feedback_entra_jwks_rotation.md` durable rule. Captured here so
   the postmortem channel exists.
+
+## Live evidence (2026-05-02)
+
+End-to-end federation proven against a real Google Workspace tenant
+(`@allaboutdata.eu`). Test artefacts captured in operator notes
+(`audittrace-private/runbooks/10-m2-google-live-evidence.md` —
+private, not committed).
+
+Highlights:
+
+- **Federated JWT issued by Keycloak** with
+  `iss=https://audittrace.allaboutdata.eu:30952/realms/audittrace`,
+  `aud=audittrace-server`,
+  `sub=9e7a8d0f-3b5c-4a78-9833-4d241ebd6027` (the broker shadow
+  user's stable Keycloak federation key, unrelated to Google's
+  internal user ID — proves §4 attribute mapping works).
+- **Multi-issuer validation accepted the brokered token** without
+  any audittrace code change. ADR-032 §2's
+  `_decode_jwt_with_allowed_issuers` path holds.
+- **`/v1/chat/completions` HTTP 200** in 3.89s for the federated
+  user — full chat path (request → JWT validate → memory tool loop
+  → llama-server → response → audit row).
+- **Postgres `interactions` rows** persisted with
+  `user_id=9e7a8d0f-…` (multiple rows from the curl probe + browser
+  follow-ups).
+- **Per-user RLS** enforced — the Postgres `audittrace_app` role
+  (NOSUPERUSER + NOBYPASSRLS) forces `app.current_user_id` from the
+  JWT `sub` claim on every transaction.
+
+Architecture (this PR):
+
+- A new public PKCE client `audittrace-webui` was added to the realm
+  (additive, no impact on existing clients) so a browser-side
+  Authorization Code + PKCE flow can complete against the realm —
+  the demonstrated flow path that customer browser UIs (LibreChat,
+  M3 Day-1) will follow.
+- A minimalist single-page OIDC harness landed at `webui/` so the
+  evidence run could exercise the full browser flow without
+  depending on LibreChat. See `webui/README.md`.
+
+Test matrix coverage:
+
+- ✅ Google Workspace OIDC broker (this evidence run).
+- ⏳ Microsoft Entra ID (deferred to a follow-up backlog item — the
+  `oid`-mapper test from §4 still warrants a dedicated run).
+- ✅ Multi-issuer validation regression (existing `TestMultiIssuer`
+  unit tests in `tests/test_auth.py` continue to pass).
+
+Out of scope, filed as backlog:
+
+- The Entra production-shape pass with `oid`-mapper.
+- Audit-row status correctness for chat responses that contain an
+  ADR-033 error envelope (observed: row marked `success` even when
+  the response was a 500 envelope; should be `failed` with
+  `failure_class` populated).
+- A `trace_id` column on the `interactions` table to make the
+  Postgres-to-Tempo correlation a one-query lookup (today requires
+  joining on `(user_id, session_id, timestamp)`).

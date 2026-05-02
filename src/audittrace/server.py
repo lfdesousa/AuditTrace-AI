@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from audittrace import telemetry
@@ -279,6 +280,30 @@ def create_app() -> FastAPI:
         version="0.3.1",
         lifespan=lifespan,
     )
+
+    # CORS — required by the minimalist webui (ADR-042 reference impl)
+    # and any first-party SPA that's not behind a same-origin BFF. Allowed
+    # origins come from settings.cors_origins (env: AUDITTRACE_CORS_ORIGINS).
+    # Empty list disables CORS entirely (production-safe default for BFF
+    # deployments). Auth header + content-type are explicitly listed so
+    # preflight passes for `Authorization: Bearer ...` requests.
+    cors_origins = get_settings().cors_origins
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "X-Project",
+                "X-Memory-Mode",
+                "X-Thinking",
+                "X-Async",
+            ],
+            expose_headers=["X-Trace-Id"],
+        )
 
     app.include_router(chat.router, prefix="/v1", tags=["chat"])
     app.include_router(context.router, tags=["context"])
