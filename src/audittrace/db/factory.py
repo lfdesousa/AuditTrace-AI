@@ -6,6 +6,7 @@ in logs, traces, and metrics.
 """
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
@@ -14,6 +15,15 @@ import chromadb
 from audittrace.logging_config import log_call
 
 logger = logging.getLogger(__name__)
+
+# Retry budget for the initial ChromaDB handshake. The Chroma SDK calls
+# get_user_identity() synchronously in HttpClient.__init__; under a service
+# mesh (Istio), the outbound call can hit Envoy before xDS programming is
+# complete and surface as ValueError("no healthy upstream"). Mirror the
+# JWKS-fetch pattern in audittrace.auth so startup-time races self-heal
+# instead of crashing the lifespan.
+_CHROMADB_CONNECT_RETRIES = 3
+_CHROMADB_CONNECT_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
 
 
 class ChromaDBClient(Protocol):
@@ -59,7 +69,24 @@ class HTTPChromaDBFactory(ChromaDBFactory):
             # ChromaDB 1.x TokenAuthenticationServerProvider expects
             # X-Chroma-Token header, not Authorization: Bearer.
             kwargs["headers"] = {"X-Chroma-Token": self.token}
-        return chromadb.HttpClient(**kwargs)  # type: ignore[return-value]
+
+        last_exc: Exception | None = None
+        for attempt in range(_CHROMADB_CONNECT_RETRIES + 1):
+            try:
+                return chromadb.HttpClient(**kwargs)  # type: ignore[return-value]
+            except (ValueError, ConnectionError) as exc:
+                last_exc = exc
+                if attempt < _CHROMADB_CONNECT_RETRIES:
+                    delay = _CHROMADB_CONNECT_BACKOFF_BASE ** (attempt + 1)
+                    logger.warning(
+                        "ChromaDB connect attempt %d/%d failed (%s), retrying in %.0fs",
+                        attempt + 1,
+                        _CHROMADB_CONNECT_RETRIES + 1,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
 
 class MockChromaDBFactory(ChromaDBFactory):
