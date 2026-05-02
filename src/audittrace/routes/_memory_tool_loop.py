@@ -167,6 +167,82 @@ def _tool_call_signatures(
     return frozenset(sigs)
 
 
+# ───────────────────────────── Upstream retry helper ────────────────────────
+
+# Pattern that identifies the specific transient failure class llama.cpp
+# emits when a tool-calling model (Qwen3.6, Hermes, ...) generates a
+# malformed JSON arguments object inside its <tool_call> block. The
+# upstream HTTP response is a 500 whose body looks like:
+#
+#   {"error": {"code": 500, "type": "server_error",
+#              "message": "Failed to parse tool call arguments as JSON:
+#                          [json.exception.parse_error.101] ..."}}
+#
+# This is a model-side flake (the same prompt usually succeeds on retry,
+# observed 2026-05-02 during M2 live evidence run). Treat it as
+# transient — retry once before surfacing the failure.
+_TOOL_PARSE_ERROR_MARKERS = (
+    "json.exception.parse_error",
+    "Failed to parse tool call arguments",
+)
+_TOOL_PARSE_ERROR_RETRIES = 1  # one extra attempt after the initial POST
+
+
+def _is_tool_parse_error_500(response: httpx.Response) -> bool:
+    """Return True iff this looks like the Qwen tool-args-malformed 500."""
+    if response.status_code < 500:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    msg = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "")
+        elif isinstance(err, str):
+            msg = err
+    return any(marker in msg for marker in _TOOL_PARSE_ERROR_MARKERS)
+
+
+async def _post_with_tool_parse_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+) -> httpx.Response:
+    """POST to llama-server, retry once on the tool-parse-500 pattern.
+
+    On a non-retryable failure (any 5xx that isn't the tool-parse pattern,
+    any 4xx) ``response.raise_for_status()`` is called so the existing
+    ``httpx.HTTPStatusError`` handler in ``chat.py`` produces a clean
+    ADR-033 envelope + failed audit row.
+    """
+    response = await client.post(url, json=payload)
+    if response.status_code < 500:
+        return response
+
+    if _is_tool_parse_error_500(response):
+        for attempt in range(_TOOL_PARSE_ERROR_RETRIES):
+            logger.warning(
+                "llama-server tool-call parse error (HTTP %d) — "
+                "retrying %d/%d (model-side malformed tool_call JSON)",
+                response.status_code,
+                attempt + 1,
+                _TOOL_PARSE_ERROR_RETRIES,
+            )
+            response = await client.post(url, json=payload)
+            if response.status_code < 500:
+                return response
+            if not _is_tool_parse_error_500(response):
+                break  # different failure class — don't retry
+
+    # Persistent failure — surface as HTTPStatusError so the chat.py
+    # caller's existing handler produces a clean 502 + failed audit row.
+    response.raise_for_status()
+    return response  # unreachable, raise_for_status raised
+
+
 # ───────────────────────────── The loop ─────────────────────────────────────
 
 
@@ -237,7 +313,9 @@ async def run_memory_tool_loop(
                     connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
                 )
             ) as client:
-                response = await client.post(llama_url, json=proxy_payload)
+                response = await _post_with_tool_parse_retry(
+                    client, llama_url, proxy_payload
+                )
             last_body = response.json()
             try:
                 usage = last_body.get("usage", {}) or {}
