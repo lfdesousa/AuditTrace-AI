@@ -1,0 +1,86 @@
+{{- if .Values.keycloak.enabled }}
+# Helm post-install / post-upgrade Job that provisions the three
+# `memory:<layer>:write` Keycloak scopes onto the running realm
+# and binds them to the right clients.
+#
+# Why this Job exists: `kc.sh start --import-realm` only imports a
+# realm on its FIRST run; later realm.json edits do not propagate
+# to an existing realm. Without this Job, every chart upgrade that
+# adds a new scope to realm.json would silently leave the running
+# realm unchanged, and the `/memory/<layer>` write endpoints would
+# 403 every operator JWT (since `require_scope` in `auth.py:174`
+# does a strict scope check with no admin bypass).
+#
+# Lifecycle: same as the summariser-role Job —
+# `helm.sh/hook: post-install,post-upgrade` runs after the main
+# resources are reconciled. Hook-weight 20 (after summariser at 10)
+# so the Job orders predictably in `kubectl get jobs`. The script
+# itself is idempotent, so being run more than once on the same
+# realm is a no-op.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-ensure-memory-scopes
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Same back-off shape as the summariser-role Job — Keycloak may
+  # still be rolling when the hook fires.
+  backoffLimit: 12
+  # Hard cap. Realistic runtime <30s on a healthy cluster.
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ensure-memory-scopes
+        # Keycloak's AuthorizationPolicy gates ingress to port 8080
+        # — the Job's SA is added to the allowlist in
+        # templates/istio/authorizationpolicy-keycloak.yaml so it
+        # can talk to the Keycloak Service.
+        sidecar.istio.io/inject: "true"
+      annotations:
+        {{- if .Values.vault.enabled }}
+        {{- include "audittrace.vaultAnnotations.memoryScopesJob" . | nindent 8 }}
+        {{- end }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ .Release.Name }}-memory-scopes-job
+      containers:
+        - name: kcadm
+          image: "{{ .Values.keycloak.image.repository }}:{{ .Values.keycloak.image.tag }}"
+          # `curl` ships with the Keycloak image; `kcadm.sh` lives
+          # at /opt/keycloak/bin. Nothing else to install.
+          env:
+            - name: KC_BASE_URL
+              value: "http://{{ .Release.Name }}-keycloak:8080"
+            - name: REALM
+              value: "audittrace"
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch — K8s Secret. When
+            # vault.enabled=true KEYCLOAK_ADMIN_PASSWORD lands at
+            # runtime via /vault/secrets/env, sourced inside the
+            # script (ADR-043 §4).
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-keycloak-secret
+                  key: admin-password
+            {{- end }}
+          volumeMounts:
+            - name: script
+              mountPath: /work
+              readOnly: true
+          command:
+            - bash
+            - /work/ensure-memory-scopes.sh
+      volumes:
+        - name: script
+          configMap:
+            name: {{ .Release.Name }}-memory-scopes-script
+            defaultMode: 0755
+{{- end }}

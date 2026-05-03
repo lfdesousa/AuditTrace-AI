@@ -426,3 +426,120 @@ class TestRealmMemoryWriteScopes:
             assert expected <= optional, (
                 f"{client_id} missing optional write scopes: {expected - optional!r}"
             )
+
+
+class TestMemoryScopesProvisioningJob:
+    """Helm post-install/post-upgrade Job that provisions the three
+    `memory:<layer>:write` scopes onto a running Keycloak realm.
+
+    Keycloak's `--import-realm` only imports on a FRESH realm — chart
+    edits to realm.json don't propagate to existing realms. This Job
+    closes the gap: it runs on every helm install/upgrade and uses
+    kcadm.sh to ensure the scopes exist + are bound to the right
+    clients (idempotent).
+
+    Without this Job, every chart upgrade that adds a scope silently
+    leaves the running realm without it, and `/memory/<layer>` write
+    endpoints 403 every operator JWT (`auth.py:174` does a strict
+    scope check with no admin bypass).
+    """
+
+    def test_job_renders_with_post_upgrade_hook(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        annotations = job["metadata"].get("annotations", {})
+        assert "post-install" in annotations.get("helm.sh/hook", "")
+        assert "post-upgrade" in annotations.get("helm.sh/hook", "")
+        assert (
+            annotations.get("helm.sh/hook-delete-policy")
+            == "before-hook-creation,hook-succeeded"
+        )
+
+    def test_job_uses_dedicated_serviceaccount(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        sa = job["spec"]["template"]["spec"]["serviceAccountName"]
+        assert sa == "audittrace-memory-scopes-job"
+        # The SA itself must also exist as a manifest.
+        _find_workload(out, "ServiceAccount", "audittrace-memory-scopes-job")
+
+    def test_job_runs_on_keycloak_image(self) -> None:
+        """kcadm.sh ships with the Keycloak image — no other base
+        works without installing extra packages at runtime."""
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        image = job["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert "keycloak" in image.lower()
+
+    def test_keycloak_authorizationpolicy_allows_job_sa(self) -> None:
+        """The keycloak AP must allow the Job's SA principal — without
+        this the kcadm calls fail with TLS handshake or 403 from
+        Istio enforcement."""
+        out = _render(["--set", "vault.enabled=true"])
+        ap = _find_workload(out, "AuthorizationPolicy", "audittrace-allow-keycloak")
+        principals = ap["spec"]["rules"][0]["from"][0]["source"]["principals"]
+        joined = "\n".join(principals)
+        assert "memory-scopes-job" in joined
+
+    def test_script_configmap_lists_three_scopes(self) -> None:
+        """Regression guard against drift: the three scopes the
+        provisioner script ensures must match the realm.json
+        clientScopes block. If a future PR adds (or renames) a
+        scope, both sites must move together."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        for scope in (
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        ):
+            assert scope in script, f"script missing scope: {scope}"
+
+    def test_script_binds_to_admin_opencode_webui(self) -> None:
+        """The bash script must reference each client we expect to
+        receive the scope binding."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        for client_id in ("admin-client", "audittrace-opencode", "audittrace-webui"):
+            assert client_id in script, f"script missing client binding: {client_id}"
+
+    def test_vault_role_and_policy_declared(self) -> None:
+        """When vault.enabled=true, the Job needs a Vault role bound
+        to a least-privilege policy (read on keycloak/* only)."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-vault-policies")
+        assert "memory-scopes-job.hcl" in cm["data"]
+        assert "role-memory-scopes-job.env" in cm["data"]
+        # Policy should grant read on keycloak/* and nothing else.
+        policy = cm["data"]["memory-scopes-job.hcl"]
+        assert "keycloak/" in policy
+        assert "postgres/" not in policy
+        # Role binds to the dedicated SA.
+        role = cm["data"]["role-memory-scopes-job.env"]
+        assert "audittrace-memory-scopes-job" in role
+
+    def test_job_uses_pre_populate_only_under_vault(self) -> None:
+        """Without `agent-pre-populate-only: true` the vault-agent
+        sidecar keeps the Pod 2/3 NotReady forever and the helm
+        post-upgrade hook reports `failed: context deadline exceeded`
+        (Phase C.8 root cause — same lesson as the summariser Job)."""
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        annotations = job["spec"]["template"]["metadata"].get("annotations", {})
+        key = "vault.hashicorp.com/agent-pre-populate-only"
+        assert annotations.get(key) == "true"
+
+    def test_job_renders_under_vault_disabled(self) -> None:
+        """When vault.enabled=false, the Job sources the admin
+        password from the K8s Secret instead — the manifest must
+        still render and reference the secret."""
+        out = _render(["--set", "vault.enabled=false"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        envs = job["spec"]["template"]["spec"]["containers"][0]["env"]
+        admin_pw = next(e for e in envs if e["name"] == "KEYCLOAK_ADMIN_PASSWORD")
+        assert (
+            admin_pw["valueFrom"]["secretKeyRef"]["name"]
+            == "audittrace-keycloak-secret"
+        )

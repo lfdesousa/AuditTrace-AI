@@ -1,0 +1,180 @@
+{{- if .Values.keycloak.enabled }}
+# kcadm bash script consumed by the post-install/post-upgrade
+# `ensure-memory-scopes` Job (ADR-XXX — memory CRUD backoffice).
+#
+# Why a separate ConfigMap rather than inlining the script in the
+# Job manifest: the script is ~100 lines and we want it diffable in
+# `git log` without touching the Job's spec each time the kcadm
+# logic evolves. Same factoring as
+# `templates/postgres/configmap-summariser-sql.yaml`.
+#
+# The script is idempotent — safe to re-run on every helm upgrade
+# (which is what the post-upgrade hook does). It only ever creates
+# missing scopes / missing client bindings; never deletes or
+# rewrites existing realm content.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-memory-scopes-script
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  ensure-memory-scopes.sh: |
+    #!/usr/bin/env bash
+    # Ensure the three `memory:<layer>:write` Keycloak scopes exist on
+    # the audittrace realm and are attached to the right clients.
+    #
+    # The chart's `realm-audittrace.json` declares these scopes, but
+    # `kc.sh start --import-realm` only imports on a FRESH realm — it
+    # does NOT propagate updates to an existing realm. Without this
+    # Job, every upgrade that adds a scope to realm.json silently
+    # leaves the running realm without it, and the `/memory/<layer>`
+    # write endpoints 403 every operator JWT.
+    #
+    # Idempotent: every action is gated on a "does it already exist?"
+    # check. Re-runs are safe (and expected on every helm upgrade).
+    set -euo pipefail
+
+    REALM="${REALM:-audittrace}"
+    KC_BASE_URL="${KC_BASE_URL:-http://{{ .Release.Name }}-keycloak:8080}"
+    KCADM=/opt/keycloak/bin/kcadm.sh
+
+    # The three scopes this PR introduces. Kept in lockstep with
+    # realm-audittrace.json's clientScopes[] block — adding a scope
+    # there means adding it here too. The chart-render test
+    # (`TestRealmMemoryWriteScopes`) catches drift between the two.
+    SCOPES=(
+      "memory:episodic:write"
+      "memory:procedural:write"
+      "memory:semantic:write"
+    )
+
+    # Vault-Agent rendered the admin password to /vault/secrets/env
+    # when vault.enabled=true; otherwise it's a regular env var via
+    # K8s Secret.
+    {{- if .Values.vault.enabled }}
+    set -a; . /vault/secrets/env; set +a
+    {{- end }}
+
+    if [[ -z "${KEYCLOAK_ADMIN_PASSWORD:-}" ]]; then
+      echo "❌ KEYCLOAK_ADMIN_PASSWORD is empty — refusing to authenticate." >&2
+      exit 1
+    fi
+
+    # Keycloak rolls during a chart upgrade — wait for /realms/master
+    # to respond before talking to it. 60 × 2s = 120s of patience,
+    # well beyond a typical roll. Same shape as the summariser-role
+    # Job's pg_isready loop.
+    echo "▶ waiting for Keycloak at ${KC_BASE_URL}..."
+    for i in $(seq 1 60); do
+      if curl --fail --silent --max-time 5 \
+           "${KC_BASE_URL}/realms/master" >/dev/null 2>&1; then
+        echo "  ✓ Keycloak ready (attempt ${i})"
+        break
+      fi
+      if [ "$i" -eq 60 ]; then
+        echo "❌ Keycloak did not become ready within 120s." >&2
+        exit 1
+      fi
+      sleep 2
+    done
+
+    echo "▶ authenticating to Keycloak admin..."
+    "${KCADM}" config credentials \
+      --server "${KC_BASE_URL}" \
+      --realm master \
+      --user admin \
+      --password "${KEYCLOAK_ADMIN_PASSWORD}" >/dev/null
+    echo "  ✓ authenticated"
+
+    # ── Step 1: ensure each scope exists ──────────────────────────
+    declare -A SCOPE_ID
+    for SCOPE in "${SCOPES[@]}"; do
+      # `--fields name` + grep is the portable shape: kcadm's `-q`
+      # query parameter is silently ignored on `client-scopes` in
+      # older Keycloak releases.
+      EXISTING=$("${KCADM}" get client-scopes -r "${REALM}" \
+                   --fields id,name --format csv --noquotes 2>/dev/null \
+                 | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
+      if [[ -n "${EXISTING}" ]]; then
+        echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
+        SCOPE_ID["${SCOPE}"]="${EXISTING}"
+      else
+        "${KCADM}" create client-scopes -r "${REALM}" \
+          -s "name=${SCOPE}" \
+          -s protocol=openid-connect \
+          -s 'attributes."include.in.token.scope"=true' >/dev/null
+        # kcadm `create` writes the new ID to stderr; re-fetch it.
+        NEW_ID=$("${KCADM}" get client-scopes -r "${REALM}" \
+                   --fields id,name --format csv --noquotes \
+                 | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
+        echo "  ✓ scope ${SCOPE}: created (${NEW_ID})"
+        SCOPE_ID["${SCOPE}"]="${NEW_ID}"
+      fi
+    done
+
+    # ── Step 2: bind each scope to the right clients ──────────────
+    # admin-client gets all three as DEFAULT scopes (always issued).
+    # opencode + webui get them as OPTIONAL scopes (operator opts in
+    # per request via the `scope=` parameter).
+    declare -A CLIENT_KIND
+    CLIENT_KIND["admin-client"]="default"
+    CLIENT_KIND["audittrace-opencode"]="optional"
+    CLIENT_KIND["audittrace-webui"]="optional"
+
+    bind_scope() {
+      local CLIENT_ID="$1" SCOPE="$2" KIND="$3"
+      local CLIENT_UUID SCOPE_UUID
+
+      CLIENT_UUID=$("${KCADM}" get clients -r "${REALM}" \
+                      -q "clientId=${CLIENT_ID}" \
+                      --fields id --format csv --noquotes 2>/dev/null \
+                    | tr -d '"' | head -1)
+      if [[ -z "${CLIENT_UUID}" ]]; then
+        echo "  ⚠ client ${CLIENT_ID}: not found (skipped)"
+        return 0
+      fi
+      SCOPE_UUID="${SCOPE_ID[$SCOPE]:-}"
+      if [[ -z "${SCOPE_UUID}" ]]; then
+        echo "❌ scope ${SCOPE}: id not resolvable — bug" >&2
+        return 1
+      fi
+
+      local PATH_SUFFIX
+      if [[ "${KIND}" == "default" ]]; then
+        PATH_SUFFIX="default-client-scopes"
+      else
+        PATH_SUFFIX="optional-client-scopes"
+      fi
+
+      # PUT to the binding endpoint is idempotent — Keycloak responds
+      # 204 whether the binding already existed or was just created.
+      "${KCADM}" update \
+        "clients/${CLIENT_UUID}/${PATH_SUFFIX}/${SCOPE_UUID}" \
+        -r "${REALM}" -s "" >/dev/null 2>&1 || true
+      echo "  ✓ ${CLIENT_ID} ${KIND} ← ${SCOPE}"
+    }
+
+    for CLIENT_ID in "${!CLIENT_KIND[@]}"; do
+      KIND="${CLIENT_KIND[$CLIENT_ID]}"
+      echo "▶ binding scopes to client ${CLIENT_ID} (${KIND})..."
+      for SCOPE in "${SCOPES[@]}"; do
+        bind_scope "${CLIENT_ID}" "${SCOPE}" "${KIND}"
+      done
+    done
+
+    echo "✅ memory-scopes provisioning complete."
+
+    # ── Istio sidecar shutdown ────────────────────────────────────
+    # Identical pattern to the summariser-role Job (Phase C.8 root
+    # cause): without quitquitquit, istio-proxy keeps the Pod 2/3
+    # NotReady forever and the helm post-upgrade hook reports
+    # `failed: context deadline exceeded`.
+    {{- if .Values.istio.enabled }}
+    curl --max-time 5 -sS -o /dev/null \
+      -w 'istio quitquitquit: HTTP %{http_code}\n' \
+      -X POST http://127.0.0.1:15020/quitquitquit \
+      || echo "warn: istio quitquitquit curl failed (sidecar may already be gone)"
+    {{- end }}
+    echo "Job completing."
+{{- end }}

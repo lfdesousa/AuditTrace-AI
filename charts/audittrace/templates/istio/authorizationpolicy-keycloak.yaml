@@ -16,6 +16,11 @@ spec:
             principals:
               - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+              # The post-install/post-upgrade memory-scopes Job
+              # talks to Keycloak via kcadm.sh from a dedicated SA
+              # (least-privilege; the Job only needs admin REST
+              # access for the duration of its run).
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-memory-scopes-job"
       to:
         - operation:
             ports: ["8080"]

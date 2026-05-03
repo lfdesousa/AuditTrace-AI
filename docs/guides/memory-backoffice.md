@@ -247,6 +247,117 @@ was lost. The decorator is missing OR a downstream sidecar
 (otel-collector, Tempo, Langfuse, Loki) is sick — investigate
 before assuming the new code is the cause.
 
+## How the realm gets the new scopes (the deploy-time gap)
+
+`charts/audittrace/files/realm-audittrace.json` declares the three
+`memory:<layer>:write` scopes and binds them to `admin-client`
+(default) and `audittrace-opencode` / `audittrace-webui` (optional).
+
+But Keycloak's `kc.sh start --import-realm` only imports a realm on
+its **first run** — once the realm exists, later edits to the
+ConfigMap-mounted realm.json **do not** propagate. Without an
+explicit reconciliation step, every chart upgrade that adds a scope
+would silently leave the running realm without it, and the
+`/memory/<layer>` write endpoints would 403 every operator JWT
+(`auth.py:174` is a strict scope check with no admin bypass).
+
+### The post-install / post-upgrade Job (default path)
+
+`charts/audittrace/templates/keycloak/job-memory-scopes.yaml` runs as
+a Helm `post-install,post-upgrade` hook. It mounts the bash script
+in `templates/keycloak/configmap-memory-scopes-script.yaml` and uses
+`/opt/keycloak/bin/kcadm.sh` to:
+
+1. Wait for Keycloak's `/realms/master` to respond (60 × 2s).
+2. Authenticate as `admin` (password from K8s Secret or Vault Agent).
+3. For each scope in `{episodic, procedural, semantic}` × write:
+   create the client-scope with `include.in.token.scope=true` only
+   if it doesn't already exist.
+4. For each (client, scope, kind) binding —
+   `admin-client` → default; `audittrace-opencode` /
+   `audittrace-webui` → optional — issue an idempotent PUT to the
+   binding endpoint. Re-runs are a no-op.
+5. Curl `127.0.0.1:15020/quitquitquit` so the Istio sidecar
+   terminates and the Pod completes (Phase C.8 lesson).
+
+Lifecycle, posture, and gotchas are documented inline in the Job
+manifest. Hook-weight is `20` so the Job orders predictably after
+the summariser-role Job (weight `10`).
+
+#### Verifying the Job ran
+
+After every `helm upgrade`:
+
+```sh
+kubectl -n audittrace get jobs | grep ensure-memory-scopes
+kubectl -n audittrace logs job/audittrace-ensure-memory-scopes -c kcadm
+```
+
+A successful run ends with:
+
+```
+✅ memory-scopes provisioning complete.
+istio quitquitquit: HTTP 200
+Job completing.
+```
+
+The Job's logs are also visible in Loki under
+`{namespace="audittrace", app_kubernetes_io_component="ensure-memory-scopes"}`.
+
+### The operator-runnable wrapper (backstop)
+
+`scripts/setup-memory-scopes.sh` wraps the same kcadm logic for
+ad-hoc reconciliation outside of `helm upgrade`. Use cases:
+
+- A realm got wiped and re-imported and the scopes need to come
+  back without bouncing the chart.
+- You're debugging the kcadm calls without rebuilding the
+  ConfigMap.
+- You migrated `vault.enabled=false` ↔ `true` and the Job's Vault
+  role wasn't ready in time.
+
+```sh
+KEYCLOAK_ADMIN_PASSWORD=...  ./scripts/setup-memory-scopes.sh
+```
+
+If `KEYCLOAK_ADMIN_PASSWORD` isn't set, the script tries
+`vault kv get -field=password kv/audittrace/keycloak/admin` (after
+`vault login`).
+
+### Vault role + Istio AuthorizationPolicy (vault.enabled=true)
+
+The Job authenticates with Vault via the dedicated SA
+`audittrace-memory-scopes-job`. That SA is bound to the Vault role
+`memory-scopes-job`, which carries the policy
+`memory-scopes-job.hcl` — `read` on
+`kv/audittrace/keycloak/*` only. Least-privilege on a 1h TTL.
+
+The Keycloak `AuthorizationPolicy`
+(`templates/istio/authorizationpolicy-keycloak.yaml`) lists the
+Job's SA principal alongside the ingress gateway and the
+memory-server SA, so kcadm can talk to the Keycloak Service.
+
+### Drift guards
+
+`tests/test_chart_rendering.py::TestMemoryScopesProvisioningJob`
+covers:
+
+- Job renders with `post-install,post-upgrade` hook + correct
+  delete-policy.
+- Job uses the dedicated SA + Keycloak base image.
+- Keycloak AP allowlist contains the Job's SA principal.
+- Script ConfigMap mentions all three scopes + all three client
+  bindings.
+- Vault policy + role exist when `vault.enabled=true`, with
+  scope narrowed to `keycloak/*`.
+- `agent-pre-populate-only=true` annotation is set (the Phase C.8
+  defense).
+- Chart still renders cleanly with `vault.enabled=false`.
+
+A regression that touches any of those — say someone removes the
+script's binding for `audittrace-webui` — fails the test instead
+of silently breaking live deployments.
+
 ## Cross-references
 
 - ADR-025 — Memory layers as LLM-callable tools (read paths).

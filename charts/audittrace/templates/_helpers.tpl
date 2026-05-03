@@ -293,3 +293,26 @@ vault.hashicorp.com/agent-inject-template-env: |
   export SUMMARISER_PASSWORD='{{ "{{ .Data.data.password }}" }}'
   {{ "{{ end }}" }}
 {{- end }}
+
+{{/*
+Vault Agent Injector annotations — memory-scopes provisioning Job
+(memory CRUD backoffice). Same `agent-pre-populate-only` posture as
+the summariser Job: vault-agent runs as an init container and exits
+before the kcadm container starts, so the Pod can complete cleanly
+once kcadm + Istio sidecar have shut down.
+
+Exposes KEYCLOAK_ADMIN_PASSWORD only — the Job uses it to authenticate
+against the realm's master admin and provision client scopes
+idempotently.
+*/}}
+{{- define "audittrace.vaultAnnotations.memoryScopesJob" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "memory-scopes-job"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-pre-populate-only: "true"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/keycloak/admin"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/keycloak/admin\" }}" }}
+  export KEYCLOAK_ADMIN_PASSWORD='{{ "{{ .Data.data.password }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}

@@ -70,6 +70,16 @@ data:
       capabilities = ["read"]
     }
 
+  memory-scopes-job.hcl: |
+    # Post-install/post-upgrade memory-scopes Job needs the Keycloak
+    # admin password to authenticate kcadm.sh against the master
+    # realm and reconcile the three `memory:<layer>:write` scopes
+    # onto the audittrace realm. Read-only on a single KV path —
+    # least privilege.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/keycloak/*" {
+      capabilities = ["read"]
+    }
+
   chromadb.hcl: |
     # ChromaDB reads its own auth token (CHROMA_SERVER_AUTHN_CREDENTIALS)
     # via Vault Agent injection at boot.
@@ -107,6 +117,13 @@ data:
     bound_service_account_names=default
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=summariser-job
+    ttl=1h
+    audience=https://kubernetes.default.svc.cluster.local
+
+  role-memory-scopes-job.env: |
+    bound_service_account_names={{ .Release.Name }}-memory-scopes-job
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=memory-scopes-job
     ttl=1h
     audience=https://kubernetes.default.svc.cluster.local
 
