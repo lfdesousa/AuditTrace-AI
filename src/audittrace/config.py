@@ -91,9 +91,8 @@ class Settings(BaseSettings):
     memory_max_context_turns: int = 117000  # ~131k - system prompt - output buffer
     memory_embedding_dim: int = 1024  # Nomic-embed-text default
 
-    # 4-layer memory paths (ADR-018) — filesystem fallback for tests/local dev
-    adr_dir: str = "./memory/episodic"
-    skill_dir: str = "./memory/procedural"
+    # 4-layer memory: layers 1+2 are S3-only (MinIO) — no filesystem paths.
+    # See feedback_storage_always_s3 for the durable rule (2026-05-03 sweep).
     llama_proxy_timeout: int = 120  # seconds — DEPRECATED: use llama_chunk_timeout
     llama_chunk_timeout: int = 600  # seconds — per-chunk idle timeout (ADR-034).
     # 600s accommodates first-chunk delay on 27B Q4 + consumer GPU,

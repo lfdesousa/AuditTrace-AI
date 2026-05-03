@@ -72,18 +72,22 @@ def test_reset_container():
 def test_register_default_dependencies_no_pg(monkeypatch):
     """Test default registration with no database_url falls back to in-memory PG.
 
-    Uses MockChromaDBFactory to avoid needing a live ChromaDB server.
+    Uses MockChromaDBFactory to avoid needing a live ChromaDB server. MinIO
+    is mandatory since the 2026-05-03 sweep, so this test stubs the client
+    creation with a fake — the FS fallback no longer exists.
     """
     from audittrace import dependencies as deps_module
     from audittrace.config import Settings
     from audittrace.db.postgres import InMemoryPostgresFactory
 
-    # Patch the factory constructor to avoid real ChromaDB connection
     monkeypatch.setattr(
         deps_module,
         "HTTPChromaDBFactory",
         lambda url, token=None: MockChromaDBFactory(),
     )
+    # MinIO is mandatory — stub the client creation so this test doesn't need
+    # a real MinIO server.
+    monkeypatch.setattr(deps_module, "_create_minio_client", lambda settings: object())
 
     settings = Settings(chroma_url="http://localhost:8000")
     register_default_dependencies(settings)
@@ -93,6 +97,29 @@ def test_register_default_dependencies_no_pg(monkeypatch):
         deps_module.container._instances["postgres_factory"],
         InMemoryPostgresFactory,
     )
+
+
+def test_register_default_dependencies_raises_when_minio_missing(monkeypatch):
+    """The 2026-05-03 sweep removed the FS fallback for layers 1+2.
+    A missing ``AUDITTRACE_MINIO_SECRET_KEY`` MUST surface as a startup-time
+    ``RuntimeError`` instead of a silent filesystem fallback. See
+    ``feedback_storage_always_s3``.
+    """
+    from audittrace import dependencies as deps_module
+    from audittrace.config import Settings
+
+    monkeypatch.setattr(
+        deps_module,
+        "HTTPChromaDBFactory",
+        lambda url, token=None: MockChromaDBFactory(),
+    )
+    # Reset container so we exercise the registration path, not the cached
+    # instances guard at the top of register_default_dependencies.
+    deps_module.container = deps_module.DependencyContainer()
+
+    settings = Settings(chroma_url="http://localhost:8000", minio_secret_key="")
+    with pytest.raises(RuntimeError, match="MinIO is required"):
+        register_default_dependencies(settings)
 
 
 def test_set_test_mode():

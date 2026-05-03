@@ -45,9 +45,12 @@ from audittrace.tools import register_memory_tool
 logger = logging.getLogger(__name__)
 
 
-# Snippet length for every document-style match result. The LLM only needs
-# enough context to decide whether the match is relevant; the full content
-# can be retrieved on a follow-up call.
+# Snippet length for keyword-discovery tools (recall_decisions / recall_skills).
+# Discovery results return short previews so the LLM can pick a candidate, then
+# fetch the full document via read_decision / read_skill on a follow-up call.
+# recall_semantic does NOT use this — its results are vector-store chunks that
+# are already bounded by the chunker, so truncating them again was hiding
+# useful context with no benefit.
 _SNIPPET_LIMIT = 400
 
 
@@ -283,7 +286,7 @@ async def recall_semantic(
         "matches": [
             {
                 "title": d.metadata.get("source", d.metadata.get("file", "?")),
-                "snippet": d.page_content[:_SNIPPET_LIMIT],
+                "snippet": d.page_content,
                 "source": d.metadata.get("collection", ""),
             }
             for d in matches
@@ -293,9 +296,102 @@ async def recall_semantic(
     }
 
 
+# ────────────────────────────── read_decision ──────────────────────────────
+
+
+@register_memory_tool(
+    name="read_decision",
+    description=(
+        "Fetch the full text of a single Architecture Decision Record (ADR) "
+        "by exact filename. Use this AFTER recall_decisions narrows the field "
+        "to a candidate — the discovery tool returns 400-char snippets, this "
+        "one returns the entire document so questions like 'what does ADR-025 "
+        "actually say?' can be answered."
+    ),
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": (
+                    "Exact ADR filename, e.g. 'ADR-025-memory-as-tools.md'. "
+                    "Path-traversal characters are rejected."
+                ),
+            },
+        },
+        "required": ["file"],
+    },
+    required_scope="memory:episodic:read",
+)
+async def read_decision(
+    user_context: UserContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Wrap ``EpisodicService.read`` in a full-content tool result."""
+    file = args.get("file")
+    if not isinstance(file, str) or not file.strip():
+        return {"error": "read_decision: 'file' is required and must be a string"}
+
+    episodic = get_episodic_service()
+    doc = episodic.read(user_context, file)
+    if doc is None:
+        return {"error": "not_found", "file": file}
+    return {
+        "title": doc.metadata.get("title", file),
+        "file": doc.metadata.get("file", file),
+        "source": "episodic",
+        "content": doc.page_content,
+    }
+
+
+# ──────────────────────────────── read_skill ────────────────────────────────
+
+
+@register_memory_tool(
+    name="read_skill",
+    description=(
+        "Fetch the full text of a single SKILL document by exact filename. "
+        "Use this AFTER recall_skills narrows the field — the discovery tool "
+        "returns 400-char snippets, this one returns the entire skill so "
+        "questions like 'what's the IAM skill content?' can be answered."
+    ),
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": (
+                    "Exact SKILL filename, e.g. 'SKILL-IAM.md'. "
+                    "Path-traversal characters are rejected."
+                ),
+            },
+        },
+        "required": ["file"],
+    },
+    required_scope="memory:procedural:read",
+)
+async def read_skill(user_context: UserContext, args: dict[str, Any]) -> dict[str, Any]:
+    """Wrap ``ProceduralService.read`` in a full-content tool result."""
+    file = args.get("file")
+    if not isinstance(file, str) or not file.strip():
+        return {"error": "read_skill: 'file' is required and must be a string"}
+
+    procedural = get_procedural_service()
+    doc = procedural.read(user_context, file)
+    if doc is None:
+        return {"error": "not_found", "file": file}
+    return {
+        "title": doc.metadata.get("skill", file),
+        "file": doc.metadata.get("file", file),
+        "source": "procedural",
+        "content": doc.page_content,
+    }
+
+
 __all__ = [
     "recall_decisions",
     "recall_skills",
     "recall_recent_sessions",
     "recall_semantic",
+    "read_decision",
+    "read_skill",
 ]

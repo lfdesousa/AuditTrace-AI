@@ -1,16 +1,19 @@
 """Procedural memory service — Layer 2 of the 4-layer memory architecture (ADR-018).
 
-Loads SKILL-*.md files from the filesystem and provides query-driven retrieval
+Loads SKILL-*.md files from object storage and provides query-driven retrieval
 based on keyword matching against skill names and content.
 
+Storage is **always S3-backed** (MinIO) — there is no filesystem implementation.
+Tests use ``MockProceduralService``. See ``feedback_storage_always_s3`` for the
+durable rule.
+
 DESIGN §15 Phase 2: every method takes ``user_context: UserContext`` as the
-first positional argument. SKILL files are filesystem-backed and shared, so
-the parameter is pure plumbing here.
+first positional argument. SKILL files are shared (not per-user), so the
+parameter is plumbing here.
 """
 
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Any
 
 from langchain_core.documents import Document
@@ -36,67 +39,28 @@ class ProceduralService(ABC):
     def as_context(self, user_context: UserContext, query: str) -> str:
         """Return matched skills formatted as context string."""
 
+    @abstractmethod
+    def read(self, user_context: UserContext, file: str) -> Document | None:
+        """Fetch a single SKILL by exact filename. Returns ``None`` if not found.
 
-class FileProceduralService(ProceduralService):
-    """Filesystem-based procedural service reading SKILL-*.md files."""
-
-    def __init__(self, skill_dir: Path | str):
-        self._skill_dir = Path(skill_dir)
-
-    @log_call(logger=logger)
-    def load(self, user_context: UserContext) -> list[Document]:
-        """Load all SKILL-*.md files as LangChain Documents."""
-        del user_context  # plumbing only — skills are shared, not per-user
-        docs: list[Document] = []
-        if not self._skill_dir.exists():
-            return docs
-        for f in sorted(self._skill_dir.glob("SKILL-*.md")):
-            content = f.read_text(encoding="utf-8")
-            skill_name = f.stem.replace("SKILL-", "")
-            docs.append(
-                Document(
-                    page_content=content,
-                    metadata={
-                        "source": "procedural",
-                        "file": f.name,
-                        "skill": skill_name,
-                    },
-                )
-            )
-        return docs
-
-    @log_call(logger=logger)
-    def search(self, user_context: UserContext, query: str) -> list[Document]:
-        """Filter skills by keyword relevance. No arbitrary caps on results.
-
-        Searches the full skill content (not just the first 200 chars) so that
-        descriptive frontmatter further down the file can still match a query.
+        ``file`` must be a leaf filename like ``SKILL-IAM.md``. Path-traversal
+        characters (``..``, ``/``) are rejected.
         """
-        skills = self.load(user_context)
-        query_lower = query.lower()
-        keywords = [kw for kw in query_lower.split() if len(kw) > 3]
-        if not keywords:
-            return []
-        return [
-            s
-            for s in skills
-            if any(
-                kw in s.metadata.get("skill", "").lower()
-                or kw in s.page_content.lower()
-                for kw in keywords
-            )
-        ]
 
-    @log_call(logger=logger)
-    def as_context(self, user_context: UserContext, query: str) -> str:
-        """Return matched skills formatted as a context section."""
-        matched = self.search(user_context, query)
-        if not matched:
-            return ""
-        lines = ["## Relevant Skills"]
-        for s in matched:
-            lines.append(f"- **{s.metadata['skill']}** ({s.metadata['file']})")
-        return "\n".join(lines)
+
+def _validate_filename(file: str) -> bool:
+    """Reject empty, path-traversal, and non-``.md`` filenames."""
+    if not isinstance(file, str) or not file:
+        return False
+    if ".." in file or "/" in file or "\\" in file:
+        return False
+    if not file.endswith(".md"):
+        return False
+    return True
+
+
+def _skill_name_from_filename(filename: str) -> str:
+    return filename.replace("SKILL-", "").replace(".md", "")
 
 
 class S3ProceduralService(ProceduralService):
@@ -106,8 +70,9 @@ class S3ProceduralService(ProceduralService):
     Skills are shared content — ``user_context`` is required (authenticated)
     but not used for path scoping (ADR-027 §2).
 
-    Documents are cached in memory on first load since skills are static,
-    small (~11 files), and read-heavy. Cache is per-process lifetime.
+    Documents are cached in memory on first ``load()`` since skills are static,
+    small (~11 files), and read-heavy. Cache is per-process lifetime. The
+    ``read()`` path bypasses the cache and does a direct ``get_object``.
     """
 
     def __init__(self, minio_client: object, bucket: str, prefix: str = "procedural/"):
@@ -135,14 +100,13 @@ class S3ProceduralService(ProceduralService):
                 finally:
                     response.close()
                     response.release_conn()
-                skill_name = filename.replace("SKILL-", "").replace(".md", "")
                 docs.append(
                     Document(
                         page_content=content,
                         metadata={
                             "source": "procedural",
                             "file": filename,
-                            "skill": skill_name,
+                            "skill": _skill_name_from_filename(filename),
                         },
                     )
                 )
@@ -182,6 +146,35 @@ class S3ProceduralService(ProceduralService):
         for s in matched:
             lines.append(f"- **{s.metadata['skill']}** ({s.metadata['file']})")
         return "\n".join(lines)
+
+    @log_call(logger=logger)
+    def read(self, user_context: UserContext, file: str) -> Document | None:
+        del user_context  # shared content — not per-user scoped
+        if not _validate_filename(file):
+            return None
+        client: Any = self._client
+        key = f"{self._prefix}{file}"
+        try:
+            response = client.get_object(self._bucket, key)
+        except Exception as exc:
+            code = getattr(exc, "code", "")
+            if code == "NoSuchKey":
+                return None
+            logger.warning("S3ProceduralService.read(%r) failed: %s", file, exc)
+            return None
+        try:
+            content = response.read().decode("utf-8")
+        finally:
+            response.close()
+            response.release_conn()
+        return Document(
+            page_content=content,
+            metadata={
+                "source": "procedural",
+                "file": file,
+                "skill": _skill_name_from_filename(file),
+            },
+        )
 
 
 class MockProceduralService(ProceduralService):
@@ -233,6 +226,16 @@ class MockProceduralService(ProceduralService):
         for s in matched:
             lines.append(f"- **{s.metadata['skill']}** ({s.metadata['file']})")
         return "\n".join(lines)
+
+    @log_call(logger=logger)
+    def read(self, user_context: UserContext, file: str) -> Document | None:
+        del user_context  # plumbing only
+        if not _validate_filename(file):
+            return None
+        for d in self._documents:
+            if d.metadata.get("file") == file:
+                return d
+        return None
 
     def reset(self) -> None:
         """Clear all documents."""

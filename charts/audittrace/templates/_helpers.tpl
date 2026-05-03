@@ -230,6 +230,45 @@ vault.hashicorp.com/agent-inject-template-env: |
 {{- end }}
 
 {{/*
+Vault Agent secret-source guard — emit before any `set -a; . /vault/secrets/env`.
+
+If the Vault Agent injector failed to add the sidecar (e.g. transient
+TLS handshake failure during pod admission — observed 2026-05-03), the
+inline `. /vault/secrets/env` blows up with a cryptic "No such file"
+error. This guard makes the failure mode unambiguous: exit 79 with a
+diagnostic that tells the operator EXACTLY what went wrong and how to
+recover. See scripts/deploy-preflight.sh for the pre-deploy gate that
+should catch this BEFORE any pod is created.
+
+Use inside `args: [- |]` blocks, BEFORE the `set -a; . /vault/secrets/env`
+line, so the guard runs before the source attempt.
+*/}}
+{{- define "audittrace.vaultSecretFileGuard" -}}
+if [ ! -f /vault/secrets/env ]; then
+  echo "==============================================================" >&2
+  echo "ERROR: Vault Agent did not inject /vault/secrets/env (exit 79)" >&2
+  echo "==============================================================" >&2
+  echo "The Vault Agent injector failed to attach its sidecar to this" >&2
+  echo "pod, so no secret file was rendered. Most common cause is a" >&2
+  echo "transient TLS handshake failure between the kube-apiserver and" >&2
+  echo "the injector webhook (CA bundle drift in the auto-tls path)." >&2
+  echo "" >&2
+  echo "Diagnose:" >&2
+  echo "  kubectl logs -n audittrace -l app.kubernetes.io/name=vault-agent-injector \\" >&2
+  echo "    | grep -i 'tls handshake error'" >&2
+  echo "" >&2
+  echo "Recover:" >&2
+  echo "  kubectl delete pod \"\$HOSTNAME\" -n audittrace" >&2
+  echo "  # deployment will recreate via the now-healthy injector." >&2
+  echo "" >&2
+  echo "Prevent: scripts/deploy-preflight.sh runs a synthetic-pod" >&2
+  echo "injection probe before deploys; ensure k8s-rolling-image / " >&2
+  echo "k8s-upgrade depend on it." >&2
+  exit 79
+fi
+{{- end }}
+
+{{/*
 Vault Agent Injector annotations — summariser-role-creation Job (ADR-043 §4).
 Emits exports for PGPASSWORD + SUMMARISER_PASSWORD. Bound to a 1h-TTL
 role so the Job's identity is short-lived.

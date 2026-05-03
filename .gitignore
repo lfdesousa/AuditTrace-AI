@@ -98,3 +98,8 @@ test_data/
 keys/
 .structurizr/
 istio-1.29.2/
+
+# Per-deployment Helm values — holds dev secrets + the operator's
+# hostname overrides (e.g. audittrace.allaboutdata.eu for Google
+# federation). Each operator maintains their own; never committed.
+charts/audittrace/values-local.yaml

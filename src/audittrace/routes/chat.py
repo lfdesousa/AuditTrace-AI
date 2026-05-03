@@ -62,6 +62,24 @@ FAILURE_UPSTREAM_ERROR = "upstream_error"
 FAILURE_UPSTREAM_UNREACHABLE = "upstream_unreachable"
 FAILURE_INTERNAL_ERROR = "internal_error"
 
+# Map an ADR-033 error envelope's ``code`` field to one of the canonical
+# FAILURE_* constants so a body-level error envelope produces the right
+# audit-row failure_class. Anything not in the map falls back to
+# upstream_error — the most common origin of body-shaped errors.
+_ERROR_CODE_TO_FAILURE_CLASS = {
+    FAILURE_PROXY_TIMEOUT: FAILURE_PROXY_TIMEOUT,
+    FAILURE_UPSTREAM_ERROR: FAILURE_UPSTREAM_ERROR,
+    FAILURE_UPSTREAM_UNREACHABLE: FAILURE_UPSTREAM_UNREACHABLE,
+    FAILURE_INTERNAL_ERROR: FAILURE_INTERNAL_ERROR,
+}
+
+
+def _map_error_code_to_failure_class(code: object) -> str:
+    """Coerce an ADR-033 envelope ``error.code`` to a canonical FAILURE_*."""
+    if isinstance(code, str) and code in _ERROR_CODE_TO_FAILURE_CLASS:
+        return _ERROR_CODE_TO_FAILURE_CLASS[code]
+    return FAILURE_UPSTREAM_ERROR
+
 
 def _openai_error_body(
     message: str,
@@ -355,6 +373,24 @@ async def _iter_with_idle_timeout(
             pending_next.cancel()
 
 
+def _current_trace_id_hex() -> str | None:
+    """Return the active OpenTelemetry trace_id as a 32-char hex string.
+
+    Returns ``None`` when no span is active or when the captured context is
+    invalid (e.g. tools-mode persist after the @_lf_observe decorator's span
+    has closed). Defensive try/except mirrors the pattern at
+    ``server.py:330``: instrumentation should never break the request path.
+    """
+    try:
+        span = trace.get_current_span()
+        ctx = span.get_span_context() if span is not None else None
+        if ctx and ctx.is_valid:
+            return format(ctx.trace_id, "032x")
+    except Exception:  # pragma: no cover - defensive instrumentation read
+        return None
+    return None
+
+
 def _persist_interaction(
     project: str,
     source: str,
@@ -370,6 +406,7 @@ def _persist_interaction(
     failure_class: str | None = None,
     error_detail: str | None = None,
     duration_ms: int | None = None,
+    trace_id: str | None = None,
 ) -> int | None:
     """Persist a question/answer pair to PostgreSQL ``interactions``.
 
@@ -392,6 +429,14 @@ def _persist_interaction(
     successes.
     """
     try:
+        # Auto-capture trace_id from the active span when caller doesn't pass
+        # one explicitly. Same value across all persist calls in a request
+        # because the FastAPI server span stays active throughout, so this
+        # works even when an inner @_lf_observe span has already closed
+        # (tools mode). Caller can still pass an explicit value for deferred
+        # persists where the span context isn't reliable.
+        if trace_id is None:
+            trace_id = _current_trace_id_hex()
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
         db = session_factory()
@@ -411,6 +456,7 @@ def _persist_interaction(
                 failure_class=failure_class,
                 error_detail=error_detail,
                 duration_ms=duration_ms,
+                trace_id=trace_id,
             )
             db.add(record)
             db.commit()
@@ -1540,6 +1586,29 @@ async def chat_completions(
         ) from exc
 
     _set_genai_response_attributes(body)
+    # ADR-033: if the upstream returned an error envelope (body has a top-level
+    # ``error`` key), persist as failed with the right failure_class. Without
+    # this hook, an upstream 500 with an OpenAI-error-shaped body got stored
+    # as ``status='success'`` because we still extracted empty choices below.
+    err_envelope = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err_envelope, dict):
+        usage = body.get("usage") or {}
+        _persist_interaction(
+            project=project,
+            source=source,
+            question=query,
+            answer="",
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            session_id=session_id,
+            model=body.get("model") or requested_model,
+            user_id=user.user_id,
+            status="failed",
+            failure_class=_map_error_code_to_failure_class(err_envelope.get("code")),
+            error_detail=str(err_envelope.get("message", ""))[:500],
+            duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
+        )
+        return body
     try:
         choices = body.get("choices") or []
         message_obj = (choices[0].get("message") or {}) if choices else {}

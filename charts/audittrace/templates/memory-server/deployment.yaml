@@ -31,17 +31,30 @@ spec:
           image: "{{ .Values.memoryServer.image.repository }}:{{ .Values.memoryServer.image.tag }}"
           imagePullPolicy: {{ .Values.memoryServer.image.pullPolicy }}
           {{- if .Values.vault.enabled }}
-          # Source Vault Agent-rendered env file before exec'ing the
-          # entrypoint. Secrets land at /vault/secrets/env (ADR-043 §4).
-          # See sequence-vault-injection.md for the boot sequence.
-          command: ["/bin/sh", "-c"]
-          args: ["set -a; . /vault/secrets/env; set +a; exec /app/scripts/entrypoint.sh"]
+          # entrypoint.sh handles Vault-injected secret sourcing internally
+          # (gated on VAULT_AGENT_REQUIRED=true env). It fails fast with a
+          # clear diagnostic + exit code 79 when the injector did NOT add
+          # the sidecar — covers the 2026-05-03 transient-TLS class of
+          # admission-webhook failure. See ADR-043 §4 +
+          # docs/architecture/sequence-vault-injection.md for the boot
+          # sequence and scripts/deploy-preflight.sh for the pre-deploy
+          # gate that aborts before such a pod is ever created.
+          command: ["/app/scripts/entrypoint.sh"]
           {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.memoryServer.port }}
               protocol: TCP
           env:
+            {{- if .Values.vault.enabled }}
+            # Tells scripts/entrypoint.sh to require the Vault Agent
+            # secret file at /vault/secrets/env. If missing (i.e. the
+            # injector failed to attach the sidecar — see 2026-05-03
+            # TLS-handshake incident), entrypoint exits 79 with a clear
+            # diagnostic instead of the previous cryptic shell error.
+            - name: VAULT_AGENT_REQUIRED
+              value: "true"
+            {{- end }}
             # ── Plain config from values ──────────────────────────────
             {{- range $key, $value := .Values.memoryServer.env }}
             - name: {{ $key }}
@@ -66,8 +79,12 @@ spec:
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL
               value: {{ include "audittrace.keycloakJwksUrl" . | quote }}
+            # Sourced from values: keycloak.externalIssuers. Override per
+            # deployment to add hostname-specific issuer entries (e.g.
+            # `audittrace.allaboutdata.eu:30952` for Google federation).
+            # See `keycloak.externalIssuers` documentation in values.yaml.
             - name: AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS
-              value: '["https://{{ index .Values.istio.gateway.hosts 0 }}/realms/audittrace"]'
+              value: {{ .Values.keycloak.externalIssuers | toJson | quote }}
             - name: AUDITTRACE_JWT_AUDIENCE
               value: "audittrace-server"
             - name: AUDITTRACE_LLAMA_URL

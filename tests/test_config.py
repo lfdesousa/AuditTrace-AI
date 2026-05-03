@@ -133,39 +133,76 @@ def test_settings_rate_limiting():
 
 
 def test_settings_four_layer_memory_defaults():
-    """Test 4-layer memory path defaults (ADR-018, ADR-020)."""
+    """Test 4-layer memory configuration (ADR-018, ADR-020).
+
+    Layers 1+2 are S3-only since the 2026-05-03 stabilization sweep —
+    ``adr_dir`` / ``skill_dir`` were removed (see
+    ``feedback_storage_always_s3``).
+    """
     settings = Settings()
-    assert settings.adr_dir == "./memory/episodic"
-    assert settings.skill_dir == "./memory/procedural"
     assert settings.llama_proxy_timeout == 120
-    # sessions_db removed — PostgreSQL is the only path (ADR-020)
-    assert (
-        not hasattr(settings, "sessions_db")
-        or "sessions_db" not in Settings.model_fields
-    )
+    # adr_dir / skill_dir / sessions_db all removed — S3 + Postgres only
+    field_names = set(Settings.model_fields.keys())
+    assert "adr_dir" not in field_names
+    assert "skill_dir" not in field_names
+    assert "sessions_db" not in field_names
 
 
-def test_settings_four_layer_memory_from_env():
-    """Test 4-layer memory paths from environment variables."""
-    os.environ["AUDITTRACE_ADR_DIR"] = "/data/adrs"
-    os.environ["AUDITTRACE_SKILL_DIR"] = "/data/skills"
+def test_settings_llama_proxy_timeout_from_env():
+    """Test that timeout config can be overridden by env var."""
     os.environ["AUDITTRACE_LLAMA_PROXY_TIMEOUT"] = "60"
-
-    settings = Settings()
-    assert settings.adr_dir == "/data/adrs"
-    assert settings.skill_dir == "/data/skills"
-    assert settings.llama_proxy_timeout == 60
-
-    del os.environ["AUDITTRACE_ADR_DIR"]
-    del os.environ["AUDITTRACE_SKILL_DIR"]
-    del os.environ["AUDITTRACE_LLAMA_PROXY_TIMEOUT"]
+    try:
+        settings = Settings()
+        assert settings.llama_proxy_timeout == 60
+    finally:
+        del os.environ["AUDITTRACE_LLAMA_PROXY_TIMEOUT"]
 
 
-def test_no_file_based_db_fields():
-    """ADR-020: Verify file-based database fields are removed."""
+def test_no_file_based_storage_fields():
+    """Layer 1+2 are S3-only; layer 4 is Postgres-only (ADR-020 + 2026-05-03)."""
     field_names = set(Settings.model_fields.keys())
     assert "sessions_db" not in field_names
     assert "chroma_persist_dir" not in field_names
+    assert "adr_dir" not in field_names
+    assert "skill_dir" not in field_names
+
+
+def test_cors_origins_default():
+    """Sanity: default keeps the existing localhost development pair."""
+    settings = Settings()
+    assert settings.cors_origins == [
+        "http://localhost:8765",
+        "http://localhost:3000",
+    ]
+
+
+def test_cors_origins_parses_json_array_from_env():
+    """Phase A.6: chart values inject the list as a JSON array literal —
+    pydantic-settings must parse it back into ``list[str]``. Same shape
+    used in production by ``AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS``."""
+    os.environ["AUDITTRACE_CORS_ORIGINS"] = (
+        '["https://app.example.com","https://staging.example.com"]'
+    )
+    try:
+        settings = Settings()
+        assert settings.cors_origins == [
+            "https://app.example.com",
+            "https://staging.example.com",
+        ]
+    finally:
+        del os.environ["AUDITTRACE_CORS_ORIGINS"]
+
+
+def test_cors_origins_empty_list_from_env_disables_cors():
+    """An empty JSON array disables CORS — production-safe BFF default.
+    The middleware skip is asserted in test_server (separate test); here
+    we confirm the env-var → settings parse round-trip preserves []."""
+    os.environ["AUDITTRACE_CORS_ORIGINS"] = "[]"
+    try:
+        settings = Settings()
+        assert settings.cors_origins == []
+    finally:
+        del os.environ["AUDITTRACE_CORS_ORIGINS"]
 
 
 # ─────────────────── ADR-025: memory-as-tools settings ──────────────────────

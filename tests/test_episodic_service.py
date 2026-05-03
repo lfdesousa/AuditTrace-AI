@@ -1,134 +1,280 @@
 """Tests for EpisodicService — Layer 1 of the 4-layer memory architecture (ADR-018).
 
-Phase 2 (DESIGN §15): every service method takes ``user_context`` as the
-first positional argument. The admin-sentinel fixture is defined in
-``conftest.py`` and reused here — Episodic is filesystem-backed so the
-parameter is pure plumbing.
+The service is **always S3-backed** in production (MinIO) — there is no
+filesystem implementation. Tests here exercise ``S3EpisodicService`` against a
+fake MinIO client and ``MockEpisodicService`` directly. See
+``feedback_storage_always_s3``.
+
+Phase 2 (DESIGN §15): every service method takes ``user_context`` as the first
+positional argument. The admin-sentinel fixture is defined in ``conftest.py``
+and reused here — Episodic is shared content, so the parameter is plumbing.
 """
 
-from pathlib import Path
+from __future__ import annotations
+
+from typing import Any
 
 import pytest
 
 from audittrace.services.episodic import (
     EpisodicService,
-    FileEpisodicService,
     MockEpisodicService,
+    S3EpisodicService,
 )
+
+# ── Fake MinIO client ────────────────────────────────────────────────────────
+
+
+class _FakeS3Error(Exception):
+    """Stand-in for ``minio.error.S3Error`` — only the ``code`` attribute matters."""
+
+    def __init__(self, code: str, message: str = "") -> None:
+        super().__init__(message or code)
+        self.code = code
+
+
+class _FakeObject:
+    def __init__(self, object_name: str) -> None:
+        self.object_name = object_name
+
+
+class _FakeResponse:
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self.closed = False
+        self.released = False
+
+    def read(self) -> bytes:
+        return self._content
+
+    def close(self) -> None:
+        self.closed = True
+
+    def release_conn(self) -> None:
+        self.released = True
+
+
+class _FakeMinio:
+    """Minimal MinIO-client double covering ``list_objects`` + ``get_object``."""
+
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        # Keys are full S3 keys including the prefix (e.g. ``episodic/ADR-001.md``)
+        self._objects = dict(objects)
+
+    def list_objects(
+        self, bucket: str, prefix: str = "", **kwargs: Any
+    ) -> list[_FakeObject]:
+        del bucket, kwargs
+        return [_FakeObject(k) for k in self._objects if k.startswith(prefix)]
+
+    def get_object(self, bucket: str, key: str) -> _FakeResponse:
+        del bucket
+        if key not in self._objects:
+            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+        return _FakeResponse(self._objects[key])
+
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
-def adr_dir(tmp_path: Path) -> Path:
-    """Create a temp directory with sample ADR markdown files."""
-    d = tmp_path / "episodic"
-    d.mkdir()
-
-    (d / "ADR-001-use-rocm.md").write_text(
-        "# ADR-001: Use ROCm for GPU Acceleration\n\n"
-        "Date: 2026-03-01\n\n## Status\n\nAccepted\n\n"
-        "## Context\n\nThe workstation uses AMD GPU requiring ROCm.\n\n"
-        "## Decision\n\nWe use ROCm 7.2 with gfx1151 override.\n\n"
-        "## Consequences\n\nGPU acceleration enabled.\n"
-    )
-    (d / "ADR-009-kv-cache-compression.md").write_text(
-        "# ADR-009: KV Cache Compression\n\n"
-        "Date: 2026-03-31\n\n## Status\n\nAccepted\n\n"
-        "## Context\n\nKV cache consumes 16 GB with FP16.\n\n"
-        "## Decision\n\nUse q4_0 cache compression to reduce to 4 GB.\n\n"
-        "## Consequences\n\n75% memory reduction, 21% faster generation.\n"
-    )
-    (d / "ADR-016-bandwidth-optimisation.md").write_text(
-        "# ADR-016: Memory Bus Bandwidth Optimisation\n\n"
-        "Date: 2026-04-10\n\n## Status\n\nAccepted\n\n"
-        "## Context\n\nThe 256-bit memory bus is saturated.\n\n"
-        "## Decision\n\nReduce context to 65k, move embeddings to CPU.\n\n"
-        "## Consequences\n\nGPU bus exclusive to Qwen.\n"
-    )
-    return d
+def fake_bucket_objects() -> dict[str, bytes]:
+    """Three sample ADR-*.md objects under the ``episodic/`` prefix."""
+    return {
+        "episodic/ADR-001-use-rocm.md": (
+            b"# ADR-001: Use ROCm for GPU Acceleration\n\n"
+            b"Date: 2026-03-01\n\n## Status\n\nAccepted\n\n"
+            b"## Context\n\nThe workstation uses AMD GPU requiring ROCm.\n"
+        ),
+        "episodic/ADR-009-kv-cache-compression.md": (
+            b"# ADR-009: KV Cache Compression\n\n"
+            b"## Decision\n\nUse q4_0 cache compression to reduce to 4 GB.\n"
+        ),
+        "episodic/ADR-016-bandwidth-optimisation.md": (
+            b"# ADR-016: Memory Bus Bandwidth Optimisation\n\n"
+            b"## Decision\n\nReduce context to 65k.\n"
+        ),
+    }
 
 
 @pytest.fixture
-def adr_dir_five(tmp_path: Path) -> Path:
-    """5 ADRs that all contain 'server' — no arbitrary cap test."""
-    d = tmp_path / "episodic"
-    d.mkdir()
-    for i in range(1, 6):
-        (d / f"ADR-{i:03d}-server-config-{i}.md").write_text(
-            f"# ADR-{i:03d}: Server Configuration Part {i}\n\n"
-            f"## Context\n\nThe server needs configuration change {i}.\n\n"
-            f"## Decision\n\nApply server setting {i}.\n"
-        )
-    return d
+def s3_episodic(fake_bucket_objects: dict[str, bytes]) -> S3EpisodicService:
+    return S3EpisodicService(
+        minio_client=_FakeMinio(fake_bucket_objects),
+        bucket="memory-shared",
+        prefix="episodic/",
+    )
 
 
-# ── FileEpisodicService tests ────────────────────────────────────────────────
+# ── S3EpisodicService tests ──────────────────────────────────────────────────
 
 
-class TestFileEpisodicService:
-    def test_load_returns_all_adrs(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        docs = service.load(user_context)
+class TestS3EpisodicService:
+    def test_load_returns_all_adrs(self, s3_episodic: S3EpisodicService, user_context):
+        docs = s3_episodic.load(user_context)
         assert len(docs) == 3
 
-    def test_load_extracts_title_from_heading(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        docs = service.load(user_context)
+    def test_load_extracts_title_from_heading(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        docs = s3_episodic.load(user_context)
         titles = [d.metadata["title"] for d in docs]
         assert "ADR-001: Use ROCm for GPU Acceleration" in titles
         assert "ADR-009: KV Cache Compression" in titles
 
-    def test_load_sets_metadata(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        docs = service.load(user_context)
+    def test_load_sets_metadata(self, s3_episodic: S3EpisodicService, user_context):
+        docs = s3_episodic.load(user_context)
         for d in docs:
             assert d.metadata["source"] == "episodic"
-            assert "file" in d.metadata
             assert d.metadata["file"].startswith("ADR-")
+            assert d.metadata["file"].endswith(".md")
 
-    def test_load_empty_directory(self, tmp_path: Path, user_context):
-        empty = tmp_path / "empty"
-        empty.mkdir()
-        service = FileEpisodicService(adr_dir=empty)
+    def test_load_skips_non_adr_keys(self, user_context):
+        """Objects that don't match ADR-*.md must be ignored."""
+        client = _FakeMinio(
+            {
+                "episodic/README.md": b"# Just a readme\n",
+                "episodic/ADR-001-x.md": b"# ADR-001\n\nbody\n",
+            }
+        )
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         docs = service.load(user_context)
-        assert docs == []
+        files = [d.metadata["file"] for d in docs]
+        assert files == ["ADR-001-x.md"]
 
-    def test_load_missing_directory(self, tmp_path: Path, user_context):
-        nonexistent = tmp_path / "does_not_exist"
-        service = FileEpisodicService(adr_dir=nonexistent)
-        docs = service.load(user_context)
-        assert docs == []
+    def test_load_handles_empty_bucket(self, user_context):
+        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
+        assert service.load(user_context) == []
 
-    def test_search_filters_by_query(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        results = service.search(user_context, "cache compression")
-        # Should match ADR-009 (contains "cache" and "compression")
+    def test_load_handles_client_exception(self, user_context):
+        """An unexpected client error logs + returns []. No exception bubbles."""
+
+        class _Broken:
+            def list_objects(self, *a: Any, **kw: Any) -> list[_FakeObject]:
+                raise RuntimeError("connection refused")
+
+        service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
+        assert service.load(user_context) == []
+
+    def test_search_filters_by_query(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        results = s3_episodic.search(user_context, "cache compression")
         assert len(results) >= 1
         titles = [d.metadata["title"] for d in results]
         assert any("Cache" in t for t in titles)
 
-    def test_search_no_match_returns_empty(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        results = service.search(user_context, "quantum entanglement")
-        assert results == []
+    def test_search_no_match_returns_empty(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        assert s3_episodic.search(user_context, "quantum entanglement") == []
 
-    def test_search_no_arbitrary_cap(self, adr_dir_five: Path, user_context):
+    def test_search_no_arbitrary_cap(self, user_context):
         """If 5 ADRs match, all 5 should be returned — no cap."""
-        service = FileEpisodicService(adr_dir=adr_dir_five)
+        objs = {
+            f"episodic/ADR-{i:03d}-server-config-{i}.md": (
+                f"# ADR-{i:03d}: Server Config Part {i}\n\n"
+                f"## Decision\n\nApply server setting {i}.\n"
+            ).encode()
+            for i in range(1, 6)
+        }
+        service = S3EpisodicService(_FakeMinio(objs), bucket="b", prefix="episodic/")
         results = service.search(user_context, "server configuration")
         assert len(results) == 5
 
-    def test_as_context_returns_formatted_string(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        ctx = service.as_context(user_context, "cache")
+    def test_search_short_query_returns_empty(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        """Short keywords (≤3 chars) yield nothing — avoids spam matches."""
+        assert s3_episodic.search(user_context, "hi a") == []
+
+    def test_as_context_returns_formatted_string(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        ctx = s3_episodic.as_context(user_context, "cache")
         assert "Architecture Decisions" in ctx
         assert "KV Cache" in ctx
 
-    def test_as_context_empty_when_no_match(self, adr_dir: Path, user_context):
-        service = FileEpisodicService(adr_dir=adr_dir)
-        ctx = service.as_context(user_context, "quantum entanglement")
-        assert ctx == ""
+    def test_as_context_empty_when_no_match(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        assert s3_episodic.as_context(user_context, "quantum entanglement") == ""
+
+    def test_load_handles_adr_with_no_h1_header(self, user_context):
+        """An ADR file without a `# ` H1 line still loads — title is the stem."""
+        client = _FakeMinio(
+            {"episodic/ADR-100-no-header.md": b"Just body text, no H1 line.\n"}
+        )
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        docs = service.load(user_context)
+        assert len(docs) == 1
+        assert docs[0].metadata["title"] == "ADR-100-no-header"
+
+
+class TestS3EpisodicServiceRead:
+    """``read(file)`` — full-content fetch by exact filename (Phase A.1)."""
+
+    def test_read_existing_file_returns_full_content(
+        self,
+        s3_episodic: S3EpisodicService,
+        fake_bucket_objects: dict[str, bytes],
+        user_context,
+    ):
+        doc = s3_episodic.read(user_context, "ADR-009-kv-cache-compression.md")
+        assert doc is not None
+        expected = fake_bucket_objects[
+            "episodic/ADR-009-kv-cache-compression.md"
+        ].decode("utf-8")
+        assert doc.page_content == expected
+        assert doc.metadata["file"] == "ADR-009-kv-cache-compression.md"
+        assert doc.metadata["title"] == "ADR-009: KV Cache Compression"
+        assert doc.metadata["source"] == "episodic"
+
+    def test_read_missing_file_returns_none(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        assert s3_episodic.read(user_context, "ADR-999-nope.md") is None
+
+    def test_read_rejects_path_traversal(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        for bad in [
+            "../etc/passwd.md",
+            "ADR-001/../../secret.md",
+            "subdir/ADR-001.md",
+            "..\\windows.md",
+        ]:
+            assert s3_episodic.read(user_context, bad) is None
+
+    def test_read_rejects_non_md(self, s3_episodic: S3EpisodicService, user_context):
+        assert s3_episodic.read(user_context, "ADR-001") is None
+        assert s3_episodic.read(user_context, "ADR-001.txt") is None
+
+    def test_read_rejects_empty_or_non_string(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        assert s3_episodic.read(user_context, "") is None
+        assert s3_episodic.read(user_context, None) is None  # type: ignore[arg-type]
+
+    def test_read_handles_unexpected_exception(self, user_context):
+        """Non-NoSuchKey errors log + return None — caller never sees a raise."""
+
+        class _Broken:
+            def get_object(self, *a: Any, **kw: Any) -> _FakeResponse:
+                raise RuntimeError("connection reset")
+
+        service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
+        assert service.read(user_context, "ADR-001.md") is None
+
+    def test_read_returns_full_untruncated_content(self, user_context):
+        """Regression for the ADR-025 bug: full content, no 400-char limit."""
+        big = ("# ADR-025\n\n" + ("body line.\n" * 5000)).encode()
+        client = _FakeMinio({"episodic/ADR-025.md": big})
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        doc = service.read(user_context, "ADR-025.md")
+        assert doc is not None
+        assert len(doc.page_content) == len(big.decode())
+        assert len(doc.page_content) > 5000  # well over the old 400-char cap
 
 
 # ── MockEpisodicService tests ────────────────────────────────────────────────
@@ -193,28 +339,19 @@ class TestMockEpisodicService:
         service.add_document("body", title="T", file="T.md")
         assert service.as_context(user_context, "nothing-matches-here") == ""
 
+    def test_mock_read_returns_matching_document(self, user_context):
+        service = MockEpisodicService()
+        service.add_document("contents", title="ADR-007", file="ADR-007.md")
+        doc = service.read(user_context, "ADR-007.md")
+        assert doc is not None
+        assert doc.page_content == "contents"
 
-class TestFileEpisodicServiceEdgeCases:
-    """Branches in FileEpisodicService.load + search beyond the happy path."""
+    def test_mock_read_returns_none_when_missing(self, user_context):
+        service = MockEpisodicService()
+        service.add_document("contents", title="ADR-007", file="ADR-007.md")
+        assert service.read(user_context, "ADR-999.md") is None
 
-    def test_load_handles_adr_with_no_h1_header(self, tmp_path, user_context):
-        """An ADR file without an `# ` H1 line should still load — title falls
-        back to the file stem (covers the loop-completes-without-break branch)."""
-        d = tmp_path / "episodic"
-        d.mkdir()
-        (d / "ADR-100-no-header.md").write_text(
-            "Just body text, no H1 line at all.\n\nMore body.\n"
-        )
-        service = FileEpisodicService(adr_dir=str(d))
-        docs = service.load(user_context)
-        assert len(docs) == 1
-        # Title falls back to the file stem when no `# ` heading is found
-        assert docs[0].metadata["title"] == "ADR-100-no-header"
-
-    def test_search_short_query_returns_empty(self, tmp_path, user_context):
-        """File-backed service must also reject short-keyword queries."""
-        d = tmp_path / "episodic"
-        d.mkdir()
-        (d / "ADR-001-x.md").write_text("# ADR-001: X\n\nbody\n")
-        service = FileEpisodicService(adr_dir=str(d))
-        assert service.search(user_context, "hi a") == []
+    def test_mock_read_rejects_path_traversal(self, user_context):
+        service = MockEpisodicService()
+        service.add_document("contents", title="ADR-007", file="ADR-007.md")
+        assert service.read(user_context, "../etc/passwd.md") is None
