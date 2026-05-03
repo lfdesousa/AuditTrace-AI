@@ -61,6 +61,17 @@ cm_get() {
     -o jsonpath="{.data.${1}}"
 }
 
+# List ConfigMap data keys matching a glob-ish pattern. Returns one
+# key per line, in lexical order. Implementation: pull the full data
+# block as JSON, list its keys, filter by suffix/prefix in awk so we
+# don't depend on jq (which is not on the operator's PATH by default).
+cm_keys_matching() {
+  local pattern="$1"  # e.g. ".hcl" or "role-"
+  kubectl -n "${NAMESPACE}" get configmap "${POLICIES_CM}" \
+    -o go-template='{{range $k, $_ := .data}}{{$k}}{{"\n"}}{{end}}' \
+    | grep -E "${pattern}" | sort
+}
+
 echo "🔐 setup-vault.sh — configuring Vault for AuditTrace-AI"
 echo "   namespace=${NAMESPACE}"
 echo "   release=${RELEASE}"
@@ -126,16 +137,38 @@ vault_exec write auth/kubernetes/config \
 echo "  ✓ configured (token_reviewer_jwt left unset — Vault reads SA token live)"
 
 # --- 4. Apply policies -----------------------------------------------
+#
+# Discover policy names from the ConfigMap's `*.hcl` keys instead of
+# hardcoding a list. The previous approach lost a chart upgrade on
+# 2026-05-03: a new `memory-scopes-job.hcl` policy landed in the CM
+# but the script's hardcoded loop didn't include it, so Vault was
+# never told the role existed → vault-agent in the post-upgrade Job
+# got "RBAC: access denied" and the helm hook failed. With dynamic
+# discovery, adding a new entry to `templates/vault/configmap-policies.yaml`
+# is automatically picked up on the next `setup-vault.sh` run.
 echo "▶ Applying policies..."
-for policy in audittrace-server keycloak minio summariser-job memory-scopes-job chromadb; do
+policies=$(cm_keys_matching '\.hcl$' | sed 's/\.hcl$//')
+if [[ -z "${policies}" ]]; then
+  echo "❌ No *.hcl keys found in ${POLICIES_CM}." >&2
+  exit 1
+fi
+for policy in ${policies}; do
   printf '%s' "$(cm_get "${policy}\.hcl")" \
     | vault_exec_stdin policy write "${policy}" - >/dev/null
   echo "  ✓ ${policy}"
 done
 
 # --- 5. Apply role bindings ------------------------------------------
+#
+# Same dynamic-discovery shape — every `role-*.env` key in the CM
+# becomes a Vault Kubernetes-auth role with the given properties.
 echo "▶ Applying role bindings..."
-for role in audittrace-server keycloak minio summariser-job memory-scopes-job chromadb; do
+roles=$(cm_keys_matching '^role-.*\.env$' | sed -E 's/^role-(.*)\.env$/\1/')
+if [[ -z "${roles}" ]]; then
+  echo "❌ No role-*.env keys found in ${POLICIES_CM}." >&2
+  exit 1
+fi
+for role in ${roles}; do
   # Convert env-style ConfigMap data to vault write key=value args.
   args=$(cm_get "role-${role}\.env" | grep -v '^$' | tr '\n' ' ')
   # shellcheck disable=SC2086

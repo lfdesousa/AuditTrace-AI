@@ -228,6 +228,70 @@ data:
       done
     done
 
+    # ── Step 3: ensure user-identity protocol mappers ─────────────
+    #
+    # Without these mappers on user-facing clients, JWTs carry only a
+    # bare UUID `sub` and no `preferred_username` / `email` / `name`
+    # claims — every audit/log entry shows the UUID with no human
+    # identifier. Found in PR A's 2026-05-03 live test: smoke JWT had
+    # `preferred_username: None`.
+    #
+    # Why direct protocol mappers instead of the standard `profile`
+    # scope: Keycloak's `--import-realm` honours the realm.json's
+    # explicit `clientScopes` list and does NOT auto-create the
+    # built-in `profile` / `email` scopes when they're absent from the
+    # imported list. Adding them would mean either creating the scopes
+    # ourselves (with their full mapper bundle) or pulling in Keycloak's
+    # default scopes — both larger lifts. Direct client-level mappers
+    # are the surgical fix and what realm.json now declares for fresh
+    # installs.
+    #
+    # admin-client doesn't need these — service accounts have no human
+    # identity to surface.
+    ensure_mapper() {
+      local CLIENT_ID="$1" MAPPER_NAME="$2" USER_ATTR="$3" CLAIM_NAME="$4"
+      local CLIENT_UUID
+      if ! CLIENT_UUID=$(find_client_id "${CLIENT_ID}"); then
+        echo "  ⚠ client ${CLIENT_ID}: not found (skipped)"
+        return 0
+      fi
+      # Idempotency: list existing mappers, skip if name already present.
+      local existing
+      existing=$("${KCADM}" get \
+                   "clients/${CLIENT_UUID}/protocol-mappers/models" \
+                   -r "${REALM}" --fields name --format csv --noquotes \
+                   2>/dev/null | grep -Fx "${MAPPER_NAME}" || true)
+      if [[ -n "${existing}" ]]; then
+        echo "  ⊝ ${CLIENT_ID} mapper ${MAPPER_NAME}: exists"
+        return 0
+      fi
+      # Create the mapper. `oidc-usermodel-property-mapper` reads
+      # built-in user properties (username, email, firstName, lastName)
+      # and stamps them as the named claim on the access + id token.
+      #
+      # Why printf-into-pipe instead of a heredoc: this script lives
+      # inside a YAML block-scalar in a ConfigMap manifest. Bash
+      # heredocs with `<<EOF` require their body to start at column 0,
+      # which conflicts with YAML's mandatory consistent indentation.
+      # Building the JSON via a single-line printf sidesteps the
+      # indentation conflict cleanly.
+      local body
+      body=$(printf '{"name":"%s","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"%s","claim.name":"%s","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}' \
+        "${MAPPER_NAME}" "${USER_ATTR}" "${CLAIM_NAME}")
+      printf '%s' "${body}" | "${KCADM}" create \
+        "clients/${CLIENT_UUID}/protocol-mappers/models" \
+        -r "${REALM}" -f - >/dev/null
+      echo "  ✓ ${CLIENT_ID} mapper ${MAPPER_NAME}: created"
+    }
+
+    for CLIENT_ID in audittrace-opencode audittrace-webui; do
+      echo "▶ ensuring user-identity mappers on ${CLIENT_ID}..."
+      ensure_mapper "${CLIENT_ID}" preferred-username username preferred_username
+      ensure_mapper "${CLIENT_ID}" email email email
+      ensure_mapper "${CLIENT_ID}" given-name firstName given_name
+      ensure_mapper "${CLIENT_ID}" family-name lastName family_name
+    done
+
     echo "✅ memory-scopes provisioning complete."
 
     # ── Istio sidecar shutdown ────────────────────────────────────
