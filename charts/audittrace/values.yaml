@@ -115,6 +115,11 @@ memoryServer:
     AUDITTRACE_MINIO_SHARED_BUCKET: "memory-shared"
     AUDITTRACE_MINIO_PRIVATE_BUCKET: "memory-private"
     AUDITTRACE_TOOLS_CONFIG_PATH: "tools.toml"
+    # CORS allowed-origins for the FastAPI middleware. JSON array literal —
+    # parsed by pydantic-settings into ``list[str]``. Empty list disables
+    # CORS entirely (the production-safe default for BFF deployments).
+    # Override per deployment to add the operator's webui / SPA origin.
+    AUDITTRACE_CORS_ORIGINS: '["http://localhost:8765","http://localhost:3000"]'
     AUDITTRACE_METRICS_ENABLED: "true"
     AUDITTRACE_LANGFUSE_ENABLED: "true"
     # AUDITTRACE_LANGFUSE_HOST is injected by templates/memory-server/

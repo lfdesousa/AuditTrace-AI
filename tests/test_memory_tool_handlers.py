@@ -414,3 +414,136 @@ class TestCacheSemantics:
         )
         assert hit1 is False
         assert hit2 is True
+
+
+# ─────────────────── read_decision / read_skill (Phase A.1) ─────────────────
+
+
+class TestReadDecisionTool:
+    @pytest.mark.asyncio
+    async def test_read_decision_returns_full_content(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Regression: returns full untruncated content (was bounded by
+        `_SNIPPET_LIMIT = 400` in the recall_* tools).
+
+        Seeds a 5-KB ADR via the mock service so the assertion meaningfully
+        proves the 400-char limit is gone."""
+        big = "# ADR-025: Memory as Tools\n\n" + ("body line.\n" * 1000)
+        _populated_container._instances["episodic"].add_document(
+            big, title="ADR-025: Memory as Tools", file="ADR-025.md"
+        )
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_decision")
+        assert tool is not None
+        result, _ = await invoke_tool(
+            user, tool, {"file": "ADR-025.md"}, session_id="sess-1"
+        )
+        assert "error" not in result
+        assert result["file"] == "ADR-025.md"
+        assert result["source"] == "episodic"
+        assert result["title"] == "ADR-025: Memory as Tools"
+        assert result["content"] == big
+        assert len(result["content"]) > 5000  # well over the old 400-char cap
+
+    @pytest.mark.asyncio
+    async def test_read_decision_file_not_found_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_decision")
+        result, _ = await invoke_tool(
+            user, tool, {"file": "ADR-999-nope.md"}, session_id="sess-1"
+        )
+        assert result["error"] == "not_found"
+        assert result["file"] == "ADR-999-nope.md"
+
+    @pytest.mark.asyncio
+    async def test_read_decision_path_traversal_blocked(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_decision")
+        for bad in ["../etc/passwd.md", "subdir/ADR-001.md", "..\\win.md"]:
+            result, _ = await invoke_tool(
+                user, tool, {"file": bad}, session_id="sess-1"
+            )
+            assert result["error"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_read_decision_missing_file_arg_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_decision")
+        result, _ = await invoke_tool(user, tool, {}, session_id="sess-1")
+        assert "error" in result
+        assert "file" in result["error"]
+
+
+class TestReadSkillTool:
+    @pytest.mark.asyncio
+    async def test_read_skill_returns_full_content(
+        self, _populated_container, _fakeredis_cache
+    ):
+        big = "# IAM Skill\n\n" + ("OAuth2 OIDC line.\n" * 1000)
+        _populated_container._instances["procedural"].add_document(
+            big, skill="IAM-big", file="SKILL-IAM-big.md"
+        )
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_skill")
+        assert tool is not None
+        result, _ = await invoke_tool(
+            user, tool, {"file": "SKILL-IAM-big.md"}, session_id="sess-1"
+        )
+        assert "error" not in result
+        assert result["file"] == "SKILL-IAM-big.md"
+        assert result["source"] == "procedural"
+        assert result["title"] == "IAM-big"
+        assert result["content"] == big
+        assert len(result["content"]) > 5000
+
+    @pytest.mark.asyncio
+    async def test_read_skill_file_not_found_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_skill")
+        result, _ = await invoke_tool(
+            user, tool, {"file": "SKILL-NOPE.md"}, session_id="sess-1"
+        )
+        assert result["error"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_read_skill_missing_file_arg_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_skill")
+        result, _ = await invoke_tool(user, tool, {}, session_id="sess-1")
+        assert "error" in result
+        assert "file" in result["error"]
+
+
+class TestRecallSemanticUncap:
+    """``recall_semantic`` previously truncated chunks at 400 chars. Chunks
+    are bounded by the chunker so the second cap was hiding useful context."""
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_returns_untruncated_chunk(
+        self, _populated_container, _fakeredis_cache
+    ):
+        big_chunk = "RAG chunk text — " + ("cache theme repeated line.\n" * 200)
+        assert len(big_chunk) > 1000
+        _populated_container._instances["semantic"].add_document(
+            big_chunk, source="ADR-025", collection="decisions"
+        )
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "k": 4}, session_id="sess-1"
+        )
+        long_snippets = [
+            m["snippet"] for m in result["matches"] if len(m["snippet"]) > 400
+        ]
+        assert long_snippets, "expected at least one untruncated semantic chunk"

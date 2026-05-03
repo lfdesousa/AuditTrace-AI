@@ -147,6 +147,64 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
         return {}
 
 
+def _sanitise_assistant_tool_calls(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``msg`` with every ``tool_call.function.arguments``
+    field guaranteed to be a JSON-parseable dict-shaped string.
+
+    Background: a llama.cpp tool-calling model occasionally emits malformed
+    JSON inside ``<tool_call>`` blocks. The OpenAI response carries that
+    string verbatim. If we append the assistant message to history as-is,
+    the next round-trip POSTs the broken string back to llama-server, whose
+    chat-template renderer then chokes re-serialising it (parse_error.101 →
+    HTTP 500 in ~10 ms). The sanitising fallback at
+    ``_strip_tools_for_fallback`` handles the after-the-fact cleanup; this
+    helper prevents the poisoning at the source.
+
+    Replacement is ``"{}"`` (a valid JSON object literal) so the outer
+    ``tool_call`` structure stays intact for tool_call_id correlation and
+    the dispatcher's argument resolution still gets a usable empty dict.
+    """
+    if not isinstance(msg, dict):
+        return msg
+    tool_calls = msg.get("tool_calls")
+    if not tool_calls:
+        return dict(msg)
+    cleaned_calls: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            cleaned_calls.append(tc)
+            continue
+        fn = tc.get("function") or {}
+        raw = fn.get("arguments")
+        if isinstance(raw, dict):
+            # Already a dict — re-serialise to canonical JSON string and
+            # forward unchanged. Avoids mixed-shape downstream surprises.
+            cleaned_fn = {**fn, "arguments": json.dumps(raw)}
+            cleaned_calls.append({**tc, "function": cleaned_fn})
+            continue
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    cleaned_calls.append({**tc, "function": {**fn, "arguments": raw}})
+                    continue
+            except json.JSONDecodeError:
+                pass
+        # Either non-string-non-dict, or unparseable, or parsed to a non-dict
+        # (a bare list / number / null). Replace with empty-dict literal.
+        bad_repr = repr(raw)[:120] if raw is not None else "None"
+        logger.warning(
+            "sanitised malformed tool_call arguments — tool=%r call_id=%r raw=%s",
+            fn.get("name", "?"),
+            tc.get("id", "?"),
+            bad_repr,
+        )
+        cleaned_calls.append({**tc, "function": {**fn, "arguments": "{}"}})
+    out = dict(msg)
+    out["tool_calls"] = cleaned_calls
+    return out
+
+
 def _tool_call_signatures(
     tool_calls: list[dict[str, Any]],
 ) -> frozenset[tuple[str, str]]:
@@ -466,8 +524,12 @@ async def run_memory_tool_loop(
         last_sigs = this_sigs
 
         # All memory tools — execute each, append tool_result messages,
-        # and loop for the next iteration.
+        # and loop for the next iteration. Sanitise tool_call.arguments
+        # JSON strings BEFORE the message hits history, so the next
+        # llama-server round-trip never sees malformed JSON in a previous
+        # assistant turn (was the root cause of the 2026-05-02 chat 500s).
         assistant_msg = _extract_assistant_message(last_body)
+        assistant_msg = _sanitise_assistant_tool_calls(assistant_msg)
         messages.append(assistant_msg)
 
         for tc in memory_calls:

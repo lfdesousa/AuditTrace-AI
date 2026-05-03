@@ -42,7 +42,8 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
     ``failure_class``, ``error_detail``, ``duration_ms``) so the audit
     browser surfaces failed calls — without these the ADR-033 "every
     failure gets a row" promise is half-landed: the rows exist but the
-    audit API pretends they're all successes.
+    audit API pretends they're all successes. Migration 008 adds
+    ``trace_id`` for single-query Postgres↔Tempo correlation.
     """
     return {
         "id": row.id,
@@ -60,6 +61,7 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         "failure_class": row.failure_class,
         "error_detail": row.error_detail,
         "duration_ms": row.duration_ms,
+        "trace_id": row.trace_id,
     }
 
 

@@ -1179,3 +1179,155 @@ class TestToolParseErrorRetry:
             )
         assert final_body == {"error": {"message": "bad request payload"}}
         assert len(fake.post_calls) == 1
+
+
+# ───────────────── Phase A.2 — pre-emptive tool_call sanitisation ────────────
+
+
+class TestSanitiseAssistantToolCalls:
+    """``_sanitise_assistant_tool_calls`` runs between extracting the assistant
+    message and appending it to history. It guarantees every
+    ``tool_call.function.arguments`` is a JSON-parseable dict-shaped string,
+    preventing the 2026-05-02 history-poisoning class of 500 errors at the
+    source rather than via the post-hoc ``_strip_tools_for_fallback`` cleanup.
+    """
+
+    def _msg_with_args(self, args: object) -> dict:
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {"name": "recall_decisions", "arguments": args},
+                }
+            ],
+        }
+
+    def test_replaces_malformed_json_string_with_empty_object(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        msg = self._msg_with_args('{"query":')  # truncated, invalid JSON
+        out = _sanitise_assistant_tool_calls(msg)
+        assert out["tool_calls"][0]["function"]["arguments"] == "{}"
+        # Original is untouched.
+        assert msg["tool_calls"][0]["function"]["arguments"] == '{"query":'
+
+    def test_replaces_non_dict_parsed_json_with_empty_object(self):
+        """JSON parses but isn't a dict — same fix (empty object literal)."""
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        for bad in ['["a", "b"]', "42", "null", '"plain string"']:
+            out = _sanitise_assistant_tool_calls(self._msg_with_args(bad))
+            assert out["tool_calls"][0]["function"]["arguments"] == "{}"
+
+    def test_replaces_non_string_non_dict_arguments(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        for bad in [42, ["a", "b"], None]:
+            out = _sanitise_assistant_tool_calls(self._msg_with_args(bad))
+            assert out["tool_calls"][0]["function"]["arguments"] == "{}"
+
+    def test_passes_through_valid_json_string(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        good = '{"query": "cache compression"}'
+        out = _sanitise_assistant_tool_calls(self._msg_with_args(good))
+        assert out["tool_calls"][0]["function"]["arguments"] == good
+
+    def test_serialises_dict_arguments_to_canonical_json_string(self):
+        """Some clients forward already-parsed dicts. Re-serialise to a
+        string so downstream code never sees mixed-shape arguments."""
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        out = _sanitise_assistant_tool_calls(self._msg_with_args({"query": "cache"}))
+        args = out["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(args, str)
+        import json as _json
+
+        assert _json.loads(args) == {"query": "cache"}
+
+    def test_no_tool_calls_returns_copy(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        msg = {"role": "assistant", "content": "Hello!"}
+        out = _sanitise_assistant_tool_calls(msg)
+        assert out == msg
+        assert out is not msg
+
+    def test_non_dict_input_passes_through(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        # Defensive: bad upstream shape doesn't crash the helper.
+        assert _sanitise_assistant_tool_calls(None) is None  # type: ignore[arg-type]
+
+    def test_preserves_other_fields(self):
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        msg = {
+            "role": "assistant",
+            "content": "thinking text",
+            "tool_calls": [
+                {
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {"name": "recall_decisions", "arguments": "{bad"},
+                }
+            ],
+            "extra_field": "kept",
+        }
+        out = _sanitise_assistant_tool_calls(msg)
+        assert out["content"] == "thinking text"
+        assert out["extra_field"] == "kept"
+        assert out["tool_calls"][0]["id"] == "call_xyz"
+
+
+class TestLoopAppliesSanitisationProactively:
+    """End-to-end: when the model emits malformed tool_call arguments, the
+    next round-trip's payload contains the sanitised assistant message —
+    NOT the broken JSON string. Prevents the 2026-05-02 chat 500s from
+    recurring even before the post-hoc fallback can trigger."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_arguments_sanitised_before_history_send(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        # Iteration 1: model emits a tool_call with broken JSON arguments.
+        # Iteration 2: model answers in plain text (loop terminates).
+        broken = _tool_call_response("recall_decisions", '{"query":')
+        fake = _SequencedClient(
+            [
+                broken,
+                _text_response("Final answer."),
+            ]
+        )
+        with _patch_async_client(fake):
+            final_body, _ = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "explain ADR-025"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-sanitise-1",
+                max_iterations=5,
+            )
+        # Inspect the SECOND outgoing request: the assistant message in
+        # history must carry "{}" not the broken JSON string.
+        second = fake.post_calls[1]["json"]
+        assistant_msgs = [m for m in second["messages"] if m.get("role") == "assistant"]
+        assert len(assistant_msgs) >= 1
+        broken_args_in_history = [
+            tc["function"]["arguments"]
+            for am in assistant_msgs
+            for tc in (am.get("tool_calls") or [])
+        ]
+        assert "{}" in broken_args_in_history
+        # Bad JSON string must NOT be present anywhere in the assistant
+        # tool_calls of the second request.
+        assert all(a != '{"query":' for a in broken_args_in_history)
+        # Final body is the iteration-2 plain-text answer.
+        assert final_body["choices"][0]["message"]["content"] == "Final answer."

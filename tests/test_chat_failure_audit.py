@@ -217,6 +217,211 @@ class TestNonStreamingFailureAudit:
         assert row.status == "failed"
         assert row.failure_class == "upstream_unreachable"
 
+    def test_non_streaming_error_envelope_persists_failed_row(self, client):
+        """Phase A.4 regression: when the upstream returns HTTP 200 with a
+        body containing an ADR-033-shaped error envelope, the local audit row
+        MUST be ``status='failed'`` with a ``failure_class`` set — not
+        silently stored as success because we extracted empty choices."""
+        fake = _FakeAsyncClient(
+            post_json={
+                "error": {
+                    "message": "upstream_error: model returned malformed response",
+                    "type": "api_error",
+                    "param": None,
+                    "code": "upstream_error",
+                    "status": 502,
+                }
+            }
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "what is ADR-025?"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        # The proxy passes the body through unchanged (OpenAI compat).
+        assert response.status_code == 200
+        body = response.json()
+        assert body["error"]["code"] == "upstream_error"
+
+        row = _latest_interaction()
+        assert row is not None
+        assert row.status == "failed"
+        assert row.failure_class == "upstream_error"
+        assert "malformed response" in (row.error_detail or "")
+        assert row.duration_ms is not None
+
+    def test_non_streaming_error_envelope_unknown_code_falls_back_to_upstream_error(
+        self, client
+    ):
+        """An envelope with an unrecognised ``code`` still gets persisted as
+        failed; failure_class falls back to the most common origin."""
+        fake = _FakeAsyncClient(
+            post_json={
+                "error": {
+                    "message": "novel error class from a future llama version",
+                    "type": "api_error",
+                    "code": "something_new",
+                }
+            }
+        )
+        with _patch_async_client(fake):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        row = _latest_interaction()
+        assert row is not None
+        assert row.status == "failed"
+        assert row.failure_class == "upstream_error"
+
+
+@pytest.fixture
+def _real_tracer_provider():
+    """Install a real OpenTelemetry ``TracerProvider`` for the duration of a
+    test. The session-wide conftest skips provider installation when
+    ``otlp_endpoint=""`` (no exporter wanted), but trace_id capture needs a
+    valid span context — provider with no exporter is sufficient.
+    """
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    _otel_trace.set_tracer_provider(provider)
+    # Refresh the module-cached `_tracer` in chat.py so subsequent
+    # `start_as_current_span` calls bind to the new provider, not the old
+    # ProxyTracer that was captured at import time.
+    import audittrace.routes.chat as chat_mod
+
+    chat_mod._tracer = _otel_trace.get_tracer("audittrace.chat")
+    yield provider
+    # Best-effort restore. The OTel API enforces single-set semantics, so a
+    # full reset isn't possible — but tests in this class are isolated and
+    # downstream tests don't assert provider identity.
+
+
+class TestInteractionTraceIdCapture:
+    """Phase A.5 (migration 008): every persisted ``interactions`` row
+    carries the OpenTelemetry trace_id of the request that produced it,
+    so Postgres↔Tempo correlation is a single SQL lookup instead of a
+    3-tuple join on (user_id, session_id, timestamp).
+    """
+
+    def test_non_streaming_success_persists_trace_id(
+        self, client, _real_tracer_provider
+    ):
+        fake = _FakeAsyncClient(post_json=_ok_chat_response())
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "project": "AuditTrace",
+                },
+            )
+        assert response.status_code == 200
+        row = _latest_interaction()
+        assert row is not None
+        # FastAPI's auto-instrumented server span is active throughout the
+        # request, so trace_id is always captured. 32-char lowercase hex.
+        assert row.trace_id is not None
+        assert len(row.trace_id) == 32
+        assert all(c in "0123456789abcdef" for c in row.trace_id)
+        # Sentinel "all zeros" trace_id would mean is_valid was False —
+        # OTel uses INVALID_TRACE_ID == 0 for those.
+        assert row.trace_id != "0" * 32
+
+    def test_non_streaming_failure_persists_trace_id(
+        self, client, _real_tracer_provider
+    ):
+        """Even error rows carry the trace_id — that's the most useful case
+        because failures are the ones operators correlate to Tempo."""
+        fake = _FakeAsyncClient(post_exc=httpx.ReadTimeout("slow"))
+        with _patch_async_client(fake):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "slow"}],
+                    "project": "AuditTrace",
+                },
+            )
+        row = _latest_interaction()
+        assert row is not None
+        assert row.status == "failed"
+        assert row.trace_id is not None
+        assert len(row.trace_id) == 32
+
+    def test_error_envelope_path_persists_trace_id(self, client, _real_tracer_provider):
+        """The Phase A.4 path (body-level error envelope) also captures
+        trace_id — confirms the new persist branch added in this sweep
+        threads through ``_current_trace_id_hex``."""
+        fake = _FakeAsyncClient(
+            post_json={
+                "error": {
+                    "message": "upstream parse error",
+                    "type": "api_error",
+                    "code": "upstream_error",
+                }
+            }
+        )
+        with _patch_async_client(fake):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "project": "AuditTrace",
+                },
+            )
+        row = _latest_interaction()
+        assert row is not None
+        assert row.status == "failed"
+        assert row.trace_id is not None
+        assert len(row.trace_id) == 32
+
+
+class TestCurrentTraceIdHexHelper:
+    """Direct-unit coverage for the helper itself (independent of the
+    request hot path) — guards the format and the no-active-span branch.
+    """
+
+    def test_returns_hex_format_when_span_active(self, _real_tracer_provider):
+        from opentelemetry import trace as _otel_trace
+
+        from audittrace.routes.chat import _current_trace_id_hex
+
+        tracer = _otel_trace.get_tracer("audittrace.tests")
+        with tracer.start_as_current_span("test-span"):
+            tid = _current_trace_id_hex()
+        assert tid is not None
+        assert len(tid) == 32
+        assert all(c in "0123456789abcdef" for c in tid)
+
+    def test_returns_none_when_no_active_span(self):
+        """Outside any span (and without a real provider), returns ``None``
+        instead of fabricating zeros. The implementation guards on
+        ``ctx.is_valid`` which is False for INVALID_SPAN."""
+        from audittrace.routes.chat import _current_trace_id_hex
+
+        result = _current_trace_id_hex()
+        # The session-wide telemetry init in conftest does not install a
+        # real TracerProvider (otlp_endpoint=""), so the active span is
+        # the OTel NoOp INVALID_SPAN ⇒ is_valid=False ⇒ helper returns
+        # None. If a parallel test installed a real provider via the
+        # ``_real_tracer_provider`` fixture, we accept either case.
+        assert result is None or (len(result) == 32 and result != "0" * 32)
+
 
 class TestToolsModeFailureAudit:
     """ADR-025 tools mode — previously the single biggest audit hole.

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from audittrace.identity import UserContext
 from audittrace.services.episodic import S3EpisodicService
 from audittrace.services.procedural import S3ProceduralService
@@ -196,12 +198,16 @@ class TestS3ProceduralService:
 class TestCreateMinioClient:
     """Tests for _create_minio_client in dependencies.py."""
 
-    def test_returns_none_when_secret_key_empty(self):
+    def test_raises_when_secret_key_empty(self):
+        """Since the 2026-05-03 sweep, MinIO is mandatory — missing secret
+        key surfaces as a startup-time RuntimeError, not a silent FS
+        fallback. See ``feedback_storage_always_s3``."""
         from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
         settings.minio_secret_key = ""
-        assert _create_minio_client(settings) is None
+        with pytest.raises(RuntimeError, match="MinIO is required"):
+            _create_minio_client(settings)
 
     def test_returns_client_when_configured(self):
         from audittrace.dependencies import _create_minio_client
@@ -222,7 +228,9 @@ class TestCreateMinioClient:
                 secure=False,
             )
 
-    def test_returns_none_on_import_error(self):
+    def test_raises_on_client_init_error(self):
+        """Construction failure is surfaced as RuntimeError, not silently
+        swallowed — same rule as the missing-secret-key branch."""
         from audittrace.dependencies import _create_minio_client
 
         settings = MagicMock()
@@ -234,8 +242,10 @@ class TestCreateMinioClient:
             "audittrace.dependencies.Minio",
             side_effect=Exception("minio not installed"),
         ):
-            client = _create_minio_client(settings)
-            assert client is None
+            with pytest.raises(
+                RuntimeError, match="MinIO client initialisation failed"
+            ):
+                _create_minio_client(settings)
 
     def test_https_url_sets_secure_true(self):
         from audittrace.dependencies import _create_minio_client

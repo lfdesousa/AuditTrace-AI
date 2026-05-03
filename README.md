@@ -25,8 +25,8 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 
 ## Features
 
-- 🧠 **4-Layer Memory Architecture** -- Episodic (ADRs), procedural (skills), conversational (PostgreSQL), semantic (ChromaDB). MinIO-backed in production; file-backed fallback in dev.
-- 🛠️ **Memory-as-Tools** -- LLM calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` on demand instead of paying the 4-layer cost on every prompt (ADR-025). Dynamic registry, Redis-backed result cache, configurable iteration cap.
+- 🧠 **4-Layer Memory Architecture** -- Episodic (ADRs), procedural (skills), conversational (PostgreSQL), semantic (ChromaDB). Layers 1+2 are **always** MinIO-backed (S3) — no filesystem fallback; tests use `Mock*` services.
+- 🛠️ **Memory-as-Tools** -- LLM calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` (snippet discovery) plus `read_decision`, `read_skill` (full-content fetch by filename) on demand instead of paying the 4-layer cost on every prompt (ADR-025). Dynamic registry, Redis-backed result cache, configurable iteration cap.
 - 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026).
 - 🔐 **External IdP Federation** -- Keycloak brokering to Google Workspace / Okta / EntraID for multi-tenant SSO (ADR-044). Multi-issuer JWT validation already in place (ADR-032 §2).
 - 🗄️ **Server-Mode Databases** -- PostgreSQL 16 + ChromaDB HTTP server + Redis 7, all with authentication (ADR-019, ADR-020).
@@ -264,14 +264,16 @@ The Istio Gateway terminates TLS on NodePort 30952 and fans out via a VirtualSer
 
 ### 4-Layer Memory
 
-| Layer | Production (MinIO-backed) | Dev fallback | Purpose |
+| Layer | Implementation | Test backend | Purpose |
 |---|---|---|---|
-| 1. Episodic | `S3EpisodicService` (MinIO bucket prefix `episodic/`) | `FileEpisodicService` (`docs/ADR-*.md`) | Architecture decisions |
-| 2. Procedural | `S3ProceduralService` (MinIO bucket prefix `procedural/`) | `FileProceduralService` (`memory/procedural/SKILL-*.md`) | Reusable skill documents |
+| 1. Episodic | `S3EpisodicService` (MinIO bucket prefix `episodic/`) | `MockEpisodicService` | Architecture decisions |
+| 2. Procedural | `S3ProceduralService` (MinIO bucket prefix `procedural/`) | `MockProceduralService` | Reusable skill documents |
 | 3. Conversational | `PostgresConversationalService` | (same) | Session history + continuity |
 | 4. Semantic | `ChromaSemanticService` | (same) | Vector search / RAG |
 
-S3-backed services activate when `AUDITTRACE_MINIO_SECRET_KEY` is set — the standard configuration in both k3s (Vault-injected) and docker-compose (set via `.env`). The file-based services remain as the no-MinIO fallback. All services follow the ABC + implementation + mock pattern with `@log_call` observability.
+Layers 1 + 2 are **S3-only** — `AUDITTRACE_MINIO_SECRET_KEY` is mandatory at startup; missing config raises a clear `RuntimeError` instead of silently falling back to filesystem. This applies to all environments including local dev (the file-backed services were removed in the 2026-05-03 stabilization sweep). Unit tests use the `Mock*` services. All services follow the ABC + implementation + mock pattern with `@log_call` observability.
+
+Each layer's read paths support two access shapes: snippet-discovery (`recall_*`, returns truncated previews of matches) and full-content fetch (`read_decision`, `read_skill`, returns the entire document by exact filename — used after a `recall_*` narrows the candidate). See [Memory-as-Tools](#memory-as-tools-adr-025) for the env-var surface.
 
 ### Memory Access Modes (ADR-025)
 
@@ -279,10 +281,10 @@ The 4-layer memory can be exposed to the LLM in two different ways. The choice i
 
 | Mode | What happens on every `/v1/chat/completions` | Trade-off |
 |---|---|---|
-| **`tools`** *(live default — `.env` ships with this set)* | The proxy advertises four recall tools to the LLM and runs a tool-call loop. The model decides which layer it needs and calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, or `recall_semantic` on demand — at most once per question in practice. Results are cached in Redis (TTL 900s) and audit-logged to `tool_calls`. | Pay memory cost only when the model asks. Extra round-trips to llama-server (one per tool iteration), bounded by `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS`. |
+| **`tools`** *(live default — `.env` ships with this set)* | The proxy advertises six recall tools to the LLM and runs a tool-call loop. The model decides which layer it needs and calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` (snippet-level discovery) or `read_decision` / `read_skill` (full-content fetch by exact filename) on demand — at most once per question in practice. Results are cached in Redis (TTL 900s) and audit-logged to `tool_calls`. | Pay memory cost only when the model asks. Extra round-trips to llama-server (one per tool iteration), bounded by `AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS`. |
 | **`inject`** *(legacy — v0.2.x default)* | The proxy retrieves all 4 layers up front and injects them into the system message. The model sees a preassembled context block and never issues tool calls for memory. | Zero tool-loop latency but every prompt pays the full 4-layer retrieval + token cost, even when the model would have ignored memory. |
 
-The four tools in `tools` mode each map to one layer and carry their own Keycloak scope (`memory:episodic:read`, `memory:procedural:read`, `memory:conversational:read-own`, `memory:semantic:read`). Per-user isolation, RLS, and the ChromaDB scoped wrapper apply unchanged to both modes — the difference is purely *when* the layers are queried, not *what* the user sees.
+The six tools in `tools` mode each map to one layer and carry their own Keycloak scope (`memory:episodic:read` for `recall_decisions` + `read_decision`, `memory:procedural:read` for `recall_skills` + `read_skill`, `memory:conversational:read-own` for `recall_recent_sessions`, `memory:semantic:read` for `recall_semantic`). The `read_*` tools fetch a single document by exact filename and return the full untruncated content — use them after a `recall_*` snippet hints at a candidate but the question requires the whole ADR / SKILL. Per-user isolation, RLS, and the ChromaDB scoped wrapper apply unchanged to both modes — the difference is purely *when* the layers are queried, not *what* the user sees.
 
 Switch modes by setting `AUDITTRACE_MEMORY_MODE=inject|tools` in `.env` (dev) or chart values (k3s) and rolling the memory-server pod. See [ADR-025](docs/ADR-025-memory-as-tools.md) for the full design and the acceptance evidence.
 
@@ -344,8 +346,8 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | `audittrace:context` | `/context` |
 | `audittrace:audit` | `/interactions` |
 | `audittrace:admin` | `/metrics` |
-| `memory:episodic:read` | `recall_decisions` tool (ADR-025) |
-| `memory:procedural:read` | `recall_skills` tool |
+| `memory:episodic:read` | `recall_decisions` (snippet discovery) + `read_decision` (full content) tools (ADR-025) |
+| `memory:procedural:read` | `recall_skills` + `read_skill` tools |
 | `memory:conversational:read-own` | `recall_recent_sessions` tool |
 | `memory:semantic:read` | `recall_semantic` tool |
 

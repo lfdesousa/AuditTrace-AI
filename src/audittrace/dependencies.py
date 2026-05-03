@@ -5,7 +5,6 @@ No file-based databases from this point forward.
 """
 
 import logging
-from pathlib import Path
 from typing import Any, cast
 
 from fastapi import Depends
@@ -35,12 +34,10 @@ from audittrace.services.conversational import (
 )
 from audittrace.services.episodic import (
     EpisodicService,
-    FileEpisodicService,
     MockEpisodicService,
     S3EpisodicService,
 )
 from audittrace.services.procedural import (
-    FileProceduralService,
     MockProceduralService,
     ProceduralService,
     S3ProceduralService,
@@ -131,10 +128,21 @@ def register_default_dependencies(settings: Settings | None = None) -> None:
     _register_memory_services(settings, pg_factory)
 
 
-def _create_minio_client(settings: Settings) -> object | None:
-    """Create a MinIO client if credentials are configured (ADR-027)."""
+def _create_minio_client(settings: Settings) -> object:
+    """Create a MinIO client. Required — there is no FS fallback (ADR-027,
+    ``feedback_storage_always_s3``).
+
+    Raises ``RuntimeError`` if MinIO is not configured (missing secret key)
+    or the client fails to initialise. Layers 1 + 2 are S3-only by design;
+    a missing client is a startup-time error, not a silent degradation.
+    """
     if not settings.minio_secret_key:
-        return None
+        raise RuntimeError(
+            "MinIO is required for episodic + procedural memory layers. "
+            "Set AUDITTRACE_MINIO_SECRET_KEY (and AUDITTRACE_MINIO_ACCESS_KEY / "
+            "AUDITTRACE_MINIO_URL). Filesystem fallback removed in 2026-05-03 "
+            "stabilization sweep — see feedback_storage_always_s3."
+        )
     try:
         from urllib.parse import urlparse  # noqa: E402
 
@@ -148,37 +156,34 @@ def _create_minio_client(settings: Settings) -> object | None:
             secure=secure,
         )
         logger.info("MinIO client initialised — endpoint=%s", endpoint)
-        return client  # type: ignore[no-any-return]
+        return client
     except Exception as exc:
-        logger.warning("MinIO client init failed, falling back to filesystem: %s", exc)
-        return None
+        raise RuntimeError(
+            f"MinIO client initialisation failed: {exc}. "
+            "Layers 1+2 are S3-only — no filesystem fallback."
+        ) from exc
 
 
 @log_call(logger=logger)
 def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -> None:
     """Register all 4 memory layer services + context builder (ADR-018, ADR-027).
 
-    When MinIO credentials are configured, S3-backed services replace the
-    filesystem services for Layers 1+2. Otherwise falls back to File* services.
+    Layers 1 + 2 are **always S3-backed** (MinIO). There is no filesystem
+    fallback — see ``feedback_storage_always_s3``.
     """
     minio_client = _create_minio_client(settings)
 
-    if minio_client is not None:
-        episodic: EpisodicService = S3EpisodicService(
-            minio_client=minio_client,
-            bucket=settings.minio_shared_bucket,
-            prefix="episodic/",
-        )
-        procedural: ProceduralService = S3ProceduralService(
-            minio_client=minio_client,
-            bucket=settings.minio_shared_bucket,
-            prefix="procedural/",
-        )
-        logger.info("Memory layers 1+2: S3-backed (MinIO)")
-    else:
-        episodic = FileEpisodicService(adr_dir=Path(settings.adr_dir))
-        procedural = FileProceduralService(skill_dir=Path(settings.skill_dir))
-        logger.info("Memory layers 1+2: filesystem-backed (fallback)")
+    episodic: EpisodicService = S3EpisodicService(
+        minio_client=minio_client,
+        bucket=settings.minio_shared_bucket,
+        prefix="episodic/",
+    )
+    procedural: ProceduralService = S3ProceduralService(
+        minio_client=minio_client,
+        bucket=settings.minio_shared_bucket,
+        prefix="procedural/",
+    )
+    logger.info("Memory layers 1+2: S3-backed (MinIO)")
 
     conversational = PostgresConversationalService(
         session_factory=pg_factory.get_session_factory(),

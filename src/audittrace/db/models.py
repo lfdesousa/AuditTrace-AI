@@ -89,6 +89,11 @@ class InteractionRecord(Base):
     failure_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Migration 008 (2026-05-03): OpenTelemetry trace_id for single-query
+    # Postgres↔Tempo correlation. Captured once per request from the active
+    # span context; indexed because the lookup pattern is "find rows by
+    # trace_id". 32-char lowercase hex string per OTel format.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
 
 class ToolCall(Base):
