@@ -31,6 +31,24 @@ COPY --from=builder /root/.local /home/sovereign/.local
 ENV PATH=/home/sovereign/.local/bin:$PATH
 ENV PYTHONPATH=/app/src
 
+# Pre-warm ChromaDB's default embedding model (all-MiniLM-L6-v2, ~79 MB
+# ONNX). Without this, the FIRST `collection.upsert()` call from any pod
+# triggers an in-process download that blocks the FastAPI worker for
+# ~26 s — long enough for kubelet's liveness probe to mark the pod
+# unhealthy, kill it mid-request, and CrashLoopBackOff. Found in PR A's
+# 2026-05-03 live test (semantic POST 200 then GET/PUT/DELETE 503).
+#
+# Baking the model into the image layer means every pod that boots has
+# it on disk already — no startup hit, no in-request hit, no liveness
+# false-positive. Trade-off: ~79 MB image size increase.
+#
+# Run as root to populate /home/sovereign/.cache, then chown to the
+# runtime UID so the sovereign user can read the cached model at
+# runtime. ChromaDB's DefaultEmbeddingFunction resolves the cache
+# location from $HOME, so we set it explicitly.
+RUN HOME=/home/sovereign python -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; ef = DefaultEmbeddingFunction(); ef(['prewarm'])" && \
+    chown -R 1000:1000 /home/sovereign/.cache
+
 # Copy application source and scripts
 COPY src/ ./src/
 COPY alembic.ini ./

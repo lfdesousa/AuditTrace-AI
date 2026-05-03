@@ -427,6 +427,37 @@ class TestRealmMemoryWriteScopes:
                 f"{client_id} missing optional write scopes: {expected - optional!r}"
             )
 
+    def test_user_facing_clients_carry_user_identity_mappers(self) -> None:
+        """JWTs issued via audittrace-opencode / audittrace-webui must
+        carry `preferred_username`, `email`, `given_name`, `family_name`
+        claims so audit logs can show a human-readable identifier
+        instead of a bare UUID `sub`.
+
+        Found in PR A's 2026-05-03 live test: the smoke JWT had
+        `preferred_username: None`. The fix is direct protocol mappers
+        on each client (rather than the standard `profile` scope —
+        Keycloak's `--import-realm` does not auto-create the standard
+        scopes when realm.json declares an explicit `clientScopes`
+        list, so adding "profile" to defaultClientScopes resolves to
+        nothing). See the provisioner script for the full rationale."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        expected_mappers = {
+            "preferred-username",
+            "email",
+            "given-name",
+            "family-name",
+        }
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            mappers = {m["name"] for m in client.get("protocolMappers") or []}
+            missing = expected_mappers - mappers
+            assert not missing, (
+                f"{client_id}: missing user-identity protocolMappers: "
+                f"{missing!r}; got {mappers!r}"
+            )
+
 
 class TestMemoryScopesProvisioningJob:
     """Helm post-install/post-upgrade Job that provisions the three
@@ -524,6 +555,35 @@ class TestMemoryScopesProvisioningJob:
         script = cm["data"]["ensure-memory-scopes.sh"]
         for client_id in ("admin-client", "audittrace-opencode", "audittrace-webui"):
             assert client_id in script, f"script missing client binding: {client_id}"
+
+    def test_script_creates_user_identity_mappers(self) -> None:
+        """The provisioner script must also create user-identity
+        protocol mappers on user-facing clients for EXISTING realms
+        (the realm.json change only affects fresh installs).
+
+        This was added after PR A's 2026-05-03 live test where the JWT
+        had `preferred_username: None`. The fix is direct protocol
+        mappers on each client (rather than the standard `profile`
+        scope — Keycloak's `--import-realm` does not auto-create the
+        standard scopes when realm.json declares an explicit
+        `clientScopes` list)."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        assert "ensure_mapper()" in script, (
+            "script no longer defines ensure_mapper() — user-identity "
+            "claims will be missing on existing realms"
+        )
+        for line in (
+            'ensure_mapper "${CLIENT_ID}" preferred-username username preferred_username',
+            'ensure_mapper "${CLIENT_ID}" email email email',
+            'ensure_mapper "${CLIENT_ID}" given-name firstName given_name',
+            'ensure_mapper "${CLIENT_ID}" family-name lastName family_name',
+        ):
+            assert line in script, f"script missing mapper line: {line}"
+        assert "for CLIENT_ID in audittrace-opencode audittrace-webui" in script, (
+            "user-identity mapper loop targets wrong/missing clients"
+        )
 
     def test_vault_role_and_policy_declared(self) -> None:
         """When vault.enabled=true, the Job needs a Vault role bound

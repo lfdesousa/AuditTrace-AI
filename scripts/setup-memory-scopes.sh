@@ -167,4 +167,51 @@ for CLIENT_ID in "${!CLIENT_KIND[@]}"; do
   done
 done
 
+# ----- User-identity protocol mappers -----
+# Without these, JWTs from user-facing clients lack `preferred_username`,
+# `email`, `name` etc. — only a bare UUID `sub`. Found in PR A's
+# 2026-05-03 live test. See the in-cluster Job script for the full
+# rationale on why direct mappers (not the standard `profile` scope).
+# admin-client doesn't need this — service accounts have no human
+# identity to surface.
+ensure_mapper() {
+  local CLIENT_ID="$1" MAPPER_NAME="$2" USER_ATTR="$3" CLAIM_NAME="$4"
+  local CLIENT_UUID
+  CLIENT_UUID=$(kcadm get clients -r "${REALM}" \
+                  -q "clientId=${CLIENT_ID}" \
+                  --fields id --format csv --noquotes 2>/dev/null \
+                | tr -d '"' | head -1)
+  if [[ -z "${CLIENT_UUID}" ]]; then
+    echo "  ⚠ client ${CLIENT_ID}: not found (skipped)"
+    return 0
+  fi
+  local existing
+  existing=$(kcadm get \
+               "clients/${CLIENT_UUID}/protocol-mappers/models" \
+               -r "${REALM}" --fields name --format csv --noquotes \
+               2>/dev/null | grep -Fx "${MAPPER_NAME}" || true)
+  if [[ -n "${existing}" ]]; then
+    echo "  ⊝ ${CLIENT_ID} mapper ${MAPPER_NAME}: exists"
+    return 0
+  fi
+  # Single-line JSON via printf — same shape as the in-cluster Job
+  # script; see configmap-memory-scopes-script.yaml for the heredoc-vs-
+  # YAML rationale.
+  local body
+  body=$(printf '{"name":"%s","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"%s","claim.name":"%s","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}' \
+    "${MAPPER_NAME}" "${USER_ATTR}" "${CLAIM_NAME}")
+  printf '%s' "${body}" | kcadm create \
+    "clients/${CLIENT_UUID}/protocol-mappers/models" \
+    -r "${REALM}" -f - >/dev/null
+  echo "  ✓ ${CLIENT_ID} mapper ${MAPPER_NAME}: created"
+}
+
+for CLIENT_ID in audittrace-opencode audittrace-webui; do
+  echo "▶ ensuring user-identity mappers on ${CLIENT_ID}..."
+  ensure_mapper "${CLIENT_ID}" preferred-username username preferred_username
+  ensure_mapper "${CLIENT_ID}" email email email
+  ensure_mapper "${CLIENT_ID}" given-name firstName given_name
+  ensure_mapper "${CLIENT_ID}" family-name lastName family_name
+done
+
 echo "✅ memory-scopes provisioning complete."
