@@ -335,6 +335,8 @@ For first-party web UIs (LibreChat, future audit dashboards) we use OIDC Authori
 **External IdP — Keycloak brokering (ADR-044):**
 Google Workspace / Okta / EntraID identities federate through Keycloak realm brokering. The memory-server's JWT validation is multi-issuer (ADR-032 §2) and accepts both the local realm issuer and any configured federated issuers via `AUDITTRACE_KEYCLOAK_EXTRA_ISSUERS`. No code changes were needed in the validation layer.
 
+→ See [`docs/guides/idp-federation-setup.md`](docs/guides/idp-federation-setup.md) for the operator-side procedure (uses `scripts/setup-idp-federation.sh`, post-Phase-B.3 auto-populates all OIDC discovery endpoints).
+
 **Service accounts (CI, smoke tests) -- `client_credentials`:**
 The `audittrace-dev` client is the right choice for non-interactive scripts; see `scripts/mint-dev-jwt.sh`.
 

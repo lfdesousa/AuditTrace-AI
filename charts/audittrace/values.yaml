@@ -317,6 +317,24 @@ keycloak:
   hostnameUrl: "https://audittrace.local"
   externalIssuers:
     - "https://audittrace.local/realms/audittrace"
+  # `audittrace-webui` Keycloak client config. The realm-import JSON at
+  # files/realm-audittrace.json templates these via `tpl` so per-deployment
+  # overrides land cleanly. Add an entry for each external hostname the
+  # webui will be served from (including the operator's own
+  # `audittrace.allaboutdata.eu:30952` if applicable). See Phase B.9
+  # in the 2026-05-03 stabilisation tail PR for context.
+  webui:
+    redirectUris:
+      - "https://audittrace.local/oauth2/callback"
+      - "https://audittrace.local/*"
+      - "https://audittrace.local:30952/oauth2/callback"
+      - "https://audittrace.local:30952/*"
+      - "http://localhost:8765/*"
+    webOrigins:
+      - "https://audittrace.local"
+      - "https://audittrace.local:30952"
+      - "http://localhost:8765"
+    postLogoutRedirectUri: "https://audittrace.local/*"
   resources:
     requests:
       cpu: 500m

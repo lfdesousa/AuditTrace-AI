@@ -221,20 +221,18 @@
       "serviceAccountsEnabled": false,
       "protocol": "openid-connect",
       "redirectUris": [
-        "https://audittrace.local/oauth2/callback",
-        "https://audittrace.local/*",
-        "https://audittrace.local:30952/oauth2/callback",
-        "https://audittrace.local:30952/*",
-        "http://localhost:8765/*"
+{{- range $i, $uri := .Values.keycloak.webui.redirectUris }}{{ if $i }},{{ end }}
+        "{{ $uri }}"
+{{- end }}
       ],
       "webOrigins": [
-        "https://audittrace.local",
-        "https://audittrace.local:30952",
-        "http://localhost:8765"
+{{- range $i, $origin := .Values.keycloak.webui.webOrigins }}{{ if $i }},{{ end }}
+        "{{ $origin }}"
+{{- end }}
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "https://audittrace.local/*"
+        "post.logout.redirect.uris": "{{ .Values.keycloak.webui.postLogoutRedirectUri }}"
       },
       "defaultClientScopes": [
         "audittrace:query",
