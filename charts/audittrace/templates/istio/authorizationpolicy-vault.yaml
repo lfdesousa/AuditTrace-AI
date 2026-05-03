@@ -8,15 +8,24 @@
 #
 # The allowed SAs map 1:1 with the kubernetes-auth roles in
 # templates/vault/configmap-policies.yaml:
-#   - memory-server       → role audittrace-server
-#   - audittrace-keycloak → role keycloak
-#   - audittrace-minio    → role minio
-#   - audittrace-chromadb → role chromadb
-#   - default             → role summariser-job (the post-install hook Job)
+#   - memory-server                       → role audittrace-server
+#   - audittrace-keycloak                 → role keycloak
+#   - audittrace-minio                    → role minio
+#   - audittrace-chromadb                 → role chromadb
+#   - default                             → role summariser-job (post-install hook Job)
+#   - audittrace-memory-scopes-job        → role memory-scopes-job (post-upgrade hook Job)
 #
 # The Vault Agent Injector itself does NOT reach :8200 — it only patches
 # pod specs at admission time. So the injector SA is intentionally absent
 # from this allow-list.
+#
+# 2026-05-03 lesson: Vault role config (in `auth/kubernetes/role/<name>`)
+# was correct, manual `vault write auth/kubernetes/login` from inside
+# the vault pod succeeded, but the Job's vault-agent got `403: RBAC:
+# access denied`. Cause: missing principal in this AP — Envoy was
+# rejecting the request before Vault ever saw it. Adding a Vault-bound
+# workload requires updating BOTH the Vault role AND this AP. A future
+# verify-deploy gate should catch the divergence (PR B).
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
@@ -37,6 +46,7 @@ spec:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-minio"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-chromadb"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-memory-scopes-job"
       to:
         - operation:
             ports: ["8200"]

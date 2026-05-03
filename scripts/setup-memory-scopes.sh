@@ -147,9 +147,15 @@ bind_scope() {
     PATH_SUFFIX="optional-client-scopes"
   fi
 
-  kcadm update \
-    "clients/${CLIENT_UUID}/${PATH_SUFFIX}/${SCOPE_UUID}" \
-    -r "${REALM}" -s "" >/dev/null 2>&1 || true
+  # `-b '{}'` not `-s ''` — see configmap-memory-scopes-script.yaml
+  # for the 2026-05-03 lesson on why the kcadm binding command needs
+  # an explicit empty JSON body rather than an empty -s argument.
+  if ! kcadm update \
+         "clients/${CLIENT_UUID}/${PATH_SUFFIX}/${SCOPE_UUID}" \
+         -r "${REALM}" -b '{}' >/dev/null 2>&1; then
+    echo "  ✗ ${CLIENT_ID} ${KIND} ← ${SCOPE} (kcadm rejected the bind)" >&2
+    return 1
+  fi
   echo "  ✓ ${CLIENT_ID} ${KIND} ← ${SCOPE}"
 }
 

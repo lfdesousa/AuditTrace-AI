@@ -127,7 +127,7 @@ echo "  ✓ configured (token_reviewer_jwt left unset — Vault reads SA token l
 
 # --- 4. Apply policies -----------------------------------------------
 echo "▶ Applying policies..."
-for policy in audittrace-server keycloak minio summariser-job chromadb; do
+for policy in audittrace-server keycloak minio summariser-job memory-scopes-job chromadb; do
   printf '%s' "$(cm_get "${policy}\.hcl")" \
     | vault_exec_stdin policy write "${policy}" - >/dev/null
   echo "  ✓ ${policy}"
@@ -135,7 +135,7 @@ done
 
 # --- 5. Apply role bindings ------------------------------------------
 echo "▶ Applying role bindings..."
-for role in audittrace-server keycloak minio summariser-job chromadb; do
+for role in audittrace-server keycloak minio summariser-job memory-scopes-job chromadb; do
   # Convert env-style ConfigMap data to vault write key=value args.
   args=$(cm_get "role-${role}\.env" | grep -v '^$' | tr '\n' ' ')
   # shellcheck disable=SC2086

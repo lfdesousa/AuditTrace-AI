@@ -481,6 +481,26 @@ class TestMemoryScopesProvisioningJob:
         joined = "\n".join(principals)
         assert "memory-scopes-job" in joined
 
+    def test_vault_authorizationpolicy_allows_job_sa(self) -> None:
+        """The Vault AP must allow the Job's SA principal — without
+        this Envoy rejects the vault-agent's auth/kubernetes/login
+        with `403: RBAC: access denied` BEFORE Vault ever sees the
+        request. The 2026-05-03 live debug found this the hard way:
+        Vault role was correct, manual login worked from inside the
+        vault pod (bypasses Istio), but the Job pod's vault-agent
+        consistently failed because Envoy denied the request first.
+
+        Adding a Vault-bound workload requires three coordinated edits
+        — the Vault policy, the Vault role, AND this AP. Drift in any
+        one of the three breaks live auth silently."""
+        out = _render(["--set", "vault.enabled=true"])
+        ap = _find_workload(out, "AuthorizationPolicy", "audittrace-allow-vault")
+        principals = ap["spec"]["rules"][0]["from"][0]["source"]["principals"]
+        joined = "\n".join(principals)
+        assert "memory-scopes-job" in joined, (
+            f"Vault AP missing memory-scopes-job principal; got: {principals!r}"
+        )
+
     def test_script_configmap_lists_three_scopes(self) -> None:
         """Regression guard against drift: the three scopes the
         provisioner script ensures must match the realm.json
