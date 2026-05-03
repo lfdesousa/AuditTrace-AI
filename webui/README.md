@@ -1,9 +1,12 @@
-# AuditTrace WebUI — minimalist OIDC + chat probe
+# AuditTrace WebUI — minimalist OIDC + chat probe + memory backoffice
 
 A single-page browser harness that exercises the full
 **OIDC Authorization Code + PKCE** flow against the `audittrace-webui`
-Keycloak client, then uses the resulting JWT to hit
-`/v1/chat/completions`.
+Keycloak client, then uses the resulting JWT to:
+
+1. Hit `/v1/chat/completions` (the **Chat** tab — original purpose).
+2. Administer the three non-conversational memory layers via the
+   v1.0.3 CRUD endpoints (the **Memory** tab — added v1.0.5).
 
 This is a **harness**, not a product. It exists to:
 
@@ -15,6 +18,10 @@ This is a **harness**, not a product. It exists to:
    build step.
 3. Let an operator validate that the realm wiring is correct without
    spinning up LibreChat.
+4. Let an operator administer ADRs / SKILLs / semantic docs from a
+   browser instead of `kubectl exec`-ing a pod and running
+   `seed-memory.py`. Per-layer write scopes gate every action and
+   buttons gray out when the JWT is missing the right scope.
 
 The full first-party UI work lives separately under M3 (LibreChat
 Day-1, see `project_m3_librechat_split` memory). This webui is
@@ -38,14 +45,21 @@ deliberately *minimal* — it is not LibreChat in disguise.
 ## What the page does
 
 - **PKCE generation** in `crypto.subtle` — random verifier, SHA-256
-  challenge, stored in `sessionStorage` across the redirect.
+  challenge, stored in `localStorage` across the redirect.
 - **Authorization Code flow** with optional `kc_idp_hint` parameter
   to pre-select a brokered IdP (e.g. `google-test`).
 - **Token exchange** against `/realms/audittrace/protocol/openid-connect/token`.
 - **JWT decoding** — header.payload split + base64url decode of the
   payload, displayed inline.
-- **Chat probe** — `POST /v1/chat/completions` with the JWT as
-  bearer; response shown inline.
+- **Chat probe** (Chat tab) — `POST /v1/chat/completions` with the
+  JWT as bearer; response shown inline.
+- **Memory backoffice** (Memory tab) — full CRUD on episodic /
+  procedural / semantic layers via the v1.0.3 endpoints. Per-layer
+  layer-pill switcher; manifest table with key, title,
+  `modified_at_ms` (rendered UTC), `modified_by_user_id`, soft-delete
+  state; New / Edit / Delete (soft) actions on each row. Buttons
+  disable when the JWT lacks `memory:<layer>:write` so the operator
+  sees the scope gate before clicking.
 
 ## Trust model + scope
 

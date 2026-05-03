@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AuditTrace WebUI — minimalist OIDC + chat probe</title>
+  <title>AuditTrace WebUI — minimalist OIDC + chat probe + memory backoffice</title>
   <style>
     :root {
       --bg: #0e1116;
@@ -42,8 +42,10 @@
     button:hover { filter: brightness(1.1); }
     button[disabled] { opacity: 0.5; cursor: not-allowed; }
     button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--border); }
+    button.danger { background: #b34553; color: #fff; }
+    button.small { padding: 5px 10px; font-size: 12px; }
     label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
-    input, textarea {
+    input, textarea, select {
       background: #0a0d12;
       color: var(--fg);
       border: 1px solid var(--border);
@@ -83,12 +85,81 @@
     }
     .chip.ok { background: #1f3a26; color: var(--ok); }
     .chip.err { background: #3a1f25; color: var(--err); }
+    .chip.warn { background: #3a311f; color: #e0c067; }
+
+    /* Top-level tabs (Chat / Memory) */
+    .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin: 0 0 16px; }
+    .tabs button {
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      padding: 12px 20px;
+      font-weight: 500;
+      margin: 0;
+    }
+    .tabs button.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    .tabs button:hover:not(.active) { color: var(--fg); }
+    .hidden { display: none !important; }
+
+    /* Layer pill selector inside Memory tab */
+    .pills { display: inline-flex; gap: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .pills button {
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+      border-radius: 0;
+      padding: 8px 14px;
+      font-weight: 500;
+      margin: 0;
+      font-size: 13px;
+    }
+    .pills button.active { background: var(--accent); color: #061018; }
+    .pills button:hover:not(.active) { background: #232a36; color: var(--fg); }
+
+    /* Memory list table */
+    table.memory-list { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    table.memory-list th, table.memory-list td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    table.memory-list th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+    table.memory-list td.key { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; word-break: break-all; }
+    table.memory-list td.actions { white-space: nowrap; }
+    table.memory-list tr.deleted { opacity: 0.55; }
+    table.memory-list tr.deleted td.key { text-decoration: line-through; }
+
+    /* Toolbar inside Memory tab */
+    .mem-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+    .mem-toolbar .grow { flex: 1; }
+    .mem-toolbar label { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+    .mem-toolbar input[type="checkbox"] { width: auto; }
+    .mem-toolbar input[type="text"] { width: 200px; }
+
+    /* Modal for new/edit */
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100;
+    }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      padding: 20px; width: min(720px, 92vw); max-height: 85vh; overflow-y: auto;
+    }
+    .modal h3 { margin-top: 0; font-size: 16px; }
+    .modal .actions { margin-top: 16px; }
   </style>
 </head>
 <body>
   <h1>AuditTrace WebUI <span class="chip">minimalist</span></h1>
-  <p class="subtitle">OIDC Authorization Code + PKCE → JWT → <code>/v1/chat/completions</code> probe.
-    Used as the live-evidence harness for ADR-044 (External IdP federation) — see <code>webui/README.md</code>.</p>
+  <p class="subtitle">OIDC Authorization Code + PKCE → JWT → <code>/v1/chat/completions</code> probe + memory-layer backoffice (PR A endpoints).
+    See <code>webui/README.md</code>.</p>
 
   <div class="panel">
     <h2>Configuration</h2>
@@ -98,11 +169,11 @@
     <input id="clientId" value="audittrace-webui">
     <label>Redirect URI</label>
     <input id="redirectUri" value="http://localhost:8765/">
-    <label>Scopes (space-separated)</label>
-    <input id="scopes" value="openid audittrace:query audittrace:audit memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read">
+    <label>Scopes (space-separated). Add <code>memory:&lt;layer&gt;:write</code> to operate the Memory tab.</label>
+    <input id="scopes" value="openid audittrace:query audittrace:audit memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read memory:episodic:write memory:procedural:write memory:semantic:write">
     <label>Identity provider hint (Keycloak <code>kc_idp_hint</code> — pre-selects an IdP at login). Leave blank to show Keycloak's chooser.</label>
-    <input id="idpHint" value="google-test" placeholder="e.g. google-test, entra-acme">
-    <label>Memory-server base URL (where /v1/chat/completions lives)</label>
+    <input id="idpHint" value="" placeholder="e.g. google-test, entra-acme">
+    <label>Memory-server base URL (where /v1/chat/completions and /memory/* live)</label>
     <input id="apiBase" value="https://audittrace.allaboutdata.eu:30952">
     <label>Max output tokens (max_tokens — bump for summarisation prompts)</label>
     <input id="maxTokens" type="number" min="1" max="32768" value="4096">
@@ -113,22 +184,111 @@
   </div>
 
   <div class="panel" id="tokenPanel" style="display:none;">
-    <h2>Tokens <span id="tokenStatus" class="chip ok">received</span></h2>
+    <h2>Tokens <span id="tokenStatus" class="chip ok">received</span> <span id="userChip" class="chip"></span></h2>
     <label>Access token (JWT)</label>
     <textarea id="accessToken" readonly></textarea>
     <label>Decoded claims</label>
     <pre id="decodedClaims">—</pre>
   </div>
 
-  <div class="panel" id="chatPanel" style="display:none;">
-    <h2>Chat probe</h2>
-    <label>Prompt</label>
-    <textarea id="prompt">Reply with the single word: federated</textarea>
-    <p>
-      <button id="chatBtn">Send /v1/chat/completions</button>
-    </p>
-    <h2 style="margin-top: 18px;">Response</h2>
-    <pre id="chatResponse">—</pre>
+  <!-- Top-level tab nav -->
+  <div class="tabs" id="topTabs" style="display:none;">
+    <button data-tab="chat" class="active">Chat</button>
+    <button data-tab="memory">Memory</button>
+  </div>
+
+  <!-- ── Chat tab ─────────────────────────────────────────────────────── -->
+  <div id="tab-chat" class="tab-panel">
+    <div class="panel" id="chatPanel" style="display:none;">
+      <h2>Chat probe</h2>
+      <label>Prompt</label>
+      <textarea id="prompt">Reply with the single word: federated</textarea>
+      <p>
+        <button id="chatBtn">Send /v1/chat/completions</button>
+      </p>
+      <h2 style="margin-top: 18px;">Response</h2>
+      <pre id="chatResponse">—</pre>
+    </div>
+  </div>
+
+  <!-- ── Memory tab ────────────────────────────────────────────────────── -->
+  <div id="tab-memory" class="tab-panel hidden">
+    <div class="panel">
+      <h2>Memory layer</h2>
+      <div class="pills" id="layerPills">
+        <button data-layer="episodic" class="active">Episodic (ADRs)</button>
+        <button data-layer="procedural">Procedural (SKILLs)</button>
+        <button data-layer="semantic">Semantic (vectors)</button>
+        <button data-layer="conversational">Conversational (your sessions)</button>
+      </div>
+      <div class="mem-toolbar">
+        <button id="memNewBtn">+ New</button>
+        <button id="memRefreshBtn" class="secondary">Refresh</button>
+        <label><input type="checkbox" id="memShowDeleted"> Include soft-deleted</label>
+        <span id="semanticCollectionWrap" style="display:none;">
+          <label>Collection: <input type="text" id="semanticCollection" value="audittrace"></label>
+        </span>
+        <span class="grow"></span>
+        <span id="memCounts" class="chip"></span>
+      </div>
+      <table class="memory-list" id="memList">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Title</th>
+            <th>Modified (UTC)</th>
+            <th>By</th>
+            <th>Bytes</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="memEmpty" class="subtitle" style="display:none;">No items.</p>
+    </div>
+
+    <div class="panel" id="memDetailPanel" style="display:none;">
+      <h2>Item detail <button id="memDetailClose" class="secondary small" style="float:right;">Close</button></h2>
+      <pre id="memDetailContent">—</pre>
+      <h2 style="margin-top:14px;">Manifest</h2>
+      <pre id="memDetailManifest">—</pre>
+    </div>
+  </div>
+
+  <!-- ── Modal for new / edit ─────────────────────────────────────────── -->
+  <div id="memModalBg" class="modal-bg hidden">
+    <div class="modal">
+      <h3 id="memModalTitle">New item</h3>
+      <form id="memForm">
+        <div id="memFormFilenameWrap">
+          <label>Filename (e.g. <code>ADR-007.md</code>)</label>
+          <input type="text" id="memFormFilename" required>
+        </div>
+        <div id="memFormSemanticKeyWrap" style="display:none;">
+          <div class="row">
+            <div>
+              <label>Collection</label>
+              <input type="text" id="memFormCollection" value="audittrace">
+            </div>
+            <div>
+              <label>Document ID</label>
+              <input type="text" id="memFormDocumentId">
+            </div>
+          </div>
+        </div>
+        <label>Title (optional)</label>
+        <input type="text" id="memFormTitle">
+        <label id="memFormContentLabel">Content (markdown)</label>
+        <textarea id="memFormContent" style="min-height: 220px;"></textarea>
+        <label id="memFormMetadataLabel" style="display:none;">Metadata (optional JSON)</label>
+        <textarea id="memFormMetadata" style="display:none; min-height: 60px;"></textarea>
+        <p class="actions">
+          <button type="submit" id="memFormSubmit">Save</button>
+          <button type="button" id="memFormCancel" class="secondary">Cancel</button>
+        </p>
+        <p id="memFormError" class="err" style="display:none;"></p>
+      </form>
+    </div>
   </div>
 
   <div class="panel">
@@ -168,10 +328,7 @@ function log(level, msg, extra) {
 // ── Config + state ──────────────────────────────────────────────────────────
 function cfg() {
   // max_tokens is read from a numeric input. The default (4096) is enough
-  // for a real summary of the largest documents in the memory layer
-  // (ADR-025 is 24 KB ⇒ ~6.5 k input tokens; 4 k output covers a thorough
-  // summary). Operators can bump for longer responses or trim for cheap
-  // smoke tests. 32768 is the hard ceiling per the input's max attr.
+  // for a real summary of the largest documents in the memory layer.
   const mt = parseInt($('maxTokens').value, 10);
   return {
     issuer:     $('issuer').value.replace(/\/+$/, ''),
@@ -188,9 +345,7 @@ function cfg() {
 // can wipe sessionStorage on cross-origin redirects (the OAuth flow round-trips
 // through Keycloak + Google), causing state-mismatch errors on return.
 // localStorage survives those redirects.
-const SS = localStorage;
 const SS_NS = 'audittrace-webui:';
-// Wrap so all keys are namespaced (avoid colliding with other localStorage usage)
 const SS_get = (k) => localStorage.getItem(SS_NS + k);
 const SS_set = (k, v) => localStorage.setItem(SS_NS + k, v);
 const SS_clear = () => {
@@ -198,6 +353,28 @@ const SS_clear = () => {
     if (k.startsWith(SS_NS)) localStorage.removeItem(k);
   }
 };
+
+// ── JWT helpers ─────────────────────────────────────────────────────────────
+function decodeJwt(jwt) {
+  const parts = jwt.split('.');
+  if (parts.length < 2) return null;
+  const pad = (s) => s + '='.repeat((4 - s.length % 4) % 4);
+  return JSON.parse(atob(pad(parts[1].replace(/-/g, '+').replace(/_/g, '/'))));
+}
+function jwtScopes() {
+  const t = SS_get('access_token');
+  if (!t) return new Set();
+  const c = decodeJwt(t);
+  return new Set((c.scope || '').split(/\s+/).filter(Boolean));
+}
+function jwtUserLabel() {
+  const t = SS_get('access_token');
+  if (!t) return '';
+  const c = decodeJwt(t);
+  // Prefer human-readable claim; fall back to sub. Findings PR closed
+  // the gap where preferred_username was missing from the token.
+  return c.preferred_username || c.email || c.sub || '(no id)';
+}
 
 // ── Phase 1: kick off auth code + PKCE ──────────────────────────────────────
 $('loginBtn').addEventListener('click', async () => {
@@ -274,19 +451,16 @@ async function handleCallback() {
 }
 
 // ── Phase 3: show + decode token ────────────────────────────────────────────
-function decodeJwt(jwt) {
-  const parts = jwt.split('.');
-  if (parts.length < 2) return null;
-  const pad = (s) => s + '='.repeat((4 - s.length % 4) % 4);
-  return JSON.parse(atob(pad(parts[1].replace(/-/g, '+').replace(/_/g, '/'))));
-}
 function showToken(token) {
   $('tokenPanel').style.display = '';
   $('chatPanel').style.display = '';
+  $('topTabs').style.display = '';
   $('accessToken').value = token;
   const claims = decodeJwt(token);
   $('decodedClaims').textContent = JSON.stringify(claims, null, 2);
+  $('userChip').textContent = jwtUserLabel();
   log('ok', 'token received', `sub=${claims.sub} iss=${claims.iss}`);
+  applyScopeGuards();
 }
 
 // ── Phase 4: chat probe ──────────────────────────────────────────────────────
@@ -327,7 +501,386 @@ $('logoutBtn').addEventListener('click', () => {
   SS_clear();
   $('tokenPanel').style.display = 'none';
   $('chatPanel').style.display = 'none';
+  $('topTabs').style.display = 'none';
   log('info', 'session cleared');
+});
+
+// ── Top-level tab switch ─────────────────────────────────────────────────────
+$('topTabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-tab]');
+  if (!btn) return;
+  const tab = btn.dataset.tab;
+  for (const b of $('topTabs').querySelectorAll('button')) {
+    b.classList.toggle('active', b === btn);
+  }
+  $('tab-chat').classList.toggle('hidden', tab !== 'chat');
+  $('tab-memory').classList.toggle('hidden', tab !== 'memory');
+  if (tab === 'memory') memoryRefresh();
+});
+
+// ── Memory tab — state + helpers ────────────────────────────────────────────
+let memCurrentLayer = 'episodic';
+let memCurrentItems = [];
+
+async function memApi(method, path, body) {
+  const c = cfg();
+  const token = SS_get('access_token');
+  const headers = { 'Authorization': `Bearer ${token}` };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const r = await fetch(`${c.apiBase}${path}`, {
+    method, headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let data;
+  try { data = await r.json(); } catch { data = null; }
+  if (!r.ok) {
+    const msg = (data && (data.detail || data.error?.message)) || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function fmtUtcMs(ms) {
+  if (ms == null) return '—';
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, 'Z');
+}
+
+function applyScopeGuards() {
+  // Disable write/delete buttons in the Memory tab when the JWT lacks
+  // the matching memory:<layer>:write scope, so the operator gets
+  // visual feedback before clicking and doesn't paper over a 403.
+  // The conversational layer is read-only by design (sessions are
+  // produced by /v1/chat/completions; operators never create them).
+  const scopes = jwtScopes();
+  if (memCurrentLayer === 'conversational') {
+    $('memNewBtn').disabled = true;
+    $('memNewBtn').title = 'Conversational layer is read-only — sessions come from chat';
+    return;
+  }
+  const writeScope = `memory:${memCurrentLayer}:write`;
+  const canWrite = scopes.has(writeScope);
+  $('memNewBtn').disabled = !canWrite;
+  $('memNewBtn').title = canWrite ? '' : `JWT missing ${writeScope}`;
+}
+
+// Layer pill switcher
+$('layerPills').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-layer]');
+  if (!btn) return;
+  memCurrentLayer = btn.dataset.layer;
+  for (const b of $('layerPills').querySelectorAll('button')) {
+    b.classList.toggle('active', b === btn);
+  }
+  $('semanticCollectionWrap').style.display =
+    memCurrentLayer === 'semantic' ? '' : 'none';
+  // The conversational layer is RLS-scoped, read-only, and uses a
+  // different table shape (sessions, not key/title/bytes). Hide the
+  // include-deleted toggle since soft-delete doesn't apply to chat
+  // history.
+  $('memShowDeleted').parentElement.style.display =
+    memCurrentLayer === 'conversational' ? 'none' : '';
+  applyScopeGuards();
+  memoryRefresh();
+});
+
+$('memRefreshBtn').addEventListener('click', () => memoryRefresh());
+$('memShowDeleted').addEventListener('change', () => memoryRefresh());
+$('semanticCollection').addEventListener('change', () => {
+  if (memCurrentLayer === 'semantic') memoryRefresh();
+});
+
+async function memoryRefresh() {
+  let path;
+  if (memCurrentLayer === 'conversational') {
+    path = '/memory/conversational?limit=100';
+  } else {
+    const includeDeleted = $('memShowDeleted').checked;
+    path = `/memory/${memCurrentLayer}?include_deleted=${includeDeleted}`;
+    if (memCurrentLayer === 'semantic') {
+      const col = $('semanticCollection').value.trim();
+      if (col) path += `&collection=${encodeURIComponent(col)}`;
+    }
+  }
+  log('info', `GET ${path}`);
+  $('memList').querySelector('tbody').innerHTML = '';
+  $('memEmpty').style.display = 'none';
+  try {
+    const data = await memApi('GET', path);
+    memCurrentItems = data.items || [];
+    renderList(memCurrentItems);
+    $('memCounts').textContent = `${memCurrentItems.length} item(s)`;
+  } catch (e) {
+    log('err', `list ${memCurrentLayer} failed`, String(e));
+    $('memCounts').textContent = `error: ${e.message}`;
+  }
+}
+
+function renderList(items) {
+  const tbody = $('memList').querySelector('tbody');
+  const thead = $('memList').querySelector('thead tr');
+  tbody.innerHTML = '';
+
+  // Different layers expose different columns. Reset the header once
+  // per render so switching pills reformats the table.
+  if (memCurrentLayer === 'conversational') {
+    thead.innerHTML = `
+      <th>Session ID</th>
+      <th>Project</th>
+      <th>Date</th>
+      <th>Model</th>
+      <th>Summary</th>
+      <th></th>`;
+  } else {
+    thead.innerHTML = `
+      <th>Key</th>
+      <th>Title</th>
+      <th>Modified (UTC)</th>
+      <th>By</th>
+      <th>Bytes</th>
+      <th></th>`;
+  }
+
+  if (!items.length) {
+    $('memEmpty').style.display = '';
+    return;
+  }
+  $('memEmpty').style.display = 'none';
+
+  if (memCurrentLayer === 'conversational') {
+    for (const it of items) {
+      const tr = document.createElement('tr');
+      const sumExcerpt = (it.summary || '').slice(0, 80) +
+        (it.summary && it.summary.length > 80 ? '…' : '');
+      tr.innerHTML = `
+        <td class="key"><a href="#" data-key="${escapeAttr(it.id)}" class="memViewLink">${escapeHtml(it.id)}</a></td>
+        <td>${escapeHtml(it.project || '')}</td>
+        <td>${escapeHtml(it.date || '')}</td>
+        <td>${escapeHtml(it.model || '')}</td>
+        <td>${escapeHtml(sumExcerpt)}</td>
+        <td class="actions">${it.summarized_at ? '<span class="chip ok">summarised</span>' : '<span class="chip">live</span>'}</td>`;
+      tbody.appendChild(tr);
+    }
+    return;
+  }
+
+  const writeScope = `memory:${memCurrentLayer}:write`;
+  const canWrite = jwtScopes().has(writeScope);
+  for (const it of items) {
+    const tr = document.createElement('tr');
+    if (it.deleted_at_ms) tr.classList.add('deleted');
+    // Discovered items (S3 objects without a manifest row) have null
+    // ids and no authorship metadata. Mark them with a chip so the
+    // operator knows their first PUT/DELETE will create the manifest
+    // row.
+    const discoveredChip = it.discovered ? '<span class="chip">discovered</span>' : '';
+    const deletedChip = it.deleted_at_ms ? '<span class="chip warn">deleted</span>' : '';
+    const editable = canWrite && !it.deleted_at_ms;
+    tr.innerHTML = `
+      <td class="key"><a href="#" data-key="${escapeAttr(it.key)}" class="memViewLink">${escapeHtml(it.key)}</a> ${discoveredChip} ${deletedChip}</td>
+      <td>${escapeHtml(it.title || '')}</td>
+      <td>${fmtUtcMs(it.modified_at_ms)}</td>
+      <td>${escapeHtml((it.modified_by_user_id || '').slice(0, 8))}${it.modified_by_user_id ? '…' : ''}</td>
+      <td>${it.size_bytes != null ? it.size_bytes : ''}</td>
+      <td class="actions">
+        <button class="small secondary" data-act="edit" data-key="${escapeAttr(it.key)}" ${editable ? '' : 'disabled'}>Edit</button>
+        <button class="small danger" data-act="delete" data-key="${escapeAttr(it.key)}" ${editable && !it.discovered ? '' : 'disabled'}>Delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+$('memList').addEventListener('click', async (e) => {
+  const link = e.target.closest('a.memViewLink');
+  if (link) {
+    e.preventDefault();
+    return memoryView(link.dataset.key);
+  }
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const key = btn.dataset.key;
+  if (act === 'edit') return memoryOpenForm('edit', key);
+  if (act === 'delete') return memoryDelete(key);
+});
+
+async function memoryView(key) {
+  const path = `/memory/${memCurrentLayer}/${key}`;
+  log('info', `GET ${path}`);
+  try {
+    const data = await memApi('GET', path);
+    $('memDetailPanel').style.display = '';
+    if (memCurrentLayer === 'conversational') {
+      // Conversational read returns {session, interactions}; render
+      // the chat as a chronological log so it's immediately useful
+      // for debugging without forcing the operator to read raw JSON.
+      const lines = [];
+      lines.push(`Session: ${data.session.id}`);
+      lines.push(`Date:    ${data.session.date}`);
+      lines.push(`Model:   ${data.session.model || '?'}`);
+      lines.push(`Project: ${data.session.project || '—'}`);
+      if (data.session.summarized_at) {
+        lines.push(`Summary (${data.session.summarized_at}):\n  ${data.session.summary || '(empty)'}`);
+      }
+      lines.push('');
+      lines.push(`── ${data.interactions.length} interaction(s) ──`);
+      for (const it of data.interactions) {
+        lines.push('');
+        lines.push(`[${it.timestamp}] ${it.source || 'chat'} (${it.status || '?'})`);
+        if (it.duration_ms != null) lines.push(`  duration: ${it.duration_ms}ms`);
+        if (it.trace_id) lines.push(`  trace: ${it.trace_id}`);
+        if (it.prompt_tokens || it.completion_tokens) {
+          lines.push(`  tokens: prompt=${it.prompt_tokens || 0} completion=${it.completion_tokens || 0}`);
+        }
+        lines.push(`  USER: ${it.question || ''}`);
+        lines.push(`  ASSISTANT: ${it.answer || ''}`);
+        if (it.failure_class) lines.push(`  FAILURE: ${it.failure_class} — ${it.error_detail || ''}`);
+      }
+      $('memDetailContent').textContent = lines.join('\n');
+      $('memDetailManifest').textContent = JSON.stringify(data.session, null, 2);
+    } else {
+      $('memDetailContent').textContent = data.content || '';
+      $('memDetailManifest').textContent = JSON.stringify({
+        metadata: data.metadata,
+        manifest: data.manifest,
+      }, null, 2);
+    }
+  } catch (e) {
+    log('err', `view ${key} failed`, String(e));
+  }
+}
+
+$('memDetailClose').addEventListener('click', () => {
+  $('memDetailPanel').style.display = 'none';
+});
+
+async function memoryDelete(key) {
+  if (!confirm(`Soft-delete ${key}?\n\nThe S3 object / Chroma doc remains;\nthe manifest row is marked deleted.`)) return;
+  const path = `/memory/${memCurrentLayer}/${key}`;
+  log('info', `DELETE ${path}`);
+  try {
+    await memApi('DELETE', path);
+    log('ok', `deleted ${key}`);
+    memoryRefresh();
+  } catch (e) {
+    log('err', `delete ${key} failed`, String(e));
+    alert(`Delete failed: ${e.message}`);
+  }
+}
+
+// ── New / Edit modal ─────────────────────────────────────────────────────────
+let memFormMode = 'new';   // 'new' | 'edit'
+let memFormEditKey = null; // key being edited (for PUT path)
+
+$('memNewBtn').addEventListener('click', () => memoryOpenForm('new'));
+
+function memoryOpenForm(mode, key) {
+  memFormMode = mode;
+  memFormEditKey = key || null;
+  $('memModalTitle').textContent = mode === 'new'
+    ? `New ${memCurrentLayer} item`
+    : `Edit ${memCurrentLayer}: ${key}`;
+  $('memFormError').style.display = 'none';
+
+  // Layer-specific form shape: episodic + procedural use a filename;
+  // semantic uses (collection, document_id) and exposes a metadata box.
+  const isSemantic = memCurrentLayer === 'semantic';
+  $('memFormFilenameWrap').style.display = isSemantic ? 'none' : '';
+  $('memFormSemanticKeyWrap').style.display = isSemantic ? '' : 'none';
+  $('memFormMetadataLabel').style.display = isSemantic ? '' : 'none';
+  $('memFormMetadata').style.display = isSemantic ? '' : 'none';
+  $('memFormContentLabel').textContent = isSemantic ? 'Text' : 'Content (markdown)';
+
+  if (mode === 'new') {
+    $('memFormFilename').value = '';
+    $('memFormCollection').value = $('semanticCollection').value || 'audittrace';
+    $('memFormDocumentId').value = '';
+    $('memFormTitle').value = '';
+    $('memFormContent').value = '';
+    $('memFormMetadata').value = '';
+    $('memFormFilename').readOnly = false;
+    $('memFormCollection').readOnly = false;
+    $('memFormDocumentId').readOnly = false;
+  } else {
+    if (isSemantic) {
+      const [col, ...rest] = key.split('/');
+      $('memFormCollection').value = col;
+      $('memFormDocumentId').value = rest.join('/');
+      $('memFormCollection').readOnly = true;
+      $('memFormDocumentId').readOnly = true;
+    } else {
+      $('memFormFilename').value = key;
+      $('memFormFilename').readOnly = true;
+    }
+    // Pre-fill via the read endpoint so editing isn't blind
+    memApi('GET', `/memory/${memCurrentLayer}/${key}`)
+      .then(doc => {
+        $('memFormContent').value = doc.content || '';
+        if (doc.manifest && doc.manifest.title) $('memFormTitle').value = doc.manifest.title;
+      })
+      .catch(e => log('err', `prefill ${key} failed`, String(e)));
+  }
+  $('memModalBg').classList.remove('hidden');
+}
+
+$('memFormCancel').addEventListener('click', () => $('memModalBg').classList.add('hidden'));
+
+$('memForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const isSemantic = memCurrentLayer === 'semantic';
+  const title = $('memFormTitle').value || null;
+  const content = $('memFormContent').value;
+
+  let path; let method; let body;
+  try {
+    if (isSemantic) {
+      const collection = $('memFormCollection').value.trim();
+      const documentId = $('memFormDocumentId').value.trim();
+      if (!collection || !documentId) throw new Error('collection and document_id are required');
+      let metadata = null;
+      const metaRaw = $('memFormMetadata').value.trim();
+      if (metaRaw) {
+        try { metadata = JSON.parse(metaRaw); }
+        catch { throw new Error('metadata is not valid JSON'); }
+      }
+      if (memFormMode === 'new') {
+        path = '/memory/semantic';
+        method = 'POST';
+        body = { collection, document_id: documentId, text: content, title, metadata };
+      } else {
+        path = `/memory/semantic/${collection}/${documentId}`;
+        method = 'PUT';
+        body = { text: content, title, metadata };
+      }
+    } else {
+      const filename = $('memFormFilename').value.trim();
+      if (!filename) throw new Error('filename is required');
+      if (memFormMode === 'new') {
+        path = `/memory/${memCurrentLayer}`;
+        method = 'POST';
+        body = { filename, content, title };
+      } else {
+        path = `/memory/${memCurrentLayer}/${filename}`;
+        method = 'PUT';
+        body = { content, title };
+      }
+    }
+    log('info', `${method} ${path}`);
+    await memApi(method, path, body);
+    log('ok', `${memFormMode} ${memCurrentLayer} ok`);
+    $('memModalBg').classList.add('hidden');
+    memoryRefresh();
+  } catch (err) {
+    $('memFormError').style.display = '';
+    $('memFormError').textContent = err.message;
+    log('err', `form submit failed`, String(err));
+  }
 });
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
