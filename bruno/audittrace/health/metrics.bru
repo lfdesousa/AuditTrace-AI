@@ -1,0 +1,28 @@
+meta {
+  name: GET /metrics
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/metrics
+  body: none
+  auth: none
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("emits Prometheus exposition format", function() {
+    const body = res.getBody();
+    expect(body).to.contain("# HELP");
+    expect(body).to.contain("# TYPE");
+  });
+}
+
+docs {
+  Prometheus-format metrics. Used by the otel-collector + Grafana.
+  Test asserts the exposition format markers so a future refactor
+  that swaps to JSON would fail loudly.
+}

@@ -1,0 +1,46 @@
+meta {
+  name: GET /memory/procedural — list
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/memory/procedural?include_deleted=false
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  include_deleted: false
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has items + total", function() {
+    const body = res.getBody();
+    expect(body.items).to.be.an("array");
+    expect(body.total).to.be.a("number");
+  });
+  test("manifest rows expose Unix-epoch-ms timestamps where present", function() {
+    const items = res.getBody().items;
+    for (const it of items) {
+      if (!it.discovered) {
+        expect(it.created_at_ms).to.be.a("number");
+        expect(it.modified_at_ms).to.be.a("number");
+      }
+    }
+  });
+}
+
+docs {
+  Lists SKILL manifest rows merged with S3 discovery (PR
+  feat/webui-memory-tab v1.0.5). Pre-existing MinIO objects appear
+  with `discovered: true` and null timestamps. `include_deleted=true`
+  also surfaces soft-deleted manifest rows.
+}

@@ -1,0 +1,31 @@
+meta {
+  name: GET /health
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/health
+  body: none
+  auth: none
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("status is ok", function() {
+    expect(res.getBody().status).to.equal("ok");
+  });
+  test("declares component URLs", function() {
+    const c = res.getBody().components;
+    expect(c.server).to.equal("running");
+    expect(c.llama_url).to.be.a("string");
+    expect(c.chroma_url).to.be.a("string");
+  });
+}
+
+docs {
+  Liveness/readiness shape used by `make verify-deploy` step (4/8).
+  Unauthenticated by design — kubelet probes can't carry a JWT.
+}

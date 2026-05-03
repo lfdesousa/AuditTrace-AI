@@ -1,0 +1,33 @@
+meta {
+  name: GET /memory/episodic/{file} — read
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/memory/episodic/{{exampleAdrFile}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns content + manifest", function() {
+    const body = res.getBody();
+    expect(body.content).to.be.a("string");
+    expect(body.manifest).to.be.an("object");
+    expect(body.manifest.key).to.equal(bru.getEnvVar("exampleAdrFile"));
+  });
+}
+
+docs {
+  Reads ADR content + manifest metadata. 404 when the file
+  doesn't exist; manifest may be null if the underlying S3 object
+  was uploaded via the legacy /memory/upload path (no manifest row).
+}

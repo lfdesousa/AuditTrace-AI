@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "AuditTrace-AI",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}

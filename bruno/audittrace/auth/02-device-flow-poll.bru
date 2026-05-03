@@ -1,0 +1,69 @@
+meta {
+  name: 02 Device Flow — poll for token
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{realmIssuer}}/protocol/openid-connect/token
+  body: formUrlEncoded
+  auth: none
+}
+
+body:form-urlencoded {
+  grant_type: urn:ietf:params:oauth:grant-type:device_code
+  client_id: {{clientId}}
+  device_code: {{deviceCode}}
+}
+
+script:post-response {
+  // On success, stash access_token + refresh_token into env vars so
+  // every subsequent request just uses {{accessToken}}.
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    bru.setEnvVar("accessToken", body.access_token);
+    bru.setEnvVar("refreshToken", body.refresh_token);
+    // Decode the JWT payload + log identity claims so the operator
+    // can sanity-check before running CRUD requests.
+    try {
+      const parts = body.access_token.split(".");
+      const pad = (s) => s + "=".repeat((4 - s.length % 4) % 4);
+      const payload = JSON.parse(atob(pad(parts[1].replace(/-/g, "+").replace(/_/g, "/"))));
+      console.log("logged in as:", payload.preferred_username || payload.sub);
+      console.log("scopes:", payload.scope);
+    } catch (e) {
+      console.log("jwt decode failed:", e);
+    }
+  } else if (res.getStatus() === 400) {
+    const body = res.getBody();
+    if (body.error === "authorization_pending") {
+      console.log("waiting — open verificationUri in a browser, approve, then re-run.");
+    } else if (body.error === "expired_token") {
+      console.log("device_code expired — restart from 01-device-flow-init.");
+    }
+  }
+}
+
+tests {
+  test("returns 200 once approved", function() {
+    // Acceptable transitional states: 400 authorization_pending until
+    // the user clicks Yes. Run this request again after approval.
+    const status = res.getStatus();
+    if (status === 200) {
+      expect(res.getBody().access_token).to.be.a("string");
+    } else {
+      // Don't fail the runner pre-approval; just surface the state.
+      console.log("not yet approved — got status", status);
+    }
+  });
+}
+
+docs {
+  Step 2 of Device Flow. After running 01-init and approving the
+  user_code in your browser at verificationUri, run this request.
+  On success, access_token + refresh_token land in env vars and
+  every other request in the collection uses them.
+
+  Pre-approval, this returns 400 `authorization_pending` — that's
+  normal. Run again after approval.
+}

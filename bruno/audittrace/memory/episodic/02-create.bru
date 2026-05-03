@@ -1,0 +1,46 @@
+meta {
+  name: POST /memory/episodic — create
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/memory/episodic
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "filename": "{{exampleAdrFile}}",
+    "title": "Bruno smoke ADR",
+    "content": "# {{exampleAdrFile}}\n\nCreated by the Bruno collection's CRUD smoke run.\n"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns ManifestEntry shape", function() {
+    const e = res.getBody();
+    expect(e.layer).to.equal("episodic");
+    expect(e.key).to.equal(bru.getEnvVar("exampleAdrFile"));
+    expect(e.created_at_ms).to.be.a("number");
+    expect(e.created_at_ms).to.equal(e.modified_at_ms);
+    expect(e.deleted_at_ms).to.equal(null);
+  });
+  test("created_at_ms is recent (within 5s of Date.now())", function() {
+    const e = res.getBody();
+    expect(Math.abs(Date.now() - e.created_at_ms)).to.be.lessThan(5000);
+  });
+}
+
+docs {
+  Creates an ADR via S3 + manifest. Idempotent on the manifest:
+  re-running revives a soft-deleted item and bumps `modified_at_ms`.
+}

@@ -1,0 +1,51 @@
+meta {
+  name: 01 Device Flow — init
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{realmIssuer}}/protocol/openid-connect/auth/device
+  body: formUrlEncoded
+  auth: none
+}
+
+body:form-urlencoded {
+  client_id: {{clientId}}
+  scope: {{scope}}
+}
+
+script:post-response {
+  // Stash device_code + verification details into env vars so the
+  // follow-up "poll" request can pick them up automatically. The
+  // operator visits verification_uri_complete in a browser and
+  // approves; once approved, run the poll request.
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    bru.setEnvVar("deviceCode", body.device_code);
+    bru.setEnvVar("userCode", body.user_code);
+    bru.setEnvVar("verificationUri", body.verification_uri_complete);
+    console.log("Open in browser:", body.verification_uri_complete);
+    console.log("user_code:", body.user_code);
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has device_code + user_code + verification_uri_complete", function() {
+    const body = res.getBody();
+    expect(body.device_code).to.be.a("string");
+    expect(body.user_code).to.match(/^[A-Z]{4}-[A-Z]{4}$/);
+    expect(body.verification_uri_complete).to.contain("/realms/audittrace/device");
+  });
+}
+
+docs {
+  Step 1 of OAuth2 Device Authorization Grant (RFC 8628). Asks
+  Keycloak for a `device_code` + `user_code`. The operator then
+  opens `verificationUri` (now in the env vars) in a browser and
+  approves the request. After approval, run `02-device-flow-poll`
+  to exchange device_code for an access_token.
+}

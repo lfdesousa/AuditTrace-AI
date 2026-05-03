@@ -1,0 +1,58 @@
+meta {
+  name: GET /memory/conversational — list sessions (RLS-scoped)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/memory/conversational?limit=20
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  limit: 20
+}
+
+script:post-response {
+  // Stash the most recent session_id so the next request (read-session)
+  // can pull its detail without copy-paste.
+  if (res.getStatus() === 200) {
+    const items = res.getBody().items || [];
+    if (items.length) {
+      bru.setEnvVar("exampleSessionId", items[0].id);
+      console.log("most recent session:", items[0].id, items[0].date);
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("RLS-scoped — items are caller's own user_id", function() {
+    const items = res.getBody().items;
+    if (items.length === 0) return;
+    // Decode our own JWT to get sub
+    const tok = bru.getEnvVar("accessToken");
+    const parts = tok.split(".");
+    const pad = (s) => s + "=".repeat((4 - s.length % 4) % 4);
+    const claims = JSON.parse(atob(pad(parts[1].replace(/-/g, "+").replace(/_/g, "/"))));
+    const mySub = claims.sub;
+    for (const it of items) {
+      expect(it.user_id).to.equal(mySub);
+    }
+  });
+}
+
+docs {
+  Layer 3 — your own chat history. Postgres-backed with RLS so the
+  caller only sees rows whose `user_id` matches their JWT `sub`.
+  Read-only by design — sessions are produced by /v1/chat/completions.
+
+  Filters: project, since (ISO date), summarised (bool), limit, offset.
+}

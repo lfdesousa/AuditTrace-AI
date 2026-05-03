@@ -1,0 +1,18 @@
+vars {
+  baseUrl: http://localhost:8765
+  realmIssuer: http://localhost:8081/realms/audittrace
+  clientId: audittrace-opencode
+  scope: openid memory:episodic:read memory:procedural:read memory:semantic:read memory:conversational:read-own memory:episodic:write memory:procedural:write memory:semantic:write audittrace:query audittrace:context audittrace:audit
+  exampleAdrFile: ADR-bruno-test.md
+  exampleSkillFile: SKILL-bruno-test.md
+  exampleCollection: audittrace
+  exampleDocId: bruno-probe
+}
+vars:secret [
+  accessToken,
+  refreshToken,
+  deviceCode,
+  userCode,
+  verificationUri,
+  exampleSessionId
+]

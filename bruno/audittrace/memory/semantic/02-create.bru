@@ -1,0 +1,42 @@
+meta {
+  name: POST /memory/semantic — upsert
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/memory/semantic
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "collection": "{{exampleCollection}}",
+    "document_id": "{{exampleDocId}}",
+    "text": "Bruno smoke fragment about audit trails and OpenAI compatibility.",
+    "title": "Bruno semantic probe"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("manifest key is <collection>/<doc_id>", function() {
+    const e = res.getBody();
+    const expected = `${bru.getEnvVar("exampleCollection")}/${bru.getEnvVar("exampleDocId")}`;
+    expect(e.key).to.equal(expected);
+  });
+}
+
+docs {
+  Upsert into ChromaDB. The collection's embedding function (set at
+  create time — default `all-MiniLM-L6-v2`) handles vectorisation.
+  The Dockerfile pre-warms the model at build time so this call no
+  longer blocks the worker on a 79 MB download (PR fix v1.0.4).
+}

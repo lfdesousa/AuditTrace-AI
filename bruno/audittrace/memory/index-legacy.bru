@@ -1,0 +1,36 @@
+meta {
+  name: POST /memory/index — rebuild ChromaDB collections (admin)
+  type: http
+  seq: 91
+}
+
+post {
+  url: {{baseUrl}}/memory/index
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns per-collection chunk counts", function() {
+    const body = res.getBody();
+    expect(body.collections).to.be.an("object");
+    expect(body.elapsed_seconds).to.be.a("number");
+  });
+}
+
+docs {
+  Reads every `.md` from MinIO and pushes chunked embeddings to the
+  `decisions`, `skills`, `semantic` ChromaDB collections. Use this
+  to repopulate the semantic layer if it ever gets wiped (the
+  2026-05-04 carry-forward from session-2026-05-03).
+
+  Requires `audittrace:admin` scope. Slow — chunks every doc and
+  embeds. ~30s for the typical corpus.
+}

@@ -1,0 +1,33 @@
+meta {
+  name: GET /v1/models
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/v1/models
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI-compatible shape", function() {
+    const body = res.getBody();
+    expect(body.object).to.equal("list");
+    expect(body.data).to.be.an("array");
+    expect(body.data[0].id).to.be.a("string");
+  });
+}
+
+docs {
+  OpenAI-compatible model listing. Used by clients that want to
+  enumerate available models before issuing a chat request. The
+  `data[].id` is what clients pass as `model` in /chat/completions.
+}
