@@ -41,6 +41,12 @@ spec:
   # invocation waits up to 2 min for pg_isready. See ADR-045 §Verification
   # postmortem.
   backoffLimit: 12
+  # Hard cap. The actual work (pg_isready + DDL + sidecar shutdown)
+  # finishes in <60 s on a healthy cluster. 600 s is the operator's
+  # backstop — if the sidecars somehow refuse to terminate (Phase C.8
+  # root cause), the Job dies on its own instead of leaving a stuck
+  # NotReady pod that fails the helm post-upgrade hook indefinitely.
+  activeDeadlineSeconds: 600
   template:
     metadata:
       labels:
@@ -129,10 +135,19 @@ spec:
                    --set "pw=$SUMMARISER_PASSWORD" \
                    -f /work/ensure-role.sql
               echo "done."
-              # Signal the Istio sidecar to quit so the pod can terminate.
-              # Without this, an injected sidecar keeps the pod Running
-              # forever and the Job never completes.
-              curl --max-time 5 -fsS -X POST http://127.0.0.1:15020/quitquitquit || true
+              # ── Istio sidecar shutdown (Phase C.8) ───────────────────────
+              # The Vault Agent is configured with `agent-pre-populate-only:
+              # "true"` so it runs as an init container only and exits
+              # before the main container starts — no need to kill it
+              # here. Istio is the only remaining sidecar to terminate.
+              # Without the quitquitquit call, istio-proxy keeps the Pod
+              # 2/3 NotReady forever and the Helm post-upgrade hook
+              # reports `failed: context deadline exceeded`.
+              curl --max-time 5 -sS -o /dev/null \
+                -w 'istio quitquitquit: HTTP %{http_code}\n' \
+                -X POST http://127.0.0.1:15020/quitquitquit \
+                || echo "warn: istio quitquitquit curl failed (sidecar may already be gone)"
+              echo "Job completing."
       volumes:
         - name: sql
           configMap:

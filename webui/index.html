@@ -104,6 +104,8 @@
     <input id="idpHint" value="google-test" placeholder="e.g. google-test, entra-acme">
     <label>Memory-server base URL (where /v1/chat/completions lives)</label>
     <input id="apiBase" value="https://audittrace.allaboutdata.eu:30952">
+    <label>Max output tokens (max_tokens — bump for summarisation prompts)</label>
+    <input id="maxTokens" type="number" min="1" max="32768" value="4096">
     <p style="margin-top: 12px;">
       <button id="loginBtn">Sign in</button>
       <button id="logoutBtn" class="secondary">Clear session</button>
@@ -165,6 +167,12 @@ function log(level, msg, extra) {
 
 // ── Config + state ──────────────────────────────────────────────────────────
 function cfg() {
+  // max_tokens is read from a numeric input. The default (4096) is enough
+  // for a real summary of the largest documents in the memory layer
+  // (ADR-025 is 24 KB ⇒ ~6.5 k input tokens; 4 k output covers a thorough
+  // summary). Operators can bump for longer responses or trim for cheap
+  // smoke tests. 32768 is the hard ceiling per the input's max attr.
+  const mt = parseInt($('maxTokens').value, 10);
   return {
     issuer:     $('issuer').value.replace(/\/+$/, ''),
     clientId:   $('clientId').value,
@@ -172,6 +180,7 @@ function cfg() {
     scopes:     $('scopes').value,
     idpHint:    $('idpHint').value.trim(),
     apiBase:    $('apiBase').value.replace(/\/+$/, ''),
+    maxTokens:  Number.isFinite(mt) && mt > 0 ? mt : 4096,
   };
 }
 
@@ -299,7 +308,7 @@ $('chatBtn').addEventListener('click', async () => {
         model: 'audittrace-default',
         messages: [{ role: 'user', content: $('prompt').value }],
         stream: false,
-        max_tokens: 80,
+        max_tokens: c.maxTokens,
       }),
     });
     const data = await r.json();

@@ -70,6 +70,21 @@ require IDP_CLIENT_ID
 require IDP_CLIENT_SECRET
 require KEYCLOAK_ADMIN_PASSWORD
 
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "❌ Required command not on PATH: $1" >&2
+    exit 1
+  fi
+}
+
+# `curl` + `jq` are needed for discovery-doc auto-populate (Phase B.3).
+# Prior to that, the script only set `issuer` and required a manual
+# `kcadm update` to fill in authorizationUrl/tokenUrl/userInfoUrl/jwksUrl
+# afterwards — caught during the M2 evidence run.
+require_cmd curl
+require_cmd jq
+require_cmd kubectl
+
 case "${IDP_TYPE}" in
   oidc-generic|entra|google|okta) ;;
   *)
@@ -78,6 +93,50 @@ case "${IDP_TYPE}" in
     exit 1
     ;;
 esac
+
+# ----- Discovery-doc auto-populate (Phase B.3) -----
+# Fetch the IdP's well-known/openid-configuration document and extract the
+# five endpoints Keycloak needs explicitly: authorizationUrl, tokenUrl,
+# userInfoUrl, jwksUrl, logoutUrl. Without these, Keycloak's IdP config
+# silently misbehaves at first login (e.g. broker tries to hit a
+# non-configured token endpoint and 500s). See ADR-044 §Risks.
+echo "▶ Fetching IdP discovery document from ${IDP_DISCOVERY_URL}..."
+DISCOVERY_DOC=$(curl --fail --silent --show-error --connect-timeout 10 \
+  --max-time 30 "${IDP_DISCOVERY_URL}") || {
+  echo "❌ Failed to fetch discovery document from ${IDP_DISCOVERY_URL}" >&2
+  echo "   curl exit was non-zero. Check network access + URL correctness." >&2
+  exit 1
+}
+
+# Required endpoints (per OIDC core 1.0 §4 — these are MUST in the
+# discovery doc for any conformant IdP). Hard-fail if any is missing
+# rather than installing a half-working IdP.
+IDP_ISSUER=$(echo "${DISCOVERY_DOC}" | jq -re '.issuer // empty')
+IDP_AUTHZ_URL=$(echo "${DISCOVERY_DOC}" | jq -re '.authorization_endpoint // empty')
+IDP_TOKEN_URL=$(echo "${DISCOVERY_DOC}" | jq -re '.token_endpoint // empty')
+IDP_USERINFO_URL=$(echo "${DISCOVERY_DOC}" | jq -re '.userinfo_endpoint // empty')
+IDP_JWKS_URL=$(echo "${DISCOVERY_DOC}" | jq -re '.jwks_uri // empty')
+
+for v in IDP_ISSUER IDP_AUTHZ_URL IDP_TOKEN_URL IDP_USERINFO_URL IDP_JWKS_URL; do
+  if [[ -z "${!v}" ]]; then
+    echo "❌ Discovery document is missing the field corresponding to ${v}" >&2
+    echo "   The IdP at ${IDP_DISCOVERY_URL} is not OIDC-conformant" >&2
+    echo "   or the URL points at a stale/cached doc. Aborting." >&2
+    exit 1
+  fi
+done
+
+# end_session_endpoint is OPTIONAL in OIDC discovery (RP-initiated
+# logout is a separate spec). Empty string means "Keycloak doesn't
+# attempt RP-initiated logout against this IdP" — that's fine.
+IDP_LOGOUT_URL=$(echo "${DISCOVERY_DOC}" | jq -r '.end_session_endpoint // ""')
+
+echo "  ✓ issuer:         ${IDP_ISSUER}"
+echo "  ✓ authorization:  ${IDP_AUTHZ_URL}"
+echo "  ✓ token:          ${IDP_TOKEN_URL}"
+echo "  ✓ userinfo:       ${IDP_USERINFO_URL}"
+echo "  ✓ jwks:           ${IDP_JWKS_URL}"
+echo "  ✓ logout:         ${IDP_LOGOUT_URL:-<none — RP-initiated logout disabled>}"
 
 # ----- kcadm helper -----
 KC_POD="$(kubectl -n "${NAMESPACE}" get pod -l app.kubernetes.io/component=keycloak -o jsonpath='{.items[0].metadata.name}' 2>&1)"
@@ -117,7 +176,12 @@ IDP_JSON=$(cat <<EOF
   "addReadTokenRoleOnCreate": false,
   "firstBrokerLoginFlowAlias": "first broker login",
   "config": {
-    "issuer": "$(echo "${IDP_DISCOVERY_URL}" | sed 's|/\.well-known/openid-configuration$||')",
+    "issuer": "${IDP_ISSUER}",
+    "authorizationUrl": "${IDP_AUTHZ_URL}",
+    "tokenUrl": "${IDP_TOKEN_URL}",
+    "userInfoUrl": "${IDP_USERINFO_URL}",
+    "jwksUrl": "${IDP_JWKS_URL}",
+    "logoutUrl": "${IDP_LOGOUT_URL}",
     "useJwksUrl": "true",
     "validateSignature": "true",
     "clientId": "${IDP_CLIENT_ID}",

@@ -277,6 +277,13 @@ role so the Job's identity is short-lived.
 vault.hashicorp.com/agent-inject: "true"
 vault.hashicorp.com/role: "summariser-job"
 vault.hashicorp.com/agent-inject-status: "update"
+# Run vault-agent as init container only — no long-lived sidecar renewal.
+# The Job is short-lived (renders the role, exits). Without this the
+# vault-agent SIDECAR keeps the Pod at 2/3 NotReady forever and the
+# Helm post-upgrade hook reports `failed: context deadline exceeded`
+# (the 2026-05-03 Phase C.8 root cause). Same pattern as the
+# `vaultAnnotations.tests` block above.
+vault.hashicorp.com/agent-pre-populate-only: "true"
 vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/summariser/db"
 vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/postgres/superuser\" }}" }}

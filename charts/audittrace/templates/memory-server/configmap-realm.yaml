@@ -5,5 +5,10 @@ metadata:
   labels:
     {{- include "audittrace.labels" . | nindent 4 }}
 data:
+  # `tpl` evaluates Helm-template syntax embedded in the realm JSON
+  # so per-deployment values (audittrace-webui redirect URIs / webOrigins
+  # / post-logout) can be overridden via chart values without editing
+  # the source file. See keycloak.webui.* values + Phase B.9 in the
+  # 2026-05-03 stabilisation tail PR.
   realm.json: |-
-    {{ .Files.Get "files/realm-audittrace.json" | nindent 4 }}
+    {{ tpl (.Files.Get "files/realm-audittrace.json") . | nindent 4 }}

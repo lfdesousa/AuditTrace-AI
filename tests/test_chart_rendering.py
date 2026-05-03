@@ -16,6 +16,7 @@ These tests run via ``make test`` (no cluster needed; they shell out to
 
 from __future__ import annotations
 
+import json as _json
 import shutil
 import subprocess
 from pathlib import Path
@@ -265,3 +266,88 @@ class TestEntrypointScriptSafety:
         )
         assert result.returncode == 0
         assert "would-skip-guard" in result.stdout
+
+
+# ── Phase B.9: realm.json templated audittrace-webui client URIs ─────────────
+
+
+def _rendered_realm(extra_args: list[str]) -> dict:
+    """Return the audittrace-webui client dict from the rendered realm JSON."""
+    out = _render(extra_args)
+    cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+    realm = _json.loads(cm["data"]["realm.json"])
+    return next(c for c in realm["clients"] if c["clientId"] == "audittrace-webui")
+
+
+class TestRealmWebuiClientFromValues:
+    """Phase B.9: redirectUris / webOrigins / post-logout-redirect-uris on the
+    audittrace-webui client are populated from chart values via `tpl`. Without
+    this, fresh installs on non-`.local` hostnames fail at first login until
+    the operator kcadm-patches in their URIs (the M2 evidence pattern we
+    explicitly wanted to eliminate)."""
+
+    def test_default_includes_localhost_8765_and_local(self) -> None:
+        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway."""
+        client = _rendered_realm(["--set", "vault.enabled=true"])
+        assert "http://localhost:8765/*" in client["redirectUris"]
+        assert "https://audittrace.local/*" in client["redirectUris"]
+        assert "https://audittrace.local:30952/*" in client["redirectUris"]
+        assert "http://localhost:8765" in client["webOrigins"]
+        assert "https://audittrace.local" in client["webOrigins"]
+
+    def test_redirect_uris_extend_via_values_override(self) -> None:
+        """A custom redirectUris value lands verbatim in the rendered client.
+        Asserts the per-deployment override pattern works for new hostnames
+        (e.g. an operator's audittrace.allaboutdata.eu:30952)."""
+        custom = [
+            "https://audittrace.example.com/*",
+            "https://audittrace.example.com/oauth2/callback",
+            "http://localhost:8765/*",
+        ]
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                f"keycloak.webui.redirectUris={_json.dumps(custom)}",
+            ]
+        )
+        assert client["redirectUris"] == custom
+
+    def test_web_origins_extend_via_values_override(self) -> None:
+        custom = ["https://audittrace.example.com", "http://localhost:8765"]
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                f"keycloak.webui.webOrigins={_json.dumps(custom)}",
+            ]
+        )
+        assert client["webOrigins"] == custom
+
+    def test_post_logout_redirect_uri_overrideable(self) -> None:
+        client = _rendered_realm(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set",
+                "keycloak.webui.postLogoutRedirectUri=https://audittrace.example.com/logout",
+            ]
+        )
+        assert (
+            client["attributes"]["post.logout.redirect.uris"]
+            == "https://audittrace.example.com/logout"
+        )
+
+    def test_realm_json_remains_valid_after_tpl_render(self) -> None:
+        """tpl() rendering leaves the source file with `{{ }}` directives that
+        are not valid JSON. Once Helm has rendered it, the result must parse
+        as JSON cleanly. Regression for someone breaking the template syntax
+        (e.g. unbalanced range loops)."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        # Will raise if the rendered string isn't valid JSON.
+        realm = _json.loads(cm["data"]["realm.json"])
+        assert "clients" in realm
+        assert any(c["clientId"] == "audittrace-webui" for c in realm["clients"])

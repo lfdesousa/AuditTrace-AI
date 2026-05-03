@@ -1,6 +1,6 @@
 .PHONY: help venv install lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight
+       deploy-preflight verify-deploy
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -157,6 +157,9 @@ k8s-template: ## Render templates without installing (dry-run)
 deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + Vault injector probe (REQUIRED before any cluster mutation)
 	@TAG="$(TAG)" CHART_DIR=$(CHART_DIR) RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) \
 	  scripts/deploy-preflight.sh
+
+verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /metrics, pg_isready, Tempo traces, Loki ERROR threshold (Phase C.12)
+	@RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) scripts/post-deploy-verify.sh
 
 k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
