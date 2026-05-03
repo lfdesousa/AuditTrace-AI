@@ -1,0 +1,36 @@
+meta {
+  name: PUT /memory/episodic/{file} — update
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/memory/episodic/{{exampleAdrFile}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "content": "# {{exampleAdrFile}}\n\nUPDATED by the Bruno smoke run.\n"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("modified_at_ms bumped", function() {
+    const e = res.getBody();
+    expect(e.modified_at_ms).to.be.greaterThan(e.created_at_ms);
+  });
+}
+
+docs {
+  Replaces content + bumps `modified_at_ms`. Cannot be applied to
+  a soft-deleted item (returns 409). Recreate via POST instead.
+}

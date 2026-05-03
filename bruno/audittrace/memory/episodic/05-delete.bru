@@ -1,0 +1,33 @@
+meta {
+  name: DELETE /memory/episodic/{file} — soft-delete
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{baseUrl}}/memory/episodic/{{exampleAdrFile}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("deleted_at_ms is set", function() {
+    const e = res.getBody();
+    expect(e.deleted_at_ms).to.be.a("number");
+    expect(e.deleted_by_user_id).to.be.a("string");
+  });
+}
+
+docs {
+  Soft-delete by default. Add `?hard=true` to also remove the S3
+  object (additionally requires `audittrace:admin` scope). Subsequent
+  GET on the file returns 404 unless `?include_deleted=true` is set
+  on the list endpoint.
+}

@@ -1,0 +1,40 @@
+meta {
+  name: POST /memory/upload — legacy file upload (admin)
+  type: http
+  seq: 90
+}
+
+post {
+  url: {{baseUrl}}/memory/upload?layer=episodic&filename=ADR-bruno-legacy.md
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  layer: episodic
+  filename: ADR-bruno-legacy.md
+}
+
+body:multipart-form {
+  file: @file(/tmp/ADR-bruno-legacy.md)
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}
+
+docs {
+  Pre-PR-A upload path. Writes to MinIO directly without creating a
+  manifest row — items uploaded this way appear as `discovered: true`
+  in the new /memory/<layer> list endpoint until they get touched
+  via PUT/POST.
+
+  Requires `audittrace:admin` scope. Prepare a fixture file at
+  `/tmp/ADR-bruno-legacy.md` before running.
+}

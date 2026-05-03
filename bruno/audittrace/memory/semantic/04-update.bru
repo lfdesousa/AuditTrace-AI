@@ -1,0 +1,35 @@
+meta {
+  name: PUT /memory/semantic/{collection}/{doc_id} — update
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "text": "Bruno smoke fragment — UPDATED."
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("modified_at_ms is greater than created_at_ms", function() {
+    const e = res.getBody();
+    expect(e.modified_at_ms).to.be.greaterThan(e.created_at_ms);
+  });
+}
+
+docs {
+  Re-embeds the document (replaces stored vector + text).
+}

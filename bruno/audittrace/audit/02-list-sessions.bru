@@ -1,0 +1,36 @@
+meta {
+  name: GET /sessions — auditor view
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/sessions?limit=20
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  limit: 20
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("envelope shape", function() {
+    const body = res.getBody();
+    expect(body.sessions).to.be.an("array");
+    expect(body.total).to.be.a("number");
+  });
+}
+
+docs {
+  Auditor list of sessions (audittrace:audit scope), ordered by
+  `date` DESC. The user-facing equivalent for "my own sessions" is
+  /memory/conversational under memory:conversational:read-own.
+}

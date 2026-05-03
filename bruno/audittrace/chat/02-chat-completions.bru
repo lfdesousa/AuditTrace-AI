@@ -1,0 +1,61 @@
+meta {
+  name: POST /v1/chat/completions
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "Reply with a single word: bruno" }
+    ],
+    "stream": false,
+    "max_tokens": 256
+  }
+}
+
+script:post-response {
+  // Capture session_id from the response so the conversational
+  // memory requests can reference an actual session right after a
+  // chat round-trip.
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    const session = body.system_fingerprint || body.audittrace_session_id;
+    // Server stamps `audittrace_session_id` on the OpenAI-strict-superset
+    // response (ADR-024); fall back to system_fingerprint on older builds.
+    if (session) {
+      bru.setEnvVar("exampleSessionId", session);
+      console.log("session_id stashed:", session);
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI choices shape preserved (feedback_openai_schema_inviolate)", function() {
+    const body = res.getBody();
+    expect(body.choices).to.be.an("array");
+    expect(body.choices[0].message.role).to.equal("assistant");
+    expect(body.choices[0].message.content).to.be.a("string");
+  });
+}
+
+docs {
+  Hot-path chat endpoint. The default POST body shape is OpenAI
+  byte-compatible (`feedback_openai_schema_inviolate`). Header-based
+  extensions (e.g. ADR-046's `X-Persist-Mode: async` once shipped)
+  are additive; the default shape never changes.
+}

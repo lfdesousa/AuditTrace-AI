@@ -1,0 +1,40 @@
+meta {
+  name: GET /memory/conversational/{session_id} — read interactions
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/memory/conversational/{{exampleSessionId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns session metadata + interactions array", function() {
+    const body = res.getBody();
+    expect(body.session.id).to.equal(bru.getEnvVar("exampleSessionId"));
+    expect(body.interactions).to.be.an("array");
+  });
+  test("each interaction has question + answer + timestamp", function() {
+    const ints = res.getBody().interactions;
+    if (ints.length === 0) return;
+    expect(ints[0].question).to.be.a("string");
+    expect(ints[0].answer).to.be.a("string");
+    expect(ints[0].timestamp).to.be.a("string");
+  });
+}
+
+docs {
+  Returns the session's full interaction log (Q + A + duration_ms +
+  trace_id) ordered by timestamp ASC. 404 for unknown / foreign
+  session ids — RLS prevents cross-user reads. The webui Memory
+  tab uses this to render the chat timeline for debugging.
+}

@@ -1,0 +1,44 @@
+meta {
+  name: GET /memory/semantic — list
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic?include_deleted=false&collection={{exampleCollection}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  include_deleted: false
+  collection: {{exampleCollection}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has items + total", function() {
+    const body = res.getBody();
+    expect(body.items).to.be.an("array");
+    expect(body.total).to.be.a("number");
+  });
+  test("keys are <collection>/<doc_id>", function() {
+    const items = res.getBody().items;
+    for (const it of items) {
+      expect(it.key).to.contain("/");
+    }
+  });
+}
+
+docs {
+  Lists semantic items in one collection (or all collections if
+  the `collection` query param is omitted — capped at 5 collections
+  × 200 docs per call to keep latency bounded). Discovered entries
+  surface from ChromaDB; tracked entries from the manifest.
+}

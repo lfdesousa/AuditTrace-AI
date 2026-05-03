@@ -1,0 +1,32 @@
+meta {
+  name: GET /memory/semantic/{collection}/{doc_id} — read
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic/{{exampleCollection}}/{{exampleDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns content + metadata + manifest", function() {
+    const body = res.getBody();
+    expect(body.content).to.be.a("string");
+    expect(body.metadata.collection).to.equal(bru.getEnvVar("exampleCollection"));
+  });
+}
+
+docs {
+  Reads one document from ChromaDB by (collection, document_id).
+  404 if either is unknown. Returns the embedding's stored text
+  (not a re-decoded vector).
+}

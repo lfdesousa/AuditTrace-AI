@@ -1,0 +1,45 @@
+meta {
+  name: 03 Refresh access_token
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{realmIssuer}}/protocol/openid-connect/token
+  body: formUrlEncoded
+  auth: none
+}
+
+body:form-urlencoded {
+  grant_type: refresh_token
+  client_id: {{clientId}}
+  refresh_token: {{refreshToken}}
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    bru.setEnvVar("accessToken", body.access_token);
+    bru.setEnvVar("refreshToken", body.refresh_token);
+    console.log("token refreshed; new access_token expires in", body.expires_in, "s");
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns new access_token", function() {
+    expect(res.getBody().access_token).to.be.a("string");
+  });
+}
+
+docs {
+  When the access_token expires, refresh it without re-doing the
+  Device Flow. Updates env vars in place.
+
+  Caveat (caught during PR A live test, 2026-05-03): refresh-token
+  grants do NOT widen scopes. If you originally logged in without
+  `memory:*:write`, refreshing won't add it — re-run 01+02 with the
+  full scope list from the env vars.
+}
