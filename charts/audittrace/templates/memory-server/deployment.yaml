@@ -79,8 +79,12 @@ spec:
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL
               value: {{ include "audittrace.keycloakJwksUrl" . | quote }}
+            # Sourced from values: keycloak.externalIssuers. Override per
+            # deployment to add hostname-specific issuer entries (e.g.
+            # `audittrace.allaboutdata.eu:30952` for Google federation).
+            # See `keycloak.externalIssuers` documentation in values.yaml.
             - name: AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS
-              value: '["https://{{ index .Values.istio.gateway.hosts 0 }}/realms/audittrace"]'
+              value: {{ .Values.keycloak.externalIssuers | toJson | quote }}
             - name: AUDITTRACE_JWT_AUDIENCE
               value: "audittrace-server"
             - name: AUDITTRACE_LLAMA_URL

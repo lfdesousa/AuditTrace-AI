@@ -277,7 +277,46 @@ keycloak:
   image:
     repository: quay.io/keycloak/keycloak
     tag: "24.0"
+  # ─────────────────────────────────────────────────────────────────────
+  # HOSTNAME OVERRIDE PATTERN (per-deployment)
+  #
+  # The chart defaults to `audittrace.local`, which works for
+  # localhost-only dev with /etc/hosts entries. For deployments using a
+  # publicly-resolvable hostname (e.g. Google Workspace federation
+  # rejects `.local` TLDs — ADR-044), override these in your local
+  # values-local.yaml or via --set:
+  #
+  #   istio:
+  #     gateway:
+  #       hosts:
+  #         - audittrace.allaboutdata.eu
+  #
+  #   keycloak:
+  #     hostnameUrl: "https://audittrace.allaboutdata.eu:30952"
+  #     externalIssuers:
+  #       - "https://audittrace.allaboutdata.eu:30952/realms/audittrace"
+  #       - "https://audittrace.local/realms/audittrace"   # transitional, drop later
+  #
+  # WHY a separate `keycloak.hostnameUrl`:
+  #   That value is mapped to KC_HOSTNAME_URL in the Keycloak deployment
+  #   template. It dictates the redirect_uri Keycloak sends to upstream
+  #   IdPs (Google) — MUST match whatever you registered with the IdP.
+  #
+  # WHY a separate `keycloak.externalIssuers` list:
+  #   Memory-server's JWT validator accepts the in-cluster issuer
+  #   (audittrace.keycloakIssuer helper, used internally) PLUS any
+  #   external hostname that Keycloak serves under (gateway-fronted
+  #   tokens carry `iss=<hostnameUrl>/realms/audittrace`). Add an entry
+  #   for every external hostname you want tokens to validate from.
+  #
+  # NOTE: A hostname rotation requires both keys overlapping — the
+  # transitional `audittrace.local` entry stays in `externalIssuers`
+  # until every existing token has expired (token TTL ~5 min in
+  # production, refresh TTL longer).
+  # ─────────────────────────────────────────────────────────────────────
   hostnameUrl: "https://audittrace.local"
+  externalIssuers:
+    - "https://audittrace.local/realms/audittrace"
   resources:
     requests:
       cpu: 500m
