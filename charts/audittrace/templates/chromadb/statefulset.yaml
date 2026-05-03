@@ -34,9 +34,18 @@ spec:
           {{- if .Values.vault.enabled }}
           # Source Vault Agent-rendered env file before exec'ing the chromadb
           # entrypoint. CHROMA_SERVER_AUTHN_CREDENTIALS is supplied by Vault
-          # at /vault/secrets/env (ADR-043 §4).
+          # at /vault/secrets/env (ADR-043 §4). The guard fails fast with
+          # exit 79 + a structured diagnostic if the file is missing —
+          # see _helpers.tpl `audittrace.vaultSecretFileGuard` (added
+          # after the 2026-05-03 injector-TLS-handshake incident).
           command: ["/bin/sh", "-c"]
-          args: ["set -a; . /vault/secrets/env; set +a; exec dumb-init -- chroma run /config.yaml"]
+          args:
+            - |
+              {{ include "audittrace.vaultSecretFileGuard" . | nindent 14 }}
+              set -a
+              . /vault/secrets/env
+              set +a
+              exec dumb-init -- chroma run /config.yaml
           {{- end }}
           env:
             - name: CHROMA_SERVER_AUTHN_PROVIDER

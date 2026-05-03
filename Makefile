@@ -1,5 +1,6 @@
 .PHONY: help venv install lint test test-cov test-coverage clean \
-       docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template
+       docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
+       deploy-preflight
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -153,15 +154,19 @@ k8s-deps: ## Update Helm chart dependencies (Bitnami subcharts)
 k8s-template: ## Render templates without installing (dry-run)
 	@helm template $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
 
-k8s-install: k8s-deps ## Install the Helm chart on k3s
+deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + Vault injector probe (REQUIRED before any cluster mutation)
+	@TAG="$(TAG)" CHART_DIR=$(CHART_DIR) RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) \
+	  scripts/deploy-preflight.sh
+
+k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
 	@helm install $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
 
-k8s-upgrade: ## Upgrade the Helm release (passes values file explicitly — safe after chart structure changes)
+k8s-upgrade: deploy-preflight ## Upgrade the Helm release with values file (gated by preflight)
 	@helm upgrade $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
 
-k8s-rolling-image: ## Quick image-only update preserving user-supplied values (use for dev iteration; see runbook Scenario B)
+k8s-rolling-image: deploy-preflight ## Quick image-only update preserving user-supplied values (gated by preflight; see 2026-05-03 incident — TLS-handshake failure on injector left CrashLoopBackOff pods undetected before this gate landed)
 	@# --reset-then-reuse-values MERGES the chart's new defaults with prior user-supplied values.
 	@# --reuse-values would FAIL if the chart gained a new top-level block since last install.
 	@helm upgrade $(RELEASE) $(CHART_DIR) \

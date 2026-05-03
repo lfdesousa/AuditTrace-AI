@@ -141,3 +141,79 @@ jobs:
           name: coverage-html
           path: htmlcov/
           retention-days: 30
+
+  helm-lint:
+    # Static chart validation — no cluster needed. Catches Helm syntax,
+    # missing values, broken `include` directives, and template-render
+    # errors at PR-review time. Complements scripts/deploy-preflight.sh
+    # which runs the same checks (plus admission-time ones) at deploy time.
+    # Added 2026-05-03 after a chart change reached deploy without any
+    # static gate having run on it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: helm dependency update
+        run: helm dependency update charts/audittrace
+
+      - name: helm lint (vault.enabled=true — production path)
+        run: |
+          helm lint charts/audittrace \
+            --set vault.enabled=true \
+            --set secrets.minio.secretKey=ci-test \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test
+
+      - name: helm lint (vault.enabled=false — dev fallback path)
+        run: |
+          helm lint charts/audittrace \
+            --set vault.enabled=false \
+            --set secrets.minio.secretKey=ci-test \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test
+
+      - name: helm template (assert renders cleanly + contains vaultSecretFileGuard)
+        # Renders the chart and grep-asserts the 2026-05-03 guard helper
+        # is present in the args of every workload that sources
+        # /vault/secrets/env. Regression test for the helper being
+        # accidentally removed from a deployment template.
+        run: |
+          helm template audittrace charts/audittrace -n audittrace \
+            --set vault.enabled=true \
+            --set secrets.minio.secretKey=ci-test \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test \
+            > /tmp/helm-rendered.yaml
+          # Every chart that sources /vault/secrets/env MUST include the
+          # guard. Count occurrences and assert >= 3 (chromadb, keycloak,
+          # minio; memory-server uses entrypoint.sh which has its own check).
+          guards=$(grep -c "Vault Agent did not inject /vault/secrets/env (exit 79)" /tmp/helm-rendered.yaml || echo 0)
+          if [ "$guards" -lt 3 ]; then
+            echo "::error::expected >=3 vaultSecretFileGuard occurrences, found $guards"
+            echo "::error::regression: a deployment template lost its guard against missing /vault/secrets/env"
+            exit 1
+          fi
+          echo "vaultSecretFileGuard present in $guards workloads — OK"
+
+      - name: bash syntax check on deploy scripts
+        run: |
+          bash -n scripts/deploy-preflight.sh
+          bash -n scripts/check-vault-injector.sh
+          bash -n scripts/entrypoint.sh

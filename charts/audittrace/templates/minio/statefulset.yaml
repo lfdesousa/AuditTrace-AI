@@ -33,7 +33,13 @@ spec:
           imagePullPolicy: IfNotPresent
           {{- if .Values.vault.enabled }}
           command: ["/bin/sh", "-c"]
-          args: ["set -a; . /vault/secrets/env; set +a; exec minio server /data --console-address :9001"]
+          args:
+            - |
+              {{ include "audittrace.vaultSecretFileGuard" . | nindent 14 }}
+              set -a
+              . /vault/secrets/env
+              set +a
+              exec minio server /data --console-address :9001
           {{- else }}
           command:
             - minio

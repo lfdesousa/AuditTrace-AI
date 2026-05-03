@@ -31,8 +31,19 @@ spec:
           image: "{{ .Values.keycloak.image.repository }}:{{ .Values.keycloak.image.tag }}"
           imagePullPolicy: IfNotPresent
           {{- if .Values.vault.enabled }}
+          # Source Vault-injected env file before exec'ing keycloak.
+          # The guard fails fast with exit 79 + a structured diagnostic
+          # if /vault/secrets/env is missing — see _helpers.tpl
+          # `audittrace.vaultSecretFileGuard`. Replaces the previous
+          # cryptic shell error from 2026-05-03 incident.
           command: ["/bin/sh", "-c"]
-          args: ["set -a; . /vault/secrets/env; set +a; exec /opt/keycloak/bin/kc.sh start-dev --import-realm --health-enabled=true"]
+          args:
+            - |
+              {{ include "audittrace.vaultSecretFileGuard" . | nindent 14 }}
+              set -a
+              . /vault/secrets/env
+              set +a
+              exec /opt/keycloak/bin/kc.sh start-dev --import-realm --health-enabled=true
           {{- else }}
           command:
             - /opt/keycloak/bin/kc.sh
