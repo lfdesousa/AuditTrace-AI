@@ -180,12 +180,51 @@ class MockCollection:
         }
 
     @log_call(logger=logger)
-    def get(self, **kwargs: Any) -> dict[str, Any]:
+    def get(
+        self,
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        # Filter by ``ids`` if provided (matches ChromaDB's real API).
+        rows = self.data
+        if ids is not None:
+            id_set = set(ids)
+            rows = [r for r in rows if r["id"] in id_set]
         return {
-            "ids": [r["id"] for r in self.data],
-            "documents": [r["document"] for r in self.data],
-            "metadatas": [r["metadata"] for r in self.data],
+            "ids": [r["id"] for r in rows],
+            "documents": [r["document"] for r in rows],
+            "metadatas": [r["metadata"] for r in rows],
         }
+
+    @log_call(logger=logger)
+    def upsert(
+        self,
+        ids: list[str] | None = None,
+        documents: list[str] | None = None,
+        metadatas: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Insert-or-replace: matches the real ChromaDB upsert semantics."""
+        ids = ids or []
+        documents = documents or []
+        metadatas = metadatas or [{} for _ in ids]
+        for i, doc_id in enumerate(ids):
+            doc = documents[i] if i < len(documents) else ""
+            meta = metadatas[i] if i < len(metadatas) else {}
+            # Replace if id exists, else append.
+            for j, existing in enumerate(self.data):
+                if existing["id"] == doc_id:
+                    self.data[j] = {"id": doc_id, "document": doc, "metadata": meta}
+                    break
+            else:
+                self.data.append({"id": doc_id, "document": doc, "metadata": meta})
+
+    @log_call(logger=logger)
+    def delete(self, ids: list[str] | None = None, **kwargs: Any) -> None:
+        if not ids:
+            return
+        id_set = set(ids)
+        self.data = [r for r in self.data if r["id"] not in id_set]
 
     @log_call(logger=logger)
     def count(self, where: dict[str, Any] | None = None, **kwargs: Any) -> int:

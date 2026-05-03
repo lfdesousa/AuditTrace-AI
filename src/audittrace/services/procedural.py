@@ -47,6 +47,23 @@ class ProceduralService(ABC):
         characters (``..``, ``/``) are rejected.
         """
 
+    @abstractmethod
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        """Create or replace a SKILL document. Returns the persisted
+        ``Document``. Same filename validation as ``read``. Caches
+        invalidated on success."""
+
+    @abstractmethod
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        """Hard-delete the underlying object from storage. Returns
+        ``True`` if deleted, ``False`` if it didn't exist. Caches
+        invalidated on success."""
+
+    @abstractmethod
+    def invalidate_cache(self) -> None:
+        """Drop any in-memory cache so the next ``load()`` re-fetches
+        from the backing store."""
+
 
 def _validate_filename(file: str) -> bool:
     """Reject empty, path-traversal, and non-``.md`` filenames."""
@@ -176,6 +193,64 @@ class S3ProceduralService(ProceduralService):
             },
         )
 
+    @log_call(logger=logger)
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        del user_context  # shared content — not per-user scoped
+        if not _validate_filename(file):
+            raise ValueError(f"invalid filename: {file!r}")
+        import io
+
+        client: Any = self._client
+        key = f"{self._prefix}{file}"
+        body = content.encode("utf-8")
+        try:
+            client.put_object(self._bucket, key, io.BytesIO(body), length=len(body))
+        except Exception as exc:
+            raise RuntimeError(
+                f"S3ProceduralService.write({file!r}) failed: {exc}"
+            ) from exc
+        self.invalidate_cache()
+        return Document(
+            page_content=content,
+            metadata={
+                "source": "procedural",
+                "file": file,
+                "skill": _skill_name_from_filename(file),
+            },
+        )
+
+    @log_call(logger=logger)
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        del user_context  # shared content — not per-user scoped
+        if not _validate_filename(file):
+            return False
+        client: Any = self._client
+        key = f"{self._prefix}{file}"
+        try:
+            client.stat_object(self._bucket, key)
+        except Exception as exc:
+            code = getattr(exc, "code", "")
+            if code == "NoSuchKey":
+                return False
+            logger.warning(
+                "S3ProceduralService.delete(%r): stat failed (%s) — "
+                "attempting remove regardless",
+                file,
+                exc,
+            )
+        try:
+            client.remove_object(self._bucket, key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"S3ProceduralService.delete({file!r}) failed: {exc}"
+            ) from exc
+        self.invalidate_cache()
+        return True
+
+    @log_call(logger=logger)
+    def invalidate_cache(self) -> None:
+        self._cache = None
+
 
 class MockProceduralService(ProceduralService):
     """Mock procedural service for unit testing."""
@@ -236,6 +311,49 @@ class MockProceduralService(ProceduralService):
             if d.metadata.get("file") == file:
                 return d
         return None
+
+    @log_call(logger=logger)
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        del user_context  # plumbing only
+        if not _validate_filename(file):
+            raise ValueError(f"invalid filename: {file!r}")
+        for i, d in enumerate(self._documents):
+            if d.metadata.get("file") == file:
+                self._documents[i] = Document(
+                    page_content=content,
+                    metadata={
+                        "source": "procedural",
+                        "file": file,
+                        "skill": _skill_name_from_filename(file),
+                    },
+                )
+                return self._documents[i]
+        new_doc = Document(
+            page_content=content,
+            metadata={
+                "source": "procedural",
+                "file": file,
+                "skill": _skill_name_from_filename(file),
+            },
+        )
+        self._documents.append(new_doc)
+        return new_doc
+
+    @log_call(logger=logger)
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        del user_context  # plumbing only
+        if not _validate_filename(file):
+            return False
+        for i, d in enumerate(self._documents):
+            if d.metadata.get("file") == file:
+                self._documents.pop(i)
+                return True
+        return False
+
+    @log_call(logger=logger)
+    def invalidate_cache(self) -> None:
+        # No cache to invalidate; mock is the source of truth.
+        pass
 
     def reset(self) -> None:
         """Clear all documents."""

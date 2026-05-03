@@ -66,6 +66,27 @@
       "attributes": {
         "include.in.token.scope": "true"
       }
+    },
+    {
+      "name": "memory:episodic:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:procedural:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:semantic:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     }
   ],
   "clients": [
@@ -128,7 +149,13 @@
       "protocol": "openid-connect",
       "defaultClientScopes": [
         "audittrace:admin",
-        "audittrace:audit"
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:semantic:read",
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write"
       ],
       "optionalClientScopes": []
     },
@@ -195,7 +222,11 @@
         "memory:conversational:read-own",
         "memory:semantic:read"
       ],
-      "optionalClientScopes": [],
+      "optionalClientScopes": [
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write"
+      ],
       "protocolMappers": [
         {
           "name": "aud-audittrace-server",
@@ -243,7 +274,11 @@
         "memory:conversational:read-own",
         "memory:semantic:read"
       ],
-      "optionalClientScopes": [],
+      "optionalClientScopes": [
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write"
+      ],
       "protocolMappers": [
         {
           "name": "aud-audittrace-server",

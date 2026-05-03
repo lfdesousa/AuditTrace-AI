@@ -348,10 +348,15 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | `audittrace:context` | `/context` |
 | `audittrace:audit` | `/interactions` |
 | `audittrace:admin` | `/metrics` |
-| `memory:episodic:read` | `recall_decisions` (snippet discovery) + `read_decision` (full content) tools (ADR-025) |
-| `memory:procedural:read` | `recall_skills` + `read_skill` tools |
+| `memory:episodic:read` | `recall_decisions` (snippet discovery) + `read_decision` (full content) tools (ADR-025) + `GET /memory/episodic` |
+| `memory:procedural:read` | `recall_skills` + `read_skill` tools + `GET /memory/procedural` |
 | `memory:conversational:read-own` | `recall_recent_sessions` tool |
-| `memory:semantic:read` | `recall_semantic` tool |
+| `memory:semantic:read` | `recall_semantic` tool + `GET /memory/semantic` |
+| `memory:episodic:write` | `POST/PUT/DELETE /memory/episodic` (memory backoffice — v1.0.3) |
+| `memory:procedural:write` | `POST/PUT/DELETE /memory/procedural` |
+| `memory:semantic:write` | `POST/PUT/DELETE /memory/semantic` |
+
+→ See [`docs/guides/memory-backoffice.md`](docs/guides/memory-backoffice.md) for the operator workflow + endpoint matrix + the `memory_items` manifest table that backs every CRUD response (created_at_ms / modified_at_ms / deleted_at_ms in Unix epoch milliseconds UTC).
 
 ### Roadmap
 

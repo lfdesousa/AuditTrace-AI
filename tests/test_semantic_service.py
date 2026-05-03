@@ -333,3 +333,90 @@ class TestUserScopedSemanticService:
             inner=MockSemanticService(), user_context=user_context
         )
         assert isinstance(wrapper, SemanticService)
+
+
+# ── upsert / delete_document / get_document (PR A — CRUD backoffice) ────────
+
+
+class TestChromaSemanticServiceCrud:
+    """Write-side tests via the MockChromaDBFactory."""
+
+    @pytest.fixture
+    def service(self):
+        factory = MockChromaDBFactory()
+        client = factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    def test_upsert_then_get(self, service, user_context):
+        service.upsert(
+            user_context,
+            "decisions",
+            "doc-7",
+            "hello world",
+            metadata={"source": "ADR-007"},
+        )
+        doc = service.get_document(user_context, "decisions", "doc-7")
+        assert doc is not None
+        assert doc.page_content == "hello world"
+        # User-id stamping happened (sentinel admin user_id).
+        assert "user_id" in doc.metadata
+
+    def test_upsert_replaces_existing(self, service, user_context):
+        service.upsert(user_context, "decisions", "doc-7", "v1")
+        service.upsert(user_context, "decisions", "doc-7", "v2")
+        doc = service.get_document(user_context, "decisions", "doc-7")
+        assert doc.page_content == "v2"
+
+    def test_get_missing_returns_none(self, service, user_context):
+        assert service.get_document(user_context, "decisions", "nope") is None
+
+    def test_delete_existing_returns_true(self, service, user_context):
+        service.upsert(user_context, "decisions", "doc-d", "bye")
+        assert service.delete_document(user_context, "decisions", "doc-d") is True
+        assert service.get_document(user_context, "decisions", "doc-d") is None
+
+    def test_delete_missing_returns_false(self, service, user_context):
+        assert service.delete_document(user_context, "decisions", "never") is False
+
+
+class TestMockSemanticServiceCrud:
+    """In-memory variant — used by the route tests."""
+
+    def test_upsert_get_delete(self, user_context):
+        s = MockSemanticService()
+        s.upsert(user_context, "col", "id-1", "first", metadata={"k": "v"})
+        d = s.get_document(user_context, "col", "id-1")
+        assert d is not None and d.page_content == "first"
+        # Replace
+        s.upsert(user_context, "col", "id-1", "second")
+        d = s.get_document(user_context, "col", "id-1")
+        assert d.page_content == "second"
+        # Delete
+        assert s.delete_document(user_context, "col", "id-1") is True
+        assert s.get_document(user_context, "col", "id-1") is None
+        assert s.delete_document(user_context, "col", "id-1") is False
+
+
+class TestUserScopedSemanticServiceCrud:
+    """The wrapper must forward upsert/get/delete to the inner service
+    using the bound user (not the per-call argument)."""
+
+    def test_wrapper_forwards_upsert(self, user_context):
+        from audittrace.services.semantic import UserScopedSemanticService
+
+        inner = MockSemanticService()
+        wrapper = UserScopedSemanticService(inner=inner, user_context=user_context)
+        # Use a different user_context as the per-call arg; wrapper should
+        # ignore it and use the bound one.
+        other = replace(user_context, user_id="some-other-user")
+        wrapper.upsert(other, "col", "id-1", "text")
+        assert inner.get_document(user_context, "col", "id-1") is not None
+
+    def test_wrapper_forwards_delete_and_get(self, user_context):
+        from audittrace.services.semantic import UserScopedSemanticService
+
+        inner = MockSemanticService()
+        inner.upsert(user_context, "col", "id-1", "x")
+        wrapper = UserScopedSemanticService(inner=inner, user_context=user_context)
+        assert wrapper.get_document(user_context, "col", "id-1") is not None
+        assert wrapper.delete_document(user_context, "col", "id-1") is True

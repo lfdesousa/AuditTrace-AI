@@ -62,6 +62,20 @@ class _FakeMinio:
             raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
         return _FakeResponse(self._objects[key])
 
+    def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
+        del bucket, length
+        self._objects[key] = body.read()
+
+    def stat_object(self, bucket: str, key: str) -> object:
+        del bucket
+        if key not in self._objects:
+            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+        return object()
+
+    def remove_object(self, bucket: str, key: str) -> None:
+        del bucket
+        self._objects.pop(key, None)
+
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -323,3 +337,72 @@ class TestMockProceduralService:
         service = MockProceduralService()
         service.add_document("body", skill="IAM", file="SKILL-IAM.md")
         assert service.read(user_context, "../passwd.md") is None
+
+
+# ── write / delete / invalidate_cache (PR A — CRUD backoffice) ──────────────
+
+
+class TestS3ProceduralServiceWriteDelete:
+    def test_write_creates_and_invalidates_cache(self, user_context) -> None:
+        client = _FakeMinio({})
+        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service.load(user_context)  # warm
+        doc = service.write(user_context, "SKILL-NEW.md", "# NEW\n\nbody\n")
+        assert doc.metadata["skill"] == "NEW"
+        assert "procedural/SKILL-NEW.md" in client._objects
+        assert any(
+            d.metadata["file"] == "SKILL-NEW.md" for d in service.load(user_context)
+        )
+
+    def test_write_replaces_existing(self, user_context) -> None:
+        client = _FakeMinio({"procedural/SKILL-X.md": b"# v1\n"})
+        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service.write(user_context, "SKILL-X.md", "# v2\n")
+        doc = service.read(user_context, "SKILL-X.md")
+        assert doc is not None and doc.page_content == "# v2\n"
+
+    def test_write_rejects_invalid_filename(self, user_context) -> None:
+        service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")
+        with pytest.raises(ValueError):
+            service.write(user_context, "../escape.md", "x")
+
+    def test_delete_existing(self, user_context) -> None:
+        client = _FakeMinio({"procedural/SKILL-bye.md": b"# bye\n"})
+        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service.load(user_context)
+        assert service.delete(user_context, "SKILL-bye.md") is True
+        assert "procedural/SKILL-bye.md" not in client._objects
+        assert service.read(user_context, "SKILL-bye.md") is None
+
+    def test_delete_missing_returns_false(self, user_context) -> None:
+        service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")
+        assert service.delete(user_context, "never.md") is False
+
+    def test_invalidate_cache_explicit(self, user_context) -> None:
+        client = _FakeMinio({"procedural/SKILL-c.md": b"# c\n"})
+        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        service.load(user_context)
+        client._objects["procedural/SKILL-side.md"] = b"# side\n"
+        before = {d.metadata["file"] for d in service.load(user_context)}
+        assert "SKILL-side.md" not in before
+        service.invalidate_cache()
+        after = {d.metadata["file"] for d in service.load(user_context)}
+        assert "SKILL-side.md" in after
+
+
+class TestMockProceduralServiceWriteDelete:
+    def test_write_then_read(self, user_context) -> None:
+        service = MockProceduralService()
+        doc = service.write(user_context, "SKILL-foo.md", "# Foo\n")
+        assert doc.metadata["skill"] == "foo"
+        assert service.read(user_context, "SKILL-foo.md").page_content == "# Foo\n"
+
+    def test_delete_existing(self, user_context) -> None:
+        service = MockProceduralService()
+        service.write(user_context, "SKILL-x.md", "x")
+        assert service.delete(user_context, "SKILL-x.md") is True
+        assert service.read(user_context, "SKILL-x.md") is None
+
+    def test_invalidate_cache_no_op(self, user_context) -> None:
+        service = MockProceduralService()
+        service.invalidate_cache()  # no exception

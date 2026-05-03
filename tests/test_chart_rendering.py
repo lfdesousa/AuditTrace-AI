@@ -367,3 +367,199 @@ class TestRealmWebuiClientFromValues:
         realm = _json.loads(cm["data"]["realm.json"])
         assert "clients" in realm
         assert any(c["clientId"] == "audittrace-webui" for c in realm["clients"])
+
+
+class TestRealmMemoryWriteScopes:
+    """Phase 3.0 (PR A): the realm must declare the three per-layer
+    write scopes used by the memory CRUD backoffice. Without these
+    declarations, Keycloak rejects token requests asking for the
+    scope and the routes 403 even with a correct admin user."""
+
+    def test_three_write_scopes_declared(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        scope_names = {s["name"] for s in realm.get("clientScopes", [])}
+        # Subset comparison so future scope additions don't fail the
+        # test (CodeQL-friendly per the v1.0.2 lesson).
+        expected = {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+        assert expected <= scope_names, (
+            f"missing write scope(s); got {scope_names - expected!r} extras "
+            f"and {expected - scope_names!r} missing"
+        )
+
+    def test_admin_client_grants_write_scopes_by_default(self) -> None:
+        """Operators using the admin-client (service account) get the
+        write scopes without having to opt in per request."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        admin_client = next(
+            c for c in realm["clients"] if c["clientId"] == "admin-client"
+        )
+        defaults = set(admin_client["defaultClientScopes"])
+        expected = {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+        assert expected <= defaults
+
+    def test_user_facing_clients_offer_write_scopes_optionally(self) -> None:
+        """Browser / OpenCode flows declare the write scopes as
+        optional — clients request them per session as needed."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            optional = set(client.get("optionalClientScopes") or [])
+            expected = {
+                "memory:episodic:write",
+                "memory:procedural:write",
+                "memory:semantic:write",
+            }
+            assert expected <= optional, (
+                f"{client_id} missing optional write scopes: {expected - optional!r}"
+            )
+
+
+class TestMemoryScopesProvisioningJob:
+    """Helm post-install/post-upgrade Job that provisions the three
+    `memory:<layer>:write` scopes onto a running Keycloak realm.
+
+    Keycloak's `--import-realm` only imports on a FRESH realm — chart
+    edits to realm.json don't propagate to existing realms. This Job
+    closes the gap: it runs on every helm install/upgrade and uses
+    kcadm.sh to ensure the scopes exist + are bound to the right
+    clients (idempotent).
+
+    Without this Job, every chart upgrade that adds a scope silently
+    leaves the running realm without it, and `/memory/<layer>` write
+    endpoints 403 every operator JWT (`auth.py:174` does a strict
+    scope check with no admin bypass).
+    """
+
+    def test_job_renders_with_post_upgrade_hook(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        annotations = job["metadata"].get("annotations", {})
+        assert "post-install" in annotations.get("helm.sh/hook", "")
+        assert "post-upgrade" in annotations.get("helm.sh/hook", "")
+        assert (
+            annotations.get("helm.sh/hook-delete-policy")
+            == "before-hook-creation,hook-succeeded"
+        )
+
+    def test_job_uses_dedicated_serviceaccount(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        sa = job["spec"]["template"]["spec"]["serviceAccountName"]
+        assert sa == "audittrace-memory-scopes-job"
+        # The SA itself must also exist as a manifest.
+        _find_workload(out, "ServiceAccount", "audittrace-memory-scopes-job")
+
+    def test_job_runs_on_keycloak_image(self) -> None:
+        """kcadm.sh ships with the Keycloak image — no other base
+        works without installing extra packages at runtime."""
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        image = job["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert "keycloak" in image.lower()
+
+    def test_keycloak_authorizationpolicy_allows_job_sa(self) -> None:
+        """The keycloak AP must allow the Job's SA principal — without
+        this the kcadm calls fail with TLS handshake or 403 from
+        Istio enforcement."""
+        out = _render(["--set", "vault.enabled=true"])
+        ap = _find_workload(out, "AuthorizationPolicy", "audittrace-allow-keycloak")
+        principals = ap["spec"]["rules"][0]["from"][0]["source"]["principals"]
+        joined = "\n".join(principals)
+        assert "memory-scopes-job" in joined
+
+    def test_vault_authorizationpolicy_allows_job_sa(self) -> None:
+        """The Vault AP must allow the Job's SA principal — without
+        this Envoy rejects the vault-agent's auth/kubernetes/login
+        with `403: RBAC: access denied` BEFORE Vault ever sees the
+        request. The 2026-05-03 live debug found this the hard way:
+        Vault role was correct, manual login worked from inside the
+        vault pod (bypasses Istio), but the Job pod's vault-agent
+        consistently failed because Envoy denied the request first.
+
+        Adding a Vault-bound workload requires three coordinated edits
+        — the Vault policy, the Vault role, AND this AP. Drift in any
+        one of the three breaks live auth silently."""
+        out = _render(["--set", "vault.enabled=true"])
+        ap = _find_workload(out, "AuthorizationPolicy", "audittrace-allow-vault")
+        principals = ap["spec"]["rules"][0]["from"][0]["source"]["principals"]
+        joined = "\n".join(principals)
+        assert "memory-scopes-job" in joined, (
+            f"Vault AP missing memory-scopes-job principal; got: {principals!r}"
+        )
+
+    def test_script_configmap_lists_three_scopes(self) -> None:
+        """Regression guard against drift: the three scopes the
+        provisioner script ensures must match the realm.json
+        clientScopes block. If a future PR adds (or renames) a
+        scope, both sites must move together."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        for scope in (
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        ):
+            assert scope in script, f"script missing scope: {scope}"
+
+    def test_script_binds_to_admin_opencode_webui(self) -> None:
+        """The bash script must reference each client we expect to
+        receive the scope binding."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        for client_id in ("admin-client", "audittrace-opencode", "audittrace-webui"):
+            assert client_id in script, f"script missing client binding: {client_id}"
+
+    def test_vault_role_and_policy_declared(self) -> None:
+        """When vault.enabled=true, the Job needs a Vault role bound
+        to a least-privilege policy (read on keycloak/* only)."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-vault-policies")
+        assert "memory-scopes-job.hcl" in cm["data"]
+        assert "role-memory-scopes-job.env" in cm["data"]
+        # Policy should grant read on keycloak/* and nothing else.
+        policy = cm["data"]["memory-scopes-job.hcl"]
+        assert "keycloak/" in policy
+        assert "postgres/" not in policy
+        # Role binds to the dedicated SA.
+        role = cm["data"]["role-memory-scopes-job.env"]
+        assert "audittrace-memory-scopes-job" in role
+
+    def test_job_uses_pre_populate_only_under_vault(self) -> None:
+        """Without `agent-pre-populate-only: true` the vault-agent
+        sidecar keeps the Pod 2/3 NotReady forever and the helm
+        post-upgrade hook reports `failed: context deadline exceeded`
+        (Phase C.8 root cause — same lesson as the summariser Job)."""
+        out = _render(["--set", "vault.enabled=true"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        annotations = job["spec"]["template"]["metadata"].get("annotations", {})
+        key = "vault.hashicorp.com/agent-pre-populate-only"
+        assert annotations.get(key) == "true"
+
+    def test_job_renders_under_vault_disabled(self) -> None:
+        """When vault.enabled=false, the Job sources the admin
+        password from the K8s Secret instead — the manifest must
+        still render and reference the secret."""
+        out = _render(["--set", "vault.enabled=false"])
+        job = _find_workload(out, "Job", "audittrace-ensure-memory-scopes")
+        envs = job["spec"]["template"]["spec"]["containers"][0]["env"]
+        admin_pw = next(e for e in envs if e["name"] == "KEYCLOAK_ADMIN_PASSWORD")
+        assert (
+            admin_pw["valueFrom"]["secretKeyRef"]["name"]
+            == "audittrace-keycloak-secret"
+        )

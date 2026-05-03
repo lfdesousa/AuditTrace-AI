@@ -49,6 +49,35 @@ class EpisodicService(ABC):
         ADRs are flat objects keyed by filename, not a directory tree.
         """
 
+    @abstractmethod
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        """Create or replace an ADR. Returns the persisted ``Document``.
+
+        Validates the filename (same rules as ``read``: ``.md`` extension,
+        no path traversal). Implementations that maintain an in-memory
+        cache MUST call ``invalidate_cache()`` so subsequent ``load()``
+        / ``search()`` see the new content. Raises ``ValueError`` for an
+        invalid filename and ``RuntimeError`` for a backend write failure.
+        """
+
+    @abstractmethod
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        """Hard-delete the underlying object from storage.
+
+        Returns ``True`` if the object was deleted, ``False`` if it
+        didn't exist. Implementations MUST invalidate the cache on
+        success so the deleted ADR doesn't keep appearing in
+        ``load()`` / ``search()`` results until the next pod restart.
+        """
+
+    @abstractmethod
+    def invalidate_cache(self) -> None:
+        """Drop any in-memory cache so the next ``load()`` re-fetches
+        from the backing store. Safe to call multiple times. Required
+        after any write/delete so changes propagate without a pod
+        restart (Phase A's S3 services kept a per-process cache that
+        only refreshed on cold start)."""
+
 
 def _validate_filename(file: str) -> bool:
     """Reject empty, path-traversal, and non-``.md`` filenames."""
@@ -179,6 +208,69 @@ class S3EpisodicService(EpisodicService):
             },
         )
 
+    @log_call(logger=logger)
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        del user_context  # shared content — not per-user scoped
+        if not _validate_filename(file):
+            raise ValueError(f"invalid filename: {file!r}")
+        import io
+
+        client: Any = self._client
+        key = f"{self._prefix}{file}"
+        body = content.encode("utf-8")
+        try:
+            client.put_object(self._bucket, key, io.BytesIO(body), length=len(body))
+        except Exception as exc:
+            raise RuntimeError(
+                f"S3EpisodicService.write({file!r}) failed: {exc}"
+            ) from exc
+        self.invalidate_cache()
+        return Document(
+            page_content=content,
+            metadata={
+                "source": "episodic",
+                "file": file,
+                "title": _title_from_content(content, file[:-3]),
+            },
+        )
+
+    @log_call(logger=logger)
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        del user_context  # shared content — not per-user scoped
+        if not _validate_filename(file):
+            return False
+        client: Any = self._client
+        key = f"{self._prefix}{file}"
+        # Existence check first so "didn't exist" → False (idempotent),
+        # not "boom". MinIO `remove_object` happily no-ops on missing,
+        # but we want the explicit signal back to the caller.
+        try:
+            client.stat_object(self._bucket, key)
+        except Exception as exc:
+            code = getattr(exc, "code", "")
+            if code == "NoSuchKey":
+                return False
+            # On any other stat failure, attempt the delete anyway; if
+            # it succeeds we return True, else propagate.
+            logger.warning(
+                "S3EpisodicService.delete(%r): stat failed (%s) — "
+                "attempting remove regardless",
+                file,
+                exc,
+            )
+        try:
+            client.remove_object(self._bucket, key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"S3EpisodicService.delete({file!r}) failed: {exc}"
+            ) from exc
+        self.invalidate_cache()
+        return True
+
+    @log_call(logger=logger)
+    def invalidate_cache(self) -> None:
+        self._cache = None
+
 
 class MockEpisodicService(EpisodicService):
     """Mock episodic service for unit testing."""
@@ -235,6 +327,52 @@ class MockEpisodicService(EpisodicService):
             if d.metadata.get("file") == file:
                 return d
         return None
+
+    @log_call(logger=logger)
+    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+        del user_context  # plumbing only
+        if not _validate_filename(file):
+            raise ValueError(f"invalid filename: {file!r}")
+        # Replace if exists, else append.
+        for i, d in enumerate(self._documents):
+            if d.metadata.get("file") == file:
+                self._documents[i] = Document(
+                    page_content=content,
+                    metadata={
+                        "source": "episodic",
+                        "file": file,
+                        "title": _title_from_content(content, file[:-3]),
+                    },
+                )
+                return self._documents[i]
+        new_doc = Document(
+            page_content=content,
+            metadata={
+                "source": "episodic",
+                "file": file,
+                "title": _title_from_content(content, file[:-3]),
+            },
+        )
+        self._documents.append(new_doc)
+        return new_doc
+
+    @log_call(logger=logger)
+    def delete(self, user_context: UserContext, file: str) -> bool:
+        del user_context  # plumbing only
+        if not _validate_filename(file):
+            return False
+        for i, d in enumerate(self._documents):
+            if d.metadata.get("file") == file:
+                self._documents.pop(i)
+                return True
+        return False
+
+    @log_call(logger=logger)
+    def invalidate_cache(self) -> None:
+        # MockEpisodicService doesn't maintain a cache (data is the
+        # source of truth), so this is a no-op. Implemented to satisfy
+        # the abstract method.
+        pass
 
     def reset(self) -> None:
         """Clear all documents."""

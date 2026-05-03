@@ -55,7 +55,9 @@ class _FakeResponse:
 
 
 class _FakeMinio:
-    """Minimal MinIO-client double covering ``list_objects`` + ``get_object``."""
+    """Minimal MinIO-client double covering ``list_objects`` + ``get_object``
+    + ``put_object`` + ``remove_object`` + ``stat_object`` (the methods our
+    services touch). All operate on the same in-memory `_objects` dict."""
 
     def __init__(self, objects: dict[str, bytes]) -> None:
         # Keys are full S3 keys including the prefix (e.g. ``episodic/ADR-001.md``)
@@ -72,6 +74,20 @@ class _FakeMinio:
         if key not in self._objects:
             raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
         return _FakeResponse(self._objects[key])
+
+    def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
+        del bucket, length
+        self._objects[key] = body.read()
+
+    def stat_object(self, bucket: str, key: str) -> object:
+        del bucket
+        if key not in self._objects:
+            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+        return object()  # opaque "exists" sentinel
+
+    def remove_object(self, bucket: str, key: str) -> None:
+        del bucket
+        self._objects.pop(key, None)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -355,3 +371,108 @@ class TestMockEpisodicService:
         service = MockEpisodicService()
         service.add_document("contents", title="ADR-007", file="ADR-007.md")
         assert service.read(user_context, "../etc/passwd.md") is None
+
+
+# ── write / delete / invalidate_cache (PR A — CRUD backoffice) ──────────────
+
+
+class TestS3EpisodicServiceWriteDelete:
+    """write() and delete() round-trip through the fake MinIO and
+    invalidate the in-memory cache so subsequent load()/read() see
+    the change."""
+
+    def test_write_creates_object_and_invalidates_cache(self, user_context) -> None:
+        client = _FakeMinio({})
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        # Warm the cache
+        assert service.load(user_context) == []
+        # Write
+        doc = service.write(user_context, "ADR-100.md", "# ADR-100\n\nbody\n")
+        assert doc.metadata["file"] == "ADR-100.md"
+        assert doc.metadata["title"] == "ADR-100"
+        # Object landed in the fake MinIO
+        assert "episodic/ADR-100.md" in client._objects
+        # Cache was invalidated → next load() sees the new doc
+        assert any(
+            d.metadata["file"] == "ADR-100.md" for d in service.load(user_context)
+        )
+
+    def test_write_replaces_existing(self, user_context) -> None:
+        client = _FakeMinio({"episodic/ADR-x.md": b"# v1\n"})
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service.write(user_context, "ADR-x.md", "# v2\n")
+        # Re-fetch
+        doc = service.read(user_context, "ADR-x.md")
+        assert doc is not None
+        assert doc.page_content == "# v2\n"
+
+    def test_write_rejects_invalid_filename(self, user_context) -> None:
+        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
+        with pytest.raises(ValueError):
+            service.write(user_context, "../escape.md", "x")
+
+    def test_delete_removes_existing(self, user_context) -> None:
+        client = _FakeMinio({"episodic/ADR-d.md": b"# bye\n"})
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        # Warm cache
+        service.load(user_context)
+        deleted = service.delete(user_context, "ADR-d.md")
+        assert deleted is True
+        assert "episodic/ADR-d.md" not in client._objects
+        # Cache invalidated → not found
+        assert service.read(user_context, "ADR-d.md") is None
+
+    def test_delete_missing_returns_false(self, user_context) -> None:
+        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
+        assert service.delete(user_context, "never.md") is False
+
+    def test_delete_rejects_invalid_filename(self, user_context) -> None:
+        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
+        assert service.delete(user_context, "../escape.md") is False
+
+    def test_invalidate_cache_explicit(self, user_context) -> None:
+        client = _FakeMinio({"episodic/ADR-c.md": b"# c\n"})
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service.load(user_context)  # warm
+        # Backdoor an extra object straight into MinIO
+        client._objects["episodic/ADR-side.md"] = b"# side\n"
+        # Without invalidation, cache hides it
+        files_before = {d.metadata["file"] for d in service.load(user_context)}
+        assert "ADR-side.md" not in files_before
+        service.invalidate_cache()
+        files_after = {d.metadata["file"] for d in service.load(user_context)}
+        assert "ADR-side.md" in files_after
+
+
+class TestMockEpisodicServiceWriteDelete:
+    """Mock variants — used by route tests + the in-process pytest stack."""
+
+    def test_write_then_read(self, user_context) -> None:
+        service = MockEpisodicService()
+        doc = service.write(user_context, "ADR-7.md", "# Seven\n")
+        assert doc.metadata["title"] == "Seven"
+        # Read back
+        assert service.read(user_context, "ADR-7.md").page_content == "# Seven\n"
+
+    def test_write_replaces(self, user_context) -> None:
+        service = MockEpisodicService()
+        service.write(user_context, "ADR-7.md", "v1")
+        service.write(user_context, "ADR-7.md", "v2")
+        assert len(service.load(user_context)) == 1
+        assert service.read(user_context, "ADR-7.md").page_content == "v2"
+
+    def test_delete_existing_returns_true(self, user_context) -> None:
+        service = MockEpisodicService()
+        service.write(user_context, "ADR-7.md", "x")
+        assert service.delete(user_context, "ADR-7.md") is True
+        assert service.read(user_context, "ADR-7.md") is None
+
+    def test_delete_missing_returns_false(self, user_context) -> None:
+        service = MockEpisodicService()
+        assert service.delete(user_context, "never.md") is False
+
+    def test_invalidate_cache_is_no_op(self, user_context) -> None:
+        # Mock has no cache; calling should not error.
+        service = MockEpisodicService()
+        service.invalidate_cache()
+        service.invalidate_cache()  # idempotent
