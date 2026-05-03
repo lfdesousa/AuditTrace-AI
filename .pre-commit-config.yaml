@@ -36,6 +36,11 @@ repos:
           - types-redis
           - sqlalchemy
           - chromadb
+          # minio is a runtime dep — including it here so pre-commit's
+          # mypy sees the same `type[Minio]` as local `make lint` and the
+          # two gates agree on whether `type: ignore` comments are needed
+          # (was a 2026-05-03 stabilisation pickup).
+          - minio
         args: [--ignore-missing-imports]
         exclude: ^(scripts/|tests/)
 

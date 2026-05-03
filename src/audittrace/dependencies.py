@@ -46,7 +46,12 @@ from audittrace.services.procedural import (
 try:
     from minio import Minio
 except ImportError:  # pragma: no cover - optional dep
-    Minio = None
+    # The suppression below is required because mypy sees `Minio` as
+    # `type[Minio]` from the try-branch import; the None fallback is
+    # intentional for the optional-dep import-failure case (which only
+    # happens in degenerate build environments — minio is a real
+    # runtime dep).
+    Minio = None  # type: ignore[assignment, misc]
 
 from audittrace.services.semantic import (
     ChromaSemanticService,
