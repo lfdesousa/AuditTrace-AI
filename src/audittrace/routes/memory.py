@@ -40,10 +40,13 @@ from minio import Minio
 
 from audittrace.auth import require_scope, require_user
 from audittrace.config import get_settings
+from audittrace.db.models import InteractionRecord as InteractionRow
+from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import (
     get_chromadb,
     get_episodic_service,
     get_memory_manifest_service,
+    get_postgres_factory,
     get_procedural_service,
     get_semantic_service,
 )
@@ -381,18 +384,100 @@ async def create_episodic(
     return entry.to_dict()
 
 
+def _merge_layer_items_with_s3(
+    layer: str,
+    visible_entries: list[ManifestEntry],
+    user: UserContext,
+) -> list[dict[str, Any]]:
+    """Merge S3 objects into the manifest-row list so pre-PR-A items
+    (uploaded via /memory/upload or seeded via index-chromadb) surface
+    in the backoffice.
+
+    The manifest table is operator-managed and only contains items
+    created via the new POST endpoint. The Memory tab has to reflect
+    *all* content for the layer, so we walk the S3 prefix and emit
+    a "discovered" entry for any object not already in the manifest.
+    Manifest rows take precedence — they carry authorship, soft-delete
+    state, sub-second timestamps. Discovered entries carry only what
+    the storage backend knows: filename, size, title-from-content.
+
+    Excludes from S3 discovery any key that has a manifest row even
+    if it's currently filtered out (e.g. soft-deleted with
+    ``include_deleted=False``). Otherwise a soft-deleted item would
+    resurrect on every list as "discovered" because the S3 object
+    is still there — we'd be papering over the operator's delete
+    intent.
+    """
+    items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
+
+    manifest = get_memory_manifest_service()
+    all_known: list[ManifestEntry] = manifest.list_for_layer(
+        layer, include_deleted=True
+    )
+    known_keys = {e.key for e in all_known}
+
+    service: Any
+    if layer == "episodic":
+        service = get_episodic_service()
+    elif layer == "procedural":
+        service = get_procedural_service()
+    else:
+        return items  # other layers don't have S3 backing
+
+    try:
+        docs = service.load(user)
+    except Exception as exc:
+        logger.warning(
+            "S3 backfill load failed for layer %s: %s — listing manifest only",
+            layer,
+            exc,
+        )
+        return items
+
+    for doc in docs:
+        filename = doc.metadata.get("file")
+        if not filename or filename in known_keys:
+            continue
+        items.append(
+            {
+                "id": None,
+                "layer": layer,
+                "key": filename,
+                "title": doc.metadata.get("title")
+                or doc.metadata.get("skill")
+                or filename,
+                "size_bytes": len(doc.page_content.encode("utf-8")),
+                "created_at_ms": None,
+                "modified_at_ms": None,
+                "created_by_user_id": None,
+                "modified_by_user_id": None,
+                "deleted_at_ms": None,
+                "deleted_by_user_id": None,
+                "discovered": True,
+            }
+        )
+    return items
+
+
 @router.get("/episodic")
 async def list_episodic(
     include_deleted: bool = Query(False),
     _auth: dict[str, Any] = Depends(require_scope("memory:episodic:read")),
+    user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """List ADRs. ``include_deleted=true`` requires the same read scope
-    (the soft-delete signal is operator-public, not sensitive)."""
+    """List ADRs. Merges manifest rows with S3 objects so pre-PR-A
+    content (uploaded via /memory/upload or seeded via index-chromadb)
+    surfaces alongside operator-created items.
+
+    ``include_deleted=true`` returns soft-deleted manifest rows; it
+    has no effect on discovered entries (they have no soft-delete
+    state)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = manifest.list_for_layer(
         "episodic", include_deleted=include_deleted
     )
-    return {"items": [e.to_dict() for e in entries], "total": len(entries)}
+    items = _merge_layer_items_with_s3("episodic", entries, user)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/episodic/{filename}")
@@ -535,12 +620,16 @@ async def create_procedural(
 async def list_procedural(
     include_deleted: bool = Query(False),
     _auth: dict[str, Any] = Depends(require_scope("memory:procedural:read")),
+    user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
+    so pre-PR-A items appear alongside operator-created ones."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = manifest.list_for_layer(
         "procedural", include_deleted=include_deleted
     )
-    return {"items": [e.to_dict() for e in entries], "total": len(entries)}
+    items = _merge_layer_items_with_s3("procedural", entries, user)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/procedural/{filename}")
@@ -684,6 +773,87 @@ async def create_semantic(
     return entry.to_dict()
 
 
+def _merge_semantic_with_chroma(
+    visible_entries: list[ManifestEntry],
+    collection: str | None,
+) -> list[dict[str, Any]]:
+    """Same shape as `_merge_layer_items_with_s3` for the semantic layer.
+
+    ChromaDB has its own listing semantics — `collection.get()` with
+    no `ids=` returns every doc. We cap the per-collection scan at
+    ``_SEMANTIC_DISCOVERY_LIMIT`` rows to keep the list endpoint snappy
+    on collections that grow large; operators who need to browse a
+    large semantic store can paginate via the manifest's offset/limit
+    once they've created tracked rows for the items they care about.
+    """
+    items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
+
+    manifest = get_memory_manifest_service()
+    all_known: list[ManifestEntry] = manifest.list_for_layer(
+        "semantic", include_deleted=True
+    )
+    known_keys = {e.key for e in all_known}
+
+    chroma = get_chromadb()
+    # Discovery target collections: filter param if given, else all
+    # collections the chroma client knows about (capped — see
+    # _SEMANTIC_DISCOVERY_LIMIT). Reading every collection on every
+    # list call would scale poorly past a few collections.
+    target_cols: list[str]
+    if collection is not None:
+        target_cols = [collection]
+    else:
+        try:
+            target_cols = [c.name for c in chroma.list_collections()][:5]
+        except Exception as exc:
+            logger.warning("ChromaDB list_collections failed: %s", exc)
+            return items
+
+    for col_name in target_cols:
+        try:
+            col = chroma.get_or_create_collection(name=col_name)
+            res = col.get(
+                limit=_SEMANTIC_DISCOVERY_LIMIT,
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            logger.warning("ChromaDB get failed for collection %s: %s", col_name, exc)
+            continue
+        ids = res.get("ids") or []
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        for i, doc_id in enumerate(ids):
+            key = _semantic_key(col_name, doc_id)
+            if key in known_keys:
+                continue
+            content = docs[i] if i < len(docs) else ""
+            meta = metas[i] if i < len(metas) and metas[i] else {}
+            title = meta.get("title") or meta.get("source") or doc_id
+            items.append(
+                {
+                    "id": None,
+                    "layer": "semantic",
+                    "key": key,
+                    "title": title,
+                    "size_bytes": len((content or "").encode("utf-8")),
+                    "created_at_ms": None,
+                    "modified_at_ms": None,
+                    "created_by_user_id": None,
+                    "modified_by_user_id": None,
+                    "deleted_at_ms": None,
+                    "deleted_by_user_id": None,
+                    "discovered": True,
+                }
+            )
+    return items
+
+
+# Cap per-collection discovery scan so the list endpoint stays snappy
+# even when a chroma collection grows large. Operators wanting full
+# enumeration should paginate the manifest.
+_SEMANTIC_DISCOVERY_LIMIT = 200
+
+
 @router.get("/semantic")
 async def list_semantic(
     collection: str | None = Query(
@@ -692,6 +862,9 @@ async def list_semantic(
     include_deleted: bool = Query(False),
     _auth: dict[str, Any] = Depends(require_scope("memory:semantic:read")),
 ) -> dict[str, Any]:
+    """List semantic-layer items. Merges the manifest with ChromaDB
+    discovery so pre-PR-A vectors (seeded via index-chromadb.py)
+    surface alongside operator-created ones."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = manifest.list_for_layer(
         "semantic", include_deleted=include_deleted
@@ -699,7 +872,8 @@ async def list_semantic(
     if collection is not None:
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
-    return {"items": [e.to_dict() for e in entries], "total": len(entries)}
+    items = _merge_semantic_with_chroma(entries, collection)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/semantic/{collection}/{document_id}")
@@ -788,3 +962,179 @@ async def delete_semantic(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     return entry.to_dict()
+
+
+# ── /memory/conversational ──────────────────────────────────────────────────
+#
+# Layer 3 — chat sessions + interactions persisted in Postgres on the
+# `/v1/chat/completions` hot path. Unlike the other three layers,
+# conversational data is **per-user**: RLS on the ``sessions`` and
+# ``interactions`` tables (migration 005) restricts every query to the
+# caller's own ``user_id``. Read-only — sessions are produced by the
+# chat path itself, not by operator writes.
+#
+# Why these endpoints exist on top of the older ``/sessions`` and
+# ``/interactions`` audit routes: the audit routes gate on
+# ``audittrace:audit`` scope (which carries auditor semantics —
+# "see everything in your scope, including across projects"). For an
+# end-user wanting to review their own chat history, ``memory:
+# conversational:read-own`` is the right scope. The two surfaces serve
+# different roles intentionally.
+
+
+@router.get("/conversational")
+async def list_conversational_sessions(
+    project: str | None = Query(None, description="Filter by project tag (ADR-029)."),
+    since: str | None = Query(
+        None,
+        description=(
+            "ISO date string. Only sessions with ``date >= since`` are returned."
+        ),
+    ),
+    summarised: bool | None = Query(
+        None,
+        description=(
+            "true → only rows with ``summarized_at`` populated; "
+            "false → only un-summarised rows; omit → both."
+        ),
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    _scope: dict[str, Any] = Depends(require_scope("memory:conversational:read-own")),
+    _user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """List the caller's own chat sessions, ordered by date DESC.
+
+    RLS-scoped: the caller only sees rows whose ``user_id`` matches
+    their JWT ``sub``. No cross-user reads are possible from this
+    endpoint, even if the caller crafts a ``user_id`` filter — the
+    ``after_begin`` listener sets ``app.current_user_id`` and the
+    Postgres policy on ``sessions`` filters it.
+    """
+    try:
+        pg = get_postgres_factory()
+    except Exception as exc:
+        logger.error(
+            "Conversational endpoint unavailable — PostgresFactory not registered"
+        )
+        raise HTTPException(
+            status_code=503, detail="Conversational store unavailable"
+        ) from exc
+
+    session_factory = pg.get_session_factory()
+    with session_factory() as db:
+        q = db.query(SessionRow)
+        if project is not None:
+            q = q.filter(SessionRow.project == project)
+        if since is not None:
+            q = q.filter(SessionRow.date >= since)
+        if summarised is True:
+            q = q.filter(SessionRow.summarized_at.is_not(None))
+        elif summarised is False:
+            q = q.filter(SessionRow.summarized_at.is_(None))
+        total = q.count()
+        rows = q.order_by(SessionRow.date.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "project": r.project,
+                "date": r.date,
+                "model": r.model,
+                "summary": r.summary,
+                "key_points": r.key_points,
+                "summarized_at": (
+                    r.summarized_at.isoformat() if r.summarized_at is not None else None
+                ),
+                "user_id": r.user_id,
+            }
+            for r in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/conversational/{session_id}")
+async def read_conversational_session(
+    session_id: str,
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    _scope: dict[str, Any] = Depends(require_scope("memory:conversational:read-own")),
+    _user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """Fetch one session's metadata + its interactions, ordered by
+    timestamp ASC (chronological). RLS gates visibility — calling on a
+    session_id that exists but belongs to another user returns 404
+    (not 403) so the caller can't probe for foreign session ids.
+    """
+    try:
+        pg = get_postgres_factory()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Conversational store unavailable"
+        ) from exc
+
+    session_factory = pg.get_session_factory()
+    with session_factory() as db:
+        session_row = (
+            db.query(SessionRow).filter(SessionRow.id == session_id).one_or_none()
+        )
+        if session_row is None:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        q = (
+            db.query(InteractionRow)
+            .filter(InteractionRow.session_id == session_id)
+            .order_by(InteractionRow.timestamp.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        interactions = q.all()
+
+    return {
+        "session": {
+            "id": session_row.id,
+            "project": session_row.project,
+            "date": session_row.date,
+            "model": session_row.model,
+            "summary": session_row.summary,
+            "key_points": session_row.key_points,
+            "summarized_at": (
+                session_row.summarized_at.isoformat()
+                if session_row.summarized_at is not None
+                else None
+            ),
+            "user_id": session_row.user_id,
+        },
+        "interactions": [
+            {
+                "id": r.id,
+                # `timestamp` is stored as a String column in the
+                # `interactions` table (migration 005), not a TIMESTAMP.
+                # Pass it through as-is — schema-driven contract.
+                "timestamp": r.timestamp,
+                "session_id": r.session_id,
+                "source": r.source,
+                "project": r.project,
+                # The ORM columns are `question` / `answer` (migration 005's
+                # original names). Surface as `question` / `answer` here so
+                # the response shape mirrors the row faithfully — the webui
+                # will rename for display, not the API.
+                "question": r.question,
+                "answer": r.answer,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "model": r.model,
+                "status": r.status,
+                "failure_class": r.failure_class,
+                "error_detail": r.error_detail,
+                "duration_ms": r.duration_ms,
+                "trace_id": r.trace_id,
+            }
+            for r in interactions
+        ],
+        "total": len(interactions),
+    }

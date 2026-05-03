@@ -1001,3 +1001,118 @@ class TestHardDeleteAdminGate:
                 client.app.dependency_overrides.pop(auth_require_user, None)
         assert r.status_code == 403
         assert "audittrace:admin" in r.json()["detail"]
+
+
+class TestS3DiscoveryMerge:
+    """The list endpoints must merge S3 objects (pre-PR-A items uploaded
+    via /memory/upload or seeded via index-chromadb) into the response
+    so the Memory tab reflects ALL content, not just operator-created
+    items. Found in PR A's 2026-05-03 live test: the page showed 0
+    items because the manifest table was empty — the underlying ADRs
+    were in MinIO already.
+    """
+
+    def test_episodic_list_includes_s3_objects(self, client: TestClient) -> None:
+        # Seed the mock episodic service with an "uploaded" item that
+        # has no manifest row — the manifest is empty at this point.
+        from audittrace.dependencies import get_episodic_service
+
+        ep = get_episodic_service()
+        ep.add_document(
+            content="# ADR-pre-existing\n\ncontent",
+            title="Pre-existing ADR",
+            file="ADR-pre-existing.md",
+        )
+
+        r = client.get("/memory/episodic")
+        assert r.status_code == 200
+        body = r.json()
+        keys = {i["key"] for i in body["items"]}
+        assert "ADR-pre-existing.md" in keys
+        # The discovered entry has no manifest authorship/timestamps
+        discovered = next(i for i in body["items"] if i["key"] == "ADR-pre-existing.md")
+        assert discovered["discovered"] is True
+        assert discovered["id"] is None
+        assert discovered["created_by_user_id"] is None
+        assert discovered["modified_at_ms"] is None
+
+    def test_procedural_list_includes_s3_objects(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_procedural_service
+
+        pr = get_procedural_service()
+        pr.add_document(
+            content="# SKILL-pre\n\nbody",
+            skill="PreSkill",
+            file="SKILL-pre.md",
+        )
+
+        r = client.get("/memory/procedural")
+        assert r.status_code == 200
+        body = r.json()
+        keys = {i["key"] for i in body["items"]}
+        assert "SKILL-pre.md" in keys
+
+    def test_manifest_row_takes_precedence_over_s3_object(
+        self, client: TestClient
+    ) -> None:
+        """An operator-created item is in BOTH the manifest and S3.
+        The list endpoint must surface the manifest version (with
+        authorship metadata), not the S3 discovery synthesis."""
+        # Create via the new POST endpoint; this writes both to S3 and
+        # to the manifest.
+        client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-tracked.md", "content": "# tracked"},
+        )
+
+        r = client.get("/memory/episodic")
+        assert r.status_code == 200
+        rows = [i for i in r.json()["items"] if i["key"] == "ADR-tracked.md"]
+        assert len(rows) == 1, "key duplicated between manifest + S3 discovery"
+        assert rows[0].get("discovered") is None
+        assert rows[0]["id"] is not None
+        assert rows[0]["created_by_user_id"]
+
+    def test_soft_deleted_key_is_not_resurrected_via_s3(
+        self, client: TestClient
+    ) -> None:
+        """When a manifest row is soft-deleted, the S3 object is left
+        in place by design. The list endpoint must NOT re-discover the
+        S3 object as a "new" entry — that would silently reverse the
+        operator's delete intent."""
+        client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-killed.md", "content": "# killed"},
+        )
+        r = client.delete("/memory/episodic/ADR-killed.md")
+        assert r.status_code == 200
+
+        r = client.get("/memory/episodic")  # default include_deleted=False
+        keys = {i["key"] for i in r.json()["items"]}
+        assert "ADR-killed.md" not in keys, (
+            "soft-deleted manifest row was resurrected via S3 discovery"
+        )
+
+
+class TestConversationalLayer:
+    """Layer 3 — chat sessions + interactions. Read-only RLS-scoped
+    surface separate from the audit routes. Backed by the same
+    Postgres tables as `/sessions` + `/interactions` but gated on the
+    user-facing `memory:conversational:read-own` scope."""
+
+    def test_list_requires_conversational_read_scope(self, client: TestClient) -> None:
+        # auth_enabled=False in tests so the scope check is bypassed;
+        # we only assert the route exists and returns the documented
+        # shape.
+        r = client.get("/memory/conversational")
+        assert r.status_code == 200
+        body = r.json()
+        assert "items" in body
+        assert "total" in body
+        assert "limit" in body
+        assert "offset" in body
+
+    def test_read_unknown_session_returns_404(self, client: TestClient) -> None:
+        r = client.get("/memory/conversational/does-not-exist")
+        assert r.status_code == 404
+        assert "not found" in r.json()["detail"].lower()
