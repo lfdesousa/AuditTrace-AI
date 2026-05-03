@@ -287,13 +287,29 @@ class TestRealmWebuiClientFromValues:
     explicitly wanted to eliminate)."""
 
     def test_default_includes_localhost_8765_and_local(self) -> None:
-        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway."""
+        """Out-of-the-box defaults cover localhost-dev + .local k3s gateway.
+
+        Subset comparison rather than ``"<url>" in <list>`` because
+        CodeQL's "Incomplete URL substring sanitization" rule
+        false-positives on the latter pattern (it can't tell that the
+        right-hand side is a list, not a string, so it warns as if
+        we were doing substring matching for security validation).
+        Subset semantics are equivalent here — every expected URI must
+        be exactly present in the rendered list — and read more
+        clearly besides.
+        """
         client = _rendered_realm(["--set", "vault.enabled=true"])
-        assert "http://localhost:8765/*" in client["redirectUris"]
-        assert "https://audittrace.local/*" in client["redirectUris"]
-        assert "https://audittrace.local:30952/*" in client["redirectUris"]
-        assert "http://localhost:8765" in client["webOrigins"]
-        assert "https://audittrace.local" in client["webOrigins"]
+        expected_redirect_uris = {
+            "http://localhost:8765/*",
+            "https://audittrace.local/*",
+            "https://audittrace.local:30952/*",
+        }
+        expected_web_origins = {
+            "http://localhost:8765",
+            "https://audittrace.local",
+        }
+        assert expected_redirect_uris <= set(client["redirectUris"])
+        assert expected_web_origins <= set(client["webOrigins"])
 
     def test_redirect_uris_extend_via_values_override(self) -> None:
         """A custom redirectUris value lands verbatim in the rendered client.
