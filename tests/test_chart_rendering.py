@@ -367,3 +367,62 @@ class TestRealmWebuiClientFromValues:
         realm = _json.loads(cm["data"]["realm.json"])
         assert "clients" in realm
         assert any(c["clientId"] == "audittrace-webui" for c in realm["clients"])
+
+
+class TestRealmMemoryWriteScopes:
+    """Phase 3.0 (PR A): the realm must declare the three per-layer
+    write scopes used by the memory CRUD backoffice. Without these
+    declarations, Keycloak rejects token requests asking for the
+    scope and the routes 403 even with a correct admin user."""
+
+    def test_three_write_scopes_declared(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        scope_names = {s["name"] for s in realm.get("clientScopes", [])}
+        # Subset comparison so future scope additions don't fail the
+        # test (CodeQL-friendly per the v1.0.2 lesson).
+        expected = {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+        assert expected <= scope_names, (
+            f"missing write scope(s); got {scope_names - expected!r} extras "
+            f"and {expected - scope_names!r} missing"
+        )
+
+    def test_admin_client_grants_write_scopes_by_default(self) -> None:
+        """Operators using the admin-client (service account) get the
+        write scopes without having to opt in per request."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        admin_client = next(
+            c for c in realm["clients"] if c["clientId"] == "admin-client"
+        )
+        defaults = set(admin_client["defaultClientScopes"])
+        expected = {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+        assert expected <= defaults
+
+    def test_user_facing_clients_offer_write_scopes_optionally(self) -> None:
+        """Browser / OpenCode flows declare the write scopes as
+        optional — clients request them per session as needed."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            optional = set(client.get("optionalClientScopes") or [])
+            expected = {
+                "memory:episodic:write",
+                "memory:procedural:write",
+                "memory:semantic:write",
+            }
+            assert expected <= optional, (
+                f"{client_id} missing optional write scopes: {expected - optional!r}"
+            )

@@ -19,11 +19,13 @@ All schema changes are managed via Alembic migrations.
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -128,3 +130,41 @@ class ToolCall(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     granted_scope: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class MemoryItem(Base):
+    """Manifest row for a memory-layer item managed via the operator
+    backoffice (migration 009 — 2026-05-03).
+
+    Stores authorship + sub-second-precision timestamps + soft-delete
+    state for items whose actual content lives in S3 (episodic /
+    procedural) or ChromaDB (semantic). This table is the source of
+    truth for "what items exist + who put them there"; the storage
+    backends hold the bytes.
+
+    Timestamps are **Unix epoch milliseconds UTC** (per user
+    directive — evening 2026-05-03). API surface returns BIGINT
+    integers; clients render them as needed.
+
+    No RLS on this table — the manifest is operator-global, not
+    per-user content. Access is gated by the per-layer write scope
+    (``memory:<layer>:write``) at the route layer.
+    """
+
+    __tablename__ = "memory_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    layer: Mapped[str] = mapped_column(String(16), nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    modified_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    modified_by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    deleted_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
+    )

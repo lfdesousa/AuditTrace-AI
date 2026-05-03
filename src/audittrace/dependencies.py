@@ -37,6 +37,10 @@ from audittrace.services.episodic import (
     MockEpisodicService,
     S3EpisodicService,
 )
+from audittrace.services.memory_manifest import (
+    MemoryManifestService,
+    MockMemoryManifestService,
+)
 from audittrace.services.procedural import (
     MockProceduralService,
     ProceduralService,
@@ -201,6 +205,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         default_collections=["decisions", "skills", "ai_research", "scm_coursework"],
     )
 
+    # Memory-layer manifest (CRUD backoffice — migration 009 + the
+    # /memory/<layer> REST endpoints). Postgres-backed; same session
+    # factory as conversational since the table is in the same DB.
+    memory_manifest = MemoryManifestService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     context_builder = DefaultContextBuilder(
         episodic=episodic,
         procedural=procedural,
@@ -212,6 +223,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
 
@@ -298,6 +310,14 @@ def get_semantic_service() -> SemanticService:
 
 
 @log_call(logger=logger)
+def get_memory_manifest_service() -> MemoryManifestService:
+    """Get memory-layer manifest service (CRUD backoffice — migration 009).
+    Backs the /memory/<layer> REST endpoints' authorship + timestamps +
+    soft-delete bookkeeping."""
+    return cast(MemoryManifestService, container._instances["memory_manifest"])
+
+
+@log_call(logger=logger)
 def set_test_mode() -> None:
     """Set container to test mode with mock dependencies."""
     container.register_factory("chromadb", MockChromaDBFactory())
@@ -312,6 +332,7 @@ def _register_mock_memory_services() -> None:
     procedural = MockProceduralService()
     conversational = MockConversationalService()
     semantic = MockSemanticService()
+    memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
         procedural=procedural,
@@ -322,6 +343,7 @@ def _register_mock_memory_services() -> None:
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
 
@@ -341,6 +363,7 @@ def create_test_container() -> DependencyContainer:
     procedural = MockProceduralService()
     conversational = MockConversationalService()
     semantic = MockSemanticService()
+    memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
         procedural=procedural,
@@ -351,6 +374,7 @@ def create_test_container() -> DependencyContainer:
     test_container._instances["procedural"] = procedural
     test_container._instances["conversational"] = conversational
     test_container._instances["semantic"] = semantic
+    test_container._instances["memory_manifest"] = memory_manifest
     test_container._instances["context_builder"] = context_builder
     # In-memory PostgreSQL factory so persistence side-effects work in tests
     test_container._instances["postgres_factory"] = InMemoryPostgresFactory()

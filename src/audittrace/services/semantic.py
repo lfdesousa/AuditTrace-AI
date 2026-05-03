@@ -40,6 +40,43 @@ class SemanticService(ABC):
     def available_collections(self) -> list[str]:
         """List available ChromaDB collections."""
 
+    @abstractmethod
+    def upsert(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Insert or replace a single document in ``collection`` keyed by
+        ``document_id``. The collection's embedding function (configured
+        when the collection was created) handles vectorisation. The
+        item's ``user_id`` field in ``metadata`` is set from
+        ``user_context`` if not already provided so the existing per-user
+        ``where`` filter in ``search()`` continues to apply."""
+
+    @abstractmethod
+    def delete_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> bool:
+        """Hard-delete a document from a ChromaDB collection. Returns
+        ``True`` if the document existed and was removed, ``False`` if
+        it didn't exist."""
+
+    @abstractmethod
+    def get_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> Document | None:
+        """Fetch a single document by ID. Returns ``None`` if the
+        document doesn't exist in the collection."""
+
 
 class ChromaSemanticService(SemanticService):
     """ChromaDB-based semantic memory service."""
@@ -115,6 +152,63 @@ class ChromaSemanticService(SemanticService):
         except Exception:
             return []
 
+    @log_call(logger=logger)
+    def upsert(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        # Stamp user_id into the metadata so the per-user `where` filter
+        # in `search()` keeps working for the new doc. Operator overrides
+        # are honoured if the caller provided their own user_id.
+        meta = dict(metadata or {})
+        meta.setdefault("user_id", user_context.user_id)
+        col = self._client.get_or_create_collection(name=collection)
+        # ChromaDB's `upsert` is exactly what we want — insert or replace.
+        col.upsert(ids=[document_id], documents=[text], metadatas=[meta])
+
+    @log_call(logger=logger)
+    def delete_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> bool:
+        del user_context  # operator-side write; not user-scoped
+        col = self._client.get_or_create_collection(name=collection)
+        # ChromaDB's `delete` is silently idempotent (deleting a non-
+        # existent ID does not raise). To return a faithful boolean we
+        # check existence first.
+        existing = col.get(ids=[document_id], include=["documents"])
+        if not existing.get("ids"):
+            return False
+        col.delete(ids=[document_id])
+        return True
+
+    @log_call(logger=logger)
+    def get_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> Document | None:
+        del user_context  # operator-side read; admin scope gates the route
+        col = self._client.get_or_create_collection(name=collection)
+        result = col.get(ids=[document_id], include=["documents", "metadatas"])
+        if not result.get("ids"):
+            return None
+        documents = result.get("documents") or []
+        if not documents:
+            return None
+        meta = (result.get("metadatas") or [{}])[0] or {}
+        return Document(
+            page_content=documents[0],
+            metadata={**meta, "collection": collection},
+        )
+
 
 class UserScopedSemanticService(SemanticService):
     """Request-scoped wrapper that binds a ``UserContext`` at construction
@@ -158,6 +252,38 @@ class UserScopedSemanticService(SemanticService):
     @log_call(logger=logger)
     def available_collections(self) -> list[str]:
         return self._inner.available_collections()
+
+    @log_call(logger=logger)
+    def upsert(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del user_context
+        self._inner.upsert(self._bound_user, collection, document_id, text, metadata)
+
+    @log_call(logger=logger)
+    def delete_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> bool:
+        del user_context
+        return self._inner.delete_document(self._bound_user, collection, document_id)
+
+    @log_call(logger=logger)
+    def get_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> Document | None:
+        del user_context
+        return self._inner.get_document(self._bound_user, collection, document_id)
 
 
 class MockSemanticService(SemanticService):
@@ -204,6 +330,55 @@ class MockSemanticService(SemanticService):
     @log_call(logger=logger)
     def available_collections(self) -> list[str]:
         return list(self._docs.keys())
+
+    @log_call(logger=logger)
+    def upsert(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del user_context  # mock: no scoping
+        meta = dict(metadata or {})
+        meta.setdefault("collection", collection)
+        meta.setdefault("document_id", document_id)
+        if collection not in self._docs:
+            self._docs[collection] = []
+        # Replace if same document_id, else append.
+        for i, d in enumerate(self._docs[collection]):
+            if d.metadata.get("document_id") == document_id:
+                self._docs[collection][i] = Document(page_content=text, metadata=meta)
+                return
+        self._docs[collection].append(Document(page_content=text, metadata=meta))
+
+    @log_call(logger=logger)
+    def delete_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> bool:
+        del user_context  # mock: no scoping
+        for i, d in enumerate(self._docs.get(collection, [])):
+            if d.metadata.get("document_id") == document_id:
+                self._docs[collection].pop(i)
+                return True
+        return False
+
+    @log_call(logger=logger)
+    def get_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> Document | None:
+        del user_context  # mock: no scoping
+        for d in self._docs.get(collection, []):
+            if d.metadata.get("document_id") == document_id:
+                return d
+        return None
 
     def reset(self) -> None:
         """Clear all documents."""
