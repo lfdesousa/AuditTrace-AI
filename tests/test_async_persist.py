@@ -12,6 +12,7 @@ on a build whose code paths can't tolerate a Redis blip.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from datetime import datetime
@@ -518,6 +519,167 @@ class TestModuleSingletons:
         ap.install_test_producer(sentinel)
         assert ap.get_async_persist_producer() is sentinel
         ap.reset_for_tests()
+
+
+class TestDlqCli:
+    """ADR-046 Bucket 3 — operator CLI for the DLQ stream."""
+
+    @staticmethod
+    def _load_dlq_module():
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        from pathlib import Path
+
+        path = Path(__file__).parent.parent / "scripts" / "audittrace-dlq"
+        # The script has no .py suffix, so spec_from_file_location returns
+        # None unless we hand it an explicit SourceFileLoader.
+        loader = SourceFileLoader("audittrace_dlq", str(path))
+        spec = importlib.util.spec_from_loader("audittrace_dlq", loader)
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    @pytest.mark.asyncio
+    async def test_inspect_empty_dlq(self, monkeypatch, capsys):
+        redis = FakeRedis(decode_responses=True)
+        mod = self._load_dlq_module()
+        monkeypatch.setattr(mod, "_client", AsyncMock(return_value=redis))
+        monkeypatch.setattr(mod, "_dlq_stream", lambda: "test:dlq")
+
+        rc = await mod.cmd_inspect(
+            argparse.Namespace(limit=100, reason=None, cmd="inspect")
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "is empty" in out
+
+    @pytest.mark.asyncio
+    async def test_inspect_renders_table_with_one_entry(self, monkeypatch, capsys):
+        redis = FakeRedis(decode_responses=True)
+        # Manually XADD a DLQ entry.
+        await redis.xadd(
+            "test:dlq",
+            {
+                "record_json": json.dumps({"user_id": "user-luis"}),
+                "tool_calls_json": "[]",
+                "enqueued_ts": "0",
+                "trace_id": "abc",
+                "orig_id": "1234-0",
+                "reason": "max_deliveries=5",
+                "attempt": "5",
+            },
+        )
+        mod = self._load_dlq_module()
+        monkeypatch.setattr(mod, "_client", AsyncMock(return_value=redis))
+        monkeypatch.setattr(mod, "_dlq_stream", lambda: "test:dlq")
+
+        rc = await mod.cmd_inspect(
+            argparse.Namespace(limit=100, reason=None, cmd="inspect")
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "max_deliveries=5" in out
+        assert "user-luis" in out
+        assert "Total: 1 entries" in out
+
+    @pytest.mark.asyncio
+    async def test_replay_against_fixed_postgres_succeeds(self, monkeypatch, capsys):
+        redis = FakeRedis(decode_responses=True)
+        # Store a well-formed entry in DLQ.
+        eid = await redis.xadd(
+            "test:dlq",
+            {
+                "record_json": json.dumps(_kwargs()),
+                "tool_calls_json": "[]",
+                "enqueued_ts": "0",
+                "trace_id": "abc",
+                "orig_id": "1234-0",
+                "reason": "max_deliveries=5",
+                "attempt": "5",
+            },
+        )
+        mod = self._load_dlq_module()
+        monkeypatch.setattr(mod, "_client", AsyncMock(return_value=redis))
+        monkeypatch.setattr(mod, "_dlq_stream", lambda: "test:dlq")
+        # Patch _persist_interaction to return a fake interaction id.
+        from audittrace.routes import chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod, "_persist_interaction", MagicMock(return_value=99)
+        )
+
+        rc = await mod.cmd_replay(
+            argparse.Namespace(dlq_id=eid, all=False, max=100, cmd="replay")
+        )
+        assert rc == 0
+        # DLQ entry XDELed.
+        remaining = await redis.xrange("test:dlq", "-", "+")
+        assert remaining == []
+
+    @pytest.mark.asyncio
+    async def test_replay_still_failing_preserves_entry(self, monkeypatch, capsys):
+        redis = FakeRedis(decode_responses=True)
+        eid = await redis.xadd(
+            "test:dlq",
+            {
+                "record_json": json.dumps(_kwargs()),
+                "tool_calls_json": "[]",
+                "enqueued_ts": "0",
+                "trace_id": "abc",
+                "orig_id": "1234-0",
+                "reason": "max_deliveries=5",
+                "attempt": "5",
+            },
+        )
+        mod = self._load_dlq_module()
+        monkeypatch.setattr(mod, "_client", AsyncMock(return_value=redis))
+        monkeypatch.setattr(mod, "_dlq_stream", lambda: "test:dlq")
+        # Patch persist to raise.
+        from audittrace.routes import chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod,
+            "_persist_interaction",
+            MagicMock(side_effect=RuntimeError("still broken")),
+        )
+
+        rc = await mod.cmd_replay(
+            argparse.Namespace(dlq_id=eid, all=False, max=100, cmd="replay")
+        )
+        assert rc == 1
+        # Entry preserved.
+        remaining = await redis.xrange("test:dlq", "-", "+")
+        assert len(remaining) == 1
+
+    @pytest.mark.asyncio
+    async def test_drain_requires_confirm(self, monkeypatch, capsys):
+        redis = FakeRedis(decode_responses=True)
+        eid = await redis.xadd("test:dlq", {"record_json": "{}"})
+        mod = self._load_dlq_module()
+        monkeypatch.setattr(mod, "_client", AsyncMock(return_value=redis))
+        monkeypatch.setattr(mod, "_dlq_stream", lambda: "test:dlq")
+
+        # Without --confirm: aborts.
+        rc = await mod.cmd_drain(
+            argparse.Namespace(
+                dlq_id=eid, all=False, older_than=30, confirm=False, cmd="drain"
+            )
+        )
+        assert rc == 2
+        # Entry still present.
+        remaining = await redis.xrange("test:dlq", "-", "+")
+        assert len(remaining) == 1
+
+        # With --confirm: drops.
+        rc = await mod.cmd_drain(
+            argparse.Namespace(
+                dlq_id=eid, all=False, older_than=30, confirm=True, cmd="drain"
+            )
+        )
+        assert rc == 0
+        remaining = await redis.xrange("test:dlq", "-", "+")
+        assert remaining == []
 
 
 class TestConsumerExtras:
