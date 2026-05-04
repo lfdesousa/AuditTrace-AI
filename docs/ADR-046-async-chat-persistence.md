@@ -1,10 +1,14 @@
 # ADR-046 — Opt-in async chat-completion persistence
 
-**Status:** Proposed
-**Date:** 2026-05-04
+**Status:** Accepted (2026-05-04 — multi-pod live evidence captured)
+**Date:** 2026-05-04 (proposed) · 2026-05-04 (accepted)
+**Deciders:** Luis Filipe de Sousa
 **Related:** ADR-024 (OpenAI compatibility regression precedent),
 ADR-029 (`/interactions` route + audit-record schema), ADR-033 (three-
-audience error envelope), ADR-034 (long-running generation patterns)
+audience error envelope), ADR-034 (long-running generation patterns),
+ADR-035 (rename retention exceptions — Redis key prefixes
+`sovereign:*` retained for token + tool-result caches; new streams
+under `audittrace:*`).
 
 ## Context
 
@@ -322,3 +326,93 @@ The implementation PR must demonstrate:
 - **Default-flip evaluation** — after 90 d of operator data on the
   failed-counter rate, evaluate whether `async` can become the
   default. Out of scope for this ADR; do not pre-commit.
+
+## Live evidence (2026-05-04)
+
+End-to-end implementation proven on the live k3s cluster against real
+Redis + Postgres + Vault, with 2 memory-server replicas. Image tag
+`adr046-rls-fix-170859`. Test transcript captured in operator notes.
+
+Highlights:
+
+- **Multi-pod consumer-group routing**. Scaled
+  `deploy/audittrace-memory-server` to `replicas=2`. Both pods started
+  one consumer each; group `audittrace-persisters` registered with
+  `consumers=2`. Six XADDed messages were split exactly 3:3 between
+  the two pods (verified via per-pod log counts of `interaction
+  persisted`). All 6 rows landed in Postgres with the correct
+  `user_id`, `session_id`, and `project="live-multipod-rls-fix"`. Zero
+  failures.
+
+- **Pod-kill survival**. Force-deleted one of the two pods mid-flight
+  (`kubectl delete pod --grace-period=0 --force`). Injected 4 more
+  messages while only the survivor was alive. Survivor's consumer
+  picked all 4 up (sole member of the group); final
+  `live-survival` row count = 8 of 8 expected, no orphans.
+
+- **DLQ end-to-end via `scripts/audittrace-dlq`**. Injected a poison
+  entry (malformed `record_json`). Consumer auto-detected the parse
+  failure and XADDed to `audittrace:persist:dlq` while XACKing the
+  original off the main stream. `audittrace-dlq inspect` rendered
+  the entry with `reason="parse_error: Expecting value: line 1
+  column 1 (char 0)"`, `orig_id`, `trace_id`. `audittrace-dlq drain
+  <dlq_id> --confirm` cleared it; DLQ depth back to 0.
+
+- **`/health` surface** (per §7) shows
+  `async_persist_enabled=true`,
+  `async_persist_dlq_depth=0`,
+  `async_persist_consumer_lag` per the live state.
+
+- **OTel telemetry** wired per §7 catalog
+  (`audittrace.async_persist.enqueued_total`,
+  `..._completed_total`, `..._consumer_errors_total`,
+  `..._queue_lag_seconds`, `..._stream_depth`); Bucket 2 of the
+  implementation PR captures the unit-test coverage of every counter
+  increment.
+
+- **Full LLM round-trip via Keycloak-authenticated `curl`**. With a
+  device-flow-issued JWT (`scripts/audittrace-login --show`) and
+  `X-Persist-Mode: async`, the request landed at `/v1/chat/completions`,
+  passed JWT validation, ran the memory tool loop, hit the Qwen3.6
+  LLM, returned 200 in 4359 ms, and the resulting `interactions` row
+  appeared in Postgres within 3 seconds (id 353,
+  `project="live-e2e-async"`). The matching sync-mode call (id 352,
+  `project="live-e2e-sync"`) acted as the bit-identical baseline —
+  identical 4-layer pipeline, only the persistence step differs. This
+  is the load-bearing integration proof that `feedback_openai_schema_inviolate`
+  holds (sync default unchanged) and that the async path is end-to-end
+  production-viable.
+
+Architecture (this PR):
+
+- New components inside `memoryServer.api` in
+  `docs/architecture/workspace.dsl`: `asyncPersistConsumer` +
+  `asyncPersistProducer`, with 5 new arrows covering the
+  XADD / XREADGROUP / INSERT / DLQ flow.
+- `docs/architecture/sequence-chat-completions.md` updated with an
+  `alt` block at the persistence step showing the async branch.
+- `docs/architecture/sequence-async-persist.md` (NEW) — three
+  viewpoints in one file: producer→consumer happy path,
+  consumer→DLQ poison-handling, operator-driven replay via
+  `scripts/audittrace-dlq`.
+
+Caveat captured during live testing — Vault KV path
+`kv/audittrace/redis/main` was out of sync with the actual
+Bitnami-Redis-subchart-generated password (k8s secret
+`audittrace-redis`). Aligned manually as part of this verification
+(`vault kv put kv/audittrace/redis/main password=<from k8s>` +
+`kubectl rollout restart`). Permanent fix is to make the chart use
+`auth.existingSecret` populated from a Vault Agent template — filed
+as a follow-up backlog item. Not a blocker for this ADR's
+acceptance.
+
+## Follow-up backlog (post-acceptance)
+
+- **Redis subchart `auth.existingSecret` from Vault Agent** (M3.x).
+  Permanent alignment of Vault as the source of truth for the Redis
+  password. Today's PR verified with manual Vault↔k8s sync; the
+  chart-level fix removes the manual step.
+- **Default-flip evaluation** at +90 days (already mentioned in
+  Follow-ups above).
+- **Async-persist DLQ retry tooling** integration with backlog
+  alerts (Grafana panel for DLQ depth + queue lag p99).

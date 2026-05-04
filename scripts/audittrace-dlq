@@ -164,6 +164,18 @@ async def _replay_one(
     except Exception as exc:
         return False, f"parse failed: {exc}"
 
+    # ADR-046 § — set the ``app.current_user_id`` ContextVar so the
+    # SQLAlchemy after_begin listener emits ``SET LOCAL
+    # app.current_user_id = ...`` on the replay txn. Without this the
+    # Postgres RLS WITH CHECK rejects the INSERT.
+    try:
+        from audittrace.db.rls import set_current_user_id
+
+        if kwargs.get("user_id"):
+            set_current_user_id(kwargs["user_id"])
+    except Exception:
+        pass  # SQLite test path; RLS is a no-op anyway.
+
     try:
         interaction_id = await asyncio.to_thread(_persist_interaction, **kwargs)
         if tcs and interaction_id is not None:

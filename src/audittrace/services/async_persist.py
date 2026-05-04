@@ -386,6 +386,19 @@ class AsyncPersistConsumer:
             return
 
         # Persist + flush. Sync work runs in a thread.
+        # IMPORTANT: the consumer task does NOT pass through FastAPI's auth
+        # middleware, so the ``app.current_user_id`` ContextVar is unset.
+        # Set it from the deserialised ``user_id`` kwarg so the SQLAlchemy
+        # ``after_begin`` listener (db/rls.py) sets ``SET LOCAL
+        # app.current_user_id = ...`` on the txn — Postgres RLS WITH CHECK
+        # then accepts the INSERT instead of rejecting with
+        # ``InsufficientPrivilege``. ContextVars propagate through
+        # ``asyncio.to_thread`` in Python 3.9+ via contextvars.copy_context.
+        from audittrace.db.rls import set_current_user_id
+
+        user_id = kwargs.get("user_id") or ""
+        if user_id:
+            set_current_user_id(user_id)
         try:
             interaction_id = await asyncio.to_thread(self._persist, **kwargs)
             if tcs and interaction_id is not None:
