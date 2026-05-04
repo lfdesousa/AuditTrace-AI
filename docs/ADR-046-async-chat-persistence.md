@@ -76,20 +76,70 @@ Case-insensitive lookup mirrors `_resolve_project()`. No body-field
 fallback — opt-in lives in the transport layer, not the prompt
 payload.
 
-### §3 — Implementation: `asyncio.create_task` (no Redis Streams)
+### §3 — Implementation: Redis Streams + per-pod consumer worker
 
-The codebase's established pattern for background work is
-`asyncio.create_task`. `SessionSummarizer` uses it
-(`server.py` lifespan ↔ `services/session_summarizer.py`) with
-defensive cancel-on-shutdown semantics (5s timeout, try/except
-TimeoutError + CancelledError). Async chat persistence will mirror
-this pattern.
+> **Amended 2026-05-04** — the original draft chose `asyncio.create_task`
+> per pod. With multi-pod memory-server now in scope for production,
+> §8's trigger #1 fires; the in-flight loss surface from §8 trigger #3
+> grows linearly with N. The implementation pivots to Redis Streams
+> for cross-pod-safe persistence.
 
-Why not Redis Streams (the EOD memo's first phrasing): adding a queue
-introduces a moving part — broker, consumer worker, dead-letter handling
-— for marginal value at single-pod scale. The codebase already has a
-proven asyncio-task lifecycle. Re-evaluate Streams when we scale beyond
-one memory-server replica or add cross-pod fan-out (see §8).
+**Producer** (inside the chat-completion handler, when
+`X-Persist-Mode: async` and the feature flag is on):
+
+1. Build the `InteractionRecord` constructor kwargs as a flat dict.
+2. `await async_redis.xadd(settings.async_persist_stream,
+   {"record_json": json.dumps(kwargs), "trace_id": ...,
+    "enqueued_ts": ts})`.
+3. Tag the FastAPI root span: `audittrace.persist.mode="async"`,
+   `audittrace.persist.stream_id=<XADD return>`.
+4. Return the response normally. The `XADD` round-trip is sub-millisecond
+   to a co-located Redis; far cheaper than the original sync DB write.
+5. **Producer fallback** — if `XADD` raises (Redis unreachable, network
+   glitch), fall back to the sync `_persist_interaction` so the audit
+   invariant (`feedback_traceability_requirement`) is never violated.
+   Counter `audittrace.async_persist.enqueued_total{outcome="fallback"}`
+   is alertable so the operator notices the silent degradation.
+
+**Consumer** (per-pod background `asyncio.Task`, started in
+`server.py::lifespan` next to `SessionSummarizer`):
+
+1. Class shape mirrors `SessionSummarizer`: `__init__(*, settings,
+   session_factory, redis_client)`, `run()` infinite loop with
+   `CancelledError` re-raised, `run_once()` atomic testable unit.
+2. Joins the consumer group `settings.async_persist_group`
+   (`audittrace-persisters`) under the consumer name
+   `consumer-${HOSTNAME}` (the pod name in k8s — guaranteed unique
+   per replica).
+3. **Startup**: first pass reads pending entries (`XREADGROUP ... 0`)
+   in case a prior pod incarnation died with un-acked messages
+   assigned to this consumer name. Then the loop switches to `>`
+   (new entries only).
+4. Per message: deserialise `record_json` → call
+   `_persist_interaction` (the same function the sync path calls — no
+   duplicated logic) → `XACK` on success.
+5. On transient error (DB blip, pool exhausted): leave un-acked.
+   Redis re-delivers via `XPENDING` IDLE check after
+   `settings.async_persist_pending_idle_ms`. Another consumer (or
+   the same one) picks it up.
+6. On poison message (delivery_count ≥ `max_deliveries`, JSON parse
+   failure, RLS reject): `XADD` to the DLQ stream
+   `settings.async_persist_dlq` with `orig_id`, `reason`, `attempt`,
+   then `XACK` the original. Counter
+   `audittrace.async_persist.completed_total{outcome="dlq"}`++.
+
+**Why Redis Streams over asyncio.create_task in multi-pod**:
+
+- Redis consumer-group routing guarantees each entry goes to **exactly
+  one** consumer in the group, regardless of how many pods are running.
+  No coordination overhead needed in app code.
+- `XPENDING` re-claim provides cross-pod survival: if a pod dies
+  mid-write, another consumer picks up its un-acked messages on the
+  next IDLE-window check.
+- `XLEN` is an alertable backpressure signal (gauge metric in §7).
+- DLQ as a first-class stream means operator triage tooling
+  (`scripts/audittrace-dlq inspect / replay / drain`) can be a thin
+  wrapper over `XRANGE` / `XDEL` / `XADD-to-main`.
 
 ### §4 — Sync fallback on header parse error or feature-flag off
 
@@ -102,72 +152,108 @@ persistence cluster-wide without a rebuild.
 The flag default is `false` until the implementation PR lands its
 verification gates per §6.
 
-### §5 — Failure handling: log + counter, no retry
+### §5 — Failure handling: bounded retry → DLQ
 
-Background-task failures (DB transient error, RLS misconfiguration,
-Postgres restart mid-write) are caught at the task boundary:
+> **Amended 2026-05-04** — was "log + counter, no retry". Redis
+> Streams give us bounded retry for free via `XPENDING` re-delivery;
+> the DLQ that the original draft listed as a follow-up ADR moves
+> into scope as a first-class stream.
 
-```python
-async def _persist_async(record: InteractionRecord) -> None:
-    try:
-        await _persist_interaction(record)
-    except Exception:
-        logger.exception("async persist failed", extra={"trace_id": record.trace_id})
-        ASYNC_PERSIST_FAILED_TOTAL.inc()
-```
+Two error classes inside the consumer:
 
-No retry. The same write would re-fail the same way; queueing it
-would just delay the failure and risk unbounded memory growth on the
-in-flight set. A real DLQ is a future ADR (`§Follow-ups`).
+- **Transient** (DB blip, pool exhausted, network hiccup): the message
+  is left un-acked. Redis re-delivers via `XPENDING` IDLE check after
+  `settings.async_persist_pending_idle_ms`. The same consumer (after
+  its block) or any other pod's consumer picks it up. Counter
+  `audittrace.async_persist.consumer_errors_total{error_class="transient"}`.
 
-The `audittrace_async_persist_failed_total` Prometheus counter is
-the operator's signal — a non-zero rate is a paging condition.
+- **Poison** (JSON parse failure, `delivery_count ≥ max_deliveries`,
+  hard RLS reject): `XADD` to `settings.async_persist_dlq` with
+  `orig_id`, `reason`, `attempt`; then `XACK` the original.
+  Counter `audittrace.async_persist.completed_total{outcome="dlq"}`.
+  Any non-zero DLQ rate is a paging condition; the operator
+  triages with `scripts/audittrace-dlq inspect / replay / drain`
+  (Bucket 3 of the implementation PR).
 
-### §6 — Shutdown semantics
+Producer-side `XADD` failures (Redis unreachable) fall back to sync
+persistence — see §3.
 
-The lifespan context tracks in-flight async-persist tasks in a set
-keyed by trace_id. On `app.shutdown`:
+### §6 — Shutdown semantics (Redis-Streams version)
 
-```python
-remaining = list(state.async_persist_tasks)
-if remaining:
-    done, pending = await asyncio.wait(remaining, timeout=5.0)
-    for t in pending:
-        t.cancel()
-        logger.warning("async persist abandoned at shutdown", trace_id=...)
-```
+> **Amended 2026-05-04** — the original draft tracked in-flight
+> `asyncio.Task`s and drained them with `asyncio.wait(timeout=5.0)`.
+> With Redis Streams, in-flight messages are durable across pod
+> death, so the shutdown story is much shorter.
 
-Bounded 5 s mirrors the summariser's shutdown handling. Tasks
-abandoned past the timeout emit a structured warning so the operator
-can correlate against `interactions` gaps post-restart.
+The consumer worker is one `asyncio.Task` started in lifespan
+alongside `SessionSummarizer`. On `app.shutdown`:
 
-Hard SIGKILL (OOM, node loss) loses any in-flight tasks. This is the
-acceptance trade-off for async persistence; clients that cannot
-tolerate this risk keep the default `sync` mode.
+1. `task.cancel()` — propagates `asyncio.CancelledError`.
+2. `await asyncio.wait_for(task, timeout=5.0)` — bounded drain of the
+   *current* `XREADGROUP` iteration's batch. The worker re-raises
+   `CancelledError` cleanly per the established pattern.
+3. Any messages already pulled from the stream but not yet `XACK`ed
+   stay un-acked in Redis. They are NOT lost: another pod's consumer
+   re-claims them via `XPENDING` IDLE on its next iteration (after
+   `pending_idle_ms`).
 
-### §7 — Telemetry
+**Hard SIGKILL** (OOM, node loss): same story — un-acked messages
+sit in Redis until another consumer's IDLE check picks them up. No
+data loss. This is the structural advantage of Redis Streams over the
+original `asyncio.create_task`-only design and the primary reason for
+the §3 amendment.
 
-- **Span attribute**: `audittrace.persist.mode = "sync"|"async"` on
-  the FastAPI root span. Lets us slice latency dashboards by mode.
-- **Latency histogram**: existing chat-completion latency histogram
-  gets a `persist_mode` label. The hypothesis "async cuts p95 by N
-  ms" becomes a Grafana query.
-- **Counter**: `audittrace_async_persist_total` (label
-  `outcome=ok|failed`) for fan-out tracking and the SLO above.
+### §7 — Telemetry catalog
 
-### §8 — Why not Redis Streams (yet)
+> **Amended 2026-05-04** — expanded for the producer/consumer split.
 
-Defer until at least one of these holds:
-1. Memory-server scales beyond one replica (writes from multiple
-   pods need ordering / dedup beyond what asyncio.create_task can
-   give).
-2. We need cross-process replay (e.g. for cold-start backfill or
-   debug rerun).
-3. Persistence has to outlive the writing pod's lifetime by more than
-   the shutdown grace window.
+OTel meter under `audittrace.async_persist`:
 
-None of these are true today. ADR-046 remains intentionally narrow:
-move the existing sync write into an asyncio task, opt-in only.
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `audittrace.async_persist.enqueued_total` | counter | `outcome=ok\|fallback` | Producer-side XADD result |
+| `audittrace.async_persist.completed_total` | counter | `outcome=ok\|dlq` | Consumer terminal state |
+| `audittrace.async_persist.queue_lag_seconds` | histogram | (none) | XACK ts − enqueued_ts (end-to-end) |
+| `audittrace.async_persist.consumer_errors_total` | counter | `error_class=transient\|poison\|cancel` | Per-iteration error class |
+| `audittrace.async_persist.stream_depth` | observable_gauge | (none) | `XLEN` sampled per consumer iteration |
+
+Span attributes on the FastAPI root span:
+
+- `audittrace.persist.mode = "sync"\|"async"` — set on every
+  chat-completion. Lets dashboards slice latency by mode.
+- `audittrace.persist.stream_id = <XADD return>` — set only when
+  `mode=async`. Joins the producer span to the consumer's eventual
+  XACK in Langfuse.
+
+Multi-pod aggregation works automatically in Prometheus / Grafana via
+the `consumer-${HOSTNAME}` label that OTel attaches by default.
+
+### §8 — Why Redis Streams (adopted)
+
+> **Amended 2026-05-04** — the original draft deferred Redis Streams
+> until a multi-pod, cross-process-replay, or post-shutdown-persistence
+> trigger fired. Trigger #1 (multi-replica) fires today: Luis confirmed
+> multi-pod memory-server is in scope for production. Trigger #3
+> (in-flight loss surface) compounds with N. The implementation
+> adopts Streams now rather than retrofitting later.
+
+Three properties Streams gives us that `asyncio.create_task` cannot:
+
+1. **Multi-pod safety.** Redis consumer groups route each entry to
+   exactly one consumer. Two memory-server pods racing on the same
+   `XADD` is impossible by construction.
+2. **Cross-pod survival on hard kill.** Un-acked messages stay in
+   Redis. The next `XPENDING` IDLE check (any consumer) re-claims
+   them. No correlation against `interactions` gaps post-restart.
+3. **First-class DLQ.** Poison messages move to
+   `audittrace:persist:dlq` with explicit metadata. The operator
+   tool `scripts/audittrace-dlq` inspects, replays, or drains via
+   `XRANGE` / `XDEL` / `XADD-to-main`. No "lost event" failure mode.
+
+Trade-off accepted: one new moving piece (the consumer group) and
+the operational cost of monitoring `XLEN` + DLQ depth. The cost is
+amortised across §6 shutdown safety, §7 telemetry, and the bucket-3
+operator tooling.
 
 ## Consequences
 

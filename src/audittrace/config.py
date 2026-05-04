@@ -186,6 +186,37 @@ class Settings(BaseSettings):
     # small safety margin against tokenizer drift.
     summarizer_ctx_reserve_tokens: int = 700
 
+    # ─────────────── ADR-046 — async chat persistence ─────────────────────
+    # Opt-in (`X-Persist-Mode: async` request header) Redis-Streams-backed
+    # async write of the InteractionRecord. Each pod runs one consumer in
+    # the `async_persist_group` consumer group; multi-pod safe by Redis
+    # consumer-group routing semantics.
+    #
+    # Default OFF — toggled to ON in chart values once live evidence
+    # captures the multi-pod behaviour (`feedback_test_and_evidence`).
+    # While OFF: the producer never sees the async branch even if the
+    # caller sends `X-Persist-Mode: async`; the consumer worker is not
+    # started in lifespan. Zero runtime impact.
+    async_persist_enabled: bool = False
+    async_persist_stream: str = "audittrace:persist:stream"
+    async_persist_dlq: str = "audittrace:persist:dlq"
+    async_persist_group: str = "audittrace-persisters"
+    # XREADGROUP BLOCK timeout (ms). Long enough that the consumer
+    # parks gracefully when idle, short enough that shutdown drains in
+    # under one BLOCK window after cancellation.
+    async_persist_block_ms: int = 5000
+    # Max entries pulled per XREADGROUP iteration.
+    async_persist_batch_size: int = 10
+    # Threshold (delivery_count from XPENDING) at which a stuck message
+    # is moved to the DLQ stream and XACKed off the main stream. Must
+    # be > 1 so transient errors get at least one retry.
+    async_persist_max_deliveries: int = 5
+    # XPENDING IDLE window (ms): on consumer iteration, any message
+    # that has been pending longer than this without an XACK is
+    # eligible for re-claim by THIS consumer (the prior owner is
+    # presumed dead — pod restart, OOM, network partition).
+    async_persist_pending_idle_ms: int = 60000
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
