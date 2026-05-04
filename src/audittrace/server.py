@@ -257,6 +257,39 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
             "yes" if settings.summarizer_database_url else "no",
         )
 
+    # ADR-046 — async chat-completion persistence consumer worker.
+    # Per-pod background task; multi-pod-safe via Redis consumer groups.
+    # Gated by ``async_persist_enabled`` so the worker is dormant until
+    # the chart values opt in (default off until live evidence captured).
+    async_persist_task: asyncio.Task[None] | None = None
+    if settings.async_persist_enabled:  # pragma: no cover - live-startup path
+        from audittrace.routes.chat import (
+            _flush_pending_tool_calls,
+            _persist_interaction,
+        )
+        from audittrace.services.async_persist import (
+            AsyncPersistConsumer,
+            get_async_persist_redis,
+        )
+
+        async_persist_consumer = AsyncPersistConsumer(
+            settings=settings,
+            persist_callable=_persist_interaction,
+            flush_tool_calls_callable=_flush_pending_tool_calls,
+            redis=get_async_persist_redis(),
+        )
+        async_persist_task = asyncio.create_task(
+            async_persist_consumer.run(), name="async-persist-consumer"
+        )
+        logger.info(
+            "Async-persist consumer scheduled — group=%s consumer=%s stream=%s",
+            settings.async_persist_group,
+            async_persist_consumer.consumer_name,
+            settings.async_persist_stream,
+        )
+    else:
+        logger.info("Async-persist consumer NOT started (async_persist_enabled=False)")
+
     yield
 
     logger.info("Shutting down audittrace-server")
@@ -264,6 +297,12 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         summarizer_task.cancel()
         try:
             await asyncio.wait_for(summarizer_task, timeout=5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+    if async_persist_task is not None:  # pragma: no cover - paired with startup
+        async_persist_task.cancel()
+        try:
+            await asyncio.wait_for(async_persist_task, timeout=5.0)
         except (TimeoutError, asyncio.CancelledError):
             pass
     telemetry.shutdown()

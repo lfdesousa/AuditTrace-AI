@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Operator CLI for the ADR-046 async-persist DLQ.
+
+Subcommands:
+  inspect [--limit N] [--reason SUBSTR]
+      List DLQ entries: dlq_id, age, attempt, reason, orig_id, user_id,
+      trace_id. Read-only — safe to run repeatedly.
+  replay <dlq_id>
+      Re-execute the persistence (calls the same _persist_interaction the
+      sync producer + consumer use). On success: XDEL from the DLQ
+      stream. On failure: print error and leave the entry in place.
+  replay --all [--max N]
+      Bulk replay; aggregate report (replayed, still_failing).
+  drain <dlq_id> --confirm
+      XDEL without retry (operator-decided drop). Requires --confirm.
+  drain --all --older-than DAYS --confirm
+      Bulk drop of entries older than ``DAYS`` days.
+
+Auth path: runs from the operator's machine with KUBECONFIG set.
+Postgres + Redis access goes via ``kubectl port-forward`` — the same
+pattern as ``make verify-deploy``. No HTTP admin endpoint added.
+
+Required env vars:
+  AUDITTRACE_REDIS_URL          — e.g. redis://localhost:16379/0
+                                  (operator runs `kubectl port-forward
+                                  svc/audittrace-redis-master 16379:6379`)
+  AUDITTRACE_REDIS_PASSWORD     — fetch via vault on the operator's machine
+  AUDITTRACE_DATABASE_URL       — postgres URL via port-forward
+  AUDITTRACE_ASYNC_PERSIST_DLQ  — defaults to audittrace:persist:dlq
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timedelta
+
+# Ensure the src package is importable when run from a repo checkout.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.isdir(os.path.join(_REPO_ROOT, "src", "audittrace")):
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
+
+from redis.asyncio import Redis as AsyncRedis  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("audittrace-dlq")
+
+
+def _redis_url() -> str:
+    return os.environ.get("AUDITTRACE_REDIS_URL") or "redis://localhost:6379/0"
+
+
+def _redis_password() -> str | None:
+    return os.environ.get("AUDITTRACE_REDIS_PASSWORD") or None
+
+
+def _dlq_stream() -> str:
+    return os.environ.get("AUDITTRACE_ASYNC_PERSIST_DLQ") or "audittrace:persist:dlq"
+
+
+def _stream() -> str:
+    return (
+        os.environ.get("AUDITTRACE_ASYNC_PERSIST_STREAM") or "audittrace:persist:stream"
+    )
+
+
+async def _client() -> AsyncRedis[str]:
+    return AsyncRedis.from_url(
+        _redis_url(),
+        password=_redis_password(),
+        decode_responses=True,
+    )
+
+
+def _stream_id_age_seconds(stream_id: str) -> float:
+    """``XADD`` returns ``"<ms>-<seq>"``. Parse the leading ms and
+    diff against now()."""
+    try:
+        ms_part = stream_id.split("-", 1)[0]
+        ts = datetime.fromtimestamp(int(ms_part) / 1000.0)
+        return (datetime.now() - ts).total_seconds()
+    except Exception:
+        return -1.0
+
+
+def _format_age(seconds: float) -> str:
+    if seconds < 0:
+        return "?"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+# ──────────────────────────── inspect ────────────────────────────
+
+
+async def cmd_inspect(args: argparse.Namespace) -> int:
+    redis = await _client()
+    try:
+        entries = await redis.xrange(_dlq_stream(), "-", "+", count=args.limit)
+    finally:
+        await redis.aclose()
+    if not entries:
+        print(f"DLQ {_dlq_stream()} is empty.")
+        return 0
+
+    rows: list[dict[str, str]] = []
+    for entry_id, fields in entries:
+        if args.reason and args.reason not in (fields.get("reason") or ""):
+            continue
+        record_json = fields.get("record_json") or "{}"
+        try:
+            rec = json.loads(record_json)
+        except json.JSONDecodeError:
+            rec = {}
+        rows.append(
+            {
+                "dlq_id": entry_id,
+                "age": _format_age(_stream_id_age_seconds(entry_id)),
+                "attempt": fields.get("attempt") or "?",
+                "reason": (fields.get("reason") or "")[:60],
+                "orig_id": fields.get("orig_id") or "",
+                "user_id": (rec.get("user_id") or "")[:24],
+                "trace_id": fields.get("trace_id") or "",
+            }
+        )
+    if not rows:
+        print(f"No entries match filter (--reason={args.reason!r}).")
+        return 0
+
+    cols = ["dlq_id", "age", "attempt", "reason", "orig_id", "user_id", "trace_id"]
+    widths = {c: max(len(c), max(len(r[c]) for r in rows)) for c in cols}
+    print("  ".join(c.ljust(widths[c]) for c in cols))
+    print("  ".join("-" * widths[c] for c in cols))
+    for r in rows:
+        print("  ".join(r[c].ljust(widths[c]) for c in cols))
+    print(f"\nTotal: {len(rows)} entries (DLQ stream: {_dlq_stream()}).")
+    return 0
+
+
+# ──────────────────────────── replay ─────────────────────────────
+
+
+async def _replay_one(
+    redis: AsyncRedis[str], entry_id: str, fields: dict[str, str]
+) -> tuple[bool, str]:
+    """Re-run persistence for one DLQ entry. Returns (ok, message)."""
+    from audittrace.routes.chat import _flush_pending_tool_calls, _persist_interaction
+    from audittrace.services.async_persist import (
+        deserialise_record,
+        reconstruct_pending_tool_calls,
+    )
+
+    try:
+        kwargs, tcs, _ = deserialise_record(fields)
+    except Exception as exc:
+        return False, f"parse failed: {exc}"
+
+    # ADR-046 § — set the ``app.current_user_id`` ContextVar so the
+    # SQLAlchemy after_begin listener emits ``SET LOCAL
+    # app.current_user_id = ...`` on the replay txn. Without this the
+    # Postgres RLS WITH CHECK rejects the INSERT.
+    try:
+        from audittrace.db.rls import set_current_user_id
+
+        if kwargs.get("user_id"):
+            set_current_user_id(kwargs["user_id"])
+    except Exception:
+        pass  # SQLite test path; RLS is a no-op anyway.
+
+    try:
+        interaction_id = await asyncio.to_thread(_persist_interaction, **kwargs)
+        if tcs and interaction_id is not None:
+            pending = reconstruct_pending_tool_calls(tcs)
+            await asyncio.to_thread(_flush_pending_tool_calls, pending, interaction_id)
+    except Exception as exc:
+        return False, f"persist raised: {exc}"
+    if interaction_id is None:
+        return False, "persist returned None (DB error logged by _persist_interaction)"
+
+    await redis.xdel(_dlq_stream(), entry_id)
+    return True, f"interaction_id={interaction_id}"
+
+
+async def cmd_replay(args: argparse.Namespace) -> int:
+    redis = await _client()
+    try:
+        if args.all:
+            entries = await redis.xrange(_dlq_stream(), "-", "+", count=args.max)
+            if not entries:
+                print(f"DLQ {_dlq_stream()} is empty — nothing to replay.")
+                return 0
+            replayed = 0
+            failing = 0
+            for eid, fields in entries:
+                ok, msg = await _replay_one(redis, eid, fields)
+                status = "✓ replayed" if ok else "✗ failed"
+                logger.info("[audittrace-dlq] %s %s — %s", status, eid, msg)
+                if ok:
+                    replayed += 1
+                else:
+                    failing += 1
+            print(
+                f"\nSummary: replayed={replayed} still_failing={failing} "
+                f"total={replayed + failing}."
+            )
+            return 0 if failing == 0 else 1
+        # Single entry.
+        entries = await redis.xrange(_dlq_stream(), args.dlq_id, args.dlq_id)
+        if not entries:
+            print(
+                f"No entry with id={args.dlq_id} in {_dlq_stream()}.", file=sys.stderr
+            )
+            return 2
+        eid, fields = entries[0]
+        ok, msg = await _replay_one(redis, eid, fields)
+        status = "✓ replayed" if ok else "✗ failed"
+        logger.info("[audittrace-dlq] %s %s — %s", status, eid, msg)
+        return 0 if ok else 1
+    finally:
+        await redis.aclose()
+
+
+# ──────────────────────────── drain ──────────────────────────────
+
+
+async def cmd_drain(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        print(
+            "Refusing to drain without --confirm (drain is destructive).",
+            file=sys.stderr,
+        )
+        return 2
+    redis = await _client()
+    try:
+        if args.all:
+            entries = await redis.xrange(_dlq_stream(), "-", "+", count=10000)
+            cutoff = datetime.now() - timedelta(days=args.older_than)
+            dropped = 0
+            for eid, _fields in entries:
+                ms_part = eid.split("-", 1)[0]
+                try:
+                    ts = datetime.fromtimestamp(int(ms_part) / 1000.0)
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    continue
+                await redis.xdel(_dlq_stream(), eid)
+                logger.info("[audittrace-dlq] drained %s", eid)
+                dropped += 1
+            print(f"\nDrained {dropped} entries older than {args.older_than} days.")
+            return 0
+        # Single entry.
+        n = await redis.xdel(_dlq_stream(), args.dlq_id)
+        if n == 0:
+            print(f"No entry with id={args.dlq_id}.", file=sys.stderr)
+            return 2
+        logger.info("[audittrace-dlq] drained %s", args.dlq_id)
+        return 0
+    finally:
+        await redis.aclose()
+
+
+# ──────────────────────────── main ───────────────────────────────
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="audittrace-dlq",
+        description="Operator CLI for the ADR-046 async-persist DLQ.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_inspect = sub.add_parser("inspect", help="List DLQ entries.")
+    p_inspect.add_argument("--limit", type=int, default=100)
+    p_inspect.add_argument("--reason", default=None)
+    p_inspect.set_defaults(func=cmd_inspect)
+
+    p_replay = sub.add_parser("replay", help="Replay a DLQ entry.")
+    p_replay.add_argument("dlq_id", nargs="?")
+    p_replay.add_argument("--all", action="store_true")
+    p_replay.add_argument("--max", type=int, default=100)
+    p_replay.set_defaults(func=cmd_replay)
+
+    p_drain = sub.add_parser("drain", help="Drop a DLQ entry without retry.")
+    p_drain.add_argument("dlq_id", nargs="?")
+    p_drain.add_argument("--all", action="store_true")
+    p_drain.add_argument("--older-than", type=int, default=30)
+    p_drain.add_argument("--confirm", action="store_true")
+    p_drain.set_defaults(func=cmd_drain)
+
+    return parser
+
+
+async def _amain(args: argparse.Namespace) -> int:
+    return await args.func(args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    # Validate replay/drain arg shape.
+    if args.cmd == "replay" and not args.all and not args.dlq_id:
+        parser.error("replay requires either <dlq_id> or --all")
+    if args.cmd == "drain" and not args.all and not args.dlq_id:
+        parser.error("drain requires either <dlq_id> or --all")
+    return asyncio.run(_amain(args))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
