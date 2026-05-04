@@ -129,7 +129,13 @@ sequenceDiagram
     Note over Chat: Stream finished — post-stream work begins
 
     Chat->>Chat: answer = "".join(text_chunks)\n+ render [tool_call] lines if accumulated
-    Chat->>DB: INSERT interactions\n(user_id = UserContext.user_id\n= Keycloak sub)
+
+    alt X-Persist-Mode: async + async_persist_enabled (ADR-046)
+        Chat->>Redis: XADD audittrace:persist:stream\n{record_json, tool_calls_json, ...}
+        Note over Chat: Returns response immediately;\nconsumer XACKs out-of-band.
+    else default (sync)
+        Chat->>DB: INSERT interactions\n(user_id = UserContext.user_id\n= Keycloak sub)
+    end
 
     Chat->>LF: POST /api/public/ingestion\n{id: trace_id, output: answer,\nmetadata: {...}, sessionId: ...}
 

@@ -69,6 +69,10 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                 // Background summarisation (ADR-030)
                 sessionSummarizer = component "SessionSummarizer" "Background asyncio task — every AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES picks idle sessions (last interaction > AUDITTRACE_SUMMARIZER_IDLE_MINUTES) via FOR UPDATE SKIP LOCKED, calls the summariser LLM with strict-JSON response_format, writes SessionRecord rows. Sets app.current_user_id GUC per-session for RLS attribution (ADR-030)" "services/session_summarizer.py"
 
+                // Async chat-completion persistence (ADR-046)
+                asyncPersistConsumer = component "AsyncPersistConsumer" "Background asyncio task — XREADGROUP from audittrace:persist:stream under consumer-${HOSTNAME} in the audittrace-persisters group. Per iteration: XPENDING+XCLAIM idle entries (steals from dead consumers, bumps delivery_count), XREADGROUP > for new entries, deserialise → _persist_interaction → XACK. Poison messages (parse fail or delivery_count > max_deliveries) move to audittrace:persist:dlq + XACK. Multi-pod safe via Redis consumer-group routing — each entry goes to exactly one consumer (ADR-046 §3, §4)" "services/async_persist.py"
+                asyncPersistProducer = component "AsyncPersistProducer" "Per-request opt-in path. Triggered when X-Persist-Mode: async + async_persist_enabled. XADDs the InteractionRecord kwargs + pending tool_calls to audittrace:persist:stream and returns immediately. On any Redis failure falls back to sync _persist_interaction so the audit invariant is preserved (ADR-046 §3)" "services/async_persist.py + routes/chat.py"
+
                 // Plumbing
                 diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"
                 pgFactory = component "PostgresFactory" "Connection pooling + session management (ADR-020)" "ABC + URLPostgresFactory"
@@ -81,7 +85,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             chromaDb = container "ChromaDB Server" "Vector store — decisions, skills collections — token auth" "ChromaDB HTTP Server" {
                 tags "Database"
             }
-            redisCache = container "Redis 7" "Shared cache — audittrace:token:* for TokenCache (DESIGN §15.4) and audittrace:tool-result:* for ToolResultCache (ADR-025 §Decision.8). Disjoint key prefixes." "Redis" {
+            redisCache = container "Redis 7" "Shared cache + streams. Cache namespaces: audittrace:token:* (TokenCache, DESIGN §15.4), audittrace:tool-result:* (ToolResultCache, ADR-025 §Decision.8). Streams: audittrace:persist:stream + audittrace:persist:dlq (ADR-046 — async chat persistence + DLQ)." "Redis" {
                 tags "Database"
             }
             minioStore = container "MinIO" "S3-compatible object storage — memory-shared (ADRs, skills) + memory-private (per-user knowledge). SSE-S3 encryption at rest (ADR-027)" "MinIO" {
@@ -156,6 +160,13 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         memoryServer.api.sessionSummarizer -> memoryServer.postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
         memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
         memoryServer.api.sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
+
+        // Async chat-completion persistence (ADR-046, Accepted)
+        memoryServer.api.chatRoute -> memoryServer.api.asyncPersistProducer "On X-Persist-Mode: async — serialise InteractionRecord kwargs + tool_calls"
+        memoryServer.api.asyncPersistProducer -> memoryServer.redisCache "XADD audittrace:persist:stream" "Redis Streams"
+        memoryServer.redisCache -> memoryServer.api.asyncPersistConsumer "XREADGROUP > / XCLAIM idle pending — multi-pod safe via consumer group" "Redis Streams"
+        memoryServer.api.asyncPersistConsumer -> memoryServer.postgresDb "_persist_interaction + _flush_pending_tool_calls (reused from sync path) → XACK on success" "SQLAlchemy ORM"
+        memoryServer.api.asyncPersistConsumer -> memoryServer.redisCache "XADD audittrace:persist:dlq + XACK on poison (parse fail or delivery_count > max_deliveries)" "Redis Streams"
 
         // DI wiring
         memoryServer.api.diContainer -> memoryServer.api.contextBuilder "Injects"

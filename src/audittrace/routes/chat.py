@@ -242,18 +242,23 @@ router = APIRouter()
 def _compute_session_id(source: str, first_user_content: str, user_id: str) -> str:
     """Deterministic session id grouping all turns of the same conversation.
 
-    Format: ``{source}-{YYYY-MM-DD}-{sha256(source|date|user_id|first)[:16]}``
-    Stable across requests so Langfuse can cluster traces by session and
-    PostgreSQL ``interactions.session_id`` correlates rows.
+    Format: ``{source}-{YYYY-MM-DD}-{sha256(source|date|user_id|first)}``
+    where the trailing component is the full 64-char SHA-256 hex digest
+    (256 bits). Stable across requests so Langfuse can cluster traces by
+    session and PostgreSQL ``interactions.session_id`` correlates rows.
 
     DESIGN §15 Phase 2: ``user_id`` (Keycloak ``sub``) is mixed into the
     hash so two users with identical ``(source, date, first_message)``
     can never produce the same session id — a correctness invariant
     once multi-user traffic lands.
+
+    Backlog #04: hash widened from 128 → 256 bits on 2026-05-04. The
+    ``interactions.session_id`` column is TEXT; old (shorter) ids remain
+    valid identifiers, only new sessions get the longer form.
     """
     today = date.today().isoformat()
     raw = f"{source}|{today}|{user_id}|{first_user_content}"
-    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()  # full 64 hex chars / 256 bits
     return f"{source}-{today}-{h}"
 
 
@@ -317,6 +322,19 @@ def _apply_thinking_mode(payload: dict[str, Any], thinking: str | None) -> None:
         return
     kwargs = payload.setdefault("chat_template_kwargs", {})
     kwargs["enable_thinking"] = thinking == "deep"
+
+
+def _resolve_persist_mode(request: Request) -> str:
+    """Parse ``X-Persist-Mode`` header (ADR-046).
+
+    Returns ``"async"`` only on the explicit opt-in (case-insensitive
+    ``async``). Every other value — absent, ``sync``, unknown — falls
+    back to ``"sync"`` so a typo never silently drops persistence.
+    The async branch is additionally gated by
+    ``settings.async_persist_enabled`` at the call site.
+    """
+    raw = (request.headers.get("x-persist-mode") or "").strip().lower()
+    return "async" if raw == "async" else "sync"
 
 
 async def _iter_with_idle_timeout(
@@ -532,6 +550,60 @@ def _flush_pending_tool_calls(
             interaction_id,
             exc,
         )
+
+
+async def _persist_or_enqueue(
+    *,
+    persist_mode: str,
+    pending_tool_calls: list[PendingToolCall] | None = None,
+    **kwargs: Any,
+) -> int | None:
+    """ADR-046 — branch sync vs async chat-completion persistence.
+
+    When ``persist_mode == "async"`` AND ``settings.async_persist_enabled``,
+    serialise ``kwargs`` (the ``_persist_interaction`` arguments) plus any
+    ``pending_tool_calls`` and ``XADD`` to the persist stream. The consumer
+    worker (``audittrace.services.async_persist.AsyncPersistConsumer``)
+    drains the stream and calls ``_persist_interaction`` +
+    ``_flush_pending_tool_calls`` itself; this returns ``None`` on the
+    async branch.
+
+    Otherwise (sync default, feature flag off, or ``XADD`` raised) run
+    the sync path: ``_persist_interaction(**kwargs)`` and, if
+    ``pending_tool_calls`` is non-empty, ``_flush_pending_tool_calls``.
+    Returns the interaction id (or ``None`` on sync-side DB hiccup).
+
+    Span attribute ``audittrace.persist.mode`` is set on every call so
+    Grafana / Langfuse dashboards always have the dimension.
+    """
+    settings = get_settings()
+    if persist_mode == "async" and settings.async_persist_enabled:
+        from audittrace.services.async_persist import get_async_persist_producer
+
+        try:
+            producer = get_async_persist_producer()
+            stream_id = await producer.enqueue(
+                kwargs=kwargs,
+                pending_tool_calls=pending_tool_calls,
+            )
+        except Exception:  # pragma: no cover - defensive
+            stream_id = None
+        if stream_id is not None:
+            telemetry.set_current_span_attributes(
+                {
+                    "audittrace.persist.mode": "async",
+                    "audittrace.persist.stream_id": stream_id,
+                }
+            )
+            return None
+        # Producer failed — fall through to sync to preserve the audit
+        # invariant (feedback_traceability_requirement).
+
+    interaction_id = _persist_interaction(**kwargs)
+    if pending_tool_calls:
+        _flush_pending_tool_calls(pending_tool_calls, interaction_id)
+    telemetry.set_current_span_attributes({"audittrace.persist.mode": "sync"})
+    return interaction_id
 
 
 def _set_genai_request_attributes(
@@ -968,6 +1040,7 @@ async def _handle_tools_mode(
     session_id: str,
     query: str,
     settings: Settings,
+    persist_mode: str = "sync",
 ) -> Any:
     """ADR-025 ``memory_mode=tools`` path.
 
@@ -1133,8 +1206,14 @@ async def _handle_tools_mode(
     finish_reason = first.get("finish_reason") or "stop"
     response_model = final_body.get("model") or requested_model
 
-    # 4 — Persist interaction + flush audit rows
-    interaction_id = _persist_interaction(
+    # 4 — Persist interaction + flush audit rows. ADR-046: async branch
+    # XADDs to audittrace:persist:stream when the caller opts in via
+    # X-Persist-Mode: async (and the feature flag is on); the consumer
+    # worker drains and flushes tool_calls itself. Sync default is
+    # bit-identical to the pre-ADR-046 behaviour.
+    await _persist_or_enqueue(
+        persist_mode=persist_mode,
+        pending_tool_calls=pending,
         project=project,
         source=source,
         question=query,
@@ -1146,7 +1225,6 @@ async def _handle_tools_mode(
         user_id=user.user_id,
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
-    _flush_pending_tool_calls(pending, interaction_id)
 
     # 5 — Push the output to Langfuse. Best-effort: the helper swallows
     # its own exceptions so a Langfuse outage cannot break the chat
@@ -1266,6 +1344,8 @@ async def chat_completions(
     # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
     # runs the pre-Phase-4 4-layer context build; the tools path runs
     # the proxy-internal tool-call loop.
+    persist_mode = _resolve_persist_mode(http_request)
+
     if settings.memory_mode == "tools":
         return await _handle_tools_mode(
             payload=payload,
@@ -1274,6 +1354,7 @@ async def chat_completions(
             session_id=session_id,
             query=query,
             settings=settings,
+            persist_mode=persist_mode,
         )
 
     # Build memory context inside an @observe span (off-loop because the
@@ -1454,7 +1535,9 @@ async def chat_completions(
             else:
                 answer = text_answer
 
-            _persist_interaction(
+            # ADR-046: success-path persistence honours X-Persist-Mode.
+            await _persist_or_enqueue(
+                persist_mode=persist_mode,
                 project=project,
                 source=source,
                 question=query,
@@ -1622,7 +1705,9 @@ async def chat_completions(
             answer = (answer + "\n" + tool_text) if answer else tool_text
         usage = body.get("usage") or {}
         finish_reason = (choices[0].get("finish_reason") if choices else None) or "stop"
-        _persist_interaction(
+        # ADR-046: success-path persistence honours X-Persist-Mode.
+        await _persist_or_enqueue(
+            persist_mode=persist_mode,
             project=project,
             source=source,
             question=query,

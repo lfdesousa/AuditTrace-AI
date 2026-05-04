@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from audittrace.services.context_builder import PROFILE_SECTION_HEADER
+
 # Reuse the AsyncClient fake from the chat-proxy tests so this file doesn't
 # duplicate the mock plumbing (ADR-024).
 from tests.test_chat_proxy import _FakeAsyncClient, _patch_async_client
@@ -74,7 +76,7 @@ def test_context_endpoint_empty_results(client):
 
     assert response.status_code == 200
     data = response.json()
-    assert "Profile" in data["context_string"]  # profile always present
+    assert PROFILE_SECTION_HEADER in data["context_string"]  # profile always present
 
 
 def test_health_endpoint(client):
@@ -84,6 +86,19 @@ def test_health_endpoint(client):
     data = response.json()
     assert data["status"] == "ok"
     assert "components" in data
+
+
+def test_health_surfaces_async_persist_state(client):
+    """ADR-046 §7 — /health exposes the async-persist runtime state so
+    operators can see the feature flag + DLQ depth in one curl."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    components = response.json()["components"]
+    assert "async_persist_enabled" in components
+    # Feature flag default is False in tests — only the flag field is
+    # surfaced; DLQ depth + consumer lag fields appear when the flag
+    # is on (gated to avoid touching Redis on every readiness probe).
+    assert components["async_persist_enabled"] == "false"
 
 
 def test_metrics_endpoint(client):

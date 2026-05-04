@@ -315,6 +315,59 @@ echo "127.0.0.1 audittrace.local" | sudo tee -a /etc/hosts
 curl -sk https://audittrace.local/health
 ```
 
+### Vault & Keycloak bootstrap (post-install / post-upgrade)
+
+After `make k8s-install` (or any `helm upgrade` that adds a new Vault
+policy / role or memory-scopes binding to the chart), run the bootstrap
+umbrella to push the chart's expected provisioner state into Vault and
+Keycloak:
+
+```bash
+# Prerequisites:
+#   - Vault initialised + unsealed (vault operator init && unseal x3)
+#   - VAULT_TOKEN exported (root token from `vault operator init`,
+#     rotate to a less-privileged operator token after first run)
+export VAULT_TOKEN="<root-or-operator-token>"
+
+make k8s-bootstrap-secrets
+```
+
+The umbrella chains:
+
+1. **`scripts/setup-vault.sh`** — enables KV v2 + Kubernetes auth, applies
+   every `*.hcl` policy and `role-*.env` binding present in the
+   `audittrace-vault-policies` ConfigMap (dynamic discovery — adding a
+   new policy to `templates/vault/configmap-policies.yaml` is automatically
+   picked up here), seeds initial KV secrets from `secrets/*.txt`.
+2. **`scripts/setup-memory-scopes.sh`** — provisions the three OAuth2
+   memory scopes (`memory:episodic:write`, `memory:procedural:write`,
+   `memory:semantic:write`) on the audittrace realm and binds them to
+   the relevant clients via `kcadm.sh`. Reads the Keycloak admin
+   password from Vault when available.
+
+Both scripts are **idempotent** — they check current state before
+applying, so re-running is safe and prints `⊝ exists (skip)` for entries
+already present.
+
+After this command, the operator must seed Keycloak's admin password
+into Vault (one-time, NOT auto-seeded for security):
+
+```bash
+vault kv put kv/audittrace/keycloak/admin password="<new-password>"
+```
+
+Then verify the cluster is in the expected state:
+
+```bash
+make verify-deploy
+# Expect: 9/9 PASS — check 9 asserts ConfigMap policies/roles match Vault.
+```
+
+If the verify gate's check 9 reports drift (e.g. `policy 'X' is in
+ConfigMap but missing in Vault`), re-run `make k8s-bootstrap-secrets`
+and re-verify. This is the failure mode that cost half a session day on
+2026-05-03 — the umbrella + drift-guard pair makes it self-healing.
+
 ### Day-2 operations
 
 ```bash
