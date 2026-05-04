@@ -166,6 +166,13 @@ k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak mem
 	@scripts/setup-vault.sh
 	@scripts/setup-memory-scopes.sh
 
+openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fixtures/openapi.snapshot.yaml from the live FastAPI app (ADR-046 / v1.0.10).
+	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov
+	@echo "✅ Regenerated:"
+	@echo "   tests/fixtures/openapi.snapshot.yaml"
+	@echo "   docs/reference/audittrace/openapi.yaml"
+	@echo "Commit both alongside the API change so reviewers see the diff."
+
 k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
