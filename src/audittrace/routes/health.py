@@ -27,6 +27,9 @@ async def health_check() -> HealthResponse:
             "server": "running",
             "llama_url": settings.llama_url,
             "chroma_url": settings.chroma_url,
+            # Backlog #10 — surface so an operator can see the summariser's
+            # ctx ceiling in one curl, no kubectl exec needed.
+            "summariser_ctx_tokens": str(settings.summarizer_ctx_tokens),
         },
     )
 

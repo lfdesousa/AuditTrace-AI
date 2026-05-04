@@ -671,3 +671,214 @@ class TestRunLifecycle:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ─────────────── Backlog #10 — pre-flight ctx-overflow guard ────────────
+
+
+def _mock_summariser_client_with_tokenize(
+    *,
+    tokens_per_call: int,
+    summary: str = "ok",
+    key_points: list[str] | None = None,
+    tokenize_status: int = 200,
+) -> httpx.AsyncClient:
+    """Mock transport that routes ``/tokenize`` and ``/v1/chat/completions``
+    to different responses, matching llama-server's URL layout.
+
+    ``tokens_per_call`` lets a test pin the count returned for ANY
+    tokenize call. The granularity is intentionally coarse — we are
+    testing the budget-comparison branch, not the truncation algorithm
+    pinned to a particular tokeniser.
+
+    ``tokenize_status`` lets a test simulate ``/tokenize`` being
+    unreachable (5xx / non-200) so the fall-through-to-raw-send branch
+    is exercised.
+    """
+    if key_points is None:
+        key_points = ["a"]
+    chat_content = json.dumps({"summary": summary, "key_points": key_points})
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tokenize"):
+            if tokenize_status != 200:
+                return httpx.Response(tokenize_status, json={})
+            # llama.cpp tokenize returns {"tokens": [int, int, ...]}.
+            return httpx.Response(200, json={"tokens": list(range(tokens_per_call))})
+        # /v1/chat/completions
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": chat_content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+
+@pytest.fixture
+def seed_five_turn_session(pg_factory):
+    """Seed a session with 5 idle turns so the truncate branch has
+    something to drop.
+
+    Timestamps are spaced 1 minute apart inside the idle window so the
+    eligibility query treats this as one session, idle for >15 min.
+    """
+    session = pg_factory.get_session_factory()()
+    try:
+        for i in range(5):
+            session.add(
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question=f"Q{i}",
+                    answer=f"A{i}",
+                    timestamp=_iso_minutes_ago(60 - i),  # 60, 59, 58, 57, 56
+                    session_id="sess-long",
+                    user_id="user-1",
+                )
+            )
+        session.commit()
+    finally:
+        session.close()
+    return pg_factory
+
+
+class TestCtxOverflowGuard:
+    """Backlog #10 — primary fix from project_summarizer_400.md."""
+
+    @pytest.mark.asyncio
+    async def test_truncate_branch_drops_oldest_turns(self, seed_five_turn_session):
+        """Prompt over ctx → drop oldest turns until it fits, write a
+        normal summary annotated with the truncation note.
+
+        Mock returns token counts in a fixed sequence so we can pin which
+        truncation step succeeds. With budget = ctx(100)-reserve(20) = 80
+        and sys_tokens = 10, the per-step transcript count must drop from
+        > 70 to ≤ 70 between calls. Sequence: full=100, drop1→90, drop2→80,
+        drop3→70 (fits, 10+70=80 ≤ 80). Expect dropped=3, 2 turns kept.
+        """
+        token_counts = iter(
+            [
+                10,  # _SYSTEM_PROMPT
+                100,  # full 5-turn transcript — over budget
+                90,  # 4 turns — still over
+                80,  # 3 turns — still over (10+80=90 > 80)
+                70,  # 2 turns — fits (10+70=80 ≤ 80) ← returns here
+            ]
+        )
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tokenize"):
+                count = next(token_counts, 0)
+                return httpx.Response(200, json={"tokens": list(range(count))})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {"summary": "trunc-ok", "key_points": ["k"]}
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+            )
+
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=100,
+                summarizer_ctx_reserve_tokens=20,
+            ),
+            session_factory=seed_five_turn_session.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        count = await summariser.run_once()
+        assert count == 1
+
+        db = seed_five_turn_session.get_session_factory()()
+        try:
+            row = db.query(SessionRecord).filter_by(id="sess-long").one()
+            assert "[truncated:" in row.summary, (
+                f"expected truncation note in summary, got: {row.summary}"
+            )
+            assert "trunc-ok" in row.summary
+            assert row.model == "mistral-7b-summarizer"  # NOT the sentinel model
+            assert row.summarized_at is not None
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_branch_for_pathological_single_turn(
+        self, seed_session_turns
+    ):
+        """Even the most recent single turn exceeds ctx → write a sentinel
+        SessionRecord so the row leaves the eligibility set; no infinite
+        retry. The seeded fixture has 2 turns; we report tokens_per_call
+        large enough that even one turn alone busts the budget."""
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=10,
+                summarizer_ctx_reserve_tokens=2,
+            ),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client_with_tokenize(
+                tokens_per_call=999,  # everything is way over a budget of 8
+            ),
+        )
+        count = await summariser.run_once()
+        assert count == 1  # sentinel write counts as a successful skip
+
+        db = seed_session_turns.get_session_factory()()
+        try:
+            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+            assert row.model == "sentinel-skip-ctx-overflow-auto"
+            assert "sentinel-skip-ctx-overflow-auto" in row.summary
+            assert row.summarized_at is not None  # critical: leaves eligibility set
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_tokenize_unreachable_falls_back_to_raw_send(
+        self, seed_session_turns
+    ):
+        """If ``/tokenize`` is unavailable (e.g. older llama-server build,
+        partial outage), the summariser must NOT block on the pre-flight
+        check — it falls through and sends the prompt as-is. The existing
+        post-error path is the safety net of last resort.
+
+        Regression guard: the happy path produced a normal summary BEFORE
+        backlog #10 landed; introducing the pre-flight must not break it."""
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client_with_tokenize(
+                tokens_per_call=10,
+                summary="happy-path-summary",
+                key_points=["p"],
+                tokenize_status=503,  # /tokenize unreachable
+            ),
+        )
+        count = await summariser.run_once()
+        assert count == 1
+
+        db = seed_session_turns.get_session_factory()()
+        try:
+            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+            assert row.summary == "happy-path-summary"
+            assert "[truncated:" not in row.summary  # no spurious annotation
+            assert row.model == "mistral-7b-summarizer"
+        finally:
+            db.close()
