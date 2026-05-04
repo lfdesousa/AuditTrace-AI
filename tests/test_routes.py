@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from audittrace.services.context_builder import PROFILE_SECTION_HEADER
+
 # Reuse the AsyncClient fake from the chat-proxy tests so this file doesn't
 # duplicate the mock plumbing (ADR-024).
 from tests.test_chat_proxy import _FakeAsyncClient, _patch_async_client
@@ -74,7 +76,7 @@ def test_context_endpoint_empty_results(client):
 
     assert response.status_code == 200
     data = response.json()
-    assert "Profile" in data["context_string"]  # profile always present
+    assert PROFILE_SECTION_HEADER in data["context_string"]  # profile always present
 
 
 def test_health_endpoint(client):

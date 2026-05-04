@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # names without this note, this constant + its two injection sites can be
 # deleted in one commit. Keep it short — the ambient-context word budget
 # (_AMBIENT_BUDGET_WORDS, pinned by test) is 280 words.
+# Profile section heading — exported so tests can assert on the rendered
+# header without duplicating the literal across 13 sites. If the heading
+# is ever renamed (e.g. localised), every dependent call site updates
+# together (backlog #03, closed 2026-05-04).
+PROFILE_SECTION_HEADER = "## Profile"
+
+
 NAMING_CONVENTION_NOTE = (
     "## Names\n"
     "Project renamed sovereign-memory-server → audittrace-server "
@@ -125,7 +132,7 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Identity — always present, minimal
         sections.append(
-            "## Profile\n"
+            f"{PROFILE_SECTION_HEADER}\n"
             "You are working with a Solutions Architect specialised in IAM/OAuth2. "
             f"Current project: **{project or 'unspecified'}**."
         )
@@ -259,7 +266,7 @@ def build_ambient_context(
     project_label = project or "unspecified"
 
     lines: list[str] = []
-    lines.append("## Profile")
+    lines.append(PROFILE_SECTION_HEADER)
     lines.append(
         f"You are working with {user_context.username} (role: {role_label}). "
         f"Current project: {project_label}. Date: {today_iso}."

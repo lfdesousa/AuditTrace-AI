@@ -19,6 +19,7 @@ from audittrace.routes.chat import (
     _resolve_project,
     _resolve_thinking,
 )
+from audittrace.services.context_builder import PROFILE_SECTION_HEADER
 
 # ──────────────────────────── httpx.AsyncClient fakes ────────────────────────
 #
@@ -269,7 +270,9 @@ class TestChatProxy:
         assert fake.last_post_json is not None
         system_msg = fake.last_post_json["messages"][0]
         assert system_msg["role"] == "system"
-        assert "Profile" in system_msg["content"]  # memory context injected
+        assert (
+            PROFILE_SECTION_HEADER in system_msg["content"]
+        )  # memory context injected
         assert "You are a helpful assistant." in system_msg["content"]
 
     def test_chat_proxy_creates_system_message_when_missing(self, client):
@@ -286,7 +289,7 @@ class TestChatProxy:
         assert response.status_code == 200
         msgs = fake.last_post_json["messages"]
         assert msgs[0]["role"] == "system"
-        assert "Profile" in msgs[0]["content"]
+        assert PROFILE_SECTION_HEADER in msgs[0]["content"]
 
     def test_chat_proxy_passes_through_openai_fields(self, client):
         """temperature, top_p, max_tokens forwarded to llama-server."""
@@ -1070,7 +1073,7 @@ class TestToolsModeIntegration:
         # The first POST carries the ambient context in the system message
         system_msg = fake.post_calls[0]["json"]["messages"][0]
         assert system_msg["role"] == "system"
-        assert "Profile" in system_msg["content"]
+        assert PROFILE_SECTION_HEADER in system_msg["content"]
         # And the memory tools are advertised in the tools array
         tools_arr = fake.post_calls[0]["json"].get("tools") or []
         tool_names = {t["function"]["name"] for t in tools_arr}
