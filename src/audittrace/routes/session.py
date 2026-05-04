@@ -17,6 +17,7 @@ from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 from audittrace.models import (
     SessionSaveRequest,
+    SessionSaveResponse,
     SessionSummaryRequest,
     SessionSummaryResponse,
 )
@@ -27,12 +28,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/save")
+@router.post("/save", response_model=SessionSaveResponse)
 @log_call(logger=logger)
 async def save_session(
     request: SessionSaveRequest,
     _auth: dict[str, Any] = Depends(require_scope("audittrace:query")),
-) -> dict[str, Any]:
+) -> SessionSaveResponse:
     """Persist session interactions to the audit trail."""
     settings = get_settings()
     logger.debug(
@@ -40,12 +41,12 @@ async def save_session(
     )
     # TODO: Phase 1 - batch insert into PostgreSQL + update ChromaDB
     _ = settings  # noqa: F841 (reserved for Phase 1 wiring)
-    return {
-        "status": "ok",
-        "project": request.project,
-        "interactions_saved": len(request.interactions),
-        "metadata": request.metadata,
-    }
+    return SessionSaveResponse(
+        status="ok",
+        project=request.project,
+        interactions_saved=len(request.interactions),
+        metadata=request.metadata or {},
+    )
 
 
 @router.post("/summary", response_model=SessionSummaryResponse)

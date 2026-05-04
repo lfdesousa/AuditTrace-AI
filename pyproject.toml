@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audittrace-ai"
-version = "0.3.1"
+version = "1.0.10"
 description = "AuditTrace-AI: sovereign AI memory server with 4-tier memory architecture and OAuth2 authentication"
 readme = "README.md"
 requires-python = ">=3.12"

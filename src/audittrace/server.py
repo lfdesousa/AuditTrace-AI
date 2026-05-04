@@ -308,15 +308,97 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     telemetry.shutdown()
 
 
+def _resolve_version() -> str:
+    """Read the package version from installed metadata.
+
+    Tries ``audittrace-ai`` (the pyproject ``project.name``); falls back
+    to a constant when running from a source tree without
+    ``pip install -e``. The constant tracks the latest release tag.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("audittrace-ai")
+    except (PackageNotFoundError, ImportError):  # pragma: no cover - dev path
+        return "1.0.10"
+
+
+# Tag descriptions populate the Swagger UI sidebar. Keep one paragraph
+# per tag — ``description`` is rendered as Markdown.
+OPENAPI_TAGS: list[dict[str, str]] = [
+    {
+        "name": "chat",
+        "description": (
+            "OpenAI-compatible chat completions proxy. The default POST shape "
+            "is intentionally permissive (raw dict pass-through) per ADR-024 "
+            "to preserve unknown tool-calling fields. Memory augmentation is "
+            "merged into the system message; an opt-in ``X-Persist-Mode: async`` "
+            "header (ADR-046) routes the audit-row write through Redis Streams "
+            "instead of the synchronous Postgres write on the response path."
+        ),
+    },
+    {
+        "name": "context",
+        "description": (
+            "Build the augmented system context across all four memory layers "
+            "(episodic, procedural, conversational, semantic) without going "
+            "through chat completions. Used by the webui memory tab and by "
+            "external agents that want to inspect what would be injected."
+        ),
+    },
+    {
+        "name": "memory",
+        "description": (
+            "CRUD over the four memory layers. Episodic = ADRs, "
+            "Procedural = skill files, Conversational = past sessions "
+            "(read-only), Semantic = ChromaDB-backed RAG. Each write is "
+            "scoped to the caller's Keycloak ``sub`` and gated by RLS at the "
+            "Postgres + ChromaDB layers."
+        ),
+    },
+    {
+        "name": "session",
+        "description": (
+            "Save + summarise full chat sessions for replay and audit. Used "
+            "by the OpenCode bridge to land long-running conversations into "
+            "the conversational layer."
+        ),
+    },
+    {
+        "name": "audit",
+        "description": (
+            "Read-only audit endpoints: ``/interactions`` returns every "
+            "chat-completion row with token counts, status, failure-class, "
+            "and trace_id; ``/sessions`` aggregates them by session. "
+            "EU-AI-Act Article 12 compliance hook."
+        ),
+    },
+    {
+        "name": "health",
+        "description": (
+            "Kubernetes-grade liveness + metrics endpoints. ``/health`` "
+            "surfaces the summariser ctx-window and async-persist runtime "
+            "state alongside the standard component checks."
+        ),
+    },
+]
+
+
 def create_app() -> FastAPI:
     """Create and configure FastAPI application."""
     app = FastAPI(
-        title="Sovereign Memory Server",
+        title="AuditTrace-AI",
         description=(
-            "Production-grade sovereign AI memory server with 4-tier memory "
-            "and OAuth2 authentication"
+            "EU-AI-Act-aligned audit trail for LLM workloads. "
+            "OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer memory "
+            "augmentation (episodic + procedural + conversational + semantic), "
+            "Keycloak-delegated identity, Postgres RLS per-user isolation, and "
+            "opt-in Redis-Streams async persistence (ADR-046).\n\n"
+            "See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set "
+            "(014–046) is the source of truth for design decisions."
         ),
-        version="0.3.1",
+        version=_resolve_version(),
+        openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
 

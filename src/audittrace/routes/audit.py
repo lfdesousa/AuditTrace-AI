@@ -24,7 +24,11 @@ from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
-from audittrace.models import InteractionRecord
+from audittrace.models import (
+    InteractionListResponse,
+    InteractionRecord,
+    SessionListResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +69,7 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
     }
 
 
-@router.get("/interactions")
+@router.get("/interactions", response_model=InteractionListResponse)
 @log_call(logger=logger)
 async def list_interactions(
     project: str | None = Query(None, description="Filter by project tag (ADR-029)."),
@@ -187,7 +191,7 @@ def _session_row_to_dict(row: SessionRow) -> dict[str, Any]:
     }
 
 
-@router.get("/sessions")
+@router.get("/sessions", response_model=SessionListResponse)
 @log_call(logger=logger)
 async def list_sessions(
     project: str | None = Query(None, description="Filter by project tag (ADR-029)."),
