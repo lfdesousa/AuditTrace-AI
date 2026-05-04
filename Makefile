@@ -161,6 +161,10 @@ deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + V
 verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /metrics, pg_isready, Tempo traces, Loki ERROR threshold (Phase C.12)
 	@RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) scripts/post-deploy-verify.sh
 
+k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported.
+	@scripts/setup-vault.sh
+	@scripts/setup-memory-scopes.sh
+
 k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
