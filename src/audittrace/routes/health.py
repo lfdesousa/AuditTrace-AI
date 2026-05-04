@@ -68,7 +68,9 @@ async def health_check() -> HealthResponse:
     components.update(await _async_persist_health_fields())
     return HealthResponse(
         status="ok",
-        version="0.3.1",
+        version=__import__(
+            "audittrace.server", fromlist=["_resolve_version"]
+        )._resolve_version(),
         components=components,
     )
 

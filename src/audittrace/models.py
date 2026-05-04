@@ -179,10 +179,15 @@ class SessionSummaryResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Schema for /health endpoint."""
+    """Schema for /health endpoint.
+
+    ``version`` defaults to a constant for backwards compatibility with
+    older clients; in production handlers should override with the
+    package version (see audittrace.routes.health.health_check).
+    """
 
     status: str = "ok"
-    version: str = "0.3.1"
+    version: str = "1.0.10"
     components: dict[str, str] = Field(default_factory=dict)
 
 
@@ -193,3 +198,126 @@ class MetricsResponse(BaseModel):
     total_chunks: int = 0
     active_sessions: int = 0
     uptime_seconds: int = 0
+
+
+# ─────────────────── ADR-046 Bucket-2 (v1.0.10) — list responses ─────────
+# These types narrow what was previously ``dict[str, Any]`` on five
+# routes so /openapi.json can render exact field shapes. No runtime
+# behaviour change — same fields are returned in the same order.
+
+
+class SessionSaveResponse(BaseModel):
+    """Response from POST /session/save."""
+
+    status: str = "ok"
+    project: str
+    interactions_saved: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class InteractionListItem(BaseModel):
+    """One row in the interactions list. Mirror of InteractionRecord
+    fields the GET /interactions handler returns today."""
+
+    id: int
+    project: str
+    source: str
+    question: str
+    answer: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    timestamp: str
+    session_id: str | None = None
+    model: str | None = None
+    user_id: str | None = None
+    status: str = "success"
+    failure_class: str | None = None
+    error_detail: str | None = None
+    duration_ms: int | None = None
+    trace_id: str | None = None
+
+
+class InteractionListResponse(BaseModel):
+    """Response from GET /interactions."""
+
+    interactions: list[InteractionListItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+
+
+class SessionListItem(BaseModel):
+    """One row in GET /sessions. Mirrors the SessionRecord columns
+    serialised by ``audit._session_row_to_dict``."""
+
+    id: str
+    project: str
+    date: str | None = None
+    summary: str | None = None
+    key_points: str | None = None  # JSON-encoded list of strings
+    model: str | None = None
+    user_id: str | None = None
+    summarized_at: str | None = None
+
+
+class SessionListResponse(BaseModel):
+    """Response from GET /sessions."""
+
+    sessions: list[SessionListItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+
+
+class ConversationalSessionItem(BaseModel):
+    """One row in GET /memory/conversational. Mirrors what the handler
+    returns from SessionRow today (note: ``key_points`` is the raw
+    JSON-encoded string straight off the column, not parsed)."""
+
+    id: str
+    project: str
+    date: str | None = None
+    model: str | None = None
+    summary: str | None = None
+    key_points: str | None = None
+    summarized_at: str | None = None
+    user_id: str | None = None
+
+
+class ConversationalListResponse(BaseModel):
+    """Response from GET /memory/conversational."""
+
+    items: list[ConversationalSessionItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+
+
+class ConversationalDetailInteraction(BaseModel):
+    """One interaction row in the per-session detail response. Distinct
+    from InteractionListItem because the order/keys come from a
+    different SELECT and must match for response_model validation."""
+
+    id: int
+    timestamp: str
+    session_id: str | None = None
+    source: str
+    project: str
+    question: str
+    answer: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str | None = None
+    status: str = "success"
+    failure_class: str | None = None
+    error_detail: str | None = None
+    duration_ms: int | None = None
+    trace_id: str | None = None
+
+
+class ConversationalDetailResponse(BaseModel):
+    """Response from GET /memory/conversational/{session_id}."""
+
+    session: ConversationalSessionItem
+    interactions: list[ConversationalDetailInteraction] = Field(default_factory=list)
+    total: int = 0

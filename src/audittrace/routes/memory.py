@@ -51,6 +51,10 @@ from audittrace.dependencies import (
     get_semantic_service,
 )
 from audittrace.identity import UserContext
+from audittrace.models import (
+    ConversationalDetailResponse,
+    ConversationalListResponse,
+)
 from audittrace.services.memory_manifest import ManifestEntry
 
 logger = logging.getLogger(__name__)
@@ -982,7 +986,7 @@ async def delete_semantic(
 # different roles intentionally.
 
 
-@router.get("/conversational")
+@router.get("/conversational", response_model=ConversationalListResponse)
 async def list_conversational_sessions(
     project: str | None = Query(None, description="Filter by project tag (ADR-029)."),
     since: str | None = Query(
@@ -1057,7 +1061,7 @@ async def list_conversational_sessions(
     }
 
 
-@router.get("/conversational/{session_id}")
+@router.get("/conversational/{session_id}", response_model=ConversationalDetailResponse)
 async def read_conversational_session(
     session_id: str,
     limit: int = Query(500, ge=1, le=5000),
