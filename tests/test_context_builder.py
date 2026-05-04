@@ -8,6 +8,7 @@ layer methods with Phase-2 signatures (``user_context, query, ...``).
 import pytest
 
 from audittrace.services.context_builder import (
+    PROFILE_SECTION_HEADER,
     ContextBuilderService,
     DefaultContextBuilder,
     MockContextBuilder,
@@ -90,7 +91,7 @@ class TestDefaultContextBuilder:
         ctx = populated_builder.build_system_context(
             user_context, project="AuditTrace", query=None
         )
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
         assert "Architecture Decisions" not in ctx
         assert "Relevant Skills" not in ctx
         assert "Recent Sessions" not in ctx
@@ -124,7 +125,7 @@ class TestDefaultContextBuilder:
         ctx = populated_builder.build_system_context(
             user_context, project="AuditTrace", query="quantum entanglement"
         )
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
         # Episodic/procedural/semantic should return nothing for this query
         assert "Architecture Decisions" not in ctx
         # Conversational always returns for the project
@@ -134,7 +135,7 @@ class TestDefaultContextBuilder:
         ctx = empty_builder.build_system_context(
             user_context, project="P", query="cache"
         )
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
         assert "Architecture Decisions" not in ctx
         assert "Recent Sessions" not in ctx
 
@@ -190,13 +191,13 @@ class TestDefaultContextBuilder:
         )
         # Should not raise
         ctx = builder.build_system_context(user_context, project="P", query="cache")
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
 
     def test_project_none_still_works(self, populated_builder, user_context):
         ctx = populated_builder.build_system_context(
             user_context, project=None, query="cache"
         )
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
 
     def test_procedural_layer_exception_is_swallowed(self, user_context):
         """Procedural layer exception must be swallowed; layer_stats=0.
@@ -220,7 +221,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["procedural"] == 0
-        assert "Profile" in ctx  # other layers still produced output
+        assert PROFILE_SECTION_HEADER in ctx  # always-on layer survived broken sibling
 
     def test_conversational_layer_exception_is_swallowed(self, user_context):
         """Conversational layer exception must be swallowed; layer_stats=0."""
@@ -239,7 +240,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["conversational"] == 0
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
 
     def test_semantic_layer_exception_is_swallowed(self, user_context):
         """Semantic layer exception must be swallowed; layer_stats=0."""
@@ -258,7 +259,7 @@ class TestDefaultContextBuilder:
             user_context, project="P", query="cache"
         )
         assert stats["semantic"] == 0
-        assert "Profile" in ctx
+        assert PROFILE_SECTION_HEADER in ctx
 
     def test_semantic_layer_strips_path_prefix_from_source(self, user_context):
         """Sources containing '/' must be displayed as basename only (line 132-133)."""

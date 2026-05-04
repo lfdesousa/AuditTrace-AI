@@ -242,18 +242,23 @@ router = APIRouter()
 def _compute_session_id(source: str, first_user_content: str, user_id: str) -> str:
     """Deterministic session id grouping all turns of the same conversation.
 
-    Format: ``{source}-{YYYY-MM-DD}-{sha256(source|date|user_id|first)[:16]}``
-    Stable across requests so Langfuse can cluster traces by session and
-    PostgreSQL ``interactions.session_id`` correlates rows.
+    Format: ``{source}-{YYYY-MM-DD}-{sha256(source|date|user_id|first)}``
+    where the trailing component is the full 64-char SHA-256 hex digest
+    (256 bits). Stable across requests so Langfuse can cluster traces by
+    session and PostgreSQL ``interactions.session_id`` correlates rows.
 
     DESIGN §15 Phase 2: ``user_id`` (Keycloak ``sub``) is mixed into the
     hash so two users with identical ``(source, date, first_message)``
     can never produce the same session id — a correctness invariant
     once multi-user traffic lands.
+
+    Backlog #04: hash widened from 128 → 256 bits on 2026-05-04. The
+    ``interactions.session_id`` column is TEXT; old (shorter) ids remain
+    valid identifiers, only new sessions get the longer form.
     """
     today = date.today().isoformat()
     raw = f"{source}|{today}|{user_id}|{first_user_content}"
-    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()  # full 64 hex chars / 256 bits
     return f"{source}-{today}-{h}"
 
 

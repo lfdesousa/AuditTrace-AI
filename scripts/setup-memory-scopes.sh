@@ -46,19 +46,43 @@ require_cmd() {
 require_cmd kubectl
 
 # ----- Resolve Keycloak admin password -----
+# Three resolution paths, tried in order:
+#   1. KEYCLOAK_ADMIN_PASSWORD env var already set — use as-is.
+#   2. Local `vault` CLI on PATH (operator has vault installed) — `vault kv get`.
+#   3. In-cluster fallback: `kubectl exec audittrace-vault-0 -- vault kv get`.
+#      Mirrors setup-vault.sh's vault_exec pattern so the umbrella target
+#      `make k8s-bootstrap-secrets` works without requiring the vault CLI on
+#      the operator's machine — the only prerequisite is VAULT_TOKEN exported,
+#      same as setup-vault.sh.
 if [[ -z "${KEYCLOAK_ADMIN_PASSWORD:-}" ]]; then
   if command -v vault >/dev/null 2>&1; then
-    echo "▶ KEYCLOAK_ADMIN_PASSWORD not set — attempting Vault lookup..."
+    echo "▶ KEYCLOAK_ADMIN_PASSWORD not set — attempting Vault lookup (local CLI)..."
     if KEYCLOAK_ADMIN_PASSWORD=$(vault kv get -field=password kv/audittrace/keycloak/admin 2>/dev/null); then
       export KEYCLOAK_ADMIN_PASSWORD
       echo "  ✓ resolved from kv/audittrace/keycloak/admin"
     else
-      echo "❌ Could not resolve KEYCLOAK_ADMIN_PASSWORD via Vault." >&2
-      echo "   Either set the env var directly or run `vault login` first." >&2
+      echo "❌ Could not resolve KEYCLOAK_ADMIN_PASSWORD via local Vault CLI." >&2
+      echo "   Either set the env var directly or run \`vault login\` first." >&2
+      exit 1
+    fi
+  elif [[ -n "${VAULT_TOKEN:-}" ]] \
+       && kubectl -n "${NAMESPACE}" get pod "${RELEASE}-vault-0" >/dev/null 2>&1; then
+    echo "▶ KEYCLOAK_ADMIN_PASSWORD not set — attempting in-cluster Vault lookup..."
+    if KEYCLOAK_ADMIN_PASSWORD=$(kubectl -n "${NAMESPACE}" exec -i "${RELEASE}-vault-0" -- \
+                                   env "VAULT_TOKEN=${VAULT_TOKEN}" \
+                                   vault kv get -field=password kv/audittrace/keycloak/admin 2>/dev/null); then
+      export KEYCLOAK_ADMIN_PASSWORD
+      echo "  ✓ resolved from kv/audittrace/keycloak/admin (via kubectl exec ${RELEASE}-vault-0)"
+    else
+      echo "❌ In-cluster Vault lookup failed. Has 'vault kv put kv/audittrace/keycloak/admin password=...' been run?" >&2
       exit 1
     fi
   else
-    echo "❌ KEYCLOAK_ADMIN_PASSWORD env var is empty and `vault` CLI is not on PATH." >&2
+    echo "❌ KEYCLOAK_ADMIN_PASSWORD env var is empty and no Vault path is available." >&2
+    echo "   Either:" >&2
+    echo "     - export KEYCLOAK_ADMIN_PASSWORD directly, or" >&2
+    echo "     - install the vault CLI locally and run \`vault login\`, or" >&2
+    echo "     - export VAULT_TOKEN so this script can read via kubectl exec." >&2
     exit 1
   fi
 fi

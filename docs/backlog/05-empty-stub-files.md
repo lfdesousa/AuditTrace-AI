@@ -2,7 +2,31 @@
 title: "chore(src): delete or fill 5 empty forward-declared stub files"
 labels: ["tech-debt", "cleanup"]
 priority: P4
+status: closed
+closed: 2026-05-04
 ---
+
+## Closure note (2026-05-04, PR B)
+
+Audit during PR B turned up that this item was effectively already
+resolved through normal Phase 1/2 work:
+
+- `src/audittrace/auth.py` — **exists, 321 lines**, fully-implemented:
+  multi-issuer JWT validation, JWKS cache, `require_user`,
+  `require_scope`, JIT user-context binding for RLS. Phase 1+2 used
+  this file as designed; the original "empty stub" framing is stale.
+- `src/audittrace/backend.py` — **never created**. YAGNI applied.
+- `src/audittrace/chain.py` — **never created**. YAGNI applied.
+- `src/audittrace/memory.py` — **never created**. YAGNI applied.
+- `src/audittrace/tracing.py` — **never created**. YAGNI applied.
+
+Acceptance criteria from the original ticket re-evaluated:
+
+> All five files either deleted or contain real content
+
+Met: `auth.py` has real content; the four others were never committed
+(`git log -- src/audittrace/{backend,chain,memory,tracing}.py` returns
+no commits), so deletion is moot. Item closed without code change.
 
 ## Context
 

@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/8) Pod readiness"
+header "(1/9) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/8) No crashing pods"
+header "(2/9) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/8) Helm release status"
+header "(3/9) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/8) Memory-server /health"
+header "(4/9) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/8) Memory-server /metrics"
+header "(5/9) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/8) Postgres reachability"
+header "(6/9) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/8) Tempo: recent traces for audittrace-server"
+header "(7/9) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/8) Loki: audittrace ERROR rate"
+header "(8/9) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -168,6 +168,81 @@ else
         pass "Loki ERROR count over 30m = $err_count (threshold $LOKI_ERROR_THRESHOLD)"
     else
         fail "Loki ERROR count over 30m = $err_count (threshold $LOKI_ERROR_THRESHOLD exceeded)"
+    fi
+fi
+
+# ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
+header "(9/9) Vault drift guard (ConfigMap ⊆ Vault)"
+# Catches the 2026-05-03 drift class: chart adds a policy/role to
+# templates/vault/configmap-policies.yaml, operator forgets to re-run
+# `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
+# rollout. Any expected entry missing from Vault is a hard FAIL with a
+# concrete diff. Reuses the same go-template + kubectl-exec pattern as
+# scripts/setup-vault.sh so there is one source of truth for "expected".
+#
+# SKIPped when:
+#   - VAULT_TOKEN is unset (drift guard requires a Vault token to list
+#     policies/roles; cluster-recovery scenarios run the gate first to
+#     confirm the rest of the chart is healthy, then operator re-runs
+#     once a token is in hand)
+#   - vault-0 pod is not Ready (cold-start)
+#   - the policies ConfigMap is absent (vault.enabled=false in chart)
+POLICIES_CM="${RELEASE}-vault-policies"
+vault_pod="${RELEASE}-vault-0"
+vault_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod "$vault_pod" \
+    -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+if [ -z "${VAULT_TOKEN:-}" ]; then
+    skip "VAULT_TOKEN unset — drift guard requires a Vault token"
+elif [ "$vault_ready" != "true" ]; then
+    skip "vault-0 pod not Ready (status=$vault_ready)"
+elif ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap "$POLICIES_CM" \
+        >/dev/null 2>&1; then
+    skip "ConfigMap $POLICIES_CM not present (vault.enabled=false?)"
+else
+    # Expected from ConfigMap (mirrors setup-vault.sh:cm_keys_matching).
+    expected_policies=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" \
+        get configmap "$POLICIES_CM" \
+        -o go-template='{{range $k, $_ := .data}}{{$k}}{{"\n"}}{{end}}' \
+        | grep -E '\.hcl$' | sed 's/\.hcl$//' | sort)
+    expected_roles=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" \
+        get configmap "$POLICIES_CM" \
+        -o go-template='{{range $k, $_ := .data}}{{$k}}{{"\n"}}{{end}}' \
+        | grep -E '^role-.*\.env$' | sed -E 's/^role-(.*)\.env$/\1/' | sort)
+
+    # Actual from Vault — `vault list -format=json` returns a JSON array
+    # of strings. Empty mounts return null/empty; jq's `.[]?` is null-safe.
+    actual_policies=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$vault_pod" -- \
+        env "VAULT_TOKEN=${VAULT_TOKEN}" \
+        vault list -format=json sys/policies/acl 2>/dev/null \
+        | jq -r '.[]?' 2>/dev/null | sort || echo "")
+    actual_roles=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$vault_pod" -- \
+        env "VAULT_TOKEN=${VAULT_TOKEN}" \
+        vault list -format=json auth/kubernetes/role 2>/dev/null \
+        | jq -r '.[]?' 2>/dev/null | sort || echo "")
+
+    # comm -23 prints lines unique to first input (expected but not actual).
+    # `|| true` because a non-empty diff still exits 0; we use the output
+    # to decide pass/fail.
+    missing_policies=$(comm -23 <(echo "$expected_policies") <(echo "$actual_policies") \
+        | grep -v '^$' || true)
+    missing_roles=$(comm -23 <(echo "$expected_roles") <(echo "$actual_roles") \
+        | grep -v '^$' || true)
+
+    if [ -z "$missing_policies" ] && [ -z "$missing_roles" ]; then
+        pol_count=$(echo "$expected_policies" | grep -c -v '^$' || echo 0)
+        role_count=$(echo "$expected_roles" | grep -c -v '^$' || echo 0)
+        pass "Vault has all $pol_count expected policies and $role_count expected roles"
+    else
+        fail "Vault drift detected — run 'make k8s-bootstrap-secrets':"
+        if [ -n "$missing_policies" ]; then
+            echo "[verify]      missing policies (in ConfigMap, not in Vault):" >&2
+            echo "$missing_policies" | sed 's/^/[verify]        - /' >&2
+        fi
+        if [ -n "$missing_roles" ]; then
+            echo "[verify]      missing roles (in ConfigMap, not in Vault):" >&2
+            echo "$missing_roles" | sed 's/^/[verify]        - /' >&2
+        fi
     fi
 fi
 

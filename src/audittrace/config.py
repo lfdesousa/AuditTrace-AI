@@ -174,6 +174,18 @@ class Settings(BaseSettings):
     # first-run spike when there are thousands of unsummarised sessions.
     summarizer_max_per_cycle: int = 10
 
+    # Backlog #10 — pre-flight ctx-window guard.
+    # llama-server's ``--ctx-size`` for the summariser model. When the rendered
+    # transcript would exceed this minus headroom, the summariser truncates
+    # oldest turns until it fits, rather than letting llama-server reject the
+    # request with HTTP 400 and re-trying every 5 min indefinitely (the
+    # 2026-04-22 incident, see project_summarizer_400.md). Match the value
+    # baked into scripts/start-summarizer-llama.sh; 32768 since 2026-04-24.
+    summarizer_ctx_tokens: int = 32768
+    # Output-token reservation: max_tokens=600 in the request; pad with a
+    # small safety margin against tokenizer drift.
+    summarizer_ctx_reserve_tokens: int = 700
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100

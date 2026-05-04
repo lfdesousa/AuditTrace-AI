@@ -40,6 +40,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
+from opentelemetry import metrics
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,6 +48,20 @@ from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
 
 logger = logging.getLogger(__name__)
+
+# Backlog #10 — counter for ctx-overflow handling.
+# Label `branch` ∈ {"truncate", "sentinel"} so the operator can tell ordinary
+# clipping (most long sessions, recoverable) from pathological skips
+# (single-turn bigger than ctx; data-loss class).
+_meter = metrics.get_meter("audittrace.summariser")
+_ctx_overflow_counter = _meter.create_counter(
+    name="audittrace.summariser.skipped_ctx_overflow",
+    description=(
+        "Sessions where the pre-flight token count exceeded ctx_size and "
+        "the summariser had to drop turns ('truncate') or insert a sentinel "
+        "row ('sentinel') instead of sending the full transcript."
+    ),
+)
 
 
 # ─────────────────────────── Data structures ──────────────────────────────
@@ -262,7 +277,18 @@ class SessionSummarizer:
             )
             return
 
-        prompt = _format_transcript(turns)
+        # Backlog #10 — pre-flight ctx guard. Before sending the prompt,
+        # check it fits in the summariser's ctx window. If not, drop oldest
+        # turns until it does ("truncate" branch). If even one turn is
+        # bigger than ctx by itself, write a sentinel SessionRecord so the
+        # row leaves the eligibility set ("sentinel" branch) rather than
+        # looping every cycle on an HTTP 400.
+        prompt, dropped = await self._fit_prompt_to_ctx(turns)
+        if prompt is None:
+            await asyncio.to_thread(self._persist_sentinel_overflow, es, len(turns))
+            _ctx_overflow_counter.add(1, {"branch": "sentinel"})
+            return
+
         raw = await self._call_llm(prompt)
         parsed = _parse_llm_response(raw)
         if parsed is None:
@@ -274,7 +300,148 @@ class SessionSummarizer:
             )
             return
 
+        if dropped > 0:
+            # Surface the truncation to the operator via the persisted
+            # summary so audit consumers see what was elided.
+            note = (
+                f"[truncated: oldest {dropped} of {len(turns)} turns omitted, "
+                f"summariser ctx={self._settings.summarizer_ctx_tokens}]"
+            )
+            existing = parsed.get("summary") or ""
+            parsed = {
+                **parsed,
+                "summary": f"{note} {existing}".strip(),
+            }
+            _ctx_overflow_counter.add(1, {"branch": "truncate"})
+
         await asyncio.to_thread(self._persist, es, parsed)
+
+    async def _fit_prompt_to_ctx(
+        self, turns: Sequence[InteractionRecord]
+    ) -> tuple[str | None, int]:
+        """Render ``turns`` as a transcript, dropping oldest turns until the
+        token count fits below ``ctx_size - reserve``.
+
+        Returns ``(prompt, dropped_count)`` on success; ``(None, len(turns))``
+        if even the most recent single turn is over ctx (pathological — the
+        sentinel branch handles this).
+
+        Counts tokens via llama-server's native ``/tokenize`` endpoint so
+        we use the same tokeniser as the model. Falls back to sending the
+        prompt as-is if ``/tokenize`` is unreachable — the existing
+        post-error path is the safety net of last resort.
+        """
+        budget = (
+            self._settings.summarizer_ctx_tokens
+            - self._settings.summarizer_ctx_reserve_tokens
+        )
+        # System prompt counts against the budget too.
+        try:
+            sys_tokens = await self._count_tokens(_SYSTEM_PROMPT)
+        except Exception as exc:
+            logger.debug(
+                "session summariser: /tokenize unreachable (%s) — sending as-is",
+                exc,
+            )
+            return _format_transcript(turns), 0
+
+        # Try the full transcript first; if it fits, no truncation needed.
+        full = _format_transcript(turns)
+        full_tokens = await self._count_tokens(full)
+        if sys_tokens + full_tokens <= budget:
+            return full, 0
+
+        # Drop oldest turns one at a time until it fits. We keep the most
+        # recent context because (a) it's likeliest to be on-topic and
+        # (b) it includes whatever final user query the summary should
+        # capture.
+        kept = list(turns)
+        dropped = 0
+        while kept:
+            kept = kept[1:]  # drop oldest
+            dropped += 1
+            if not kept:
+                break
+            candidate = _format_transcript(kept)
+            cand_tokens = await self._count_tokens(candidate)
+            if sys_tokens + cand_tokens <= budget:
+                return candidate, dropped
+
+        # Even the most recent single turn is over ctx. Fall to sentinel.
+        return None, len(turns)
+
+    async def _count_tokens(self, content: str) -> int:
+        """POST to llama-server's ``/tokenize`` and return the token count.
+
+        ``summarizer_url`` ends in ``/v1`` (the OpenAI-compat shim). The
+        ``/tokenize`` endpoint lives at the server root, so we strip the
+        ``/v1`` suffix before constructing the URL.
+        """
+        client = self._ensure_client()
+        base = self._settings.summarizer_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        url = f"{base}/tokenize"
+        response = await client.post(url, json={"content": content}, timeout=10)
+        response.raise_for_status()
+        body = response.json()
+        tokens = body.get("tokens") or []
+        return len(tokens)
+
+    def _persist_sentinel_overflow(self, es: EligibleSession, turn_count: int) -> None:
+        """Write a sentinel SessionRecord for a session whose latest single
+        turn exceeds ctx_size. Marks ``summarized_at`` so the row leaves
+        the eligibility set; manual operator follow-up resolves the data
+        archive question.
+        """
+        db = self._session_factory()
+        try:
+            self._set_user_id_if_postgres(db, es.user_id)
+            now = datetime.now()
+            sentinel_summary = (
+                f"[sentinel-skip-ctx-overflow-auto] session has "
+                f"{turn_count} turns whose most recent single turn alone "
+                f"exceeds the summariser ctx window "
+                f"({self._settings.summarizer_ctx_tokens} tokens). "
+                "No automated summary produced. Manual review recommended."
+            )
+            existing = (
+                db.query(SessionRecord)
+                .filter(SessionRecord.id == es.session_id)
+                .one_or_none()
+            )
+            if existing is None:
+                db.add(
+                    SessionRecord(
+                        id=es.session_id,
+                        project=es.project,
+                        date=now.isoformat(),
+                        summary=sentinel_summary,
+                        key_points=json.dumps([]),
+                        model="sentinel-skip-ctx-overflow-auto",
+                        user_id=es.user_id,
+                        summarized_at=now,
+                    )
+                )
+            else:
+                existing.summary = sentinel_summary
+                existing.key_points = json.dumps([])
+                existing.date = now.isoformat()
+                existing.model = "sentinel-skip-ctx-overflow-auto"
+                existing.summarized_at = now
+            db.commit()
+            logger.warning(
+                "session summariser: sentinel-skip session=%s user=%s "
+                "(latest turn alone exceeds ctx=%d)",
+                es.session_id,
+                es.user_id,
+                self._settings.summarizer_ctx_tokens,
+            )
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def _fetch_turns(self, es: EligibleSession) -> list[InteractionRecord]:
         db = self._session_factory()
