@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/9) Pod readiness"
+header "(1/10) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/9) No crashing pods"
+header "(2/10) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/9) Helm release status"
+header "(3/10) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/9) Memory-server /health"
+header "(4/10) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/9) Memory-server /metrics"
+header "(5/10) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/9) Postgres reachability"
+header "(6/10) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/9) Tempo: recent traces for audittrace-server"
+header "(7/10) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/9) Loki: audittrace ERROR rate"
+header "(8/10) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
-header "(9/9) Vault drift guard (ConfigMap ⊆ Vault)"
+header "(9/10) Vault drift guard (ConfigMap ⊆ Vault)"
 # Catches the 2026-05-03 drift class: chart adds a policy/role to
 # templates/vault/configmap-policies.yaml, operator forgets to re-run
 # `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
@@ -243,6 +243,42 @@ else
             echo "[verify]      missing roles (in ConfigMap, not in Vault):" >&2
             echo "$missing_roles" | sed 's/^/[verify]        - /' >&2
         fi
+    fi
+fi
+
+# ── 10. Vault ↔ k8s Redis password alignment (closes 2026-05-04 drift) ─────
+header "(10/10) Vault Redis-password sync"
+# v1.0.9 ADR-046 live test surfaced this drift class: Bitnami Redis
+# subchart auto-generates the password into the k8s secret
+# '${RELEASE}-redis' on first install; setup-vault.sh independently
+# seeded Vault from secrets/redis_password.txt (a different value).
+# Memory-server with vault.enabled=true read Vault → couldn't auth.
+# v1.0.10 ``setup-vault.sh`` now syncs Vault from the k8s secret on
+# every ``make k8s-bootstrap-secrets`` run; this check is the gate that
+# notices when the sync hasn't happened (or someone manually rewrote
+# Vault between bootstraps).
+#
+# SKIP semantics mirror check 9: VAULT_TOKEN unset, vault-0 not Ready.
+if [ -z "${VAULT_TOKEN:-}" ]; then
+    skip "VAULT_TOKEN unset — Redis password sync check requires Vault token"
+elif [ "$vault_ready" != "true" ]; then
+    skip "vault-0 pod not Ready (status=$vault_ready)"
+else
+    k8s_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get secret \
+              "${RELEASE}-redis" -o jsonpath='{.data.redis-password}' \
+              2>/dev/null | base64 -d 2>/dev/null || echo "")
+    vault_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$vault_pod" -- \
+                env "VAULT_TOKEN=${VAULT_TOKEN}" \
+                vault kv get -field=password kv/audittrace/redis/main \
+                2>/dev/null || echo "")
+    if [ -z "$k8s_pw" ]; then
+        skip "k8s secret '${RELEASE}-redis' not found (chart not installed?)"
+    elif [ -z "$vault_pw" ]; then
+        fail "Vault kv/audittrace/redis/main is empty — run 'make k8s-bootstrap-secrets'"
+    elif [ "$k8s_pw" = "$vault_pw" ]; then
+        pass "Redis password aligned: k8s '${RELEASE}-redis' matches Vault kv/audittrace/redis/main"
+    else
+        fail "Redis password drift — k8s '${RELEASE}-redis' != Vault kv/audittrace/redis/main. Run 'make k8s-bootstrap-secrets'"
     fi
 fi
 

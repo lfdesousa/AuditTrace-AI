@@ -203,6 +203,32 @@ seed_kv summariser/db password=postgres_password.txt
 seed_kv redis/main password=redis_password.txt
 seed_kv chromadb/main token=chroma_token.txt
 seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.txt
+
+# ─── Bitnami Redis password sync (closes 2026-05-04 drift class) ─────
+# The Bitnami Redis subchart auto-generates the password into the k8s
+# secret '${RELEASE}-redis' on first install. The seed_kv call above
+# seeds Vault from secrets/redis_password.txt — a DIFFERENT value,
+# which Bitnami never sees. Memory-server (vault.enabled=true) reads
+# Vault → can't auth. Manual ``vault kv put`` aligned them on
+# 2026-05-04 during the v1.0.9 ADR-046 live test; this block makes
+# the alignment automatic on every ``make k8s-bootstrap-secrets`` run.
+#
+# Vault becomes a follower of the k8s secret rather than the leader.
+# Swapping that around is a chart-level change tracked as a future
+# follow-up (use ``redis.auth.existingSecret`` populated by a
+# pre-install Vault Agent template). post-deploy-verify check 10/10
+# asserts the two stay aligned.
+echo "▶ Syncing Bitnami-generated Redis password → Vault..."
+RPW_FROM_K8S=$(kubectl -n "${NAMESPACE}" get secret "${RELEASE}-redis" \
+                 -o jsonpath='{.data.redis-password}' 2>/dev/null \
+               | base64 -d 2>/dev/null || echo "")
+if [[ -n "${RPW_FROM_K8S}" ]]; then
+  vault_exec kv put "${KV_MOUNT}/audittrace/redis/main" \
+    password="${RPW_FROM_K8S}" >/dev/null
+  echo "  ✓ ${KV_MOUNT}/audittrace/redis/main aligned to k8s secret '${RELEASE}-redis'"
+else
+  echo "  ⊝ k8s secret '${RELEASE}-redis' not found — skipping (chart not installed yet?)"
+fi
 # Keycloak admin pw is NOT seeded from secrets/ — it must be supplied
 # directly via `vault kv put kv/audittrace/keycloak/admin password=...`
 # by the operator after this script runs. See runbook 02-vault-unseal.md
