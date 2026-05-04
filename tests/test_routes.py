@@ -88,6 +88,19 @@ def test_health_endpoint(client):
     assert "components" in data
 
 
+def test_health_surfaces_async_persist_state(client):
+    """ADR-046 §7 — /health exposes the async-persist runtime state so
+    operators can see the feature flag + DLQ depth in one curl."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    components = response.json()["components"]
+    assert "async_persist_enabled" in components
+    # Feature flag default is False in tests — only the flag field is
+    # surfaced; DLQ depth + consumer lag fields appear when the flag
+    # is on (gated to avoid touching Redis on every readiness probe).
+    assert components["async_persist_enabled"] == "false"
+
+
 def test_metrics_endpoint(client):
     """Test metrics endpoint."""
     response = client.get("/metrics")

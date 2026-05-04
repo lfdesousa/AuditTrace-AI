@@ -521,6 +521,50 @@ class TestModuleSingletons:
         ap.reset_for_tests()
 
 
+class TestHealthSurface:
+    """ADR-046 §7 — /health exposes async-persist runtime state."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_returns_only_flag(self, monkeypatch):
+        from audittrace.routes import health as health_mod
+
+        # Default Settings has async_persist_enabled=False.
+        fields = await health_mod._async_persist_health_fields()
+        assert fields == {"async_persist_enabled": "false"}
+
+    @pytest.mark.asyncio
+    async def test_enabled_surfaces_dlq_depth_and_lag(self, monkeypatch):
+        from audittrace.routes import health as health_mod
+
+        # Redis fake with one DLQ entry + one pending main entry.
+        redis = FakeRedis(decode_responses=True)
+        await redis.xadd("audittrace:persist:dlq", {"x": "1"})
+        await redis.xadd("audittrace:persist:stream", {"x": "1"})
+        await redis.xgroup_create(
+            "audittrace:persist:stream", "audittrace-persisters", id="0"
+        )
+        await redis.xreadgroup(
+            "audittrace-persisters", "c1", {"audittrace:persist:stream": ">"}, count=10
+        )
+
+        # Force settings to enabled.
+        from audittrace.config import get_settings
+
+        s = get_settings()
+        monkeypatch.setattr(s, "async_persist_enabled", True)
+        # Inject the fake redis as the lazy singleton.
+        from audittrace.services import async_persist as ap
+
+        ap.reset_for_tests()
+        monkeypatch.setattr(ap, "get_async_persist_redis", lambda: redis)
+
+        fields = await health_mod._async_persist_health_fields()
+        assert fields["async_persist_enabled"] == "true"
+        assert fields["async_persist_dlq_depth"] == "1"
+        assert fields["async_persist_consumer_lag"] == "1"
+        ap.reset_for_tests()
+
+
 class TestDlqCli:
     """ADR-046 Bucket 3 — operator CLI for the DLQ stream."""
 
