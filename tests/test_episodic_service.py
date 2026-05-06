@@ -39,6 +39,13 @@ class _FakeObject:
 
 
 class _FakeResponse:
+    """MinIO ``get_object`` response double.
+
+    Implements the context-manager protocol because the production
+    code uses ``with client.get_object(...) as response:`` for
+    deterministic cleanup (PYTHON-ENGINEERING skill §1).
+    """
+
     def __init__(self, content: bytes) -> None:
         self._content = content
         self.closed = False
@@ -52,6 +59,13 @@ class _FakeResponse:
 
     def release_conn(self) -> None:
         self.released = True
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+        self.release_conn()
 
 
 class _FakeMinio:

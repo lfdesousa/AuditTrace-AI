@@ -128,8 +128,7 @@ class MemoryManifestService:
         """
         _validate_layer(layer)
         now = _now_ms()
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             existing = (
                 session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
             )
@@ -161,8 +160,6 @@ class MemoryManifestService:
             session.commit()
             session.refresh(row)
             return ManifestEntry.from_row(row)
-        finally:
-            session.close()
 
     @log_call(logger=logger)
     def record_update(
@@ -182,8 +179,7 @@ class MemoryManifestService:
         rather than update a deleted row).
         """
         _validate_layer(layer)
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             row = (
                 session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
             )
@@ -202,8 +198,6 @@ class MemoryManifestService:
             session.commit()
             session.refresh(row)
             return ManifestEntry.from_row(row)
-        finally:
-            session.close()
 
     @log_call(logger=logger)
     def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
@@ -213,8 +207,7 @@ class MemoryManifestService:
         the row does not exist at all.
         """
         _validate_layer(layer)
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             row = (
                 session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
             )
@@ -226,8 +219,6 @@ class MemoryManifestService:
                 session.commit()
                 session.refresh(row)
             return ManifestEntry.from_row(row)
-        finally:
-            session.close()
 
     @log_call(logger=logger)
     def list_for_layer(
@@ -241,15 +232,12 @@ class MemoryManifestService:
         callers can request ``include_deleted=True``.
         """
         _validate_layer(layer)
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             q = session.query(MemoryItem).filter_by(layer=layer)
             if not include_deleted:
                 q = q.filter(MemoryItem.deleted_at_ms.is_(None))
             rows = q.order_by(MemoryItem.modified_at_ms.desc()).all()
             return [ManifestEntry.from_row(r) for r in rows]
-        finally:
-            session.close()
 
     @log_call(logger=logger)
     def get(self, layer: str, key: str) -> ManifestEntry | None:
@@ -259,14 +247,11 @@ class MemoryManifestService:
         usually treats them as missing for normal reads, while
         admin/audit paths surface them)."""
         _validate_layer(layer)
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             row = (
                 session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
             )
             return ManifestEntry.from_row(row) if row is not None else None
-        finally:
-            session.close()
 
 
 class MockMemoryManifestService(MemoryManifestService):

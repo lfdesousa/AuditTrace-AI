@@ -216,7 +216,9 @@
         "memory:conversational:read-own",
         "memory:semantic:read"
       ],
-      "optionalClientScopes": [],
+      "optionalClientScopes": [
+        "audittrace:admin"
+      ],
       "protocolMappers": [
         {
           "name": "aud-audittrace-server",
@@ -318,7 +320,9 @@
         "memory:conversational:read-own",
         "memory:semantic:read"
       ],
-      "optionalClientScopes": [],
+      "optionalClientScopes": [
+        "audittrace:admin"
+      ],
       "protocolMappers": [
         {
           "name": "aud-audittrace-server",

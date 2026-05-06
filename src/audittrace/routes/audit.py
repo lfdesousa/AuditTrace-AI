@@ -16,9 +16,9 @@ against a buggy caller anyway — RLS is the enforcement boundary).
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Security
 
-from audittrace.auth import require_scope, require_user
+from audittrace.auth import require_user, validate_jwt
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
@@ -99,7 +99,7 @@ async def list_interactions(
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
     offset: int = Query(0, ge=0, description="Pagination offset."),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:audit")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:audit"]),
     _user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List interactions the caller is allowed to see (RLS-scoped).
@@ -145,7 +145,7 @@ async def list_interactions(
 @log_call(logger=logger)
 async def create_interaction(
     record: InteractionRecord,
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:audit")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:audit"]),
 ) -> dict[str, Any]:
     """Create a new interaction audit record.
 
@@ -217,7 +217,7 @@ async def list_sessions(
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
     offset: int = Query(0, ge=0, description="Pagination offset."),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:audit")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:audit"]),
     _user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List sessions the caller is allowed to see (RLS-scoped).

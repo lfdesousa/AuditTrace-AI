@@ -169,7 +169,7 @@ class TestIndex:
         """Build a mock MinIO client that returns a few objects."""
         mock_minio = MagicMock()
 
-        def list_objects(bucket: str, prefix: str = "") -> list[Any]:
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
             if prefix == "episodic/":
                 return [
                     _mock_minio_object("episodic/ADR-001.md"),
@@ -224,8 +224,8 @@ class TestIndex:
         assert data["total_chunks"] > 0
         assert data["duration_s"] >= 0
 
-        # ChromaDB collection.add must have been called
-        assert mock_collection.add.call_count >= 1
+        # ChromaDB collection.upsert must have been called
+        assert mock_collection.upsert.call_count >= 1
 
     def test_index_default_collections(self, client: TestClient) -> None:
         """Without the collections param, defaults to decisions/skills/semantic."""
@@ -343,7 +343,7 @@ class TestIndexErrorPaths:
         """When get_object raises, the object is skipped with a warning."""
         mock_minio = MagicMock()
 
-        def list_objects(bucket: str, prefix: str = "") -> list[Any]:
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
             if prefix == "episodic/":
                 return [_mock_minio_object("episodic/ADR-001.md")]
             return []
@@ -376,7 +376,7 @@ class TestIndexErrorPaths:
         """Procedural get_object failure is handled gracefully."""
         mock_minio = MagicMock()
 
-        def list_objects(bucket: str, prefix: str = "") -> list[Any]:
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
             if prefix == "procedural/":
                 return [_mock_minio_object("procedural/SKILL-test.md")]
             return []
@@ -404,13 +404,272 @@ class TestIndexErrorPaths:
         assert response.status_code == 200
         assert response.json()["collections"]["skills"] == 0
 
+    def test_list_objects_uses_recursive_listing(self, client: TestClient) -> None:
+        """MinIO's default ``list_objects`` returns only direct
+        children of *prefix*. Nested files (the ai_research_papers
+        corpus stores PDFs at e.g. ``episodic/papers/books/foo.pdf``)
+        would silently return zero objects without ``recursive=True``.
+        Caught live 2026-05-06: a /memory/index?collections=ai_research_papers
+        returned 0 chunks even though 13 PDFs were sitting in MinIO."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = []
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            client.post("/memory/index", params={"collections": "decisions"})
+
+        # Every list_objects call must request recursive listing.
+        assert mock_minio.list_objects.call_count >= 1
+        for call in mock_minio.list_objects.call_args_list:
+            assert call.kwargs.get("recursive") is True, (
+                f"non-recursive list_objects call: {call!r}. "
+                "Nested files (papers/, etc.) will be silently skipped."
+            )
+
+    def test_index_rejects_unknown_collection(self, client: TestClient) -> None:
+        """`?collections=` validates against the known set; unknown
+        names 400 with a clear message rather than silently no-op."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = []
+        mock_chroma = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research,decisions"},
+            )
+
+        assert response.status_code == 400
+        assert "ai_research" in response.json()["detail"]
+
+    def test_index_default_excludes_ai_research_papers(
+        self, client: TestClient
+    ) -> None:
+        """ai_research_papers is opt-in only — must NOT appear in the
+        default rebuild target set, otherwise routine /memory/index
+        calls drag the 50 MB+ paper corpus through the embedder every
+        time."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = []
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post("/memory/index")
+
+        assert response.status_code == 200
+        assert "ai_research_papers" not in response.json()["collections"]
+
+    def test_index_ai_research_papers_extracts_pdf_pages(
+        self, client: TestClient
+    ) -> None:
+        """ai_research_papers extracts text per-page from PDFs in
+        episodic/ and indexes each page as one or more chunks. Skips
+        non-PDF files so the same MinIO bucket can host both the
+        legacy .md corpus and the paper corpus."""
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [
+                    _mock_minio_object("episodic/papers/research/foo.pdf"),
+                    _mock_minio_object("episodic/ADR-007.md"),  # must be skipped
+                ]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"%PDF-1.4 ... pretend bytes"
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        # Mock pymupdf — two pages with non-empty text. The route
+        # uses ``with pymupdf.open(...) as doc:`` (deterministic
+        # cleanup, see feedback_use_context_managers), so the mock
+        # must support the context-manager protocol.
+        fake_page_1 = MagicMock()
+        fake_page_1.get_text.return_value = "Page one body text."
+        fake_page_2 = MagicMock()
+        fake_page_2.get_text.return_value = "Page two body text."
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page_1, fake_page_2])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict(
+                "sys.modules",
+                {"pymupdf": fake_pymupdf},
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # 2 pages, each fits in one chunk → 2 chunks total. The .md
+        # file MUST be skipped (only PDFs are indexed into this
+        # collection).
+        assert body["collections"]["ai_research_papers"] == 2
+        # Verify metadata shape: one of the upsert() calls should
+        # carry `page` and `source_key` fields. Upsert (not add) is
+        # the idempotent path so per-file client loops can re-run.
+        assert mock_collection.upsert.called
+        call_kwargs = mock_collection.upsert.call_args.kwargs
+        assert call_kwargs["metadatas"][0]["file_type"] == "pdf"
+        assert call_kwargs["metadatas"][0]["page"] in (1, 2)
+        assert call_kwargs["metadatas"][0]["source_key"] == "papers/research/foo.pdf"
+        # PDF doc context manager should have exited exactly once
+        # (one PDF processed). __exit__ replaces the prior explicit
+        # .close() call now that the route uses `with`.
+        assert fake_doc.__exit__.call_count == 1
+
+    def test_index_single_file_mode_skips_minio_listing(
+        self, client: TestClient
+    ) -> None:
+        """?file=<key> mode synthesises the object list from the
+        provided key — no list_objects call. This is the contract
+        that makes the per-file client loop bounded: one HTTP call
+        ⇒ one MinIO read ⇒ one collection.upsert pass."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# A note\nbody"
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "episodic/ADR-007.md",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        # No bucket-wide listing in single-file mode.
+        mock_minio.list_objects.assert_not_called()
+        # Collection is NOT delete-and-recreated.
+        mock_chroma.delete_collection.assert_not_called()
+        # Upsert (not add) is the idempotent path.
+        mock_collection.upsert.assert_called()
+        mock_collection.add.assert_not_called()
+        # Exactly the one file was read.
+        assert mock_minio.get_object.call_count == 1
+        call_args = mock_minio.get_object.call_args
+        assert call_args.args[1] == "episodic/ADR-007.md"
+
+    def test_index_single_file_requires_one_collection(
+        self, client: TestClient
+    ) -> None:
+        """?file= is per-collection — passing a comma-separated set
+        is ambiguous (which file matches which collection?). 400."""
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=MagicMock(),
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions,skills",
+                    "file": "episodic/foo.md",
+                },
+            )
+        assert response.status_code == 400
+        assert "exactly one collection" in response.json()["detail"]
+
+    def test_index_single_file_validates_layer_prefix(self, client: TestClient) -> None:
+        """?file= keys must live under episodic/ or procedural/.
+        Anything else is 400 — defends against typos that would
+        silently produce empty results."""
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=MagicMock(),
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "papers/foo.md",  # missing layer prefix
+                },
+            )
+        assert response.status_code == 400
+        assert "episodic/" in response.json()["detail"]
+
     def test_index_delete_collection_exception_swallowed(
         self, client: TestClient
     ) -> None:
         """delete_collection failure is swallowed so the create succeeds."""
         mock_minio = MagicMock()
 
-        def list_objects(bucket: str, prefix: str = "") -> list[Any]:
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
             if prefix == "episodic/":
                 return [_mock_minio_object("episodic/ADR-001.md")]
             return []
@@ -443,7 +702,7 @@ class TestIndexErrorPaths:
 
         assert response.status_code == 200
         assert response.json()["collections"]["decisions"] > 0
-        mock_collection.add.assert_called()
+        mock_collection.upsert.assert_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

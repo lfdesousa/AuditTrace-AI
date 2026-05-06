@@ -130,12 +130,8 @@ class S3EpisodicService(EpisodicService):
                 filename = name.rsplit("/", 1)[-1] if "/" in name else name
                 if not filename.startswith("ADR-") or not filename.endswith(".md"):
                     continue
-                response = client.get_object(self._bucket, name)
-                try:
+                with client.get_object(self._bucket, name) as response:
                     content = response.read().decode("utf-8")
-                finally:
-                    response.close()
-                    response.release_conn()
                 docs.append(
                     Document(
                         page_content=content,
@@ -187,18 +183,14 @@ class S3EpisodicService(EpisodicService):
         client: Any = self._client
         key = f"{self._prefix}{file}"
         try:
-            response = client.get_object(self._bucket, key)
+            with client.get_object(self._bucket, key) as response:
+                content = response.read().decode("utf-8")
         except Exception as exc:  # MinIO raises S3Error on missing/etc
             code = getattr(exc, "code", "")
             if code == "NoSuchKey":
                 return None
             logger.warning("S3EpisodicService.read(%r) failed: %s", file, exc)
             return None
-        try:
-            content = response.read().decode("utf-8")
-        finally:
-            response.close()
-            response.release_conn()
         return Document(
             page_content=content,
             metadata={

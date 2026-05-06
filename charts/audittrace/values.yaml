@@ -92,7 +92,15 @@ memoryServer:
       memory: 512Mi
     limits:
       cpu: 2000m
-      memory: 2Gi
+      # 4 GiB ceiling. Original 2 GiB OOMKilled (exit 137) the
+      # /memory/index route on live ai-knowledge ingest. After the
+      # streaming refactor + the ?file=<key> single-file API
+      # contract, peak working set during one PDF is bounded by
+      # pymupdf's parse-tree for that one file (≤19 MiB seen in
+      # corpus). Operators loop client-side per file rather than
+      # cramming a whole corpus into one request. Re-evaluate if a
+      # synchronous bulk path is reintroduced.
+      memory: 4Gi
   env:
     AUDITTRACE_ENV: "local"
     AUDITTRACE_HOST: "0.0.0.0"

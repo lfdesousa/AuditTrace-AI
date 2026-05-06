@@ -225,7 +225,8 @@
       "optionalClientScopes": [
         "memory:episodic:write",
         "memory:procedural:write",
-        "memory:semantic:write"
+        "memory:semantic:write",
+        "audittrace:admin"
       ],
       "protocolMappers": [
         {
@@ -329,7 +330,8 @@
       "optionalClientScopes": [
         "memory:episodic:write",
         "memory:procedural:write",
-        "memory:semantic:write"
+        "memory:semantic:write",
+        "audittrace:admin"
       ],
       "protocolMappers": [
         {

@@ -109,11 +109,29 @@ def hash_token(token: str) -> str:
 def is_admin_scope(scopes: Iterable[str]) -> bool:
     """True iff any scope grants administrative access.
 
-    Recognises both ``memory:admin`` and any ``admin:*`` namespace.
+    Recognises:
+
+    * ``audittrace:admin`` — the canonical operator scope per
+      ``ALL_SCOPES`` in ``audittrace.auth`` and the realm definition
+      in ``keycloak/realm-audittrace.json``. Carrying this scope
+      bypasses the per-user ``where={"user_id": ...}`` filter in
+      ``ChromaSemanticService.search`` so admin-ingested shared
+      content (ADRs, skills, ai_research_papers PDFs) is reachable
+      regardless of who's querying.
+    * ``memory:admin`` — historical/legacy alias from the pre-rename
+      memory-server era; preserved for back-compat with tokens still
+      in flight at upgrade time.
+    * ``admin:*`` — future-proofing for any new admin-namespaced
+      scope (e.g. ``admin:billing`` if we ever add one) without
+      requiring this function to grow with each addition.
+
     Used to set ``UserContext.is_admin`` for downstream gates and
-    the future Phase 4 RLS bypass policy.
+    the Phase 4 RLS bypass policy.
     """
-    return any(s == "memory:admin" or s.startswith("admin:") for s in scopes)
+    return any(
+        s in ("audittrace:admin", "memory:admin") or s.startswith("admin:")
+        for s in scopes
+    )
 
 
 def sentinel_user_context(agent_type: str = "opencode") -> UserContext:

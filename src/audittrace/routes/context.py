@@ -7,9 +7,9 @@ carries a concrete ``UserContext`` down through all four layers.
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Security
 
-from audittrace.auth import require_scope, require_user
+from audittrace.auth import require_user, validate_jwt
 from audittrace.dependencies import get_context_builder
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
@@ -26,7 +26,7 @@ router = APIRouter()
 async def get_context(
     request: ContextRequest,
     context_builder: ContextBuilderService = Depends(get_context_builder),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:context")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:context"]),
     user: UserContext = Depends(require_user),
 ) -> ContextBuildResponse:
     """Retrieve relevant context from all 4 memory layers."""

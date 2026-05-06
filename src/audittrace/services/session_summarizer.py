@@ -236,8 +236,7 @@ class SessionSummarizer:
         threshold = (
             datetime.now() - timedelta(minutes=self._settings.summarizer_idle_minutes)
         ).isoformat()
-        db = self._session_factory()
-        try:
+        with self._session_factory() as db:
             self._disable_rls_if_postgres(db)
             rows = db.execute(
                 _ELIGIBILITY_SQL,
@@ -263,8 +262,6 @@ class SessionSummarizer:
                 if len(eligible) >= max_per_cycle:
                     break
             return eligible
-        finally:
-            db.close()
 
     # ── per-session work ───────────────────────────────────────────────
 
@@ -394,58 +391,55 @@ class SessionSummarizer:
         the eligibility set; manual operator follow-up resolves the data
         archive question.
         """
-        db = self._session_factory()
-        try:
-            self._set_user_id_if_postgres(db, es.user_id)
-            now = datetime.now()
-            sentinel_summary = (
-                f"[sentinel-skip-ctx-overflow-auto] session has "
-                f"{turn_count} turns whose most recent single turn alone "
-                f"exceeds the summariser ctx window "
-                f"({self._settings.summarizer_ctx_tokens} tokens). "
-                "No automated summary produced. Manual review recommended."
-            )
-            existing = (
-                db.query(SessionRecord)
-                .filter(SessionRecord.id == es.session_id)
-                .one_or_none()
-            )
-            if existing is None:
-                db.add(
-                    SessionRecord(
-                        id=es.session_id,
-                        project=es.project,
-                        date=now.isoformat(),
-                        summary=sentinel_summary,
-                        key_points=json.dumps([]),
-                        model="sentinel-skip-ctx-overflow-auto",
-                        user_id=es.user_id,
-                        summarized_at=now,
-                    )
+        with self._session_factory() as db:
+            try:
+                self._set_user_id_if_postgres(db, es.user_id)
+                now = datetime.now()
+                sentinel_summary = (
+                    f"[sentinel-skip-ctx-overflow-auto] session has "
+                    f"{turn_count} turns whose most recent single turn alone "
+                    f"exceeds the summariser ctx window "
+                    f"({self._settings.summarizer_ctx_tokens} tokens). "
+                    "No automated summary produced. Manual review recommended."
                 )
-            else:
-                existing.summary = sentinel_summary
-                existing.key_points = json.dumps([])
-                existing.date = now.isoformat()
-                existing.model = "sentinel-skip-ctx-overflow-auto"
-                existing.summarized_at = now
-            db.commit()
-            logger.warning(
-                "session summariser: sentinel-skip session=%s user=%s "
-                "(latest turn alone exceeds ctx=%d)",
-                es.session_id,
-                es.user_id,
-                self._settings.summarizer_ctx_tokens,
-            )
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+                existing = (
+                    db.query(SessionRecord)
+                    .filter(SessionRecord.id == es.session_id)
+                    .one_or_none()
+                )
+                if existing is None:
+                    db.add(
+                        SessionRecord(
+                            id=es.session_id,
+                            project=es.project,
+                            date=now.isoformat(),
+                            summary=sentinel_summary,
+                            key_points=json.dumps([]),
+                            model="sentinel-skip-ctx-overflow-auto",
+                            user_id=es.user_id,
+                            summarized_at=now,
+                        )
+                    )
+                else:
+                    existing.summary = sentinel_summary
+                    existing.key_points = json.dumps([])
+                    existing.date = now.isoformat()
+                    existing.model = "sentinel-skip-ctx-overflow-auto"
+                    existing.summarized_at = now
+                db.commit()
+                logger.warning(
+                    "session summariser: sentinel-skip session=%s user=%s "
+                    "(latest turn alone exceeds ctx=%d)",
+                    es.session_id,
+                    es.user_id,
+                    self._settings.summarizer_ctx_tokens,
+                )
+            except Exception:
+                db.rollback()
+                raise
 
     def _fetch_turns(self, es: EligibleSession) -> list[InteractionRecord]:
-        db = self._session_factory()
-        try:
+        with self._session_factory() as db:
             self._disable_rls_if_postgres(db)
             return (
                 db.query(InteractionRecord)
@@ -455,8 +449,6 @@ class SessionSummarizer:
                 .order_by(InteractionRecord.timestamp)
                 .all()
             )
-        finally:
-            db.close()
 
     def _persist(
         self,
@@ -464,57 +456,55 @@ class SessionSummarizer:
         parsed: dict[str, Any],
     ) -> None:
         """Upsert SessionRecord under the session's user's GUC."""
-        db = self._session_factory()
-        try:
-            # SET LOCAL app.current_user_id so the RLS WITH CHECK on
-            # sessions accepts the write.
-            self._set_user_id_if_postgres(db, es.user_id)
-            now = datetime.now()
-            summary = str(parsed.get("summary") or "")[:400]
-            key_points = parsed.get("key_points") or []
-            if not isinstance(key_points, list):
-                key_points = []
-            # Only keep string entries, bounded length.
-            kp_clean: list[str] = [
-                str(k)[:120] for k in key_points[:8] if isinstance(k, str)
-            ]
+        with self._session_factory() as db:
+            try:
+                # SET LOCAL app.current_user_id so the RLS WITH CHECK on
+                # sessions accepts the write.
+                self._set_user_id_if_postgres(db, es.user_id)
+                now = datetime.now()
+                summary = str(parsed.get("summary") or "")[:400]
+                key_points = parsed.get("key_points") or []
+                if not isinstance(key_points, list):
+                    key_points = []
+                # Only keep string entries, bounded length.
+                kp_clean: list[str] = [
+                    str(k)[:120] for k in key_points[:8] if isinstance(k, str)
+                ]
 
-            existing = (
-                db.query(SessionRecord)
-                .filter(SessionRecord.id == es.session_id)
-                .one_or_none()
-            )
-            if existing is None:
-                db.add(
-                    SessionRecord(
-                        id=es.session_id,
-                        project=es.project,
-                        date=now.isoformat(),
-                        summary=summary,
-                        key_points=json.dumps(kp_clean),
-                        model=self._settings.summarizer_model,
-                        user_id=es.user_id,
-                        summarized_at=now,
-                    )
+                existing = (
+                    db.query(SessionRecord)
+                    .filter(SessionRecord.id == es.session_id)
+                    .one_or_none()
                 )
-            else:
-                existing.summary = summary
-                existing.key_points = json.dumps(kp_clean)
-                existing.date = now.isoformat()
-                existing.model = self._settings.summarizer_model
-                existing.summarized_at = now
-            db.commit()
-            logger.info(
-                "session summariser: wrote summary session=%s user=%s kp=%d",
-                es.session_id,
-                es.user_id,
-                len(kp_clean),
-            )
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+                if existing is None:
+                    db.add(
+                        SessionRecord(
+                            id=es.session_id,
+                            project=es.project,
+                            date=now.isoformat(),
+                            summary=summary,
+                            key_points=json.dumps(kp_clean),
+                            model=self._settings.summarizer_model,
+                            user_id=es.user_id,
+                            summarized_at=now,
+                        )
+                    )
+                else:
+                    existing.summary = summary
+                    existing.key_points = json.dumps(kp_clean)
+                    existing.date = now.isoformat()
+                    existing.model = self._settings.summarizer_model
+                    existing.summarized_at = now
+                db.commit()
+                logger.info(
+                    "session summariser: wrote summary session=%s user=%s kp=%d",
+                    es.session_id,
+                    es.user_id,
+                    len(kp_clean),
+                )
+            except Exception:
+                db.rollback()
+                raise
 
     # ── LLM call ───────────────────────────────────────────────────────
 

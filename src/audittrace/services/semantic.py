@@ -19,6 +19,7 @@ from langchain_core.documents import Document
 from audittrace.db.factory import ChromaDBClient
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.embedder import SINGLETON_EMBEDDER
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,9 @@ class ChromaSemanticService(SemanticService):
 
         for col_name in target_collections:
             try:
-                collection = self._client.get_or_create_collection(name=col_name)
+                collection = self._client.get_or_create_collection(
+                    name=col_name, embedding_function=SINGLETON_EMBEDDER
+                )
                 count = collection.count()
                 if count == 0:
                     continue
@@ -166,7 +169,9 @@ class ChromaSemanticService(SemanticService):
         # are honoured if the caller provided their own user_id.
         meta = dict(metadata or {})
         meta.setdefault("user_id", user_context.user_id)
-        col = self._client.get_or_create_collection(name=collection)
+        col = self._client.get_or_create_collection(
+            name=collection, embedding_function=SINGLETON_EMBEDDER
+        )
         # ChromaDB's `upsert` is exactly what we want — insert or replace.
         col.upsert(ids=[document_id], documents=[text], metadatas=[meta])
 
@@ -178,7 +183,9 @@ class ChromaSemanticService(SemanticService):
         document_id: str,
     ) -> bool:
         del user_context  # operator-side write; not user-scoped
-        col = self._client.get_or_create_collection(name=collection)
+        col = self._client.get_or_create_collection(
+            name=collection, embedding_function=SINGLETON_EMBEDDER
+        )
         # ChromaDB's `delete` is silently idempotent (deleting a non-
         # existent ID does not raise). To return a faithful boolean we
         # check existence first.
@@ -196,7 +203,9 @@ class ChromaSemanticService(SemanticService):
         document_id: str,
     ) -> Document | None:
         del user_context  # operator-side read; admin scope gates the route
-        col = self._client.get_or_create_collection(name=collection)
+        col = self._client.get_or_create_collection(
+            name=collection, embedding_function=SINGLETON_EMBEDDER
+        )
         result = col.get(ids=[document_id], include=["documents", "metadatas"])
         if not result.get("ids"):
             return None
