@@ -202,7 +202,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     chroma_client = container.get_instance("chromadb")
     semantic = ChromaSemanticService(
         client=chroma_client,
-        default_collections=["decisions", "skills", "ai_research", "scm_coursework"],
+        default_collections=[
+            "decisions",
+            "skills",
+            "ai_research",  # legacy index-chromadb.py corpus (host-side script)
+            "ai_research_papers",  # /memory/index?collections=ai_research_papers (PDF corpus, ADR-047 path)
+            "scm_coursework",
+        ],
     )
 
     # Memory-layer manifest (CRUD backoffice — migration 009 + the

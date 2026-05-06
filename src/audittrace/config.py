@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     redis_password: str | None = None
     token_cache_ttl_seconds: int = 300
 
+    # In-memory JWKS cache TTL. JWKS keys rotate slowly; refetching on
+    # every request would beat up Keycloak. 5 minutes is the same TTL
+    # most OIDC clients pick by default, and falls inside Keycloak's
+    # default key rotation interval (~12 h) by 144x — fast enough for
+    # rotation pickup, slow enough to absorb startup races.
+    jwks_cache_ttl_seconds: int = 300
+
     # Memory tiering configuration
     memory_cache_ttl: int = 3600  # seconds
     memory_max_context_turns: int = 117000  # ~131k - system prompt - output buffer

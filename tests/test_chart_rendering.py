@@ -211,6 +211,43 @@ class TestMemoryServerEntrypointSafety:
             f" Got command: {cmd}"
         )
 
+    def test_memory_limit_at_least_4gi(self) -> None:
+        """Regression guard for the 2026-05-06 OOMKilled (exit 137)
+        on /memory/index. The streaming refactor cut peak working
+        set substantially, but the safety floor for this pod is
+        ≥4 GiB so a burst of /memory/upload buffers + a hot embedder
+        + the ai_research_papers PDF rebuild can't drive RSS into
+        the limit again. If a future PR drops below this, the live
+        index path will start dying under realistic loads."""
+        import re as _re
+
+        out = _render(["--set", "vault.enabled=true"])
+        doc = _find_workload(out, "Deployment", "audittrace-memory-server")
+        container = next(
+            c
+            for c in doc["spec"]["template"]["spec"]["containers"]
+            if c["name"] == "memory-server"
+        )
+        limit = container.get("resources", {}).get("limits", {}).get("memory")
+        assert limit, "memory-server has no memory limit configured"
+        # Accept Gi / Mi / G / M units; convert to MiB for comparison.
+        match = _re.fullmatch(r"(\d+)(Gi|Mi|G|M)", str(limit))
+        assert match, f"unparseable memory limit: {limit!r}"
+        value, unit = int(match.group(1)), match.group(2)
+        mib = {
+            "Gi": value * 1024,
+            "Mi": value,
+            "G": value * 1000,  # binary-vs-decimal slop is fine for the floor
+            "M": value,
+        }[unit]
+        assert mib >= 4 * 1024, (
+            f"memory-server limit is {limit} (~{mib} MiB) — must be at "
+            f"least 4Gi to absorb one PDF's pymupdf parse-tree plus the "
+            f"warm embedder. Single-file ?file= mode is the contract; "
+            f"bulk synchronous indexing is intentionally not supported "
+            f"for the ai_research_papers collection (2026-05-06)."
+        )
+
 
 class TestEntrypointScriptSafety:
     """Direct unit tests on scripts/entrypoint.sh — exercise the guard
@@ -427,6 +464,27 @@ class TestRealmMemoryWriteScopes:
                 f"{client_id} missing optional write scopes: {expected - optional!r}"
             )
 
+    def test_user_facing_clients_offer_admin_scope_optionally(self) -> None:
+        """Operators driving /memory/upload + /memory/index from
+        OpenCode or the browser need `audittrace:admin` on the same
+        opt-in basis as the write scopes — the admin scope must NEVER
+        be in defaultClientScopes (every chat completion would carry
+        it otherwise)."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            defaults = set(client.get("defaultClientScopes") or [])
+            optional = set(client.get("optionalClientScopes") or [])
+            assert "audittrace:admin" not in defaults, (
+                f"{client_id} carries audittrace:admin in defaults — "
+                "every token would be admin-scoped"
+            )
+            assert "audittrace:admin" in optional, (
+                f"{client_id} missing optional audittrace:admin"
+            )
+
     def test_user_facing_clients_carry_user_identity_mappers(self) -> None:
         """JWTs issued via audittrace-opencode / audittrace-webui must
         carry `preferred_username`, `email`, `given_name`, `family_name`
@@ -533,10 +591,11 @@ class TestMemoryScopesProvisioningJob:
         )
 
     def test_script_configmap_lists_three_scopes(self) -> None:
-        """Regression guard against drift: the three scopes the
-        provisioner script ensures must match the realm.json
-        clientScopes block. If a future PR adds (or renames) a
-        scope, both sites must move together."""
+        """Regression guard against drift: every scope the provisioner
+        script ensures must match the realm.json clientScopes block.
+        If a future PR adds (or renames) a scope, both sites must
+        move together. `audittrace:admin` was added to gate
+        /memory/upload + /memory/index from user-facing clients."""
         out = _render(["--set", "vault.enabled=true"])
         cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
         script = cm["data"]["ensure-memory-scopes.sh"]
@@ -544,6 +603,7 @@ class TestMemoryScopesProvisioningJob:
             "memory:episodic:write",
             "memory:procedural:write",
             "memory:semantic:write",
+            "audittrace:admin",
         ):
             assert scope in script, f"script missing scope: {scope}"
 

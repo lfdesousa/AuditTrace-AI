@@ -3,9 +3,9 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Security
 
-from audittrace.auth import require_scope
+from audittrace.auth import validate_jwt
 from audittrace.config import get_settings
 from audittrace.logging_config import log_call
 from audittrace.models import HealthResponse, MetricsResponse
@@ -78,7 +78,7 @@ async def health_check() -> HealthResponse:
 @router.get("/metrics", response_model=MetricsResponse)
 @log_call(logger=logger)
 async def metrics(
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:admin")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
 ) -> MetricsResponse:
     """Application-level metrics endpoint.
 

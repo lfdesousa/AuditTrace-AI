@@ -117,6 +117,7 @@ SCOPES=(
   "memory:episodic:write"
   "memory:procedural:write"
   "memory:semantic:write"
+  "audittrace:admin"
 )
 
 # ----- Ensure each scope exists -----

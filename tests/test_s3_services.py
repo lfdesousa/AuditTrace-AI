@@ -34,11 +34,17 @@ def _mock_s3_object(name: str) -> MagicMock:
 
 
 def _mock_get_response(content: str) -> MagicMock:
-    """Create a mock response from get_object."""
+    """Create a mock response from get_object.
+
+    Supports the context-manager protocol because the production code
+    now uses ``with client.get_object(...) as response:`` for
+    deterministic resource cleanup (per the PYTHON-ENGINEERING skill
+    §1 and feedback_use_context_managers).
+    """
     resp = MagicMock()
     resp.read.return_value = content.encode("utf-8")
-    resp.close = MagicMock()
-    resp.release_conn = MagicMock()
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = None
     return resp
 
 

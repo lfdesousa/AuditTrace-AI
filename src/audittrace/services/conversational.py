@@ -90,8 +90,7 @@ class PostgresConversationalService(ConversationalService):
         for sessions produced by the summariser — that's how the two
         tables join without a side table.
         """
-        session = self._session_factory()
-        try:
+        with self._session_factory() as session:
             # Step 1 — real summaries, already ordered and limited.
             real_rows = (
                 session.query(SessionRecord)
@@ -179,8 +178,6 @@ class PostgresConversationalService(ConversationalService):
             combined = real + synthetic
             combined.sort(key=lambda d: d.get("date") or "", reverse=True)
             return combined[:n]
-        finally:
-            session.close()
 
     @log_call(logger=logger)
     def save_session(
@@ -199,25 +196,23 @@ class PostgresConversationalService(ConversationalService):
         caller-supplied ``session_id`` so the ADR-030 hybrid-recall join
         (SessionRecord.id == InteractionRecord.session_id) lines up.
         """
-        session = self._session_factory()
-        try:
-            record = SessionRecord(
-                id=session_id,
-                project=project,
-                date=datetime.now().isoformat(),
-                summary=summary,
-                key_points=json.dumps(key_points or []),
-                model="sovereign-memory",
-                user_id=user_context.user_id,
-            )
-            session.add(record)
-            session.commit()
-            return session_id
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+        with self._session_factory() as session:
+            try:
+                record = SessionRecord(
+                    id=session_id,
+                    project=project,
+                    date=datetime.now().isoformat(),
+                    summary=summary,
+                    key_points=json.dumps(key_points or []),
+                    model="sovereign-memory",
+                    user_id=user_context.user_id,
+                )
+                session.add(record)
+                session.commit()
+                return session_id
+            except Exception:
+                session.rollback()
+                raise
 
     @log_call(logger=logger)
     def as_context(self, user_context: UserContext, project: str) -> str:

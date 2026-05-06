@@ -206,7 +206,7 @@ class TestRequireUserPopulatesContextVar:
         # Fake request with a User-Agent so agent_type resolves.
         request = MagicMock(spec=Request)
         request.headers = {"user-agent": "curl/8"}
-        result = await require_user(request, credentials=None)
+        result = await require_user(request, token=None)
 
         try:
             assert result.user_id == SENTINEL_SUBJECT

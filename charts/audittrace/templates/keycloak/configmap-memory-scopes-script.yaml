@@ -39,14 +39,21 @@ data:
     KC_BASE_URL="${KC_BASE_URL:-http://{{ .Release.Name }}-keycloak:8080}"
     KCADM=/opt/keycloak/bin/kcadm.sh
 
-    # The three scopes this PR introduces. Kept in lockstep with
+    # Scopes provisioned onto the running realm. Kept in lockstep with
     # realm-audittrace.json's clientScopes[] block — adding a scope
     # there means adding it here too. The chart-render test
-    # (`TestRealmMemoryWriteScopes`) catches drift between the two.
+    # (`TestRealmMemoryWriteScopes` / `TestRealmAdminScope`) catches
+    # drift between the two.
+    #
+    # `audittrace:admin` is bound here so /memory/upload + /memory/index
+    # (which require it via auth.require_scope) become reachable from
+    # user-facing clients (opencode/webui) when the operator opts in
+    # per-session via `scope=audittrace:admin`.
     SCOPES=(
       "memory:episodic:write"
       "memory:procedural:write"
       "memory:semantic:write"
+      "audittrace:admin"
     )
 
     # Vault-Agent rendered the admin password to /vault/secrets/env

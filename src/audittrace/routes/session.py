@@ -8,9 +8,9 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Security
 
-from audittrace.auth import require_scope, require_user
+from audittrace.auth import require_user, validate_jwt
 from audittrace.config import get_settings
 from audittrace.dependencies import get_conversational_service
 from audittrace.identity import UserContext
@@ -32,7 +32,7 @@ router = APIRouter()
 @log_call(logger=logger)
 async def save_session(
     request: SessionSaveRequest,
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:query")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
 ) -> SessionSaveResponse:
     """Persist session interactions to the audit trail."""
     settings = get_settings()
@@ -54,7 +54,7 @@ async def save_session(
 async def save_session_summary(
     request: SessionSummaryRequest,
     conversational: ConversationalService = Depends(get_conversational_service),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:query")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
     user: UserContext = Depends(require_user),
 ) -> SessionSummaryResponse:
     """Save a session summary to the conversational memory layer.

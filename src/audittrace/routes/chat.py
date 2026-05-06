@@ -26,7 +26,7 @@ from datetime import date, datetime
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.responses import StreamingResponse
 from opentelemetry import trace
 
@@ -35,7 +35,7 @@ from opentelemetry import trace
 # request reaches ``chat_completions``.
 import audittrace.tools.memory_handlers  # noqa: F401
 from audittrace import telemetry
-from audittrace.auth import require_scope, require_user
+from audittrace.auth import require_user, validate_jwt
 from audittrace.config import Settings, get_settings
 from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
@@ -457,8 +457,7 @@ def _persist_interaction(
             trace_id = _current_trace_id_hex()
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
-        db = session_factory()
-        try:
+        with session_factory() as db:
             record = InteractionRecord(
                 project=project,
                 source=source,
@@ -489,8 +488,6 @@ def _persist_interaction(
                 duration_ms,
             )
             return record.id
-        finally:
-            db.close()
     except Exception as exc:  # pragma: no cover - defensive logging only
         logger.warning("Failed to persist interaction: %s", exc)
         return None
@@ -518,8 +515,7 @@ def _flush_pending_tool_calls(
     try:
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
-        db = session_factory()
-        try:
+        with session_factory() as db:
             for rec in pending:
                 db.add(
                     ToolCall(
@@ -541,8 +537,6 @@ def _flush_pending_tool_calls(
                 len(pending),
                 interaction_id,
             )
-        finally:
-            db.close()
     except Exception as exc:  # pragma: no cover - defensive logging only
         logger.warning(
             "Failed to persist %d tool_calls for interaction %s: %s",
@@ -946,7 +940,7 @@ def _render_tool_calls_text(tool_calls_acc: dict[int, dict[str, Any]]) -> str:
 @router.get("/models")
 @log_call(logger=logger)
 async def list_models(
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:query")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
 ) -> Any:
     """Proxy GET /v1/models to llama-server.
 
@@ -1268,7 +1262,7 @@ async def _handle_tools_mode(
 async def chat_completions(
     http_request: Request,
     context_builder: ContextBuilderService = Depends(get_context_builder),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:query")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
     user: UserContext = Depends(require_user),
 ) -> Any:
     """OpenAI-compatible chat completions with memory augmentation.

@@ -42,6 +42,15 @@ CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
 TOKENS_DIR="${AUDITTRACE_TOKENS_DIR:-$HOME/.config/audittrace}"
 TOKENS_FILE="$TOKENS_DIR/tokens.json"
 
+# Default OAuth2 scopes requested at login. The realm declares
+# `audittrace:admin` and the `memory:*:write` scopes as OPTIONAL on
+# `audittrace-opencode`, so they're never issued unless the operator
+# opts in via `--scope` or AUDITTRACE_EXTRA_SCOPES (or a fresh login
+# with the override). See `keycloak/realm-audittrace.json` and the
+# `ensure-memory-scopes` Helm Job.
+DEFAULT_SCOPES="openid memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read audittrace:query audittrace:context audittrace:audit"
+EXTRA_SCOPES="${AUDITTRACE_EXTRA_SCOPES:-}"
+
 # Refresh the access_token if it expires within this window.
 REFRESH_THRESHOLD_SECONDS="${REFRESH_THRESHOLD_SECONDS:-60}"
 
@@ -113,10 +122,15 @@ persist_from_token_response() {
 
 action_login() {
   log "initiating Device Authorization Grant at $DEVICE_ENDPOINT"
+  local scope_str="$DEFAULT_SCOPES"
+  if [[ -n "$EXTRA_SCOPES" ]]; then
+    scope_str="$scope_str $EXTRA_SCOPES"
+    log "requesting extra scopes: $EXTRA_SCOPES"
+  fi
   local init_body
   init_body="$(curl "${CURL_OPTS[@]}" -s -S --fail \
     -d "client_id=$CLIENT_ID" \
-    -d "scope=openid memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read audittrace:query audittrace:context audittrace:audit" \
+    --data-urlencode "scope=$scope_str" \
     "$DEVICE_ENDPOINT")" || {
     echo "error: device-auth request failed — is Keycloak reachable at $KEYCLOAK_BASE?" >&2
     exit 3
@@ -255,31 +269,55 @@ action_ensure() {
 
 # ─────────────────────────────── main ─────────────────────────────
 
-case "${1:-login}" in
-  login|"")       action_login ;;
-  --show)         action_show ;;
-  --ensure)       action_ensure ;;
-  --logout)       action_logout ;;
-  -h|--help)
-    cat <<EOF
+# Parse args. `--scope "X Y Z"` adds optional scopes to the device-flow
+# request. Refreshes preserve the original grant, so admin/write scopes
+# require a fresh login with `--scope` set.
+ACTION="login"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    login)        ACTION="login"; shift ;;
+    --show)       ACTION="show"; shift ;;
+    --ensure)     ACTION="ensure"; shift ;;
+    --logout)     ACTION="logout"; shift ;;
+    --scope)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --scope requires a value (e.g. --scope audittrace:admin)" >&2
+        exit 64
+      fi
+      EXTRA_SCOPES="${EXTRA_SCOPES:+$EXTRA_SCOPES }$2"
+      shift 2
+      ;;
+    -h|--help)
+      cat <<EOF
 audittrace-login — OAuth2 Device Flow helper (ADR-032)
 
 Usage:
-  audittrace-login                 Interactive login (Device Flow)
-  audittrace-login --show          Print access_token to stdout (refresh if needed)
-  audittrace-login --ensure        Refresh if needed, exit 0 if token valid
-  audittrace-login --logout        Delete the saved token pair
+  audittrace-login                       Interactive login (Device Flow)
+  audittrace-login --scope <scopes>      Request extra scopes (e.g. audittrace:admin) at login
+  audittrace-login --show                Print access_token to stdout (refresh if needed)
+  audittrace-login --ensure              Refresh if needed, exit 0 if token valid
+  audittrace-login --logout              Delete the saved token pair
 
 Environment overrides:
   KEYCLOAK_BASE            (default https://localhost — Traefik-fronted)
   KEYCLOAK_REALM           (default audittrace)
   CLIENT_ID                (default audittrace-opencode)
   AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
+  AUDITTRACE_EXTRA_SCOPES  (space-separated; same effect as --scope)
   REFRESH_THRESHOLD_SECONDS (default 60 — refresh if expires within this window)
 EOF
-    ;;
-  *)
-    echo "error: unknown argument '$1' (try --help)" >&2
-    exit 64
-    ;;
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument '$1' (try --help)" >&2
+      exit 64
+      ;;
+  esac
+done
+
+case "$ACTION" in
+  login)   action_login ;;
+  show)    action_show ;;
+  ensure)  action_ensure ;;
+  logout)  action_logout ;;
 esac

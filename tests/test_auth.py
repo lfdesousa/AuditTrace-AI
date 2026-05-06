@@ -67,6 +67,7 @@ def _mock_settings(**overrides):
         "keycloak_issuer_extras": [],
         "keycloak_jwks_url": "http://keycloak:8080/realms/audittrace/protocol/openid-connect/certs",
         "jwt_audience": TEST_AUDIENCE,
+        "jwks_cache_ttl_seconds": 300,
     }
     defaults.update(overrides)
     mock = MagicMock()

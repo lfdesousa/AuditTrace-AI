@@ -654,9 +654,26 @@ components:
       title: ValidationError
       type: object
   securitySchemes:
-    HTTPBearer:
-      scheme: bearer
-      type: http
+    audittrace-oauth2:
+      flows:
+        authorizationCode:
+          authorizationUrl: /protocol/openid-connect/auth
+          scopes:
+            audittrace:admin: 'Operator-grade administration: /memory/upload, /memory/index, hard-delete, configuration introspection.
+              Optional scope on user-facing clients; never granted by default.'
+            audittrace:audit: Read interactions, sessions, and tool-call audit rows
+            audittrace:context: Read context-builder output for a query
+            audittrace:index: Trigger semantic-store reindex (legacy dev client)
+            audittrace:query: Issue chat completions and inference queries
+            memory:conversational:read-own: Read your own past conversations from the conversational layer
+            memory:episodic:read: Read episodic-layer (ADR-style) documents
+            memory:episodic:write: Create/update/delete episodic-layer documents
+            memory:procedural:read: Read procedural-layer (SKILL-style) documents
+            memory:procedural:write: Create/update/delete procedural-layer documents
+            memory:semantic:read: Read semantic-layer (vector) documents
+            memory:semantic:write: Create/update/delete semantic-layer documents
+          tokenUrl: /protocol/openid-connect/token
+      type: oauth2
 info:
   description: 'EU-AI-Act-aligned audit trail for LLM workloads. OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer
     memory augmentation (episodic + procedural + conversational + semantic), Keycloak-delegated identity, Postgres RLS per-user
@@ -691,7 +708,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:context
       summary: Get Context
       tags:
       - context
@@ -820,7 +838,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:audit
       summary: List Interactions
       tags:
       - audit
@@ -860,7 +879,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:audit
       summary: Create Interaction
       tags:
       - audit
@@ -941,7 +961,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:conversational:read-own
       summary: List Conversational Sessions
       tags:
       - memory
@@ -993,7 +1014,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:conversational:read-own
       summary: Read Conversational Session
       tags:
       - memory
@@ -1036,7 +1058,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:episodic:read
       summary: List Episodic
       tags:
       - memory
@@ -1073,7 +1096,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:episodic:write
       summary: Create Episodic
       tags:
       - memory
@@ -1113,7 +1137,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:episodic:write
       summary: Delete Episodic
       tags:
       - memory
@@ -1143,7 +1168,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:episodic:read
       summary: Read Episodic
       tags:
       - memory
@@ -1186,18 +1212,20 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:episodic:write
       summary: Update Episodic
       tags:
       - memory
   /memory/index:
     post:
-      description: 'Read documents from MinIO and push chunked embeddings to ChromaDB.
-
-
-        If *collections* is provided (comma-separated), only those collections
-
-        are rebuilt.  Otherwise all default collections are rebuilt.'
+      description: "Read documents from MinIO and push chunked embeddings to ChromaDB.\n\nTwo modes:\n\n* **Bulk** (default\
+        \ — no ``file``): rebuilds each named collection\n  via delete-and-recreate. ``collections`` is comma-separated;\n\
+        \  defaults to ``decisions,skills,semantic`` (all ``.md``-only).\n* **Single-file** (``?file=<key>``): idempotent\
+        \ upsert of one\n  MinIO object into the named collection. Operators use this in\n  a per-file client loop for the\
+        \ ``ai_research_papers`` collection\n  so each request's working set stays within the request-handler's\n  memory\
+        \ budget.\n\nThe opt-in ``ai_research_papers`` collection extracts text per page\nfrom PDFs and is rebuilt only when\
+        \ explicitly named in\n*collections* — keeping routine /memory/index calls fast."
       operationId: index_memory_memory_index_post
       parameters:
       - in: query
@@ -1208,6 +1236,22 @@ paths:
           - type: string
           - type: 'null'
           title: Collections
+      - description: Optional MinIO object key (e.g. ``episodic/papers/foo.pdf``). When set, only this single object is indexed
+          via idempotent upsert into the named collection — used by the per-file client loop pattern that keeps memory bounded
+          for the PDF corpus. The collection is NOT delete-and-recreated in this mode; existing chunks for other files are
+          preserved.
+        in: query
+        name: file
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Optional MinIO object key (e.g. ``episodic/papers/foo.pdf``). When set, only this single object is
+            indexed via idempotent upsert into the named collection — used by the per-file client loop pattern that keeps
+            memory bounded for the PDF corpus. The collection is NOT delete-and-recreated in this mode; existing chunks for
+            other files are preserved.
+          title: File
       responses:
         '200':
           content:
@@ -1224,7 +1268,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:admin
       summary: Index Memory
       tags:
       - memory
@@ -1258,7 +1303,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:procedural:read
       summary: List Procedural
       tags:
       - memory
@@ -1290,7 +1336,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:procedural:write
       summary: Create Procedural
       tags:
       - memory
@@ -1327,7 +1374,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:procedural:write
       summary: Delete Procedural
       tags:
       - memory
@@ -1356,7 +1404,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:procedural:read
       summary: Read Procedural
       tags:
       - memory
@@ -1394,7 +1443,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:procedural:write
       summary: Update Procedural
       tags:
       - memory
@@ -1440,7 +1490,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:semantic:read
       summary: List Semantic
       tags:
       - memory
@@ -1474,7 +1525,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:semantic:write
       summary: Create Semantic
       tags:
       - memory
@@ -1517,7 +1569,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:semantic:write
       summary: Delete Semantic
       tags:
       - memory
@@ -1552,7 +1605,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:semantic:read
       summary: Read Semantic
       tags:
       - memory
@@ -1596,7 +1650,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - memory:semantic:write
       summary: Update Semantic
       tags:
       - memory
@@ -1647,7 +1702,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:admin
       summary: Upload Memory File
       tags:
       - memory
@@ -1670,7 +1726,8 @@ paths:
                 $ref: '#/components/schemas/MetricsResponse'
           description: Successful Response
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:admin
       summary: Metrics
       tags:
       - health
@@ -1698,7 +1755,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:query
       summary: Save Session
       tags:
       - session
@@ -1733,7 +1791,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:query
       summary: Save Session Summary
       tags:
       - session
@@ -1828,7 +1887,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:audit
       summary: List Sessions
       tags:
       - audit
@@ -1866,7 +1926,8 @@ paths:
                 title: Response Chat Completions V1 Chat Completions Post
           description: Successful Response
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:query
       summary: Chat Completions
       tags:
       - chat
@@ -1887,7 +1948,8 @@ paths:
                 title: Response List Models V1 Models Get
           description: Successful Response
       security:
-      - HTTPBearer: []
+      - audittrace-oauth2:
+        - audittrace:query
       summary: List Models
       tags:
       - chat

@@ -27,6 +27,7 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 (semantic).
 """
 
+import contextlib
 import hashlib
 import io
 import logging
@@ -35,10 +36,19 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Security,
+    UploadFile,
+)
 from minio import Minio
 
-from audittrace.auth import require_scope, require_user
+from audittrace.auth import require_user, validate_jwt
 from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
@@ -55,6 +65,7 @@ from audittrace.models import (
     ConversationalDetailResponse,
     ConversationalListResponse,
 )
+from audittrace.services.embedder import SINGLETON_EMBEDDER
 from audittrace.services.memory_manifest import ManifestEntry
 
 logger = logging.getLogger(__name__)
@@ -64,6 +75,28 @@ router = APIRouter()
 # Chunking parameters — must match scripts/index-chromadb.py
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
+
+# Per-file `collection.add` batch. Keeps the embedding model's working
+# set bounded — important for the PDF path where a single 50MB paper
+# can yield thousands of chunks. Chosen to match the legacy-mode batch
+# in scripts/index-chromadb.py.
+_INDEX_BATCH_SIZE = 50
+
+# Allowed `?collections=` values. `ai_research_papers` is an opt-in
+# target (PDFs only) and is intentionally NOT in the default list:
+# routine /memory/index calls stay fast and the embedder doesn't have
+# to chew through 50+ MB of papers each time. Operators rebuild it
+# explicitly via `?collections=ai_research_papers` when papers change.
+_KNOWN_COLLECTIONS = frozenset(
+    {"decisions", "skills", "semantic", "ai_research_papers"}
+)
+_DEFAULT_COLLECTIONS = ("decisions", "skills", "semantic")
+
+
+# Singleton ONNX embedder lives in ``audittrace.services.embedder`` —
+# imported above — so routes + services share one model instance.
+# See the embedder module docstring for the leak-fix rationale; see
+# the PYTHON-ENGINEERING skill §2 for the singleton-with-lock pattern.
 
 
 class MemoryLayer(StrEnum):
@@ -120,9 +153,17 @@ def _list_objects_from_minio(
     """List all objects under *prefix* in *bucket*.
 
     Returns a list of ``{"key": ..., "filename": ...}`` dicts.
+
+    ``recursive=True`` walks the full subtree. Without it, MinIO's
+    default returns only direct children of *prefix*, hiding files
+    in subdirectories. The pre-existing .md corpus was flat
+    (``episodic/ADR-NNN.md``) and got away with non-recursive
+    listing; the ai_research_papers corpus uses nested paths
+    (``episodic/papers/books/foo.pdf``) and would otherwise return
+    zero objects (caught live, 2026-05-06).
     """
     objects: list[dict[str, str]] = []
-    for obj in client.list_objects(bucket, prefix=prefix):
+    for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
         key = obj.object_name or ""
         filename = key.rsplit("/", 1)[-1] if "/" in key else key
         if filename:
@@ -138,7 +179,7 @@ async def upload_memory_file(
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:admin")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
 ) -> dict[str, Any]:
     """Upload a file to MinIO under the specified memory layer.
 
@@ -186,21 +227,221 @@ async def upload_memory_file(
 # ── POST /memory/index ──────────────────────────────────────────────────────
 
 
+def _upsert_in_batches(
+    collection: Any,
+    ids: list[str],
+    documents: list[str],
+    metadatas: list[dict[str, Any]],
+) -> None:
+    """``collection.upsert`` in fixed-size slices.
+
+    Upsert (vs. add) so the single-file ?file= mode is idempotent —
+    a client looping per file can re-run the same call without
+    duplicate-id errors. Splitting per file into _INDEX_BATCH_SIZE
+    chunks bounds the in-flight payload size to ChromaDB.
+    """
+    for start in range(0, len(ids), _INDEX_BATCH_SIZE):
+        end = min(start + _INDEX_BATCH_SIZE, len(ids))
+        collection.upsert(
+            ids=ids[start:end],
+            documents=documents[start:end],
+            metadatas=metadatas[start:end],
+        )
+
+
+def _read_minio_object(client: Any, bucket: str, key: str) -> bytes | None:
+    """Fetch an object's bytes; return None on read failure (logged).
+
+    Uses a ``with`` block on the MinIO response so the underlying
+    urllib3 connection is closed + released on every exit path
+    (success, decode error, network blip). Replaces the prior
+    try/finally + ``response.close() / release_conn()`` pair — same
+    semantics, idiomatic Python resource cleanup.
+    """
+    try:
+        with client.get_object(bucket, key) as response:
+            return bytes(response.read())
+    except Exception as exc:
+        logger.warning("Failed to read %s: %s", key, exc)
+        return None
+
+
+def _index_md_objects(
+    collection: Any,
+    minio_client: Any,
+    bucket: str,
+    objects: list[dict[str, str]],
+    col_name: str,
+    category: str,
+) -> int:
+    """Stream-index ``.md`` files into *collection*.
+
+    Per-file: read → chunk → add → drop. Avoids holding the cross-corpus
+    document list in memory.
+    """
+    total = 0
+    for obj in objects:
+        if not obj["filename"].endswith(".md"):
+            continue
+        raw = _read_minio_object(minio_client, bucket, obj["key"])
+        if raw is None:
+            continue
+        content = raw.decode("utf-8", errors="replace")
+        chunks = _chunk_text(content)
+        if not chunks:
+            continue
+        ids = [_doc_id(col_name, obj["filename"], i) for i in range(len(chunks))]
+        metadatas: list[dict[str, Any]] = [
+            {
+                "source": obj["filename"],
+                "category": category,
+                "file_type": "md",
+                "chunk": i,
+            }
+            for i in range(len(chunks))
+        ]
+        if category == "procedural" and obj["filename"].startswith("SKILL-"):
+            skill_name = obj["filename"].replace("SKILL-", "").replace(".md", "")
+            for m in metadatas:
+                m["skill"] = skill_name
+        _upsert_in_batches(collection, ids, chunks, metadatas)
+        total += len(chunks)
+    return total
+
+
+def _index_pdf_objects(
+    collection: Any,
+    minio_client: Any,
+    bucket: str,
+    objects: list[dict[str, str]],
+    col_name: str,
+    category: str,
+    layer_prefix: str,
+) -> int:
+    """Stream-index ``.pdf`` files into *collection*, per-page.
+
+    Each page yields one or more text chunks; embedding happens per
+    page in _INDEX_BATCH_SIZE slices. The pymupdf ``Document`` is
+    opened in a ``with`` block so its internal C-level page cache
+    is released deterministically when the block exits — important
+    for the per-file client loop where each request must come down
+    cleanly before the next one starts.
+
+    *layer_prefix* (``"episodic/"`` / ``"procedural/"``) is stripped
+    from the MinIO key to produce a stable ``source_key`` metadata
+    field — useful for disambiguating same-name files across folders
+    (e.g. two ``main.pdf`` in different paper subdirs).
+    """
+    import pymupdf  # heavy import; only load when ai_research_papers is requested
+
+    total = 0
+    for obj in objects:
+        if not obj["filename"].lower().endswith(".pdf"):
+            continue
+        raw = _read_minio_object(minio_client, bucket, obj["key"])
+        if raw is None:
+            continue
+        source_key = (
+            obj["key"][len(layer_prefix) :]
+            if obj["key"].startswith(layer_prefix)
+            else obj["key"]
+        )
+        try:
+            # Assign through Any so mypy doesn't flag pymupdf.open's
+            # untyped Document return; the project's `disallow_untyped_calls`
+            # would otherwise reject the with-context here.
+            doc_factory: Any = pymupdf.open
+            with doc_factory(stream=raw, filetype="pdf") as doc:
+                for page_num, page in enumerate(doc, start=1):
+                    text = page.get_text().strip()
+                    if not text:
+                        continue
+                    chunks = _chunk_text(text)
+                    if not chunks:
+                        continue
+                    ids = [
+                        _doc_id(col_name, f"{source_key}:p{page_num}", i)
+                        for i in range(len(chunks))
+                    ]
+                    metadatas: list[dict[str, Any]] = [
+                        {
+                            "source": obj["filename"],
+                            "source_key": source_key,
+                            "category": category,
+                            "file_type": "pdf",
+                            "page": page_num,
+                            "chunk": i,
+                        }
+                        for i in range(len(chunks))
+                    ]
+                    _upsert_in_batches(collection, ids, chunks, metadatas)
+                    total += len(chunks)
+        except Exception as exc:
+            logger.warning("Failed to process PDF %s: %s", obj["key"], exc)
+            continue
+    return total
+
+
+# `def` (NOT `async def`) is deliberate. The body holds CPU-bound
+# blocking work — ChromaDB upserts that compute embeddings via the
+# in-process ONNX model, plus pymupdf page extraction. FastAPI runs
+# sync `def` handlers in its threadpool, so the event loop stays
+# free to answer /health probes. Originally written as `async def`,
+# which blocked the loop and caused k8s livez/readyz to time out
+# mid-index → Istio marked the pod NotReady → next request 503'd
+# with "no healthy upstream" (caught live 2026-05-06 on the
+# per-file PDF loop). The threadpool also lets concurrent
+# /memory/index calls run side-by-side without serialising on the
+# loop. See feedback_use_context_managers for the related leak fix
+# that landed in the same PR.
 @router.post("/index")
-async def index_memory(
+def index_memory(
     collections: str | None = Query(None),
-    _auth: dict[str, Any] = Depends(require_scope("audittrace:admin")),
+    file: str | None = Query(
+        None,
+        description=(
+            "Optional MinIO object key (e.g. ``episodic/papers/foo.pdf``). "
+            "When set, only this single object is indexed via idempotent "
+            "upsert into the named collection — used by the per-file "
+            "client loop pattern that keeps memory bounded for the PDF "
+            "corpus. The collection is NOT delete-and-recreated in this "
+            "mode; existing chunks for other files are preserved."
+        ),
+    ),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
 ) -> dict[str, Any]:
     """Read documents from MinIO and push chunked embeddings to ChromaDB.
 
-    If *collections* is provided (comma-separated), only those collections
-    are rebuilt.  Otherwise all default collections are rebuilt.
+    Two modes:
+
+    * **Bulk** (default — no ``file``): rebuilds each named collection
+      via delete-and-recreate. ``collections`` is comma-separated;
+      defaults to ``decisions,skills,semantic`` (all ``.md``-only).
+    * **Single-file** (``?file=<key>``): idempotent upsert of one
+      MinIO object into the named collection. Operators use this in
+      a per-file client loop for the ``ai_research_papers`` collection
+      so each request's working set stays within the request-handler's
+      memory budget.
+
+    The opt-in ``ai_research_papers`` collection extracts text per page
+    from PDFs and is rebuilt only when explicitly named in
+    *collections* — keeping routine /memory/index calls fast.
     """
     target_collections = (
         [c.strip() for c in collections.split(",") if c.strip()]
         if collections
-        else ["decisions", "skills", "semantic"]
+        else list(_DEFAULT_COLLECTIONS)
     )
+
+    unknown = [c for c in target_collections if c not in _KNOWN_COLLECTIONS]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown collection(s): {unknown!r}. "
+                f"Valid: {sorted(_KNOWN_COLLECTIONS)!r}"
+            ),
+        )
 
     settings = get_settings()
     bucket = settings.minio_shared_bucket
@@ -211,96 +452,95 @@ async def index_memory(
     results: dict[str, int] = {}
     total_chunks = 0
 
-    # Read all documents from MinIO across both layers
-    episodic_objects = _list_objects_from_minio(minio_client, bucket, "episodic/")
-    procedural_objects = _list_objects_from_minio(minio_client, bucket, "procedural/")
+    single_file_mode = file is not None
+    episodic_objects: list[dict[str, str]] = []
+    procedural_objects: list[dict[str, str]] = []
+    if file is not None:
+        # mypy: ``file`` is now narrowed to ``str``.
+        if len(target_collections) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "?file= requires exactly one collection in ?collections= "
+                    "(single-file mode is per-collection)."
+                ),
+            )
+        single_obj: dict[str, str] = {
+            "key": file,
+            "filename": file.rsplit("/", 1)[-1],
+        }
+        if file.startswith("episodic/"):
+            episodic_objects = [single_obj]
+        elif file.startswith("procedural/"):
+            procedural_objects = [single_obj]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="file= must start with 'episodic/' or 'procedural/'",
+            )
+    else:
+        episodic_objects = _list_objects_from_minio(minio_client, bucket, "episodic/")
+        procedural_objects = _list_objects_from_minio(
+            minio_client, bucket, "procedural/"
+        )
 
     for col_name in target_collections:
-        docs: list[dict[str, Any]] = []
-
-        if col_name in ("decisions", "semantic"):
-            # Episodic layer — ADR-*.md and any other .md files
-            for obj in episodic_objects:
-                if not obj["filename"].endswith(".md"):
-                    continue
-                try:
-                    response = minio_client.get_object(bucket, obj["key"])
-                    try:
-                        content = response.read().decode("utf-8", errors="replace")
-                    finally:
-                        response.close()
-                        response.release_conn()
-                except Exception as exc:
-                    logger.warning("Failed to read %s: %s", obj["key"], exc)
-                    continue
-                chunks = _chunk_text(content)
-                for i, chunk in enumerate(chunks):
-                    docs.append(
-                        {
-                            "id": _doc_id(col_name, obj["filename"], i),
-                            "document": chunk,
-                            "metadata": {
-                                "source": obj["filename"],
-                                "category": "episodic",
-                                "file_type": "md",
-                                "chunk": i,
-                            },
-                        }
-                    )
-
-        if col_name in ("skills", "semantic"):
-            # Procedural layer — SKILL-*.md and any other .md files
-            for obj in procedural_objects:
-                if not obj["filename"].endswith(".md"):
-                    continue
-                try:
-                    response = minio_client.get_object(bucket, obj["key"])
-                    try:
-                        content = response.read().decode("utf-8", errors="replace")
-                    finally:
-                        response.close()
-                        response.release_conn()
-                except Exception as exc:
-                    logger.warning("Failed to read %s: %s", obj["key"], exc)
-                    continue
-                chunks = _chunk_text(content)
-                for i, chunk in enumerate(chunks):
-                    skill_name = (
-                        obj["filename"].replace("SKILL-", "").replace(".md", "")
-                    )
-                    docs.append(
-                        {
-                            "id": _doc_id(col_name, obj["filename"], i),
-                            "document": chunk,
-                            "metadata": {
-                                "source": obj["filename"],
-                                "category": "procedural",
-                                "file_type": "md",
-                                "skill": skill_name,
-                                "chunk": i,
-                            },
-                        }
-                    )
-
-        # Push to ChromaDB — delete-and-recreate for idempotency
-        if docs:
-            try:
+        # Bulk mode: delete-and-recreate for idempotency. Single-file
+        # mode: get-or-create only — preserves chunks for other files
+        # in the collection so a per-file client loop builds up
+        # cumulatively. ``contextlib.suppress`` swallows delete
+        # failures so a fresh install with no prior collection
+        # doesn't 500 (per ``feedback_use_context_managers``).
+        if not single_file_mode:
+            with contextlib.suppress(Exception):
                 chroma_client.delete_collection(col_name)
-            except Exception:
-                pass
-            collection = chroma_client.get_or_create_collection(name=col_name)
-            batch_size = 100
-            for i in range(0, len(docs), batch_size):
-                batch = docs[i : i + batch_size]
-                collection.add(
-                    ids=[d["id"] for d in batch],
-                    documents=[d["document"] for d in batch],
-                    metadatas=[d["metadata"] for d in batch],
-                )
+        collection = chroma_client.get_or_create_collection(
+            name=col_name,
+            embedding_function=SINGLETON_EMBEDDER,
+        )
 
-        results[col_name] = len(docs)
-        total_chunks += len(docs)
-        logger.info("Indexed %s: %d chunks", col_name, len(docs))
+        chunk_count = 0
+        if col_name in ("decisions", "semantic"):
+            chunk_count += _index_md_objects(
+                collection,
+                minio_client,
+                bucket,
+                episodic_objects,
+                col_name,
+                category="episodic",
+            )
+        if col_name in ("skills", "semantic"):
+            chunk_count += _index_md_objects(
+                collection,
+                minio_client,
+                bucket,
+                procedural_objects,
+                col_name,
+                category="procedural",
+            )
+        if col_name == "ai_research_papers":
+            chunk_count += _index_pdf_objects(
+                collection,
+                minio_client,
+                bucket,
+                episodic_objects,
+                col_name,
+                category="episodic",
+                layer_prefix="episodic/",
+            )
+            chunk_count += _index_pdf_objects(
+                collection,
+                minio_client,
+                bucket,
+                procedural_objects,
+                col_name,
+                category="procedural",
+                layer_prefix="procedural/",
+            )
+
+        results[col_name] = chunk_count
+        total_chunks += chunk_count
+        logger.info("Indexed %s: %d chunks", col_name, chunk_count)
 
     duration = time.time() - start
     return {
@@ -353,7 +593,7 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
 @router.post("/episodic")
 async def create_episodic(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
-    _scope: dict[str, Any] = Depends(require_scope("memory:episodic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Create an ADR. Body: ``{filename, content, title?}``.
@@ -466,7 +706,7 @@ def _merge_layer_items_with_s3(
 @router.get("/episodic")
 async def list_episodic(
     include_deleted: bool = Query(False),
-    _auth: dict[str, Any] = Depends(require_scope("memory:episodic:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List ADRs. Merges manifest rows with S3 objects so pre-PR-A
@@ -487,7 +727,7 @@ async def list_episodic(
 @router.get("/episodic/{filename}")
 async def read_episodic(
     filename: str,
-    _auth: dict[str, Any] = Depends(require_scope("memory:episodic:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Read ADR content + manifest metadata."""
@@ -509,7 +749,7 @@ async def read_episodic(
 async def update_episodic(
     filename: str,
     payload: dict[str, Any] = Body(..., description="{content, title?}"),
-    _scope: dict[str, Any] = Depends(require_scope("memory:episodic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Replace ADR content. The manifest's ``modified_at_ms`` /
@@ -557,7 +797,7 @@ async def delete_episodic(
             "audittrace:admin in addition to memory:episodic:write."
         ),
     ),
-    _scope: dict[str, Any] = Depends(require_scope("memory:episodic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Soft-delete by default; ``?hard=true`` also purges the S3 object."""
@@ -589,7 +829,7 @@ async def delete_episodic(
 @router.post("/procedural")
 async def create_procedural(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
-    _scope: dict[str, Any] = Depends(require_scope("memory:procedural:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Create a SKILL document. Body shape mirrors POST /memory/episodic."""
@@ -623,7 +863,7 @@ async def create_procedural(
 @router.get("/procedural")
 async def list_procedural(
     include_deleted: bool = Query(False),
-    _auth: dict[str, Any] = Depends(require_scope("memory:procedural:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
@@ -639,7 +879,7 @@ async def list_procedural(
 @router.get("/procedural/{filename}")
 async def read_procedural(
     filename: str,
-    _auth: dict[str, Any] = Depends(require_scope("memory:procedural:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     _validate_filename_or_400(filename, "procedural")
@@ -660,7 +900,7 @@ async def read_procedural(
 async def update_procedural(
     filename: str,
     payload: dict[str, Any] = Body(..., description="{content, title?}"),
-    _scope: dict[str, Any] = Depends(require_scope("memory:procedural:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     _validate_filename_or_400(filename, "procedural")
@@ -699,7 +939,7 @@ async def update_procedural(
 async def delete_procedural(
     filename: str,
     hard: bool = Query(False),
-    _scope: dict[str, Any] = Depends(require_scope("memory:procedural:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     _validate_filename_or_400(filename, "procedural")
@@ -742,7 +982,7 @@ async def create_semantic(
     payload: dict[str, Any] = Body(
         ..., description="{collection, document_id, text, metadata?, title?}"
     ),
-    _scope: dict[str, Any] = Depends(require_scope("memory:semantic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Upsert a semantic-layer document. The collection's embedding
@@ -815,7 +1055,10 @@ def _merge_semantic_with_chroma(
 
     for col_name in target_cols:
         try:
-            col = chroma.get_or_create_collection(name=col_name)
+            col = chroma.get_or_create_collection(
+                name=col_name,
+                embedding_function=SINGLETON_EMBEDDER,
+            )
             res = col.get(
                 limit=_SEMANTIC_DISCOVERY_LIMIT,
                 include=["documents", "metadatas"],
@@ -864,7 +1107,7 @@ async def list_semantic(
         None, description="Filter to a single collection if set."
     ),
     include_deleted: bool = Query(False),
-    _auth: dict[str, Any] = Depends(require_scope("memory:semantic:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
     discovery so pre-PR-A vectors (seeded via index-chromadb.py)
@@ -884,7 +1127,7 @@ async def list_semantic(
 async def read_semantic(
     collection: str,
     document_id: str,
-    _auth: dict[str, Any] = Depends(require_scope("memory:semantic:read")),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     service = get_semantic_service()
@@ -907,7 +1150,7 @@ async def update_semantic(
     collection: str,
     document_id: str,
     payload: dict[str, Any] = Body(..., description="{text, metadata?, title?}"),
-    _scope: dict[str, Any] = Depends(require_scope("memory:semantic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     text = payload.get("text")
@@ -945,7 +1188,7 @@ async def delete_semantic(
     collection: str,
     document_id: str,
     hard: bool = Query(False),
-    _scope: dict[str, Any] = Depends(require_scope("memory:semantic:write")),
+    _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
@@ -1004,7 +1247,9 @@ async def list_conversational_sessions(
     ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    _scope: dict[str, Any] = Depends(require_scope("memory:conversational:read-own")),
+    _scope: dict[str, Any] = Security(
+        validate_jwt, scopes=["memory:conversational:read-own"]
+    ),
     _user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List the caller's own chat sessions, ordered by date DESC.
@@ -1066,7 +1311,9 @@ async def read_conversational_session(
     session_id: str,
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
-    _scope: dict[str, Any] = Depends(require_scope("memory:conversational:read-own")),
+    _scope: dict[str, Any] = Security(
+        validate_jwt, scopes=["memory:conversational:read-own"]
+    ),
     _user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Fetch one session's metadata + its interactions, ordered by
