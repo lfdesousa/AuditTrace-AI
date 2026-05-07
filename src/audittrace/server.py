@@ -504,7 +504,100 @@ def create_app() -> FastAPI:
     except Exception as e:  # pragma: no cover
         logger.warning("FastAPI OTel instrumentation failed: %s", e)
 
+    # Custom OpenAPI generator: emit OR-semantics security scopes for
+    # routes whose required scope is dynamic (per-layer). FastAPI's
+    # static ``Security(fn, scopes=[...])`` is AND-only — so per-layer
+    # routes use ``scopes=[]`` at the decorator level + a runtime
+    # check against the parsed ``layer`` query param. This generator
+    # rewrites the resulting empty ``security`` block into an OpenAPI
+    # 3.x OR-shape (``[{OAuth2: [scopeA]}, {OAuth2: [scopeB]}, ...]``)
+    # so the spec accurately reflects "any one of these scopes is
+    # sufficient." Reviewers + Bruno-collection consumers see the
+    # contract from the spec alone — no need to read prose.
+    _wire_per_layer_or_scopes(app)
+
     return app
+
+
+# Routes whose required scope is dynamic at runtime (parsed from a
+# query param). For each, the OpenAPI spec must declare the *union*
+# of acceptable scope grants — no single static decorator can express
+# this shape. Listed here so the OpenAPI post-processor below applies
+# the rewrite consistently and any new per-layer route is a single-
+# line addition rather than a fresh patch.
+#
+# Format: (HTTP method lowercase, path) → list of scope alternatives.
+# Each alternative becomes one OpenAPI security requirement object,
+# yielding OR semantics across the list.
+_PER_LAYER_OR_SCOPES: dict[tuple[str, str], list[list[str]]] = {
+    ("post", "/memory/upload"): [
+        ["memory:episodic:write"],
+        ["memory:procedural:write"],
+        ["audittrace:admin"],
+    ],
+    # /memory/index has two runtime modes:
+    #   - bulk (no ?file=) → audittrace:admin
+    #   - single-file (?file=<layer>/<key>) → memory:<layer>:write OR admin
+    # Spec declares the union: any of the three is *sufficient* to
+    # call the operation; the body branches on ?file= to enforce the
+    # narrower bulk-only-admin rule. Documented in the route prose
+    # (and tested by tests/test_memory_routes.py::TestIndexAuth).
+    ("post", "/memory/index"): [
+        ["memory:episodic:write"],
+        ["memory:procedural:write"],
+        ["audittrace:admin"],
+    ],
+}
+
+
+def _wire_per_layer_or_scopes(app: FastAPI) -> None:
+    """Install ``app.openapi`` override that rewrites the ``security``
+    block on the routes listed in :data:`_PER_LAYER_OR_SCOPES`.
+
+    The rewrite uses the OAuth2 scheme name FastAPI picks for our
+    ``OAuth2PasswordBearer`` instance — looked up dynamically from the
+    generated schema rather than hardcoded so a future scheme rename
+    does not silently break the rewrite.
+    """
+    from fastapi.openapi.utils import get_openapi
+
+    def custom_openapi() -> dict[str, Any]:
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+            tags=app.openapi_tags,
+        )
+        # Find the OAuth2 scheme name. There is exactly one in our
+        # config (``OAuth2PasswordBearer`` / ``OAuth2`` per FastAPI's
+        # auto-naming); guard for absence to keep dev-mode (no auth)
+        # builds happy.
+        sec_schemes: dict[str, Any] = schema.get("components", {}).get(
+            "securitySchemes", {}
+        )
+        oauth2_name = next(
+            (
+                name
+                for name, defn in sec_schemes.items()
+                if defn.get("type") == "oauth2"
+            ),
+            None,
+        )
+        if oauth2_name is None:
+            app.openapi_schema = schema
+            return schema
+        for (method, path), alternatives in _PER_LAYER_OR_SCOPES.items():
+            op = schema.get("paths", {}).get(path, {}).get(method)
+            if op is None:
+                continue
+            op["security"] = [{oauth2_name: scope_list} for scope_list in alternatives]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = custom_openapi  # type: ignore[method-assign]
 
 
 app = create_app()

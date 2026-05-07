@@ -22,12 +22,15 @@ def _make_upload_file(
 
 
 class TestUploadAuth:
-    """POST /memory/upload requires audittrace:admin scope."""
+    """POST /memory/upload requires per-layer ``memory:<layer>:write``
+    (or ``audittrace:admin``) matching the ``layer`` query parameter."""
 
-    def test_upload_requires_admin_scope_no_token(self, client: TestClient) -> None:
+    def test_upload_requires_token_no_token(self, client: TestClient) -> None:
         """Request without a bearer token is rejected when auth is enabled."""
         with patch("audittrace.auth.get_settings") as mock_settings:
-            mock_settings.return_value = MagicMock(auth_enabled=True)
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
             response = client.post(
                 "/memory/upload",
                 params={"layer": "episodic"},
@@ -35,16 +38,21 @@ class TestUploadAuth:
             )
         assert response.status_code == 401
 
-    def test_upload_requires_admin_scope_wrong_scope(self, client: TestClient) -> None:
-        """Token with insufficient scope is rejected (403)."""
+    def test_upload_query_only_scope_is_rejected(self, client: TestClient) -> None:
+        """A read-only token (``audittrace:query``) cannot upload — 403."""
         with (
             patch("audittrace.auth.get_settings") as mock_settings,
             patch("audittrace.auth._get_jwks_keys") as mock_jwks,
             patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
         ):
-            mock_settings.return_value = MagicMock(auth_enabled=True)
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
             mock_jwks.return_value = ["fake-key"]
-            mock_decode.return_value = {"scope": "audittrace:query"}
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "audittrace:query",
+            }
             response = client.post(
                 "/memory/upload",
                 params={"layer": "episodic"},
@@ -52,16 +60,211 @@ class TestUploadAuth:
                 headers={"Authorization": "Bearer fake-token"},
             )
         assert response.status_code == 403
+        # The 403 names the missing scope so a UI client knows what to ask for.
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_upload_per_layer_write_succeeds(self, client: TestClient) -> None:
+        """A token with ``memory:episodic:write`` can upload to ``layer=episodic``.
+
+        This is the M3 LibreChat end-user flow: per-layer write replaces
+        the old admin-only gate so UI sessions don't need broad admin tokens.
+        """
+        mock_minio = MagicMock()
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "episodic"},
+                files=_make_upload_file(b"hi", "doc.md"),
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 200
+        assert response.json()["key"] == "episodic/doc.md"
+
+    def test_upload_cross_layer_denied(self, client: TestClient) -> None:
+        """A ``memory:procedural:write`` token cannot upload to ``layer=episodic``.
+
+        Cross-layer write must be denied: tokens are scoped per layer for
+        a reason. This is the principal least-privilege check protecting
+        the M3 UI flow.
+        """
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "memory:procedural:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "episodic"},
+                files=_make_upload_file(),
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_upload_admin_works_for_any_layer(self, client: TestClient) -> None:
+        """``audittrace:admin`` continues to bypass the per-layer gate
+        (operator path: bulk operations, scripted ingestion)."""
+        mock_minio = MagicMock()
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "ops-user",
+                "scope": "audittrace:admin",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "procedural"},
+                files=_make_upload_file(b"skill", "SKILL.md"),
+                headers={"Authorization": "Bearer admin-token"},
+            )
+        assert response.status_code == 200
 
 
 class TestIndexAuth:
-    """POST /memory/index requires audittrace:admin scope."""
+    """POST /memory/index — bulk mode is admin-only; single-file mode
+    requires per-layer ``memory:<layer>:write`` (or admin)."""
 
-    def test_index_requires_admin_scope_no_token(self, client: TestClient) -> None:
+    def test_index_requires_token_no_token(self, client: TestClient) -> None:
+        """Request without a bearer token is rejected when auth is enabled."""
         with patch("audittrace.auth.get_settings") as mock_settings:
-            mock_settings.return_value = MagicMock(auth_enabled=True)
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
             response = client.post("/memory/index")
         assert response.status_code == 401
+
+    def test_index_bulk_requires_admin_per_layer_token_denied(
+        self, client: TestClient
+    ) -> None:
+        """Bulk rebuild (no ?file=) is destructive whole-collection delete-and-
+        recreate; cross-user by design. A ``memory:episodic:write`` token must
+        not be able to drive it — admin only.
+        """
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 403
+        assert "audittrace:admin" in response.json()["detail"]
+
+    def test_index_single_file_with_layer_write_succeeds(
+        self, client: TestClient
+    ) -> None:
+        """Single-file mode (``?file=episodic/...``) accepts the matching
+        per-layer write scope. Same M3 UI-flow contract as /memory/upload."""
+        mock_minio = MagicMock()
+        # Empty list_objects so the body short-circuits with no work — the
+        # auth gate fires first regardless, which is what this test asserts.
+        mock_minio.list_objects.return_value = iter([])
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = MagicMock()
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "memory:episodic:write",
+            }
+            # Bytes for fetch_object — mock returns an empty body so the
+            # PDF/text path early-returns with 0 chunks.
+            mock_minio.get_object.return_value = MagicMock(
+                read=lambda: b"", close=MagicMock(), release_conn=MagicMock()
+            )
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/foo.pdf",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        # Auth must have passed; whether the body succeeds or fails on the
+        # empty-body path, the status must NOT be 403/401. Accept any
+        # 2xx/4xx that isn't auth-related.
+        assert response.status_code not in (401, 403), response.text
+
+    def test_index_single_file_cross_layer_denied(self, client: TestClient) -> None:
+        """A ``memory:procedural:write`` token cannot index a file from
+        the episodic layer (``?file=episodic/...``). Symmetric with upload."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "test-user",
+                "scope": "memory:procedural:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/foo.pdf",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
 
 
 # ── upload behaviour ─────────────────────────────────────────────────────────
@@ -665,7 +868,10 @@ class TestIndexErrorPaths:
                 },
             )
         assert response.status_code == 400
-        assert "episodic/" in response.json()["detail"]
+        # Detail is the new auth-gate message which lists the valid layer
+        # prefixes from MemoryLayer enum (future-proof to additions).
+        detail = response.json()["detail"]
+        assert "episodic" in detail and "procedural" in detail
 
     def test_index_delete_collection_exception_swallowed(
         self, client: TestClient

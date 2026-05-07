@@ -174,19 +174,62 @@ def _list_objects_from_minio(
 # ── POST /memory/upload ─────────────────────────────────────────────────────
 
 
+def _require_layer_write(user: UserContext, layer: MemoryLayer) -> None:
+    """Raise 403 unless *user* may write to *layer*.
+
+    Per-layer write scope (``memory:<layer>:write``) is the natural
+    grant for end-user UI uploads; ``audittrace:admin`` continues to
+    bypass per-layer gating so operator bulk operations don't break.
+    Empty-handed callers see the layer name in the error so they know
+    which scope to request.
+    """
+    required = f"memory:{layer.value}:write"
+    if user.is_admin or "audittrace:admin" in user.scopes or required in user.scopes:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"Required scope: {required} (or audittrace:admin)",
+    )
+
+
+def _require_admin(user: UserContext, action: str) -> None:
+    """Raise 403 unless *user* has the operator-level scope.
+
+    Bulk-rebuild and other destructive whole-collection operations
+    keep an admin gate even after the per-layer redesign — they
+    cross user boundaries by definition.
+    """
+    if user.is_admin or "audittrace:admin" in user.scopes:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"Required scope: audittrace:admin ({action})",
+    )
+
+
 @router.post("/upload")
 async def upload_memory_file(
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
-    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
+    user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Upload a file to MinIO under the specified memory layer.
 
     The file lands in the ``memory-shared`` bucket at
     ``{layer}/{filename}``.  If *filename* is omitted the upload's
     original filename is used.
+
+    Authorization (per-layer): the caller's JWT must carry
+    ``memory:<layer>:write`` matching the ``layer`` query parameter
+    (or ``audittrace:admin``). A token with ``memory:procedural:write``
+    cannot upload to ``layer=episodic`` and vice-versa. The empty
+    static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI spec
+    without baking the dynamic per-layer scope into the schema —
+    the prose contract lives here.
     """
+    _require_layer_write(user, layer)
     settings = get_settings()
     bucket = settings.minio_shared_bucket
     target_filename = filename or file.filename or "unnamed"
@@ -832,7 +875,7 @@ def index_memory(
             "mode; existing chunks for other files are preserved."
         ),
     ),
-    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Read documents from MinIO and push chunked embeddings to ChromaDB.
@@ -851,7 +894,33 @@ def index_memory(
     The opt-in ``ai_research_papers`` collection extracts text per page
     from PDFs and is rebuilt only when explicitly named in
     *collections* — keeping routine /memory/index calls fast.
+
+    Authorization:
+
+    * Bulk mode (``?file`` absent) — destructive whole-collection
+      delete-and-recreate; cross-user by design. Requires
+      ``audittrace:admin``.
+    * Single-file mode (``?file=<layer>/<key>``) — one-document
+      idempotent upsert. Requires ``memory:<layer>:write`` matching
+      the file's MinIO prefix (or ``audittrace:admin``). The empty
+      static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI
+      spec; the prose contract lives here.
     """
+    if file is None:
+        _require_admin(user, "bulk /memory/index rebuild")
+    else:
+        try:
+            layer_str, _ = file.split("/", 1)
+            layer_for_scope = MemoryLayer(layer_str)
+        except (KeyError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "?file= must start with a known layer prefix "
+                    f"({sorted(layer.value for layer in MemoryLayer)!r})"
+                ),
+            ) from None
+        _require_layer_write(user, layer_for_scope)
     target_collections = (
         [c.strip() for c in collections.split(",") if c.strip()]
         if collections

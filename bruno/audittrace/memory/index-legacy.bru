@@ -1,5 +1,5 @@
 meta {
-  name: POST /memory/index — rebuild ChromaDB collections (admin)
+  name: POST /memory/index — bulk rebuild ChromaDB (admin)
   type: http
   seq: 91
 }
@@ -26,11 +26,18 @@ tests {
 }
 
 docs {
-  Reads every `.md` from MinIO and pushes chunked embeddings to the
-  `decisions`, `skills`, `semantic` ChromaDB collections. Use this
-  to repopulate the semantic layer if it ever gets wiped (the
-  2026-05-04 carry-forward from session-2026-05-03).
+  Bulk rebuild mode — no ``?file=``. Reads every ``.md`` from
+  MinIO and pushes chunked embeddings to the ``decisions``,
+  ``skills``, ``semantic`` ChromaDB collections via destructive
+  delete-and-recreate. Use this to repopulate the semantic layer
+  if it ever gets wiped (the 2026-05-04 carry-forward from
+  session-2026-05-03).
 
-  Requires `audittrace:admin` scope. Slow — chunks every doc and
-  embeds. ~30s for the typical corpus.
+  Authorization: bulk mode is destructive cross-collection, so
+  it always requires ``audittrace:admin``. The single-file mode
+  (``?file=<layer>/<key>``) accepts the matching per-layer write
+  scope as well — see ``index-single-file.bru`` for the per-layer
+  flow.
+
+  Slow — chunks every doc and embeds. ~30s for the typical corpus.
 }
