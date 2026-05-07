@@ -1,6 +1,6 @@
 .PHONY: help venv install lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight verify-deploy
+       deploy-preflight verify-deploy sync-requirements check-requirements-sync
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -165,6 +165,12 @@ verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /
 k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported.
 	@scripts/setup-vault.sh
 	@scripts/setup-memory-scopes.sh
+
+sync-requirements: ## Regenerate requirements.txt from pyproject.toml (single source of truth). Run after touching dependencies; the requirements-sync hook + CI job block drifted state.
+	@python3 scripts/sync-requirements.py
+
+check-requirements-sync: ## Fail if requirements.txt has drifted from pyproject.toml (mirrors the pre-commit hook + CI job).
+	@python3 scripts/sync-requirements.py --check
 
 openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fixtures/openapi.snapshot.yaml from the live FastAPI app (ADR-046 / v1.0.10).
 	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov
