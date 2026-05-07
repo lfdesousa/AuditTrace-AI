@@ -526,6 +526,10 @@ class TestIndexErrorPaths:
         fake_doc.__iter__.return_value = iter([fake_page_1, fake_page_2])
         fake_doc.__enter__.return_value = fake_doc
         fake_doc.__exit__.return_value = None
+        # Bomb-defense caps (#18) read these properties — explicit
+        # values keep MagicMock auto-comparison from tripping them.
+        fake_doc.page_count = 2
+        fake_doc.xref_length.return_value = 10
         fake_pymupdf = MagicMock()
         fake_pymupdf.open.return_value = fake_doc
 
@@ -703,6 +707,1129 @@ class TestIndexErrorPaths:
         assert response.status_code == 200
         assert response.json()["collections"]["decisions"] > 0
         mock_collection.upsert.assert_called()
+
+
+class TestPdfProvenance:
+    """Per-chunk provenance schema (gap-inventory item #21).
+
+    Asserts that every PDF chunk carries the full provenance set:
+    bbox_x0/y0/x1/y1, text_source, extraction_confidence,
+    document_hash (sha256 of raw bytes), signature_status (placeholder
+    until #12 lands), ingested_by_user_id, ingestion_ts_ms.
+
+    Static defaults for text_source / confidence / signature_status
+    are pinned here so future commits in the tier-A series surface
+    in the diff when they flip these fields (#1 OCR, #12 signatures).
+    """
+
+    def test_pdf_chunks_carry_full_provenance_schema(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Every PDF chunk metadata dict has the 12 item-#21+#12 fields.
+        Signature check is disabled here so ``signature_status`` is the
+        deterministic ``"check_skipped"`` value — separate tests in
+        ``TestPdfSignatureValidation`` cover the real signature paths.
+        """
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED", "false")
+        config_mod.get_settings.cache_clear()
+        import hashlib
+
+        raw_bytes = b"%PDF-1.4 ... pretend bytes"
+        expected_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/papers/research/foo.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        # _read_minio_object uses ``with client.get_object(...) as response``,
+        # so the response mock must return itself from __enter__ for the
+        # configured .read() bytes to actually flow through. Without this,
+        # ``bytes(MagicMock())`` produces b'\\x00' and the document_hash
+        # assertion below fails.
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        # Realistic page rect — US Letter portrait (612 × 792 pt).
+        # Set rect attrs explicitly so float(rect.x0) returns the
+        # actual page dimension instead of MagicMock's __float__
+        # default of 1.0 — we want to verify _page_bbox extracts
+        # the four floats in order.
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text of page one."
+        fake_page.rect = rect_mock
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert mock_collection.upsert.called
+        meta = mock_collection.upsert.call_args.kwargs["metadatas"][0]
+
+        # Existing fields preserved (regression guard).
+        assert meta["source"] == "foo.pdf"
+        assert meta["source_key"] == "papers/research/foo.pdf"
+        assert meta["category"] == "episodic"
+        assert meta["file_type"] == "pdf"
+        assert meta["page"] == 1
+        assert meta["chunk"] == 0
+
+        # Item #21 — bbox flattened (ChromaDB metadata is
+        # str|int|float|bool only; tuples are not supported).
+        assert meta["bbox_x0"] == 0.0
+        assert meta["bbox_y0"] == 0.0
+        assert meta["bbox_x1"] == 612.0
+        assert meta["bbox_y1"] == 792.0
+
+        # Item #21 — text-extraction provenance. Defaults pinned
+        # for v1; #1 (OCR fallback) will flip text_source/confidence.
+        assert meta["text_source"] == "native"
+        assert meta["extraction_confidence"] == 1.0
+
+        # Item #21 — document identity. SHA-256 of the raw bytes,
+        # canonical for the entire downstream lifecycle.
+        assert meta["document_hash"] == expected_hash
+        assert len(meta["document_hash"]) == 64  # hex digest length
+
+        # Item #12 — signature provenance. With the check explicitly
+        # disabled at the top of this test, the helper returns the
+        # deterministic ``"check_skipped"`` status.
+        assert meta["signature_status"] == "check_skipped"
+
+        # Item #21 — ingestion identity. user_id comes from
+        # require_user (sentinel "audittrace-admin" in bypass mode);
+        # ingestion_ts_ms is the wall clock at request entry.
+        assert isinstance(meta["ingested_by_user_id"], str)
+        assert meta["ingested_by_user_id"]  # non-empty
+        assert isinstance(meta["ingestion_ts_ms"], int)
+        assert meta["ingestion_ts_ms"] > 1_700_000_000_000  # post-2023
+
+        # Cache hygiene — next test gets fresh Settings.
+        config_mod.get_settings.cache_clear()
+
+    def test_pdf_chunks_share_document_hash_and_ingestion_ts(
+        self, client: TestClient
+    ) -> None:
+        """All chunks from one document share document_hash +
+        ingestion_ts_ms — letting an auditor group "this index call
+        produced these chunks" by exact match on either field."""
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/papers/multi.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"%PDF-1.4 multi-page bytes"
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        # Three pages with the same rect.
+        rect = MagicMock(x0=0.0, y0=0.0, x1=595.0, y1=842.0)  # A4
+        pages = []
+        for i in range(3):
+            p = MagicMock()
+            p.get_text.return_value = f"Page {i + 1} body."
+            p.rect = rect
+            pages.append(p)
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter(pages)
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 3
+        fake_doc.xref_length.return_value = 10
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        # Each page calls _upsert_in_batches once (one chunk per page);
+        # aggregate metadatas across all upsert calls.
+        all_metas: list[dict[str, Any]] = []
+        for call in mock_collection.upsert.call_args_list:
+            all_metas.extend(call.kwargs["metadatas"])
+        assert len(all_metas) == 3
+        # Single value of document_hash + ingestion_ts_ms across all chunks.
+        hashes = {m["document_hash"] for m in all_metas}
+        ts = {m["ingestion_ts_ms"] for m in all_metas}
+        assert len(hashes) == 1
+        assert len(ts) == 1
+
+
+class TestPdfBombDefense:
+    """PDF bomb defenses (gap-inventory item #18).
+
+    Four layers of guard, each catching a different bomb shape:
+      1. Raw byte-size cap (rejects oversized files before parser load)
+      2. Page-count + xref-count caps (rejects shape-bombs after open)
+      3. Wall-clock timeout (page-boundary granularity)
+      4. Per-page extracted-text-size cap (decompression-ratio defense)
+
+    Each test sets the relevant cap to a tiny value via env var so the
+    test PDF's mock values trigger rejection. Per the
+    feedback_run_tests_before_commit pattern, monkeypatch.setenv +
+    config.get_settings.cache_clear() is the canonical override.
+    """
+
+    @staticmethod
+    def _build_minio_with_pdf(raw_bytes: bytes) -> Any:
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/papers/research/foo.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+        return mock_minio
+
+    @staticmethod
+    def _build_doc(page_count: int, xref_length: int, page_text: str) -> Any:
+        rect = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        pages = []
+        for _ in range(page_count):
+            p = MagicMock()
+            p.get_text.return_value = page_text
+            p.rect = rect
+            pages.append(p)
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter(pages)
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = page_count
+        fake_doc.xref_length.return_value = xref_length
+        return fake_doc
+
+    def test_oversized_file_rejected_before_parser_load(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Layer 1: file size > pdf_max_size_mb → reject before pymupdf.open."""
+        from audittrace import config as config_mod
+
+        # Cap to 0 MB so any non-empty file trips the gate.
+        monkeypatch.setenv("AUDITTRACE_PDF_MAX_SIZE_MB", "0")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._build_minio_with_pdf(b"some bytes here")
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+            fake_pymupdf = MagicMock()
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            assert response.json()["collections"]["ai_research_papers"] == 0
+            # pymupdf.open MUST NOT be called — layer 1 rejects before
+            # the parser is even instantiated.
+            assert not fake_pymupdf.open.called
+            assert not mock_collection.upsert.called
+        finally:
+            config_mod.get_settings.cache_clear()
+
+    def test_too_many_pages_rejected(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Layer 2: doc.page_count > pdf_max_pages → reject the file."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_MAX_PAGES", "1")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            # Doc claims 2 pages; cap is 1 → reject.
+            fake_doc = self._build_doc(page_count=2, xref_length=10, page_text="body")
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            assert response.json()["collections"]["ai_research_papers"] == 0
+            # No page was iterated — the doc was rejected after open.
+            assert not mock_collection.upsert.called
+        finally:
+            config_mod.get_settings.cache_clear()
+
+    def test_too_many_xrefs_rejected(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Layer 2: doc.xref_length > pdf_max_xref_count → reject."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_MAX_XREF_COUNT", "5")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            fake_doc = self._build_doc(page_count=1, xref_length=100, page_text="body")
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            assert response.json()["collections"]["ai_research_papers"] == 0
+            assert not mock_collection.upsert.called
+        finally:
+            config_mod.get_settings.cache_clear()
+
+    def test_parse_timeout_breaks_page_loop(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Layer 3: pdf_parse_timeout_seconds=0 → first page check trips."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_PARSE_TIMEOUT_SECONDS", "0")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            fake_doc = self._build_doc(page_count=10, xref_length=10, page_text="body")
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            # With timeout=0, the budget check at top of the first
+            # page-iteration trips — no pages indexed.
+            assert response.json()["collections"]["ai_research_papers"] == 0
+            assert not mock_collection.upsert.called
+        finally:
+            config_mod.get_settings.cache_clear()
+
+    def test_oversized_page_text_skipped_but_other_pages_indexed(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """Layer 4: per-page text > pdf_max_page_text_bytes → skip page,
+        keep processing others. One bad page in an otherwise legit doc
+        is rare but plausible — abort-the-whole-file is too aggressive."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_MAX_PAGE_TEXT_BYTES", "100")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            rect = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+            small_page = MagicMock()
+            small_page.get_text.return_value = "tiny body text"  # under cap
+            small_page.rect = rect
+            big_page = MagicMock()
+            big_page.get_text.return_value = "x" * 1000  # over cap (100)
+            big_page.rect = rect
+            fake_doc = MagicMock()
+            fake_doc.__iter__.return_value = iter([small_page, big_page])
+            fake_doc.__enter__.return_value = fake_doc
+            fake_doc.__exit__.return_value = None
+            fake_doc.page_count = 2
+            fake_doc.xref_length.return_value = 10
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            # Small page indexed (1 chunk); big page skipped.
+            assert response.json()["collections"]["ai_research_papers"] == 1
+            assert mock_collection.upsert.call_count == 1
+        finally:
+            config_mod.get_settings.cache_clear()
+
+
+class TestPdfRedactions:
+    """Unflattened redaction handling (gap-inventory item #8).
+
+    The default policy is ``reject`` — any page with a redaction
+    annotation aborts the whole file. Auditors get a structured log
+    line; the corpus stays clean. ``clip-extract`` (env override) is
+    for advanced operators who explicitly want partial content from
+    redacted documents.
+    """
+
+    @staticmethod
+    def _mk_redact_annot(rect_tuple: tuple[float, float, float, float]) -> Any:
+        """Build a fake pymupdf-annot with redaction subtype."""
+        annot = MagicMock()
+        annot.type = (12, "Redact")  # PDF_ANNOT_REDACT == 12
+        rect = MagicMock(
+            x0=rect_tuple[0],
+            y0=rect_tuple[1],
+            x1=rect_tuple[2],
+            y1=rect_tuple[3],
+        )
+        annot.rect = rect
+        return annot
+
+    @staticmethod
+    def _mk_minio_with_one_pdf() -> Any:
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/papers/research/foo.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"%PDF-1.4 redacted bytes"
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+        return mock_minio
+
+    def test_redactions_reject_default_policy(self, client: TestClient) -> None:
+        """Default policy=reject: whole document is skipped on first
+        redaction-bearing page; no chunks are emitted."""
+        mock_minio = self._mk_minio_with_one_pdf()
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        redact_annot = self._mk_redact_annot((100.0, 100.0, 200.0, 200.0))
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "would-be body text"
+        fake_page.rect = rect_mock
+        fake_page.annots.return_value = [redact_annot]
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        # Whole file rejected — zero chunks indexed.
+        assert response.json()["collections"]["ai_research_papers"] == 0
+        assert not mock_collection.upsert.called
+
+    def test_redactions_clip_extract_drops_intersecting_blocks(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """policy=clip-extract: blocks intersecting any redaction rect
+        are dropped; surviving blocks are joined and indexed with
+        redaction_status='clipped'."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_REDACTION_POLICY", "clip-extract")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._mk_minio_with_one_pdf()
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+            # Redaction at (100,100)-(200,200).
+            redact_annot = self._mk_redact_annot((100.0, 100.0, 200.0, 200.0))
+
+            # Two blocks: one outside the redaction (will survive),
+            # one inside (will be dropped).
+            def fake_get_text(*args: Any, **_kw: Any) -> Any:
+                if args and args[0] == "blocks":
+                    return [
+                        # Block 0 — outside redaction → survives.
+                        (0.0, 0.0, 50.0, 50.0, "Surviving content.", 0, 0),
+                        # Block 1 — inside redaction → dropped.
+                        (110.0, 110.0, 190.0, 190.0, "Redacted content.", 1, 0),
+                    ]
+                return "(unused — clip path uses 'blocks' mode)"
+
+            fake_page = MagicMock()
+            fake_page.get_text.side_effect = fake_get_text
+            fake_page.rect = rect_mock
+            fake_page.annots.return_value = [redact_annot]
+            fake_doc = MagicMock()
+            fake_doc.__iter__.return_value = iter([fake_page])
+            fake_doc.__enter__.return_value = fake_doc
+            fake_doc.__exit__.return_value = None
+            fake_doc.page_count = 1
+            fake_doc.xref_length.return_value = 10
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            # One chunk indexed (only the surviving block).
+            assert response.json()["collections"]["ai_research_papers"] == 1
+            assert mock_collection.upsert.called
+            call_kwargs = mock_collection.upsert.call_args.kwargs
+            assert "Surviving content." in call_kwargs["documents"][0]
+            assert "Redacted content." not in call_kwargs["documents"][0]
+            # Schema check: redaction_status="clipped" on the chunk.
+            assert call_kwargs["metadatas"][0]["redaction_status"] == "clipped"
+        finally:
+            config_mod.get_settings.cache_clear()
+
+    def test_no_redactions_marks_status_none(self, client: TestClient) -> None:
+        """Page with zero redaction annotations: chunk metadata has
+        redaction_status='none' (the v1 default)."""
+        mock_minio = self._mk_minio_with_one_pdf()
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Clean page body."
+        fake_page.rect = rect_mock
+        fake_page.annots.return_value = []  # no annotations at all
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["collections"]["ai_research_papers"] == 1
+        meta = mock_collection.upsert.call_args.kwargs["metadatas"][0]
+        assert meta["redaction_status"] == "none"
+
+    def test_unknown_redaction_policy_rejects_for_safety(
+        self, client: TestClient, monkeypatch: Any
+    ) -> None:
+        """A misconfigured policy value (typo, env-var leak) MUST NOT
+        silently leak redacted content. Reject the document instead."""
+        from audittrace import config as config_mod
+
+        monkeypatch.setenv("AUDITTRACE_PDF_REDACTION_POLICY", "warn-and-skip")
+        config_mod.get_settings.cache_clear()
+        try:
+            mock_minio = self._mk_minio_with_one_pdf()
+            mock_collection = MagicMock()
+            mock_chroma = MagicMock()
+            mock_chroma.get_or_create_collection.return_value = mock_collection
+
+            rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+            redact_annot = self._mk_redact_annot((100.0, 100.0, 200.0, 200.0))
+            fake_page = MagicMock()
+            fake_page.get_text.return_value = "would-be body"
+            fake_page.rect = rect_mock
+            fake_page.annots.return_value = [redact_annot]
+            fake_doc = MagicMock()
+            fake_doc.__iter__.return_value = iter([fake_page])
+            fake_doc.__enter__.return_value = fake_doc
+            fake_doc.__exit__.return_value = None
+            fake_doc.page_count = 1
+            fake_doc.xref_length.return_value = 10
+            fake_pymupdf = MagicMock()
+            fake_pymupdf.open.return_value = fake_doc
+
+            with (
+                patch(
+                    "audittrace.routes.memory._get_minio_client",
+                    return_value=mock_minio,
+                ),
+                patch(
+                    "audittrace.routes.memory.get_chromadb",
+                    return_value=mock_chroma,
+                ),
+                patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            ):
+                response = client.post(
+                    "/memory/index",
+                    params={"collections": "ai_research_papers"},
+                )
+
+            assert response.status_code == 200, response.text
+            # Misconfig → safe-by-default reject.
+            assert response.json()["collections"]["ai_research_papers"] == 0
+            assert not mock_collection.upsert.called
+        finally:
+            config_mod.get_settings.cache_clear()
+
+
+class TestPdfSignatureValidation:
+    """PDF signature validation (gap-inventory item #12).
+
+    Tests the ``_pdf_signature_status`` helper directly across the full
+    status taxonomy (check_skipped / none / signed_valid /
+    signed_invalid / signed_tampered / check_failed). Plus a smoke
+    test that runs the helper against a real unsigned PDF generated
+    in-memory via pymupdf — catches contract drift between this code
+    and pyhanko's ``embedded_signatures`` / ``PdfSignatureStatus``
+    APIs without committing a signed-PDF binary fixture to the repo.
+
+    Detect-and-record only in v1: every status is recorded on every
+    chunk; nothing rejects on signature failure. Reject-on-invalid is
+    a future revision.
+    """
+
+    def test_signature_check_disabled_returns_check_skipped(self) -> None:
+        from audittrace.routes.memory import _pdf_signature_status
+
+        status, count = _pdf_signature_status(
+            b"%PDF-1.4 ignored", enabled=False, trust_store_path=""
+        )
+        assert status == "check_skipped"
+        assert count == 0
+
+    def test_pdf_with_no_signatures_returns_none_real_pdf(self) -> None:
+        """Real pyhanko + real (unsigned) PDF generated via pymupdf.
+        Smoke test for contract drift between our helper and pyhanko's
+        ``embedded_signatures`` field — runs every CI pass."""
+        import pymupdf  # type: ignore[import-untyped]
+
+        from audittrace.routes.memory import _pdf_signature_status
+
+        # Build a one-page PDF in-memory; no signatures.
+        doc = pymupdf.open()
+        doc.new_page()
+        raw = doc.tobytes()
+        doc.close()
+
+        status, count = _pdf_signature_status(raw, enabled=True, trust_store_path="")
+        assert status == "none"
+        assert count == 0
+
+    def test_signed_valid_returns_signed_valid(self) -> None:
+        """Mock pyhanko: one signature, all checks pass."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock()]
+        fake_status = MagicMock(intact=True, valid=True, trusted=True)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=fake_status,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_valid"
+        assert count == 1
+
+    def test_signed_invalid_returns_signed_invalid(self) -> None:
+        """Signature exists, content intact, but cert chain not
+        trusted (or signature math broken). Distinct from tampering —
+        the document hasn't been modified, but the auth claim is
+        unverifiable."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock()]
+        # intact (content unchanged) but valid=False (sig math broken).
+        fake_status = MagicMock(intact=True, valid=False, trusted=False)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=fake_status,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_invalid"
+        assert count == 1
+
+    def test_signed_with_untrusted_chain_returns_signed_invalid(self) -> None:
+        """Signature math valid + content intact but cert chain not
+        trusted by the configured trust store. ``signed_invalid`` —
+        same status as bad-math, since both fail the trust contract."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock()]
+        # intact + valid but trusted=False (chain not in trust store).
+        fake_status = MagicMock(intact=True, valid=True, trusted=False)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=fake_status,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_invalid"
+        assert count == 1
+
+    def test_signed_tampered_returns_signed_tampered(self) -> None:
+        """``intact=False`` is the strongest negative signal:
+        cryptographic proof that the document was modified after
+        signing. Reported separately from generic ``signed_invalid``
+        so auditors can prioritise tampering over trust-chain noise."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock()]
+        fake_status = MagicMock(intact=False, valid=True, trusted=True)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=fake_status,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_tampered"
+        assert count == 1
+
+    def test_signature_validation_exception_returns_check_failed(self) -> None:
+        """Any unexpected exception during validation (malformed PDF,
+        OCSP timeout, pyhanko bug) is recorded as ``check_failed`` —
+        distinct from ``signed_invalid`` so auditors can separate
+        "we tried and broke" from "we tried and the document was
+        provably bad". v1 never rejects; the chunk lands with the
+        status, the corpus stays consistent."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        with patch(
+            "pyhanko.pdf_utils.reader.PdfFileReader",
+            side_effect=ValueError("corrupted xref"),
+        ):
+            status, count = _pdf_signature_status(
+                b"\x00bad bytes", enabled=True, trust_store_path=""
+            )
+        assert status == "check_failed"
+        assert count == 0
+
+    def test_multiple_signatures_aggregate_to_worst_status(self) -> None:
+        """When a document has N signatures, the file's status is the
+        worst across them — one tampered signature poisons the file
+        even if other signatures are valid. (Tampering > invalid >
+        valid in severity order.)"""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        # Three signatures.
+        fake_reader.embedded_signatures = [MagicMock(), MagicMock(), MagicMock()]
+        # First two valid, third tampered.
+        statuses = [
+            MagicMock(intact=True, valid=True, trusted=True),
+            MagicMock(intact=True, valid=True, trusted=True),
+            MagicMock(intact=False, valid=True, trusted=True),
+        ]
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                side_effect=statuses,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_tampered"
+        assert count == 3
+
+    def test_signature_status_propagates_to_chunk_metadata(
+        self, client: TestClient
+    ) -> None:
+        """Integration: full /memory/index call with mocked pyhanko
+        returning ``signed_valid``. Every chunk metadata dict carries
+        the same status (signature is per-document, not per-chunk —
+        amortises the OCSP/CRL roundtrips)."""
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/papers/research/foo.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"%PDF-1.4 mock bytes"
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body."
+        fake_page.rect = rect_mock
+        fake_page.annots.return_value = []
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        # Mock pyhanko: one valid signature.
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock()]
+        fake_sig_status = MagicMock(intact=True, valid=True, trusted=True)
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=fake_sig_status,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        meta = mock_collection.upsert.call_args.kwargs["metadatas"][0]
+        assert meta["signature_status"] == "signed_valid"
+
+
+class TestPdfHelperCoverage:
+    """Direct unit coverage for the PDF helper functions —
+    defensive branches that the route-level tests don't exercise.
+
+    These tests exist so the per-file coverage gate on
+    ``audittrace/routes/memory.py`` stays >= 90% as the module
+    grows. Each test pins one specific defensive branch.
+    """
+
+    def test_page_bbox_falls_back_on_attribute_error(self) -> None:
+        """``_page_bbox`` returns zeros when ``page.rect`` access
+        raises — keeps the metadata schema stable on malformed PDFs.
+        Use a plain class instead of MagicMock here: setting
+        ``PropertyMock`` on ``type(MagicMock())`` mutates global
+        state shared by every other MagicMock in the suite."""
+        from audittrace.routes.memory import _page_bbox
+
+        class _BadPage:
+            @property
+            def rect(self) -> Any:
+                raise AttributeError("no rect on this page")
+
+        x0, y0, x1, y1 = _page_bbox(_BadPage())
+        assert (x0, y0, x1, y1) == (0.0, 0.0, 0.0, 0.0)
+
+    def test_redaction_rects_swallows_annots_exception(self) -> None:
+        """Some malformed PDFs raise inside ``page.annots()`` — we
+        return an empty list rather than crashing the file."""
+        from audittrace.routes.memory import _redaction_rects
+
+        bad_page = MagicMock()
+        bad_page.annots.side_effect = RuntimeError("malformed annot table")
+        assert _redaction_rects(bad_page) == []
+
+    def test_redaction_rects_skips_annot_with_no_type(self) -> None:
+        """An annot whose ``.type`` is None or empty is skipped —
+        defense against pymupdf returning a degraded-shape annot."""
+        from audittrace.routes.memory import _redaction_rects
+
+        annot_no_type = MagicMock()
+        annot_no_type.type = None  # type missing
+        annot_empty_type = MagicMock()
+        annot_empty_type.type = ()  # truthy-falsy edge
+        page = MagicMock()
+        page.annots.return_value = [annot_no_type, annot_empty_type]
+        assert _redaction_rects(page) == []
+
+    def test_text_clipped_drops_short_block_tuple(self) -> None:
+        """Block tuples shorter than 5 elements (defensive against
+        pymupdf API drift) are skipped, not crashed on."""
+        from audittrace.routes.memory import _text_clipped_around_redactions
+
+        page = MagicMock()
+        page.get_text.return_value = [
+            (0.0, 0.0, 50.0),  # malformed — len < 5
+            (10.0, 10.0, 50.0, 50.0, "kept text", 0, 0),
+        ]
+        result = _text_clipped_around_redactions(page, redaction_rects=[])
+        assert result == "kept text"
+
+    def test_text_clipped_drops_non_string_block_text(self) -> None:
+        """Block whose [4] element isn't a string (image block, byte
+        stream, etc.) is skipped — only string content is indexable."""
+        from audittrace.routes.memory import _text_clipped_around_redactions
+
+        page = MagicMock()
+        page.get_text.return_value = [
+            (0.0, 0.0, 50.0, 50.0, b"binary stream", 0, 1),
+            (60.0, 60.0, 100.0, 100.0, "real text", 1, 0),
+            (110.0, 110.0, 150.0, 150.0, "   ", 2, 0),  # whitespace-only
+        ]
+        result = _text_clipped_around_redactions(page, redaction_rects=[])
+        assert result == "real text"
+
+    def test_validation_context_caches_across_calls(self) -> None:
+        """Second call with same trust_store_path returns the cached
+        ValidationContext — confirms the singleton-with-lock pattern
+        is doing its job (no per-call allocation)."""
+        import audittrace.routes.memory as routes_memory
+
+        routes_memory._VALIDATION_CONTEXT = None
+        routes_memory._VC_TRUST_STORE_PATH = ""
+
+        from audittrace.routes.memory import _get_validation_context
+
+        vc1 = _get_validation_context("")
+        vc2 = _get_validation_context("")
+        assert vc1 is vc2
+
+    def test_validation_context_rebuilds_on_trust_store_change(self) -> None:
+        """When trust_store_path changes between calls (operator
+        updated Settings), the context is rebuilt — deliberate
+        cache invalidation point so the new trust store takes
+        effect without a process restart. Path that doesn't exist
+        triggers the OSError fallback to system roots — still a
+        valid context, just rebuilt."""
+        import audittrace.routes.memory as routes_memory
+
+        routes_memory._VALIDATION_CONTEXT = None
+        routes_memory._VC_TRUST_STORE_PATH = ""
+
+        from audittrace.routes.memory import _get_validation_context
+
+        vc1 = _get_validation_context("")
+        vc2 = _get_validation_context("/nonexistent/trust/store.pem")
+        assert vc1 is not vc2
+
+    def test_signature_check_unavailable_when_pyhanko_missing(self) -> None:
+        """If pyhanko.pdf_utils.reader can't import, the helper
+        returns ``check_unavailable`` instead of crashing — graceful
+        degradation per PYTHON-ENGINEERING §4."""
+        import sys
+
+        from audittrace.routes.memory import _pdf_signature_status
+
+        # Force the inner import to fail by injecting a None sentinel
+        # into sys.modules — Python raises ImportError when an entry
+        # is None on import attempt.
+        with patch.dict(sys.modules, {"pyhanko.pdf_utils.reader": None}):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "check_unavailable"
+        assert count == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
