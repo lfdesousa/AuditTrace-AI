@@ -2,13 +2,23 @@
 Description=AuditTrace-AI Vault auto-unseal at boot
 Documentation=file:///home/lfdesousa/work/audittrace-private/runbooks/07-vault-auto-unseal.md
 After=k3s.service network-online.target
-Wants=network-online.target
-Requires=k3s.service
-# Allow up to 5 retries within 5 minutes — k3s API server and Vault
-# pod can take longer than the unit's 180s TimeoutStartSec on a slow
-# boot, and the script itself is idempotent.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Soft dependency on k3s.service (NOT Requires=). When k3s fails its
+# first start (e.g. the network-online race where /proc/net/route is
+# empty for the first second after the link comes up), Requires= would
+# cancel this unit's job with result 'dependency' and no Restart=
+# behaviour can recover from that — the unit never started so nothing
+# is there to restart. Wants= lets us start regardless of k3s's
+# first-attempt outcome; the script's k3s-readiness wait + this unit's
+# Restart=on-failure together cover the recovery path. (Diagnosed
+# 2026-05-07 after a 9h sealed-vault outage; see
+# ~/work/audittrace-evidence/2026-05-07-vault-autounseal-fix/.)
+Wants=k3s.service network-online.target
+# Allow up to 10 retries within 10 minutes — k3s startup races + Vault
+# pod scheduling + Vault HTTP listener bind can together exceed the
+# unit's 300s TimeoutStartSec on a degraded boot. Script is idempotent,
+# so retrying after a successful unseal is a fast no-op.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=oneshot
@@ -24,7 +34,10 @@ RemainAfterExit=yes
 # after a successful unseal is safe.
 Restart=on-failure
 RestartSec=15s
-TimeoutStartSec=180s
+# 300s gives the script room for: k3s-readiness wait (240s upper bound)
+# + vault-status wait (180s upper bound) + 3 unseal calls. In practice
+# both waits exit much faster on a healthy boot.
+TimeoutStartSec=300s
 
 [Install]
 WantedBy=multi-user.target
