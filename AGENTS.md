@@ -166,6 +166,47 @@ Examples:
 
 No `Co-Authored-By` tags on commits.
 
+## Test + Evidence Gate (HARD — see [ADR-049](docs/ADR-049-test-evidence-and-reconstructibility-gate.md))
+
+Every change is gated by a four-rule **Test, Evidence, and
+Reconstructibility Gate**, mapping to V&V (verification +
+validation) and the **Sovereignty-Reconstructibility Gap**
+formalised in `main_signed.pdf` §7. **No exceptions.**
+
+| Rule | Discipline | Required artefact |
+|---|---|---|
+| 1 — Unit tests + ≥90% per-file coverage | **Verification** | `make test` green output, `check-per-file-coverage.py` PASS |
+| 2 — End-to-end through public API + scoped JWT, against a deployed image | **Validation** | API request/response, image tag, `verify-deploy` summary |
+| 3 — Reconstruction artefacts captured + referenced from commit + PR body | **Reconstruction** | trace ID, audit-row ID, ChromaDB / MinIO / Postgres query result |
+| 4 — No override | **Discipline** | fix the friction (cluster, scope, dependency); never bypass |
+
+**No bypass paths** — `kubectl exec` into backend pods to do what
+the API should do, MinIO root credentials, scope-skipping,
+mocked auth at the edge: all forbidden. If `/memory/upload`
+requires `memory:episodic:write` and your token lacks it, the
+answer is `AUDITTRACE_EXTRA_SCOPES="memory:episodic:write"
+scripts/audittrace-login`, not a workaround.
+
+**Mechanical enforcement** (so the rule survives a hard week):
+
+- **Pre-commit hook** (`scripts/check-commit-evidence.sh` via
+  `.pre-commit-config.yaml`) — refuses commits to
+  `src/audittrace/routes/**` or `src/audittrace/services/**`
+  whose commit message lacks an evidence reference (PR draft URL,
+  evidence-file path, or trace-ID-shaped string).
+- **CI gate** (`evidence-check` job in
+  `.github/workflows/ci.yml`) — parses the PR body via `gh api`;
+  fails the check if the **Verification** / **Validation** /
+  **Reconstruction** sections are missing or empty. Branch
+  protection enforces it for merges to `main`.
+- **PR template** (`.github/pull_request_template.md`) —
+  pre-populates every new PR with the three required sections so
+  the requirement is visible from the moment the PR opens.
+
+Out-of-scope (path-skip): pure docs (`docs/**.md`), pure tests
+(`tests/**`), and `*.md` top-level files skip the pre-commit hook.
+The CI gate still requires the PR body sections.
+
 ## Cluster operations (k3s + Istio + Helm)
 - **Build + push image:** `make k8s-build TAG=<unique-tag>` (honours
   `TAG=…` since 2026-05-04; pushes to local registry on `localhost:5000`).
