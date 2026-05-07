@@ -17,17 +17,30 @@ All schema changes are managed via Alembic migrations.
 """
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
+    CHAR,
+    JSON,
     BigInteger,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# JSONB on Postgres (queryable via GIN + the `@>` containment operator),
+# plain JSON (TEXT under the hood) on SQLite for the test suite. The
+# audit-pivot query
+# ``WHERE extraction_warnings @> '[{"code": "ocr_low_confidence"}]'``
+# only needs JSONB at production runtime; SQLite-in-memory tests use
+# pure-Python list comprehensions on the loaded value.
+_PdfWarningsType = JSON().with_variant(JSONB(), "postgresql")
 
 
 def _uuid_str() -> str:
@@ -164,6 +177,30 @@ class MemoryItem(Base):
     modified_by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
     deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     deleted_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # ── Tier-B PDF manifest columns (migration 010, ADR-050 #22) ────────
+    # Nullable so existing rows pre-dating migration 010 keep reading
+    # cleanly. PDF-specific fields populated by /memory/index; non-PDF
+    # rows (Markdown, plain text, etc.) leave them NULL.
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    signature_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ocr_coverage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    attachment_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=0
+    )
+    form_field_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=0
+    )
+    # JSONB array of {"code": "<closed-set>", ...} entries. Closed-set
+    # codes per ADR-050 §extraction_warnings; new codes need an ADR
+    # amendment. Default `[]` so callers can iterate unconditionally.
+    extraction_warnings: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        _PdfWarningsType, nullable=True, default=list
+    )
+    # SHA-256 of the raw bytes — same value tier-A propagated to every
+    # chunk's metadata. Doc-level mirror saves a ChromaDB query for the
+    # "manifest row ↔ specific bytes version" audit question.
+    document_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),

@@ -54,6 +54,14 @@ dependencies = [
     # §2.3.
     "pyhanko>=0.21.0",
     "pyhanko-certvalidator>=0.26.0",
+    # pytesseract: tier-B item #1 — OCR for scanned pages. Python
+    # binding only; the actual `tesseract` binary + language packs
+    # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
+    # Graceful degradation: if the binary is missing at runtime,
+    # `_ocr_render_page` emits a `no_text_layer` warning rather than
+    # crashing — keeps unit tests green on hosts that don't have
+    # tesseract installed locally.
+    "pytesseract>=0.3.10",
     "opentelemetry-api>=1.27.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp>=1.27.0",

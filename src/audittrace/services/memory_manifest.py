@@ -53,6 +53,18 @@ class ManifestEntry:
     modified_by_user_id: str
     deleted_at_ms: int | None
     deleted_by_user_id: str | None
+    # ── Tier-B PDF manifest fields (ADR-050 #22) ─────────────────────
+    # All Optional — non-PDF rows + PDFs that pre-date migration 010
+    # leave them unset. Counts default to 0 to disambiguate "no
+    # attachment in this doc" from "this doc was indexed before tier-B
+    # shipped" — the count fields read NULL only on the latter.
+    page_count: int | None = None
+    signature_status: str | None = None
+    ocr_coverage_pct: float | None = None
+    attachment_count: int | None = None
+    form_field_count: int | None = None
+    extraction_warnings: list[dict[str, Any]] | None = None
+    document_sha256: str | None = None
 
     @classmethod
     def from_row(cls, row: MemoryItem) -> ManifestEntry:
@@ -68,6 +80,13 @@ class ManifestEntry:
             modified_by_user_id=row.modified_by_user_id,
             deleted_at_ms=row.deleted_at_ms,
             deleted_by_user_id=row.deleted_by_user_id,
+            page_count=row.page_count,
+            signature_status=row.signature_status,
+            ocr_coverage_pct=row.ocr_coverage_pct,
+            attachment_count=row.attachment_count,
+            form_field_count=row.form_field_count,
+            extraction_warnings=row.extraction_warnings,
+            document_sha256=row.document_sha256,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,6 +103,13 @@ class ManifestEntry:
             "modified_by_user_id": self.modified_by_user_id,
             "deleted_at_ms": self.deleted_at_ms,
             "deleted_by_user_id": self.deleted_by_user_id,
+            "page_count": self.page_count,
+            "signature_status": self.signature_status,
+            "ocr_coverage_pct": self.ocr_coverage_pct,
+            "attachment_count": self.attachment_count,
+            "form_field_count": self.form_field_count,
+            "extraction_warnings": self.extraction_warnings,
+            "document_sha256": self.document_sha256,
         }
 
 
@@ -240,6 +266,67 @@ class MemoryManifestService:
             return [ManifestEntry.from_row(r) for r in rows]
 
     @log_call(logger=logger)
+    def upsert_pdf_metadata(
+        self,
+        layer: str,
+        key: str,
+        *,
+        user_id: str,
+        size_bytes: int | None,
+        page_count: int | None,
+        signature_status: str | None,
+        ocr_coverage_pct: float | None,
+        attachment_count: int,
+        form_field_count: int,
+        extraction_warnings: list[dict[str, Any]],
+        document_sha256: str | None,
+    ) -> ManifestEntry:
+        """Write tier-B PDF manifest fields for ``(layer, key)``.
+
+        Creates a new ``MemoryItem`` row if none exists (since /memory/index
+        is itself the first touch for many uploaded PDFs — the per-layer
+        CRUD endpoints don't fire on direct /memory/upload). Existing rows
+        keep their authorship; only the PDF fields + ``modified_*`` are
+        bumped.
+
+        Per ADR-050 #22: this is the single audit-pivot writer. Every
+        successful PDF index call lands one of these per file.
+        """
+        _validate_layer(layer)
+        now = _now_ms()
+        with self._session_factory() as session:
+            row = (
+                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
+            )
+            if row is None:
+                row = MemoryItem(
+                    layer=layer,
+                    key=key,
+                    title=None,
+                    size_bytes=size_bytes,
+                    created_at_ms=now,
+                    modified_at_ms=now,
+                    created_by_user_id=user_id,
+                    modified_by_user_id=user_id,
+                )
+                session.add(row)
+            else:
+                row.modified_at_ms = now
+                row.modified_by_user_id = user_id
+                if size_bytes is not None:
+                    row.size_bytes = size_bytes
+            row.page_count = page_count
+            row.signature_status = signature_status
+            row.ocr_coverage_pct = ocr_coverage_pct
+            row.attachment_count = attachment_count
+            row.form_field_count = form_field_count
+            row.extraction_warnings = extraction_warnings
+            row.document_sha256 = document_sha256
+            session.commit()
+            session.refresh(row)
+            return ManifestEntry.from_row(row)
+
+    @log_call(logger=logger)
     def get(self, layer: str, key: str) -> ManifestEntry | None:
         """Return a single manifest entry, or ``None`` if no row
         exists. Soft-deleted rows ARE returned (the caller decides
@@ -279,6 +366,13 @@ class MockMemoryManifestService(MemoryManifestService):
             modified_by_user_id=row["modified_by_user_id"],
             deleted_at_ms=row.get("deleted_at_ms"),
             deleted_by_user_id=row.get("deleted_by_user_id"),
+            page_count=row.get("page_count"),
+            signature_status=row.get("signature_status"),
+            ocr_coverage_pct=row.get("ocr_coverage_pct"),
+            attachment_count=row.get("attachment_count"),
+            form_field_count=row.get("form_field_count"),
+            extraction_warnings=row.get("extraction_warnings"),
+            document_sha256=row.get("document_sha256"),
         )
 
     def record_create(
@@ -367,6 +461,55 @@ class MockMemoryManifestService(MemoryManifestService):
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         return self._to_entry(existing) if existing is not None else None
+
+    def upsert_pdf_metadata(
+        self,
+        layer: str,
+        key: str,
+        *,
+        user_id: str,
+        size_bytes: int | None,
+        page_count: int | None,
+        signature_status: str | None,
+        ocr_coverage_pct: float | None,
+        attachment_count: int,
+        form_field_count: int,
+        extraction_warnings: list[dict[str, Any]],
+        document_sha256: str | None,
+    ) -> ManifestEntry:
+        _validate_layer(layer)
+        now = _now_ms()
+        existing = self._rows.get((layer, key))
+        if existing is None:
+            import uuid
+
+            existing = {
+                "id": str(uuid.uuid4()),
+                "layer": layer,
+                "key": key,
+                "title": None,
+                "size_bytes": size_bytes,
+                "created_at_ms": now,
+                "modified_at_ms": now,
+                "created_by_user_id": user_id,
+                "modified_by_user_id": user_id,
+                "deleted_at_ms": None,
+                "deleted_by_user_id": None,
+            }
+            self._rows[(layer, key)] = existing
+        else:
+            existing["modified_at_ms"] = now
+            existing["modified_by_user_id"] = user_id
+            if size_bytes is not None:
+                existing["size_bytes"] = size_bytes
+        existing["page_count"] = page_count
+        existing["signature_status"] = signature_status
+        existing["ocr_coverage_pct"] = ocr_coverage_pct
+        existing["attachment_count"] = attachment_count
+        existing["form_field_count"] = form_field_count
+        existing["extraction_warnings"] = extraction_warnings
+        existing["document_sha256"] = document_sha256
+        return self._to_entry(existing)
 
     def reset(self) -> None:
         self._rows.clear()

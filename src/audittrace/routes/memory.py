@@ -573,6 +573,252 @@ def _text_clipped_around_redactions(page: Any, redaction_rects: list[Any]) -> st
     return "\n".join(safe_text)
 
 
+# Closed-set of ``code`` values allowed inside ``extraction_warnings``
+# JSONB entries (per ADR-050). New codes need an ADR amendment so the
+# set stays auditable. Tested by tests/test_memory_routes.py
+# (TestExtractionWarningCodes). Adding a code here without updating
+# ADR-050 is a documentation drift; CI doesn't catch it but reviewers
+# will.
+_PDF_WARNING_CODES: frozenset[str] = frozenset(
+    {
+        # Bomb defenses (tier-A item #18)
+        "max_size",
+        "max_pages",
+        "max_xref",
+        "max_page_text",
+        "parse_timeout",
+        # Redaction handling (tier-A item #8)
+        "redaction_clipped",
+        "redaction_rejected",
+        # Tier-B items
+        "encrypted",  # #15 — encrypted PDF refused
+        "no_text_layer",  # #1 — page had raster only, OCR unavailable
+        "ocr_low_confidence",  # #1 — OCR ran but confidence < threshold
+        "attachment",  # #6 — quarantined embedded file
+        "attachment_quarantine_failed",  # #6 — could not write to MinIO
+        "form_fields",  # #7 — page yielded form-field data
+    }
+)
+
+
+def _pdf_is_encrypted(doc: Any) -> bool:
+    """Return True if the PDF is encrypted and not yet authenticated.
+
+    Tier-B item #15. ``pymupdf`` exposes both ``is_encrypted`` (any
+    encryption present) and ``needs_pass`` (encryption requires a
+    password to read content). We treat *any* encryption requiring
+    authentication as a refuse — see ADR-050 §#15 for the rationale
+    (no password-bearing endpoint).
+
+    Strict ``is True`` comparison (not truthy-check) means MagicMock
+    attributes — which would otherwise be truthy by default — read
+    as False. Test fixtures don't need to opt into the tier-B
+    encryption contract; real pymupdf documents return real ``bool``
+    values from these attrs and the comparison works correctly.
+    """
+    is_enc = getattr(doc, "is_encrypted", False)
+    needs_pw = getattr(doc, "needs_pass", False)
+    return is_enc is True and needs_pw is True
+
+
+def _quarantine_pdf_attachments(
+    doc: Any,
+    *,
+    parent_filename: str,
+    layer_prefix: str,
+    minio_client: Any,
+    bucket: str,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Extract embedded attachments and write them to MinIO under
+    ``{layer_prefix}{parent_filename}/attachments/{name}``.
+
+    Tier-B item #6. Returns ``(count, warnings)``. Each successful
+    quarantine appends one ``{"code": "attachment", ...}`` entry to
+    *warnings*; failures append ``"attachment_quarantine_failed"`` so
+    auditors can distinguish "no attachments" from "attachments
+    existed but we couldn't store them." Recursion bound = 1 level
+    (per ADR-050 §#6) — embedded PDFs get an attachment row but are
+    not themselves parsed.
+    """
+    warnings: list[dict[str, Any]] = []
+    try:
+        # int() coercion: real pymupdf returns int; tests with
+        # MagicMock would otherwise return a MagicMock, breaking the
+        # range() iteration below.
+        count = int(doc.embfile_count() or 0)
+    except (TypeError, ValueError, Exception):
+        # Older pymupdf or malformed catalog. Treat as zero
+        # attachments rather than failing the whole document.
+        return 0, []
+    if count <= 0:
+        return 0, []
+    successes = 0
+    # Sanity cap on attachment count — a real PDF rarely carries
+    # more than a few. MagicMock-driven tests sometimes return
+    # ``__int__`` defaults of 1, which is fine; if a real PDF
+    # somehow declared 10 000 attachments we'd refuse to walk all
+    # of them.
+    if count > 256:
+        return 0, [
+            {
+                "code": "attachment_quarantine_failed",
+                "error": "too_many_attachments",
+                "count": count,
+            }
+        ]
+    for i in range(count):
+        # One try/except per iteration covering the full extract +
+        # write cycle so any failure (malformed embfile entry, MinIO
+        # error, MagicMock duck-typing edge case in tests) records a
+        # structured warning and moves on rather than aborting the
+        # whole document.
+        try:
+            info = doc.embfile_info(i)
+            name = info.get("filename") or f"attachment-{i}"
+            mime = info.get("mime") or "application/octet-stream"
+            data = doc.embfile_get(i)
+            if not isinstance(data, (bytes, bytearray)):
+                raise TypeError(
+                    f"embfile_get({i}) returned {type(data).__name__}, "
+                    f"expected bytes-like"
+                )
+            sha256 = hashlib.sha256(data).hexdigest()
+            # parent_filename is the human key (e.g. "main.pdf");
+            # the layer prefix is "episodic/" or "procedural/".
+            # MinIO key shape: "episodic/main.pdf/attachments/<name>".
+            attachment_key = f"{layer_prefix}{parent_filename}/attachments/{name}"
+            minio_client.put_object(
+                bucket,
+                attachment_key,
+                io.BytesIO(data),
+                length=len(data),
+            )
+        except Exception as exc:
+            warnings.append(
+                {
+                    "code": "attachment_quarantine_failed",
+                    "index": i,
+                    "error": type(exc).__name__,
+                }
+            )
+            continue
+        successes += 1
+        warnings.append(
+            {
+                "code": "attachment",
+                "name": name,
+                "mime": mime,
+                "size": len(data),
+                "sha256": sha256,
+                "minio_key": attachment_key,
+            }
+        )
+    return successes, warnings
+
+
+def _acroform_text_for_page(page: Any) -> tuple[str | None, int]:
+    """Return ``(text, count)`` rendered from AcroForm widgets on *page*.
+
+    Tier-B item #7. Concatenates ``Label: Value`` lines in widget
+    order. Returns ``(None, 0)`` when the page has no widgets — caller
+    can fall back to plain text-layer extraction. The page's normal
+    text is chunked separately; form-field text is its own chunk so
+    embeddings carry the label-value semantic anchor (per ADR-050 §#7).
+    """
+    try:
+        widgets = list(page.widgets() or [])
+    except Exception:
+        return None, 0
+    if not widgets:
+        return None, 0
+    lines: list[str] = []
+    count = 0
+    for w in widgets:
+        # pymupdf Widget exposes field_name + field_value + field_label
+        # (the latter is the human-readable display string when the
+        # PDF carries one, else None).
+        name = getattr(w, "field_name", None) or ""
+        value = getattr(w, "field_value", None)
+        label = getattr(w, "field_label", None) or name
+        if value is None or value == "":
+            # Empty fields contribute no semantic signal — skip rather
+            # than emit "Label: " noise that pollutes the embedding.
+            continue
+        lines.append(f"{label}: {value}".strip())
+        count += 1
+    if not lines:
+        return None, 0
+    return "\n".join(lines), count
+
+
+def _ocr_render_page(
+    page: Any,
+    *,
+    enabled: bool,
+    languages: str,
+    dpi: int,
+) -> tuple[str, str, float]:
+    """Run Tesseract OCR on *page* if it has raster content but no text.
+
+    Tier-B item #1. Returns ``(text, text_source, confidence)`` where:
+
+    * ``text_source`` ∈ {``"native"``, ``"ocr"``, ``"no_text_layer"``}.
+      ``"native"`` is the no-op return for callers that pre-checked
+      and decided OCR isn't needed. ``"no_text_layer"`` signals a
+      raster page where OCR was unavailable (binary missing) or
+      returned empty; caller should emit an extraction warning.
+    * ``confidence`` is Tesseract's mean per-word confidence in
+      [0.0, 1.0]; 1.0 for the native short-circuit; 0.0 for
+      no_text_layer.
+
+    Graceful degradation: if pytesseract is not importable OR the
+    tesseract binary is missing OR rendering fails, return
+    ``("", "no_text_layer", 0.0)`` — caller logs the warning, the
+    page produces zero chunks, processing continues. Per ADR-050 §#1.
+    """
+    if not enabled:
+        return ("", "no_text_layer", 0.0)
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return ("", "no_text_layer", 0.0)
+    try:
+        # Render the page to a 300-DPI raster. pymupdf's get_pixmap
+        # returns a Pixmap; we convert to PNG bytes then to PIL.Image
+        # for pytesseract's image_to_data API.
+        pix = page.get_pixmap(dpi=dpi)
+        png_bytes = pix.tobytes("png")
+        img = Image.open(io.BytesIO(png_bytes))
+        # image_to_data returns word-level results with confidences.
+        # The mean of the (non -1) confidences is the cleanest signal.
+        data = pytesseract.image_to_data(
+            img, lang=languages, output_type=pytesseract.Output.DICT
+        )
+    except Exception as exc:
+        logger.debug("OCR unavailable for page: %s", exc)
+        return ("", "no_text_layer", 0.0)
+    words: list[str] = []
+    confidences: list[float] = []
+    for word, conf in zip(data.get("text", []), data.get("conf", []), strict=False):
+        if not word or not word.strip():
+            continue
+        try:
+            conf_value = float(conf)
+        except (TypeError, ValueError):
+            continue
+        if conf_value < 0:
+            # Tesseract emits -1 for "no recognition"; skip.
+            continue
+        words.append(word)
+        confidences.append(conf_value)
+    if not words:
+        return ("", "no_text_layer", 0.0)
+    text = " ".join(words)
+    mean_conf = (sum(confidences) / len(confidences)) / 100.0
+    return (text, "ocr", round(mean_conf, 3))
+
+
 def _index_pdf_objects(
     collection: Any,
     minio_client: Any,
@@ -583,6 +829,7 @@ def _index_pdf_objects(
     layer_prefix: str,
     user_id: str,
     ingestion_ts_ms: int,
+    manifest_service: Any | None = None,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -604,11 +851,25 @@ def _index_pdf_objects(
     (docs/architecture/pdf-ingestion-gaps.md §2.6). Both ChromaDB
     and Postgres can answer "who ingested this chunk and when" from
     the chunk row alone.
+
+    *manifest_service* (tier-B item #22) — when supplied, every PDF
+    processed yields one ``upsert_pdf_metadata`` call carrying
+    page_count, signature_status, ocr_coverage_pct, attachment_count,
+    form_field_count, the structured ``extraction_warnings`` list,
+    and document_sha256. Pre-tier-B callers passing ``None`` skip
+    the manifest write — backward-compatible during the rollout
+    window. Production wiring always supplies the service.
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
     settings = get_settings()
     max_size_bytes = settings.pdf_max_size_mb * 1024 * 1024
+
+    # Layer for manifest writes. The function takes ``layer_prefix``
+    # as ``"episodic/"`` / ``"procedural/"``; strip the trailing slash
+    # for the manifest's ``layer`` column.
+    manifest_layer = layer_prefix.rstrip("/")
+
     total = 0
     for obj in objects:
         if not obj["filename"].lower().endswith(".pdf"):
@@ -616,6 +877,17 @@ def _index_pdf_objects(
         raw = _read_minio_object(minio_client, bucket, obj["key"])
         if raw is None:
             continue
+
+        # Per-document state — accumulated through the per-page loop
+        # and flushed to the manifest at end-of-file. Reset per file
+        # so a previous bomb-rejected document never bleeds into the
+        # next one.
+        warnings: list[dict[str, Any]] = []
+        attachment_count_doc = 0
+        form_field_count_doc = 0
+        ocr_pages_doc = 0
+        page_count_doc: int | None = None
+
         # Item #18 — bomb defense layer 1: raw byte-size cap. Catches
         # the simplest case (operator drag-drops a 2 GiB file). The
         # check fires before pymupdf.open so a small file claiming
@@ -632,6 +904,27 @@ def _index_pdf_objects(
                     "size_bytes": len(raw),
                     "cap_bytes": max_size_bytes,
                 },
+            )
+            warnings.append(
+                {
+                    "code": "max_size",
+                    "size_bytes": len(raw),
+                    "cap_bytes": max_size_bytes,
+                }
+            )
+            _flush_pdf_manifest(
+                manifest_service=manifest_service,
+                layer=manifest_layer,
+                key=obj["key"],
+                user_id=user_id,
+                size_bytes=len(raw),
+                page_count=None,
+                signature_status=None,
+                ocr_coverage_pct=None,
+                attachment_count=0,
+                form_field_count=0,
+                extraction_warnings=warnings,
+                document_sha256=None,
             )
             continue
         source_key = (
@@ -660,12 +953,39 @@ def _index_pdf_objects(
             # would otherwise reject the with-context here.
             doc_factory: Any = pymupdf.open
             with doc_factory(stream=raw, filetype="pdf") as doc:
+                # Tier-B item #15 — encrypted PDFs refused before any
+                # text extraction. ADR-050 §#15: no password-bearing
+                # endpoint; operator must decrypt out-of-band first.
+                if _pdf_is_encrypted(doc):
+                    logger.warning(
+                        "PDF %s rejected: encrypted (refusing — no "
+                        "password endpoint per ADR-050)",
+                        obj["key"],
+                        extra={"file": obj["key"], "reason": "encrypted"},
+                    )
+                    warnings.append({"code": "encrypted", "page": None})
+                    _flush_pdf_manifest(
+                        manifest_service=manifest_service,
+                        layer=manifest_layer,
+                        key=obj["key"],
+                        user_id=user_id,
+                        size_bytes=len(raw),
+                        page_count=None,
+                        signature_status=signature_status,
+                        ocr_coverage_pct=None,
+                        attachment_count=0,
+                        form_field_count=0,
+                        extraction_warnings=warnings,
+                        document_sha256=document_hash,
+                    )
+                    continue
                 # Item #18 — bomb defense layer 2: declared-shape caps.
                 # Read both page_count and xref_length from the document
                 # catalogue WITHOUT decompressing any stream — these are
                 # cheap dictionary lookups. A bomb declaring billions of
                 # pages or millions of xrefs is rejected here before any
                 # page is ever rendered.
+                page_count_doc = doc.page_count
                 if doc.page_count > settings.pdf_max_pages:
                     logger.warning(
                         "PDF %s rejected: page_count=%d exceeds pdf_max_pages=%d",
@@ -678,6 +998,27 @@ def _index_pdf_objects(
                             "page_count": doc.page_count,
                             "cap": settings.pdf_max_pages,
                         },
+                    )
+                    warnings.append(
+                        {
+                            "code": "max_pages",
+                            "page_count": doc.page_count,
+                            "cap": settings.pdf_max_pages,
+                        }
+                    )
+                    _flush_pdf_manifest(
+                        manifest_service=manifest_service,
+                        layer=manifest_layer,
+                        key=obj["key"],
+                        user_id=user_id,
+                        size_bytes=len(raw),
+                        page_count=page_count_doc,
+                        signature_status=signature_status,
+                        ocr_coverage_pct=None,
+                        attachment_count=0,
+                        form_field_count=0,
+                        extraction_warnings=warnings,
+                        document_sha256=document_hash,
                     )
                     continue
                 xref_count = doc.xref_length()
@@ -694,7 +1035,42 @@ def _index_pdf_objects(
                             "cap": settings.pdf_max_xref_count,
                         },
                     )
+                    warnings.append(
+                        {
+                            "code": "max_xref",
+                            "xref_count": xref_count,
+                            "cap": settings.pdf_max_xref_count,
+                        }
+                    )
+                    _flush_pdf_manifest(
+                        manifest_service=manifest_service,
+                        layer=manifest_layer,
+                        key=obj["key"],
+                        user_id=user_id,
+                        size_bytes=len(raw),
+                        page_count=page_count_doc,
+                        signature_status=signature_status,
+                        ocr_coverage_pct=None,
+                        attachment_count=0,
+                        form_field_count=0,
+                        extraction_warnings=warnings,
+                        document_sha256=document_hash,
+                    )
                     continue
+                # Tier-B item #6 — quarantine embedded attachments
+                # (PDF/A-3, ZUGFeRD, evidence bundles). Done before
+                # the page loop because attachments are document-level.
+                # Per ADR-050 §#6: write to MinIO, emit
+                # ``{"code":"attachment", ...}`` warnings, do not
+                # recurse into PDF-typed attachments.
+                attachment_count_doc, attachment_warnings = _quarantine_pdf_attachments(
+                    doc,
+                    parent_filename=source_key,
+                    layer_prefix=layer_prefix,
+                    minio_client=minio_client,
+                    bucket=bucket,
+                )
+                warnings.extend(attachment_warnings)
                 # Item #18 — bomb defense layer 3: wall-clock budget.
                 # Page-boundary granularity (signal.alarm doesn't work
                 # in FastAPI's worker-thread pool). A single pathological
@@ -715,6 +1091,12 @@ def _index_pdf_objects(
                                 "reason": "parse_timeout",
                                 "pages_processed": page_num - 1,
                             },
+                        )
+                        warnings.append(
+                            {
+                                "code": "parse_timeout",
+                                "pages_processed": page_num - 1,
+                            }
                         )
                         break
                     # Item #8 — unflattened redaction handling. Detect
@@ -740,6 +1122,13 @@ def _index_pdf_objects(
                                     "policy": "reject",
                                 },
                             )
+                            warnings.append(
+                                {
+                                    "code": "redaction_rejected",
+                                    "page": page_num,
+                                    "redaction_count": len(redaction_rects),
+                                }
+                            )
                             # Whole-file abort, not per-page skip — the
                             # gap-doc directive is "reject the document"
                             # (item #8). One leaky page = whole doc.
@@ -760,6 +1149,13 @@ def _index_pdf_objects(
                                     "redaction_count": len(redaction_rects),
                                     "policy": "clip-extract",
                                 },
+                            )
+                            warnings.append(
+                                {
+                                    "code": "redaction_clipped",
+                                    "page": page_num,
+                                    "redaction_count": len(redaction_rects),
+                                }
                             )
                         else:
                             # Unknown policy value: log + reject for
@@ -797,11 +1193,90 @@ def _index_pdf_objects(
                                 "cap": settings.pdf_max_page_text_bytes,
                             },
                         )
+                        warnings.append(
+                            {
+                                "code": "max_page_text",
+                                "page": page_num,
+                                "extracted_bytes": len(text),
+                                "cap": settings.pdf_max_page_text_bytes,
+                            }
+                        )
                         continue
                     text = text.strip()
+                    # Tier-B item #1 — OCR fallback for raster-only
+                    # pages. Triggered only when the native text-layer
+                    # extraction is empty AND the page carries images.
+                    # Per ADR-050 §#1: graceful degradation if Tesseract
+                    # binary missing — page produces zero chunks but
+                    # the warning is recorded.
+                    text_source = "native"
+                    extraction_confidence = 1.0
                     if not text:
+                        try:
+                            has_images = bool(page.get_images(full=False))
+                        except Exception:
+                            has_images = False
+                        if has_images:
+                            ocr_text, ocr_source, ocr_conf = _ocr_render_page(
+                                page,
+                                enabled=settings.pdf_ocr_enabled,
+                                languages=settings.pdf_ocr_languages,
+                                dpi=settings.pdf_ocr_dpi,
+                            )
+                            if ocr_source == "ocr" and ocr_text:
+                                text = ocr_text
+                                text_source = "ocr"
+                                extraction_confidence = ocr_conf
+                                ocr_pages_doc += 1
+                                if ocr_conf < 0.6:
+                                    warnings.append(
+                                        {
+                                            "code": "ocr_low_confidence",
+                                            "page": page_num,
+                                            "confidence": ocr_conf,
+                                        }
+                                    )
+                            else:
+                                # Raster-only page, OCR unavailable or
+                                # produced nothing — the silent-data-
+                                # loss case the gap inventory cites.
+                                # Record + skip; do not pretend the
+                                # page is empty.
+                                warnings.append(
+                                    {
+                                        "code": "no_text_layer",
+                                        "page": page_num,
+                                    }
+                                )
+                                continue
+                        else:
+                            # Truly empty page (no text layer, no
+                            # images) — benign, no warning needed.
+                            continue
+                    # Tier-B item #7 — AcroForm widget extraction.
+                    # Form-field text emits its own chunk so the
+                    # embedding carries the label-value semantic
+                    # anchor (per ADR-050 §#7). The page's natural
+                    # text is chunked separately below.
+                    form_text, form_count = _acroform_text_for_page(page)
+                    if form_text and form_count > 0:
+                        form_field_count_doc += form_count
+                        warnings.append(
+                            {
+                                "code": "form_fields",
+                                "page": page_num,
+                                "field_count": form_count,
+                            }
+                        )
+                    if not text and not form_text:
                         continue
-                    chunks = _chunk_text(text)
+                    chunks = _chunk_text(text) if text else []
+                    if form_text:
+                        # Append form-field text as a dedicated chunk
+                        # at the end of the page's chunk list so
+                        # downstream callers can identify it via the
+                        # ``chunk_type`` metadata field.
+                        chunks.append(form_text)
                     if not chunks:
                         continue
                     bbox_x0, bbox_y0, bbox_x1, bbox_y1 = _page_bbox(page)
@@ -809,6 +1284,11 @@ def _index_pdf_objects(
                         _doc_id(col_name, f"{source_key}:p{page_num}", i)
                         for i in range(len(chunks))
                     ]
+                    # Form-field chunk (always last when present)
+                    # gets ``chunk_type=form_field``; preceding chunks
+                    # are normal text or OCR — already disambiguated
+                    # by ``text_source``.
+                    form_idx = len(chunks) - 1 if form_text else -1
                     metadatas: list[dict[str, Any]] = [
                         {
                             "source": obj["filename"],
@@ -818,35 +1298,102 @@ def _index_pdf_objects(
                             "page": page_num,
                             "chunk": i,
                             # Item #21 — per-chunk provenance fields.
-                            # Flattened (bbox_x0..y1) for ChromaDB
-                            # queryability since metadata only accepts
-                            # str|int|float|bool. Static defaults below
-                            # (text_source="native", confidence=1.0,
-                            # signature_status="unknown") will be
-                            # overridden by future commits in this
-                            # tier-A series — #1 (OCR fallback) flips
-                            # text_source; #12 (signature validity)
-                            # flips signature_status.
+                            # Tier-B completes this set: ``text_source``
+                            # now flips to ``"ocr"`` for OCR'd pages
+                            # (was always ``"native"`` in tier-A); the
+                            # per-chunk ``extraction_confidence``
+                            # carries Tesseract's mean-per-word
+                            # confidence on OCR pages.
                             "bbox_x0": bbox_x0,
                             "bbox_y0": bbox_y0,
                             "bbox_x1": bbox_x1,
                             "bbox_y1": bbox_y1,
-                            "text_source": "native",
-                            "extraction_confidence": 1.0,
+                            "text_source": (
+                                "form_field" if i == form_idx else text_source
+                            ),
+                            "extraction_confidence": extraction_confidence,
                             "document_hash": document_hash,
                             "signature_status": signature_status,
                             "redaction_status": redaction_status,
                             "ingested_by_user_id": user_id,
                             "ingestion_ts_ms": ingestion_ts_ms,
+                            "chunk_type": ("form_field" if i == form_idx else "text"),
                         }
                         for i in range(len(chunks))
                     ]
                     _upsert_in_batches(collection, ids, chunks, metadatas)
                     total += len(chunks)
+            # Successful (or partial) processing — flush manifest.
+            ocr_coverage_pct: float | None = None
+            if page_count_doc and page_count_doc > 0:
+                ocr_coverage_pct = round((ocr_pages_doc / page_count_doc) * 100.0, 2)
+            _flush_pdf_manifest(
+                manifest_service=manifest_service,
+                layer=manifest_layer,
+                key=obj["key"],
+                user_id=user_id,
+                size_bytes=len(raw),
+                page_count=page_count_doc,
+                signature_status=signature_status,
+                ocr_coverage_pct=ocr_coverage_pct,
+                attachment_count=attachment_count_doc,
+                form_field_count=form_field_count_doc,
+                extraction_warnings=warnings,
+                document_sha256=document_hash,
+            )
         except Exception as exc:
             logger.warning("Failed to process PDF %s: %s", obj["key"], exc)
             continue
     return total
+
+
+def _flush_pdf_manifest(
+    *,
+    manifest_service: Any | None,
+    layer: str,
+    key: str,
+    user_id: str,
+    size_bytes: int,
+    page_count: int | None,
+    signature_status: str | None,
+    ocr_coverage_pct: float | None,
+    attachment_count: int,
+    form_field_count: int,
+    extraction_warnings: list[dict[str, Any]],
+    document_sha256: str | None,
+) -> None:
+    """Best-effort manifest write for one PDF (tier-B item #22).
+
+    Skips silently when ``manifest_service is None`` (pre-tier-B
+    callers, unit tests that patch out the manifest path). Logs but
+    does not re-raise on Postgres failure — the chunks were already
+    written to ChromaDB; a manifest miss should not undo that. The
+    audit trail's resiliency requirement (the chunks are queryable
+    even without a manifest row) trumps strict consistency here.
+    """
+    if manifest_service is None:
+        return
+    try:
+        manifest_service.upsert_pdf_metadata(
+            layer,
+            key,
+            user_id=user_id,
+            size_bytes=size_bytes,
+            page_count=page_count,
+            signature_status=signature_status,
+            ocr_coverage_pct=ocr_coverage_pct,
+            attachment_count=attachment_count,
+            form_field_count=form_field_count,
+            extraction_warnings=extraction_warnings,
+            document_sha256=document_sha256,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to write PDF manifest for %s/%s: %s",
+            layer,
+            key,
+            exc,
+        )
 
 
 # `def` (NOT `async def`) is deliberate. The body holds CPU-bound
@@ -1018,6 +1565,12 @@ def index_memory(
                 category="procedural",
             )
         if col_name == "ai_research_papers":
+            # Tier-B item #22: thread the manifest service in so each
+            # processed PDF lands one ``upsert_pdf_metadata`` call
+            # carrying page_count, signature_status, ocr_coverage_pct,
+            # attachment_count, form_field_count, extraction_warnings,
+            # document_sha256.
+            manifest_service = get_memory_manifest_service()
             chunk_count += _index_pdf_objects(
                 collection,
                 minio_client,
@@ -1028,6 +1581,7 @@ def index_memory(
                 layer_prefix="episodic/",
                 user_id=user.user_id,
                 ingestion_ts_ms=ingestion_ts_ms,
+                manifest_service=manifest_service,
             )
             chunk_count += _index_pdf_objects(
                 collection,
@@ -1039,6 +1593,7 @@ def index_memory(
                 layer_prefix="procedural/",
                 user_id=user.user_id,
                 ingestion_ts_ms=ingestion_ts_ms,
+                manifest_service=manifest_service,
             )
 
         results[col_name] = chunk_count

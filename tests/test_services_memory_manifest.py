@@ -275,10 +275,20 @@ class TestManifestEntryFromRow:
             modified_by_user_id="u",
             deleted_at_ms=None,
             deleted_by_user_id=None,
+            # Tier-B PDF columns (ADR-050 #22) — None for non-PDF rows.
+            page_count=None,
+            signature_status=None,
+            ocr_coverage_pct=None,
+            attachment_count=None,
+            form_field_count=None,
+            extraction_warnings=None,
+            document_sha256=None,
         )
         e = ManifestEntry.from_row(row)
         assert e.id == "abc"
         assert e.size_bytes == 42
+        assert e.page_count is None
+        assert e.attachment_count is None
 
 
 # ── Postgres-backed MemoryManifestService (uses InMemoryPostgresFactory) ─────
@@ -498,3 +508,213 @@ class TestTelemetryCoverage:
                 assert hasattr(method, "__wrapped__"), (
                     f"{cls.__name__}.{method_name} is not @log_call-decorated"
                 )
+
+
+# ── Tier-B (ADR-050 #22): upsert_pdf_metadata coverage ──────────────────────
+
+
+class TestMockUpsertPdfMetadata:
+    """Tier-B item #22 — ``MockMemoryManifestService.upsert_pdf_metadata``
+    creates rows when none exist + updates fields when one does, on
+    both code paths."""
+
+    def test_first_call_creates_row_with_pdf_columns(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        entry = manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="user-1",
+            size_bytes=12345,
+            page_count=46,
+            signature_status="signed_invalid",
+            ocr_coverage_pct=12.5,
+            attachment_count=2,
+            form_field_count=0,
+            extraction_warnings=[
+                {"code": "no_text_layer", "page": 5},
+                {"code": "ocr_low_confidence", "page": 7, "confidence": 0.42},
+            ],
+            document_sha256="a" * 64,
+        )
+        assert entry.layer == "episodic"
+        assert entry.key == "main.pdf"
+        assert entry.page_count == 46
+        assert entry.signature_status == "signed_invalid"
+        assert entry.ocr_coverage_pct == 12.5
+        assert entry.attachment_count == 2
+        assert entry.form_field_count == 0
+        assert entry.document_sha256 == "a" * 64
+        assert entry.extraction_warnings is not None
+        assert len(entry.extraction_warnings) == 2
+        assert entry.extraction_warnings[0]["code"] == "no_text_layer"
+
+    def test_subsequent_call_updates_fields_keeps_authorship(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        # First call as user-1
+        manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="user-1",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="b" * 64,
+        )
+        # Second call as user-2 — bumps modified_*, keeps created_*.
+        e2 = manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="user-2",
+            size_bytes=200,
+            page_count=20,
+            signature_status="signed_valid",
+            ocr_coverage_pct=50.0,
+            attachment_count=1,
+            form_field_count=3,
+            extraction_warnings=[{"code": "attachment", "name": "x.xml"}],
+            document_sha256="c" * 64,
+        )
+        assert e2.created_by_user_id == "user-1"  # preserved
+        assert e2.modified_by_user_id == "user-2"  # bumped
+        assert e2.page_count == 20  # updated
+        assert e2.attachment_count == 1
+        assert e2.form_field_count == 3
+        assert e2.size_bytes == 200
+
+    def test_rejects_invalid_layer(self, manifest: MockMemoryManifestService) -> None:
+        with pytest.raises(ValueError):
+            manifest.upsert_pdf_metadata(
+                "bogus-layer",
+                "x.pdf",
+                user_id="u",
+                size_bytes=1,
+                page_count=1,
+                signature_status="check_skipped",
+                ocr_coverage_pct=None,
+                attachment_count=0,
+                form_field_count=0,
+                extraction_warnings=[],
+                document_sha256=None,
+            )
+
+    def test_warnings_round_trip_through_to_dict(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        warnings = [
+            {"code": "encrypted", "page": None},
+            {
+                "code": "attachment",
+                "name": "invoice.xml",
+                "mime": "application/xml",
+                "size": 1024,
+                "sha256": "d" * 64,
+                "minio_key": "episodic/main.pdf/attachments/invoice.xml",
+            },
+        ]
+        entry = manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="u",
+            size_bytes=1,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=1,
+            form_field_count=0,
+            extraction_warnings=warnings,
+            document_sha256="e" * 64,
+        )
+        d = entry.to_dict()
+        assert d["extraction_warnings"] == warnings
+        assert d["page_count"] == 1
+        assert d["attachment_count"] == 1
+
+
+class TestPostgresUpsertPdfMetadata:
+    """End-to-end tier-B #22 against the real Postgres-backed service.
+    Mirrors the Mock suite so the production code path is exercised."""
+
+    def test_create_writes_pdf_columns(self, pg_manifest) -> None:
+        entry = pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="alice",
+            size_bytes=12345,
+            page_count=46,
+            signature_status="signed_invalid",
+            ocr_coverage_pct=12.5,
+            attachment_count=2,
+            form_field_count=0,
+            extraction_warnings=[
+                {"code": "no_text_layer", "page": 5},
+            ],
+            document_sha256="a" * 64,
+        )
+        assert entry.page_count == 46
+        # Round-trip: fetch via get() and verify the same shape.
+        got = pg_manifest.get("episodic", "main.pdf")
+        assert got is not None
+        assert got.signature_status == "signed_invalid"
+        assert got.attachment_count == 2
+        assert got.extraction_warnings == [{"code": "no_text_layer", "page": 5}]
+
+    def test_update_preserves_created_by(self, pg_manifest) -> None:
+        pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="alice",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="b" * 64,
+        )
+        e2 = pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="bob",
+            size_bytes=200,
+            page_count=20,
+            signature_status="signed_valid",
+            ocr_coverage_pct=50.0,
+            attachment_count=1,
+            form_field_count=2,
+            extraction_warnings=[],
+            document_sha256="c" * 64,
+        )
+        assert e2.created_by_user_id == "alice"
+        assert e2.modified_by_user_id == "bob"
+        assert e2.page_count == 20
+
+    def test_update_after_crud_create_carries_over(self, pg_manifest) -> None:
+        """Common flow: operator first POSTs to /memory/episodic
+        (record_create), THEN runs /memory/index which writes PDF
+        metadata. The second call must update — not duplicate — the
+        same row."""
+        pg_manifest.record_create("episodic", "main.pdf", "Main paper", 100, "alice")
+        e = pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "main.pdf",
+            user_id="indexer",
+            size_bytes=200,
+            page_count=46,
+            signature_status="signed_invalid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="d" * 64,
+        )
+        # Same row — created_by stays as the original creator.
+        assert e.created_by_user_id == "alice"
+        assert e.title == "Main paper"  # preserved by upsert path
+        assert e.page_count == 46  # populated by upsert

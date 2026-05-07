@@ -16,8 +16,26 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
-# curl needed for healthcheck
-RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+# curl for healthcheck; tesseract + language packs for tier-B item #1
+# (OCR fallback on raster-only PDF pages, ADR-050).
+#
+# Image-size cost: tesseract-ocr (~30 MB) + four language packs
+# (~10 MB each) ≈ 65 MB total. Default languages = English + the
+# three CH national languages (de/fr/it). Adding a language is a
+# one-line change here; keeping the default minimal preserves
+# cold-start time.
+#
+# pytesseract (the Python binding) lives in requirements.txt; without
+# this apt install the Python helper falls through to the
+# ``no_text_layer`` graceful-degradation branch — see
+# ``_ocr_render_page`` in routes/memory.py.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        tesseract-ocr-deu \
+        tesseract-ocr-fra \
+        tesseract-ocr-ita && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security

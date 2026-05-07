@@ -2708,3 +2708,582 @@ class TestConversationalLayer:
         r = client.get("/memory/conversational/does-not-exist")
         assert r.status_code == 404
         assert "not found" in r.json()["detail"].lower()
+
+
+# ── Tier-B: PDF robustness (ADR-050) ─────────────────────────────────────────
+
+
+class TestExtractionWarningCodes:
+    """Closed-set discipline on the JSONB ``extraction_warnings.code``
+    enum. Adding a new code without an ADR-050 amendment is a quiet
+    documentation drift; this test pins the set so the drift surfaces
+    in CI."""
+
+    def test_warning_codes_match_adr_050_closed_set(self) -> None:
+        from audittrace.routes.memory import _PDF_WARNING_CODES
+
+        # The exact set documented in ADR-050 §extraction_warnings.
+        # Adding a code: bump the ADR + add it here. Removing one:
+        # same. CI fails the diff if these drift.
+        expected = {
+            # tier-A bomb defenses (item #18)
+            "max_size",
+            "max_pages",
+            "max_xref",
+            "max_page_text",
+            "parse_timeout",
+            # tier-A redaction (item #8)
+            "redaction_clipped",
+            "redaction_rejected",
+            # tier-B (this PR)
+            "encrypted",
+            "no_text_layer",
+            "ocr_low_confidence",
+            "attachment",
+            "attachment_quarantine_failed",
+            "form_fields",
+        }
+        assert _PDF_WARNING_CODES == expected
+
+
+class TestPdfIsEncrypted:
+    """Direct unit tests for ``_pdf_is_encrypted`` (tier-B item #15)."""
+
+    def test_real_bool_attrs_detected(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _pdf_is_encrypted
+
+        encrypted = SimpleNamespace(is_encrypted=True, needs_pass=True)
+        assert _pdf_is_encrypted(encrypted) is True
+
+    def test_clear_pdf_returns_false(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _pdf_is_encrypted
+
+        clear = SimpleNamespace(is_encrypted=False, needs_pass=False)
+        assert _pdf_is_encrypted(clear) is False
+
+    def test_encrypted_but_authenticated_is_not_refused(self) -> None:
+        """An owner-password PDF (encrypted, but password not required
+        to read) returns False — pymupdf can read content, we proceed."""
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _pdf_is_encrypted
+
+        owner_pwd = SimpleNamespace(is_encrypted=True, needs_pass=False)
+        assert _pdf_is_encrypted(owner_pwd) is False
+
+    def test_magicmock_attrs_evaluate_false(self) -> None:
+        """Defensive: MagicMock attrs must NOT be treated as truthy.
+        Test fixtures throughout the suite would otherwise be rejected
+        as encrypted."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _pdf_is_encrypted
+
+        m = MagicMock()
+        # Attributes accessed on a default MagicMock return more
+        # MagicMocks (truthy by default). We rely on strict ``is True``
+        # comparison to evaluate as False here.
+        assert _pdf_is_encrypted(m) is False
+
+
+class TestPdfEncryptedReject:
+    """Tier-B item #15 — encrypted PDFs refuse with 0 chunks +
+    extraction_warning, no password endpoint exposed."""
+
+    def test_encrypted_pdf_yields_zero_chunks_and_warning(
+        self, client: TestClient
+    ) -> None:
+        # Direct-ish unit test: feed an encrypted document into the
+        # helper and assert the warning shape. The route-level path
+        # is covered by TestPdfManifestColumns below — keeping this
+        # one focused so failures localise.
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest, _pdf_is_encrypted
+
+        encrypted_doc = SimpleNamespace(is_encrypted=True, needs_pass=True)
+        assert _pdf_is_encrypted(encrypted_doc) is True
+
+        # Flush a manifest with the encrypted-warning shape and
+        # verify the structured entry.
+        manifest = MagicMock()
+        _flush_pdf_manifest(
+            manifest_service=manifest,
+            layer="episodic",
+            key="episodic/locked.pdf",
+            user_id="u",
+            size_bytes=4096,
+            page_count=None,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[{"code": "encrypted", "page": None}],
+            document_sha256="abc123",
+        )
+        manifest.upsert_pdf_metadata.assert_called_once()
+        call = manifest.upsert_pdf_metadata.call_args
+        assert call.args == ("episodic", "episodic/locked.pdf")
+        assert call.kwargs["page_count"] is None
+        assert call.kwargs["extraction_warnings"] == [
+            {"code": "encrypted", "page": None}
+        ]
+        # Critical contract: the function name does NOT carry a
+        # ``password`` parameter (per ADR-050 §#15: no password
+        # endpoint, ever).
+        import inspect
+
+        from audittrace.routes.memory import upload_memory_file
+
+        sig = inspect.signature(upload_memory_file)
+        assert "password" not in sig.parameters
+
+
+class TestAcroFormHelper:
+    """Tier-B item #7 — AcroForm widget extraction returns
+    label/value pairs as a single page-level chunk."""
+
+    def test_widgets_present_yields_text_and_count(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _acroform_text_for_page
+
+        widgets = [
+            SimpleNamespace(
+                field_name="name", field_label="Full name", field_value="Alice"
+            ),
+            SimpleNamespace(
+                field_name="dob", field_label="Date of birth", field_value="2000-01-01"
+            ),
+            # Empty value — should be skipped (no semantic signal)
+            SimpleNamespace(
+                field_name="middle", field_label="Middle name", field_value=""
+            ),
+        ]
+        page = MagicMock()
+        page.widgets.return_value = widgets
+        text, count = _acroform_text_for_page(page)
+        assert count == 2
+        assert "Full name: Alice" in text
+        assert "Date of birth: 2000-01-01" in text
+        # Empty field omitted.
+        assert "Middle name" not in text
+
+    def test_no_widgets_returns_none(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _acroform_text_for_page
+
+        page = MagicMock()
+        page.widgets.return_value = []
+        text, count = _acroform_text_for_page(page)
+        assert text is None
+        assert count == 0
+
+    def test_widgets_call_failure_returns_none(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _acroform_text_for_page
+
+        page = MagicMock()
+        page.widgets.side_effect = RuntimeError("malformed widget tree")
+        text, count = _acroform_text_for_page(page)
+        assert text is None
+        assert count == 0
+
+
+class TestAttachmentQuarantine:
+    """Tier-B item #6 — embedded attachments are extracted to MinIO
+    and recorded as structured warnings."""
+
+    def test_two_attachments_quarantined(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _quarantine_pdf_attachments
+
+        # Real bytes payloads so hashlib.sha256 + io.BytesIO work
+        # without the defensive fallback firing.
+        invoice_bytes = b"<?xml version='1.0'?><Invoice/>"
+        evidence_bytes = b"binary-evidence-bundle"
+
+        doc = MagicMock()
+        doc.embfile_count.return_value = 2
+        doc.embfile_info.side_effect = [
+            {"filename": "invoice.xml", "mime": "application/xml"},
+            {"filename": "evidence.bin", "mime": "application/octet-stream"},
+        ]
+        doc.embfile_get.side_effect = [invoice_bytes, evidence_bytes]
+
+        minio_client = MagicMock()
+        count, warnings = _quarantine_pdf_attachments(
+            doc,
+            parent_filename="main.pdf",
+            layer_prefix="episodic/",
+            minio_client=minio_client,
+            bucket="memory-shared",
+        )
+        assert count == 2
+        assert len(warnings) == 2
+        # Both succeeded — codes should be ``attachment``, not
+        # ``attachment_quarantine_failed``.
+        assert all(w["code"] == "attachment" for w in warnings)
+        assert warnings[0]["name"] == "invoice.xml"
+        assert warnings[0]["mime"] == "application/xml"
+        assert warnings[0]["minio_key"] == "episodic/main.pdf/attachments/invoice.xml"
+        assert warnings[0]["size"] == len(invoice_bytes)
+        # MinIO put_object called twice with the right bucket + keys.
+        assert minio_client.put_object.call_count == 2
+
+    def test_no_embedded_files_returns_zero(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _quarantine_pdf_attachments
+
+        doc = MagicMock()
+        doc.embfile_count.return_value = 0
+        minio_client = MagicMock()
+        count, warnings = _quarantine_pdf_attachments(
+            doc,
+            parent_filename="main.pdf",
+            layer_prefix="episodic/",
+            minio_client=minio_client,
+            bucket="memory-shared",
+        )
+        assert count == 0
+        assert warnings == []
+        assert minio_client.put_object.call_count == 0
+
+    def test_minio_failure_records_quarantine_failed_warning(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _quarantine_pdf_attachments
+
+        doc = MagicMock()
+        doc.embfile_count.return_value = 1
+        doc.embfile_info.return_value = {"filename": "x.bin", "mime": "x"}
+        doc.embfile_get.return_value = b"data"
+
+        minio_client = MagicMock()
+        minio_client.put_object.side_effect = RuntimeError("MinIO down")
+
+        count, warnings = _quarantine_pdf_attachments(
+            doc,
+            parent_filename="main.pdf",
+            layer_prefix="episodic/",
+            minio_client=minio_client,
+            bucket="memory-shared",
+        )
+        assert count == 0
+        assert len(warnings) == 1
+        assert warnings[0]["code"] == "attachment_quarantine_failed"
+
+    def test_excessive_attachment_count_capped(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _quarantine_pdf_attachments
+
+        doc = MagicMock()
+        doc.embfile_count.return_value = 10_000
+        minio_client = MagicMock()
+        count, warnings = _quarantine_pdf_attachments(
+            doc,
+            parent_filename="main.pdf",
+            layer_prefix="episodic/",
+            minio_client=minio_client,
+            bucket="memory-shared",
+        )
+        assert count == 0
+        assert len(warnings) == 1
+        assert warnings[0]["code"] == "attachment_quarantine_failed"
+        assert warnings[0]["error"] == "too_many_attachments"
+        # Critical: never call put_object for any of the 10k declared.
+        assert minio_client.put_object.call_count == 0
+
+
+class TestOcrRenderPage:
+    """Tier-B item #1 — OCR fallback for raster-only pages."""
+
+    def test_ocr_disabled_returns_no_text_layer(self) -> None:
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _ocr_render_page
+
+        page = MagicMock()
+        text, source, conf = _ocr_render_page(
+            page, enabled=False, languages="eng", dpi=300
+        )
+        assert text == ""
+        assert source == "no_text_layer"
+        assert conf == 0.0
+
+    def test_pytesseract_missing_returns_no_text_layer(self) -> None:
+        """Graceful degradation: if pytesseract is not importable,
+        the helper returns a no_text_layer signal rather than crashing.
+        Simulated by patching the pytesseract import to raise."""
+        import builtins
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory import _ocr_render_page
+
+        real_import = builtins.__import__
+
+        def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "pytesseract":
+                raise ImportError("not installed")
+            return real_import(name, *args, **kwargs)
+
+        page = MagicMock()
+        with patch("builtins.__import__", side_effect=fake_import):
+            text, source, conf = _ocr_render_page(
+                page, enabled=True, languages="eng", dpi=300
+            )
+        assert text == ""
+        assert source == "no_text_layer"
+        assert conf == 0.0
+
+    def test_ocr_succeeds_returns_text_and_confidence(self) -> None:
+        """When Tesseract returns recognised words, the helper emits
+        the joined text + mean confidence in [0,1]."""
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory import _ocr_render_page
+
+        page = MagicMock()
+        # page.get_pixmap → pix; pix.tobytes → real PNG-ish bytes
+        # are not needed because we mock pytesseract.image_to_data.
+        page.get_pixmap.return_value.tobytes.return_value = b"fake-png-bytes"
+
+        fake_data = {
+            "text": ["Hello", "", "world", "!"],
+            "conf": [95, -1, 90, 80],
+        }
+        # We need PIL.Image.open to succeed; mock it to return a
+        # MagicMock the rest of the code path doesn't inspect.
+        with patch("audittrace.routes.memory.io.BytesIO") as mock_bytesio:
+            mock_bytesio.return_value = b"any"
+            with patch.dict(
+                "sys.modules",
+                {
+                    "pytesseract": MagicMock(
+                        image_to_data=MagicMock(return_value=fake_data),
+                        Output=MagicMock(DICT="dict"),
+                    ),
+                    "PIL": MagicMock(),
+                    "PIL.Image": MagicMock(),
+                },
+            ):
+                text, source, conf = _ocr_render_page(
+                    page, enabled=True, languages="eng", dpi=300
+                )
+        # "Hello" "world" "!" — the empty-word and -1-conf entries
+        # are filtered. Mean of [95, 90, 80] / 100 = 0.883.
+        assert source == "ocr"
+        assert "Hello" in text
+        assert "world" in text
+        # Mean conf is (95+90+80)/3/100 ≈ 0.883
+        assert 0.85 < conf < 0.90
+
+
+class TestPdfManifestColumnsLive:
+    """Tier-B item #22 — every successful PDF index call lands one
+    ``upsert_pdf_metadata`` row carrying the structured fields."""
+
+    def test_clean_pdf_index_writes_manifest_row(self, client: TestClient) -> None:
+        """End-to-end through the route: fake a clean 1-page PDF,
+        run /memory/index, assert manifest.upsert_pdf_metadata was
+        called once with the expected shape."""
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/clean.pdf")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text of clean page."
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        # Manifest service was called once for the single PDF.
+        mock_manifest.upsert_pdf_metadata.assert_called_once()
+        kwargs = mock_manifest.upsert_pdf_metadata.call_args.kwargs
+        # Tier-B columns are populated with the right shapes.
+        assert mock_manifest.upsert_pdf_metadata.call_args.args == (
+            "episodic",
+            "episodic/clean.pdf",
+        )
+        assert kwargs["page_count"] == 1
+        assert kwargs["attachment_count"] == 0
+        assert kwargs["form_field_count"] == 0
+        assert kwargs["ocr_coverage_pct"] == 0.0
+        # document_sha256 matches the raw bytes hash.
+        import hashlib
+
+        assert kwargs["document_sha256"] == hashlib.sha256(raw_bytes).hexdigest()
+        # Warnings list is empty for a clean document.
+        assert kwargs["extraction_warnings"] == []
+
+    def test_encrypted_pdf_writes_manifest_with_warning(
+        self, client: TestClient
+    ) -> None:
+        """An encrypted PDF: no chunks emitted, but the manifest
+        still records the refusal so an auditor can answer 'why
+        did this PDF produce zero chunks?'."""
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 encrypted-stub"
+
+        mock_minio = MagicMock()
+        mock_minio.list_objects.side_effect = lambda bucket, prefix="", **_: (
+            [_mock_minio_object("episodic/locked.pdf")] if prefix == "episodic/" else []
+        )
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        fake_doc = MagicMock()
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.is_encrypted = True
+        fake_doc.needs_pass = True
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        # Zero chunks (encrypted file is refused).
+        assert mock_collection.upsert.call_count == 0
+        # Manifest still recorded the refusal — that's the audit-grade
+        # contract: every indexed key gets a manifest row, even on refuse.
+        mock_manifest.upsert_pdf_metadata.assert_called_once()
+        warnings = mock_manifest.upsert_pdf_metadata.call_args.kwargs[
+            "extraction_warnings"
+        ]
+        assert any(w.get("code") == "encrypted" for w in warnings)
+
+
+class TestPdfFlushManifest:
+    """Tier-B item #22 — ``_flush_pdf_manifest`` resilience: missing
+    service is a no-op; service errors are logged + swallowed."""
+
+    def test_none_service_is_silent_noop(self) -> None:
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        # Should not raise. No assertion needed beyond "did not crash".
+        _flush_pdf_manifest(
+            manifest_service=None,
+            layer="episodic",
+            key="x.pdf",
+            user_id="u",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+        )
+
+    def test_service_failure_is_swallowed(self) -> None:
+        """Postgres outage during manifest write must not undo the
+        ChromaDB chunk writes already committed. Per ADR-050 §#22."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        manifest = MagicMock()
+        manifest.upsert_pdf_metadata.side_effect = RuntimeError("pg down")
+        # Should NOT raise.
+        _flush_pdf_manifest(
+            manifest_service=manifest,
+            layer="episodic",
+            key="x.pdf",
+            user_id="u",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+        )
+        manifest.upsert_pdf_metadata.assert_called_once()
