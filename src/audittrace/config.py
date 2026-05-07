@@ -193,6 +193,67 @@ class Settings(BaseSettings):
     # small safety margin against tokenizer drift.
     summarizer_ctx_reserve_tokens: int = 700
 
+    # ─────────────── PDF ingestion bomb defenses (gap-inventory #18) ──────
+    # Defense in depth — pymupdf does not bound resource usage by default,
+    # and a 2 KiB malformed PDF can specify enormous page counts, deeply
+    # nested resources, or content streams that decompress to gigabytes.
+    # See docs/architecture/pdf-ingestion-gaps.md §2.5 for the threat
+    # model. Multi-layer because pymupdf does not expose stream
+    # decompression-ratio at the API level — we can't predict a single
+    # ratio, so we cap shape (size, pages, xrefs) AND content (per-page
+    # extracted text) AND time (parse timeout). Each layer catches a
+    # different bomb shape; together they bound the worst case.
+    pdf_max_size_mb: int = 200
+    pdf_max_pages: int = 2000
+    # Total declared object count in the PDF cross-reference table.
+    # Benign documents are typically O(10²-10⁴); bombs use O(10⁶+).
+    pdf_max_xref_count: int = 100_000
+    # Total wall-clock budget for one PDF's parse + extract loop. The
+    # check fires at page-boundary granularity (signal.alarm doesn't
+    # work in FastAPI's worker-thread pool), so individual pymupdf
+    # calls can still spike past this — but the total stays bounded
+    # to ~timeout + one-page latency.
+    pdf_parse_timeout_seconds: int = 300
+    # Per-page extracted text byte cap. The decompression-ratio defense:
+    # if a single page yields >10 MB of text, that's bomb-shaped (a
+    # benign 50-page paper has ~50-500 KB total text). The check fires
+    # AFTER ``page.get_text()`` returns, so a single page can still
+    # transiently allocate up to this size — but the file as a whole
+    # cannot decompress to gigabytes through repeated small streams.
+    pdf_max_page_text_bytes: int = 10_000_000
+
+    # ─────────────── PDF redaction policy (gap-inventory #8) ──────────────
+    # Unflattened redaction annotations carry the redacted text in the
+    # underlying content stream; indexing them would expose data the
+    # author intended to remove. This is a confidentiality bug, not a
+    # feature gap. See docs/architecture/pdf-ingestion-gaps.md §2.2.
+    #
+    # "reject" (default) — refuse the whole document on first
+    # redaction-bearing page. Strict + safe; the right default.
+    #
+    # "clip-extract" — for advanced operators who explicitly accept
+    # the residual risk (the underlying stream may still leak through
+    # other paths): extract block-level text and drop blocks whose
+    # bbox intersects any redaction rect. Pages without redactions
+    # index normally; pages with redactions emit ``redaction_status =
+    # "clipped"`` so auditors can see what was filtered.
+    pdf_redaction_policy: str = "reject"
+
+    # ─────────────── PDF signature validation (gap-inventory #12) ─────────
+    # Detect-and-record only in v1 — every chunk metadata carries a
+    # ``signature_status`` field; auditors can query for invalid /
+    # tampered / unsigned content. Future revisions can flip a flag
+    # to reject on invalid (defense-in-depth for high-assurance
+    # corpora). See docs/architecture/pdf-ingestion-gaps.md §2.3.
+    pdf_signature_check_enabled: bool = True
+    # Filesystem path to a PEM bundle of additional trust-anchor
+    # certificates (e.g. operator's internal CA). Empty string =
+    # use system roots only (certifi + OS trust store via pyhanko's
+    # default ``ValidationContext``). Vault-backed delivery: mount
+    # the PEM via Vault Agent under /etc/audittrace/trust-store.pem
+    # and point this Settings value at that path.
+    pdf_signature_trust_store: str = ""
+
     # ─────────────── ADR-046 — async chat persistence ─────────────────────
     # Opt-in (`X-Persist-Mode: async` request header) Redis-Streams-backed
     # async write of the InteractionRecord. Each pod runs one consumer in

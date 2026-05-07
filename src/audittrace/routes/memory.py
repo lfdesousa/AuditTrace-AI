@@ -309,6 +309,227 @@ def _index_md_objects(
     return total
 
 
+def _page_bbox(page: Any) -> tuple[float, float, float, float]:
+    """Return (x0, y0, x1, y1) in PDF user-space units for *page*.
+
+    Page-level bbox in v1 — every chunk on a page shares the page's
+    rectangle. Per-block bbox (one rect per text block) is a future
+    item (#4 in docs/architecture/pdf-ingestion-gaps.md, multi-column
+    reading order). Falls back to zeros if rect access raises — keeps
+    the metadata schema stable on malformed PDFs.
+    """
+    try:
+        rect = page.rect
+        return (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+    except (AttributeError, TypeError, ValueError):
+        return (0.0, 0.0, 0.0, 0.0)
+
+
+# pymupdf.PDF_ANNOT_REDACT — the integer code for redaction-type
+# annotations in the PDF spec. Inlined to avoid importing pymupdf at
+# module-load time (the heavy import is gated to inside
+# _index_pdf_objects). Matches pymupdf.PDF_ANNOT_REDACT == 12 across
+# 1.24+ versions; the type tuple's [1] string ("Redact") is also
+# checked as a belt-and-braces fallback.
+_PDF_ANNOT_REDACT = 12
+
+
+def _redaction_rects(page: Any) -> list[Any]:
+    """Return list of redaction-annotation rects on *page*.
+
+    Empty list if the page has no annotations or no redactions.
+    Robust to ``page.annots()`` returning ``None`` or raising — both
+    seen in the wild on malformed PDFs.
+    """
+    try:
+        annots = page.annots() or []
+    except Exception:
+        return []
+    rects: list[Any] = []
+    for annot in annots:
+        annot_type = getattr(annot, "type", None)
+        if not annot_type:
+            continue
+        # type is a (int_code, name_str) tuple in pymupdf.
+        type_code = annot_type[0] if len(annot_type) > 0 else None
+        type_name = annot_type[1] if len(annot_type) > 1 else None
+        if type_code == _PDF_ANNOT_REDACT or type_name == "Redact":
+            rects.append(annot.rect)
+    return rects
+
+
+def _rects_intersect(a: tuple[float, float, float, float], b: Any) -> bool:
+    """Standard rect-overlap test on (x0, y0, x1, y1) pairs.
+
+    Inclusive on edges (two rects touching at a single line still
+    count as intersecting — conservative for redaction safety: when
+    in doubt, drop the block).
+    """
+    bx0, by0, bx1, by1 = float(b.x0), float(b.y0), float(b.x1), float(b.y1)
+    return not (a[2] < bx0 or a[0] > bx1 or a[3] < by0 or a[1] > by1)
+
+
+# Module-level lazy singleton for pyhanko's ValidationContext.
+# Building a ValidationContext is cheap, but the OCSP/CRL session
+# state inside it is process-resident and amortises across many
+# files. Per PYTHON-ENGINEERING §2 — "ML models, ONNX sessions,
+# HTTPX/Boto3 clients, connection pools — these are process-resident
+# infrastructure. They load once, live forever." Same shape as
+# `_SingletonOnnxEmbedder` in services/embedder.py: double-checked
+# locking, fast read path stays lock-free, init runs exactly once.
+_VALIDATION_CONTEXT: Any = None
+_VC_LOCK = __import__("threading").Lock()
+_VC_TRUST_STORE_PATH: str = ""  # tracks which trust store the cached VC was built with
+
+
+def _get_validation_context(trust_store_path: str) -> Any:
+    """Return a process-cached pyhanko ValidationContext.
+
+    First call builds it from the configured trust store; subsequent
+    calls return the cached instance. If *trust_store_path* changes
+    between calls (operator updated Settings without restart), the
+    context is rebuilt — a deliberate cache invalidation point.
+    """
+    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH
+    # Fast path — lock-free read.
+    if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == trust_store_path:
+        return _VALIDATION_CONTEXT
+    # Slow path — race-safe init.
+    with _VC_LOCK:
+        if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == trust_store_path:
+            return _VALIDATION_CONTEXT
+        from pyhanko_certvalidator import ValidationContext
+
+        kwargs: dict[str, Any] = {}
+        if trust_store_path:
+            # Operator-provided extra trust roots (PEM bundle).
+            try:
+                with open(trust_store_path, "rb") as fh:
+                    pem_bytes = fh.read()
+                kwargs["trust_roots"] = [pem_bytes]
+            except OSError as exc:
+                logger.warning(
+                    "Could not read pdf_signature_trust_store=%r: %s; "
+                    "falling back to system trust roots",
+                    trust_store_path,
+                    exc,
+                )
+        # Defaults: certifi + system trust + pyhanko's built-in
+        # algorithm_usage_policy (rejects MD5, SHA-1, RSA<2048 with
+        # warnings or hard-fail per pyhanko's current defaults).
+        # IAM §"Algorithm Security Rules" — never accept weak algs.
+        _VALIDATION_CONTEXT = ValidationContext(**kwargs)
+        _VC_TRUST_STORE_PATH = trust_store_path
+        return _VALIDATION_CONTEXT
+
+
+def _pdf_signature_status(
+    raw: bytes,
+    *,
+    enabled: bool,
+    trust_store_path: str,
+) -> tuple[str, int]:
+    """Return ``(status, signers_count)`` for *raw* PDF bytes.
+
+    Status taxonomy (every chunk metadata carries one of these via
+    ``signature_status``):
+
+    * ``"check_skipped"`` — operator disabled the check via
+      ``AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED=false``.
+    * ``"check_unavailable"`` — pyhanko not importable (graceful
+      degradation per PYTHON-ENGINEERING §4).
+    * ``"check_failed"`` — pyhanko raised on this file (malformed
+      PDF, network failure during OCSP, unexpected exception).
+      Distinct from ``"signed_invalid"`` so auditors can separate
+      "we tried and the document broke" from "the document said it
+      was signed and the signature was bad."
+    * ``"none"`` — file parsed successfully and contains zero
+      embedded signatures.
+    * ``"signed_valid"`` — every signature is intact, valid, AND
+      trusted by the configured trust store.
+    * ``"signed_invalid"`` — at least one signature exists but
+      fails validation (untrusted chain, expired cert, etc.) —
+      content itself is intact.
+    * ``"signed_tampered"`` — at least one signature shows the
+      content was modified after signing (``intact=False``). The
+      strongest negative signal: the file is provably altered
+      from what was signed.
+
+    Detect-and-record only in v1 — never reject. The chunk metadata
+    field lets auditors query for any non-clean state without changing
+    the ingestion contract.
+    """
+    if not enabled:
+        return ("check_skipped", 0)
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        from pyhanko.sign.validation import validate_pdf_signature
+    except ImportError:
+        return ("check_unavailable", 0)
+    try:
+        reader = PdfFileReader(io.BytesIO(raw))
+        signatures = list(reader.embedded_signatures)
+        if not signatures:
+            return ("none", 0)
+        vc = _get_validation_context(trust_store_path)
+        any_tampered = False
+        any_invalid = False
+        for emb in signatures:
+            status = validate_pdf_signature(emb, vc)
+            if not getattr(status, "intact", True):
+                any_tampered = True
+                continue
+            if not getattr(status, "valid", True):
+                any_invalid = True
+                continue
+            if not getattr(status, "trusted", True):
+                any_invalid = True
+        if any_tampered:
+            return ("signed_tampered", len(signatures))
+        if any_invalid:
+            return ("signed_invalid", len(signatures))
+        return ("signed_valid", len(signatures))
+    except Exception as exc:
+        logger.warning(
+            "Signature validation raised on document: %s",
+            exc,
+            extra={"reason": "signature_check_exception", "error": repr(exc)},
+        )
+        return ("check_failed", 0)
+
+
+def _text_clipped_around_redactions(page: Any, redaction_rects: list[Any]) -> str:
+    """Join block-level text from blocks NOT intersecting any redaction.
+
+    Uses ``page.get_text("blocks")`` which returns
+    ``(x0, y0, x1, y1, text, block_no, block_type)`` tuples. Blocks
+    whose bbox intersects any redaction rect are dropped — the rest
+    are joined in their existing reading order. This is the
+    clip-extract path for the AUDITTRACE_PDF_REDACTION_POLICY setting.
+    """
+    blocks = page.get_text("blocks")
+    safe_text: list[str] = []
+    for block in blocks:
+        # Each block tuple: (x0, y0, x1, y1, text, ...). Defensive
+        # indexing — pymupdf has stayed stable on this shape, but
+        # downstream changes shouldn't crash extraction.
+        if len(block) < 5:
+            continue
+        bbox = (
+            float(block[0]),
+            float(block[1]),
+            float(block[2]),
+            float(block[3]),
+        )
+        text = block[4]
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if any(_rects_intersect(bbox, r) for r in redaction_rects):
+            continue
+        safe_text.append(text)
+    return "\n".join(safe_text)
+
+
 def _index_pdf_objects(
     collection: Any,
     minio_client: Any,
@@ -317,6 +538,8 @@ def _index_pdf_objects(
     col_name: str,
     category: str,
     layer_prefix: str,
+    user_id: str,
+    ingestion_ts_ms: int,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -331,9 +554,18 @@ def _index_pdf_objects(
     from the MinIO key to produce a stable ``source_key`` metadata
     field — useful for disambiguating same-name files across folders
     (e.g. two ``main.pdf`` in different paper subdirs).
+
+    *user_id* + *ingestion_ts_ms* propagate into every chunk's
+    metadata as ``ingested_by_user_id`` and ``ingestion_ts_ms`` —
+    per-chunk reconstructibility per gap-inventory item #21
+    (docs/architecture/pdf-ingestion-gaps.md §2.6). Both ChromaDB
+    and Postgres can answer "who ingested this chunk and when" from
+    the chunk row alone.
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
+    settings = get_settings()
+    max_size_bytes = settings.pdf_max_size_mb * 1024 * 1024
     total = 0
     for obj in objects:
         if not obj["filename"].lower().endswith(".pdf"):
@@ -341,10 +573,43 @@ def _index_pdf_objects(
         raw = _read_minio_object(minio_client, bucket, obj["key"])
         if raw is None:
             continue
+        # Item #18 — bomb defense layer 1: raw byte-size cap. Catches
+        # the simplest case (operator drag-drops a 2 GiB file). The
+        # check fires before pymupdf.open so a small file claiming
+        # to span a giant document never instantiates the parser.
+        if len(raw) > max_size_bytes:
+            logger.warning(
+                "PDF %s rejected: %d bytes exceeds pdf_max_size_mb=%d",
+                obj["key"],
+                len(raw),
+                settings.pdf_max_size_mb,
+                extra={
+                    "file": obj["key"],
+                    "reason": "max_size",
+                    "size_bytes": len(raw),
+                    "cap_bytes": max_size_bytes,
+                },
+            )
+            continue
         source_key = (
             obj["key"][len(layer_prefix) :]
             if obj["key"].startswith(layer_prefix)
             else obj["key"]
+        )
+        # SHA-256 of the raw bytes is the canonical document identity
+        # for the entire downstream lifecycle — same file produces the
+        # same hash regardless of MinIO key, letting auditors prove the
+        # indexed content matches a specific version of the file. Item
+        # #21: document_hash field on every chunk.
+        document_hash = hashlib.sha256(raw).hexdigest()
+        # Item #12 — signature validation. Computed once per file
+        # (cert-chain checks are network-bound; doing them per-chunk
+        # would multiply OCSP/CRL load by chunks-per-doc). Every chunk
+        # of this file carries the same ``signature_status`` value.
+        signature_status, _signers_count = _pdf_signature_status(
+            raw,
+            enabled=settings.pdf_signature_check_enabled,
+            trust_store_path=settings.pdf_signature_trust_store,
         )
         try:
             # Assign through Any so mypy doesn't flag pymupdf.open's
@@ -352,13 +617,151 @@ def _index_pdf_objects(
             # would otherwise reject the with-context here.
             doc_factory: Any = pymupdf.open
             with doc_factory(stream=raw, filetype="pdf") as doc:
+                # Item #18 — bomb defense layer 2: declared-shape caps.
+                # Read both page_count and xref_length from the document
+                # catalogue WITHOUT decompressing any stream — these are
+                # cheap dictionary lookups. A bomb declaring billions of
+                # pages or millions of xrefs is rejected here before any
+                # page is ever rendered.
+                if doc.page_count > settings.pdf_max_pages:
+                    logger.warning(
+                        "PDF %s rejected: page_count=%d exceeds pdf_max_pages=%d",
+                        obj["key"],
+                        doc.page_count,
+                        settings.pdf_max_pages,
+                        extra={
+                            "file": obj["key"],
+                            "reason": "max_pages",
+                            "page_count": doc.page_count,
+                            "cap": settings.pdf_max_pages,
+                        },
+                    )
+                    continue
+                xref_count = doc.xref_length()
+                if xref_count > settings.pdf_max_xref_count:
+                    logger.warning(
+                        "PDF %s rejected: xref_count=%d exceeds pdf_max_xref_count=%d",
+                        obj["key"],
+                        xref_count,
+                        settings.pdf_max_xref_count,
+                        extra={
+                            "file": obj["key"],
+                            "reason": "max_xref",
+                            "xref_count": xref_count,
+                            "cap": settings.pdf_max_xref_count,
+                        },
+                    )
+                    continue
+                # Item #18 — bomb defense layer 3: wall-clock budget.
+                # Page-boundary granularity (signal.alarm doesn't work
+                # in FastAPI's worker-thread pool). A single pathological
+                # page can still spike past the cap mid-call, but the
+                # total stays bounded to (timeout + one-page latency).
+                parse_start = time.monotonic()
                 for page_num, page in enumerate(doc, start=1):
-                    text = page.get_text().strip()
+                    if (
+                        time.monotonic() - parse_start
+                        > settings.pdf_parse_timeout_seconds
+                    ):
+                        logger.warning(
+                            "PDF %s parse aborted: exceeded pdf_parse_timeout_seconds=%d",
+                            obj["key"],
+                            settings.pdf_parse_timeout_seconds,
+                            extra={
+                                "file": obj["key"],
+                                "reason": "parse_timeout",
+                                "pages_processed": page_num - 1,
+                            },
+                        )
+                        break
+                    # Item #8 — unflattened redaction handling. Detect
+                    # redaction annotations BEFORE pulling text so the
+                    # reject path never instantiates the redacted
+                    # content stream, and the clip-extract path can
+                    # filter blocks against the redaction rects.
+                    redaction_rects = _redaction_rects(page)
+                    redaction_status = "none"
+                    if redaction_rects:
+                        if settings.pdf_redaction_policy == "reject":
+                            logger.warning(
+                                "PDF %s rejected at page %d: %d unflattened "
+                                "redaction(s); pdf_redaction_policy=reject",
+                                obj["key"],
+                                page_num,
+                                len(redaction_rects),
+                                extra={
+                                    "file": obj["key"],
+                                    "page": page_num,
+                                    "reason": "unflattened_redactions",
+                                    "redaction_count": len(redaction_rects),
+                                    "policy": "reject",
+                                },
+                            )
+                            # Whole-file abort, not per-page skip — the
+                            # gap-doc directive is "reject the document"
+                            # (item #8). One leaky page = whole doc.
+                            break
+                        if settings.pdf_redaction_policy == "clip-extract":
+                            text = _text_clipped_around_redactions(
+                                page, redaction_rects
+                            )
+                            redaction_status = "clipped"
+                            logger.info(
+                                "PDF %s page %d: %d redaction(s) clipped",
+                                obj["key"],
+                                page_num,
+                                len(redaction_rects),
+                                extra={
+                                    "file": obj["key"],
+                                    "page": page_num,
+                                    "redaction_count": len(redaction_rects),
+                                    "policy": "clip-extract",
+                                },
+                            )
+                        else:
+                            # Unknown policy value: log + reject for
+                            # safety. Misconfiguration shouldn't silently
+                            # leak redacted content.
+                            logger.warning(
+                                "PDF %s rejected at page %d: unknown "
+                                "pdf_redaction_policy=%r (expected "
+                                "'reject' | 'clip-extract')",
+                                obj["key"],
+                                page_num,
+                                settings.pdf_redaction_policy,
+                            )
+                            break
+                    else:
+                        text = page.get_text()
+                    # Item #18 — bomb defense layer 4: per-page text
+                    # decompression cap. If a page yields gigabytes of
+                    # text from a small source, that's the
+                    # decompression-ratio bomb shape. Skip the page, log,
+                    # but keep processing the file (one bad page in an
+                    # otherwise legit doc is rare but plausible).
+                    if len(text) > settings.pdf_max_page_text_bytes:
+                        logger.warning(
+                            "PDF %s page %d skipped: extracted_bytes=%d exceeds pdf_max_page_text_bytes=%d",
+                            obj["key"],
+                            page_num,
+                            len(text),
+                            settings.pdf_max_page_text_bytes,
+                            extra={
+                                "file": obj["key"],
+                                "page": page_num,
+                                "reason": "max_page_text",
+                                "extracted_bytes": len(text),
+                                "cap": settings.pdf_max_page_text_bytes,
+                            },
+                        )
+                        continue
+                    text = text.strip()
                     if not text:
                         continue
                     chunks = _chunk_text(text)
                     if not chunks:
                         continue
+                    bbox_x0, bbox_y0, bbox_x1, bbox_y1 = _page_bbox(page)
                     ids = [
                         _doc_id(col_name, f"{source_key}:p{page_num}", i)
                         for i in range(len(chunks))
@@ -371,6 +774,27 @@ def _index_pdf_objects(
                             "file_type": "pdf",
                             "page": page_num,
                             "chunk": i,
+                            # Item #21 — per-chunk provenance fields.
+                            # Flattened (bbox_x0..y1) for ChromaDB
+                            # queryability since metadata only accepts
+                            # str|int|float|bool. Static defaults below
+                            # (text_source="native", confidence=1.0,
+                            # signature_status="unknown") will be
+                            # overridden by future commits in this
+                            # tier-A series — #1 (OCR fallback) flips
+                            # text_source; #12 (signature validity)
+                            # flips signature_status.
+                            "bbox_x0": bbox_x0,
+                            "bbox_y0": bbox_y0,
+                            "bbox_x1": bbox_x1,
+                            "bbox_y1": bbox_y1,
+                            "text_source": "native",
+                            "extraction_confidence": 1.0,
+                            "document_hash": document_hash,
+                            "signature_status": signature_status,
+                            "redaction_status": redaction_status,
+                            "ingested_by_user_id": user_id,
+                            "ingestion_ts_ms": ingestion_ts_ms,
                         }
                         for i in range(len(chunks))
                     ]
@@ -409,6 +833,7 @@ def index_memory(
         ),
     ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:admin"]),
+    user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Read documents from MinIO and push chunked embeddings to ChromaDB.
 
@@ -449,6 +874,11 @@ def index_memory(
     chroma_client = get_chromadb()
 
     start = time.time()
+    # One ingestion timestamp per /memory/index call — every chunk
+    # written in this batch carries this value, so an auditor can
+    # group "all chunks indexed during this request" by exact match.
+    # Item #21: per-chunk reconstructibility.
+    ingestion_ts_ms = int(start * 1000)
     results: dict[str, int] = {}
     total_chunks = 0
 
@@ -527,6 +957,8 @@ def index_memory(
                 col_name,
                 category="episodic",
                 layer_prefix="episodic/",
+                user_id=user.user_id,
+                ingestion_ts_ms=ingestion_ts_ms,
             )
             chunk_count += _index_pdf_objects(
                 collection,
@@ -536,6 +968,8 @@ def index_memory(
                 col_name,
                 category="procedural",
                 layer_prefix="procedural/",
+                user_id=user.user_id,
+                ingestion_ts_ms=ingestion_ts_ms,
             )
 
         results[col_name] = chunk_count
