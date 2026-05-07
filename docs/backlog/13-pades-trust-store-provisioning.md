@@ -133,6 +133,62 @@ ADR (likely a successor to ADR-049's evidence catalog).
   operator with a different jurisdictional posture can swap roots
   without rebuilding the image.
 
+## Pre-work findings (2026-05-08)
+
+Pickup attempt 2026-05-08 surfaced these facts before pausing for
+out-of-band verification:
+
+- **Chain of `main_signed.pdf`** (verified via pyhanko inspection):
+  - Signer: `LUIS ATALAIA NUNES DE SOUSA` (CH)
+  - Issuer: `SwissSign RSA SIGN ZertES QES ICA 2023 - 1`
+  - Sub-issuer: `SwissSign RSA SIGN Signature Services Root CA 2023 - 1`
+  - **Root (self-signed):** `SwissSign Signature Services Root 2020 - 2`
+- **Root SHA-256 (from embedded copy in main_signed.pdf):**
+  `b87f292a4d9feace2d669159eb26f56d85ec77c19e01098cd754e8abb310cde5`
+- **SHA-1:** `425419cd83663ae8815437bbeef09b15e3723e39`
+- **Validity:** 2020-10-07 → 2050-09-30
+- **Serial:** `2fdba9b88d001ebce7b99c2d23ef4a`
+
+**Out-of-band sources attempted (none succeeded automated):**
+
+| Source | Result |
+|---|---|
+| `repository.swisssign.com` (guessed filenames) | 404s on every shape tried |
+| `swisssign.net/cgi-bin/authority/download/<sha256>` | 303 → reCAPTCHA gate (not automatable) |
+| Mozilla CCADB `AllCertificateRecordsCSVFormatv2` | does not list ZertES roots (CCADB scope is WebPKI/TLS) |
+| `certifi` (Python's bundle) | not present (137 certs scanned, none match) |
+| Debian `ca-certificates` (`/etc/ssl/certs`) | only older Gold/Silver G2 SwissSign roots present |
+| `crt.sh` JSON API | 502 (downstream issue, retry later) |
+
+**Why this root is missing from default bundles:** Mozilla's CA
+Program — the source for both `certifi` and Debian's
+`ca-certificates` — is scoped to WebPKI (TLS server certificates).
+ZertES / eIDAS qualified-signature roots, including SwissSign
+Signature Services Root 2020 - 2, are not in scope. They are
+distributed via document-signing trust lists (Microsoft AATL, EU
+LOTL, Swiss federal TSL).
+
+## Resume trigger (BEFORE picking up again)
+
+Luis must complete one of these out-of-band verification paths and
+stage the verified PEM at `/tmp/swisssign-root-2020-2-verified.pem`
+before this issue can resume:
+
+1. **SwissSign reCAPTCHA download.** Visit
+   `https://swisssign.net/cgi-bin/authority/download/B87F292A4D9FEACE2D669159EB26F56D85EC77C19E01098CD754E8ABB310CDE5`,
+   solve the reCAPTCHA, save the file. Compute
+   `sha256sum` and confirm it equals `b87f29...0cde5`.
+2. **Microsoft AATL bundle.** Pull the AATL CSV/CAB; Adobe document
+   signers should include this root.
+3. **Swiss federal TSL.** OFCOM/BAKOM publishes the Swiss Trust List
+   in eIDAS-compatible XML. The SwissSign Signature Services Root
+   2020 - 2 is the anchor for all Swiss qualified-signature
+   ICAs, so it must be in the TSL.
+
+The `/tmp/swisssign-root-2020-2.pem` file produced by the pickup
+attempt (extracted from `main_signed.pdf`) has the matching SHA-256
+but is **not** out-of-band verified — do not use it as-is.
+
 ## Cross-references
 
 - `project_session_20260507.md` — original `signed_invalid` ×46

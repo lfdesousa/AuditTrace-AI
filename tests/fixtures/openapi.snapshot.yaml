@@ -1217,7 +1217,11 @@ paths:
         \ upsert of one\n  MinIO object into the named collection. Operators use this in\n  a per-file client loop for the\
         \ ``ai_research_papers`` collection\n  so each request's working set stays within the request-handler's\n  memory\
         \ budget.\n\nThe opt-in ``ai_research_papers`` collection extracts text per page\nfrom PDFs and is rebuilt only when\
-        \ explicitly named in\n*collections* — keeping routine /memory/index calls fast."
+        \ explicitly named in\n*collections* — keeping routine /memory/index calls fast.\n\nAuthorization:\n\n* Bulk mode\
+        \ (``?file`` absent) — destructive whole-collection\n  delete-and-recreate; cross-user by design. Requires\n  ``audittrace:admin``.\n\
+        * Single-file mode (``?file=<layer>/<key>``) — one-document\n  idempotent upsert. Requires ``memory:<layer>:write``\
+        \ matching\n  the file's MinIO prefix (or ``audittrace:admin``). The empty\n  static ``scopes=[]`` keeps OAuth2 declared\
+        \ in the OpenAPI\n  spec; the prose contract lives here."
       operationId: index_memory_memory_index_post
       parameters:
       - in: query
@@ -1260,6 +1264,10 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
+      - audittrace-oauth2:
+        - memory:episodic:write
+      - audittrace-oauth2:
+        - memory:procedural:write
       - audittrace-oauth2:
         - audittrace:admin
       summary: Index Memory
@@ -1656,7 +1664,22 @@ paths:
 
         ``{layer}/{filename}``.  If *filename* is omitted the upload''s
 
-        original filename is used.'
+        original filename is used.
+
+
+        Authorization (per-layer): the caller''s JWT must carry
+
+        ``memory:<layer>:write`` matching the ``layer`` query parameter
+
+        (or ``audittrace:admin``). A token with ``memory:procedural:write``
+
+        cannot upload to ``layer=episodic`` and vice-versa. The empty
+
+        static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI spec
+
+        without baking the dynamic per-layer scope into the schema —
+
+        the prose contract lives here.'
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query
@@ -1694,6 +1717,10 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       security:
+      - audittrace-oauth2:
+        - memory:episodic:write
+      - audittrace-oauth2:
+        - memory:procedural:write
       - audittrace-oauth2:
         - audittrace:admin
       summary: Upload Memory File

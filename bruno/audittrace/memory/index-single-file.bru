@@ -1,0 +1,49 @@
+meta {
+  name: POST /memory/index?file= — single-file (per-layer scope)
+  type: http
+  seq: 92
+}
+
+post {
+  url: {{baseUrl}}/memory/index?collections=ai_research_papers&file=episodic/main_signed.pdf
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  collections: ai_research_papers
+  file: episodic/main_signed.pdf
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("returns single-file outcome", function() {
+    const body = res.getBody();
+    expect(body.collections).to.be.an("object");
+    expect(body.collections.ai_research_papers).to.be.a("number");
+  });
+}
+
+docs {
+  Single-file mode (``?file=<layer>/<key>``). Idempotent upsert of one
+  MinIO object into the named collection — the per-file client loop
+  pattern that keeps the request-handler's working set bounded for
+  the PDF corpus (caught live 2026-05-06: bulk mode hits Istio's
+  NotReady threshold mid-rebuild).
+
+  Authorization: requires the per-layer write scope matching the
+  file's MinIO prefix — e.g. ``file=episodic/...`` requires
+  ``memory:episodic:write``. ``audittrace:admin`` continues to work.
+  A token with the wrong layer's write scope returns 403 with the
+  missing scope name in the detail.
+
+  This is the per-layer scope flow added by backlog #14 (2026-05-08)
+  for the M3 LibreChat user-driven upload path: end-user UI sessions
+  hold ``memory:episodic:write`` and never need an admin token.
+}

@@ -1,5 +1,5 @@
 meta {
-  name: POST /memory/upload — legacy file upload (admin)
+  name: POST /memory/upload — per-layer file upload
   type: http
   seq: 90
 }
@@ -30,11 +30,21 @@ tests {
 }
 
 docs {
-  Pre-PR-A upload path. Writes to MinIO directly without creating a
-  manifest row — items uploaded this way appear as `discovered: true`
-  in the new /memory/<layer> list endpoint until they get touched
-  via PUT/POST.
+  Direct MinIO upload path. Writes to ``{layer}/{filename}`` in the
+  ``memory-shared`` bucket without creating a manifest row — items
+  uploaded this way appear as ``discovered: true`` in the per-layer
+  list endpoint until they get touched via PUT/POST.
 
-  Requires `audittrace:admin` scope. Prepare a fixture file at
-  `/tmp/ADR-bruno-legacy.md` before running.
+  Authorization (per-layer): the JWT must carry
+  ``memory:<layer>:write`` matching the ``layer`` query parameter,
+  OR ``audittrace:admin``. A token with ``memory:procedural:write``
+  cannot upload to ``layer=episodic`` and vice-versa. Cross-layer
+  attempts return 403 with the missing scope name in the detail.
+
+  OpenAPI: spec declares the OR shape (memory:episodic:write OR
+  memory:procedural:write OR audittrace:admin) — any one is
+  sufficient. The runtime check enforces the layer-vs-token match.
+
+  Prepare a fixture file at ``/tmp/ADR-bruno-legacy.md`` before
+  running. Migrated 2026-05-08 to per-layer scope contract (backlog #14).
 }
