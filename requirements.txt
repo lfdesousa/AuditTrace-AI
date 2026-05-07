@@ -20,6 +20,14 @@ psycopg2-binary>=2.9.9
 redis>=5.0.0
 minio>=7.2.0
 pymupdf>=1.24.0
+# pyhanko: PAdES / PDF signature validation (gap-inventory item #12).
+# Adds ~10 MB to image size via transitive cryptography + asn1crypto.
+# Without these the deployed image silently degrades to
+# signature_status="check_unavailable" — a real bug, not a graceful
+# behaviour we want to ship. Diagnosed 2026-05-07 during tier-A live
+# evidence capture; pyproject.toml had them, requirements.txt did not.
+pyhanko>=0.21.0
+pyhanko-certvalidator>=0.26.0
 
 # Observability (ADR-014.4)
 opentelemetry-api>=1.27.0
