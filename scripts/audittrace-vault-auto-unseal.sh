@@ -38,6 +38,13 @@ POD="${VAULT_POD:-audittrace-vault-0}"
 WAIT_TOTAL_S=180
 WAIT_POLL_S=3
 
+# k3s API readiness wait. Override via env var for tests so the bash
+# test runner doesn't have to wait the full default.
+K3S_WAIT_MAX_S="${K3S_WAIT_MAX_S:-240}"
+K3S_WAIT_POLL_S="${K3S_WAIT_POLL_S:-5}"
+# kubectl binary — overridable so tests can stub via PATH shim.
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+
 # ────────────────────────────── helpers ─────────────────────────────
 
 log() { printf '%s [%s] %s\n' "$(date -Iseconds)" "$1" "$2" >&2; }
@@ -57,13 +64,43 @@ require_cmd() {
 # and a sealed Vault's exit 2 made `if ! ... | grep -q true` wrongly
 # report failure even when the grep matched.
 vault_status() {
-  kubectl -n "$NS" exec "$POD" -c vault -- vault status 2>/dev/null || true
+  "$KUBECTL_BIN" -n "$NS" exec "$POD" -c vault -- vault status 2>/dev/null || true
+}
+
+# Probe k3s API readiness. Returns 0 once the API server responds to
+# `--raw=/livez`, 1 if the timeout is exhausted. Used to make this
+# script resilient to the k3s-startup race on boot — historically the
+# unit had `Requires=k3s.service` which made k3s's first-attempt
+# failure permanent (systemd cancels the dependent's start job and
+# Restart= can't recover because the unit never started). Now the
+# unit uses Wants=k3s.service and this function bridges the gap.
+wait_for_k3s_api() {
+  local elapsed=0
+  while [[ $elapsed -lt $K3S_WAIT_MAX_S ]]; do
+    if "$KUBECTL_BIN" --request-timeout=5s get --raw=/livez >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$K3S_WAIT_POLL_S"
+    elapsed=$((elapsed + K3S_WAIT_POLL_S))
+  done
+  return 1
 }
 
 # ────────────────────────────── pre-flight ──────────────────────────
 
-require_cmd kubectl
+require_cmd "$KUBECTL_BIN"
 require_cmd python3
+
+# Wait for the k3s API server to be reachable before doing anything
+# else. Exit code 10 is reserved for "k3s API not ready"; systemd's
+# Restart=on-failure will cycle the unit until k3s is up (bounded by
+# StartLimitBurst / StartLimitIntervalSec in the unit file).
+log INFO "waiting for k3s API to be ready (max ${K3S_WAIT_MAX_S}s)..."
+if ! wait_for_k3s_api; then
+  log ERROR "k3s API not ready within ${K3S_WAIT_MAX_S}s — exiting 10 for systemd to retry"
+  exit 10
+fi
+log INFO "k3s API responsive"
 
 if [[ ! -f "$VAULT_INIT_FILE" ]]; then
   log ERROR "vault-init file not found: $VAULT_INIT_FILE"
@@ -100,7 +137,7 @@ done
 
 if ! grep -qE '^Initialized[[:space:]]+(true|false)' <<<"$status"; then
   log ERROR "vault did not respond to status within ${WAIT_TOTAL_S}s"
-  kubectl -n "$NS" get pod "$POD" 2>&1 || true
+  "$KUBECTL_BIN" -n "$NS" get pod "$POD" 2>&1 || true
   exit 5
 fi
 
@@ -131,7 +168,7 @@ if len(keys) <= $i:
 print(keys[$i])
 ")
 
-  if ! kubectl -n "$NS" exec -i "$POD" -c vault -- \
+  if ! "$KUBECTL_BIN" -n "$NS" exec -i "$POD" -c vault -- \
          vault operator unseal "$KEY" >/dev/null 2>&1; then
     log ERROR "unseal step $((i+1))/3 failed"
     exit 8
