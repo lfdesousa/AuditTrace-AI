@@ -1,12 +1,22 @@
-# Requirements for audittrace-server
-# Generated from pyproject.toml dependencies
+# DO NOT EDIT — regenerated from pyproject.toml by scripts/sync-requirements.py.
+#
+# Source of truth: pyproject.toml ([project].dependencies +
+# [project.optional-dependencies].dev). Run `make sync-requirements`
+# after touching dependencies. The pre-commit hook `requirements-sync`
+# and the CI job of the same name refuse to land drifted state.
+#
+# Why this file exists at all (we ship from a lockfile, not pyproject):
+#   - Docker image build uses `pip install -r requirements.txt`.
+#   - 2026-05-07 tier-A live-evidence capture caught pyhanko +
+#     pyhanko-certvalidator missing here, producing a false
+#     `signature_status="check_unavailable"` audit signal because the
+#     deployed image lacked the deps. The drift-guard closes that class.
 
+# Runtime dependencies
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
-# langchain / langchain-community dropped per ADR-025.
-# langchain-core retained for the passive Document dataclass import.
 langchain-core>=0.1.0
 chromadb>=0.4.22
 python-jose[cryptography]>=3.3.0
@@ -20,16 +30,8 @@ psycopg2-binary>=2.9.9
 redis>=5.0.0
 minio>=7.2.0
 pymupdf>=1.24.0
-# pyhanko: PAdES / PDF signature validation (gap-inventory item #12).
-# Adds ~10 MB to image size via transitive cryptography + asn1crypto.
-# Without these the deployed image silently degrades to
-# signature_status="check_unavailable" — a real bug, not a graceful
-# behaviour we want to ship. Diagnosed 2026-05-07 during tier-A live
-# evidence capture; pyproject.toml had them, requirements.txt did not.
 pyhanko>=0.21.0
 pyhanko-certvalidator>=0.26.0
-
-# Observability (ADR-014.4)
 opentelemetry-api>=1.27.0
 opentelemetry-sdk>=1.27.0
 opentelemetry-exporter-otlp>=1.27.0
@@ -40,12 +42,13 @@ opentelemetry-instrumentation-urllib3>=0.48b0
 opentelemetry-instrumentation-sqlalchemy>=0.48b0
 opentelemetry-instrumentation-redis>=0.48b0
 
-# Dev dependencies
+# Dev dependencies (extras = [dev])
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0
 pytest-mock>=3.12.0
 fakeredis>=2.30.0
+httpx>=0.25.0
 ruff>=0.15.0
 mypy>=1.8.0
 black>=24.1.0

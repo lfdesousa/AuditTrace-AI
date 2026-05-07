@@ -144,6 +144,25 @@ jobs:
           path: htmlcov/
           retention-days: 30
 
+  requirements-sync:
+    # Drift guard: requirements.txt must equal what
+    # `python3 scripts/sync-requirements.py` would regenerate from
+    # pyproject.toml. Mirrors the pre-commit hook of the same name.
+    # Closes the 2026-05-07 tier-A failure mode where pyhanko +
+    # pyhanko-certvalidator landed in pyproject only and the image
+    # silently shipped without the PAdES deps.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Assert requirements.txt is in sync with pyproject.toml
+        run: python3 scripts/sync-requirements.py --check
+
   helm-lint:
     # Static chart validation — no cluster needed. Catches Helm syntax,
     # missing values, broken `include` directives, and template-render

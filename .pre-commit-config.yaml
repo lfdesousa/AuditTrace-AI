@@ -58,6 +58,21 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # Drift guard: requirements.txt must always be regenerable from
+      # pyproject.toml (the single source of truth for dependencies).
+      # 2026-05-07 tier-A live-evidence capture diagnosed a silent
+      # image-build degradation where pyproject got pyhanko +
+      # pyhanko-certvalidator but requirements.txt did not, shipping an
+      # image without the PAdES validation deps. This hook fires on any
+      # change to either file and refuses commits where the two
+      # disagree. Run `make sync-requirements` to fix.
+      - id: requirements-sync
+        name: requirements.txt is in sync with pyproject.toml
+        entry: python3 scripts/sync-requirements.py --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|requirements\.txt)$
+
       # ADR-049 — Test, Evidence, and Reconstructibility Gate.
       # Refuses commits to src/audittrace/routes/** or
       # src/audittrace/services/** that lack an evidence reference
