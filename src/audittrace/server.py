@@ -320,7 +320,7 @@ def _resolve_version() -> str:
 
         return version("audittrace-ai")
     except (PackageNotFoundError, ImportError):  # pragma: no cover - dev path
-        return "1.0.10"
+        return "1.0.11"
 
 
 # Tag descriptions populate the Swagger UI sidebar. Keep one paragraph

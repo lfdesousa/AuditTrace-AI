@@ -38,7 +38,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 638 tests, 94.92% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 896 tests, 93.97% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
