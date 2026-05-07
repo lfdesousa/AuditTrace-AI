@@ -254,6 +254,28 @@ class Settings(BaseSettings):
     # and point this Settings value at that path.
     pdf_signature_trust_store: str = ""
 
+    # ─────────────── PDF OCR (gap-inventory #1, ADR-050 tier-B) ───────────
+    # Tesseract-backed OCR fallback for raster-only pages
+    # (`page.get_text() == ""` AND `page.get_images()` non-empty).
+    # The actual ``tesseract`` binary + language packs ship in the
+    # Dockerfile (apt). Locally, missing binary triggers graceful
+    # degradation: pages without a text layer get a
+    # ``no_text_layer`` extraction-warning and zero chunks rather
+    # than crashing. Operator can disable OCR entirely (e.g. to
+    # keep the index path fast on a corpus known to be all-native-text)
+    # by setting AUDITTRACE_PDF_OCR_ENABLED=false.
+    pdf_ocr_enabled: bool = True
+    # Languages Tesseract loads. Plus-separated; matches Tesseract's
+    # CLI ``-l`` argument shape. Default = English + the three CH
+    # national languages (de, fr, it). Each language pack adds
+    # ~10 MB to the image; keep the default minimal.
+    pdf_ocr_languages: str = "eng+deu+fra+ita"
+    # DPI for page-to-PNG rasterisation before Tesseract reads. 300
+    # is Tesseract's recommended sweet spot for accuracy (>200 quality
+    # rises noticeably; >400 the curve flattens). Per-page memory at
+    # 300 DPI A4 ≈ 3 MB, freed before the next page.
+    pdf_ocr_dpi: int = 300
+
     # ─────────────── ADR-046 — async chat persistence ─────────────────────
     # Opt-in (`X-Persist-Mode: async` request header) Redis-Streams-backed
     # async write of the InteractionRecord. Each pod runs one consumer in

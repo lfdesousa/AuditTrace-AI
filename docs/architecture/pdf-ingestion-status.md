@@ -1,7 +1,7 @@
 # PDF ingestion robustness — work-in-progress status
 
 **Companion to:** [`pdf-ingestion-gaps.md`](pdf-ingestion-gaps.md) (the *what*).
-**Last updated:** 2026-05-08 (tier-B kickoff)
+**Last updated:** 2026-05-08 (tier-B shipped)
 **Maintainer note:** update on every commit that ships or partially ships a gap-inventory item. The gap inventory describes the failure mode; this file records what's been done about it.
 
 ---
@@ -55,14 +55,14 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 
 | # | Item | Status | Shipped where | Notes |
 |---|---|---|---|---|
-| **#1** | OCR for scanned pages | ⏳ **Pending** | (tier-B) | Tesseract `eng+deu+fra+ita`. `text_source: native\|ocr\|mixed` chunk metadata. Adds ~200 MB to image. |
-| **#6** | Embedded attachments (PDF/A-3, e-invoicing) | ⏳ **Pending** | (tier-B) | Quarantine to MinIO under `episodic/<doc>/attachments/<name>`; manifest field. Recursion bound = 1 level. |
-| **#7** | AcroForm field values | ⏳ **Pending** | (tier-B) | `page.widgets()` extraction; per-section chunking with `chunk_type: "form_field"`. Populates `form_field_count` manifest column. |
-| **#15** | Encrypted / password-protected PDFs | ⏳ **Pending** | (tier-B) | `doc.is_encrypted` / `doc.needs_pass` detection → HTTP 422 reject. **No password-bearing endpoint** (sanitisation surface). |
-| **#21** | Per-chunk provenance | 🟨 **8/9 fields shipped** | PR #42 (`fdeb24e`) | Shipped: `bbox_{x0,y0,x1,y1}`, `text_source` (default `native`), `extraction_confidence` (default `1.0`), `document_hash` (SHA-256), `signature_status`, `redaction_status`, `ingested_by_user_id`, `ingestion_ts_ms`. Residual: `text_source` flip to `ocr`/`mixed` lands with #1. |
-| **#22** | Document-level manifest columns | ⏳ **Pending** | (tier-B) | Alembic migration 010 adds: `page_count`, `signature_status`, `ocr_coverage_pct`, `pdfa_conformance`, `scan_verdict`, `attachment_count`, `form_field_count`, `extraction_warnings (jsonb)`, `document_sha256` to `memory_items`. Surfaced via `GET /memory/episodic/{filename}`. |
+| **#1** | OCR for scanned pages | ✅ **Shipped** | tier-B PR (`feat/tier-b-pdf-robustness`) | Tesseract `eng+deu+fra+ita` (~65 MB image delta), 300 DPI per-page render, `text_source` ∈ {`native`,`ocr`,`form_field`}, per-page `extraction_confidence` from Tesseract's mean-per-word. `ocr_coverage_pct` populated on the manifest. Graceful degradation when Tesseract binary missing → `no_text_layer` warning. `pdf_ocr_enabled` / `pdf_ocr_languages` / `pdf_ocr_dpi` settings. |
+| **#6** | Embedded attachments (PDF/A-3, e-invoicing) | ✅ **Shipped** | tier-B PR | `embfile_count` / `embfile_get` extraction; quarantine to MinIO at `{layer}/{parent}/attachments/{name}`. Recursion bound = 1. Sanity cap = 256 attachments per doc. `attachment` + `attachment_quarantine_failed` warnings; `attachment_count` manifest column. |
+| **#7** | AcroForm field values | ✅ **Shipped** | tier-B PR | `page.widgets()` extraction; `Label: Value` lines emitted as one form-field chunk per page (chunk_type=`form_field`, text_source=`form_field`). Empty fields skipped. `form_fields` warnings; `form_field_count` manifest column. |
+| **#15** | Encrypted / password-protected PDFs | ✅ **Shipped** | tier-B PR | `is_encrypted` ∧ `needs_pass` strict-bool detection → 0 chunks emitted, manifest row written with `extraction_warnings += [{"code":"encrypted"}]`. **No password-bearing endpoint** (per ADR-050 §#15 — operator decrypts out-of-band). |
+| **#21** | Per-chunk provenance | ✅ **Shipped (9/9)** | PR #42 (`fdeb24e`) + tier-B PR | tier-A shipped 8/9 fields; tier-B closes the residual: `text_source` now flips to `"ocr"` / `"form_field"` and `extraction_confidence` carries Tesseract's mean-per-word on OCR pages (was always `1.0` in tier-A). New `chunk_type` field disambiguates form-field chunks from text chunks. |
+| **#22** | Document-level manifest columns | ✅ **Shipped** | tier-B PR — Alembic migration 010 | Added to `memory_items`: `page_count`, `signature_status`, `ocr_coverage_pct`, `attachment_count` (default 0), `form_field_count` (default 0), `extraction_warnings` (JSONB on Postgres / JSON on SQLite, default `[]`), `document_sha256`. Surfaced via the existing per-layer endpoints (the `ManifestEntry` dataclass carries the new fields). `pdfa_conformance` + `scan_verdict` deferred per ADR-050. GIN index on `extraction_warnings` for the audit-pivot query `WHERE extraction_warnings @> '[{"code":"…"}]'`. |
 
-**Tier-B target:** all 5 fully pending items + the OCR-driven #21 residual, one ADR-050 covering decisions, single PR `feat/tier-b-pdf-robustness`.
+**Tier-B summary:** 6/6 ✅ shipped. ADR-050 records the design decisions. `extraction_warnings` JSONB closed-set enum (13 codes) is the single audit pivot; `tests/test_memory_routes.py::TestExtractionWarningCodes` pins the set so a code added without ADR amendment fails CI.
 
 ---
 
@@ -93,7 +93,7 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 
 - **ADR-048 prereq:** 0 % (Proposed)
 - **Tier-A:** 100 % code shipped, 1 data-side gap (backlog #13)
-- **Tier-B:** 1/6 partial (#21 8/9 fields), 5/6 pending — **today's target: ship all 6 to ✅ or 🟨**
+- **Tier-B:** **6/6 ✅ shipped** (ADR-050 + tier-B PR, 2026-05-08)
 - **Tier-C:** 0/16 shipped
 
 ---
