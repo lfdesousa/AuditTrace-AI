@@ -247,3 +247,129 @@ jobs:
             exit 1
           fi
           echo "tag v$tag == pyproject.toml version $pyproject_version — OK"
+
+  evidence-check:
+    # Test, Evidence, and Reconstructibility Gate (ADR-049). Hard
+    # gate: PR cannot merge to main without populated Verification +
+    # Validation + Reconstruction sections in the PR body. No
+    # override mechanism — fix the friction (capture the evidence)
+    # rather than bypass the gate. The PR template at
+    # .github/pull_request_template.md pre-populates the sections so
+    # contributors see the requirement at PR-creation time. This
+    # job catches the failure mode where sections are present but
+    # left empty as bare checklist lines.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Fetch PR body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --json body \
+            --jq .body > /tmp/pr_body.md
+          echo "PR body fetched ($(wc -l < /tmp/pr_body.md) lines)"
+
+      - name: Parse evidence sections
+        run: |
+          python3 <<'PY'
+          # ADR-049 evidence-check parser. Required sections:
+          #   ## Verification (unit)
+          #   ## Validation (end-to-end against deployed image)
+          #   ## Reconstruction (audit artefacts)
+          #
+          # Heuristic for "populated": each section must contain
+          # AT LEAST ONE of (a) a checked box ``- [x]`` (case-insensitive),
+          # OR (b) a fenced code block whose content is not purely
+          # template placeholders (i.e. contains characters outside
+          # the ``<...>`` placeholder shape). Empty checklists with all
+          # boxes unchecked fail the gate — checking a box is a
+          # deliberate, visible action that confirms the contributor
+          # produced the artefact named by that line.
+          import pathlib, re, sys
+
+          body = pathlib.Path("/tmp/pr_body.md").read_text(encoding="utf-8")
+
+          required = [
+              ("Verification", r"^##\s+Verification\b"),
+              ("Validation", r"^##\s+Validation\b"),
+              ("Reconstruction", r"^##\s+Reconstruction\b"),
+          ]
+
+          # Split body into sections keyed by H2 heading.
+          sections: dict[str, list[str]] = {}
+          current: str | None = None
+          for line in body.splitlines():
+              h2 = re.match(r"^##\s+(.+)$", line)
+              if h2:
+                  current = h2.group(1).strip()
+                  sections[current] = []
+              elif current is not None:
+                  sections[current].append(line)
+
+          def section_is_populated(lines: list[str]) -> bool:
+              # Signal A: at least one checked box.
+              for raw in lines:
+                  if re.match(r"^\s*-\s*\[x\]", raw, flags=re.IGNORECASE):
+                      return True
+              # Signal B: a fenced code block whose content is not
+              # purely <placeholder> markers.
+              in_fence = False
+              fence_buf: list[str] = []
+              for raw in lines:
+                  if raw.strip().startswith("```"):
+                      if in_fence:
+                          # End of fence — inspect what we collected.
+                          collected = "\n".join(fence_buf).strip()
+                          stripped_placeholders = re.sub(
+                              r"<[^>]*>", "", collected
+                          ).strip()
+                          if stripped_placeholders:
+                              return True
+                          fence_buf = []
+                      in_fence = not in_fence
+                  elif in_fence:
+                      fence_buf.append(raw)
+              return False
+
+          failures: list[str] = []
+          for label, pattern in required:
+              matched_key = next(
+                  (k for k in sections if re.match(pattern, f"## {k}")),
+                  None,
+              )
+              if matched_key is None:
+                  failures.append(
+                      f"Missing required section: ## {label}"
+                  )
+                  continue
+              if not section_is_populated(sections[matched_key]):
+                  failures.append(
+                      f"Section ## {matched_key} has no checked box "
+                      f"and no populated code block — looks like the "
+                      f"template is unfilled"
+                  )
+
+          if failures:
+              print("::error::ADR-049 evidence gate FAILED")
+              for f in failures:
+                  print(f"::error::  - {f}")
+              print(
+                  "::error::See ADR-049 + .github/pull_request_template.md. "
+                  "Check at least one box per section, OR paste real "
+                  "command output into a code block. No override available."
+              )
+              sys.exit(1)
+          print("ADR-049 evidence gate: PASSED")
+          PY

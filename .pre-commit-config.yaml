@@ -57,3 +57,19 @@ repos:
         language: script
         pass_filenames: false
         always_run: true
+
+      # ADR-049 — Test, Evidence, and Reconstructibility Gate.
+      # Refuses commits to src/audittrace/routes/** or
+      # src/audittrace/services/** that lack an evidence reference
+      # (PR URL, evidence-file path, or 32-hex-char trace ID) in
+      # the commit message. The commit-msg stage gives the script
+      # access to the message file as $1. Per ADR-049 §Decision
+      # rule 4: NO override — fix the friction, do not bypass the
+      # gate. Companion enforcement: PR template + CI evidence-check
+      # job in .github/workflows/ci.yml.
+      - id: commit-evidence
+        name: ADR-049 commit-evidence gate (routes/services touch requires evidence ref)
+        entry: scripts/check-commit-evidence.sh
+        language: script
+        stages: [commit-msg]
+        pass_filenames: true
