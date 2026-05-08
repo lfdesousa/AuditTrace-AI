@@ -423,6 +423,10 @@ def _rects_intersect(a: tuple[float, float, float, float], b: Any) -> bool:
 _VALIDATION_CONTEXT: Any = None
 _VC_LOCK = __import__("threading").Lock()
 _VC_TRUST_STORE_PATH: str = ""  # tracks which trust store the cached VC was built with
+# Cached parsed cert list — re-used by the as-of-signing-time retry
+# path in ``_pdf_signature_status`` (ADR-054 §3) so we don't re-parse
+# the PEM bundle for the second ValidationContext.
+_VC_TRUST_ROOTS: list[Any] = []
 
 
 _PEM_CERT_RE = __import__("re").compile(
@@ -495,7 +499,7 @@ def _get_validation_context(trust_store_path: str) -> Any:
       the Provider; the cache invalidates on metadata sha256 change.
     * If neither source is configured, certifi + OS trust roots only.
     """
-    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH
+    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH, _VC_TRUST_ROOTS
     # Resolve the Provider-side cache key BEFORE the fast-path check
     # so a refresh (which changes the metadata sha256) invalidates
     # the in-process cache without a pod restart.
@@ -562,6 +566,11 @@ def _get_validation_context(trust_store_path: str) -> Any:
         # IAM §"Algorithm Security Rules" — never accept weak algs.
         _VALIDATION_CONTEXT = ValidationContext(**kwargs)
         _VC_TRUST_STORE_PATH = cache_key
+        # ADR-054 §3 — cache the parsed trust-roots list so the
+        # as-of-signing-time retry path in _pdf_signature_status can
+        # build a second ValidationContext(moment=signing_time) with
+        # the SAME roots, no re-parsing.
+        _VC_TRUST_ROOTS = list(kwargs.get("trust_roots") or [])
         return _VALIDATION_CONTEXT
 
 
@@ -575,10 +584,11 @@ def _invalidate_validation_context() -> None:
     but explicit invalidation is cheaper than letting the next
     request walk the full slow path.
     """
-    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH
+    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH, _VC_TRUST_ROOTS
     with _VC_LOCK:
         _VALIDATION_CONTEXT = None
         _VC_TRUST_STORE_PATH = ""
+        _VC_TRUST_ROOTS = []
 
 
 def _pdf_signature_status(
@@ -589,9 +599,9 @@ def _pdf_signature_status(
 ) -> tuple[str, int]:
     """Return ``(status, signers_count)`` for *raw* PDF bytes.
 
-    Status taxonomy — 8 closed-set values pinned by
-    ``_SIGNATURE_STATUS_CODES`` (see also ADR-052 §1). Every chunk's
-    metadata carries one via ``signature_status``:
+    Status taxonomy — 9 closed-set values pinned by
+    ``_SIGNATURE_STATUS_CODES`` (per ADR-052 §1 + ADR-054 §1).
+    Every chunk's metadata carries one via ``signature_status``:
 
     * ``"check_skipped"`` — operator disabled the check via
       ``AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED=false``.
@@ -605,26 +615,38 @@ def _pdf_signature_status(
     * ``"none"`` — file parsed successfully and contains zero
       embedded signatures.
     * ``"signed_valid"`` — every signature is intact, valid, AND
-      trusted by the configured trust store.
+      trusted by the configured trust store **as of now**.
     * ``"signed_invalid"`` — at least one signature exists with
       ``valid=False`` (signature math broken — wrong key, corrupted
       bytes, weak-algorithm policy reject). Real audit signal: the
       claim itself is unverifiable.
     * ``"signed_untrusted"`` — at least one signature is intact and
       ``valid=True`` but its chain does not terminate at our
-      configured trust roots (configuration signal, not security
-      signal — the signature math worked, we just don't know the
-      issuing CA). Split from ``signed_invalid`` per ADR-052 §1
-      so auditors can distinguish "broken" from "scope gap."
+      configured trust roots, even when re-validated at the
+      self-reported signing time. Split from ``signed_invalid``
+      per ADR-052 §1 so auditors can distinguish "broken" from
+      "scope gap."
+    * ``"signed_expired"`` — at least one signature is intact +
+      valid + trusted **as of the self-reported signing time** but
+      no longer trusted at present (typically because the
+      end-entity cert expired since signing). ADR-054 §1 — distinct
+      from ``signed_untrusted`` because we DO trust the issuing CA;
+      the chain has just aged out.
     * ``"signed_tampered"`` — at least one signature shows the
       content was modified after signing (``intact=False``). The
       strongest negative signal: the file is provably altered
       from what was signed.
 
-    Aggregate precedence when a document carries multiple
-    signatures: ``signed_tampered > signed_invalid > signed_untrusted
-    > signed_valid``. The worst signal across all signatures wins —
-    one tampered sig poisons the file even if the others are clean.
+    Aggregate precedence when a document carries multiple signatures
+    (per ADR-054 §4):
+
+        ``signed_tampered > signed_invalid > signed_untrusted
+         > signed_expired > signed_valid``
+
+    The worst signal across all signatures wins. ``signed_untrusted``
+    outranks ``signed_expired`` because untrusted = no confidence in
+    the signing identity at any time, while expired = confidence in
+    the identity, just past the validity window.
 
     Detect-and-record only in v1 — never reject. The chunk metadata
     field lets auditors query for any non-clean state without changing
@@ -635,6 +657,7 @@ def _pdf_signature_status(
     try:
         from pyhanko.pdf_utils.reader import PdfFileReader
         from pyhanko.sign.validation import validate_pdf_signature
+        from pyhanko_certvalidator import ValidationContext
     except ImportError:
         return ("check_unavailable", 0)
     try:
@@ -646,6 +669,7 @@ def _pdf_signature_status(
         any_tampered = False
         any_invalid = False
         any_untrusted = False
+        any_expired = False
         for emb in signatures:
             status = validate_pdf_signature(emb, vc)
             if not getattr(status, "intact", True):
@@ -654,18 +678,53 @@ def _pdf_signature_status(
             if not getattr(status, "valid", True):
                 any_invalid = True
                 continue
-            if not getattr(status, "trusted", True):
+            if getattr(status, "trusted", True):
+                continue  # signed_valid for this sig
+            # trusted=False — try as-of-signing-time validation
+            # (ADR-054 §2). If pyhanko's chain walk failed because
+            # the end-entity cert is expired, retry with a
+            # ValidationContext anchored at the signer-asserted
+            # signing time. If THAT validates, the signature was
+            # legitimate when signed (issuing CA in our trust roots);
+            # the chain has just aged out — distinct audit signal
+            # from "we don't know this CA at all".
+            signing_time = getattr(emb, "self_reported_timestamp", None)
+            if signing_time is None or not _VC_TRUST_ROOTS:
                 any_untrusted = True
-        # Precedence: tampered > invalid > untrusted > valid.
-        # ADR-052 §1 — signed_invalid (math broken, real audit
-        # signal) outranks signed_untrusted (config gap, scope
-        # signal) when both fire on a multi-sig document.
+                continue
+            try:
+                retry_vc = ValidationContext(
+                    trust_roots=list(_VC_TRUST_ROOTS),
+                    moment=signing_time,
+                    best_signature_time=signing_time,
+                )
+                retry_status = validate_pdf_signature(emb, retry_vc)
+            except Exception as retry_exc:
+                # Retry path crashed — fall back to untrusted rather
+                # than masking the original outcome with a worse one.
+                logger.warning(
+                    "as-of-signing-time retry crashed: %s; "
+                    "classifying as signed_untrusted",
+                    retry_exc,
+                )
+                any_untrusted = True
+                continue
+            if getattr(retry_status, "trusted", False):
+                any_expired = True
+            else:
+                any_untrusted = True
+        # Precedence (ADR-054 §4): tampered > invalid > untrusted
+        # > expired > valid. signed_untrusted (no confidence at any
+        # time) outranks signed_expired (confidence at signing time,
+        # past validity now).
         if any_tampered:
             return ("signed_tampered", len(signatures))
         if any_invalid:
             return ("signed_invalid", len(signatures))
         if any_untrusted:
             return ("signed_untrusted", len(signatures))
+        if any_expired:
+            return ("signed_expired", len(signatures))
         return ("signed_valid", len(signatures))
     except Exception as exc:
         logger.warning(
@@ -737,15 +796,19 @@ _PDF_WARNING_CODES: frozenset[str] = frozenset(
 
 
 # Closed-set of every value ``_pdf_signature_status`` may emit (per
-# ADR-052 §1). New status values need an ADR amendment so the audit
-# taxonomy stays auditable. Tested by tests/test_memory_routes.py
-# (TestSignatureStatusCodes). The 8 values are split across three
-# concerns:
+# ADR-052 §1 + ADR-054 §1). New status values need an ADR amendment so
+# the audit taxonomy stays auditable. Tested by
+# tests/test_memory_routes.py::TestSignatureStatusCodes. The 9 values
+# are split across three concerns:
 #   - operator/runtime conditions (check_skipped, check_unavailable,
 #     check_failed) — the check could not produce a security verdict
 #   - structural (none) — the document carries no signatures
 #   - verdicts (signed_valid, signed_invalid, signed_untrusted,
-#     signed_tampered) — pyhanko produced a verdict
+#     signed_expired, signed_tampered) — pyhanko produced a verdict.
+#     signed_expired (ADR-054) was added 2026-05-09: chain validates
+#     as-of self-reported signing time but no longer at present;
+#     distinct from signed_untrusted (chain doesn't validate at any
+#     time).
 _SIGNATURE_STATUS_CODES: frozenset[str] = frozenset(
     {
         "check_skipped",
@@ -755,6 +818,7 @@ _SIGNATURE_STATUS_CODES: frozenset[str] = frozenset(
         "signed_valid",
         "signed_invalid",
         "signed_untrusted",
+        "signed_expired",
         "signed_tampered",
     }
 )
