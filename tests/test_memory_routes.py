@@ -1743,17 +1743,20 @@ class TestPdfSignatureValidation:
 
     def test_signed_with_untrusted_chain_returns_signed_untrusted(self) -> None:
         """Signature math valid + content intact but cert chain not
-        trusted by the configured trust store. Per ADR-052 §1 this
-        is ``signed_untrusted``, NOT ``signed_invalid`` — it's a
-        configuration signal (we don't carry the issuing CA), not a
-        security signal (the math worked). Splitting the two stops
-        ``signed_invalid`` from collapsing two distinct audit
-        categories."""
+        trusted by the configured trust store, even when re-validated
+        as-of self-reported signing time. Per ADR-052 §1 + ADR-054 §2
+        this is ``signed_untrusted``: a configuration signal (we don't
+        carry the issuing CA at any time), not a security signal
+        (the math worked) and not an expiry signal (the chain doesn't
+        validate at signing time either)."""
         from audittrace.routes.memory import _pdf_signature_status
 
+        fake_emb = MagicMock()
+        # No self-reported timestamp → retry is short-circuited;
+        # falls straight through to signed_untrusted.
+        fake_emb.self_reported_timestamp = None
         fake_reader = MagicMock()
-        fake_reader.embedded_signatures = [MagicMock()]
-        # intact + valid but trusted=False (chain not in trust store).
+        fake_reader.embedded_signatures = [fake_emb]
         fake_status = MagicMock(intact=True, valid=True, trusted=False)
 
         with (
@@ -1772,20 +1775,195 @@ class TestPdfSignatureValidation:
         assert status == "signed_untrusted"
         assert count == 1
 
+    def test_signed_expired_returns_signed_expired(self) -> None:
+        """ADR-054 §1 — chain doesn't validate at present (e.g. cert
+        expired) but DOES validate as-of the self-reported signing
+        time. Distinct from ``signed_untrusted`` (no confidence at
+        any time) and from ``signed_valid`` (confidence at present).
+        Surfaces "valid signature whose cert has aged out" as a
+        usable audit signal."""
+        from datetime import UTC, datetime
+
+        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory import _pdf_signature_status
+
+        # Prime the trust-roots cache so the retry path can build a
+        # second ValidationContext. Sentinel value — pyhanko's ctor
+        # is mocked below, so the contents don't need to be a real
+        # cert list.
+        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+
+        fake_emb = MagicMock()
+        fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [fake_emb]
+        # First validation (current time): trusted=False (chain expired now).
+        # Retry (as-of signing time): trusted=True (chain valid then).
+        first_status = MagicMock(intact=True, valid=True, trusted=False)
+        retry_status = MagicMock(intact=True, valid=True, trusted=True)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                side_effect=[first_status, retry_status],
+            ),
+            patch("pyhanko_certvalidator.ValidationContext"),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_expired"
+        assert count == 1
+
+    def test_signed_untrusted_when_retry_also_fails(self) -> None:
+        """ADR-054 §2 — retry path: when the as-of-signing-time
+        re-validation ALSO returns trusted=False (the chain doesn't
+        validate at any time, not just now), classify as
+        ``signed_untrusted``, not ``signed_expired``. Distinguishes
+        "unknown CA" from "known CA with expired cert"."""
+        from datetime import UTC, datetime
+
+        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory import _pdf_signature_status
+
+        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+
+        fake_emb = MagicMock()
+        fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [fake_emb]
+        # First + retry both untrusted → signed_untrusted.
+        first_status = MagicMock(intact=True, valid=True, trusted=False)
+        retry_status = MagicMock(intact=True, valid=True, trusted=False)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                side_effect=[first_status, retry_status],
+            ),
+            patch("pyhanko_certvalidator.ValidationContext"),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_untrusted"
+        assert count == 1
+
+    def test_signed_untrusted_when_retry_path_crashes(self) -> None:
+        """ADR-054 §2 — defensive guard: if the as-of-signing-time
+        retry path itself crashes (e.g. ValidationContext ctor blows
+        up on edge-case input), fall back to ``signed_untrusted``
+        rather than masking with a worse class. The original outcome
+        (trusted=False, no retry signal) is the safe interpretation."""
+        from datetime import UTC, datetime
+
+        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory import _pdf_signature_status
+
+        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+
+        fake_emb = MagicMock()
+        fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [fake_emb]
+        first_status = MagicMock(intact=True, valid=True, trusted=False)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                return_value=first_status,
+            ),
+            patch(
+                "pyhanko_certvalidator.ValidationContext",
+                side_effect=RuntimeError("crash inside retry"),
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_untrusted"
+        assert count == 1
+
+    def test_signed_untrusted_takes_precedence_over_signed_expired(self) -> None:
+        """ADR-054 §4 — multi-sig document with one expired sig and
+        one untrusted sig flags as ``signed_untrusted``. ``untrusted``
+        (no confidence at any time) outranks ``expired`` (confidence
+        at signing time, past validity now) because the more cautious
+        signal wins."""
+        from datetime import UTC, datetime
+
+        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory import _pdf_signature_status
+
+        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+
+        sig_a = MagicMock()
+        sig_a.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        sig_b = MagicMock()
+        sig_b.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [sig_a, sig_b]
+        # Sig A: first untrusted, retry trusted → signed_expired.
+        # Sig B: first untrusted, retry also untrusted → signed_untrusted.
+        # Order pyhanko sees:
+        #   sig_a first  → trusted=False
+        #   sig_a retry  → trusted=True (would be expired alone)
+        #   sig_b first  → trusted=False
+        #   sig_b retry  → trusted=False (untrusted)
+        statuses = [
+            MagicMock(intact=True, valid=True, trusted=False),
+            MagicMock(intact=True, valid=True, trusted=True),
+            MagicMock(intact=True, valid=True, trusted=False),
+            MagicMock(intact=True, valid=True, trusted=False),
+        ]
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                side_effect=statuses,
+            ),
+            patch("pyhanko_certvalidator.ValidationContext"),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_untrusted"
+        assert count == 2
+
     def test_signed_invalid_takes_precedence_over_signed_untrusted(self) -> None:
         """Multi-sig document with one ``valid=False`` sig and one
         ``trusted=False`` sig flags as ``signed_invalid`` — the
         worst-signal-wins precedence per ADR-052 §1
-        (``tampered > invalid > untrusted > valid``). Closes the
-        single-bit-or-the-other ambiguity that ``signed_invalid``
-        had pre-PR-2."""
+        (``tampered > invalid > untrusted > expired > valid``).
+        Closes the single-bit-or-the-other ambiguity that
+        ``signed_invalid`` had pre-ADR-052."""
         from audittrace.routes.memory import _pdf_signature_status
 
+        fake_emb_a = MagicMock()
+        fake_emb_a.self_reported_timestamp = None
+        fake_emb_b = MagicMock()
+        fake_emb_b.self_reported_timestamp = None
         fake_reader = MagicMock()
-        fake_reader.embedded_signatures = [MagicMock(), MagicMock()]
+        fake_reader.embedded_signatures = [fake_emb_a, fake_emb_b]
         # First signature: math broken (signed_invalid).
         # Second signature: valid math but untrusted chain
-        # (signed_untrusted).
+        # (signed_untrusted; no signing-time so retry is skipped).
         statuses = [
             MagicMock(intact=True, valid=False, trusted=True),
             MagicMock(intact=True, valid=True, trusted=False),
@@ -2892,9 +3070,9 @@ class TestSignatureStatusCodes:
     def test_signature_status_codes_match_adr_052_closed_set(self) -> None:
         from audittrace.routes.memory import _SIGNATURE_STATUS_CODES
 
-        # The exact 8 values documented in ADR-052 §1. Adding a
-        # value: bump the ADR + add it here. Removing one: same.
-        # CI fails the diff if these drift. The split across
+        # The exact 9 values documented in ADR-052 §1 + ADR-054 §1.
+        # Adding a value: bump the ADR + add it here. Removing one:
+        # same. CI fails the diff if these drift. The split across
         # operator/runtime conditions, structural, and verdict
         # categories is intentional — see the constant's docstring.
         expected = {
@@ -2909,6 +3087,7 @@ class TestSignatureStatusCodes:
             "signed_valid",
             "signed_invalid",
             "signed_untrusted",
+            "signed_expired",  # ADR-054: valid as-of signing time, expired now
             "signed_tampered",
         }
         assert _SIGNATURE_STATUS_CODES == expected
