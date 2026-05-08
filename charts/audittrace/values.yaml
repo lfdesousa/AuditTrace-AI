@@ -170,7 +170,13 @@ memoryServer:
     # PEM dir) override these values + provide the Provider/Builder
     # impl. ADR-052 §2 + §3.
     AUDITTRACE_PDF_TRUST_STORE_PROVIDER: "s3"
-    AUDITTRACE_PDF_TRUST_STORE_BUILDER: "eu_lotl"
+    # ADR-053 — default to "composite" with the EU LOTL +
+    # Swiss federal TSL inner builders. Covers the EU + CH
+    # jurisdictions in one bundle (the v1 default for
+    # Swiss-located, EU-customer-serving deployments).
+    AUDITTRACE_PDF_TRUST_STORE_BUILDER: "composite"
+    AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS: "eu_lotl,swiss_tsl"
+    AUDITTRACE_PDF_TRUST_STORE_SWISS_TSLO_CERT_PATH: "/etc/audittrace/swiss-federal-tsl/CH-TL-cert.der"
     AUDITTRACE_PDF_TRUST_STORE_S3_KEY: "trust-store/eu-lotl-bundle.pem"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"

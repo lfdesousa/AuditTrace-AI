@@ -153,6 +153,9 @@ _COMPONENT_MAP: dict[str, str] = {
     "MockTrustStoreProvider": "trust-store.provider",
     "EuLotlTrustStoreBuilder": "trust-store.builder",
     "StaticTrustStoreBuilder": "trust-store.builder",
+    # ADR-053 — Swiss federal TSL + composite
+    "SwissTslTrustStoreBuilder": "trust-store.builder",
+    "CompositeTrustStoreBuilder": "trust-store.builder",
 }
 
 
@@ -202,6 +205,8 @@ _SPAN_NAME_MAP: list[tuple[str, str]] = [
     ("MockTrustStoreProvider.metadata", "trust-store-metadata"),
     ("EuLotlTrustStoreBuilder.build", "trust-store-build-eu-lotl"),
     ("StaticTrustStoreBuilder.build", "trust-store-build-static"),
+    ("SwissTslTrustStoreBuilder.build", "trust-store-build-swiss-tsl"),
+    ("CompositeTrustStoreBuilder.build", "trust-store-build-composite"),
     ("get_trust_store_provider", "di-trust-store-provider"),
     ("get_trust_store_builder", "di-trust-store-builder"),
     ("refresh_trust_store", "admin-trust-store-refresh"),

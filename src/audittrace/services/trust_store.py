@@ -500,6 +500,295 @@ class EuLotlTrustStoreBuilder(TrustStoreBuilder):
         )
 
 
+class SwissTslTrustStoreBuilder(TrustStoreBuilder):
+    """Walk Switzerland's federal Trusted List (OFCOM/BAKOM, ETSI TS
+    119 612) via pyhanko's per-TSL parser (ADR-053).
+
+    Switzerland is **not an EU member state**, so the EU LOTL walked
+    by :class:`EuLotlTrustStoreBuilder` does not include the Swiss
+    federal TSL. For an audit-grade product running on Swiss soil with
+    Swiss customers, the ZertES-supervised TSPs (SwissSign, Swisscom
+    Trust Services, et al.) must be in scope. This builder closes that
+    gap by fetching the Swiss federal TSL directly from OFCOM and
+    walking it with pyhanko's :func:`trust_list_to_registry`.
+
+    Auth chain (ADR-053 §4):
+
+    1. The TSLO (Trust List Operator) signing certificate is vendored
+       in the chart at ``charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der``.
+       Out-of-band SHA-1 fingerprint
+       ``e8638362 5130bdf0 1e42a317 6501e079 261b137f`` was verified
+       against the published one at
+       https://uri.tsl-switzerland.ch/TrstSvc/TrustedList/schemerules/CH/index.html
+       on 2026-05-09 by the maintainer.
+    2. The cert is mounted into memory-server via ConfigMap; the path
+       is read from ``Settings.pdf_trust_store_swiss_tslo_cert_path``.
+    3. The TSL XML is fetched from
+       ``https://trustedlist.tsl-switzerland.ch/tsl-ch.xml`` (HTTPS,
+       state-managed endpoint) and validated against the vendored
+       TSLO cert before any TSP is added to the registry.
+
+    Combine with :class:`EuLotlTrustStoreBuilder` via
+    :class:`CompositeTrustStoreBuilder` to cover both EU + CH
+    qualified TSPs in one trust bundle.
+    """
+
+    builder_id_const = "swiss_tsl"
+    SOURCE_URL = "https://trustedlist.tsl-switzerland.ch/tsl-ch.xml"
+
+    def __init__(self, tslo_cert_path: str | Path) -> None:
+        self._tslo_cert_path = Path(tslo_cert_path)
+
+    @property
+    def builder_id(self) -> str:
+        return self.builder_id_const
+
+    @log_call(logger=logger)
+    async def build(self) -> TrustStoreBundle:
+        try:
+            import aiohttp
+            from asn1crypto import pem as asn1_pem
+            from asn1crypto import x509 as asn1_x509
+            from pyhanko.sign.validation.qualified.eutl_parse import (
+                _validate_and_extract_tl_data_multiple_certs,
+            )
+        except ImportError as exc:
+            raise TrustStoreBuilderUnavailableError(
+                "SwissTslTrustStoreBuilder: pyhanko[etsi,async-http] "
+                "extras + asn1crypto required. Reinstall with "
+                "`pip install pyhanko[etsi,async-http]`."
+            ) from exc
+
+        # Load the OOB-vendored TSLO cert.
+        if not self._tslo_cert_path.exists() or not self._tslo_cert_path.is_file():
+            raise TrustStoreBuilderUnavailableError(
+                f"SwissTslTrustStoreBuilder: TSLO cert not found at "
+                f"{self._tslo_cert_path}. Vendor the cert in the chart "
+                f"and set AUDITTRACE_PDF_TRUST_STORE_SWISS_TSLO_CERT_PATH."
+            )
+        try:
+            cert_bytes = self._tslo_cert_path.read_bytes()
+            if asn1_pem.detect(cert_bytes):
+                _, _, der = asn1_pem.unarmor(cert_bytes)
+            else:
+                der = cert_bytes
+            tslo_cert = asn1_x509.Certificate.load(der)
+        except (ValueError, TypeError) as exc:
+            raise TrustStoreBuilderUnavailableError(
+                f"SwissTslTrustStoreBuilder: failed to parse TSLO cert "
+                f"at {self._tslo_cert_path}: {exc!r}"
+            ) from exc
+
+        # Fetch the Swiss TSL XML over HTTPS.
+        try:
+            async with aiohttp.ClientSession() as client:
+                async with client.get(
+                    self.SOURCE_URL, timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    resp.raise_for_status()
+                    tl_xml = await resp.text()
+        except Exception as exc:
+            raise TrustStoreBuilderUnavailableError(
+                f"SwissTslTrustStoreBuilder: failed to fetch Swiss TSL "
+                f"from {self.SOURCE_URL}: {exc!r}"
+            ) from exc
+
+        # Two-phase processing (caught live 2026-05-09):
+        # (1) verify the XAdES signature on the TSL using pyhanko's
+        #     internal helper — this raises if the TSL was tampered
+        #     with or signed by an unknown TSLO.
+        # (2) walk the verified XML directly with lxml to extract
+        #     the X.509 certs from QC services. We can't use
+        #     ``trust_list_to_registry`` here because Switzerland
+        #     uses its own URI namespace for service-type identifiers
+        #     (``https://uri.tsl-switzerland.ch/TrstSvc/Svctype/CA/QC``)
+        #     while pyhanko's parser only recognises ETSI's URI
+        #     (``http://uri.etsi.org/TrstSvc/Svctype/CA/QC``). Both
+        #     URIs identify the same ETSI TS 119 612 concept — a
+        #     qualified-signature CA — but pyhanko's hard-coded URI
+        #     check drops every Swiss CA on the floor. Verified live
+        #     2026-05-09: 36 services in the Swiss TSL, 0 CAs parsed
+        #     by pyhanko under the unmodified path; this two-phase
+        #     approach extracts them correctly.
+        try:
+            _validate_and_extract_tl_data_multiple_certs(tl_xml, [tslo_cert])
+        except Exception as exc:
+            raise TrustStoreBuilderUnavailableError(
+                f"SwissTslTrustStoreBuilder: TSL signature validation "
+                f"failed (TSLO cert may be stale, or the TSL was "
+                f"tampered in transit): {exc!r}"
+            ) from exc
+
+        try:
+            der_certs = _extract_qc_certs_from_swiss_tsl(tl_xml)
+        except Exception as exc:
+            raise TrustStoreBuilderUnavailableError(
+                f"SwissTslTrustStoreBuilder: Swiss TSL XML walk failed: {exc!r}"
+            ) from exc
+
+        pem_bytes = _ders_to_pem_bundle(der_certs)
+        return _bundle_from_pem(
+            pem_bytes,
+            builder_id=self.builder_id_const,
+            source_url=self.SOURCE_URL,
+            cert_count=_count_pem_certs(pem_bytes),
+        )
+
+
+class CompositeTrustStoreBuilder(TrustStoreBuilder):
+    """Run a list of inner ``TrustStoreBuilder`` impls in order and
+    concatenate the resulting PEM bundles into a single bundle (ADR-053).
+
+    Use case: cover EU eIDAS qualified TSPs + Swiss federal qualified
+    TSPs + any operator-supplied jurisdictional roots in one trust
+    bundle, without inflating each builder's responsibilities.
+
+    The composite's ``builder_id`` is the comma-joined list of inner
+    builder ids (e.g. ``eu_lotl+swiss_tsl``); the ``source_url`` is
+    the first inner builder's source for human readability — full
+    sourcing detail is in the chart values + ADR-053.
+
+    If ANY inner builder raises :class:`TrustStoreBuilderUnavailableError`,
+    the composite logs the error and continues with the remaining
+    builders. The bundle reflects whichever builders succeeded —
+    "best-effort, audit-clear" posture (the operator can read the
+    cert_count + builder_id chain and notice a missing layer).
+    Composite raises only if EVERY inner builder fails.
+    """
+
+    builder_id_const = "composite"
+
+    def __init__(self, inner: list[TrustStoreBuilder]) -> None:
+        if not inner:
+            raise ValueError(
+                "CompositeTrustStoreBuilder: empty inner-builder list "
+                "(at least one TrustStoreBuilder required)"
+            )
+        self._inner = list(inner)
+
+    @property
+    def builder_id(self) -> str:
+        # Stable, deterministic — operators see the chain in the
+        # admin endpoint response + audit log.
+        return "+".join(b.builder_id for b in self._inner)
+
+    @log_call(logger=logger)
+    async def build(self) -> TrustStoreBundle:
+        chunks: list[bytes] = []
+        successes: list[str] = []
+        failures: list[tuple[str, Exception]] = []
+        for inner_builder in self._inner:
+            try:
+                bundle = await inner_builder.build()
+            except TrustStoreBuilderUnavailableError as exc:
+                logger.warning(
+                    "CompositeTrustStoreBuilder: inner builder %r failed: %s",
+                    inner_builder.builder_id,
+                    exc,
+                )
+                failures.append((inner_builder.builder_id, exc))
+                continue
+            successes.append(f"{inner_builder.builder_id}={bundle.metadata.cert_count}")
+            chunks.append(bundle.pem_bytes)
+        if not chunks:
+            # All inner builders failed — propagate the first error
+            # so the admin endpoint surfaces the cause.
+            first_id, first_exc = failures[0]
+            raise TrustStoreBuilderUnavailableError(
+                f"CompositeTrustStoreBuilder: every inner builder "
+                f"failed. First: {first_id}: {first_exc}"
+            )
+        if failures:
+            logger.warning(
+                "CompositeTrustStoreBuilder: %d/%d inner builders "
+                "failed (%s); proceeding with remainder",
+                len(failures),
+                len(self._inner),
+                ", ".join(b for b, _ in failures),
+            )
+        # Concatenate; deduplication already happens at the per-cert
+        # PEM-emission level inside _registry_to_pem_bundle. Cross-
+        # bundle duplicates (e.g. a CA listed in both EU LOTL and
+        # the Swiss TSL) survive here — pyhanko_certvalidator handles
+        # duplicate trust roots gracefully (set semantics on subject
+        # name + key match).
+        pem_bytes = b"".join(chunks)
+        return _bundle_from_pem(
+            pem_bytes,
+            builder_id=self.builder_id,
+            source_url=", ".join(b.builder_id for b in self._inner),
+            cert_count=_count_pem_certs(pem_bytes),
+        )
+
+
+# ETSI TS 119 612 service-type URI fragment for qualified-signature
+# CAs. Switzerland uses ``https://uri.tsl-switzerland.ch/...``;
+# the EU/ETSI standard uses ``http://uri.etsi.org/...``. Both end
+# in ``/Svctype/CA/QC`` (ETSI's stable suffix). Suffix-match means
+# we accept either jurisdiction's URI prefix, which is the right
+# semantic per the ETSI standard.
+_SVCTYPE_QC_SUFFIX = "/TrstSvc/Svctype/CA/QC"
+
+
+def _extract_qc_certs_from_swiss_tsl(tl_xml: str) -> list[bytes]:
+    """Walk a ETSI TS 119 612 trusted list XML and return the DER
+    bytes of every X.509 cert attached to a qualified-signature CA
+    service. URI-suffix-matched on ``/TrstSvc/Svctype/CA/QC`` so the
+    Swiss namespace (``https://uri.tsl-switzerland.ch/...``) and the
+    ETSI namespace (``http://uri.etsi.org/...``) both resolve to QC.
+
+    Caller is responsible for verifying the TSL's XAdES signature
+    BEFORE invoking this — this function trusts the input bytes.
+    """
+    import base64
+
+    from lxml import etree
+
+    # Parse without resolving entities (defence in depth — tl_xml
+    # came from the network).
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    root = etree.fromstring(tl_xml.encode("utf-8"), parser=parser)
+
+    # ETSI TS 119 612 namespace.
+    ns = {"tsl": "http://uri.etsi.org/02231/v2#"}
+    der_certs: list[bytes] = []
+    seen: set[bytes] = set()
+    for service in root.findall(".//tsl:TSPService", ns):
+        type_el = service.find(".//tsl:ServiceTypeIdentifier", ns)
+        if type_el is None or not type_el.text:
+            continue
+        if not type_el.text.strip().endswith(_SVCTYPE_QC_SUFFIX):
+            continue
+        for cert_el in service.findall(".//tsl:X509Certificate", ns):
+            if not cert_el.text:
+                continue
+            try:
+                der_bytes = base64.b64decode(cert_el.text.strip())
+            except (ValueError, TypeError):
+                continue
+            if der_bytes in seen:
+                continue
+            seen.add(der_bytes)
+            der_certs.append(der_bytes)
+    return der_certs
+
+
+def _ders_to_pem_bundle(der_certs: list[bytes]) -> bytes:
+    """Serialise a list of DER cert bytes as a single PEM bundle."""
+    import base64
+
+    blocks: list[bytes] = []
+    for der in der_certs:
+        b64 = base64.b64encode(der).decode("ascii")
+        wrapped = "\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
+        blocks.append(
+            b"-----BEGIN CERTIFICATE-----\n"
+            + wrapped.encode("ascii")
+            + b"\n-----END CERTIFICATE-----\n"
+        )
+    return b"".join(blocks)
+
+
 def _registry_to_pem_bundle(registry: Any) -> bytes:
     """Walk a pyhanko ``TSPRegistry`` and serialise every qualified
     CA's anchor certificate as a single PEM bundle.

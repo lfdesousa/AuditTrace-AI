@@ -1,0 +1,24 @@
+# ADR-053 — Swiss federal TSL (OFCOM/BAKOM) signer certificate.
+#
+# Vendored binary cert at chart-build time from
+# charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der.
+#
+# SHA-1: e8638362 5130bdf0 1e42a317 6501e079 261b137f
+# Source (OOB-verified 2026-05-09):
+#   https://uri.tsl-switzerland.ch/TrstSvc/TrustedList/schemerules/CH/index.html
+#   https://trustedlist.tsl-switzerland.ch/tsl-signer-certificate/CH-TL-cert-DER.cer
+#
+# The SwissTslTrustStoreBuilder reads this cert to validate the
+# Swiss TSL's XAdES signature before registering any TSP.
+# Without it, the builder cannot trust the TSL it fetches.
+#
+# binaryData (not data) because the cert is DER (binary). k8s
+# decodes the base64 into the file at the mount point.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-swiss-federal-tsl
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+binaryData:
+  CH-TL-cert.der: {{ .Files.Get "trust-store/swiss-federal-tsl/CH-TL-cert.der" | b64enc }}

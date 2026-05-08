@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -23,10 +24,13 @@ import pytest
 
 from audittrace.services.trust_store import (
     _QC_SERVICE_TYPES,
+    CompositeTrustStoreBuilder,
     EuLotlTrustStoreBuilder,
     MockTrustStoreProvider,
     S3TrustStoreProvider,
     StaticTrustStoreBuilder,
+    SwissTslTrustStoreBuilder,
+    TrustStoreBuilder,
     TrustStoreBuilderUnavailableError,
     TrustStoreMetadata,
     _bundle_from_pem,
@@ -38,6 +42,17 @@ _FAKE_PEM_ONE = (
     b"-----BEGIN CERTIFICATE-----\n"
     b"MIIBfTCCASOgAwIBAgIBATAFBgMrZXAwIzEhMB8GA1UEAwwYQXVkaXRUcmFjZS1B\n"
     b"-----END CERTIFICATE-----\n"
+)
+
+# Repo-rooted path to the vendored Swiss TSLO cert. Computed from
+# __file__ so the tests work both on a developer's laptop and on a
+# CI runner (different home directories). Caught by CI 2026-05-09:
+# hard-coded absolute paths failed because the runner's repo root
+# is /home/runner/work/AuditTrace-AI/AuditTrace-AI/, not the
+# developer's /home/lfdesousa/work/AuditTrace-AI/.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENDORED_TSLO_CERT_PATH = (
+    _REPO_ROOT / "charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der"
 )
 _FAKE_PEM_TWO = (
     b"-----BEGIN CERTIFICATE-----\n"
@@ -466,6 +481,319 @@ class TestEuLotlTrustStoreBuilder:
                 TrustStoreBuilderUnavailableError, match="LOTL unreachable"
             ):
                 asyncio.run(builder.build())
+
+
+# ────────────────── SwissTslTrustStoreBuilder (ADR-053) ────────────────
+
+
+class TestSwissTslTrustStoreBuilder:
+    def test_builder_id_is_stable(self, tmp_path: Any) -> None:
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=tmp_path / "ch-tl.der")
+        assert builder.builder_id == "swiss_tsl"
+
+    def test_build_raises_unavailable_when_tslo_cert_missing(
+        self, tmp_path: Any
+    ) -> None:
+        """The TSLO cert is the OOB-verified bootstrap — without it
+        the builder cannot validate the Swiss TSL's signature.
+        Surface as TrustStoreBuilderUnavailableError so the admin
+        endpoint returns 502, not 500 (per ADR-053 failure-modes)."""
+        builder = SwissTslTrustStoreBuilder(
+            tslo_cert_path=tmp_path / "does-not-exist.der"
+        )
+        with pytest.raises(
+            TrustStoreBuilderUnavailableError, match="TSLO cert not found"
+        ):
+            asyncio.run(builder.build())
+
+    def test_build_raises_unavailable_when_tslo_cert_unparseable(
+        self, tmp_path: Any
+    ) -> None:
+        """Garbage bytes at the TSLO cert path → typed unavailable,
+        not a generic crash."""
+        bad_path = tmp_path / "bad.der"
+        bad_path.write_bytes(b"this is not a certificate")
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=bad_path)
+        with pytest.raises(
+            TrustStoreBuilderUnavailableError,
+            match="failed to parse TSLO cert",
+        ):
+            asyncio.run(builder.build())
+
+    def test_build_wraps_fetch_failures_as_unavailable(self, tmp_path: Any) -> None:
+        """Network outage during the Swiss TSL fetch → typed
+        unavailable so the admin endpoint returns 502."""
+        # Vendor a real cert (extracted from main_signed.pdf — known-
+        # parseable by asn1crypto; we don't actually validate against
+        # it because aiohttp.get is mocked to raise before we reach
+        # trust_list_to_registry).
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
+
+        # Fake aiohttp.ClientSession that raises on .get().
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                raise ConnectionError("OFCOM down")
+
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=_FakeSession(),
+        ):
+            with pytest.raises(
+                TrustStoreBuilderUnavailableError, match="failed to fetch Swiss TSL"
+            ):
+                asyncio.run(builder.build())
+
+    def test_build_wraps_signature_validation_failures_as_unavailable(
+        self, tmp_path: Any
+    ) -> None:
+        """The XAdES validation step raising (TSLO cert mismatch, TSL
+        tampered in transit, schema drift, malformed XML) surfaces as
+        typed unavailable so the admin endpoint returns 502 with the
+        cause string in the response body."""
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
+
+        class _FakeResp:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            async def text(self):
+                return "<malformed/>"
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                return _FakeResp()
+
+        with (
+            patch("aiohttp.ClientSession", return_value=_FakeSession()),
+            patch(
+                "pyhanko.sign.validation.qualified.eutl_parse._validate_and_extract_tl_data_multiple_certs",
+                side_effect=ValueError("XAdES verification failed"),
+            ),
+        ):
+            with pytest.raises(
+                TrustStoreBuilderUnavailableError,
+                match="TSL signature validation failed",
+            ):
+                asyncio.run(builder.build())
+
+    def test_build_happy_path_extracts_qc_certs_via_swiss_namespace(
+        self, tmp_path: Any
+    ) -> None:
+        """The Swiss-aware extraction path walks the XML directly
+        (URI-suffix matched) and emits PEM blocks for every
+        ``X509Certificate`` attached to a ``TSPService`` whose
+        ``ServiceTypeIdentifier`` ends in ``/TrstSvc/Svctype/CA/QC``.
+        Caught by live evidence 2026-05-09: the unmodified pyhanko
+        path returns 0 CAs because Switzerland uses the
+        ``https://uri.tsl-switzerland.ch/...`` namespace, not
+        ETSI's ``http://uri.etsi.org/...``."""
+        import base64
+
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
+
+        # Synthetic ETSI TS 119 612 fragment with ONE Swiss QC service
+        # and ONE non-QC service (must be filtered out). The XML uses
+        # the official ETSI v2 namespace.
+        swiss_der = b"\x30\x82der-from-swiss-qc-ca"
+        non_qc_der = b"\x30\x82der-from-non-qc"
+        swiss_b64 = base64.b64encode(swiss_der).decode("ascii")
+        non_qc_b64 = base64.b64encode(non_qc_der).decode("ascii")
+        synth_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <TrustServiceStatusList xmlns="http://uri.etsi.org/02231/v2#">
+          <TSPService>
+            <ServiceInformation>
+              <ServiceTypeIdentifier>
+                https://uri.tsl-switzerland.ch/TrstSvc/Svctype/CA/QC
+              </ServiceTypeIdentifier>
+              <ServiceDigitalIdentity>
+                <DigitalId>
+                  <X509Certificate>{swiss_b64}</X509Certificate>
+                </DigitalId>
+              </ServiceDigitalIdentity>
+            </ServiceInformation>
+          </TSPService>
+          <TSPService>
+            <ServiceInformation>
+              <ServiceTypeIdentifier>
+                https://uri.tsl-switzerland.ch/TrstSvc/Svctype/TSA/QTST
+              </ServiceTypeIdentifier>
+              <ServiceDigitalIdentity>
+                <DigitalId>
+                  <X509Certificate>{non_qc_b64}</X509Certificate>
+                </DigitalId>
+              </ServiceDigitalIdentity>
+            </ServiceInformation>
+          </TSPService>
+        </TrustServiceStatusList>"""
+
+        # Strip leading whitespace per line (lxml handles it but the
+        # ServiceTypeIdentifier text gets its surrounding whitespace
+        # preserved — strip in production via .text.strip()).
+        synth_xml = "\n".join(line.lstrip() for line in synth_xml.splitlines())
+
+        class _FakeResp:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            async def text(self):
+                return synth_xml
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                return _FakeResp()
+
+        with (
+            patch("aiohttp.ClientSession", return_value=_FakeSession()),
+            # Skip the XAdES verification — we're testing the
+            # Swiss-namespace-aware walker, not the signature path.
+            patch(
+                "pyhanko.sign.validation.qualified.eutl_parse._validate_and_extract_tl_data_multiple_certs",
+                return_value=None,
+            ),
+        ):
+            bundle = asyncio.run(builder.build())
+
+        # Exactly one cert (the QC one); the QTST got filtered out.
+        assert bundle.metadata.cert_count == 1
+        assert bundle.metadata.builder_id == "swiss_tsl"
+        # The QC DER appears base64-encoded in the PEM bundle.
+        assert swiss_b64[:30] in bundle.pem_bytes.decode("ascii", errors="replace")
+
+
+# ───────────────── CompositeTrustStoreBuilder (ADR-053) ────────────────
+
+
+class _FakeBuilder(TrustStoreBuilder):
+    """Tiny test double for CompositeTrustStoreBuilder. Yields a
+    pre-constructed bundle on build() success, or raises a typed
+    unavailable on failure — mirrors the contract."""
+
+    def __init__(
+        self,
+        *,
+        builder_id: str,
+        bundle_pem: bytes | None = None,
+        fail: TrustStoreBuilderUnavailableError | None = None,
+    ) -> None:
+        self._id = builder_id
+        self._bundle_pem = bundle_pem
+        self._fail = fail
+
+    @property
+    def builder_id(self) -> str:
+        return self._id
+
+    async def build(self):  # type: ignore[no-untyped-def]
+        if self._fail is not None:
+            raise self._fail
+        assert self._bundle_pem is not None
+        return _bundle_from_pem(
+            self._bundle_pem,
+            builder_id=self._id,
+            source_url=f"test://{self._id}",
+            cert_count=_count_pem_certs(self._bundle_pem),
+        )
+
+
+class TestCompositeTrustStoreBuilder:
+    def test_empty_inner_list_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="empty inner-builder list"):
+            CompositeTrustStoreBuilder([])
+
+    def test_builder_id_chains_inner_ids(self) -> None:
+        composite = CompositeTrustStoreBuilder(
+            [
+                _FakeBuilder(builder_id="eu_lotl", bundle_pem=_FAKE_PEM_ONE),
+                _FakeBuilder(builder_id="swiss_tsl", bundle_pem=_FAKE_PEM_TWO),
+            ]
+        )
+        assert composite.builder_id == "eu_lotl+swiss_tsl"
+
+    def test_build_concatenates_bundles_from_all_inner_builders(self) -> None:
+        composite = CompositeTrustStoreBuilder(
+            [
+                _FakeBuilder(builder_id="eu_lotl", bundle_pem=_FAKE_PEM_ONE),
+                _FakeBuilder(builder_id="swiss_tsl", bundle_pem=_FAKE_PEM_TWO),
+            ]
+        )
+        bundle = asyncio.run(composite.build())
+        # Both inner PEMs concatenated; one cert each.
+        assert _FAKE_PEM_ONE in bundle.pem_bytes
+        assert _FAKE_PEM_TWO in bundle.pem_bytes
+        assert bundle.metadata.cert_count == 2
+        assert bundle.metadata.builder_id == "eu_lotl+swiss_tsl"
+
+    def test_build_continues_when_some_inner_builders_fail(self) -> None:
+        """One inner builder failing should not poison the bundle —
+        the others' results survive. Best-effort posture per ADR-053."""
+        composite = CompositeTrustStoreBuilder(
+            [
+                _FakeBuilder(builder_id="eu_lotl", bundle_pem=_FAKE_PEM_ONE),
+                _FakeBuilder(
+                    builder_id="swiss_tsl",
+                    fail=TrustStoreBuilderUnavailableError("OFCOM down"),
+                ),
+            ]
+        )
+        bundle = asyncio.run(composite.build())
+        # Only the EU LOTL bundle survived.
+        assert _FAKE_PEM_ONE in bundle.pem_bytes
+        assert bundle.metadata.cert_count == 1
+        # builder_id still reports BOTH so auditors can see the
+        # composite shape (the per-inner failure lives in the log).
+        assert bundle.metadata.builder_id == "eu_lotl+swiss_tsl"
+
+    def test_build_raises_when_all_inner_builders_fail(self) -> None:
+        """If EVERY inner builder fails the composite must not return
+        an empty bundle — propagate the first failure so the admin
+        endpoint surfaces the cause."""
+        composite = CompositeTrustStoreBuilder(
+            [
+                _FakeBuilder(
+                    builder_id="eu_lotl",
+                    fail=TrustStoreBuilderUnavailableError("EU LOTL outage"),
+                ),
+                _FakeBuilder(
+                    builder_id="swiss_tsl",
+                    fail=TrustStoreBuilderUnavailableError("OFCOM outage"),
+                ),
+            ]
+        )
+        with pytest.raises(
+            TrustStoreBuilderUnavailableError,
+            match="every inner builder.*failed",
+        ):
+            asyncio.run(composite.build())
 
 
 # ───────────────────────── Closed-set discipline ───────────────────────

@@ -125,6 +125,16 @@ spec:
             {{- end }}
             - name: AUDITTRACE_MINIO_ACCESS_KEY
               value: "minioadmin"
+          volumeMounts:
+            # ADR-053 — Swiss federal TSL signer cert mounted from
+            # ConfigMap. Read-only; the SwissTslTrustStoreBuilder uses
+            # this to validate the Swiss TSL XAdES signature before
+            # registering any TSP. SHA-1 OOB-verified against
+            # https://uri.tsl-switzerland.ch/TrstSvc/TrustedList/schemerules/CH/index.html
+            # on 2026-05-09.
+            - name: swiss-federal-tsl
+              mountPath: /etc/audittrace/swiss-federal-tsl
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
@@ -139,3 +149,13 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.memoryServer.resources | nindent 12 }}
+      volumes:
+        # ADR-053 — Swiss federal TSL signer cert as ConfigMap.
+        # Vendored at chart-build time from
+        # charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der
+        # via the configmap template; mounted read-only into
+        # memory-server. The cert binary is ~2 KB so ConfigMap is
+        # comfortably within the k8s 1 MiB-per-CM limit.
+        - name: swiss-federal-tsl
+          configMap:
+            name: {{ .Release.Name }}-swiss-federal-tsl
