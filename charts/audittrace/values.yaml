@@ -180,7 +180,11 @@ memoryServer:
     AUDITTRACE_PDF_TRUST_STORE_S3_KEY: "trust-store/eu-lotl-bundle.pem"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
-    OTEL_RESOURCE_ATTRIBUTES: "service.namespace=audittrace,service.version=1.0.0,deployment.environment=local"
+    # service.version MUST track pyproject.toml::version. Pinned by
+    # tests/test_version_drift.py so future releases cannot silently
+    # ship a stale version string to Tempo / Langfuse (the v1.0.0→
+    # v1.0.12 drift class — frozen at 1.0.0 across 12 releases).
+    OTEL_RESOURCE_ATTRIBUTES: "service.namespace=audittrace,service.version=1.0.13,deployment.environment=local"
 
 # -- External LLM (host-network endpoints) -----------------------------------
 # hostIP is optional. When empty, templates fall back to global.hostNodeIP,
