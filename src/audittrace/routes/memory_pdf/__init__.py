@@ -23,6 +23,12 @@ from audittrace.routes.memory_pdf.classification import (
     _PDF_WARNING_CODES,
     _classify_pdf_extraction_error,
 )
+from audittrace.routes.memory_pdf.extraction import (
+    _acroform_text_for_page,
+    _ocr_render_page,
+    _pdf_is_encrypted,
+    _quarantine_pdf_attachments,
+)
 from audittrace.routes.memory_pdf.ltv import _summarize_ltv
 from audittrace.routes.memory_pdf.manifest import _flush_pdf_manifest
 from audittrace.routes.memory_pdf.metadata import (
@@ -34,6 +40,14 @@ from audittrace.routes.memory_pdf.pdfa import (
     _PDFA_CONFORMANCE_RE,
     _PDFA_PART_RE,
     _extract_pdfa_conformance,
+)
+from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+from audittrace.routes.memory_pdf.redactions import (
+    _PDF_ANNOT_REDACT,
+    _page_bbox,
+    _rects_intersect,
+    _redaction_rects,
+    _text_clipped_around_redactions,
 )
 from audittrace.routes.memory_pdf.signature import (
     _PEM_CERT_RE,
@@ -49,6 +63,11 @@ __all__ = [
     # classification
     "_PDF_WARNING_CODES",
     "_classify_pdf_extraction_error",
+    # extraction (page-level helpers)
+    "_acroform_text_for_page",
+    "_ocr_render_page",
+    "_pdf_is_encrypted",
+    "_quarantine_pdf_attachments",
     # ltv
     "_summarize_ltv",
     # manifest
@@ -61,6 +80,14 @@ __all__ = [
     "_PDFA_CONFORMANCE_RE",
     "_PDFA_PART_RE",
     "_extract_pdfa_conformance",
+    # pipeline (orchestrator)
+    "_index_pdf_objects",
+    # redactions
+    "_PDF_ANNOT_REDACT",
+    "_page_bbox",
+    "_rects_intersect",
+    "_redaction_rects",
+    "_text_clipped_around_redactions",
     # signature
     "_PEM_CERT_RE",
     "_SIGNATURE_STATUS_CODES",
