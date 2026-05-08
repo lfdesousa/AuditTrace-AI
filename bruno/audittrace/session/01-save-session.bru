@@ -1,0 +1,57 @@
+meta {
+  name: POST /session/save — explicit session save
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/session/save
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "project": "AuditTrace-AI",
+    "interactions": [
+      {
+        "session_id": "bruno-test-session",
+        "project": "AuditTrace-AI",
+        "question": "Bruno smoke-test interaction",
+        "answer": "fixture answer",
+        "model": "qwen3.6",
+        "user_id": "bruno-fixture-user"
+      }
+    ]
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("envelope shape", function() {
+    const body = res.getBody();
+    expect(body.status).to.equal("ok");
+    expect(body.project).to.equal("AuditTrace-AI");
+    expect(body.interactions_saved).to.be.a("number");
+    expect(body.interactions_saved).to.be.greaterThan(0);
+  });
+}
+
+docs {
+  Operator-driven session save. Writes a ``SessionRecord`` row to
+  Postgres via the conversational memory layer (Layer 3, ADR-020).
+  Distinct from the automatic background summariser (ADR-030) which
+  picks idle sessions and writes summaries via its own path.
+
+  Authorization: needs the user's own session-write scope — default
+  env scope string includes it via ``memory:conversational:read-own``
+  but write needs the IDENTITY layer's per-user implicit grant.
+
+  Re-running with the same session_id is idempotent (UPSERT).
+}

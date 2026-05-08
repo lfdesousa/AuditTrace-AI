@@ -1,0 +1,42 @@
+meta {
+  name: POST /interactions — seed audit record (non-chat sources)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/interactions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "session_id": "bruno-test-session",
+    "project": "AuditTrace-AI",
+    "question": "Bruno smoke-test interaction (non-chat source)",
+    "answer": "fixture answer",
+    "model": "qwen3.6",
+    "user_id": "bruno-fixture-user"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}
+
+docs {
+  Stub endpoint for non-chat sources to seed the audit trail. The
+  chat route at /v1/chat/completions writes every interaction to
+  Postgres on the hot path via ``_persist_interaction``; this
+  endpoint is the equivalent for callers that aren't running a
+  chat completion (CLI tools, batch scripts, replay flows).
+
+  Authorization: scope ``audittrace:audit``.
+}

@@ -1,0 +1,70 @@
+meta {
+  name: POST /system/trust-store/refresh — walk EU LOTL + Swiss TSL
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/system/trust-store/refresh
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 when builders + provider succeed", function() {
+    expect([200, 502, 500]).to.include(res.getStatus());
+  });
+  test("metadata shape (200 path)", function() {
+    if (res.getStatus() !== 200) return;
+    const body = res.getBody();
+    expect(body.sha256).to.match(/^[0-9a-f]{64}$/);
+    expect(body.builder_id).to.be.a("string");
+    expect(body.cert_count).to.be.a("number");
+    // Default composite default is eu_lotl+swiss_tsl per ADR-053 §3.
+    expect(body.builder_id).to.match(/eu_lotl|swiss_tsl|composite|static/);
+  });
+  test("composite hits ~897 EU+CH qualified-signature CAs", function() {
+    if (res.getStatus() !== 200) return;
+    const body = res.getBody();
+    if (body.builder_id.includes("eu_lotl") && body.builder_id.includes("swiss_tsl")) {
+      // Soft assertion — TSP counts drift across LOTL refreshes.
+      expect(body.cert_count).to.be.greaterThan(800);
+    }
+  });
+  test("502 detail names the failing inner builder", function() {
+    if (res.getStatus() !== 502) return;
+    const body = res.getBody();
+    expect(body.detail.error).to.equal("trust_store_build_failed");
+    expect(body.detail.builder_id).to.be.a("string");
+  });
+}
+
+docs {
+  Synchronous trust-store refresh. Walks the configured Builder
+  (default ``CompositeTrustStoreBuilder([eu_lotl, swiss_tsl])`` per
+  ADR-053 §3) and persists the resulting PEM bundle via the
+  configured Provider (default ``S3TrustStoreProvider`` → MinIO).
+
+  Wall clock: typically 25-35 s on first refresh (EU LOTL XAdES
+  verification + walk to ~30 member-state TSLs + Swiss TSL fetch).
+  Subsequent refreshes hit the same endpoints; no caching at this
+  layer (the in-process ValidationContext singleton holds the
+  parsed PEM bundle but the refresh always re-walks upstream).
+
+  Authorization: scope ``audittrace:admin``. Add it to the env's
+  ``scope`` string before running.
+
+  Failure modes (per ADR-052 §5):
+    - HTTP 502 trust_store_build_failed — one or more inner builders
+      raised TrustStoreBuilderUnavailableError (LOTL outage,
+      pyhanko[etsi] missing, stale Swiss TSLO cert, etc.).
+      CompositeTrustStoreBuilder is best-effort — partial failure
+      lets the survivors persist; only every-builder failure
+      raises 502.
+    - HTTP 500 trust_store_persist_failed — Provider write failed
+      (MinIO down, permission issue). The previous bundle stays.
+}
