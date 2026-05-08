@@ -409,3 +409,72 @@ helm upgrade $RELEASE $CHART_DIR \
 Pass a fresh values file with `-f` (Scenario A semantics). Helm always accepts the file as the authoritative source.
 
 **If you hit `nil pointer evaluating interface {}.enabled` or similar on a `helm upgrade`, assume Scenario B above was your intent — retry with `--reset-then-reuse-values`.**
+
+### PAdES trust store — bootstrap and refresh (ADR-052 + ADR-053)
+
+After a fresh `helm install` (or any chart upgrade that bumps `pyhanko[etsi]`), the in-cluster trust store is empty until an operator runs the refresh. Without it, every signed PDF flags `signed_untrusted` because the chain doesn't terminate at any configured root. The refresh walks the EU LOTL + Swiss federal TSL and persists ~900 qualified-signature CAs to MinIO.
+
+**Default composition** (per `values.yaml`): `composite` builder running `[eu_lotl, swiss_tsl]` in order. Coverage is EU eIDAS qualified TSPs (~887 CAs across 27 member states) plus Swiss federal TSL qualified TSPs (SwissSign, Swisscom, QuoVadis, Swiss Government — ~10 CAs).
+
+**Manual refresh** (works on any deploy; the audit signal of choice for ad-hoc operator action):
+
+```bash
+# 1. Mint an admin-scoped JWT (one-time interactive Device Flow per ADR-032).
+scripts/audittrace-login --scope audittrace:admin
+BEARER=$(jq -r .access_token < ~/.config/audittrace/tokens.json)
+
+# 2. Refresh — walks EU LOTL (~22 s) + Swiss TSL (~3 s).
+curl -sk --resolve audittrace.local:443:127.0.0.1 \
+     -H "Authorization: Bearer $BEARER" \
+     -X POST --max-time 300 \
+     https://audittrace.local/system/trust-store/refresh
+
+# Expect: HTTP 200 + TrustStoreMetadata JSON with builder_id="eu_lotl+swiss_tsl"
+# and cert_count ≈ 897 (varies as TSPs join/leave the lists).
+
+# 3. Read state any time:
+curl -sk --resolve audittrace.local:443:127.0.0.1 \
+     -H "Authorization: Bearer $BEARER" \
+     https://audittrace.local/system/trust-store
+```
+
+**Helm post-install hook** (opt-in; default disabled until creds are wired):
+
+```yaml
+# values-local.yaml or your overlay
+memoryServer:
+  trustStore:
+    bootstrap:
+      enabled: true
+      credentialsSecret: audittrace-trust-store-refresh-creds
+```
+
+The hook fires after each `helm install` / `helm upgrade` and hits `/system/trust-store/refresh` with a service-account JWT. Pre-requisite: a k8s Secret `<release>-trust-store-refresh-creds` containing `client_id` + `client_secret` for a Keycloak service-account client whose service-account user has the `audittrace:admin` scope. Provision via `kcadm.sh` (mirror the `setup-memory-scopes.sh` script's pattern) — left out of `make k8s-bootstrap-secrets` because the credentials are operator-supplied, not auto-generated.
+
+**Failure modes:**
+
+- **HTTP 502 with `trust_store_build_failed`** — one or more inner builders couldn't run. Common causes: EU LOTL endpoint outage (`https://ec.europa.eu/tools/lotl/eu-lotl.xml`), Swiss TSL endpoint outage (`https://trustedlist.tsl-switzerland.ch/tsl-ch.xml`), or `pyhanko[etsi,async-http]` extras missing in the image. Composite is best-effort: if at least one inner builder succeeds the bundle persists with a partial cert_count; if every inner fails the previous bundle in MinIO stays in place (validator continues to use the cached state).
+- **HTTP 502 with `TSL signature validation failed`** — the Swiss TSLO cert vendored in the chart is stale relative to OFCOM's current signing key, or the TSL was tampered in transit. Action: pull the updated DER from `https://trustedlist.tsl-switzerland.ch/tsl-signer-certificate/CH-TL-cert-DER.cer`, OOB-verify the SHA-1 against `https://uri.tsl-switzerland.ch/TrstSvc/TrustedList/schemerules/CH/index.html`, replace `charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der` in the chart, ship a new release.
+- **HTTP 500 with `trust_store_persist_failed`** — Provider write failed. Usually MinIO connectivity. Inspect with `kubectl logs deploy/audittrace-memory-server -c memory-server --tail=200 | grep trust-store` for the underlying cause.
+
+**Validating the result:**
+
+After a successful refresh, re-index a signed PDF and check the manifest:
+
+```bash
+curl -sk --resolve audittrace.local:443:127.0.0.1 \
+     -H "Authorization: Bearer $BEARER" \
+     -X POST "https://audittrace.local/memory/index?file=episodic/<your-signed.pdf>&collections=ai_research_papers"
+
+curl -sk --resolve audittrace.local:443:127.0.0.1 \
+     -H "Authorization: Bearer $BEARER" \
+     "https://audittrace.local/memory/episodic" | \
+     jq '.items[] | select(.key | contains("<your-signed.pdf>")) | .signature_status'
+
+# Expected for a current-cert EU- or CH-recognised qualified-signature
+# PDF: "signed_valid".
+# Expected for an expired-cert PDF: "signed_untrusted" (basic PAdES
+# validation rejects expired chains; LTV is ADR-054 territory).
+# Expected for a tampered PDF: "signed_tampered".
+# Expected for a self-signed-by-unknown-CA PDF: "signed_untrusted".
+```

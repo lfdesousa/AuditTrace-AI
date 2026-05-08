@@ -187,7 +187,7 @@ class HealthResponse(BaseModel):
     """
 
     status: str = "ok"
-    version: str = "1.0.12"
+    version: str = "1.0.13"
     components: dict[str, str] = Field(default_factory=dict)
 
 

@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 MODELS_PY = REPO_ROOT / "src" / "audittrace" / "models.py"
 SERVER_PY = REPO_ROOT / "src" / "audittrace" / "server.py"
+CHART_VALUES = REPO_ROOT / "charts" / "audittrace" / "values.yaml"
 
 
 def _pyproject_version() -> str:
@@ -47,6 +48,30 @@ def _server_fallback() -> str:
         text,
     )
     assert m, "Could not locate _resolve_version fallback constant in server.py"
+    return m.group(1)
+
+
+def _chart_otel_service_version() -> str:
+    """Parse the ``service.version=X`` fragment out of the chart's
+    ``OTEL_RESOURCE_ATTRIBUTES`` env-var. The chart values file ships
+    a comma-separated string per OTEL semantic conventions; the
+    ``service.version`` token must track pyproject so traces in
+    Tempo / Langfuse self-identify as the running release.
+
+    This site was missed every release between v1.0.1 and v1.0.12 —
+    OTEL_RESOURCE_ATTRIBUTES was frozen at ``service.version=1.0.0``.
+    Drift caught 2026-05-09 by Luis. Pinning here so future releases
+    can't repeat it."""
+    text = CHART_VALUES.read_text(encoding="utf-8")
+    # Match the OTEL_RESOURCE_ATTRIBUTES line; quotes optional, single
+    # or double; comma-separated tokens; pull the service.version token.
+    m = re.search(
+        r"OTEL_RESOURCE_ATTRIBUTES:\s*[\"']?[^\"'\n]*service\.version=([\d.]+)",
+        text,
+    )
+    assert m, (
+        "Could not locate service.version in chart values OTEL_RESOURCE_ATTRIBUTES"
+    )
     return m.group(1)
 
 
@@ -75,4 +100,20 @@ def test_pyproject_matches_server_fallback() -> None:
         f"server.py _resolve_version fallback ({fallback!r}) "
         f"!= pyproject.toml version ({pyproject!r}). "
         "Bump both together (v1.0.10→v1.0.11 drift class)."
+    )
+
+
+def test_pyproject_matches_chart_otel_service_version() -> None:
+    """``OTEL_RESOURCE_ATTRIBUTES`` in ``charts/audittrace/values.yaml``
+    must carry the same ``service.version`` as pyproject. Caught
+    2026-05-09 — that token was frozen at ``1.0.0`` from v1.0.0
+    onward and silently misreported the running version to Tempo
+    and Langfuse for every release between v1.0.1 and v1.0.12."""
+    pyproject = _pyproject_version()
+    chart = _chart_otel_service_version()
+    assert chart == pyproject, (
+        f"chart values OTEL_RESOURCE_ATTRIBUTES service.version "
+        f"({chart!r}) != pyproject.toml version ({pyproject!r}). "
+        "Bump both together — observability stack will misreport "
+        "the running release otherwise (v1.0.0→v1.0.12 drift class)."
     )

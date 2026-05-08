@@ -272,7 +272,7 @@ components:
           title: Status
           type: string
         version:
-          default: 1.0.12
+          default: 1.0.13
           title: Version
           type: string
       title: HealthResponse
