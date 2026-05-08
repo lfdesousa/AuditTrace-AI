@@ -187,7 +187,13 @@ class HealthResponse(BaseModel):
     """
 
     status: str = "ok"
-    version: str = "1.0.13"
+    # Default ``"unknown"`` signals an uninstalled source tree (running
+    # outside of ``pip install``). The route handler always overrides
+    # via ``server._resolve_version()``, so the default only fires
+    # when callers construct the model directly without a value
+    # (tests + ad-hoc scripts). ADR-055 §1 — no hardcoded version
+    # literals; importlib.metadata is the single source.
+    version: str = "unknown"
     components: dict[str, str] = Field(default_factory=dict)
 
 

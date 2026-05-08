@@ -320,7 +320,13 @@ def _resolve_version() -> str:
 
         return version("audittrace-ai")
     except (PackageNotFoundError, ImportError):  # pragma: no cover - dev path
-        return "1.0.13"
+        # ADR-055 §1 — no hardcoded version literal. Returning
+        # "unknown" surfaces the dev-tree state (running outside of
+        # ``pip install``) instead of pretending to be a release the
+        # developer hasn't actually built. Production images install
+        # the package via the Dockerfile builder stage so this branch
+        # only fires during local source-tree runs.
+        return "unknown"
 
 
 # Tag descriptions populate the Swagger UI sidebar. Keep one paragraph

@@ -179,6 +179,37 @@ openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fix
 	@echo "   docs/reference/audittrace/openapi.yaml"
 	@echo "Commit both alongside the API change so reviewers see the diff."
 
+release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate OpenAPI snapshot + run drift gate. Usage: make release VERSION=1.0.14. (ADR-055)
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ usage: make release VERSION=1.0.14"; \
+		echo "Bumps the two single-source-of-truth pin sites + regenerates"; \
+		echo "the OpenAPI snapshot. Stops short of committing or tagging —"; \
+		echo "review the diff, then commit + tag manually."; \
+		exit 1; \
+	fi
+	@echo "🔖 bumping pyproject.toml::version → $(VERSION)"
+	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' pyproject.toml
+	@echo "🔖 bumping charts/audittrace/Chart.yaml::version + appVersion → $(VERSION)"
+	@sed -i 's/^version: .*/version: $(VERSION)/' charts/audittrace/Chart.yaml
+	@sed -i 's/^appVersion: ".*"/appVersion: "$(VERSION)"/' charts/audittrace/Chart.yaml
+	@echo "📝 regenerating OpenAPI snapshot ..."
+	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov >/dev/null
+	@echo "🚦 running drift gate ..."
+	@.venv/bin/pytest tests/test_version_drift.py -q --no-cov
+	@echo
+	@echo "✅ release-prep done for v$(VERSION). Diff:"
+	@git diff --stat pyproject.toml charts/audittrace/Chart.yaml \
+	    docs/reference/audittrace/openapi.yaml tests/fixtures/openapi.snapshot.yaml
+	@echo
+	@echo "Next steps:"
+	@echo "  1. git add pyproject.toml charts/audittrace/Chart.yaml \\"
+	@echo "         docs/reference/audittrace/openapi.yaml \\"
+	@echo "         tests/fixtures/openapi.snapshot.yaml"
+	@echo "  2. git commit -m 'chore(release): v$(VERSION)'"
+	@echo "  3. open release PR; after merge, tag v$(VERSION) on main"
+	@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"
+	@echo "  5. helm upgrade --reset-then-reuse-values --set memoryServer.image.tag=v$(VERSION)"
+
 k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
