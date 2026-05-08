@@ -1,0 +1,72 @@
+meta {
+  name: POST /memory/index?file=&details=true — per-document outcome
+  type: http
+  seq: 93
+}
+
+post {
+  url: {{baseUrl}}/memory/index?collections=ai_research_papers&file=episodic/main_signed.pdf&details=true
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  collections: ai_research_papers
+  file: episodic/main_signed.pdf
+  details: true
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("documents array present and shaped per ADR-056 §3", function() {
+    const body = res.getBody();
+    expect(body.documents).to.be.an("array");
+    expect(body.documents.length).to.be.greaterThan(0);
+    const d = body.documents[0];
+    expect(d).to.have.property("file");
+    expect(d).to.have.property("ok");
+    expect(d).to.have.property("chunks");
+    expect(d).to.have.property("signature_status");
+    expect(d).to.have.property("page_count");
+    expect(d).to.have.property("extraction_warnings");
+    expect(d).to.have.property("document_sha256");
+    // ADR-056 #10 metadata fields.
+    expect(d).to.have.property("pdf_title");
+    expect(d).to.have.property("pdf_author");
+    expect(d).to.have.property("pdf_creator");
+    expect(d).to.have.property("pdf_creation_date");
+    expect(d).to.have.property("error");
+  });
+  test("legacy fields still present alongside documents", function() {
+    const body = res.getBody();
+    expect(body.status).to.equal("indexed");
+    expect(body.collections).to.be.an("object");
+    expect(body.total_chunks).to.be.a("number");
+    expect(body.duration_s).to.be.a("number");
+  });
+}
+
+docs {
+  Tier-C item #24 (ADR-056) — per-document outcome inside the
+  /memory/index response. Adds a ``documents`` array carrying one
+  entry per PDF processed, with the keys auditors actually want:
+  ``file``, ``ok``, ``chunks``, ``signature_status``, ``page_count``,
+  ``extraction_warnings``, ``document_sha256``, ``pdf_title``,
+  ``pdf_author``, ``pdf_creator``, ``pdf_creation_date``, ``error``.
+
+  Default response shape (``?details=false`` or omitted) is unchanged
+  per the backwards-compatibility contract — see
+  ``index-single-file.bru`` for the legacy probe.
+
+  Bulk indexes can produce large ``documents`` arrays (one entry per
+  PDF); use opt-in for clients that want the detail.
+
+  Authorization: same as the single-file probe — per-layer write
+  scope matching the file's MinIO prefix.
+}

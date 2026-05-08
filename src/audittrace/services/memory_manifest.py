@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -65,6 +66,17 @@ class ManifestEntry:
     form_field_count: int | None = None
     extraction_warnings: list[dict[str, Any]] | None = None
     document_sha256: str | None = None
+    # ── Tier-C PDF document metadata (ADR-056 #10) ───────────────────
+    # Populated from pymupdf ``doc.metadata`` during /memory/index. All
+    # Optional — non-PDF rows + PDFs pre-tier-C leave them None.
+    pdf_title: str | None = None
+    pdf_author: str | None = None
+    pdf_creator: str | None = None
+    pdf_creation_date: datetime | None = None
+    # ADR-056 #14 PDF/A + #13 LTV
+    pdfa_part: str | None = None
+    pdfa_conformance: str | None = None
+    ltv_data: dict[str, Any] | None = None
 
     @classmethod
     def from_row(cls, row: MemoryItem) -> ManifestEntry:
@@ -87,6 +99,13 @@ class ManifestEntry:
             form_field_count=row.form_field_count,
             extraction_warnings=row.extraction_warnings,
             document_sha256=row.document_sha256,
+            pdf_title=row.pdf_title,
+            pdf_author=row.pdf_author,
+            pdf_creator=row.pdf_creator,
+            pdf_creation_date=row.pdf_creation_date,
+            pdfa_part=row.pdfa_part,
+            pdfa_conformance=row.pdfa_conformance,
+            ltv_data=row.ltv_data,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,6 +129,17 @@ class ManifestEntry:
             "form_field_count": self.form_field_count,
             "extraction_warnings": self.extraction_warnings,
             "document_sha256": self.document_sha256,
+            "pdf_title": self.pdf_title,
+            "pdf_author": self.pdf_author,
+            "pdf_creator": self.pdf_creator,
+            "pdf_creation_date": (
+                self.pdf_creation_date.isoformat()
+                if self.pdf_creation_date is not None
+                else None
+            ),
+            "pdfa_part": self.pdfa_part,
+            "pdfa_conformance": self.pdfa_conformance,
+            "ltv_data": self.ltv_data,
         }
 
 
@@ -280,8 +310,15 @@ class MemoryManifestService:
         form_field_count: int,
         extraction_warnings: list[dict[str, Any]],
         document_sha256: str | None,
+        pdf_title: str | None = None,
+        pdf_author: str | None = None,
+        pdf_creator: str | None = None,
+        pdf_creation_date: datetime | None = None,
+        pdfa_part: str | None = None,
+        pdfa_conformance: str | None = None,
+        ltv_data: dict[str, Any] | None = None,
     ) -> ManifestEntry:
-        """Write tier-B PDF manifest fields for ``(layer, key)``.
+        """Write tier-B + tier-C PDF manifest fields for ``(layer, key)``.
 
         Creates a new ``MemoryItem`` row if none exists (since /memory/index
         is itself the first touch for many uploaded PDFs — the per-layer
@@ -289,8 +326,9 @@ class MemoryManifestService:
         keep their authorship; only the PDF fields + ``modified_*`` are
         bumped.
 
-        Per ADR-050 #22: this is the single audit-pivot writer. Every
-        successful PDF index call lands one of these per file.
+        Per ADR-050 #22 + ADR-056 #10: this is the single audit-pivot
+        writer. Every successful PDF index call lands one of these per
+        file.
         """
         _validate_layer(layer)
         now = _now_ms()
@@ -322,6 +360,13 @@ class MemoryManifestService:
             row.form_field_count = form_field_count
             row.extraction_warnings = extraction_warnings
             row.document_sha256 = document_sha256
+            row.pdf_title = pdf_title
+            row.pdf_author = pdf_author
+            row.pdf_creator = pdf_creator
+            row.pdf_creation_date = pdf_creation_date
+            row.pdfa_part = pdfa_part
+            row.pdfa_conformance = pdfa_conformance
+            row.ltv_data = ltv_data
             session.commit()
             session.refresh(row)
             return ManifestEntry.from_row(row)
@@ -373,6 +418,13 @@ class MockMemoryManifestService(MemoryManifestService):
             form_field_count=row.get("form_field_count"),
             extraction_warnings=row.get("extraction_warnings"),
             document_sha256=row.get("document_sha256"),
+            pdf_title=row.get("pdf_title"),
+            pdf_author=row.get("pdf_author"),
+            pdf_creator=row.get("pdf_creator"),
+            pdf_creation_date=row.get("pdf_creation_date"),
+            pdfa_part=row.get("pdfa_part"),
+            pdfa_conformance=row.get("pdfa_conformance"),
+            ltv_data=row.get("ltv_data"),
         )
 
     def record_create(
@@ -476,6 +528,13 @@ class MockMemoryManifestService(MemoryManifestService):
         form_field_count: int,
         extraction_warnings: list[dict[str, Any]],
         document_sha256: str | None,
+        pdf_title: str | None = None,
+        pdf_author: str | None = None,
+        pdf_creator: str | None = None,
+        pdf_creation_date: datetime | None = None,
+        pdfa_part: str | None = None,
+        pdfa_conformance: str | None = None,
+        ltv_data: dict[str, Any] | None = None,
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -509,6 +568,13 @@ class MockMemoryManifestService(MemoryManifestService):
         existing["form_field_count"] = form_field_count
         existing["extraction_warnings"] = extraction_warnings
         existing["document_sha256"] = document_sha256
+        existing["pdf_title"] = pdf_title
+        existing["pdf_author"] = pdf_author
+        existing["pdf_creator"] = pdf_creator
+        existing["pdf_creation_date"] = pdf_creation_date
+        existing["pdfa_part"] = pdfa_part
+        existing["pdfa_conformance"] = pdfa_conformance
+        existing["ltv_data"] = ltv_data
         return self._to_entry(existing)
 
     def reset(self) -> None:

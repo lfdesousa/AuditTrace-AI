@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from io import BytesIO
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -3035,9 +3036,10 @@ class TestExtractionWarningCodes:
     def test_warning_codes_match_adr_050_closed_set(self) -> None:
         from audittrace.routes.memory import _PDF_WARNING_CODES
 
-        # The exact set documented in ADR-050 §extraction_warnings.
-        # Adding a code: bump the ADR + add it here. Removing one:
-        # same. CI fails the diff if these drift.
+        # The exact set documented in ADR-050 §extraction_warnings (tier-A
+        # / tier-B) + ADR-056 §2 (tier-C corruption + metadata classes).
+        # Adding a code: bump the relevant ADR + add it here. Removing
+        # one: same. CI fails the diff if these drift.
         expected = {
             # tier-A bomb defenses (item #18)
             "max_size",
@@ -3048,13 +3050,17 @@ class TestExtractionWarningCodes:
             # tier-A redaction (item #8)
             "redaction_clipped",
             "redaction_rejected",
-            # tier-B (this PR)
+            # tier-B
             "encrypted",
             "no_text_layer",
             "ocr_low_confidence",
             "attachment",
             "attachment_quarantine_failed",
             "form_fields",
+            # tier-C (ADR-056 #16 corrupted-file + #10 metadata)
+            "pdf_corrupted_xref",
+            "pdf_corrupted_structure",
+            "pdf_metadata_parse_error",
         }
         assert _PDF_WARNING_CODES == expected
 
@@ -3634,3 +3640,730 @@ class TestPdfFlushManifest:
             document_sha256="hash",
         )
         manifest.upsert_pdf_metadata.assert_called_once()
+
+
+# ── Tier-C: PDF document metadata + corruption taxonomy + per-doc audit (ADR-056) ──
+
+
+class TestPdfMetadataParseDate:
+    """Direct unit tests for ``_parse_pdf_date`` (ADR-056 #10)."""
+
+    def test_full_pdf_date_with_offset(self) -> None:
+
+        from audittrace.routes.memory import _parse_pdf_date
+
+        dt = _parse_pdf_date("D:20260403103936+02'00'")
+        assert dt is not None
+        assert dt.year == 2026
+        assert dt.month == 4
+        assert dt.day == 3
+        assert dt.hour == 10
+        assert dt.minute == 39
+        assert dt.second == 36
+        assert dt.utcoffset() is not None
+        assert dt.tzinfo != UTC
+
+    def test_zulu_form(self) -> None:
+
+        from audittrace.routes.memory import _parse_pdf_date
+
+        dt = _parse_pdf_date("D:20260403103936Z")
+        assert dt is not None
+        assert dt.tzinfo == UTC
+
+    def test_short_form_year_only(self) -> None:
+        from audittrace.routes.memory import _parse_pdf_date
+
+        dt = _parse_pdf_date("D:2026")
+        assert dt is not None
+        assert dt.year == 2026
+        assert dt.month == 1
+        assert dt.day == 1
+
+    def test_empty_returns_none(self) -> None:
+        from audittrace.routes.memory import _parse_pdf_date
+
+        assert _parse_pdf_date("") is None
+        assert _parse_pdf_date("   ") is None
+
+    def test_garbage_returns_none(self) -> None:
+        from audittrace.routes.memory import _parse_pdf_date
+
+        assert _parse_pdf_date("not-a-date") is None
+        assert _parse_pdf_date("D:99999999999999") is None
+
+    def test_non_string_returns_none(self) -> None:
+        from audittrace.routes.memory import _parse_pdf_date
+
+        assert _parse_pdf_date(None) is None  # type: ignore[arg-type]
+        assert _parse_pdf_date(12345) is None  # type: ignore[arg-type]
+
+
+class TestPdfMetadataExtraction:
+    """``_extract_pdf_metadata`` over fake pymupdf docs (ADR-056 #10)."""
+
+    def test_full_metadata(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        doc = SimpleNamespace(
+            metadata={
+                "title": "Luis Research Proposal",
+                "author": "Luis Filipe de Sousa",
+                "creator": "Microsoft Word",
+                "creationDate": "D:20260403103936+02'00'",
+            }
+        )
+        title, author, creator, creation_date, codes = _extract_pdf_metadata(doc)
+        assert title == "Luis Research Proposal"
+        assert author == "Luis Filipe de Sousa"
+        assert creator == "Microsoft Word"
+        assert creation_date is not None
+        assert creation_date.year == 2026
+        assert codes == []
+
+    def test_missing_metadata_returns_all_none(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        doc = SimpleNamespace(metadata={})
+        title, author, creator, creation_date, codes = _extract_pdf_metadata(doc)
+        assert title is None
+        assert author is None
+        assert creator is None
+        assert creation_date is None
+        assert codes == []
+
+    def test_blank_string_collapses_to_none(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        doc = SimpleNamespace(metadata={"title": "  ", "author": "", "creator": "  "})
+        title, author, creator, _, codes = _extract_pdf_metadata(doc)
+        assert title is None
+        assert author is None
+        assert creator is None
+        assert codes == []
+
+    def test_garbage_creation_date_emits_metadata_parse_error(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        doc = SimpleNamespace(
+            metadata={"title": "Doc", "creationDate": "totally not a date"}
+        )
+        title, _, _, creation_date, codes = _extract_pdf_metadata(doc)
+        assert title == "Doc"
+        assert creation_date is None
+        assert "pdf_metadata_parse_error" in codes
+
+    def test_oversize_string_truncated(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        long = "x" * 1000
+        doc = SimpleNamespace(metadata={"title": long, "author": long})
+        title, author, _, _, _ = _extract_pdf_metadata(doc)
+        assert title is not None and len(title) == 255
+        assert author is not None and len(author) == 255
+
+
+class TestPdfCorruptionClassification:
+    """``_classify_pdf_extraction_error`` covers the closed-set codes
+    introduced in ADR-056 §2."""
+
+    def test_xref_message_classified_as_xref(self) -> None:
+        from audittrace.routes.memory import _classify_pdf_extraction_error
+
+        assert (
+            _classify_pdf_extraction_error(RuntimeError("invalid xref offset"))
+            == "pdf_corrupted_xref"
+        )
+
+    def test_trailer_message_classified_as_xref(self) -> None:
+        from audittrace.routes.memory import _classify_pdf_extraction_error
+
+        assert (
+            _classify_pdf_extraction_error(RuntimeError("trailer not found"))
+            == "pdf_corrupted_xref"
+        )
+
+    def test_filedata_class_classified_as_structure(self) -> None:
+        from audittrace.routes.memory import _classify_pdf_extraction_error
+
+        class FileDataError(Exception):
+            pass
+
+        assert (
+            _classify_pdf_extraction_error(FileDataError("bad data"))
+            == "pdf_corrupted_structure"
+        )
+
+    def test_unknown_falls_through_to_structure(self) -> None:
+        from audittrace.routes.memory import _classify_pdf_extraction_error
+
+        assert (
+            _classify_pdf_extraction_error(RuntimeError("something unexpected"))
+            == "pdf_corrupted_structure"
+        )
+
+
+class TestPdfFlushManifestDetailsLog:
+    """ADR-056 #24 — _flush_pdf_manifest appends a per-document outcome
+    when ``details_log`` is provided."""
+
+    def test_details_log_appended_success(self) -> None:
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        log: list[dict] = []
+        _flush_pdf_manifest(
+            manifest_service=None,
+            layer="episodic",
+            key="papers/foo.pdf",
+            user_id="u",
+            size_bytes=1024,
+            page_count=23,
+            signature_status="signed_expired",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="49aadc5e",
+            pdf_title="Doc Title",
+            pdf_author="Doc Author",
+            pdf_creator="MS Word",
+            pdf_creation_date=None,
+            chunks_written=46,
+            ok=True,
+            error=None,
+            details_log=log,
+        )
+        assert len(log) == 1
+        entry = log[0]
+        assert entry["chunks"] == 46
+        assert entry["signature_status"] == "signed_expired"
+        assert entry["page_count"] == 23
+        assert entry["ok"] is True
+        assert entry["error"] is None
+        assert entry["pdf_title"] == "Doc Title"
+        assert entry["pdf_author"] == "Doc Author"
+        assert entry["pdf_creator"] == "MS Word"
+
+    def test_details_log_failure_outcome(self) -> None:
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        log: list[dict] = []
+        _flush_pdf_manifest(
+            manifest_service=None,
+            layer="episodic",
+            key="papers/corrupt.pdf",
+            user_id="u",
+            size_bytes=512,
+            page_count=None,
+            signature_status=None,
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[{"code": "pdf_corrupted_xref", "page": None}],
+            document_sha256=None,
+            chunks_written=0,
+            ok=False,
+            error="invalid xref offset",
+            details_log=log,
+        )
+        assert len(log) == 1
+        entry = log[0]
+        assert entry["ok"] is False
+        assert entry["error"] == "invalid xref offset"
+        assert entry["chunks"] == 0
+        assert entry["extraction_warnings"] == [
+            {"code": "pdf_corrupted_xref", "page": None}
+        ]
+
+    def test_details_log_none_skips_append(self) -> None:
+        """When details_log is None, no list mutations happen — the
+        legacy callers stay legacy."""
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        _flush_pdf_manifest(
+            manifest_service=None,
+            layer="episodic",
+            key="x.pdf",
+            user_id="u",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+            details_log=None,
+        )
+
+
+class TestLtvSummary:
+    """ADR-056 #13 — `_summarize_ltv` audit-pivot summary of the DSS dict."""
+
+    def test_garbage_bytes_returns_none(self) -> None:
+        from audittrace.routes.memory import _summarize_ltv
+
+        assert _summarize_ltv(b"definitely not a pdf") is None
+
+    def test_unsigned_pdf_returns_none(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory import _summarize_ltv
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = []
+
+        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+            assert _summarize_ltv(b"%PDF-1.4 minimal") is None
+
+    def test_signed_no_dss_returns_has_dss_false(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory import _summarize_ltv
+
+        fake_sig = MagicMock()
+        fake_sig.sig_object = b"<<...>>"
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [fake_sig]
+        fake_root = {"/Type": "/Catalog"}
+        fake_trailer = {"/Root": fake_root}
+        fake_reader.trailer_view = fake_trailer
+        fake_reader.trailer = fake_trailer
+
+        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+            result = _summarize_ltv(b"%PDF-1.4 signed-no-ltv")
+        assert result is not None
+        assert result == {
+            "has_dss": False,
+            "ocsp_responses": 0,
+            "crls": 0,
+            "certs": 0,
+            "timestamps": 0,
+            "vri_keys": 0,
+        }
+
+    def test_doc_timestamp_signature_counted(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory import _summarize_ltv
+
+        regular_sig = MagicMock()
+        regular_sig.sig_object = b"<</Type /Sig>>"
+        ts_sig = MagicMock()
+        ts_sig.sig_object = b"<</Type /DocTimeStamp>>"
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [regular_sig, ts_sig]
+        fake_root = {"/Type": "/Catalog"}
+        fake_trailer = {"/Root": fake_root}
+        fake_reader.trailer_view = fake_trailer
+        fake_reader.trailer = fake_trailer
+
+        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+            result = _summarize_ltv(b"%PDF-1.4 doctimestamped")
+        assert result is not None
+        assert result["timestamps"] == 1
+
+
+class TestPdfMetadataNonStringCreationDate:
+    """Tier-C #10 — non-string `creationDate` (e.g. a datetime object) emits
+    a `pdf_metadata_parse_error` warning."""
+
+    def test_non_string_date_emits_warning(self) -> None:
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdf_metadata
+
+        doc = SimpleNamespace(
+            metadata={"title": "Doc", "creationDate": datetime(2026, 4, 3)}
+        )
+        title, _, _, creation_date, codes = _extract_pdf_metadata(doc)
+        assert title == "Doc"
+        assert creation_date is None
+        assert "pdf_metadata_parse_error" in codes
+
+
+class TestTocIndexInvalidEntries:
+    """ADR-056 #9 — `_build_toc_index` skips malformed TOC entries."""
+
+    def test_malformed_entries_skipped(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _build_toc_index
+
+        toc = [
+            [1, "Valid", 2],
+            ["bad", "missing-page"],  # IndexError on entry[2]
+            [1, None, 3],  # title=None -> skipped via title_clean
+            [1, "Bad page", "not-a-number"],  # ValueError on int()
+            [1, "Zero page", 0],  # page <= 0 -> skipped
+            [1, "Latest", 4],
+        ]
+        doc = SimpleNamespace(get_toc=lambda simple=True: toc, page_count=5)
+        index = _build_toc_index(doc)
+        assert index[2] == "Valid"
+        assert index[3] == "Valid"
+        assert index[4] == "Latest"
+        assert index[5] == "Latest"
+
+
+class TestPdfaConformanceExtraction:
+    """ADR-056 #14 — `_extract_pdfa_conformance` parses XMP."""
+
+    def test_pdfa_3b_attribute_form(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        xmp = (
+            '<?xpacket begin="..." id="W5M0MpCehiHzreSzNTczkc9d"?>'
+            '<rdf:Description xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" '
+            'pdfaid:part="3" pdfaid:conformance="B"/>'
+        )
+        doc = SimpleNamespace(get_xml_metadata=lambda: xmp)
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part == "3"
+        assert conf == "B"
+
+    def test_pdfa_2u_element_form(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        xmp = (
+            "<rdf:Description xmlns:pdfaid='http://www.aiim.org/pdfa/ns/id/'>"
+            "<pdfaid:part>2</pdfaid:part>"
+            "<pdfaid:conformance>U</pdfaid:conformance>"
+            "</rdf:Description>"
+        )
+        doc = SimpleNamespace(get_xml_metadata=lambda: xmp)
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part == "2"
+        assert conf == "U"
+
+    def test_no_xmp_returns_none(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        doc = SimpleNamespace(get_xml_metadata=lambda: "")
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part is None
+        assert conf is None
+
+    def test_xmp_raise_swallowed(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        def raises() -> str:
+            raise RuntimeError("xmp not parseable")
+
+        doc = SimpleNamespace(get_xml_metadata=raises)
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part is None
+        assert conf is None
+
+
+class TestTocIndexBuilder:
+    """ADR-056 #9 — `_build_toc_index` forward-fills TOC entries to pages."""
+
+    def test_simple_two_section_toc(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _build_toc_index
+
+        toc = [
+            [1, "Introduction", 1],
+            [1, "Methods", 5],
+            [1, "Results", 12],
+        ]
+        doc = SimpleNamespace(get_toc=lambda simple=True: toc, page_count=15)
+        index = _build_toc_index(doc)
+        assert index[1] == "Introduction"
+        assert index[4] == "Introduction"
+        assert index[5] == "Methods"
+        assert index[11] == "Methods"
+        assert index[12] == "Results"
+        assert index[15] == "Results"
+
+    def test_empty_toc_returns_empty_dict(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _build_toc_index
+
+        doc = SimpleNamespace(get_toc=lambda simple=True: [], page_count=5)
+        assert _build_toc_index(doc) == {}
+
+    def test_toc_raise_returns_empty_dict(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _build_toc_index
+
+        def raises(simple: bool = True) -> list:
+            raise RuntimeError("no toc")
+
+        doc = SimpleNamespace(get_toc=raises, page_count=5)
+        assert _build_toc_index(doc) == {}
+
+    def test_toc_entries_after_first_page_leave_pre_pages_unmapped(self) -> None:
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _build_toc_index
+
+        toc = [[1, "First Section", 3]]
+        doc = SimpleNamespace(get_toc=lambda simple=True: toc, page_count=5)
+        index = _build_toc_index(doc)
+        assert 1 not in index
+        assert 2 not in index
+        assert index[3] == "First Section"
+        assert index[5] == "First Section"
+
+
+class TestPdfIndexDryRun:
+    """ADR-056 #23 — `?dry_run=true` skips ChromaDB writes + manifest writes
+    but still surfaces per-doc outcomes via `?details=true`."""
+
+    def test_dry_run_skips_chroma_upsert_and_manifest(self, client: TestClient) -> None:
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+
+        mock_minio = MagicMock()
+        mock_minio.list_objects.side_effect = lambda bucket, prefix="", **_: (
+            [_mock_minio_object("episodic/clean.pdf")] if prefix == "episodic/" else []
+        )
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text."
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+        fake_doc.metadata = {"title": "Doc"}
+        fake_doc.get_xml_metadata = MagicMock(return_value="")
+        fake_doc.get_toc = MagicMock(return_value=[])
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "dry_run": "true",
+                    "details": "true",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # Status flips to dry_run; dry_run=true is surfaced explicitly.
+        assert body["status"] == "dry_run"
+        assert body.get("dry_run") is True
+        # No collection delete-and-recreate happened — existing chunks
+        # are preserved.
+        mock_chroma.delete_collection.assert_not_called()
+        # No manifest write happened (Postgres is not touched in
+        # dry-run).
+        mock_manifest.upsert_pdf_metadata.assert_not_called()
+        # documents array still present + per-doc outcome reported.
+        assert "documents" in body
+        docs = body["documents"]
+        assert len(docs) == 1
+        assert docs[0]["ok"] is True
+        # Collection-level chunk count is zero because no upsert ran;
+        # chunks_written on the per-doc outcome reports what *would*
+        # have been written.
+        assert body["total_chunks"] == 0
+        assert docs[0]["chunks"] >= 1
+
+
+class TestPdfIndexDetailsResponseShape:
+    """ADR-056 #24 — ``?details=true`` adds a ``documents`` array to the
+    /memory/index response; legacy ``?details=false`` (default) keeps
+    the existing shape."""
+
+    def test_default_response_omits_documents(self, client: TestClient) -> None:
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+
+        mock_minio = MagicMock()
+        mock_minio.list_objects.side_effect = lambda bucket, prefix="", **_: (
+            [_mock_minio_object("episodic/clean.pdf")] if prefix == "episodic/" else []
+        )
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text."
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=MagicMock(),
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers"},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # Legacy keys must be present and unchanged.
+        assert body["status"] == "indexed"
+        assert "collections" in body
+        assert "total_chunks" in body
+        assert "duration_s" in body
+        # ?details default false — no documents key.
+        assert "documents" not in body
+
+    def test_details_true_adds_per_document_array(self, client: TestClient) -> None:
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+
+        mock_minio = MagicMock()
+        mock_minio.list_objects.side_effect = lambda bucket, prefix="", **_: (
+            [_mock_minio_object("episodic/clean.pdf")] if prefix == "episodic/" else []
+        )
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_collection = MagicMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection.return_value = mock_collection
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text."
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+        # Real metadata dict so the tier-C #10 path runs end-to-end.
+        fake_doc.metadata = {
+            "title": "Clean Doc",
+            "author": "Alice",
+            "creator": "Microsoft Word",
+            "creationDate": "D:20260403103936Z",
+        }
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=MagicMock(),
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "ai_research_papers", "details": "true"},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert "documents" in body
+        docs = body["documents"]
+        assert len(docs) == 1
+        d = docs[0]
+        # Per-document outcome shape (ADR-056 §3).
+        assert d["ok"] is True
+        assert d["error"] is None
+        assert d["chunks"] >= 1
+        assert d["page_count"] == 1
+        assert d["pdf_title"] == "Clean Doc"
+        assert d["pdf_author"] == "Alice"
+        assert d["pdf_creator"] == "Microsoft Word"
+        # Date is serialised as ISO-8601 string.
+        assert isinstance(d["pdf_creation_date"], str)
+        assert d["pdf_creation_date"].startswith("2026-04-03")
