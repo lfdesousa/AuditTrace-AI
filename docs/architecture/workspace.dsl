@@ -32,6 +32,10 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         organisationalIdP = softwareSystem "Organisational IdP" "Customer-side OIDC issuer (Microsoft Entra ID, Okta, Google Workspace, Ping Identity, Auth0, ...). Source-of-truth for employee identity, group membership, MFA, and deprovisioning. Brokered through Keycloak per ADR-044; never directly contacted by memory-server. Optional dependency — laptop-first / POC deployments run with Keycloak as the only IdP." {
             tags "External"
         }
+        euLotl = softwareSystem "EU List of Trusted Lists" "EU Commission's eu-lotl.xml + member-state national TSLs — XAdES-signed registry of qualified-signature trust service providers. Hit transiently by EuLotlTrustStoreBuilder during admin-endpoint refresh; not a standing runtime dependency (ADR-052). pyhanko's [etsi] extra ships the LOTL bootstrap signing keys, so no out-of-band cert vendoring is required." {
+            tags "External"
+        }
+
         observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
             tags "External"
         }
@@ -77,6 +81,11 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                 diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"
                 pgFactory = component "PostgresFactory" "Connection pooling + session management (ADR-020)" "ABC + URLPostgresFactory"
                 telemetry = component "Telemetry" "OTel spans + Langfuse SDK routing (ADR-024 §15.x)" "telemetry.py + logging_config.py"
+
+                // PAdES trust store (ADR-052 — pluggable Provider + Builder)
+                adminRoute = component "Admin Route" "/admin/trust-store/refresh — operator-explicit trust-store refresh (scope: audittrace:admin). Synchronously invokes Builder.build() then Provider.store() and invalidates the in-process ValidationContext singleton. Also called once by the Helm post-install hook Job (ADR-052 §5)." "FastAPI Router (routes/admin.py)"
+                trustStoreProvider = component "TrustStoreProvider" "Where the PEM bundle lives. Pluggable storage layer — default S3TrustStoreProvider (MinIO at memory-shared/trust-store/eu-lotl-bundle.pem). MockTrustStoreProvider for tests. VaultTrustStoreProvider in ABC contract (future). ADR-052 §2." "ABC + S3TrustStoreProvider (Mock fallback for tests)"
+                trustStoreBuilder = component "TrustStoreBuilder" "Where the PEM bundle comes from. Pluggable sourcing layer — default EuLotlTrustStoreBuilder (pyhanko[etsi] lotl_to_registry, filters QC for ESig/ESeal). StaticTrustStoreBuilder (concat operator-supplied PEMs) for air-gapped deploys + tests. AdobeAATLTrustStoreBuilder + CefDssSidecarBuilder in ABC contract (future). ADR-052 §3." "ABC + EuLotlTrustStoreBuilder (+ StaticTrustStoreBuilder)"
             }
 
             postgresDb = container "PostgreSQL 16" "Audit trail (interactions, sessions, tool_calls) — user_id is Keycloak sub, no local users table" "PostgreSQL" {
@@ -160,6 +169,15 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         memoryServer.api.sessionSummarizer -> memoryServer.postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
         memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
         memoryServer.api.sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
+
+        // PAdES trust store (ADR-052, Accepted)
+        memoryServer.api.adminRoute -> memoryServer.api.requireUser "Auth: scope audittrace:admin"
+        memoryServer.api.adminRoute -> memoryServer.api.trustStoreBuilder "build() — synchronous; returns TrustStoreBundle(pem_bytes, metadata)"
+        memoryServer.api.adminRoute -> memoryServer.api.trustStoreProvider "store(bundle) — persist + invalidate ValidationContext singleton"
+        memoryServer.api.trustStoreBuilder -> euLotl "lotl_to_registry(lotl_xml=None) — fetch + verify XAdES + walk member-state TSLs (transient, only during refresh)" "HTTPS/XML"
+        memoryServer.api.trustStoreProvider -> memoryServer.minioStore "GET/PUT memory-shared/trust-store/eu-lotl-bundle.pem" "S3 API"
+        memoryServer.api.diContainer -> memoryServer.api.trustStoreProvider "Injects (default S3TrustStoreProvider; settings select impl)"
+        memoryServer.api.diContainer -> memoryServer.api.trustStoreBuilder "Injects (default EuLotlTrustStoreBuilder; settings select impl)"
 
         // Async chat-completion persistence (ADR-046, Accepted)
         memoryServer.api.chatRoute -> memoryServer.api.asyncPersistProducer "On X-Persist-Mode: async — serialise InteractionRecord kwargs + tool_calls"
