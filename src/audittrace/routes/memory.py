@@ -693,10 +693,25 @@ def _pdf_signature_status(
                 any_untrusted = True
                 continue
             try:
+                # ADR-054 §2 + 2026-05-09 hotfix:
+                # ``time_tolerance`` absorbs clock skew between the
+                # signing machine and the CA that issued the leaf
+                # cert. main_signed.pdf had a self-reported signing
+                # time 28 seconds BEFORE the leaf cert's NotBefore —
+                # signing happened mid-issuance, but pyhanko's
+                # default 1-second tolerance rejected it as
+                # NotYetValidError. 5 minutes is a realistic
+                # cap on signer-vs-CA clock skew (roughly Kerberos's
+                # default skew tolerance), generous enough to
+                # absorb workflow timing without being so wide it
+                # masks genuinely-out-of-window signatures.
+                from datetime import timedelta
+
                 retry_vc = ValidationContext(
                     trust_roots=list(_VC_TRUST_ROOTS),
                     moment=signing_time,
                     best_signature_time=signing_time,
+                    time_tolerance=timedelta(minutes=5),
                 )
                 retry_status = validate_pdf_signature(emb, retry_vc)
             except Exception as retry_exc:
