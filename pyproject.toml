@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audittrace-ai"
-version = "1.0.13"
+version = "1.0.14"
 description = "AuditTrace-AI: sovereign AI memory server with 4-tier memory architecture and OAuth2 authentication"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -95,6 +95,11 @@ dev = [
     "black>=24.1.0",
     "pre-commit>=3.6.0",
     "types-redis>=4.6.0.20241004",
+    # PyYAML — used by tests/test_version_drift.py to parse
+    # charts/audittrace/Chart.yaml. Already a transitive dep via
+    # pyhanko/etsi but declared explicitly so the dev environment
+    # is self-contained (per make sync-requirements).
+    "pyyaml>=6.0",
 ]
 
 [project.urls]

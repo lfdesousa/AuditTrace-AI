@@ -386,6 +386,52 @@ kubectl exec -n audittrace deploy/audittrace-redis -- redis-cli ping
 # Expected: connection refused (AuthorizationPolicy blocks non-SPIFFE sources)
 ```
 
+### Cutting a new release (ADR-055)
+
+Two single-source-of-truth pin sites: `pyproject.toml::version` + `charts/audittrace/Chart.yaml::appVersion`. Bumping them is the only manual release action.
+
+```bash
+# 1. Bump pyproject + Chart.yaml::appVersion atomically + regenerate
+#    OpenAPI snapshot + run the drift gate. No commit/tag yet.
+make release VERSION=1.0.14
+
+# 2. Review the diff (printed by the target). Should touch:
+#      pyproject.toml
+#      charts/audittrace/Chart.yaml
+#      docs/reference/audittrace/openapi.yaml
+#      tests/fixtures/openapi.snapshot.yaml
+
+# 3. Commit + open release PR + merge.
+git add pyproject.toml charts/audittrace/Chart.yaml \
+        docs/reference/audittrace/openapi.yaml tests/fixtures/openapi.snapshot.yaml
+git commit -m "chore(release): v1.0.14"
+git push -u origin release/v1.0.14
+# … open PR, get review, merge.
+
+# 4. Tag on main + push.
+git checkout main && git pull --ff-only
+git tag -a v1.0.14 -m "v1.0.14 — <release headline>"
+git push origin v1.0.14
+
+# 5. Build + push image with the tag (image tag MUST match git tag).
+docker build -t localhost:5000/audittrace/memory-server:v1.0.14 .
+docker push localhost:5000/audittrace/memory-server:v1.0.14
+
+# 6. Helm upgrade.
+helm upgrade audittrace ./charts/audittrace -n audittrace \
+    --reset-then-reuse-values \
+    --set memoryServer.image.tag=v1.0.14
+
+# 7. Verify the running pod self-identifies as v1.0.14:
+curl -sk --resolve audittrace.local:443:127.0.0.1 \
+    https://audittrace.local/health | jq '.version'
+# Expected: "1.0.14"
+```
+
+**Pre-ADR-055 history (don't repeat):** prior to v1.0.14, the litany required bumping four sites in lockstep (`pyproject.toml`, `models.py`, `server.py` fallback, `values.yaml::OTEL_RESOURCE_ATTRIBUTES service.version`). At least three drift incidents shipped (v1.0.10→v1.0.11 metadata mismatch, OTEL service.version frozen at 1.0.0 across 12 releases, v1.0.13 image self-reporting as v1.0.11). ADR-055 collapsed the duplication; `make release` is the new ritual.
+
+If you DO end up with a drifted release (e.g. tag mismatched against pyproject), `tests/test_version_drift.py::test_chart_appversion_matches_pyproject_version` fails CI before the merge — by design.
+
 ### Upgrading the release — which Helm flag when
 
 Two distinct upgrade scenarios appear in day-to-day work; picking the wrong flag surfaces as a cryptic `nil pointer evaluating interface {}.enabled` error.

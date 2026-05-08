@@ -11,6 +11,20 @@ WORKDIR /build
 COPY requirements.txt .
 RUN pip install --user --no-cache-dir -r requirements.txt
 
+# Install the audittrace-ai package itself (no deps — already installed
+# above). Without this, the runtime image had no package metadata for
+# ``importlib.metadata.version("audittrace-ai")`` to resolve, so
+# ``server._resolve_version()`` fell through to whichever stale
+# ``src/audittrace_ai.egg-info`` happened to be in the developer's
+# working tree (caught 2026-05-09: v1.0.13 image self-reported as
+# v1.0.11 because of a frozen dev-side egg-info). ADR-055 §4 — install
+# from the current pyproject + sources so the metadata always
+# matches the chart appVersion at build time.
+COPY pyproject.toml ./
+COPY src/ ./src/
+COPY README.md ./
+RUN pip install --user --no-cache-dir --no-deps .
+
 # Stage 2: Runtime image
 FROM python:3.12-slim AS runtime
 

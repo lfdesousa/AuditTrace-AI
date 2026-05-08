@@ -1,0 +1,62 @@
+# Docker build context exclusions.
+#
+# Caught 2026-05-09: a stale ``src/audittrace_ai.egg-info`` from a
+# developer's local ``pip install -e .`` got baked into the v1.0.13
+# image because there was no .dockerignore. The frozen
+# ``Version: 1.0.11`` in the egg-info's PKG-INFO won the
+# ``importlib.metadata.version("audittrace-ai")`` lookup at runtime,
+# so the deployed v1.0.13 pod self-identified to /health (and Tempo,
+# and Langfuse) as v1.0.11. Twelve previous releases shipped with
+# whatever stale metadata happened to be on the maintainer's laptop
+# at build time — same drift class as the OTEL_RESOURCE_ATTRIBUTES
+# service.version=1.0.0 freeze.
+#
+# Conservative posture: exclude only build artefacts, virtual envs,
+# IDE noise, and secrets. Keep tests/, charts/, docs/ in the context
+# because the multi-stage Dockerfile's Stage 3 (tests image) COPY's
+# them in. Excluding them at the .dockerignore level breaks the
+# in-cluster integration-test image build.
+
+# ── Python build / install metadata ──────────────────────────────────
+**/*.egg-info/
+**/*.egg
+**/*.dist-info
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/htmlcov/
+**/.coverage
+**/coverage.xml
+**/junit.xml
+
+# ── Virtual environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Editor / IDE / OS noise ──────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Git metadata (Docker build doesn't need it) ──────────────────────
+.git/
+
+# ── Local secrets (defence in depth — never in image) ────────────────
+secrets/*
+!secrets/.gitkeep
+.env
+.env.*
+!.env.example
+
+# ── Build / deployment artefacts ─────────────────────────────────────
+*.log
+*.bak
+*.tmp
+node_modules/
