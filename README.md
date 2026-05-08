@@ -27,18 +27,20 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 
 - 🧠 **4-Layer Memory Architecture** -- Episodic (ADRs), procedural (skills), conversational (PostgreSQL), semantic (ChromaDB). Layers 1+2 are **always** MinIO-backed (S3) — no filesystem fallback; tests use `Mock*` services.
 - 🛠️ **Memory-as-Tools** -- LLM calls `recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic` (snippet discovery) plus `read_decision`, `read_skill` (full-content fetch by filename) on demand instead of paying the 4-layer cost on every prompt (ADR-025). Dynamic registry, Redis-backed result cache, configurable iteration cap.
-- 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026).
+- 📄 **Audit-Grade PDF Ingestion** -- **Tier-A** PAdES signature validation with the 9-class taxonomy (`signed_valid` / `signed_invalid` / `signed_untrusted` / `signed_expired` / `signed_tampered` / `none` / `check_skipped` / `check_unavailable` / `check_failed`); **tier-B** robustness (encrypted-PDF reject, attachment quarantine, AcroForm extraction, OCR coverage tracking, document-level manifest with SHA-256 + GIN-indexed `extraction_warnings`); **tier-C** document metadata + per-document audit granularity + corrupted-file taxonomy + dry-run + LTV + PDF/A + TOC-aware chunking + surgical reindex. ADR-050 / ADR-052 / ADR-054 / ADR-056.
+- 🔐 **EU + Swiss Trust Store** -- Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3-backed by default, Vault-future). EU LOTL walker via `pyhanko[etsi]` (ADR-052) + Swiss federal TSL fetcher (OFCOM/BAKOM, ADR-053) → composite ~897 EU + CH qualified-signature CAs. Refresh via `POST /system/trust-store/refresh` (`audittrace:admin`) or Helm post-install hook. As-of-signing-time retry with 5-min clock-skew tolerance (ADR-054) distinguishes `signed_expired` from `signed_untrusted`.
+- 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026). RLS-aware `app.current_user_id` ContextVar plumbed through background workers + CLIs (ADR-046).
 - 🔐 **External IdP Federation** -- Keycloak brokering to Google Workspace / Okta / EntraID for multi-tenant SSO (ADR-044). Multi-issuer JWT validation already in place (ADR-032 §2).
 - 🗄️ **Server-Mode Databases** -- PostgreSQL 16 + ChromaDB HTTP server + Redis 7, all with authentication (ADR-019, ADR-020).
 - 🔒 **TLS Everywhere** -- Istio Gateway terminates TLS in production (NodePort 30952). Traefik v3 + mkcert in dev (ADR-021).
 - 🔑 **Secrets via Vault** -- HashiCorp Vault is the sole production secret store (ADR-043). Auto-unseal at boot via systemd unit. `.env` files only used in dev.
-- 🔍 **Reconstructible by Design** -- Every interaction + memory tool call traced via Langfuse + OpenTelemetry; one `tool_calls` audit row per memory invocation with `interaction_id` FK.
-- 📊 **Full-Stack Observability** -- `@log_call` aspect emits logs, OTel spans, and histogram metrics from a single decorator; stdout-only logging (12-factor).
+- 🔍 **Reconstructible by Design** -- Every interaction + memory tool call traced via Langfuse + OpenTelemetry; one `tool_calls` audit row per memory invocation with `interaction_id` FK. Test + Evidence + Reconstructibility gate (ADR-049) enforces unit + live-system evidence on every meaningful change; CI parses PR bodies for the three required sections.
+- 📊 **Full-Stack Observability** -- `@log_call` aspect emits logs, OTel spans, and histogram metrics from a single decorator; stdout-only logging (12-factor). `service.version` templated from `Chart.AppVersion` so OTel resource attributes never lie about deployed code (ADR-055).
 - 🔄 **Transparent LLM Proxy** -- Raw dict pass-through for OpenAI tool-calling protocol (ADR-024); memory context injected into the system message without stripping `tools`, `tool_calls`, `tool_call_id`.
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 896 tests, 93.97% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 1027 tests, 93% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
@@ -127,7 +129,7 @@ The same script works for both runtimes — only the in-runtime shippers (OTel C
 # or
 make install
 
-# Run tests (90% per-file coverage enforced; full suite is 638 tests / 94.92% total)
+# Run tests (90% per-file coverage enforced; full suite is 1027 tests / 93% total)
 make test
 
 # Run RLS integration tests against an ephemeral docker postgres on :15432
@@ -184,6 +186,12 @@ and review the diff like any other dependency bump.
 | `/context` | POST | 4-layer memory retrieval |
 | `/interactions` | GET | Human-facing audit browser — filters `project`, `user_id`, `session_id`, `source`, `since`; pagination via `limit` (≤1000) + `offset`. RLS scopes every caller to their own rows. See [Auditing conversations](#auditing-conversations-interactions). |
 | `/session/save` | POST | Persist session data |
+| `/session/summary` | POST | Operator-driven session summary save (ADR-030) |
+| `/memory/upload` | POST | Upload a PDF / Markdown / text artefact into the episodic or procedural layer; signature + bomb + attachment + OCR pipelines run on ingest |
+| `/memory/index` | POST | Re-index a layer (or a single file via `?file=<key>`); `?details=true` adds per-document outcomes (chunks, signature_status, page_count, pdf_*, ok/error) per ADR-056 §3; `?dry_run=true` reports what would happen without writing to ChromaDB |
+| `/memory/{layer}` | GET / POST / PUT / DELETE | Backoffice CRUD over episodic / procedural / semantic items; per-layer `memory:<layer>:write` scope |
+| `/system/trust-store` | GET | Read PEM-bundle metadata (sha256, builder_id, cert_count, source_url, built_at) — `audittrace:admin` |
+| `/system/trust-store/refresh` | POST | Walk EU LOTL + Swiss TSL → composite ~897 CAs → persist to S3 — `audittrace:admin` |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Monitoring metrics (scope: `audittrace:admin`) |
 
@@ -352,9 +360,10 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | `memory:procedural:read` | `recall_skills` + `read_skill` tools + `GET /memory/procedural` |
 | `memory:conversational:read-own` | `recall_recent_sessions` tool |
 | `memory:semantic:read` | `recall_semantic` tool + `GET /memory/semantic` |
-| `memory:episodic:write` | `POST/PUT/DELETE /memory/episodic` (memory backoffice — v1.0.3) |
-| `memory:procedural:write` | `POST/PUT/DELETE /memory/procedural` |
+| `memory:episodic:write` | `POST/PUT/DELETE /memory/episodic`, `POST /memory/upload` (episodic/), `POST /memory/index?file=episodic/...` |
+| `memory:procedural:write` | `POST/PUT/DELETE /memory/procedural`, `POST /memory/upload` (procedural/), `POST /memory/index?file=procedural/...` |
 | `memory:semantic:write` | `POST/PUT/DELETE /memory/semantic` |
+| `audittrace:admin` | `/metrics`, `GET/POST /system/trust-store/*`, bulk `POST /memory/index` (whole-collection delete-and-recreate) |
 
 → See [`docs/guides/memory-backoffice.md`](docs/guides/memory-backoffice.md) for the operator workflow + endpoint matrix + the `memory_items` manifest table that backs every CRUD response (created_at_ms / modified_at_ms / deleted_at_ms in Unix epoch milliseconds UTC).
 
@@ -383,8 +392,18 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | ✅ Done | **OIDC Auth Code + PKCE for browser UIs** | BFF-first first-party auth flow (ADR-042). Confidential clients only. |
 | ✅ Done | **Laptop-first deploy** | Chart deploys on a single-node k3s without LAN-IP hardcodes (ADR-045). Demo-ready off-LAN. |
 | ✅ Done | **External IdP federation (ADR-044)** | Keycloak brokering to Google Workspace / Okta / EntraID. Realm + provisioner + diagrams shipped 2026-04-26. M2 live evidence captured 2026-05-02 against a real Google Workspace tenant — federated user → Keycloak shadow → JWT (`iss=audittrace.allaboutdata.eu:30952`) → `/v1/chat/completions` 200 → audit row `interactions.user_id` = federated `sub`. ADR-044 status flipped to Accepted. |
+| ✅ Done | **Async Persistence (ADR-046)** | Background asyncio worker + scoped Postgres ContextVar so RLS bites on background writes. Caught by live test 2026-05-04 — InMemoryPostgresFactory had no RLS. |
+| ✅ Done | **Server-Side Embedding (ADR-047)** | Embeddings computed in-process via the bundled ONNX model; ChromaDB never sees the raw text. |
+| ✅ Done | **Test + Evidence + Reconstructibility Gate (ADR-049)** | Hard four-rule gate: unit + per-file ≥90% + E2E through public API on the deployed image + reconstruction artefacts (trace ID, audit row, ChromaDB / MinIO / Postgres query). Mechanical enforcement via pre-commit hook + CI evidence-check job + PR template. |
+| ✅ Done | **PDF tier-A signature validation** | PAdES audit-grade signature checks via pyhanko; 8-class taxonomy (`signed_valid/invalid/untrusted/tampered`, `none`, `check_*`); per-chunk + manifest `signature_status` column. |
+| ✅ Done | **PDF tier-B robustness (ADR-050)** | Encrypted-PDF reject (no password endpoint), embedded-attachment quarantine (PDF/A-3, ZUGFeRD), AcroForm field extraction, OCR-coverage tracking, document-level manifest (page_count, ocr_coverage_pct, attachment_count, form_field_count, extraction_warnings JSONB with GIN index, document_sha256). 16-code closed-set warnings enum pinned by `TestExtractionWarningCodes`. |
+| ✅ Done | **PAdES trust store + Swiss TSL (ADR-052 + ADR-053)** | Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3 + Mock + composite). EU LOTL walker via `pyhanko[etsi]` ~~830~~ + Swiss federal TSL fetcher (OFCOM/BAKOM TSLO) → composite ~897 EU + CH qualified-signature CAs. `POST /system/trust-store/refresh` admin endpoint + Helm post-install hook. Live evidence: `main_signed.pdf` flipped from `check_unavailable` → `signed_invalid` → `signed_valid` after refresh ran. |
+| ✅ Done | **As-of-signing-time validation (ADR-054)** | 9th class `signed_expired`: signature chain validates as-of self-reported signing time but the cert is no longer valid at present. 5-min Kerberos-style clock-skew tolerance handles cert NotBefore that lags signing time by seconds. |
+| ✅ Done | **Version-pin litany eliminated (ADR-055)** | Single chart-side source of truth (`Chart.AppVersion == pyproject.toml::version`). `make release VERSION=…` bumps both + regenerates OpenAPI snapshot + runs drift gate. `service.version` OTel attribute templated from `Chart.AppVersion` so it never drifts again. Dockerfile `pip install --no-deps .` closes the v1.0.13 stale-egg-info bug; `.dockerignore` rejects `.venv` / dist-info / `__pycache__`. |
+| ✅ Done | **PDF tier-C batch (ADR-056)** | 9/16 tier-C items shipped: document metadata extraction (`pdf_title` / `pdf_author` / `pdf_creator` / `pdf_creation_date` from pymupdf `doc.metadata`, Alembic 011); closed-set corruption taxonomy (`pdf_corrupted_xref` / `pdf_corrupted_structure` / `pdf_metadata_parse_error`); per-document audit granularity via `?details=true` on `/memory/index` (per-doc `ok/error/chunks/signature_status/page_count/extraction_warnings/document_sha256/pdf_*/pdfa_*/ltv_data`); dry-run mode (`?dry_run=true`); LTV summary (DSS dictionary counts); PDF/A conformance (`pdfa_part` + `pdfa_conformance` from XMP); TOC-aware chunking (`toc_section` per-chunk metadata); file-level surgical re-index (`?file=` path); #11 closed as subsumed by ADR-052 9-class taxonomy. Live on v1.0.17, evidence captured in `2026-05-09-adr-056-tier-c/`. |
 | ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |
-| 🟡 Planned | **Async Persistence** | Non-blocking audit row writes. |
+| ⏸ On hold | **ADR-048 Content-Control** | External-PDF upload gating posture; gates the M3 LibreChat Day-1 + Day-2 fork until v1. |
+| 🟡 Planned | **Tier-C deferred** | #2 mixed text/image, #3 tables, #4 multi-column, #5 RTL, #17 hybrid/linearised, #19 per-page memory, #20 embedding throughput. None blocks the M5 customer demo (2026-05-15) — each will land as its own small ADR. |
 
 ## Observability Stack (ADR-028)
 
@@ -582,6 +601,16 @@ The Vault Agent injector renders `secret/audittrace/postgres`, `secret/audittrac
 - [ADR-043: HashiCorp Vault as the sole production secret store](docs/ADR-043-vault-as-sole-secret-store.md)
 - [ADR-044: External IdP federation via Keycloak brokering](docs/ADR-044-external-idp-federation.md)
 - [ADR-045: Laptop-first deployment — no LAN hardcodes in the chart](docs/ADR-045-laptop-first-no-lan-hardcodes.md)
+- [ADR-046: Async chat persistence + RLS-aware ContextVar](docs/ADR-046-async-chat-persistence.md)
+- [ADR-047: Server-side embedding](docs/ADR-047-server-side-embedding.md)
+- [ADR-048: Ingestion content control](docs/ADR-048-ingestion-content-control.md) *(Proposed)*
+- [ADR-049: Test + Evidence + Reconstructibility gate](docs/ADR-049-test-evidence-and-reconstructibility-gate.md)
+- [ADR-050: PDF tier-B robustness](docs/ADR-050-pdf-ingestion-tier-b.md)
+- [ADR-052: PAdES trust store + signature taxonomy](docs/ADR-052-pades-trust-store-and-taxonomy.md)
+- [ADR-053: Swiss federal TSL + composite trust store](docs/ADR-053-swiss-federal-tsl-and-composite-trust-store.md)
+- [ADR-054: As-of-signing-time validation](docs/ADR-054-pades-as-of-signing-time-validation.md)
+- [ADR-055: Eliminate version-pin litany](docs/ADR-055-eliminate-version-pin-litany.md)
+- [ADR-056: PDF tier-C batch (#10 / #16 / #24 + dry-run + LTV + PDF/A + TOC + surgical reindex)](docs/ADR-056-pdf-tier-c-batch.md)
 
 ### Architecture Diagrams
 

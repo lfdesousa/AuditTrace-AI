@@ -1,0 +1,66 @@
+meta {
+  name: POST /memory/index?file=&dry_run=true&details=true — preview, no writes
+  type: http
+  seq: 94
+}
+
+post {
+  url: {{baseUrl}}/memory/index?collections=ai_research_papers&file=episodic/main_signed.pdf&dry_run=true&details=true
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  collections: ai_research_papers
+  file: episodic/main_signed.pdf
+  dry_run: true
+  details: true
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("status flips to dry_run + dry_run=true surfaced", function() {
+    const body = res.getBody();
+    expect(body.status).to.equal("dry_run");
+    expect(body.dry_run).to.equal(true);
+  });
+  test("total_chunks=0 because no upserts ran", function() {
+    const body = res.getBody();
+    expect(body.total_chunks).to.equal(0);
+  });
+  test("documents array still populated with would-be outcome", function() {
+    const body = res.getBody();
+    expect(body.documents).to.be.an("array");
+    expect(body.documents.length).to.be.greaterThan(0);
+    const d = body.documents[0];
+    expect(d).to.have.property("ok");
+    expect(d).to.have.property("chunks");
+    // chunks reflects what *would* have been written.
+    expect(d.chunks).to.be.greaterThan(0);
+    expect(d).to.have.property("signature_status");
+    expect(d).to.have.property("pdf_title");
+  });
+}
+
+docs {
+  Tier-C item #23 (ADR-056) — preview /memory/index without ChromaDB
+  upserts, collection delete-and-recreate, or Postgres manifest
+  writes. Pairs with ``?details=true`` so operators can preview the
+  per-document outcome the writer would produce.
+
+  Use cases:
+    - Validate a freshly-uploaded PDF (signature_status, page_count,
+      extraction_warnings) before committing to the index.
+    - Smoke-test ingestion changes without churning the corpus.
+    - Diff "what would a re-index produce" against current state.
+
+  Authorization: same as the regular ``/memory/index`` — per-layer
+  write scope matching the file's MinIO prefix (or ``audittrace:admin``
+  for bulk).
+}

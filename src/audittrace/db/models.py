@@ -202,6 +202,30 @@ class MemoryItem(Base):
     # "manifest row ↔ specific bytes version" audit question.
     document_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
+    # ── Tier-C PDF document-metadata columns (migration 011, ADR-056 #10) ─
+    # Populated from pymupdf's ``doc.metadata`` during /memory/index.
+    # All nullable — non-PDF rows + PDFs that pre-date migration 011
+    # leave them NULL.
+    pdf_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pdf_author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pdf_creator: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pdf_creation_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # ── ADR-056 #14 (PDF/A) + #13 (LTV) ────────────────────────────────
+    # pdfa_part is "1" / "2" / "3" / "4" and pdfa_conformance is
+    # "A" / "B" / "U" (per ISO 19005-1..-4); both NULL means "not a
+    # PDF/A document" or "XMP missing".
+    pdfa_part: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    pdfa_conformance: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    # JSONB summary of the DSS dictionary on signed PDFs:
+    # ``{"has_dss": bool, "ocsp_responses": int, "crls": int,
+    #   "timestamps": int, "certs": int, "vri_keys": int}``. NULL on
+    # unsigned / non-LTV-enabled documents.
+    ltv_data: Mapped[dict[str, Any] | None] = mapped_column(
+        _PdfWarningsType, nullable=True
+    )
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )

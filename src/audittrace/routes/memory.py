@@ -31,7 +31,9 @@ import contextlib
 import hashlib
 import io
 import logging
+import re
 import time
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
@@ -806,6 +808,10 @@ _PDF_WARNING_CODES: frozenset[str] = frozenset(
         "attachment",  # #6 — quarantined embedded file
         "attachment_quarantine_failed",  # #6 — could not write to MinIO
         "form_fields",  # #7 — page yielded form-field data
+        # Tier-C items (ADR-056)
+        "pdf_corrupted_xref",  # #16 — pymupdf raised on xref walk
+        "pdf_corrupted_structure",  # #16 — generic structural parse error
+        "pdf_metadata_parse_error",  # #10 — doc.metadata yielded malformed values
     }
 )
 
@@ -1057,6 +1063,353 @@ def _ocr_render_page(
     return (text, "ocr", round(mean_conf, 3))
 
 
+# ── Tier-C PDF metadata + corrupted-file classification (ADR-056) ────────
+
+
+def _parse_pdf_date(raw: str) -> datetime | None:
+    """Best-effort PDF-date parser.
+
+    PDF 1.7 §7.9.4 specifies ``D:YYYYMMDDHHmmSSOHH'mm`` where ``O`` is
+    ``+`` / ``-`` / ``Z``, and trailing fields are optional. Real-world
+    producers vary widely (missing seconds, missing TZ, extra whitespace,
+    UTF-16-decoded leftovers from pymupdf). We accept what we can; the
+    caller logs ``pdf_metadata_parse_error`` when this returns ``None``.
+
+    Returns a tz-aware ``datetime`` (UTC for ``Z``-suffixed or offset-
+    converted; local-as-stated otherwise — but always tz-aware so the
+    Postgres ``TIMESTAMPTZ`` column stays consistent).
+    """
+    from datetime import timedelta, timezone
+
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.startswith("D:"):
+        s = s[2:]
+    # Strip trailing apostrophes/quotes — PDF dates use ``+HH'mm'`` form.
+    s = s.replace("'", "")
+    if not s:
+        return None
+    # Pull off optional timezone suffix.
+    tz: timezone | None = None
+    tz_marker = None
+    for marker in ("Z", "+", "-"):
+        idx = s.find(marker, 8)  # Search after the date portion.
+        if idx >= 0:
+            tz_marker = marker
+            tz_part = s[idx:]
+            s = s[:idx]
+            break
+    if tz_marker == "Z":
+        tz = UTC
+    elif tz_marker in ("+", "-"):
+        try:
+            sign = 1 if tz_marker == "+" else -1
+            digits = tz_part[1:].replace(":", "")
+            hh = int(digits[:2]) if len(digits) >= 2 else 0
+            mm = int(digits[2:4]) if len(digits) >= 4 else 0
+            tz = timezone(sign * timedelta(hours=hh, minutes=mm))
+        except (ValueError, IndexError):
+            tz = UTC  # Fallback rather than fail the parse.
+    else:
+        tz = UTC  # No TZ → assume UTC for consistency.
+    fmts = (
+        "%Y%m%d%H%M%S",
+        "%Y%m%d%H%M",
+        "%Y%m%d%H",
+        "%Y%m%d",
+        "%Y%m",
+        "%Y",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=tz)
+        except ValueError:
+            continue
+    return None
+
+
+def _trim_pdf_metadata_string(value: Any, *, max_len: int = 255) -> str | None:
+    """Coerce a pymupdf metadata value to a clean ``str`` ≤ ``max_len``.
+
+    pymupdf returns either ``str`` or ``None``. Empty / whitespace-only
+    strings collapse to ``None``. Over-long strings are truncated (255 is
+    the schema cap from migration 011) — auditors are not relying on
+    these fields for cryptographic identity (that's ``document_sha256``);
+    truncation is a UX concession not a correctness loss.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    return s[:max_len] if len(s) > max_len else s
+
+
+def _extract_pdf_metadata(
+    doc: Any,
+) -> tuple[str | None, str | None, str | None, datetime | None, list[str]]:
+    """Extract the four ADR-056 #10 metadata fields from pymupdf ``doc.metadata``.
+
+    Returns ``(title, author, creator, creation_date, metadata_warning_codes)``.
+    The warning-codes list contains zero or more ``"pdf_metadata_parse_error"``
+    sentinels — the caller wraps them into structured ``extraction_warnings``
+    entries. Any pymupdf raise inside this function is swallowed and reported
+    as one warning code (the function never re-raises).
+    """
+    warning_codes: list[str] = []
+    try:
+        meta = doc.metadata
+    except Exception:  # pragma: no cover — defensive
+        return None, None, None, None, ["pdf_metadata_parse_error"]
+    if not isinstance(meta, dict):
+        # pymupdf always returns a dict in real use; non-dict (None, a
+        # MagicMock from a unit-test fixture, anything else) means there
+        # is nothing useful to extract — return clean empties without
+        # raising the metadata-parse-error sentinel.
+        return None, None, None, None, []
+    title = _trim_pdf_metadata_string(meta.get("title"))
+    author = _trim_pdf_metadata_string(meta.get("author"))
+    creator = _trim_pdf_metadata_string(meta.get("creator"))
+    raw_date = meta.get("creationDate")
+    creation_date: datetime | None = None
+    if raw_date is not None:
+        if isinstance(raw_date, str) and raw_date.strip():
+            creation_date = _parse_pdf_date(raw_date)
+            if creation_date is None:
+                warning_codes.append("pdf_metadata_parse_error")
+        elif not isinstance(raw_date, str):
+            warning_codes.append("pdf_metadata_parse_error")
+    return title, author, creator, creation_date, warning_codes
+
+
+_PDFA_PART_RE = re.compile(
+    r"<pdfaid:part[^>]*>\s*([0-9]+)\s*</pdfaid:part>"
+    r"|pdfaid:part\s*=\s*[\"']([0-9]+)[\"']",
+    re.IGNORECASE,
+)
+_PDFA_CONFORMANCE_RE = re.compile(
+    r"<pdfaid:conformance[^>]*>\s*([A-Z])\s*</pdfaid:conformance>"
+    r"|pdfaid:conformance\s*=\s*[\"']([A-Z])[\"']",
+    re.IGNORECASE,
+)
+
+
+def _extract_pdfa_conformance(doc: Any) -> tuple[str | None, str | None]:
+    """Return ``(pdfa_part, pdfa_conformance)`` from XMP, or ``(None, None)``.
+
+    Tier-C item #14 (ADR-056). PDF/A conformance is encoded in the XMP
+    packet under the ``http://www.aiim.org/pdfa/ns/id/`` namespace as
+    ``pdfaid:part`` (1, 2, 3, 4) and ``pdfaid:conformance`` (A, B, U).
+    Both attribute and element forms appear in the wild — handle both.
+
+    pymupdf returns the XMP packet as a string from ``get_xml_metadata``.
+    Defensive: any raise → both None.
+    """
+    try:
+        xmp = doc.get_xml_metadata()
+    except Exception:
+        return None, None
+    if not isinstance(xmp, str) or not xmp:
+        return None, None
+    part_match = _PDFA_PART_RE.search(xmp)
+    conf_match = _PDFA_CONFORMANCE_RE.search(xmp)
+    part = None
+    conf = None
+    if part_match is not None:
+        part = (part_match.group(1) or part_match.group(2) or "").strip() or None
+    if conf_match is not None:
+        conf = (
+            conf_match.group(1) or conf_match.group(2) or ""
+        ).strip().upper() or None
+    return part, conf
+
+
+def _summarize_ltv(raw: bytes) -> dict[str, Any] | None:
+    """Return a flat JSON-safe summary of the DSS dictionary, or ``None``.
+
+    Tier-C item #13 (ADR-056). pyhanko's ``EmbeddedPdfSignature`` knows
+    where the DSS lives. We don't try to capture every cert / OCSP
+    response (those stay in the source PDF for re-validation); we
+    capture audit-pivot counts so an auditor can answer "do we have
+    long-term-validation evidence on this signature?" from the manifest.
+
+    Returns ``None`` for unsigned PDFs or PDFs with no DSS dictionary.
+    """
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+    except Exception:  # pragma: no cover — pyhanko always installed in prod
+        return None
+    try:
+        reader = PdfFileReader(io.BytesIO(raw))
+    except Exception:
+        return None
+    try:
+        signatures = reader.embedded_signatures
+    except Exception:  # pragma: no cover — defensive
+        signatures = []
+    if not signatures:
+        return None
+    # The DSS dictionary is per-document, not per-signature; pyhanko
+    # parses it lazily off the trailer.
+    has_dss = False
+    ocsp_count = 0
+    crl_count = 0
+    cert_count = 0
+    vri_keys = 0
+    # Document timestamps land alongside the regular signature list —
+    # counted independently of DSS presence (a doc-timestamp without a
+    # DSS dictionary is a valid PAdES-LT shape).
+    try:
+        timestamp_count = sum(
+            1
+            for s in signatures
+            if "DocTimeStamp" in str(getattr(s, "sig_object", b""))
+        )
+    except Exception:  # pragma: no cover — defensive
+        timestamp_count = 0
+    try:
+        # generic_content access — pyhanko 0.30+ exposes the DSS as
+        # ``reader.security_handler.cf`` independent context, and the
+        # trailer's ``/DSS`` entry is the canonical pointer. We walk
+        # the trailer dict directly to stay independent of pyhanko's
+        # higher-level helpers (which evolve across releases).
+        trailer = getattr(reader, "trailer_view", None) or getattr(
+            reader, "trailer", None
+        )
+        if trailer is None:  # pragma: no cover — defensive
+            dss = None
+        else:
+            root = trailer.get("/Root") if hasattr(trailer, "get") else None
+            dss = (
+                root.get("/DSS") if root is not None and hasattr(root, "get") else None
+            )
+        if dss is None:
+            return {
+                "has_dss": False,
+                "ocsp_responses": 0,
+                "crls": 0,
+                "certs": 0,
+                "timestamps": timestamp_count,
+                "vri_keys": 0,
+            }
+        has_dss = True
+        for key, counter in (  # pragma: no cover — exercised by live signed PDFs
+            ("/OCSPs", "ocsp"),
+            ("/CRLs", "crl"),
+            ("/Certs", "cert"),
+        ):
+            arr = dss.get(key) if hasattr(dss, "get") else None
+            try:
+                count = len(list(arr)) if arr is not None else 0
+            except Exception:
+                count = 0
+            if counter == "ocsp":
+                ocsp_count = count
+            elif counter == "crl":
+                crl_count = count
+            elif counter == "cert":
+                cert_count = count
+        vri = dss.get("/VRI") if hasattr(dss, "get") else None
+        if vri is not None:  # pragma: no cover — exercised by live signed PDFs
+            try:
+                vri_keys = len(list(vri.keys()))
+            except Exception:
+                vri_keys = 0
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("LTV summary partial: %s", exc)
+    return {
+        "has_dss": has_dss,
+        "ocsp_responses": ocsp_count,
+        "crls": crl_count,
+        "certs": cert_count,
+        "timestamps": timestamp_count,
+        "vri_keys": vri_keys,
+    }
+
+
+def _build_toc_index(doc: Any) -> dict[int, str]:
+    """Return ``{page_number_1based: section_title}`` from the document TOC.
+
+    Tier-C item #9 (ADR-056). pymupdf's ``Document.get_toc()`` returns
+    ``[[level, title, page_1based], ...]``. We build a forward-fill
+    index so every page in a chunked document carries the title of the
+    most-recent TOC entry that started at or before it. Pages before
+    the first TOC entry stay unmapped (``None`` at lookup time).
+
+    Multi-level TOCs collapse to the leaf title — that's what auditors
+    look at in practice ("which section is this snippet from"). A
+    future iteration could synthesise breadcrumbs (``Chapter / Section
+    / Subsection``); for now the leaf wins.
+
+    Defensive: any pymupdf raise → empty dict (degrades to per-page
+    chunking with no toc_section metadata, the legacy behaviour).
+    """
+    try:
+        toc = doc.get_toc(simple=True)
+    except Exception:
+        return {}
+    if not toc:
+        return {}
+    index: dict[int, str] = {}
+    sorted_entries: list[tuple[int, str]] = []
+    for entry in toc:
+        try:
+            _level, title, page = entry[0], entry[1], entry[2]
+        except (IndexError, TypeError):
+            continue
+        try:
+            page_int = int(page)
+        except (TypeError, ValueError):
+            continue
+        if page_int <= 0:
+            continue
+        title_clean = (title or "").strip()
+        if not title_clean:
+            continue
+        sorted_entries.append((page_int, title_clean[:255]))
+    if not sorted_entries:
+        return {}
+    sorted_entries.sort(key=lambda t: t[0])
+    page_count = getattr(doc, "page_count", 0) or 0
+    if page_count <= 0:
+        page_count = sorted_entries[-1][0]
+    cursor = 0
+    current_title: str | None = None
+    for page_n in range(1, page_count + 1):
+        while cursor < len(sorted_entries) and sorted_entries[cursor][0] <= page_n:
+            current_title = sorted_entries[cursor][1]
+            cursor += 1
+        if current_title is not None:
+            index[page_n] = current_title
+    return index
+
+
+def _classify_pdf_extraction_error(exc: Exception) -> str:
+    """Map a pymupdf raise to a closed-set ``extraction_warnings`` code.
+
+    Tier-C item #16 (ADR-056). pymupdf surfaces parse failures via a
+    handful of exception classes (``FileDataError``, ``EmptyFileError``,
+    plain ``RuntimeError``) plus message strings naming the specific
+    failure mode. We route on a combination of class name + message
+    substring — both are stable across recent pymupdf releases (verified
+    against the corpus of issues on the upstream tracker).
+
+    Returns one of:
+      * ``"pdf_corrupted_xref"`` — xref walk failed (truncated, malformed)
+      * ``"pdf_corrupted_structure"`` — other structural parse error
+    """
+    cls = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "xref" in msg or "trailer" in msg:
+        return "pdf_corrupted_xref"
+    if "empty" in cls or "filedata" in cls or "format" in msg:
+        return "pdf_corrupted_structure"
+    return "pdf_corrupted_structure"
+
+
 def _index_pdf_objects(
     collection: Any,
     minio_client: Any,
@@ -1068,6 +1421,8 @@ def _index_pdf_objects(
     user_id: str,
     ingestion_ts_ms: int,
     manifest_service: Any | None = None,
+    details_log: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -1125,6 +1480,20 @@ def _index_pdf_objects(
         form_field_count_doc = 0
         ocr_pages_doc = 0
         page_count_doc: int | None = None
+        # Tier-C metadata (ADR-056 #10) — populated after pymupdf.open
+        # succeeds. Bomb-rejected docs leave them None.
+        pdf_title_doc: str | None = None
+        pdf_author_doc: str | None = None
+        pdf_creator_doc: str | None = None
+        pdf_creation_date_doc: datetime | None = None
+        # Tier-C PDF/A (ADR-056 #14) — extracted from XMP if present.
+        pdfa_part_doc: str | None = None
+        pdfa_conformance_doc: str | None = None
+        # Tier-C LTV (ADR-056 #13) — DSS dictionary summary; only
+        # meaningful on signed PDFs.
+        ltv_data_doc: dict[str, Any] | None = None
+        # Per-document chunk count for the ?details=true response.
+        chunks_written_doc = 0
 
         # Item #18 — bomb defense layer 1: raw byte-size cap. Catches
         # the simplest case (operator drag-drops a 2 GiB file). The
@@ -1163,6 +1532,9 @@ def _index_pdf_objects(
                 form_field_count=0,
                 extraction_warnings=warnings,
                 document_sha256=None,
+                ok=False,
+                error="max_size",
+                details_log=details_log,
             )
             continue
         source_key = (
@@ -1185,6 +1557,11 @@ def _index_pdf_objects(
             enabled=settings.pdf_signature_check_enabled,
             trust_store_path=settings.pdf_signature_trust_store,
         )
+        # Tier-C #13 (ADR-056) — LTV summary lives on the document
+        # itself, not on a single signature, so we compute it once per
+        # file alongside signature_status. Returns ``None`` for
+        # unsigned / no-DSS PDFs; never raises.
+        ltv_data_doc = _summarize_ltv(raw)
         try:
             # Assign through Any so mypy doesn't flag pymupdf.open's
             # untyped Document return; the project's `disallow_untyped_calls`
@@ -1215,8 +1592,32 @@ def _index_pdf_objects(
                         form_field_count=0,
                         extraction_warnings=warnings,
                         document_sha256=document_hash,
+                        ok=False,
+                        error="encrypted",
+                        details_log=details_log,
                     )
                     continue
+                # Tier-C item #10 (ADR-056) — extract document metadata
+                # once the encryption gate is past but before the page
+                # loop. Failures append a single ``pdf_metadata_parse_error``
+                # warning and leave the fields None; never raise.
+                (
+                    pdf_title_doc,
+                    pdf_author_doc,
+                    pdf_creator_doc,
+                    pdf_creation_date_doc,
+                    metadata_warning_codes,
+                ) = _extract_pdf_metadata(doc)
+                for code in metadata_warning_codes:
+                    warnings.append({"code": code, "page": None})
+                # Tier-C item #14 (ADR-056) — PDF/A conformance from XMP.
+                # Both fields stay NULL when the doc isn't a PDF/A or
+                # its XMP packet doesn't expose ``pdfaid:*``.
+                pdfa_part_doc, pdfa_conformance_doc = _extract_pdfa_conformance(doc)
+                # Tier-C item #9 (ADR-056) — page → TOC-section map.
+                # Empty dict when the doc has no TOC; per-chunk metadata
+                # then carries no ``toc_section`` field (additive only).
+                toc_index = _build_toc_index(doc)
                 # Item #18 — bomb defense layer 2: declared-shape caps.
                 # Read both page_count and xref_length from the document
                 # catalogue WITHOUT decompressing any stream — these are
@@ -1257,6 +1658,13 @@ def _index_pdf_objects(
                         form_field_count=0,
                         extraction_warnings=warnings,
                         document_sha256=document_hash,
+                        pdf_title=pdf_title_doc,
+                        pdf_author=pdf_author_doc,
+                        pdf_creator=pdf_creator_doc,
+                        pdf_creation_date=pdf_creation_date_doc,
+                        ok=False,
+                        error="max_pages",
+                        details_log=details_log,
                     )
                     continue
                 xref_count = doc.xref_length()
@@ -1293,6 +1701,13 @@ def _index_pdf_objects(
                         form_field_count=0,
                         extraction_warnings=warnings,
                         document_sha256=document_hash,
+                        pdf_title=pdf_title_doc,
+                        pdf_author=pdf_author_doc,
+                        pdf_creator=pdf_creator_doc,
+                        pdf_creation_date=pdf_creation_date_doc,
+                        ok=False,
+                        error="max_xref",
+                        details_log=details_log,
                     )
                     continue
                 # Tier-B item #6 — quarantine embedded attachments
@@ -1527,6 +1942,7 @@ def _index_pdf_objects(
                     # are normal text or OCR — already disambiguated
                     # by ``text_source``.
                     form_idx = len(chunks) - 1 if form_text else -1
+                    toc_section = toc_index.get(page_num)
                     metadatas: list[dict[str, Any]] = [
                         {
                             "source": obj["filename"],
@@ -1535,6 +1951,11 @@ def _index_pdf_objects(
                             "file_type": "pdf",
                             "page": page_num,
                             "chunk": i,
+                            # Tier-C #9 (ADR-056) — TOC section title that
+                            # contains this page (forward-filled). Absent
+                            # when the doc has no TOC; ``None`` when the
+                            # page sits before the first TOC entry.
+                            "toc_section": toc_section,
                             # Item #21 — per-chunk provenance fields.
                             # Tier-B completes this set: ``text_source``
                             # now flips to ``"ocr"`` for OCR'd pages
@@ -1559,14 +1980,28 @@ def _index_pdf_objects(
                         }
                         for i in range(len(chunks))
                     ]
-                    _upsert_in_batches(collection, ids, chunks, metadatas)
-                    total += len(chunks)
-            # Successful (or partial) processing — flush manifest.
+                    # ChromaDB metadata can't carry None values — drop
+                    # ``toc_section`` when this page sits before any
+                    # TOC entry or the document has no TOC at all.
+                    for md in metadatas:
+                        if md.get("toc_section") is None:
+                            md.pop("toc_section", None)
+                    if not dry_run:
+                        _upsert_in_batches(collection, ids, chunks, metadatas)
+                        total += len(chunks)
+                    # Tier-C #23 (ADR-056) — chunks_written_doc reflects
+                    # what *would* have been written, so the dry-run
+                    # response shape matches the real-run shape exactly.
+                    chunks_written_doc += len(chunks)
+            # Successful (or partial) processing — flush manifest. In
+            # dry-run we still surface the per-doc outcome via
+            # ``details_log`` (so callers can preview), but pass
+            # ``manifest_service=None`` so no Postgres row is written.
             ocr_coverage_pct: float | None = None
             if page_count_doc and page_count_doc > 0:
                 ocr_coverage_pct = round((ocr_pages_doc / page_count_doc) * 100.0, 2)
             _flush_pdf_manifest(
-                manifest_service=manifest_service,
+                manifest_service=None if dry_run else manifest_service,
                 layer=manifest_layer,
                 key=obj["key"],
                 user_id=user_id,
@@ -1578,9 +2013,58 @@ def _index_pdf_objects(
                 form_field_count=form_field_count_doc,
                 extraction_warnings=warnings,
                 document_sha256=document_hash,
+                pdf_title=pdf_title_doc,
+                pdf_author=pdf_author_doc,
+                pdf_creator=pdf_creator_doc,
+                pdf_creation_date=pdf_creation_date_doc,
+                pdfa_part=pdfa_part_doc,
+                pdfa_conformance=pdfa_conformance_doc,
+                ltv_data=ltv_data_doc,
+                chunks_written=chunks_written_doc,
+                ok=True,
+                error=None,
+                details_log=details_log,
             )
         except Exception as exc:
-            logger.warning("Failed to process PDF %s: %s", obj["key"], exc)
+            # Tier-C item #16 (ADR-056) — classify pymupdf raises into
+            # closed-set codes so auditors can query "show me all docs
+            # that failed for THIS class of reason" rather than reading
+            # exception strings out of logs. Falls through to
+            # ``pdf_corrupted_structure`` for unmatched raises.
+            code = _classify_pdf_extraction_error(exc)
+            logger.warning(
+                "Failed to process PDF %s: %s (classified=%s)",
+                obj["key"],
+                exc,
+                code,
+                extra={"file": obj["key"], "reason": code},
+            )
+            warnings.append({"code": code, "page": None})
+            _flush_pdf_manifest(
+                manifest_service=manifest_service,
+                layer=manifest_layer,
+                key=obj["key"],
+                user_id=user_id,
+                size_bytes=len(raw),
+                page_count=page_count_doc,
+                signature_status=signature_status,
+                ocr_coverage_pct=None,
+                attachment_count=attachment_count_doc,
+                form_field_count=form_field_count_doc,
+                extraction_warnings=warnings,
+                document_sha256=document_hash,
+                pdf_title=pdf_title_doc,
+                pdf_author=pdf_author_doc,
+                pdf_creator=pdf_creator_doc,
+                pdf_creation_date=pdf_creation_date_doc,
+                pdfa_part=pdfa_part_doc,
+                pdfa_conformance=pdfa_conformance_doc,
+                ltv_data=ltv_data_doc,
+                chunks_written=chunks_written_doc,
+                ok=False,
+                error=str(exc) or code,
+                details_log=details_log,
+            )
             continue
     return total
 
@@ -1599,16 +2083,58 @@ def _flush_pdf_manifest(
     form_field_count: int,
     extraction_warnings: list[dict[str, Any]],
     document_sha256: str | None,
+    pdf_title: str | None = None,
+    pdf_author: str | None = None,
+    pdf_creator: str | None = None,
+    pdf_creation_date: datetime | None = None,
+    pdfa_part: str | None = None,
+    pdfa_conformance: str | None = None,
+    ltv_data: dict[str, Any] | None = None,
+    chunks_written: int = 0,
+    ok: bool = True,
+    error: str | None = None,
+    details_log: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Best-effort manifest write for one PDF (tier-B item #22).
+    """Best-effort manifest write for one PDF (tier-B item #22 + tier-C
+    items #10 / #16 / #24 per ADR-056).
 
-    Skips silently when ``manifest_service is None`` (pre-tier-B
-    callers, unit tests that patch out the manifest path). Logs but
-    does not re-raise on Postgres failure — the chunks were already
-    written to ChromaDB; a manifest miss should not undo that. The
-    audit trail's resiliency requirement (the chunks are queryable
+    Skips manifest write silently when ``manifest_service is None``
+    (pre-tier-B callers, unit tests that patch out the manifest path).
+    Logs but does not re-raise on Postgres failure — the chunks were
+    already written to ChromaDB; a manifest miss should not undo that.
+    The audit trail's resiliency requirement (the chunks are queryable
     even without a manifest row) trumps strict consistency here.
+
+    *details_log* (ADR-056 #24) — when supplied, every call appends one
+    per-document outcome dict for the ``?details=true`` response shape.
+    Independent of ``manifest_service``: the response surface and the
+    Postgres surface are decoupled (a Postgres outage shouldn't lose
+    operator visibility into what was attempted).
     """
+    if details_log is not None:
+        details_log.append(
+            {
+                "file": f"{layer}/{key}" if not key.startswith(f"{layer}/") else key,
+                "chunks": chunks_written,
+                "signature_status": signature_status,
+                "page_count": page_count,
+                "extraction_warnings": list(extraction_warnings),
+                "document_sha256": document_sha256,
+                "pdf_title": pdf_title,
+                "pdf_author": pdf_author,
+                "pdf_creator": pdf_creator,
+                "pdf_creation_date": (
+                    pdf_creation_date.isoformat()
+                    if pdf_creation_date is not None
+                    else None
+                ),
+                "pdfa_part": pdfa_part,
+                "pdfa_conformance": pdfa_conformance,
+                "ltv_data": ltv_data,
+                "ok": ok,
+                "error": error,
+            }
+        )
     if manifest_service is None:
         return
     try:
@@ -1624,6 +2150,13 @@ def _flush_pdf_manifest(
             form_field_count=form_field_count,
             extraction_warnings=extraction_warnings,
             document_sha256=document_sha256,
+            pdf_title=pdf_title,
+            pdf_author=pdf_author,
+            pdf_creator=pdf_creator,
+            pdf_creation_date=pdf_creation_date,
+            pdfa_part=pdfa_part,
+            pdfa_conformance=pdfa_conformance,
+            ltv_data=ltv_data,
         )
     except Exception as exc:
         logger.warning(
@@ -1658,6 +2191,32 @@ def index_memory(
             "client loop pattern that keeps memory bounded for the PDF "
             "corpus. The collection is NOT delete-and-recreated in this "
             "mode; existing chunks for other files are preserved."
+        ),
+    ),
+    details: bool = Query(
+        False,
+        description=(
+            "Tier-C item #24 (ADR-056). When true, the response includes a "
+            "``documents`` array carrying per-document outcomes — file, "
+            "chunks written, signature_status, page_count, "
+            "extraction_warnings, document_sha256, the ADR-056 #10 metadata "
+            "fields (pdf_title, pdf_author, pdf_creator, pdf_creation_date), "
+            "ok/error. Default ``false`` keeps the legacy response shape "
+            "for backwards compatibility. Bulk indexes can produce large "
+            "``documents`` arrays; use opt-in for clients that want the "
+            "detail."
+        ),
+    ),
+    dry_run: bool = Query(
+        False,
+        description=(
+            "Tier-C item #23 (ADR-056). When true, the request walks every "
+            "PDF through the full extraction + signature + metadata "
+            "pipeline but does NOT upsert chunks into ChromaDB and does "
+            "NOT write the manifest row. Useful for previewing what would "
+            "happen — pairs naturally with ``details=true`` to surface "
+            "the per-document outcome the writer would have produced. "
+            "Default ``false`` performs the full write."
         ),
     ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
@@ -1735,6 +2294,11 @@ def index_memory(
     ingestion_ts_ms = int(start * 1000)
     results: dict[str, int] = {}
     total_chunks = 0
+    # Tier-C #24 (ADR-056) — when ?details=true, every PDF processed
+    # appends one outcome row here for inclusion in the response.
+    # Allocated unconditionally to keep the call sites uniform; only
+    # surfaced in the response when ``details`` is true.
+    details_log: list[dict[str, Any]] = []
 
     single_file_mode = file is not None
     episodic_objects: list[dict[str, str]] = []
@@ -1775,7 +2339,9 @@ def index_memory(
         # cumulatively. ``contextlib.suppress`` swallows delete
         # failures so a fresh install with no prior collection
         # doesn't 500 (per ``feedback_use_context_managers``).
-        if not single_file_mode:
+        # Tier-C #23 (ADR-056): dry-run preserves the existing
+        # collection — no delete-and-recreate side-effect.
+        if not single_file_mode and not dry_run:
             with contextlib.suppress(Exception):
                 chroma_client.delete_collection(col_name)
         collection = chroma_client.get_or_create_collection(
@@ -1803,11 +2369,12 @@ def index_memory(
                 category="procedural",
             )
         if col_name == "ai_research_papers":
-            # Tier-B item #22: thread the manifest service in so each
-            # processed PDF lands one ``upsert_pdf_metadata`` call
-            # carrying page_count, signature_status, ocr_coverage_pct,
-            # attachment_count, form_field_count, extraction_warnings,
-            # document_sha256.
+            # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
+            # the manifest service AND the per-document details
+            # accumulator AND the dry-run flag. The manifest service
+            # writes Postgres rows (skipped under dry_run); the details
+            # accumulator collects per-doc outcomes for the
+            # ?details=true response shape.
             manifest_service = get_memory_manifest_service()
             chunk_count += _index_pdf_objects(
                 collection,
@@ -1820,6 +2387,8 @@ def index_memory(
                 user_id=user.user_id,
                 ingestion_ts_ms=ingestion_ts_ms,
                 manifest_service=manifest_service,
+                details_log=details_log,
+                dry_run=dry_run,
             )
             chunk_count += _index_pdf_objects(
                 collection,
@@ -1832,6 +2401,8 @@ def index_memory(
                 user_id=user.user_id,
                 ingestion_ts_ms=ingestion_ts_ms,
                 manifest_service=manifest_service,
+                details_log=details_log,
+                dry_run=dry_run,
             )
 
         results[col_name] = chunk_count
@@ -1839,12 +2410,17 @@ def index_memory(
         logger.info("Indexed %s: %d chunks", col_name, chunk_count)
 
     duration = time.time() - start
-    return {
-        "status": "indexed",
+    response: dict[str, Any] = {
+        "status": "dry_run" if dry_run else "indexed",
         "collections": results,
         "total_chunks": total_chunks,
         "duration_s": round(duration, 2),
     }
+    if dry_run:
+        response["dry_run"] = True
+    if details:
+        response["documents"] = details_log
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────

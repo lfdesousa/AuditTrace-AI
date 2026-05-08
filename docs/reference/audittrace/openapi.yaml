@@ -1256,6 +1256,38 @@ paths:
             memory bounded for the PDF corpus. The collection is NOT delete-and-recreated in this mode; existing chunks for
             other files are preserved.
           title: File
+      - description: 'Tier-C item #24 (ADR-056). When true, the response includes a ``documents`` array carrying per-document
+          outcomes — file, chunks written, signature_status, page_count, extraction_warnings, document_sha256, the ADR-056
+          #10 metadata fields (pdf_title, pdf_author, pdf_creator, pdf_creation_date), ok/error. Default ``false`` keeps the
+          legacy response shape for backwards compatibility. Bulk indexes can produce large ``documents`` arrays; use opt-in
+          for clients that want the detail.'
+        in: query
+        name: details
+        required: false
+        schema:
+          default: false
+          description: 'Tier-C item #24 (ADR-056). When true, the response includes a ``documents`` array carrying per-document
+            outcomes — file, chunks written, signature_status, page_count, extraction_warnings, document_sha256, the ADR-056
+            #10 metadata fields (pdf_title, pdf_author, pdf_creator, pdf_creation_date), ok/error. Default ``false`` keeps
+            the legacy response shape for backwards compatibility. Bulk indexes can produce large ``documents`` arrays; use
+            opt-in for clients that want the detail.'
+          title: Details
+          type: boolean
+      - description: 'Tier-C item #23 (ADR-056). When true, the request walks every PDF through the full extraction + signature
+          + metadata pipeline but does NOT upsert chunks into ChromaDB and does NOT write the manifest row. Useful for previewing
+          what would happen — pairs naturally with ``details=true`` to surface the per-document outcome the writer would have
+          produced. Default ``false`` performs the full write.'
+        in: query
+        name: dry_run
+        required: false
+        schema:
+          default: false
+          description: 'Tier-C item #23 (ADR-056). When true, the request walks every PDF through the full extraction + signature
+            + metadata pipeline but does NOT upsert chunks into ChromaDB and does NOT write the manifest row. Useful for previewing
+            what would happen — pairs naturally with ``details=true`` to surface the per-document outcome the writer would
+            have produced. Default ``false`` performs the full write.'
+          title: Dry Run
+          type: boolean
       responses:
         '200':
           content:

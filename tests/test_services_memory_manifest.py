@@ -283,6 +283,16 @@ class TestManifestEntryFromRow:
             form_field_count=None,
             extraction_warnings=None,
             document_sha256=None,
+            # Tier-C PDF metadata columns (ADR-056 #10) — None for
+            # non-PDF rows.
+            pdf_title=None,
+            pdf_author=None,
+            pdf_creator=None,
+            pdf_creation_date=None,
+            # Tier-C PDF/A + LTV (ADR-056 #14 + #13).
+            pdfa_part=None,
+            pdfa_conformance=None,
+            ltv_data=None,
         )
         e = ManifestEntry.from_row(row)
         assert e.id == "abc"

@@ -1,7 +1,7 @@
 # PDF ingestion robustness — work-in-progress status
 
 **Companion to:** [`pdf-ingestion-gaps.md`](pdf-ingestion-gaps.md) (the *what*).
-**Last updated:** 2026-05-09 (ADR-052 + ADR-053 — full EU + CH trust-store coverage shipped)
+**Last updated:** 2026-05-09 (ADR-056 — tier-C #10 / #16 / #24 shipped in v1.0.17)
 **Maintainer note:** update on every commit that ships or partially ships a gap-inventory item. The gap inventory describes the failure mode; this file records what's been done about it.
 
 ---
@@ -62,7 +62,7 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 | **#21** | Per-chunk provenance | ✅ **Shipped (9/9)** | PR #42 (`fdeb24e`) + tier-B PR | tier-A shipped 8/9 fields; tier-B closes the residual: `text_source` now flips to `"ocr"` / `"form_field"` and `extraction_confidence` carries Tesseract's mean-per-word on OCR pages (was always `1.0` in tier-A). New `chunk_type` field disambiguates form-field chunks from text chunks. |
 | **#22** | Document-level manifest columns | ✅ **Shipped** | tier-B PR — Alembic migration 010 | Added to `memory_items`: `page_count`, `signature_status`, `ocr_coverage_pct`, `attachment_count` (default 0), `form_field_count` (default 0), `extraction_warnings` (JSONB on Postgres / JSON on SQLite, default `[]`), `document_sha256`. Surfaced via the existing per-layer endpoints (the `ManifestEntry` dataclass carries the new fields). `pdfa_conformance` + `scan_verdict` deferred per ADR-050. GIN index on `extraction_warnings` for the audit-pivot query `WHERE extraction_warnings @> '[{"code":"…"}]'`. |
 
-**Tier-B summary:** 6/6 ✅ shipped. ADR-050 records the design decisions. `extraction_warnings` JSONB closed-set enum (13 codes) is the single audit pivot; `tests/test_memory_routes.py::TestExtractionWarningCodes` pins the set so a code added without ADR amendment fails CI.
+**Tier-B summary:** 6/6 ✅ shipped. ADR-050 records the design decisions. `extraction_warnings` JSONB closed-set enum is the single audit pivot; `tests/test_memory_routes.py::TestExtractionWarningCodes` pins the set so a code added without ADR amendment fails CI. As of ADR-056 the set is 16 codes (13 tier-A/B + 3 tier-C).
 
 ---
 
@@ -74,18 +74,18 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 | #3 | Tables lose structure | ⏳ Pending |
 | #4 | Multi-column reading order | ⏳ Pending |
 | #5 | RTL / mixed-direction handling | ⏳ Pending |
-| #9 | Bookmarks / TOC for chunking | ⏳ Pending |
-| #10 | Document metadata (title, author, dates) | ⏳ Pending |
-| #11 | Signature presence detection | ⏳ Pending (subsumed by #12 already) |
-| #13 | LTV (Long-Term Validation) data | ⏳ Pending |
-| #14 | PDF/A conformance level | ⏳ Pending |
-| #16 | Corrupted / truncated files | ⏳ Pending |
+| #9 | Bookmarks / TOC for chunking | ✅ **Shipped** (ADR-056, v1.0.17) — `_build_toc_index` forward-fills `pymupdf.Document.get_toc()` entries; per-chunk ChromaDB metadata carries `toc_section` (leaf TOC title for the page). Multi-level TOCs collapse to the leaf for now; breadcrumbs deferred. |
+| #10 | Document metadata (title, author, dates) | ✅ **Shipped** (ADR-056, v1.0.17) — pymupdf `doc.metadata` extracted into manifest columns `pdf_title`, `pdf_author`, `pdf_creator`, `pdf_creation_date` (Alembic 011). Surfaced via per-layer GET + `?details=true` /memory/index response. |
+| #11 | Signature presence detection | ✅ **Shipped** (ADR-056, v1.0.17) — closed as subsumed by #12 / ADR-052 9-class taxonomy. `none` vs `signed_*` answers the presence question on every chunk + manifest row. |
+| #13 | LTV (Long-Term Validation) data | ✅ **Shipped** (ADR-056, v1.0.17) — `ltv_data` JSONB column carries DSS-dictionary summary `{has_dss, ocsp_responses, crls, certs, timestamps, vri_keys}`. NULL on unsigned / no-DSS PDFs. Full ASN.1 stays in source PDF. |
+| #14 | PDF/A conformance level | ✅ **Shipped** (ADR-056, v1.0.17) — XMP `pdfaid:` namespace parsed via `_extract_pdfa_conformance`; `pdfa_part` (1/2/3/4) + `pdfa_conformance` (A/B/U) columns added. Both NULL means non-PDF/A. |
+| #16 | Corrupted / truncated files | ✅ **Shipped** (ADR-056, v1.0.17) — three closed-set codes added (`pdf_corrupted_xref`, `pdf_corrupted_structure`, `pdf_metadata_parse_error`). Wraps the pymupdf-level except handler with `_classify_pdf_extraction_error`. `TestExtractionWarningCodes` extended to 16. |
 | #17 | Hybrid / linearised PDFs | ⏳ Pending |
 | #19 | Per-page memory growth | ⏳ Pending |
 | #20 | Embedding throughput | ⏳ Pending |
-| #23 | Dry-run / preview mode | ⏳ Pending |
-| #24 | Per-document audit-trail granularity | ⏳ Pending |
-| #25 | Surgical re-index | ⏳ Pending |
+| #23 | Dry-run / preview mode | ✅ **Shipped** (ADR-056, v1.0.17) — `?dry_run=true` query param walks the full pipeline but skips ChromaDB upserts, collection delete-and-recreate, and Postgres manifest writes. Pairs with `?details=true` to preview per-document outcomes. Response surfaces `status="dry_run"` + `dry_run: true`. |
+| #24 | Per-document audit-trail granularity | ✅ **Shipped** (ADR-056, v1.0.17) — `?details=true` query param adds `documents` array to /memory/index response. Per-doc shape: `file`, `chunks`, `signature_status`, `page_count`, `extraction_warnings`, `document_sha256`, `pdf_title`/`pdf_author`/`pdf_creator`/`pdf_creation_date`, `pdfa_part`, `pdfa_conformance`, `ltv_data`, `ok`, `error`. Default response shape unchanged. |
+| #25 | Surgical re-index (file-level) | ✅ **Shipped** (ADR-056, v1.0.17) — closed as already-supported. `?file=<key>` mode is idempotent file-level surgical reindex (introduced 2026-05-06 as the per-file client loop). Chunk-level reindex deferred. |
 
 ---
 
@@ -94,7 +94,7 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 - **ADR-048 prereq:** 0 % (Proposed)
 - **Tier-A:** 100 % code shipped, 1 data-side gap (backlog #13)
 - **Tier-B:** **6/6 ✅ shipped** (ADR-050 + tier-B PR, 2026-05-08)
-- **Tier-C:** 0/16 shipped
+- **Tier-C:** **9/16 shipped** (#9, #10, #11, #13, #14, #16, #23, #24, #25 — ADR-056, v1.0.17). Pending: #2, #3, #4, #5, #17, #19, #20.
 
 ---
 
