@@ -266,11 +266,37 @@ class Settings(BaseSettings):
     pdf_trust_store_provider: str = "s3"
     # ``pdf_trust_store_builder`` chooses the sourcing layer.
     # ``eu_lotl`` walks the EU List of Trusted Lists via
-    # pyhanko[etsi] (Layer 1+2 of the ADR-052 coverage matrix —
-    # SwissSign + EU eIDAS qualified signatures in one walk).
+    # pyhanko[etsi] (EU eIDAS qualified TSPs across all 27
+    # member states). ``swiss_tsl`` walks the Swiss federal
+    # Trusted List published by OFCOM/BAKOM (ADR-053 — adds
+    # Swiss-jurisdiction qualified TSPs incl. SwissSign +
+    # Swisscom Trust Services). ``composite`` runs both (and any
+    # future jurisdictional builder) and concatenates the
+    # bundles — the recommended default for any deployment
+    # serving signed-document workflows in either jurisdiction.
     # ``static`` concatenates a directory of operator-supplied
     # PEMs (test/dev + air-gapped customers).
-    pdf_trust_store_builder: str = "eu_lotl"
+    pdf_trust_store_builder: str = "composite"
+    # When ``pdf_trust_store_builder == "composite"`` this is the
+    # comma-separated list of inner builders (in order). Each entry
+    # must be one of {``eu_lotl``, ``swiss_tsl``, ``static``}.
+    # Default ``eu_lotl,swiss_tsl`` covers the EU + CH
+    # jurisdictions in one bundle — the right default for a
+    # Swiss-located, EU-customer-serving product.
+    pdf_trust_store_composite_builders: str = "eu_lotl,swiss_tsl"
+    # Filesystem path to the Swiss TSLO (Trust List Operator)
+    # signing certificate, vendored in the chart at
+    # ``charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der``
+    # and mounted into memory-server via ConfigMap. Read by the
+    # SwissTslTrustStoreBuilder to validate the Swiss TSL's XAdES
+    # signature before registering any TSP. SHA-1 fingerprint
+    # ``e8638362 5130bdf0 1e42a317 6501e079 261b137f`` was OOB-
+    # verified against
+    # https://uri.tsl-switzerland.ch/TrstSvc/TrustedList/schemerules/CH/index.html
+    # on 2026-05-09. ADR-053 §4.
+    pdf_trust_store_swiss_tslo_cert_path: str = (
+        "/etc/audittrace/swiss-federal-tsl/CH-TL-cert.der"
+    )
     # S3-Provider object location: bucket re-uses the existing
     # ``minio_shared_bucket`` (memory-shared by default — ADR-027
     # §2 — public to all authenticated users since trust roots

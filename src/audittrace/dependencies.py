@@ -47,10 +47,12 @@ from audittrace.services.procedural import (
     S3ProceduralService,
 )
 from audittrace.services.trust_store import (
+    CompositeTrustStoreBuilder,
     EuLotlTrustStoreBuilder,
     MockTrustStoreProvider,
     S3TrustStoreProvider,
     StaticTrustStoreBuilder,
+    SwissTslTrustStoreBuilder,
     TrustStoreBuilder,
     TrustStoreProvider,
 )
@@ -268,27 +270,55 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         )
 
     trust_store_builder: TrustStoreBuilder
-    if settings.pdf_trust_store_builder == "eu_lotl":
-        trust_store_builder = EuLotlTrustStoreBuilder()
-    elif settings.pdf_trust_store_builder == "static":
-        if not settings.pdf_trust_store_static_dir:
+    builder_kind = settings.pdf_trust_store_builder
+    if builder_kind == "composite":
+        # ADR-053 — compose multiple jurisdictional builders so the
+        # bundle covers EU + CH (and any future programs) in one
+        # refresh cycle.
+        names = [
+            n.strip()
+            for n in settings.pdf_trust_store_composite_builders.split(",")
+            if n.strip()
+        ]
+        if not names:
             raise RuntimeError(
-                "AUDITTRACE_PDF_TRUST_STORE_BUILDER=static requires "
-                "AUDITTRACE_PDF_TRUST_STORE_STATIC_DIR to be set "
-                "(directory of operator-supplied .pem/.crt files)."
+                "AUDITTRACE_PDF_TRUST_STORE_BUILDER=composite requires "
+                "AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS to be a "
+                "non-empty comma-separated list (e.g. 'eu_lotl,swiss_tsl')."
             )
-        trust_store_builder = StaticTrustStoreBuilder(
-            settings.pdf_trust_store_static_dir
-        )
+        inner_builders: list[TrustStoreBuilder] = [
+            _build_inner_builder(n, settings) for n in names
+        ]
+        trust_store_builder = CompositeTrustStoreBuilder(inner_builders)
     else:
-        raise RuntimeError(
-            f"Unknown AUDITTRACE_PDF_TRUST_STORE_BUILDER="
-            f"{settings.pdf_trust_store_builder!r}; expected one of "
-            f"'eu_lotl', 'static' (per ADR-052 §3)."
-        )
+        trust_store_builder = _build_inner_builder(builder_kind, settings)
 
     container._instances["trust_store_provider"] = trust_store_provider
     container._instances["trust_store_builder"] = trust_store_builder
+
+
+def _build_inner_builder(name: str, settings: Settings) -> TrustStoreBuilder:
+    """Resolve a single builder name to a TrustStoreBuilder instance.
+    Used both directly (when ``pdf_trust_store_builder`` is a single
+    name) and from the composite resolution path (ADR-053)."""
+    if name == "eu_lotl":
+        return EuLotlTrustStoreBuilder()
+    if name == "swiss_tsl":
+        return SwissTslTrustStoreBuilder(
+            tslo_cert_path=settings.pdf_trust_store_swiss_tslo_cert_path
+        )
+    if name == "static":
+        if not settings.pdf_trust_store_static_dir:
+            raise RuntimeError(
+                "trust-store builder 'static' requires "
+                "AUDITTRACE_PDF_TRUST_STORE_STATIC_DIR to be set "
+                "(directory of operator-supplied .pem/.crt files)."
+            )
+        return StaticTrustStoreBuilder(settings.pdf_trust_store_static_dir)
+    raise RuntimeError(
+        f"Unknown trust-store builder name: {name!r}. Expected one of "
+        f"{{'eu_lotl', 'swiss_tsl', 'static'}} (per ADR-052 §3 + ADR-053)."
+    )
 
 
 @log_call(logger=logger)
