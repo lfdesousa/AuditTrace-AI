@@ -4220,6 +4220,79 @@ class TestPdfIndexDryRun:
         assert docs[0]["chunks"] >= 1
 
 
+class TestPdfIndexCorruptionExceptionPath:
+    """ADR-056 #16 — the orchestrator's outer ``except Exception`` path.
+
+    When pymupdf raises mid-document (corrupted xref, structural
+    parse error), the orchestrator must:
+    - classify the raise into a closed-set warning code via
+      ``_classify_pdf_extraction_error``,
+    - flush a per-doc manifest entry with ``ok=False``,
+    - continue to the next file rather than aborting the batch.
+
+    Pre-refactor (Phase 1 + Phase 2 lived in routes/memory.py) the
+    coverage of this branch came from live-evidence tests through
+    the route. Post-Phase-2 the orchestrator is its own module
+    (memory_pdf/pipeline.py) and the per-file 90% gate needs a
+    direct unit test to exercise the exception branch."""
+
+    def test_pymupdf_raise_is_classified_and_flushed(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+
+        raw_bytes = b"%PDF-1.4 garbage-pretending-to-be-pdf"
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        # pymupdf.open raises on entry — this is the corrupt-file shape.
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.side_effect = RuntimeError("invalid xref offset")
+
+        mock_collection = MagicMock()
+        mock_manifest = MagicMock()
+
+        details_log: list[dict] = []
+
+        with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
+            chunks = _index_pdf_objects(
+                collection=mock_collection,
+                minio_client=mock_minio,
+                bucket="memory-shared",
+                objects=[{"key": "episodic/corrupt.pdf", "filename": "corrupt.pdf"}],
+                col_name="ai_research_papers",
+                category="episodic",
+                layer_prefix="episodic/",
+                user_id="u1",
+                ingestion_ts_ms=0,
+                manifest_service=mock_manifest,
+                details_log=details_log,
+                dry_run=False,
+            )
+
+        # No chunks committed.
+        assert chunks == 0
+        # No ChromaDB upsert happened.
+        mock_collection.upsert.assert_not_called()
+        # Manifest write fired with ok=False + classified warning.
+        assert mock_manifest.upsert_pdf_metadata.called
+        kwargs = mock_manifest.upsert_pdf_metadata.call_args.kwargs
+        warnings = kwargs["extraction_warnings"]
+        # The classifier picked pdf_corrupted_xref because the raise
+        # message contained "xref" — verifies the classifier was
+        # invoked from the exception path.
+        assert any(w.get("code") == "pdf_corrupted_xref" for w in warnings)
+        # And the per-document outcome lands in details_log with
+        # ok=False so /memory/index?details=true surfaces the failure.
+        assert len(details_log) == 1
+        assert details_log[0]["ok"] is False
+        assert details_log[0]["chunks"] == 0
+
+
 class TestPdfIndexDetailsResponseShape:
     """ADR-056 #24 — ``?details=true`` adds a ``documents`` array to the
     /memory/index response; legacy ``?details=false`` (default) keeps
