@@ -1,0 +1,51 @@
+meta {
+  name: GET /system/trust-store — read PEM bundle metadata
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/system/trust-store
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("returns 200 when bundle is provisioned, 404 if not", function() {
+    expect([200, 404]).to.include(res.getStatus());
+  });
+  test("metadata shape (200 path)", function() {
+    if (res.getStatus() !== 200) return;
+    const body = res.getBody();
+    expect(body.sha256).to.be.a("string");
+    expect(body.builder_id).to.be.a("string");
+    expect(body.cert_count).to.be.a("number");
+    expect(body.source_url).to.be.a("string");
+    expect(body.built_at).to.be.a("string");
+  });
+  test("404 detail names the recovery action", function() {
+    if (res.getStatus() !== 404) return;
+    const body = res.getBody();
+    expect(body.detail.error).to.equal("trust_store_not_provisioned");
+    expect(body.detail.hint).to.match(/refresh/);
+  });
+}
+
+docs {
+  Read-side admin endpoint introduced in ADR-052 §5. Returns the
+  ``TrustStoreMetadata`` of the currently-stored PEM bundle, or
+  404 with a hint if no bundle has been provisioned yet.
+
+  Authorization: scope ``audittrace:admin``. Add ``audittrace:admin``
+  to the env's ``scope`` string before running (the default scope
+  list does not include it — admin access is opt-in per session).
+
+  The response body's ``builder_id`` (e.g. ``eu_lotl+swiss_tsl``)
+  identifies which sourcing path produced the bundle. Useful for
+  auditors querying "which trust roots were in scope at refresh time
+  X" without having to grep logs.
+}

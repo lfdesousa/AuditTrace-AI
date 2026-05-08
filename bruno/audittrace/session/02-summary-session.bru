@@ -1,0 +1,53 @@
+meta {
+  name: POST /session/summary — request summary on demand
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/session/summary
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "project": "AuditTrace-AI",
+    "summary": "Bruno smoke-test summary — explicit operator-driven save",
+    "key_points": [
+      "exercises POST /session/summary",
+      "writes a SessionRecord summary visible to /sessions and /memory/conversational"
+    ],
+    "session_id": "bruno-test-session"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("envelope shape", function() {
+    const body = res.getBody();
+    expect(body.status).to.equal("ok");
+    expect(body.session_id).to.be.a("string");
+  });
+}
+
+docs {
+  Operator-driven session summary save (ADR-030). Equivalent of the
+  legacy ``python3 memory.py session-save --project P --summary S
+  --key-points P1 P2 ...`` workflow. Writes one row to the
+  ``sessions`` table for Layer 3 (conversational memory) continuity
+  across conversations.
+
+  Distinct from the BACKGROUND summariser worker (scripts/session-
+  summarizer.py + ADR-030 §SessionSummarizer) which scans idle
+  sessions on a cron-style interval and calls the summariser LLM
+  itself. This endpoint takes a pre-computed summary from the caller.
+
+  Authorization: scope ``audittrace:query``.
+}

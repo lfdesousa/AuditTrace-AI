@@ -86,6 +86,16 @@
     .chip.ok { background: #1f3a26; color: var(--ok); }
     .chip.err { background: #3a1f25; color: var(--err); }
     .chip.warn { background: #3a311f; color: #e0c067; }
+    /* signature_status chips — distinct hue per audit class so a
+       quick scroll surfaces the cluster of expired/untrusted/etc.
+       Mirrors the 9-class taxonomy (ADR-052 §1 + ADR-054 §1). */
+    .chip.sig-valid { background: #1f3a26; color: var(--ok); }
+    .chip.sig-invalid { background: #3a1f25; color: var(--err); }
+    .chip.sig-tampered { background: #4a1f25; color: #ff5e72; font-weight: 600; }
+    .chip.sig-untrusted { background: #2a2e35; color: #b0b8c4; }
+    .chip.sig-expired { background: #3a311f; color: #e0c067; }
+    .chip.sig-none { background: #2a2e35; color: var(--muted); }
+    .chip.sig-runtime { background: #2a2e35; color: var(--muted); font-style: italic; }
 
     /* Top-level tabs (Chat / Memory) */
     .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin: 0 0 16px; }
@@ -631,12 +641,17 @@ function renderList(items) {
       <th>Summary</th>
       <th></th>`;
   } else {
+    // Episodic/procedural/semantic — show signature_status when
+    // present so the audit class is visible in the list itself
+    // (no per-row drill-down needed). ADR-052 + ADR-054 9-class
+    // taxonomy.
     thead.innerHTML = `
       <th>Key</th>
       <th>Title</th>
       <th>Modified (UTC)</th>
       <th>By</th>
       <th>Bytes</th>
+      <th>Signature</th>
       <th></th>`;
   }
 
@@ -681,6 +696,7 @@ function renderList(items) {
       <td>${fmtUtcMs(it.modified_at_ms)}</td>
       <td>${escapeHtml((it.modified_by_user_id || '').slice(0, 8))}${it.modified_by_user_id ? '…' : ''}</td>
       <td>${it.size_bytes != null ? it.size_bytes : ''}</td>
+      <td>${signatureChip(it.signature_status)}</td>
       <td class="actions">
         <button class="small secondary" data-act="edit" data-key="${escapeAttr(it.key)}" ${editable ? '' : 'disabled'}>Edit</button>
         <button class="small danger" data-act="delete" data-key="${escapeAttr(it.key)}" ${editable && !it.discovered ? '' : 'disabled'}>Delete</button>
@@ -695,6 +711,30 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function escapeAttr(s) { return escapeHtml(s); }
+
+// signature_status → coloured chip per the 9-class taxonomy (ADR-052
+// §1 + ADR-054 §1). PDFs not yet indexed (or non-PDF rows) carry a
+// null signature_status — show nothing rather than a misleading
+// "unknown" chip. Operational/runtime classes (check_skipped /
+// check_unavailable / check_failed) collapse to a neutral chip — the
+// audit class is "we couldn't verdict", not a verdict itself.
+function signatureChip(status) {
+  if (status == null) return '';
+  switch (status) {
+    case 'signed_valid':     return '<span class="chip sig-valid">signed_valid</span>';
+    case 'signed_invalid':   return '<span class="chip sig-invalid">signed_invalid</span>';
+    case 'signed_untrusted': return '<span class="chip sig-untrusted">signed_untrusted</span>';
+    case 'signed_expired':   return '<span class="chip sig-expired">signed_expired</span>';
+    case 'signed_tampered':  return '<span class="chip sig-tampered">signed_tampered</span>';
+    case 'none':             return '<span class="chip sig-none">unsigned</span>';
+    case 'check_skipped':
+    case 'check_unavailable':
+    case 'check_failed':
+      return '<span class="chip sig-runtime">' + escapeHtml(status) + '</span>';
+    default:
+      return '<span class="chip">' + escapeHtml(status) + '</span>';
+  }
+}
 
 $('memList').addEventListener('click', async (e) => {
   const link = e.target.closest('a.memViewLink');

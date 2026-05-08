@@ -1,0 +1,54 @@
+meta {
+  name: POST /context — build context bundle for a query
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/context
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "query": "What did ADR-025 decide about memory tools?",
+    "project": "AuditTrace-AI"
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("envelope shape", function() {
+    const body = res.getBody();
+    expect(body.context_string).to.be.a("string");
+    expect(body.layer_stats).to.be.an("object");
+    expect(body.query).to.be.a("string");
+    expect(body.retrieved_at).to.be.a("string");
+  });
+  test("layer_stats names the four memory layers", function() {
+    const stats = res.getBody().layer_stats;
+    expect(stats).to.satisfy(s =>
+      ["episodic","procedural","conversational","semantic"].some(k => k in s)
+    );
+  });
+}
+
+docs {
+  Returns the context bundle the chat route would build for the
+  given query (per ADR-024 / ADR-025). Useful for debugging memory
+  retrieval without running an actual chat completion.
+
+  Authorization: scope ``audittrace:context``. Default env scope
+  string includes it.
+
+  The shape of ``stats`` depends on the memory_mode: inject mode
+  returns per-layer counts; tools mode returns the ambient context
+  + the visible-tool list.
+}
