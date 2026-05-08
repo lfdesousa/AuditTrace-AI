@@ -82,6 +82,28 @@ memoryServer:
     # keep the Job's SQL self-consistent; override only if you need
     # multiple chart installs in one DB.
     roleName: audittrace_summariser
+  trustStore:
+    # ADR-052 §5 — Helm post-install / post-upgrade hook that hits
+    # POST /system/trust-store/refresh once after deploy. Default
+    # FALSE because the hook needs a service-account JWT with the
+    # `audittrace:admin` scope, which the operator must provision
+    # ahead of time (a k8s Secret named ``<release>-trust-store-
+    # refresh-creds`` with keys ``client_id``, ``client_secret``).
+    # Until that is provisioned, set this to false and run the
+    # refresh manually:
+    #
+    #     audittrace-login --scope audittrace:admin
+    #     curl -H "Authorization: Bearer $(< ~/.audittrace/token)" \
+    #       -X POST https://audittrace.local/system/trust-store/refresh
+    #
+    # Air-gapped customers using StaticTrustStoreBuilder + a vendored
+    # PEM directory can also leave this off and run their own
+    # provisioning path.
+    bootstrap:
+      enabled: false
+      # Secret name holding service-account credentials for the
+      # bootstrap Job. Keys: `client_id`, `client_secret`.
+      credentialsSecret: ""
   serviceAccount:
     create: true
     name: memory-server
@@ -141,6 +163,15 @@ memoryServer:
     AUDITTRACE_SUMMARIZER_IDLE_MINUTES: "15"
     AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES: "5"
     AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE: "10"
+    # PAdES trust store (ADR-052). Provider = where the PEM lives;
+    # Builder = where it comes from. Defaults: S3 + EU LOTL via
+    # pyhanko[etsi]. Operators with non-default storage (Vault,
+    # ConfigMap, ...) or non-default sourcing (Adobe AATL, static
+    # PEM dir) override these values + provide the Provider/Builder
+    # impl. ADR-052 §2 + §3.
+    AUDITTRACE_PDF_TRUST_STORE_PROVIDER: "s3"
+    AUDITTRACE_PDF_TRUST_STORE_BUILDER: "eu_lotl"
+    AUDITTRACE_PDF_TRUST_STORE_S3_KEY: "trust-store/eu-lotl-bundle.pem"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
     OTEL_RESOURCE_ATTRIBUTES: "service.namespace=audittrace,service.version=1.0.0,deployment.environment=local"

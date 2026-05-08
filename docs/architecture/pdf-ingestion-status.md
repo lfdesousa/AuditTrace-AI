@@ -1,7 +1,7 @@
 # PDF ingestion robustness — work-in-progress status
 
 **Companion to:** [`pdf-ingestion-gaps.md`](pdf-ingestion-gaps.md) (the *what*).
-**Last updated:** 2026-05-08 (tier-B shipped)
+**Last updated:** 2026-05-09 (ADR-052 PR 2 — signature taxonomy split landed; PR 3 in flight)
 **Maintainer note:** update on every commit that ships or partially ships a gap-inventory item. The gap inventory describes the failure mode; this file records what's been done about it.
 
 ---
@@ -44,10 +44,10 @@ Until v1 ships, no external user uploads of PDFs are accepted into the indexable
 | # | Item | Status | Shipped where | Notes |
 |---|---|---|---|---|
 | **#8** | Annotations / unflattened redactions (confidentiality) | ✅ **Shipped** | PR #42 (`fdeb24e`) | `pdf_redaction_policy = "reject" \| "clip-extract"`. Default reject. |
-| **#12** | Signature validity (audit-grade provenance) | 🟨 **Code shipped, data gap** | PR #42 (`fdeb24e`) | `_pdf_signature_status` returns 7-class taxonomy. **Trust store empty in deployed image** → all SwissSign-signed docs flag `signed_invalid`. Backlog #13 deferred 2026-05-08 pending OOB SwissSign root verification. |
+| **#12** | Signature validity (audit-grade provenance) | ✅ **Shipped** | PR #42 (`fdeb24e`) + ADR-052 PR 3 (combined: taxonomy split + trust-store provisioning) | `_pdf_signature_status` returns **8-class taxonomy** (per ADR-052 §1) — `signed_invalid` (math broken) split from new `signed_untrusted` (chain doesn't terminate at our trust roots) so configuration gaps stop poisoning the audit signal. Trust store provisioned via the EU LOTL walker (`EuLotlTrustStoreBuilder` + `S3TrustStoreProvider`, pluggable Provider/Builder ABCs in `services/trust_store.py` per ADR-052 §2-3). Live evidence 2026-05-09: 887 EU qualified-signature CAs walked from `https://ec.europa.eu/tools/lotl/eu-lotl.xml` and persisted to MinIO at `memory-shared/trust-store/eu-lotl-bundle.pem`; refresh via `POST /system/trust-store/refresh` (scope `audittrace:admin`). Residual: Switzerland is not an EU member state and the EU LOTL does not include the Swiss federal TSL by default — Swiss-signed PDFs (incl. `main_signed.pdf`) honestly flag `signed_untrusted`, an accurate scope-aware audit signal rather than a misleading `signed_invalid`. Future iteration may extend with the Swiss federal TSL via `StaticTrustStoreBuilder`. Backlog #13 closed by this work. |
 | **#18** | PDF bombs (availability) | ✅ **Shipped** | PR #42 (`fdeb24e`) | 4 layers: byte cap (`pdf_max_size_mb`), page cap (`pdf_max_pages`), xref cap (`pdf_max_xref_count`), per-page text cap + wall-clock budget (`pdf_parse_timeout_seconds`). |
 
-**Tier-A summary:** code-complete; `#12`'s data gap is the only residual, deferred to backlog #13.
+**Tier-A summary:** code-complete; `#12`'s data gap is being closed by ADR-052 PR 3 (EU LOTL trust-store provisioning, Layer 1+2 — SwissSign + EU eIDAS). Taxonomy split (ADR-052 PR 2) lands first so `signed_untrusted` is available as the honest intermediate-state signal.
 
 ---
 

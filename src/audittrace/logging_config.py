@@ -143,8 +143,16 @@ _COMPONENT_MAP: dict[str, str] = {
     "routes.audit": "route.audit",
     "routes.session": "route.session",
     "routes.health": "route.health",
+    "routes.admin": "route.admin",
     "auth": "core.auth",
     "telemetry": "core.telemetry",
+    # ADR-052 — PAdES trust store
+    "TrustStoreProvider": "trust-store.provider",
+    "TrustStoreBuilder": "trust-store.builder",
+    "S3TrustStoreProvider": "trust-store.provider",
+    "MockTrustStoreProvider": "trust-store.provider",
+    "EuLotlTrustStoreBuilder": "trust-store.builder",
+    "StaticTrustStoreBuilder": "trust-store.builder",
 }
 
 
@@ -185,6 +193,19 @@ _SPAN_NAME_MAP: list[tuple[str, str]] = [
     ("PostgresConversationalService.as_context", "memory-conversational-context"),
     ("ChromaSemanticService.search", "memory-semantic-search"),
     ("ChromaSemanticService.available_collections", "memory-semantic-collections"),
+    # PAdES trust store (ADR-052)
+    ("S3TrustStoreProvider.load", "trust-store-load"),
+    ("S3TrustStoreProvider.store", "trust-store-store"),
+    ("S3TrustStoreProvider.metadata", "trust-store-metadata"),
+    ("MockTrustStoreProvider.load", "trust-store-load"),
+    ("MockTrustStoreProvider.store", "trust-store-store"),
+    ("MockTrustStoreProvider.metadata", "trust-store-metadata"),
+    ("EuLotlTrustStoreBuilder.build", "trust-store-build-eu-lotl"),
+    ("StaticTrustStoreBuilder.build", "trust-store-build-static"),
+    ("get_trust_store_provider", "di-trust-store-provider"),
+    ("get_trust_store_builder", "di-trust-store-builder"),
+    ("refresh_trust_store", "admin-trust-store-refresh"),
+    ("get_trust_store_metadata", "admin-trust-store-metadata"),
     # Context builder
     (
         "DefaultContextBuilder.build_system_context_with_stats",

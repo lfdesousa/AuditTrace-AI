@@ -1,0 +1,134 @@
+{{- $ts := .Values.memoryServer.trustStore | default dict }}
+{{- $bootstrap := $ts.bootstrap | default dict }}
+{{- if $bootstrap.enabled }}
+# Post-install / post-upgrade Helm hook that provisions the PAdES
+# trust store by hitting POST /system/trust-store/refresh once after
+# deploy. Without this hook the trust store is empty after a fresh
+# install — every signature check returns ``signed_untrusted`` until
+# an operator manually triggers the refresh. Mirrors the in-repo
+# pattern at templates/postgres/job-summariser-role.yaml.
+#
+# Auth flow: client_credentials against Keycloak using the
+# operator-supplied Secret ({{ .Values.memoryServer.trustStore.bootstrap.credentialsSecret }})
+# with keys `client_id` and `client_secret`. The client must have
+# the `audittrace:admin` scope provisioned (see scripts/setup-idp-federation.sh
+# and the ensure-memory-scopes Helm Job for the pattern).
+#
+# Default off — see the values.yaml comment block for the wiring
+# requirements. Set ``memoryServer.trustStore.bootstrap.enabled: true``
+# only after the credentials Secret is provisioned.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-trust-store-refresh
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # weight 30 — runs after summariser-role (10) + memory-scopes (20)
+    # so the prerequisite Postgres role + Keycloak scopes are in place.
+    "helm.sh/hook-weight": "30"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # 12 retries × ~10 s backoff ≈ 2 min — plenty of headroom for
+  # memory-server to come Ready post-rollout. Same posture as the
+  # summariser-role Job.
+  backoffLimit: 12
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: trust-store-refresh
+        # Need the Istio sidecar to present a SPIFFE identity for the
+        # in-mesh hop to memory-server (mTLS).
+        sidecar.istio.io/inject: "true"
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: default
+      containers:
+        - name: refresh
+          image: curlimages/curl:8.10.1
+          env:
+            - name: KC_TOKEN_URL
+              value: "http://{{ .Release.Name }}-keycloak.{{ .Release.Namespace }}.svc.cluster.local/realms/audittrace/protocol/openid-connect/token"
+            - name: ADMIN_REFRESH_URL
+              value: "http://{{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local:8765/system/trust-store/refresh"
+            - name: KC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bootstrap.credentialsSecret }}
+                  key: client_id
+            - name: KC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bootstrap.credentialsSecret }}
+                  key: client_secret
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for memory-server to accept connections ..."
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                if curl --max-time 5 -sS -f -o /dev/null \
+                     "http://{{ .Release.Name }}-memory-server.{{ .Release.Namespace }}.svc.cluster.local:8765/health"; then
+                  echo "memory-server ready after ${i} attempt(s)."
+                  break
+                fi
+                if [ "$i" -eq 15 ]; then
+                  echo "memory-server did not become Ready within 30 s." >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+
+              echo "minting service-account JWT for audittrace:admin scope ..."
+              # client_credentials grant — service-account JWT carrying
+              # the configured scopes. The client at $KC_CLIENT_ID must
+              # have audittrace:admin in its allowed scopes.
+              token_response=$(curl --max-time 10 -sS -f \
+                -X POST "$KC_TOKEN_URL" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "grant_type=client_credentials" \
+                -d "client_id=$KC_CLIENT_ID" \
+                -d "client_secret=$KC_CLIENT_SECRET" \
+                -d "scope=audittrace:admin")
+              # Extract access_token without jq (curlimages/curl is
+              # alpine + busybox sed — pull the token via grep + awk).
+              access_token=$(printf '%s' "$token_response" \
+                | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+              if [ -z "$access_token" ]; then
+                echo "failed to extract access_token from Keycloak response:" >&2
+                echo "$token_response" >&2
+                exit 1
+              fi
+              echo "JWT obtained (${#access_token} bytes)."
+
+              echo "POST $ADMIN_REFRESH_URL ..."
+              # Capture HTTP status + body separately so the metadata
+              # lands in the Job log for the operator to inspect.
+              http_status=$(curl --max-time 120 -sS \
+                -o /tmp/refresh-response.json \
+                -w "%{http_code}" \
+                -X POST "$ADMIN_REFRESH_URL" \
+                -H "Authorization: Bearer $access_token" \
+                -H "Accept: application/json")
+              echo "trust-store refresh response: HTTP ${http_status}"
+              cat /tmp/refresh-response.json || true
+              echo
+              if [ "$http_status" != "200" ]; then
+                echo "trust-store refresh failed (HTTP $http_status)." >&2
+                exit 1
+              fi
+
+              echo "shutting down istio sidecar ..."
+              # Without the quitquitquit call istio-proxy keeps the
+              # Pod NotReady forever and the Helm post-upgrade hook
+              # reports `failed: context deadline exceeded`.
+              curl --max-time 5 -sS -o /dev/null \
+                -w 'istio quitquitquit: HTTP %{http_code}\n' \
+                -X POST http://127.0.0.1:15020/quitquitquit \
+                || echo "warn: istio quitquitquit failed (sidecar may already be gone)"
+              echo "Job completing."
+{{- end }}

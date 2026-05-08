@@ -425,31 +425,113 @@ _VC_LOCK = __import__("threading").Lock()
 _VC_TRUST_STORE_PATH: str = ""  # tracks which trust store the cached VC was built with
 
 
+_PEM_CERT_RE = __import__("re").compile(
+    rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+    __import__("re").DOTALL,
+)
+
+
+def _pem_bundle_to_cert_list(pem_bytes: bytes) -> list[Any]:
+    """Parse a multi-cert PEM bundle into a list of
+    ``asn1crypto.x509.Certificate`` objects suitable for
+    ``pyhanko_certvalidator.ValidationContext(trust_roots=...)``.
+
+    pyhanko_certvalidator's ``TrustRootList`` is type-aliased as
+    ``Iterable[Union[x509.Certificate, TrustAnchor]]`` — the
+    docstring at ``context.py:96`` claims "byte strings containing
+    DER or PEM-encoded X.509 certificates" are also accepted, but
+    that's misleading: passing raw PEM bytes raises
+    ``'bytes' object has no attribute 'subject'`` deep inside the
+    trust-root walk. Caught by live evidence 2026-05-09 on
+    main_signed.pdf re-index. Returning parsed Certificate
+    objects matches the actual contract.
+
+    Returns an empty list if no cert markers are found — callers
+    should treat that as "no trust roots configured" and fall back
+    to system roots.
+    """
+    from asn1crypto import pem as asn1_pem
+    from asn1crypto import x509 as asn1_x509
+
+    blocks = _PEM_CERT_RE.findall(pem_bytes)
+    certs: list[Any] = []
+    for block in blocks:
+        try:
+            if asn1_pem.detect(block):
+                _, _, der_bytes = asn1_pem.unarmor(block)
+            else:
+                der_bytes = block
+            certs.append(asn1_x509.Certificate.load(der_bytes))
+        except (ValueError, TypeError) as exc:
+            # Skip malformed entries — log + continue. A single bad
+            # cert in the bundle should not poison the whole trust
+            # context. Same posture as pyhanko's own per-TSL error
+            # handling in EuLotlTrustStoreBuilder.build().
+            logger.warning("skipping malformed cert in trust bundle: %s", exc)
+    return certs
+
+
 def _get_validation_context(trust_store_path: str) -> Any:
     """Return a process-cached pyhanko ValidationContext.
 
-    First call builds it from the configured trust store; subsequent
-    calls return the cached instance. If *trust_store_path* changes
-    between calls (operator updated Settings without restart), the
-    context is rebuilt — a deliberate cache invalidation point.
+    First call builds it from the configured trust source; subsequent
+    calls return the cached instance. The cache key is
+    ``(trust_store_path, provider_metadata_sha256)`` — either the
+    operator-set file path changing OR the Provider's stored bundle
+    being refreshed invalidates the cache. Same lazy double-checked
+    locking pattern as the existing singleton.
+
+    Trust source resolution (ADR-052 §2):
+
+    * If ``trust_store_path`` is non-empty, read the PEM bundle from
+      that filesystem path. This is the pre-ADR-052 backwards-compat
+      path: an operator who mounts a PEM via Vault Agent at
+      ``/etc/audittrace/trust-store.pem`` continues to work unchanged.
+    * Otherwise, attempt ``provider.load()`` to fetch the bundle from
+      the configured Provider (default ``S3TrustStoreProvider`` →
+      MinIO). ``FileNotFoundError`` falls through to certifi + OS
+      trust roots — the honest "no trust store provisioned yet"
+      state. The next ``POST /system/trust-store/refresh`` populates
+      the Provider; the cache invalidates on metadata sha256 change.
+    * If neither source is configured, certifi + OS trust roots only.
     """
     global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH
+    # Resolve the Provider-side cache key BEFORE the fast-path check
+    # so a refresh (which changes the metadata sha256) invalidates
+    # the in-process cache without a pod restart.
+    provider_sha: str = ""
+    if not trust_store_path:
+        try:
+            from audittrace.dependencies import get_trust_store_provider
+
+            provider = get_trust_store_provider()
+            metadata = provider.metadata()
+            if metadata is not None:
+                provider_sha = metadata.sha256
+        except (KeyError, RuntimeError, ImportError):
+            # DI container not initialised (test paths) or import
+            # cycle — no Provider available, fall through to system
+            # trust roots.
+            pass
+    cache_key = f"{trust_store_path}|{provider_sha}"
+
     # Fast path — lock-free read.
-    if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == trust_store_path:
+    if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == cache_key:
         return _VALIDATION_CONTEXT
     # Slow path — race-safe init.
     with _VC_LOCK:
-        if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == trust_store_path:
+        if _VALIDATION_CONTEXT is not None and _VC_TRUST_STORE_PATH == cache_key:
             return _VALIDATION_CONTEXT
         from pyhanko_certvalidator import ValidationContext
 
         kwargs: dict[str, Any] = {}
         if trust_store_path:
-            # Operator-provided extra trust roots (PEM bundle).
+            # Operator-set explicit PEM file path takes precedence —
+            # pre-ADR-052 backwards-compat path.
             try:
                 with open(trust_store_path, "rb") as fh:
                     pem_bytes = fh.read()
-                kwargs["trust_roots"] = [pem_bytes]
+                kwargs["trust_roots"] = _pem_bundle_to_cert_list(pem_bytes)
             except OSError as exc:
                 logger.warning(
                     "Could not read pdf_signature_trust_store=%r: %s; "
@@ -457,13 +539,46 @@ def _get_validation_context(trust_store_path: str) -> Any:
                     trust_store_path,
                     exc,
                 )
+        elif provider_sha:
+            # Provider has a bundle stored — load it. We already know
+            # metadata exists (provider_sha was set above) so load()
+            # succeeds; the try/except guards against a race where the
+            # bundle is deleted between metadata() and load().
+            try:
+                from audittrace.dependencies import get_trust_store_provider
+
+                provider = get_trust_store_provider()
+                bundle = provider.load()
+                kwargs["trust_roots"] = _pem_bundle_to_cert_list(bundle.pem_bytes)
+            except (FileNotFoundError, KeyError, RuntimeError, ImportError) as exc:
+                logger.warning(
+                    "TrustStoreProvider.load() failed: %s; "
+                    "falling back to system trust roots",
+                    exc,
+                )
         # Defaults: certifi + system trust + pyhanko's built-in
         # algorithm_usage_policy (rejects MD5, SHA-1, RSA<2048 with
         # warnings or hard-fail per pyhanko's current defaults).
         # IAM §"Algorithm Security Rules" — never accept weak algs.
         _VALIDATION_CONTEXT = ValidationContext(**kwargs)
-        _VC_TRUST_STORE_PATH = trust_store_path
+        _VC_TRUST_STORE_PATH = cache_key
         return _VALIDATION_CONTEXT
+
+
+def _invalidate_validation_context() -> None:
+    """Drop the cached ValidationContext singleton.
+
+    Called by ``POST /system/trust-store/refresh`` after the new
+    bundle is persisted, so the next signature check rebuilds
+    against the freshly-stored PEM. The existing cache-key check
+    (Provider metadata sha256) would catch the refresh on its own,
+    but explicit invalidation is cheaper than letting the next
+    request walk the full slow path.
+    """
+    global _VALIDATION_CONTEXT, _VC_TRUST_STORE_PATH
+    with _VC_LOCK:
+        _VALIDATION_CONTEXT = None
+        _VC_TRUST_STORE_PATH = ""
 
 
 def _pdf_signature_status(
@@ -474,8 +589,9 @@ def _pdf_signature_status(
 ) -> tuple[str, int]:
     """Return ``(status, signers_count)`` for *raw* PDF bytes.
 
-    Status taxonomy (every chunk metadata carries one of these via
-    ``signature_status``):
+    Status taxonomy — 8 closed-set values pinned by
+    ``_SIGNATURE_STATUS_CODES`` (see also ADR-052 §1). Every chunk's
+    metadata carries one via ``signature_status``:
 
     * ``"check_skipped"`` — operator disabled the check via
       ``AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED=false``.
@@ -490,13 +606,25 @@ def _pdf_signature_status(
       embedded signatures.
     * ``"signed_valid"`` — every signature is intact, valid, AND
       trusted by the configured trust store.
-    * ``"signed_invalid"`` — at least one signature exists but
-      fails validation (untrusted chain, expired cert, etc.) —
-      content itself is intact.
+    * ``"signed_invalid"`` — at least one signature exists with
+      ``valid=False`` (signature math broken — wrong key, corrupted
+      bytes, weak-algorithm policy reject). Real audit signal: the
+      claim itself is unverifiable.
+    * ``"signed_untrusted"`` — at least one signature is intact and
+      ``valid=True`` but its chain does not terminate at our
+      configured trust roots (configuration signal, not security
+      signal — the signature math worked, we just don't know the
+      issuing CA). Split from ``signed_invalid`` per ADR-052 §1
+      so auditors can distinguish "broken" from "scope gap."
     * ``"signed_tampered"`` — at least one signature shows the
       content was modified after signing (``intact=False``). The
       strongest negative signal: the file is provably altered
       from what was signed.
+
+    Aggregate precedence when a document carries multiple
+    signatures: ``signed_tampered > signed_invalid > signed_untrusted
+    > signed_valid``. The worst signal across all signatures wins —
+    one tampered sig poisons the file even if the others are clean.
 
     Detect-and-record only in v1 — never reject. The chunk metadata
     field lets auditors query for any non-clean state without changing
@@ -517,6 +645,7 @@ def _pdf_signature_status(
         vc = _get_validation_context(trust_store_path)
         any_tampered = False
         any_invalid = False
+        any_untrusted = False
         for emb in signatures:
             status = validate_pdf_signature(emb, vc)
             if not getattr(status, "intact", True):
@@ -526,11 +655,17 @@ def _pdf_signature_status(
                 any_invalid = True
                 continue
             if not getattr(status, "trusted", True):
-                any_invalid = True
+                any_untrusted = True
+        # Precedence: tampered > invalid > untrusted > valid.
+        # ADR-052 §1 — signed_invalid (math broken, real audit
+        # signal) outranks signed_untrusted (config gap, scope
+        # signal) when both fire on a multi-sig document.
         if any_tampered:
             return ("signed_tampered", len(signatures))
         if any_invalid:
             return ("signed_invalid", len(signatures))
+        if any_untrusted:
+            return ("signed_untrusted", len(signatures))
         return ("signed_valid", len(signatures))
     except Exception as exc:
         logger.warning(
@@ -597,6 +732,30 @@ _PDF_WARNING_CODES: frozenset[str] = frozenset(
         "attachment",  # #6 — quarantined embedded file
         "attachment_quarantine_failed",  # #6 — could not write to MinIO
         "form_fields",  # #7 — page yielded form-field data
+    }
+)
+
+
+# Closed-set of every value ``_pdf_signature_status`` may emit (per
+# ADR-052 §1). New status values need an ADR amendment so the audit
+# taxonomy stays auditable. Tested by tests/test_memory_routes.py
+# (TestSignatureStatusCodes). The 8 values are split across three
+# concerns:
+#   - operator/runtime conditions (check_skipped, check_unavailable,
+#     check_failed) — the check could not produce a security verdict
+#   - structural (none) — the document carries no signatures
+#   - verdicts (signed_valid, signed_invalid, signed_untrusted,
+#     signed_tampered) — pyhanko produced a verdict
+_SIGNATURE_STATUS_CODES: frozenset[str] = frozenset(
+    {
+        "check_skipped",
+        "check_unavailable",
+        "check_failed",
+        "none",
+        "signed_valid",
+        "signed_invalid",
+        "signed_untrusted",
+        "signed_tampered",
     }
 )
 

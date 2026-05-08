@@ -46,6 +46,14 @@ from audittrace.services.procedural import (
     ProceduralService,
     S3ProceduralService,
 )
+from audittrace.services.trust_store import (
+    EuLotlTrustStoreBuilder,
+    MockTrustStoreProvider,
+    S3TrustStoreProvider,
+    StaticTrustStoreBuilder,
+    TrustStoreBuilder,
+    TrustStoreProvider,
+)
 
 try:
     from minio import Minio
@@ -232,6 +240,56 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
+    # PAdES trust store (ADR-052) — Provider/Builder pair, settings-
+    # selected. The Provider is the storage layer (where the PEM
+    # lives — default S3/MinIO); the Builder is the sourcing layer
+    # (where the PEM comes from — default EU LOTL via pyhanko[etsi]).
+    trust_store_provider: TrustStoreProvider
+    if settings.pdf_trust_store_provider == "s3":
+        trust_store_provider = S3TrustStoreProvider(
+            minio_client=minio_client,
+            bucket=settings.minio_shared_bucket,
+            pem_key=settings.pdf_trust_store_s3_key,
+        )
+    elif settings.pdf_trust_store_provider == "file":
+        # Pre-ADR-052 backwards-compat: when the operator points
+        # AUDITTRACE_PDF_SIGNATURE_TRUST_STORE at a Vault-Agent-mounted
+        # PEM file, the validator picks that up directly — the
+        # Provider is effectively bypassed. We register the Mock
+        # so DI shape is uniform; load() raises FileNotFoundError
+        # when called, which the validator handles by falling back
+        # to certifi.
+        trust_store_provider = MockTrustStoreProvider()
+    else:
+        raise RuntimeError(
+            f"Unknown AUDITTRACE_PDF_TRUST_STORE_PROVIDER="
+            f"{settings.pdf_trust_store_provider!r}; expected one of "
+            f"'s3', 'file' (per ADR-052 §2)."
+        )
+
+    trust_store_builder: TrustStoreBuilder
+    if settings.pdf_trust_store_builder == "eu_lotl":
+        trust_store_builder = EuLotlTrustStoreBuilder()
+    elif settings.pdf_trust_store_builder == "static":
+        if not settings.pdf_trust_store_static_dir:
+            raise RuntimeError(
+                "AUDITTRACE_PDF_TRUST_STORE_BUILDER=static requires "
+                "AUDITTRACE_PDF_TRUST_STORE_STATIC_DIR to be set "
+                "(directory of operator-supplied .pem/.crt files)."
+            )
+        trust_store_builder = StaticTrustStoreBuilder(
+            settings.pdf_trust_store_static_dir
+        )
+    else:
+        raise RuntimeError(
+            f"Unknown AUDITTRACE_PDF_TRUST_STORE_BUILDER="
+            f"{settings.pdf_trust_store_builder!r}; expected one of "
+            f"'eu_lotl', 'static' (per ADR-052 §3)."
+        )
+
+    container._instances["trust_store_provider"] = trust_store_provider
+    container._instances["trust_store_builder"] = trust_store_builder
+
 
 @log_call(logger=logger)
 def get_chromadb() -> Any:
@@ -324,6 +382,24 @@ def get_memory_manifest_service() -> MemoryManifestService:
 
 
 @log_call(logger=logger)
+def get_trust_store_provider() -> TrustStoreProvider:
+    """Get the PAdES trust-store Provider (ADR-052 §2). Default
+    ``S3TrustStoreProvider`` reads/writes a PEM bundle from MinIO at
+    the configured ``pdf_trust_store_s3_key``. Tests use
+    ``MockTrustStoreProvider``."""
+    return cast(TrustStoreProvider, container._instances["trust_store_provider"])
+
+
+@log_call(logger=logger)
+def get_trust_store_builder() -> TrustStoreBuilder:
+    """Get the PAdES trust-store Builder (ADR-052 §3). Default
+    ``EuLotlTrustStoreBuilder`` walks the EU LOTL via pyhanko[etsi].
+    ``StaticTrustStoreBuilder`` (operator-supplied PEM directory) is
+    the offline alternative."""
+    return cast(TrustStoreBuilder, container._instances["trust_store_builder"])
+
+
+@log_call(logger=logger)
 def set_test_mode() -> None:
     """Set container to test mode with mock dependencies."""
     container.register_factory("chromadb", MockChromaDBFactory())
@@ -351,6 +427,13 @@ def _register_mock_memory_services() -> None:
     container._instances["semantic"] = semantic
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
+    # ADR-052 — Mock trust store + Static builder pointed at a
+    # non-existent dir for unit-test isolation (integration tests
+    # override these with explicit fixtures).
+    container._instances["trust_store_provider"] = MockTrustStoreProvider()
+    container._instances["trust_store_builder"] = StaticTrustStoreBuilder(
+        directory="/tmp/audittrace-test-trust-store-empty"
+    )
 
 
 @log_call(logger=logger)
@@ -382,6 +465,13 @@ def create_test_container() -> DependencyContainer:
     test_container._instances["semantic"] = semantic
     test_container._instances["memory_manifest"] = memory_manifest
     test_container._instances["context_builder"] = context_builder
+    # ADR-052 — Mock trust store + Static builder pointed at a
+    # non-existent dir (tests that exercise the refresh path
+    # override these with explicit fixtures).
+    test_container._instances["trust_store_provider"] = MockTrustStoreProvider()
+    test_container._instances["trust_store_builder"] = StaticTrustStoreBuilder(
+        directory="/tmp/audittrace-test-trust-store-empty"
+    )
     # In-memory PostgreSQL factory so persistence side-effects work in tests
     test_container._instances["postgres_factory"] = InMemoryPostgresFactory()
     return test_container

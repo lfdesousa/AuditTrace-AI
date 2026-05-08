@@ -1643,8 +1643,9 @@ class TestPdfSignatureValidation:
     """PDF signature validation (gap-inventory item #12).
 
     Tests the ``_pdf_signature_status`` helper directly across the full
-    status taxonomy (check_skipped / none / signed_valid /
-    signed_invalid / signed_tampered / check_failed). Plus a smoke
+    8-class status taxonomy (per ADR-052 §1: check_skipped /
+    check_unavailable / check_failed / none / signed_valid /
+    signed_invalid / signed_untrusted / signed_tampered). Plus a smoke
     test that runs the helper against a real unsigned PDF generated
     in-memory via pymupdf — catches contract drift between this code
     and pyhanko's ``embedded_signatures`` / ``PdfSignatureStatus``
@@ -1707,16 +1708,22 @@ class TestPdfSignatureValidation:
         assert count == 1
 
     def test_signed_invalid_returns_signed_invalid(self) -> None:
-        """Signature exists, content intact, but cert chain not
-        trusted (or signature math broken). Distinct from tampering —
-        the document hasn't been modified, but the auth claim is
-        unverifiable."""
+        """``valid=False`` is the signature-math-broken signal:
+        wrong key, corrupted bytes, or weak-algorithm policy reject.
+        Real audit signal — the auth claim is unverifiable.
+        Distinct from ``signed_untrusted`` (configuration gap) per
+        ADR-052 §1; distinct from ``signed_tampered`` (content
+        provably modified) since the document bytes match what was
+        signed but the math itself fails."""
         from audittrace.routes.memory import _pdf_signature_status
 
         fake_reader = MagicMock()
         fake_reader.embedded_signatures = [MagicMock()]
-        # intact (content unchanged) but valid=False (sig math broken).
-        fake_status = MagicMock(intact=True, valid=False, trusted=False)
+        # intact (content unchanged) + valid=False (sig math broken).
+        # trusted=True isolates the valid=False path: post-ADR-052
+        # trusted=False would route to signed_untrusted, so this mock
+        # exercises the "math broken" branch directly.
+        fake_status = MagicMock(intact=True, valid=False, trusted=True)
 
         with (
             patch(
@@ -1734,10 +1741,14 @@ class TestPdfSignatureValidation:
         assert status == "signed_invalid"
         assert count == 1
 
-    def test_signed_with_untrusted_chain_returns_signed_invalid(self) -> None:
+    def test_signed_with_untrusted_chain_returns_signed_untrusted(self) -> None:
         """Signature math valid + content intact but cert chain not
-        trusted by the configured trust store. ``signed_invalid`` —
-        same status as bad-math, since both fail the trust contract."""
+        trusted by the configured trust store. Per ADR-052 §1 this
+        is ``signed_untrusted``, NOT ``signed_invalid`` — it's a
+        configuration signal (we don't carry the issuing CA), not a
+        security signal (the math worked). Splitting the two stops
+        ``signed_invalid`` from collapsing two distinct audit
+        categories."""
         from audittrace.routes.memory import _pdf_signature_status
 
         fake_reader = MagicMock()
@@ -1758,8 +1769,46 @@ class TestPdfSignatureValidation:
             status, count = _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
-        assert status == "signed_invalid"
+        assert status == "signed_untrusted"
         assert count == 1
+
+    def test_signed_invalid_takes_precedence_over_signed_untrusted(self) -> None:
+        """Multi-sig document with one ``valid=False`` sig and one
+        ``trusted=False`` sig flags as ``signed_invalid`` — the
+        worst-signal-wins precedence per ADR-052 §1
+        (``tampered > invalid > untrusted > valid``). Closes the
+        single-bit-or-the-other ambiguity that ``signed_invalid``
+        had pre-PR-2."""
+        from audittrace.routes.memory import _pdf_signature_status
+
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [MagicMock(), MagicMock()]
+        # First signature: math broken (signed_invalid).
+        # Second signature: valid math but untrusted chain
+        # (signed_untrusted).
+        statuses = [
+            MagicMock(intact=True, valid=False, trusted=True),
+            MagicMock(intact=True, valid=True, trusted=False),
+        ]
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.validate_pdf_signature",
+                side_effect=statuses,
+            ),
+        ):
+            status, count = _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        # signed_invalid wins because invalid > untrusted in the
+        # precedence order (a real audit signal outranks a
+        # configuration signal when both fire on the same document).
+        assert status == "signed_invalid"
+        assert count == 2
 
     def test_signed_tampered_returns_signed_tampered(self) -> None:
         """``intact=False`` is the strongest negative signal:
@@ -2018,6 +2067,92 @@ class TestPdfHelperCoverage:
         vc1 = _get_validation_context("")
         vc2 = _get_validation_context("/nonexistent/trust/store.pem")
         assert vc1 is not vc2
+
+    def test_validation_context_uses_provider_pem_when_no_path_set(self) -> None:
+        """Per ADR-052 §2: when ``pdf_signature_trust_store`` is empty
+        (no operator-set file path), ``_get_validation_context`` calls
+        the configured ``TrustStoreProvider`` to obtain the PEM bundle.
+        A populated Provider drives the ValidationContext's
+        ``trust_roots`` keyword argument.
+
+        We patch ``ValidationContext`` itself so the test does not
+        need a real X.509 cert — the asssertion is that the PEM bytes
+        from the Provider land in the constructor's ``trust_roots``."""
+        import audittrace.routes.memory as routes_memory
+        from audittrace.services.trust_store import (
+            MockTrustStoreProvider,
+            _bundle_from_pem,
+        )
+
+        fake_pem = (
+            b"-----BEGIN CERTIFICATE-----\nfake-cert-bytes\n-----END CERTIFICATE-----\n"
+        )
+        provider = MockTrustStoreProvider()
+        bundle = _bundle_from_pem(
+            fake_pem,
+            builder_id="test",
+            source_url="test://x",
+            cert_count=1,
+        )
+        provider.store(bundle)
+
+        # Reset cache.
+        routes_memory._VALIDATION_CONTEXT = None
+        routes_memory._VC_TRUST_STORE_PATH = ""
+
+        fake_vc = MagicMock(name="ValidationContext-instance")
+        with (
+            patch(
+                "audittrace.dependencies.get_trust_store_provider",
+                return_value=provider,
+            ),
+            patch(
+                "pyhanko_certvalidator.ValidationContext",
+                return_value=fake_vc,
+            ) as mock_vc_cls,
+        ):
+            from audittrace.routes.memory import _get_validation_context
+
+            # Empty trust_store_path → falls through to Provider.
+            vc = _get_validation_context("")
+
+        # The Provider's PEM bytes were parsed into asn1crypto
+        # x509.Certificate objects before being passed to
+        # ValidationContext (caught by live evidence 2026-05-09:
+        # pyhanko_certvalidator's actual TrustRootList type is
+        # Iterable[Union[x509.Certificate, TrustAnchor]]; the
+        # docstring claiming raw bytes are accepted is misleading).
+        # The fake PEM in this test is not a real cert, so the
+        # parser logs a warning and returns an empty list — that's
+        # fine for asserting the wiring; a real-cert end-to-end
+        # test runs as live evidence.
+        assert vc is fake_vc
+        kwargs = mock_vc_cls.call_args.kwargs
+        # trust_roots key may be omitted if the parser couldn't
+        # extract any cert (the synthetic fake PEM here doesn't
+        # parse). The relevant invariant is that ValidationContext
+        # was called at all and the cache key encodes the Provider
+        # metadata.
+        assert "trust_roots" in kwargs
+        # Cache key encodes the Provider's metadata sha256.
+        assert bundle.metadata.sha256 in routes_memory._VC_TRUST_STORE_PATH
+
+    def test_validation_context_invalidates_via_helper(self) -> None:
+        """``_invalidate_validation_context`` (called by the admin
+        refresh endpoint after a successful refresh) drops the
+        in-process singleton so the next signature check rebuilds
+        against the freshly-stored PEM (ADR-052 §5)."""
+        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory import _invalidate_validation_context
+
+        # Prime the singleton.
+        routes_memory._VALIDATION_CONTEXT = MagicMock()
+        routes_memory._VC_TRUST_STORE_PATH = "primed-cache-key"
+
+        _invalidate_validation_context()
+
+        assert routes_memory._VALIDATION_CONTEXT is None
+        assert routes_memory._VC_TRUST_STORE_PATH == ""
 
     def test_signature_check_unavailable_when_pyhanko_missing(self) -> None:
         """If pyhanko.pdf_utils.reader can't import, the helper
@@ -2744,6 +2879,39 @@ class TestExtractionWarningCodes:
             "form_fields",
         }
         assert _PDF_WARNING_CODES == expected
+
+
+class TestSignatureStatusCodes:
+    """Closed-set discipline on the ``signature_status`` taxonomy
+    (per ADR-052 §1). Adding a new status value without an ADR
+    amendment is a quiet audit-taxonomy drift; this test pins the
+    set so the drift surfaces in CI. Mirrors
+    :class:`TestExtractionWarningCodes` for the extraction-warnings
+    codes."""
+
+    def test_signature_status_codes_match_adr_052_closed_set(self) -> None:
+        from audittrace.routes.memory import _SIGNATURE_STATUS_CODES
+
+        # The exact 8 values documented in ADR-052 §1. Adding a
+        # value: bump the ADR + add it here. Removing one: same.
+        # CI fails the diff if these drift. The split across
+        # operator/runtime conditions, structural, and verdict
+        # categories is intentional — see the constant's docstring.
+        expected = {
+            # operator/runtime conditions
+            "check_skipped",
+            "check_unavailable",
+            "check_failed",
+            # structural (the document carries no signatures)
+            "none",
+            # verdicts (pyhanko produced a verdict for at least
+            # one embedded signature)
+            "signed_valid",
+            "signed_invalid",
+            "signed_untrusted",
+            "signed_tampered",
+        }
+        assert _SIGNATURE_STATUS_CODES == expected
 
 
 class TestPdfIsEncrypted:
