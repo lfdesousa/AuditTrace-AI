@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -41,6 +42,17 @@ _FAKE_PEM_ONE = (
     b"-----BEGIN CERTIFICATE-----\n"
     b"MIIBfTCCASOgAwIBAgIBATAFBgMrZXAwIzEhMB8GA1UEAwwYQXVkaXRUcmFjZS1B\n"
     b"-----END CERTIFICATE-----\n"
+)
+
+# Repo-rooted path to the vendored Swiss TSLO cert. Computed from
+# __file__ so the tests work both on a developer's laptop and on a
+# CI runner (different home directories). Caught by CI 2026-05-09:
+# hard-coded absolute paths failed because the runner's repo root
+# is /home/runner/work/AuditTrace-AI/AuditTrace-AI/, not the
+# developer's /home/lfdesousa/work/AuditTrace-AI/.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENDORED_TSLO_CERT_PATH = (
+    _REPO_ROOT / "charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der"
 )
 _FAKE_PEM_TWO = (
     b"-----BEGIN CERTIFICATE-----\n"
@@ -515,11 +527,7 @@ class TestSwissTslTrustStoreBuilder:
         # parseable by asn1crypto; we don't actually validate against
         # it because aiohttp.get is mocked to raise before we reach
         # trust_list_to_registry).
-        cert_path = (
-            "/home/lfdesousa/work/AuditTrace-AI/charts/audittrace/trust-store/"
-            "swiss-federal-tsl/CH-TL-cert.der"
-        )
-        builder = SwissTslTrustStoreBuilder(tslo_cert_path=cert_path)
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
 
         # Fake aiohttp.ClientSession that raises on .get().
         class _FakeSession:
@@ -548,11 +556,7 @@ class TestSwissTslTrustStoreBuilder:
         tampered in transit, schema drift, malformed XML) surfaces as
         typed unavailable so the admin endpoint returns 502 with the
         cause string in the response body."""
-        cert_path = (
-            "/home/lfdesousa/work/AuditTrace-AI/charts/audittrace/trust-store/"
-            "swiss-federal-tsl/CH-TL-cert.der"
-        )
-        builder = SwissTslTrustStoreBuilder(tslo_cert_path=cert_path)
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
 
         class _FakeResp:
             async def __aenter__(self):
@@ -603,11 +607,7 @@ class TestSwissTslTrustStoreBuilder:
         ETSI's ``http://uri.etsi.org/...``."""
         import base64
 
-        cert_path = (
-            "/home/lfdesousa/work/AuditTrace-AI/charts/audittrace/trust-store/"
-            "swiss-federal-tsl/CH-TL-cert.der"
-        )
-        builder = SwissTslTrustStoreBuilder(tslo_cert_path=cert_path)
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=_VENDORED_TSLO_CERT_PATH)
 
         # Synthetic ETSI TS 119 612 fragment with ONE Swiss QC service
         # and ONE non-QC service (must be filtered out). The XML uses
