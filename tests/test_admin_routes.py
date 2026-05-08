@@ -142,11 +142,12 @@ class TestRefreshTrustStoreEndpoint:
         """After a successful refresh, the in-process ValidationContext
         singleton is invalidated so the next signature check rebuilds
         against the freshly-stored PEM."""
-        from audittrace.routes import memory as memory_route
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        # Prime the singleton.
-        memory_route._VALIDATION_CONTEXT = MagicMock()
-        memory_route._VC_TRUST_STORE_PATH = "primed-cache-key"
+        # Prime the singleton (state lives in memory_pdf.signature
+        # post-2026-05-09 refactor).
+        _sig._VALIDATION_CONTEXT = MagicMock()
+        _sig._VC_TRUST_STORE_PATH = "primed-cache-key"
 
         bundle = _make_bundle()
         builder = MagicMock()
@@ -163,8 +164,8 @@ class TestRefreshTrustStoreEndpoint:
 
         assert r.status_code == 200
         # Singleton was reset.
-        assert memory_route._VALIDATION_CONTEXT is None
-        assert memory_route._VC_TRUST_STORE_PATH == ""
+        assert _sig._VALIDATION_CONTEXT is None
+        assert _sig._VC_TRUST_STORE_PATH == ""
 
     def test_refresh_403_when_user_not_admin(self, client: Any) -> None:
         """Non-admin user (no audittrace:admin scope) gets 403 from

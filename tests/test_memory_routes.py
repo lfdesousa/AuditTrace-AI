@@ -1785,14 +1785,14 @@ class TestPdfSignatureValidation:
         usable audit signal."""
         from datetime import UTC, datetime
 
-        import audittrace.routes.memory as routes_memory
         from audittrace.routes.memory import _pdf_signature_status
+        from audittrace.routes.memory_pdf import signature as _sig
 
         # Prime the trust-roots cache so the retry path can build a
         # second ValidationContext. Sentinel value — pyhanko's ctor
         # is mocked below, so the contents don't need to be a real
         # cert list.
-        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -1828,10 +1828,10 @@ class TestPdfSignatureValidation:
         "unknown CA" from "known CA with expired cert"."""
         from datetime import UTC, datetime
 
-        import audittrace.routes.memory as routes_memory
         from audittrace.routes.memory import _pdf_signature_status
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -1866,10 +1866,10 @@ class TestPdfSignatureValidation:
         (trusted=False, no retry signal) is the safe interpretation."""
         from datetime import UTC, datetime
 
-        import audittrace.routes.memory as routes_memory
         from audittrace.routes.memory import _pdf_signature_status
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         fake_emb = MagicMock()
         fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -1905,10 +1905,10 @@ class TestPdfSignatureValidation:
         signal wins."""
         from datetime import UTC, datetime
 
-        import audittrace.routes.memory as routes_memory
         from audittrace.routes.memory import _pdf_signature_status
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        routes_memory._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
 
         sig_a = MagicMock()
         sig_a.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
@@ -2218,10 +2218,10 @@ class TestPdfHelperCoverage:
         """Second call with same trust_store_path returns the cached
         ValidationContext — confirms the singleton-with-lock pattern
         is doing its job (no per-call allocation)."""
-        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        routes_memory._VALIDATION_CONTEXT = None
-        routes_memory._VC_TRUST_STORE_PATH = ""
+        _sig._VALIDATION_CONTEXT = None
+        _sig._VC_TRUST_STORE_PATH = ""
 
         from audittrace.routes.memory import _get_validation_context
 
@@ -2236,10 +2236,10 @@ class TestPdfHelperCoverage:
         effect without a process restart. Path that doesn't exist
         triggers the OSError fallback to system roots — still a
         valid context, just rebuilt."""
-        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory_pdf import signature as _sig
 
-        routes_memory._VALIDATION_CONTEXT = None
-        routes_memory._VC_TRUST_STORE_PATH = ""
+        _sig._VALIDATION_CONTEXT = None
+        _sig._VC_TRUST_STORE_PATH = ""
 
         from audittrace.routes.memory import _get_validation_context
 
@@ -2257,7 +2257,7 @@ class TestPdfHelperCoverage:
         We patch ``ValidationContext`` itself so the test does not
         need a real X.509 cert — the asssertion is that the PEM bytes
         from the Provider land in the constructor's ``trust_roots``."""
-        import audittrace.routes.memory as routes_memory
+        from audittrace.routes.memory_pdf import signature as _sig
         from audittrace.services.trust_store import (
             MockTrustStoreProvider,
             _bundle_from_pem,
@@ -2276,8 +2276,8 @@ class TestPdfHelperCoverage:
         provider.store(bundle)
 
         # Reset cache.
-        routes_memory._VALIDATION_CONTEXT = None
-        routes_memory._VC_TRUST_STORE_PATH = ""
+        _sig._VALIDATION_CONTEXT = None
+        _sig._VC_TRUST_STORE_PATH = ""
 
         fake_vc = MagicMock(name="ValidationContext-instance")
         with (
@@ -2314,24 +2314,24 @@ class TestPdfHelperCoverage:
         # metadata.
         assert "trust_roots" in kwargs
         # Cache key encodes the Provider's metadata sha256.
-        assert bundle.metadata.sha256 in routes_memory._VC_TRUST_STORE_PATH
+        assert bundle.metadata.sha256 in _sig._VC_TRUST_STORE_PATH
 
     def test_validation_context_invalidates_via_helper(self) -> None:
         """``_invalidate_validation_context`` (called by the admin
         refresh endpoint after a successful refresh) drops the
         in-process singleton so the next signature check rebuilds
         against the freshly-stored PEM (ADR-052 §5)."""
-        import audittrace.routes.memory as routes_memory
         from audittrace.routes.memory import _invalidate_validation_context
+        from audittrace.routes.memory_pdf import signature as _sig
 
         # Prime the singleton.
-        routes_memory._VALIDATION_CONTEXT = MagicMock()
-        routes_memory._VC_TRUST_STORE_PATH = "primed-cache-key"
+        _sig._VALIDATION_CONTEXT = MagicMock()
+        _sig._VC_TRUST_STORE_PATH = "primed-cache-key"
 
         _invalidate_validation_context()
 
-        assert routes_memory._VALIDATION_CONTEXT is None
-        assert routes_memory._VC_TRUST_STORE_PATH == ""
+        assert _sig._VALIDATION_CONTEXT is None
+        assert _sig._VC_TRUST_STORE_PATH == ""
 
     def test_signature_check_unavailable_when_pyhanko_missing(self) -> None:
         """If pyhanko.pdf_utils.reader can't import, the helper
