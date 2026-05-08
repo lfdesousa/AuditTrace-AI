@@ -2,7 +2,37 @@
 title: "pdf: provision PAdES trust store (SwissSign + EU LOTL roots) so signed PDFs validate to `signed_valid`"
 labels: ["pdf", "security", "audit-grade", "trust-store"]
 priority: P1
+status: resolved
+resolved_in: ADR-052 / PR `feat/eu-lotl-trust-store` (2026-05-09)
 ---
+
+> **Resolved 2026-05-09 in ADR-052 + PR `feat/eu-lotl-trust-store`.**
+>
+> The original framing of this backlog item was "vendor SwissSign roots
+> out-of-band and load them via Vault Agent." The 2026-05-08 pickup
+> attempt established that no automated source for the SwissSign 2020-2
+> root exists in any default bundle (Mozilla CCADB scope mismatch, certifi
+> miss, Debian ca-certificates miss, SwissSign portal reCAPTCHA-gated,
+> crt.sh API 502). Resolution pivot on 2026-05-09: walk the **EU List of
+> Trusted Lists (LOTL)** programmatically via pyhanko's `[etsi]` extra
+> (`lotl_to_registry()`, ships LOTL bootstrap signing keys with the
+> library — no out-of-band cert vendoring required). This is a strict
+> superset of the original SwissSign-only scope: Layer 1 (SwissSign) +
+> Layer 2 (EU eIDAS qualified signatures) in a single code path.
+>
+> The implementation also splits `signed_invalid` into
+> `signed_invalid` (math broken — real audit signal) + new
+> `signed_untrusted` (chain doesn't terminate at our trust roots —
+> configuration signal) so that a populated trust store doesn't
+> just flip the bit, it makes the audit signal honest forever — even
+> for PDFs signed by CAs not in the LOTL.
+>
+> Pluggable Provider/Builder pair (`services/trust_store.py`) means a
+> customer who needs Vault-backed storage or Adobe AATL sourcing
+> swaps one ABC implementation, not the architecture.
+>
+> See `docs/ADR-052-pades-trust-store-and-taxonomy.md` for the full
+> design + cross-references to live evidence.
 
 ## Context
 

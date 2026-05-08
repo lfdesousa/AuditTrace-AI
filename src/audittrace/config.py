@@ -248,11 +248,42 @@ class Settings(BaseSettings):
     pdf_signature_check_enabled: bool = True
     # Filesystem path to a PEM bundle of additional trust-anchor
     # certificates (e.g. operator's internal CA). Empty string =
-    # use system roots only (certifi + OS trust store via pyhanko's
-    # default ``ValidationContext``). Vault-backed delivery: mount
-    # the PEM via Vault Agent under /etc/audittrace/trust-store.pem
-    # and point this Settings value at that path.
+    # consult the configured TrustStoreProvider (default S3 +
+    # MinIO) at first signature check; falls through to certifi
+    # + OS trust store if the Provider has no bundle stored yet.
+    # Pre-ADR-052 deployments that mount a PEM via Vault Agent at
+    # ``/etc/audittrace/trust-store.pem`` continue to work — set
+    # this to the mount path; takes precedence over the Provider.
+    # ADR-052 §2.
     pdf_signature_trust_store: str = ""
+    # ADR-052 §2 — Trust-store Provider/Builder selection.
+    # ``pdf_trust_store_provider`` chooses the storage layer; ``s3``
+    # is the default (MinIO at the bucket + key below). ``file``
+    # uses ``pdf_signature_trust_store`` directly (pre-ADR-052
+    # backwards-compat — the Provider is essentially read-only,
+    # store() is a no-op). VaultTrustStoreProvider documented in
+    # the ADR but not implemented in PR 3.
+    pdf_trust_store_provider: str = "s3"
+    # ``pdf_trust_store_builder`` chooses the sourcing layer.
+    # ``eu_lotl`` walks the EU List of Trusted Lists via
+    # pyhanko[etsi] (Layer 1+2 of the ADR-052 coverage matrix —
+    # SwissSign + EU eIDAS qualified signatures in one walk).
+    # ``static`` concatenates a directory of operator-supplied
+    # PEMs (test/dev + air-gapped customers).
+    pdf_trust_store_builder: str = "eu_lotl"
+    # S3-Provider object location: bucket re-uses the existing
+    # ``minio_shared_bucket`` (memory-shared by default — ADR-027
+    # §2 — public to all authenticated users since trust roots
+    # are public CAs); key is single-object under
+    # ``trust-store/`` to mirror the ``episodic/``, ``procedural/``
+    # prefix convention.
+    pdf_trust_store_s3_key: str = "trust-store/eu-lotl-bundle.pem"
+    # Static-Builder source directory. Operator-supplied PEMs
+    # under this path are concatenated by
+    # ``StaticTrustStoreBuilder``. Empty string = the static
+    # builder is unavailable (default; the EU LOTL builder is the
+    # primary path).
+    pdf_trust_store_static_dir: str = ""
 
     # ─────────────── PDF OCR (gap-inventory #1, ADR-050 tier-B) ───────────
     # Tesseract-backed OCR fallback for raster-only pages

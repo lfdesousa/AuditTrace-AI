@@ -50,9 +50,18 @@ dependencies = [
     # Detect-and-record only in v1 — never reject. Adds ~10 MB
     # to image size (cryptography, asn1crypto, pyhanko-certvalidator
     # transitively). pyhanko-certvalidator declares the trust-context
-    # for OCSP/CRL chains. See docs/architecture/pdf-ingestion-gaps.md
-    # §2.3.
-    "pyhanko>=0.21.0",
+    # for OCSP/CRL chains. The [etsi] extra adds the EU LOTL walker
+    # used by EuLotlTrustStoreBuilder (ADR-052 §3 / §6); pyhanko
+    # ships the LOTL bootstrap signing keys so no out-of-band cert
+    # vendoring is required. ImportError-guarded at the call site
+    # so an air-gapped customer using StaticTrustStoreBuilder can
+    # omit the extra and still get a working memory-server. See
+    # docs/architecture/pdf-ingestion-gaps.md §2.3.
+    # The [async-http] extra brings aiohttp (transitive dep of the
+    # etsi LOTL walker — pyhanko's [etsi] extra does NOT pull aiohttp
+    # on its own, verified 2026-05-09 against pyhanko 0.35.1). Both
+    # extras must be co-installed for EuLotlTrustStoreBuilder.
+    "pyhanko[etsi,async-http]>=0.35.1",
     "pyhanko-certvalidator>=0.26.0",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs

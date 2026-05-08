@@ -1911,6 +1911,58 @@ paths:
       summary: List Sessions
       tags:
       - audit
+  /system/trust-store:
+    get:
+      description: 'Return the metadata of the currently-stored bundle, or 404 if
+
+        no bundle has been provisioned yet.
+
+
+        Cheaper than reading the full bundle — pulls only the metadata
+
+        sidecar object. Useful for health-style readouts and the Helm
+
+        hook''s pre-flight idempotency check.'
+      operationId: get_trust_store_metadata_system_trust_store_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Get Trust Store Metadata System Trust Store Get
+                type: object
+          description: TrustStoreMetadata of the currently-stored bundle
+      security:
+      - audittrace-oauth2:
+        - audittrace:admin
+      summary: Read PAdES trust-store metadata
+      tags:
+      - system
+  /system/trust-store/refresh:
+    post:
+      description: "Walk the configured Builder, persist via the configured Provider,\ninvalidate the in-process ValidationContext\
+        \ singleton, return the\nnew bundle's metadata.\n\nStatus codes:\n\n* 200 — bundle refreshed; response body = TrustStoreMetadata.\n\
+        * 401 — missing or invalid JWT.\n* 403 — JWT lacks ``audittrace:admin``.\n* 502 — Builder unavailable (pyhanko[etsi]\
+        \ missing, EU LOTL\n  unreachable, XAdES verification failed). The previously-stored\n  bundle remains in place; subsequent\
+        \ signature checks continue\n  to use it. Operator can retry once upstream conditions clear.\n* 500 — Provider write\
+        \ failed (MinIO down, permission issue).\n  Investigate and retry."
+      operationId: refresh_trust_store_system_trust_store_refresh_post
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Refresh Trust Store System Trust Store Refresh Post
+                type: object
+          description: TrustStoreMetadata of the persisted bundle
+      security:
+      - audittrace-oauth2:
+        - audittrace:admin
+      summary: Refresh PAdES trust store
+      tags:
+      - system
   /v1/chat/completions:
     post:
       description: 'OpenAI-compatible chat completions with memory augmentation.

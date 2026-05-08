@@ -18,7 +18,7 @@ from audittrace.dependencies import (
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
-from audittrace.routes import audit, chat, context, health, memory, session
+from audittrace.routes import admin, audit, chat, context, health, memory, session
 from audittrace.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
@@ -431,6 +431,13 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(memory.router, prefix="/memory", tags=["memory"])
+    # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
+    # under the same Istio gateway (templates/istio/virtualservice-
+    # keycloak.yaml routes `/admin` to keycloak's REST API). ADR-052
+    # §5 — public path is /system/trust-store/*; the Python module
+    # stays `routes/admin.py` because semantically these are the
+    # operator-admin endpoints.
+    app.include_router(admin.router, prefix="/system", tags=["system"])
     app.include_router(health.router, tags=["health"])
 
     @app.exception_handler(Exception)
