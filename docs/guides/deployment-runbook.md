@@ -456,6 +456,29 @@ Pass a fresh values file with `-f` (Scenario A semantics). Helm always accepts t
 
 **If you hit `nil pointer evaluating interface {}.enabled` or similar on a `helm upgrade`, assume Scenario B above was your intent — retry with `--reset-then-reuse-values`.**
 
+### ⚠️ Never run raw `helm upgrade` — always go through `make k8s-rolling-image TAG=...`
+
+`make k8s-rolling-image TAG=v1.0.X` (and its sibling `make k8s-upgrade`) wrap the helm command with **`make deploy-preflight`** — six gates that catch deploy-time failure classes before they hit the cluster:
+
+1. `helm lint` — chart syntax + values shape.
+2. `helm template` — every manifest renders to valid YAML.
+3. `kubectl apply --dry-run=server` — admission-webhook acceptance.
+4. **Vault Agent injector probe** — synthetic-pod admission test catches the auto-tls-CA drift class (2026-05-03 incident; bit us again 2026-05-09 during PR3/PR4 deploys).
+5. **istiod readiness probe** — control-plane Ready replicas + endpoints + `/ready` exec (2026-05-04 incident class — pods admit with sidecar but never bootstrap SPIFFE identity, recovers only via k3s restart).
+6. **Anti-affinity deadlock probe** — strict podAntiAffinity replicaCount vs node count (single-node cluster deadlock class — pods sit Pending forever).
+
+Bypassing the preflight by running `helm upgrade` directly cost time twice on 2026-05-09 (Vault-injector race recovered via `kubectl delete pod` after each helm upgrade). Don't do it. The preflight is fast (≤30 s typically) and the failure modes it catches are 30+-min recovery loops.
+
+```bash
+# YES — gated upgrade with preflight
+make k8s-rolling-image TAG=v1.0.16
+
+# NO — bypasses preflight (avoid)
+helm upgrade audittrace ./charts/audittrace --set memoryServer.image.tag=v1.0.16
+```
+
+If a preflight gate fails, the helm command never fires; the failure mode and a one-line recovery hint print to stderr.
+
 ### PAdES trust store — bootstrap and refresh (ADR-052 + ADR-053)
 
 After a fresh `helm install` (or any chart upgrade that bumps `pyhanko[etsi]`), the in-cluster trust store is empty until an operator runs the refresh. Without it, every signed PDF flags `signed_untrusted` because the chain doesn't terminate at any configured root. The refresh walks the EU LOTL + Swiss federal TSL and persists ~900 qualified-signature CAs to MinIO.
