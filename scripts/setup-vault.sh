@@ -204,6 +204,24 @@ seed_kv redis/main password=redis_password.txt
 seed_kv chromadb/main token=chroma_token.txt
 seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.txt
 
+# ── ADR-048 PR-B7 — MinIO IAM split (audittrace_app + content_control) ──
+# Two scoped users provisioned by `charts/audittrace/templates/minio/
+# job-bucket-init.yaml` on every helm upgrade. Memory-server's MinIO
+# client uses audittrace_app (DENY on GET quarantine/*). Content-control's
+# MinIO client uses content_control (GET+DELETE quarantine/, PUT
+# episodic/papers/ only).
+#
+# The username files are typically static literals
+# ("audittrace_app" / "content_control"); the password files are
+# operator-generated random secrets, gitignored alongside
+# minio_secret_key.txt etc.
+seed_kv minio/audittrace_app \
+  username=minio_audittrace_app_user.txt \
+  password=minio_audittrace_app_password.txt
+seed_kv minio/content_control \
+  username=minio_content_control_user.txt \
+  password=minio_content_control_password.txt
+
 # ── ADR-048 PR-B2 — Docker Hub Pro PAT + content-control paths ────────
 # Docker Hub PAT for the cluster's imagePullSecret (rendered by
 # secrets/secret-dockerhub-pull.yaml). Operator drops the PAT into
