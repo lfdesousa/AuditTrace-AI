@@ -306,12 +306,18 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         # ``get_postgres_factory`` is already imported at module scope
         # (line 17 — used by the summariser block above).
         from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
+        from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
+            ScanAuditConsumer,
+        )
         from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
             ScanRequestJanitor,
         )
         from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
             ScanRequestEnvelope,
             ScanRequestPublisher,
+        )
+        from audittrace.services.scan_verdict_consumer import (  # noqa: PLC0415
+            ScanVerdictConsumer,
         )
 
         scan_pipeline_stack = contextlib.AsyncExitStack()
@@ -338,20 +344,50 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
             ).run(),
             name="scan-request-janitor",
         )
+        # PR-B4 — verdict + audit consumers live in the same
+        # AsyncExitStack so their aclose hooks run after the cancel
+        # callback. ``enter_async_context`` registers the
+        # close-on-exit; the consumer instances are then turned into
+        # asyncio Tasks, with the cancel callback below covering
+        # all four (publisher, janitor, verdict, audit).
+        verdict_consumer = ScanVerdictConsumer(
+            settings=settings, session_factory=scan_session_factory
+        )
+        scan_pipeline_stack.push_async_callback(verdict_consumer.aclose)
+        audit_consumer = ScanAuditConsumer(
+            settings=settings, session_factory=scan_session_factory
+        )
+        scan_pipeline_stack.push_async_callback(audit_consumer.aclose)
+        scan_verdict_task = asyncio.create_task(
+            verdict_consumer.run(), name="scan-verdict-consumer"
+        )
+        scan_audit_task = asyncio.create_task(
+            audit_consumer.run(), name="scan-audit-consumer"
+        )
 
         async def _cancel_scan_tasks() -> None:
-            for t in (scan_publisher_task, scan_janitor_task):
+            for t in (
+                scan_publisher_task,
+                scan_janitor_task,
+                scan_verdict_task,
+                scan_audit_task,
+            ):
                 t.cancel()
-            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                await asyncio.wait_for(scan_publisher_task, timeout=5.0)
-            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                await asyncio.wait_for(scan_janitor_task, timeout=5.0)
+            for t in (
+                scan_publisher_task,
+                scan_janitor_task,
+                scan_verdict_task,
+                scan_audit_task,
+            ):
+                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(t, timeout=5.0)
 
         scan_pipeline_stack.push_async_callback(_cancel_scan_tasks)
         # Stash on app.state so the route handler reaches the queue.
         app.state.scan_queue = scan_queue
         logger.info(
-            "Scan-request pipeline scheduled — exchange=%s routing_key=%s",
+            "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
+            "(publisher + janitor + verdict-consumer + audit-consumer)",
             settings.scan_request_exchange,
             settings.scan_request_routing_key,
         )
