@@ -1694,29 +1694,15 @@ paths:
       - memory
   /memory/upload:
     post:
-      description: 'Upload a file to MinIO under the specified memory layer.
-
-
-        The file lands in the ``memory-shared`` bucket at
-
-        ``{layer}/{filename}``.  If *filename* is omitted the upload''s
-
-        original filename is used.
-
-
-        Authorization (per-layer): the caller''s JWT must carry
-
-        ``memory:<layer>:write`` matching the ``layer`` query parameter
-
-        (or ``audittrace:admin``). A token with ``memory:procedural:write``
-
-        cannot upload to ``layer=episodic`` and vice-versa. The empty
-
-        static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI spec
-
-        without baking the dynamic per-layer scope into the schema —
-
-        the prose contract lives here.'
+      description: "Upload a file to MinIO under the specified memory layer.\n\nTwo paths (Luis 2026-05-10, ADR-048 PR-B3):\n\
+        \n* **PDF uploads** (``content-type: application/pdf`` AND\n  magic-byte sniff matches ``%PDF-``) take the quarantine\
+        \ flow:\n  bytes land in ``quarantine/<user>/<scan_id>/<file>`` (not the\n  requested ``layer`` prefix), a ``memory_items``\
+        \ row is inserted\n  with ``scan_status='pending_scan'``, and an AMQP scan-request is\n  enqueued. The response is\
+        \ **HTTP 202** with a ``scan_id`` and\n  poll URL. Promotion to ``episodic/papers/`` happens\n  asynchronously in\
+        \ content-control once the verdict is clean.\n\n* **Non-PDF uploads** (markdown skills, ADRs, plain text)\n  keep\
+        \ the existing synchronous path: PUT to\n  ``{layer}/{filename}`` and return HTTP 200 with the\n  direct-write summary.\n\
+        \nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n\
+        (or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa."
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query
@@ -1762,6 +1748,51 @@ paths:
         - audittrace:admin
       summary: Upload Memory File
       tags:
+      - memory
+  /memory/upload/status:
+    get:
+      description: 'Return the current scan_status of the named upload.
+
+
+        Authorization: any authenticated user who can read the
+
+        layer can poll status. We additionally check that the
+
+        requesting user is the same one who created the row OR an
+
+        admin — content-control verdicts shouldn''t leak across
+
+        tenant boundaries even pre-PR-B7 IAM split.'
+      operationId: get_upload_status_memory_upload_status_get
+      parameters:
+      - description: Scan ID returned by POST /memory/upload
+        in: query
+        name: scan_id
+        required: true
+        schema:
+          description: Scan ID returned by POST /memory/upload
+          title: Scan Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Get Upload Status Memory Upload Status Get
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2: []
+      summary: Get Upload Status
+      tags:
+      - memory
       - memory
   /metrics:
     get:

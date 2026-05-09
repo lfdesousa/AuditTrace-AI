@@ -249,6 +249,18 @@ class MemoryItem(Base):
         String(32), nullable=True, index=True
     )
 
+    # ── ADR-048 PR-B3 outbox columns (migration 013) ──────────────────
+    # ``published_at_ms`` NULL = the manifest row is the only record of
+    # this scan-request — the AMQP basic_publish hasn't completed yet.
+    # The publisher sets it on success; the janitor (60s grace) finds
+    # NULL rows that crashed mid-flight and re-enqueues them.
+    published_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # W3C-traceparent-derived trace_id from the originating
+    # /memory/upload request. Carried into the AMQP message header so
+    # content-control's worker (PR-A3) stitches the same trace across
+    # the async boundary.
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )

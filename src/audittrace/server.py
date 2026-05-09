@@ -19,6 +19,7 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, memory, session
+from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
@@ -290,21 +291,87 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     else:
         logger.info("Async-persist consumer NOT started (async_persist_enabled=False)")
 
+    # ─── ADR-048 PR-B3 — scan-request producer + janitor ──────────────
+    # Background tasks owning the Hohpe outbox. The route handler
+    # in routes/memory.py only enqueues; these two drain the queue
+    # and re-poll the manifest for orphan rows. Gated by
+    # ``scan_pipeline_enabled`` so dev / unit tests don't need a
+    # broker. The whole subsystem is composed via AsyncExitStack so
+    # broker close + task cancel run deterministically on shutdown
+    # (Danjou §1 — "the unwind contract").
+    import contextlib  # noqa: PLC0415 — local to keep import surface tight
+
+    scan_pipeline_stack: contextlib.AsyncExitStack | None = None
+    if settings.scan_pipeline_enabled:  # pragma: no cover — live-startup path
+        # ``get_postgres_factory`` is already imported at module scope
+        # (line 17 — used by the summariser block above).
+        from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
+        from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
+            ScanRequestJanitor,
+        )
+        from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
+            ScanRequestEnvelope,
+            ScanRequestPublisher,
+        )
+
+        scan_pipeline_stack = contextlib.AsyncExitStack()
+        # Compose the broker first — its aclose runs LAST on unwind,
+        # after both background tasks have been cancelled.
+        scan_amqp_client = await scan_pipeline_stack.enter_async_context(
+            ScanAmqpClient(settings)
+        )
+        scan_queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue(maxsize=10000)
+        scan_session_factory = get_postgres_factory().get_session_factory()
+        scan_publisher_task = asyncio.create_task(
+            ScanRequestPublisher(
+                amqp_client=scan_amqp_client,
+                queue=scan_queue,
+                session_factory=scan_session_factory,
+            ).run(),
+            name="scan-request-publisher",
+        )
+        scan_janitor_task = asyncio.create_task(
+            ScanRequestJanitor(
+                settings=settings,
+                session_factory=scan_session_factory,
+                queue=scan_queue,
+            ).run(),
+            name="scan-request-janitor",
+        )
+
+        async def _cancel_scan_tasks() -> None:
+            for t in (scan_publisher_task, scan_janitor_task):
+                t.cancel()
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(scan_publisher_task, timeout=5.0)
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(scan_janitor_task, timeout=5.0)
+
+        scan_pipeline_stack.push_async_callback(_cancel_scan_tasks)
+        # Stash on app.state so the route handler reaches the queue.
+        app.state.scan_queue = scan_queue
+        logger.info(
+            "Scan-request pipeline scheduled — exchange=%s routing_key=%s",
+            settings.scan_request_exchange,
+            settings.scan_request_routing_key,
+        )
+    else:
+        app.state.scan_queue = None
+        logger.info("Scan-request pipeline NOT started (scan_pipeline_enabled=False)")
+
     yield
 
     logger.info("Shutting down audittrace-server")
     if summarizer_task is not None:  # pragma: no cover - paired with startup
         summarizer_task.cancel()
-        try:
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(summarizer_task, timeout=5.0)
-        except (TimeoutError, asyncio.CancelledError):
-            pass
     if async_persist_task is not None:  # pragma: no cover - paired with startup
         async_persist_task.cancel()
-        try:
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(async_persist_task, timeout=5.0)
-        except (TimeoutError, asyncio.CancelledError):
-            pass
+    if scan_pipeline_stack is not None:  # pragma: no cover - paired with startup
+        await scan_pipeline_stack.aclose()
     telemetry.shutdown()
 
 
@@ -437,6 +504,11 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, tags=["audit"])
     app.include_router(session.router, prefix="/session", tags=["session"])
     app.include_router(memory.router, prefix="/memory", tags=["memory"])
+    # ADR-048 PR-B3 — GET /memory/upload/status?scan_id=...
+    # Owns its own prefix `/memory/upload` (sibling to memory.router's
+    # `/memory`), so it adds the status endpoint without forcing the
+    # upload-POST surface to fork.
+    app.include_router(memory_upload_status_router, tags=["memory"])
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-
     # keycloak.yaml routes `/admin` to keycloak's REST API). ADR-052
