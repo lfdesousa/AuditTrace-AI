@@ -44,6 +44,10 @@ dependencies = [
     "sqlalchemy>=2.0.25",
     "psycopg2-binary>=2.9.9",
     "redis>=5.0.0",
+    # ADR-057 — RabbitMQ AMQP client for the scan-control broker
+    # (PR-B3 ScanRequestPublisher + PR-B4 verdict/audit consumers).
+    # ADR-046 chat persistence stays on redis-py via Redis Streams.
+    "aio-pika>=9.4.0",
     "minio>=7.2.0",
     "pymupdf>=1.24.0",
     # pyhanko: PAdES / PDF signature validation (gap-inventory item #12).

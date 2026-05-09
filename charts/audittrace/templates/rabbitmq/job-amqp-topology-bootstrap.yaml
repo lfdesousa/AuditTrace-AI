@@ -1,0 +1,188 @@
+{{- /* ADR-057 — AMQP topology bootstrap.
+
+       Post-install / post-upgrade Helm hook Job that materialises
+       the topic exchanges + quorum queues + DLX + bindings ADR-048
+       depends on. Idempotent (every command is `--ignore-existing`
+       or HTTP PUT-shaped). Re-running on every helm upgrade keeps
+       the topology aligned with the chart, enforcing
+       `feedback_no_more_drifts` for AMQP-side coupling.
+
+       Topology shape (locked in ADR-057):
+
+       Exchanges (topic, durable):
+         - audittrace.scan          (binds requests queue via scan.request.*)
+         - audittrace.scan.verdicts (binds verdicts queue via scan.verdict.*)
+         - audittrace.scan.audit    (binds audit queue via scan.audit.*)
+         - audittrace.scan.dlx      (DLX for the requests queue)
+
+       Queues (quorum, durable):
+         - audittrace.scan.requests    (consumed by content-control)
+         - audittrace.scan.requests.dlq (DLX target)
+         - audittrace.scan.verdicts    (consumed by memory-server)
+         - audittrace.scan.audit       (consumed by memory-server's audit consumer)
+
+       Users (vhost-scoped):
+         - audittrace (broker admin; the subchart auth.username)
+         - content-control (separate user; vhost permissions
+           configured by this Job: configure="" / write to
+           audittrace.scan.verdicts + audittrace.scan.audit /
+           read from audittrace.scan.requests)
+
+       The Bitnami chart already creates the audittrace user +
+       password from secrets.rabbitmq.password. This Job only
+       creates the content-control user + scopes its permissions
+       + materialises the topology.
+
+       Implementation: rabbitmqadmin (the Python tool shipped in
+       the bitnami/rabbitmq image) over AMQPS to the management
+       API on port 15672. */ -}}
+{{- if .Values.rabbitmq.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-rabbitmq-topology
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq-topology
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.labels" . | nindent 8 }}
+        app.kubernetes.io/component: rabbitmq-topology
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-rabbitmq-topology
+      restartPolicy: OnFailure
+      containers:
+        - name: rabbitmqadmin
+          image: bitnami/rabbitmq:3.13
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RABBIT_HOST
+              value: "{{ .Release.Name }}-rabbitmq.{{ .Release.Namespace }}.svc.cluster.local"
+            - name: RABBIT_MGMT_PORT
+              value: "15672"
+            - name: RABBIT_AMQP_PORT
+              value: "5672"
+            - name: RABBIT_USER
+              value: {{ .Values.rabbitmq.auth.username | quote }}
+            - name: RABBIT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-rabbitmq
+                  key: rabbitmq-password
+            - name: CC_USER
+              value: {{ .Values.secrets.rabbitmq.contentControlUser | quote }}
+            - name: CC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-rabbitmq-content-control
+                  key: password
+                  optional: true
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              echo "▶ Waiting for RabbitMQ at ${RABBIT_HOST}:${RABBIT_MGMT_PORT}..."
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                if curl -fsS -u "${RABBIT_USER}:${RABBIT_PASS}" \
+                     "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}/api/overview" \
+                     >/dev/null 2>&1; then
+                  echo "  ✓ broker reachable"
+                  break
+                fi
+                sleep 4
+              done
+
+              # Helper: PUT a JSON body. Idempotent — RabbitMQ's
+              # management API treats PUT as upsert.
+              put() {
+                local path="$1"; local body="$2"
+                curl -fsS -u "${RABBIT_USER}:${RABBIT_PASS}" \
+                  -H 'content-type: application/json' \
+                  -X PUT -d "$body" \
+                  "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}${path}"
+              }
+
+              VHOST=%2F  # default vhost "/"
+
+              echo "▶ Materialising topic exchanges..."
+              for ex in audittrace.scan audittrace.scan.verdicts audittrace.scan.audit audittrace.scan.dlx; do
+                put "/api/exchanges/${VHOST}/${ex}" \
+                    '{"type":"topic","auto_delete":false,"durable":true}' >/dev/null
+                echo "  ✓ exchange ${ex}"
+              done
+
+              echo "▶ Materialising quorum queues..."
+              # Requests queue with DLX → audittrace.scan.dlx
+              put "/api/queues/${VHOST}/audittrace.scan.requests" \
+                  '{"auto_delete":false,"durable":true,"arguments":{"x-queue-type":"quorum","x-dead-letter-exchange":"audittrace.scan.dlx","x-delivery-limit":5}}' \
+                  >/dev/null
+              echo "  ✓ queue audittrace.scan.requests (quorum, DLX→audittrace.scan.dlx)"
+
+              put "/api/queues/${VHOST}/audittrace.scan.requests.dlq" \
+                  '{"auto_delete":false,"durable":true,"arguments":{"x-queue-type":"quorum"}}' \
+                  >/dev/null
+              echo "  ✓ queue audittrace.scan.requests.dlq (quorum, DLX target)"
+
+              put "/api/queues/${VHOST}/audittrace.scan.verdicts" \
+                  '{"auto_delete":false,"durable":true,"arguments":{"x-queue-type":"quorum"}}' \
+                  >/dev/null
+              echo "  ✓ queue audittrace.scan.verdicts (quorum)"
+
+              put "/api/queues/${VHOST}/audittrace.scan.audit" \
+                  '{"auto_delete":false,"durable":true,"arguments":{"x-queue-type":"quorum"}}' \
+                  >/dev/null
+              echo "  ✓ queue audittrace.scan.audit (quorum)"
+
+              echo "▶ Materialising bindings..."
+              # bindings: exchange → queue with routing-key pattern
+              bind() {
+                local ex="$1"; local queue="$2"; local key="$3"
+                curl -fsS -u "${RABBIT_USER}:${RABBIT_PASS}" \
+                  -H 'content-type: application/json' \
+                  -X POST -d "{\"routing_key\":\"${key}\"}" \
+                  "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}/api/bindings/${VHOST}/e/${ex}/q/${queue}" \
+                  >/dev/null
+                echo "  ✓ ${ex} → ${queue} (key=${key})"
+              }
+              bind audittrace.scan          audittrace.scan.requests    "scan.request.*"
+              bind audittrace.scan.dlx      audittrace.scan.requests.dlq "#"
+              bind audittrace.scan.verdicts audittrace.scan.verdicts    "scan.verdict.*"
+              bind audittrace.scan.audit    audittrace.scan.audit       "scan.audit.*"
+
+              if [ -n "${CC_PASS:-}" ]; then
+                echo "▶ Configuring content-control user (${CC_USER}) and permissions..."
+                put "/api/users/${CC_USER}" \
+                    "{\"password\":\"${CC_PASS}\",\"tags\":\""}" >/dev/null || true
+                # Vhost permissions: configure="" (no exchange/queue
+                # creation), write to scan.verdicts + scan.audit,
+                # read from scan.requests.
+                put "/api/permissions/${VHOST}/${CC_USER}" \
+                    '{"configure":"","write":"^audittrace\\.scan\\.(verdicts|audit)$","read":"^audittrace\\.scan\\.requests$"}' \
+                    >/dev/null
+                echo "  ✓ content-control user provisioned with scoped vhost permissions"
+              else
+                echo "  ⊝ content-control password not supplied (secret '{{ .Release.Name }}-rabbitmq-content-control' missing) — skipping user provisioning"
+              fi
+
+              echo "✅ AMQP topology bootstrap complete."
+              echo
+              echo "▶ Verifying topology — exchanges:"
+              curl -fsS -u "${RABBIT_USER}:${RABBIT_PASS}" \
+                "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}/api/exchanges/${VHOST}" \
+                | python3 -c "import sys,json; [print('  ',e['name'],'(',e['type'],')') for e in json.load(sys.stdin) if e['name'].startswith('audittrace.')]" \
+                || true
+              echo "▶ Verifying topology — queues:"
+              curl -fsS -u "${RABBIT_USER}:${RABBIT_PASS}" \
+                "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}/api/queues/${VHOST}" \
+                | python3 -c "import sys,json; [print('  ',q['name'],'-',q.get('arguments',{}).get('x-queue-type','classic')) for q in json.load(sys.stdin) if q['name'].startswith('audittrace.')]" \
+                || true
+{{- end }}
