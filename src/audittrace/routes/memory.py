@@ -43,6 +43,8 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
+    Response,
     Security,
     UploadFile,
 )
@@ -249,6 +251,13 @@ def _require_admin(user: UserContext, action: str) -> None:
 
 @router.post("/upload")
 async def upload_memory_file(
+    # ``Request[Any]`` would satisfy pre-commit mypy 1.8 (which can't
+    # see starlette's generic default), but FastAPI's Pydantic field
+    # introspection rejects it at route registration. Bare ``Request``
+    # is what every other route in this codebase uses; we silence the
+    # pre-commit-only error class explicitly.
+    request: Request,  # type: ignore[type-arg, unused-ignore]
+    response: Response,
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
@@ -257,26 +266,71 @@ async def upload_memory_file(
 ) -> dict[str, Any]:
     """Upload a file to MinIO under the specified memory layer.
 
-    The file lands in the ``memory-shared`` bucket at
-    ``{layer}/{filename}``.  If *filename* is omitted the upload's
-    original filename is used.
+    Two paths (Luis 2026-05-10, ADR-048 PR-B3):
+
+    * **PDF uploads** (``content-type: application/pdf`` AND
+      magic-byte sniff matches ``%PDF-``) take the quarantine flow:
+      bytes land in ``quarantine/<user>/<scan_id>/<file>`` (not the
+      requested ``layer`` prefix), a ``memory_items`` row is inserted
+      with ``scan_status='pending_scan'``, and an AMQP scan-request is
+      enqueued. The response is **HTTP 202** with a ``scan_id`` and
+      poll URL. Promotion to ``episodic/papers/`` happens
+      asynchronously in content-control once the verdict is clean.
+
+    * **Non-PDF uploads** (markdown skills, ADRs, plain text)
+      keep the existing synchronous path: PUT to
+      ``{layer}/{filename}`` and return HTTP 200 with the
+      direct-write summary.
 
     Authorization (per-layer): the caller's JWT must carry
     ``memory:<layer>:write`` matching the ``layer`` query parameter
     (or ``audittrace:admin``). A token with ``memory:procedural:write``
-    cannot upload to ``layer=episodic`` and vice-versa. The empty
-    static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI spec
-    without baking the dynamic per-layer scope into the schema —
-    the prose contract lives here.
+    cannot upload to ``layer=episodic`` and vice-versa.
     """
     _require_layer_write(user, layer)
     settings = get_settings()
-    bucket = settings.minio_shared_bucket
     target_filename = filename or file.filename or "unnamed"
-    key = f"{layer.value}/{target_filename}"
-
     content = await file.read()
     minio_client = _get_minio_client()
+
+    # ── ADR-048 PR-B3 dispatch ───────────────────────────────────
+    from audittrace.routes.memory_upload.handler import (  # noqa: PLC0415
+        handle_pdf_upload,
+    )
+    from audittrace.routes.memory_upload.quarantine import (  # noqa: PLC0415
+        is_pdf_upload,
+    )
+
+    claimed_ct = file.content_type or ""
+    if is_pdf_upload(claimed_content_type=claimed_ct, content=content):
+        from audittrace.dependencies import (  # noqa: PLC0415
+            get_postgres_factory,
+        )
+
+        scan_queue = getattr(request.app.state, "scan_queue", None)
+        if scan_queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "scan pipeline disabled (AUDITTRACE_SCAN_PIPELINE_ENABLED=false)"
+                ),
+            )
+        body = await handle_pdf_upload(
+            settings=settings,
+            minio_client=minio_client,
+            session_factory=get_postgres_factory().get_session_factory(),
+            queue=scan_queue,
+            user=user,
+            filename=target_filename,
+            content=content,
+            content_type=claimed_ct,
+        )
+        response.status_code = 202
+        return body
+
+    # ── Legacy synchronous path (markdown, etc.) ────────────────
+    bucket = settings.minio_shared_bucket
+    key = f"{layer.value}/{target_filename}"
 
     try:
         minio_client.put_object(

@@ -364,6 +364,38 @@ class Settings(BaseSettings):
     # presumed dead — pod restart, OOM, network partition).
     async_persist_pending_idle_ms: int = 60000
 
+    # ─────────────── ADR-048 — ingestion content-control ─────────────────
+    # PR-B3: PDF uploads land in a quarantine prefix and trigger an
+    # AMQP scan-request. Markdown / non-PDF uploads keep the existing
+    # synchronous direct-PUT path. Default OFF so the service starts
+    # cleanly without RabbitMQ in dev / unit tests; the chart sets
+    # this true once the broker subchart (PR-B2.5) is up.
+    scan_pipeline_enabled: bool = False
+    # AMQP connection URL (aio_pika.connect_robust). Same broker as
+    # the topology bootstrap Job created in PR-B2.5.
+    scan_amqp_url: str = ""
+    # Topic exchange + routing-key prefix. Mirrors content-control's
+    # Settings — must match on both sides or the bound queue won't
+    # route. Closed-set in cross-repo `contracts/v1.yaml`.
+    scan_request_exchange: str = "audittrace.scan"
+    scan_request_routing_key: str = "scan.requested"
+    # Quarantine MinIO key prefix. Memory-server PUTs here; content-
+    # control reads here (and only here). Bucket-policy enforcement
+    # of the read-side denylist lands in PR-B7.
+    scan_quarantine_prefix: str = "quarantine"
+    # Producer drain interval — how long the publisher's background
+    # task waits for new ScanRequest entries before re-checking the
+    # outbox. Short enough that 202 → broker delivery is sub-second
+    # under load; long enough that an idle service doesn't burn CPU.
+    scan_publisher_drain_interval_ms: int = 100
+    # Janitor query interval — how often the background task scans
+    # `memory_items WHERE published_at_ms IS NULL AND created_at_ms
+    # < NOW()-grace`. The grace window must be > the publisher's
+    # typical drain latency so a healthy publish-in-flight isn't
+    # double-published. 60s grace + 30s interval handles that.
+    scan_janitor_interval_seconds: int = 30
+    scan_janitor_grace_seconds: int = 60
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
