@@ -38,8 +38,16 @@ env/
 .env.local
 .env.*.local
 
-# Secrets (root-level only — charts/*/templates/secrets/ are Helm templates, not actual secrets)
-/secrets/
+# Secrets (root-level only — charts/*/templates/secrets/ are Helm
+# templates, not actual secrets). Use `/secrets/*` (not `/secrets/`)
+# so the negation below works: gitignore docs say a re-included file
+# is impossible if the parent directory itself is excluded, only if
+# its CONTENTS are excluded with a glob.
+/secrets/*
+# DO commit `.example` template files so operators have a starting
+# shape for the gitignored .txt files (ADR-048 PR-B2 added Docker Hub
+# PAT templates).
+!/secrets/*.example
 *.pem
 *.key
 

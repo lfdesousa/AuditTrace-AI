@@ -151,6 +151,15 @@ def _create_minio_client(settings: Settings) -> object:
     """Create a MinIO client. Required — there is no FS fallback (ADR-027,
     ``feedback_storage_always_s3``).
 
+    Wraps the bare ``Minio`` instance in
+    ``QuarantineDenyingMinioClient`` (ADR-048 PR-B2) which refuses
+    ``get_object`` calls whose key starts with ``quarantine/``. This
+    is the application-layer half of the trust-boundary enforcement;
+    PR-B7 lands the MinIO IAM split that puts ``Effect: Deny`` on
+    ``quarantine/*`` for the ``audittrace_app`` role at the
+    bucket-policy layer. Two layers of enforcement on the same
+    invariant (defense in depth).
+
     Raises ``RuntimeError`` if MinIO is not configured (missing secret key)
     or the client fails to initialise. Layers 1 + 2 are S3-only by design;
     a missing client is a startup-time error, not a silent degradation.
@@ -165,16 +174,25 @@ def _create_minio_client(settings: Settings) -> object:
     try:
         from urllib.parse import urlparse  # noqa: E402
 
+        from audittrace.services.quarantine_guard import (  # noqa: E402
+            QuarantineDenyingMinioClient,
+        )
+
         parsed = urlparse(settings.minio_url)
         endpoint = parsed.netloc or parsed.path
         secure = parsed.scheme == "https"
-        client = Minio(
+        bare_client = Minio(
             endpoint,
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
             secure=secure,
         )
-        logger.info("MinIO client initialised — endpoint=%s", endpoint)
+        client = QuarantineDenyingMinioClient(bare_client)
+        logger.info(
+            "MinIO client initialised — endpoint=%s, quarantine-deny=%s",
+            endpoint,
+            client.quarantine_prefix,
+        )
         return client
     except Exception as exc:
         raise RuntimeError(

@@ -11,6 +11,10 @@ spec:
       app.kubernetes.io/name: redis
   action: ALLOW
   rules:
+    # memory-server only. Redis is reserved for token cache +
+    # tool-result cache + ADR-046 async chat persistence. Scan
+    # control (ADR-048) moved to RabbitMQ in PR-B2.5 / ADR-057;
+    # content-control does NOT need Redis access.
     - from:
         - source:
             principals:
