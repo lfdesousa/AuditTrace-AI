@@ -1,0 +1,63 @@
+{{- /* ADR-057 — Istio AuthorizationPolicy for RabbitMQ AMQP traffic.
+
+       Two principals allowed on AMQP port 5672:
+       - memory-server: ScanRequestPublisher (basic_publish to
+         audittrace.scan exchange) + verdict consumer
+         (basic_consume from audittrace.scan.verdicts) + audit
+         consumer (audittrace.scan.audit).
+       - content-control sibling SA: scan-request consumer
+         (basic_consume from audittrace.scan.requests) + verdict
+         publisher (basic_publish to audittrace.scan.verdicts) +
+         audit emitter (basic_publish to audittrace.scan.audit).
+
+       Management UI port 15672 is NOT exposed via Istio
+       AuthorizationPolicy — operators reach it via
+       `kubectl port-forward svc/audittrace-rabbitmq 15672:15672`.
+
+       Per-vhost / per-queue scoping happens at the AMQP layer
+       via RabbitMQ's user-permissions model (regex on
+       configure / write / read), NOT at Istio. */ -}}
+{{- if and .Values.istio.enabled .Values.rabbitmq.enabled }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-rabbitmq
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+  action: ALLOW
+  rules:
+    # memory-server: outbox publisher + verdict consumer + audit consumer
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.memoryServer.serviceAccount.name }}"
+      to:
+        - operation:
+            ports: ["5672"]
+    # audittrace-content-control sibling: scan-request consumer + verdict
+    # publisher + audit emitter. ADR-048 PR-A3.
+    {{- if .Values.contentControl }}
+    {{- if .Values.contentControl.serviceAccountName }}
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.contentControl.serviceAccountName }}"
+      to:
+        - operation:
+            ports: ["5672"]
+    {{- end }}
+    {{- end }}
+    # AMQP topology bootstrap Job — runs as the chart's release SA;
+    # post-install hook only.
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-rabbitmq-topology"
+      to:
+        - operation:
+            ports: ["5672", "15672"]
+{{- end }}

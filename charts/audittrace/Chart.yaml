@@ -25,6 +25,14 @@ dependencies:
     version: "~19"
     repository: https://charts.bitnami.com/bitnami
     condition: redis.enabled
+  # ADR-057 — scan-control broker for ADR-048's content-control
+  # pipeline. AMQP topic exchange + quorum queues + DLX. ADR-046
+  # chat persistence stays on Redis Streams; the two brokers
+  # coexist by design (different domains).
+  - name: rabbitmq
+    version: "~14"
+    repository: https://charts.bitnami.com/bitnami
+    condition: rabbitmq.enabled
   - name: vault
     version: "~0.30"
     repository: https://helm.releases.hashicorp.com

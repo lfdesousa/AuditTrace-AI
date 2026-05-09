@@ -211,15 +211,19 @@ seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.
 # committed) and re-runs setup-vault.sh.
 seed_kv docker-hub/pat username=docker_hub_username.txt pat=docker_hub_pat.txt
 
-# Content-control sibling service reads from these Vault paths via
-# its own Vault Agent annotations (audittrace-content-control's
-# charts/.../deployment.yaml). PR-B2 leaves this empty — the
-# RabbitMQ broker decision (ADR-057, lands in PR-B2.5) means
-# content-control reads from kv/audittrace/content-control/rabbitmq
-# (created in PR-B2.5), NOT Redis. For PR-A2 we may add a
-# `signature_db` path if ClamAV's freshclam needs auth, and PR-B7
-# will add dedicated `minio` IAM-role credentials when the
-# bucket-policy split lands.
+# ── ADR-057 PR-B2.5 — RabbitMQ broker credentials ─────────────────────
+# Broker admin (the Bitnami auth.username, default 'audittrace') +
+# the separate scoped 'content-control' user the AMQP topology
+# bootstrap Job provisions. Erlang cookie is the cluster shared
+# secret — required when clustering.enabled=true (Profile B/C); a
+# placeholder value is acceptable for single-node Profile A.
+seed_kv rabbitmq/admin \
+  username=rabbitmq_user.txt \
+  password=rabbitmq_password.txt \
+  erlang_cookie=rabbitmq_erlang_cookie.txt
+seed_kv content-control/rabbitmq \
+  username=rabbitmq_content_control_user.txt \
+  password=rabbitmq_content_control_password.txt
 
 # ─── Bitnami Redis password sync (closes 2026-05-04 drift class) ─────
 # The Bitnami Redis subchart auto-generates the password into the k8s

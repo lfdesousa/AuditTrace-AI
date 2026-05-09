@@ -26,13 +26,14 @@ flowchart LR
     subgraph Dependencies["Market-standard infrastructure (bring your own)"]
         IDP["1. Identity Provider<br/>OAuth2 / OIDC"]
         PG["2. PostgreSQL<br/>RLS-capable, HA"]
-        R["3. Redis<br/>token + tool cache<br/>+ scan request/verdict streams"]
+        R["3. Redis<br/>token + tool cache<br/>+ ADR-046 chat persistence"]
         OS["4. Object Storage<br/>S3 API"]
         VDB["5. Vector Database<br/>similarity + filter"]
         SEC["6. Secret Manager<br/>Vault / SOPS / ESO"]
         LLM["7. LLM Inference<br/>OpenAI-compatible endpoint"]
         OBS["8. Observability<br/>OTel + Tempo + Loki<br/>+ Prometheus + Langfuse"]
         CC["9. Ingestion Content-Control<br/>ClamAV / ICAP / pluggable<br/>(ADR-048)"]
+        MQ["10. AMQP Broker<br/>RabbitMQ<br/>(ADR-057, scan-control)"]
     end
     MS -->|JWT validation| IDP
     MS -->|SELECT / INSERT| PG
@@ -42,18 +43,19 @@ flowchart LR
     MS -->|read at pod start| SEC
     MS -->|chat.completions| LLM
     MS -->|OTLP + SDK| OBS
-    MS -->|verdict consumer<br/>via Redis Streams| CC
+    MS -->|publish scan-requests<br/>consume verdicts/audit| MQ
+    MQ -->|deliver scan-requests<br/>receive verdicts/audit| CC
     CC -->|GET quarantine/<br/>PUT episodic/papers/| OS
 
     classDef prod fill:#065f46,stroke:#10b981,color:#ecfdf5
     classDef dep fill:#1f2937,stroke:#64748b,color:#f1f5f9
     class MS prod
-    class IDP,PG,R,OS,VDB,SEC,LLM,OBS,CC dep
+    class IDP,PG,R,OS,VDB,SEC,LLM,OBS,CC,MQ dep
 ```
 
 The product is the green box. The grey boxes are the enterprise's responsibility. We do not resell them, we do not claim to improve them, and we do not attempt to rebuild them. We consume them through well-defined interfaces that the ADRs specify.
 
-## The nine dependencies — in detail
+## The ten dependencies — in detail
 
 For each dependency we state the *role* (what we need it for), the *interface* (the concrete contract), the *default* (what the current chart ships for a dev install), the *production alternatives* (what the enterprise is free to substitute), the *minimum security posture* (what must be true for the enterprise deployment to be defensible), and the *current gap* (what is not yet implemented in this direction).
 
@@ -150,15 +152,26 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 | Aspect | Detail |
 |---|---|
 | **Role** | Scan and classify externally-supplied bytes (PDF uploads today; future MIME types) before memory-server is allowed to parse them. Closes the trust-boundary gap where a parser exploit in the memory-server pod would inherit the full credential set (Postgres / MinIO / ChromaDB / JWKS / Vault token). Sits between `quarantine/` and `episodic/papers/` MinIO prefixes; refuses-by-default when unavailable. |
-| **Interface** | (a) Synchronous HTTP RPC `POST /v1/scan` over Istio mTLS (caller waits — small / interactive uploads). (b) Asynchronous: MinIO event notification → Redis Stream `audittrace:scan:requests` consumer-group, verdict published to `audittrace:scan:verdicts` (default path — caller does not block). (c) Operator surfaces: `/v1/scan/status`, `/v1/scan/retrigger`, `/v1/scan/stats`. (d) Health/ready/version. Full schema in repo A's `contracts/v1.yaml`. |
+| **Interface** | (a) Synchronous HTTP RPC `POST /v1/scan` over Istio mTLS (caller waits — small / interactive uploads). (b) Asynchronous: AMQP `audittrace.scan` topic exchange → `audittrace.scan.requests` quorum queue (consumed by content-control); verdicts published to `audittrace.scan.verdicts` exchange (consumed by memory-server). See ADR-057 for the broker decision. (c) Operator surfaces: `/v1/scan/status`, `/v1/scan/retrigger`, `/v1/scan/stats`. (d) Health/ready/version. Full schema in repo A's `contracts/v1.yaml` + `contracts/amqp-topology.yaml`. |
 | **Default (dev)** | `audittrace-content-control` sibling Helm chart (separate repo `lfdesousa/audittrace-content-control`, OCI-distributed via Docker Hub Pro under the `lfds` namespace) with ClamAV daemon + freshclam sidecar + FastAPI control-plane + asyncio scan-worker + vault-agent. |
 | **Production alternatives** | ICAP gateway (RFC 3507) fronting Symantec / Trend Micro / McAfee / Cisco / Sophos. Cloud-native scanners (Google Cloud DLP, AWS Macie, Azure Defender for Storage, VirusTotal API — sovereignty-permitting). Sandboxed detonation (Cuckoo, CAPE, Joe Sandbox) for higher-tier deployments. Service interface stays the same; backend swaps via Pydantic Settings + factory. |
 | **Minimum security posture** | Separate Kubernetes ServiceAccount, separate Vault path (`kv/audittrace/content-control/*`), separate MinIO IAM role (`content_control` — read+delete `quarantine/*`, write `episodic/papers/*`). Memory-server's IAM role (`audittrace_app`) cannot read `quarantine/*` (PR-B7 enforces at bucket-policy layer). Refuse-by-default: when scanner is unavailable, new uploads return 503 — defensible audit posture. Every verdict (clean and rejected) emits an `interactions` row with `event_class: security`. |
-| **Current gap** | ADR-048 still **Proposed**; PR sequence in flight: PR-B1 contract scaffolding (this PR), PR-A1 repo skeleton, PR-B2 Vault tree + bucket-init, PR-A2 ClamAV adapter, PR-A3 + PR-B4 paired async pipeline, PR-A4 operator surfaces, PR-B5 WebUI/Bruno/walkthrough, PR-B7 MinIO IAM split flips ADR-048 to **Accepted**. v1 ships ClamAV only; v2 adds content classification (PII / DLP / sensitivity); v3 adds sandboxed detonation. |
+| **Current gap** | ADR-048 still **Proposed**; PR sequence in flight: PR-B1 contract scaffolding ✅, PR-A1 repo skeleton ✅, PR-A1.5 CI publish ✅, PR-B2 Vault tree + bucket-init + denylist ✅, PR-B2.5 RabbitMQ subchart + ADR-057 (this PR), PR-A2 ClamAV adapter, PR-A3 + PR-B4 paired async pipeline (aio-pika adapters), PR-B3 /memory/upload outbox+asyncio.Queue, PR-A4 operator surfaces, PR-B5 WebUI/Bruno/walkthrough, PR-B7 MinIO IAM split flips ADR-048 to **Accepted**. v1 ships ClamAV only; v2 adds content classification (PII / DLP / sensitivity); v3 adds sandboxed detonation. |
+
+### 10. AMQP Broker (ADR-057)
+
+| Aspect | Detail |
+|---|---|
+| **Role** | Carries scan-control messages between memory-server (Repo B) and audittrace-content-control (Repo A). Three exchange-bound queue families: `audittrace.scan.requests` (work in), `audittrace.scan.verdicts` (work out), `audittrace.scan.audit` (SECURITY audit row out). Every queue is a quorum queue with DLX semantics; the requests queue has `x-delivery-limit=5` so poison messages route to `audittrace.scan.requests.dlq` rather than blocking the line. ADR-046 chat persistence does NOT use this broker — it stays on Redis Streams. |
+| **Interface** | AMQP 0-9-1 over TCP port 5672 (mTLS via Istio). Topic exchanges; routing keys `scan.request.*` / `scan.verdict.*` / `scan.audit.*` so v2/v3 event types layer in additively. Management API (port 15672) is in-cluster only — operators reach it via `kubectl port-forward`. Per-vhost / per-user permissions enforced by the AMQP user model. |
+| **Default (dev)** | Bitnami RabbitMQ 14.x subchart, single-node, persistent volume 2Gi. AMQP topology materialised by a post-install/post-upgrade Helm hook Job (`templates/rabbitmq/job-amqp-topology-bootstrap.yaml`). |
+| **Production alternatives** | RabbitMQ HA cluster (`clustering.enabled=true`, `replicaCount=3`, quorum queues are Raft-replicated); CloudAMQP managed RabbitMQ; AWS MQ for RabbitMQ. The hexagonal architecture in audittrace-content-control means the broker is swappable to NATS JetStream / pgmq via a new adapter module + factory branch — no business-logic changes. |
+| **Minimum security posture** | TLS in transit (mTLS via Istio is the default; AMQPS is also supported). Distinct admin user (broker-wide configure/write/read) and scoped per-tenant user (configure="" / scoped write + read regexes). Erlang cookie via Vault. No anonymous bindings. |
+| **Current gap** | Single-node default; HA cluster overlay (Profile B/C) ships in PR-B2.5. Federation / shovel for cross-region scan-control is post-v1. |
 
 ## Deployment profiles
 
-The same Helm chart ships three deployment profiles. Each profile is a different answer to *"which of the nine dependencies do you bring, and which do we bundle?"*
+The same Helm chart ships three deployment profiles. Each profile is a different answer to *"which of the ten dependencies do you bring, and which do we bundle?"*
 
 ### Profile A — Z-book (consultant laptop)
 
@@ -175,6 +188,7 @@ Everything on one device. Used by a single consultant doing client work on-devic
 | LLM Inference | Host-level llama.cpp services |
 | Observability | Bundled sibling Docker Compose stack on same host |
 | Content-Control | Bundled `audittrace-content-control` sibling chart with ClamAV (default backend) |
+| AMQP Broker | Bundled Bitnami RabbitMQ subchart, single-node |
 
 ### Profile B — Single-host on-premises (small team)
 
@@ -191,10 +205,11 @@ Everything still on one host but backed by real services. The shared small-team 
 | LLM Inference | Single GPU node running vLLM |
 | Observability | Bundled sibling stack |
 | Content-Control | Bundled `audittrace-content-control` sibling chart with ClamAV |
+| AMQP Broker | Bundled Bitnami RabbitMQ subchart, 3-replica quorum-queue cluster |
 
 ### Profile C — Enterprise (bring your own everything)
 
-The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datadog/Grafana-Cloud, a GPU cluster running Triton. AuditTrace-AI is deployed as a stateless workload that consumes all nine via configuration.
+The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datadog/Grafana-Cloud, a GPU cluster running Triton. AuditTrace-AI is deployed as a stateless workload that consumes all ten via configuration.
 
 | Dependency | Source |
 |---|---|
@@ -207,14 +222,15 @@ The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datad
 | LLM Inference | Enterprise GPU pool with Triton or vLLM |
 | Observability | Enterprise Grafana Cloud / Datadog / equivalent |
 | Content-Control | Enterprise ICAP gateway / commercial AV / sandboxed detonation. The `audittrace-content-control` interface accepts any backend; operator points it at their own scanner via Pydantic Settings. |
+| AMQP Broker | Enterprise CloudAMQP / AWS MQ for RabbitMQ / on-prem RabbitMQ HA cluster. Hexagonal architecture in audittrace-content-control means swap to NATS / pgmq is also supported via a different adapter. |
 
 The Helm chart toggles between profiles via values overlay (`values-zbook.yaml`, `values-onprem.yaml`, `values-enterprise.yaml`). Existing chart supports A and B today; C is Phase 1 + Phase 3 of the roadmap.
 
 ## The story for enterprise architects
 
-> AuditTrace-AI ships one thing — a memory-server that is audit-by-design for LLM deployments in regulated industries. It depends on nine components that your enterprise either already runs or can procure from the established market (IdP, Postgres, Redis, object storage, vector DB, secret manager, LLM inference, observability, ingestion content-control). We document each dependency's minimum security posture, the alternatives that work, and the interface contract. We do not resell, rebuild, or reinvent any of them. Our job stops at the memory-server's pod boundary.
+> AuditTrace-AI ships one thing — a memory-server that is audit-by-design for LLM deployments in regulated industries. It depends on ten components that your enterprise either already runs or can procure from the established market (IdP, Postgres, Redis, object storage, vector DB, secret manager, LLM inference, observability, ingestion content-control, AMQP broker). We document each dependency's minimum security posture, the alternatives that work, and the interface contract. We do not resell, rebuild, or reinvent any of them. Our job stops at the memory-server's pod boundary.
 
-This framing — not a platform, not a suite, one well-scoped component with nine well-documented dependencies — is what makes AuditTrace-AI auditable. Platforms accumulate scope until nothing in them is auditable. This is the inverse bet.
+This framing — not a platform, not a suite, one well-scoped component with ten well-documented dependencies — is what makes AuditTrace-AI auditable. Platforms accumulate scope until nothing in them is auditable. This is the inverse bet.
 
 ## Gap assessment — consolidated
 

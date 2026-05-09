@@ -302,6 +302,44 @@ redis:
         cpu: 100m
         memory: 256Mi
 
+# -- RabbitMQ (ADR-057, ADR-048 scan-control broker) ───────────────────
+# Bitnami subchart wiring for the AMQP broker that carries scan
+# requests + verdicts + audit events between memory-server (Repo B)
+# and audittrace-content-control (Repo A). The AMQP topology
+# (exchanges, queues, bindings, DLX) is bootstrapped post-install
+# by templates/rabbitmq/job-amqp-topology-bootstrap.yaml.
+#
+# Single-node for dev / Profile A. Profile B/C should override
+# `clustering.enabled=true` + `replicaCount=3` for a quorum-queue
+# HA story.
+rabbitmq:
+  enabled: true
+  auth:
+    username: audittrace
+    password: ""
+    erlangCookie: ""
+  clustering:
+    enabled: false
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: local-path
+  metrics:
+    enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  # The Bitnami subchart's loadDefinition hook is NOT used —
+  # AMQP topology lives in templates/rabbitmq/job-amqp-topology-bootstrap.yaml
+  # so it can be re-run on chart upgrade idempotently and the
+  # topology is in version control alongside the chart.
+  loadDefinition:
+    enabled: false
+
 minio:
   enabled: true
   image:
@@ -445,6 +483,22 @@ secrets:
     token: ""
   redis:
     password: ""
+  rabbitmq:
+    # ADR-057 broker credentials. Set via:
+    #   --set-file secrets.rabbitmq.password=secrets/rabbitmq_password.txt
+    #   --set-file secrets.rabbitmq.erlangCookie=secrets/rabbitmq_erlang_cookie.txt
+    # Operator-supplied to keep the subchart's auth.password +
+    # auth.erlangCookie aligned with what setup-vault.sh seeds at
+    # `kv/audittrace/rabbitmq/{password,erlang_cookie}`.
+    password: ""
+    erlangCookie: ""
+    # Separate user for the audittrace-content-control sibling so
+    # vhost permissions can be scoped narrowly (consume from
+    # audittrace.scan.requests, publish to audittrace.scan.verdicts +
+    # audittrace.scan.audit). Bootstrapped by
+    # job-amqp-topology-bootstrap.yaml.
+    contentControlUser: content-control
+    contentControlPassword: ""
   minio:
     secretKey: ""
     kmsKey: ""
