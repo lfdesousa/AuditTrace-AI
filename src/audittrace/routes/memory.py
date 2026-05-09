@@ -251,7 +251,12 @@ def _require_admin(user: UserContext, action: str) -> None:
 
 @router.post("/upload")
 async def upload_memory_file(
-    request: Request[Any],
+    # ``Request[Any]`` would satisfy pre-commit mypy 1.8 (which can't
+    # see starlette's generic default), but FastAPI's Pydantic field
+    # introspection rejects it at route registration. Bare ``Request``
+    # is what every other route in this codebase uses; we silence the
+    # pre-commit-only error class explicitly.
+    request: Request,  # type: ignore[type-arg, unused-ignore]
     response: Response,
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
