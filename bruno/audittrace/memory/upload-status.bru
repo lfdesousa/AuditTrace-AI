@@ -1,0 +1,72 @@
+meta {
+  name: GET /memory/upload/status?scan_id — poll PDF scan verdict
+  type: http
+  seq: 92
+}
+
+get {
+  url: {{baseUrl}}/memory/upload/status?scan_id={{scanId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  scan_id: {{scanId}}
+}
+
+tests {
+  test("returns 200 OK", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("scan_id echoed in response", function() {
+    expect(res.body.scan_id).to.equal(bru.getVar("scanId"));
+  });
+
+  test("scan_status is in the closed set (migration 012)", function() {
+    const allowed = new Set([
+      'pending_scan',
+      'scanning',
+      'scanned_clean',
+      'rejected_malware',
+      'scan_failed',
+      'scan_unrecoverable',
+    ]);
+    expect(allowed.has(res.body.status)).to.equal(true);
+  });
+
+  test("trace_id + size_bytes + object_sha256 present", function() {
+    expect(res.body).to.have.property('trace_id');
+    expect(res.body).to.have.property('size_bytes');
+    expect(res.body).to.have.property('object_sha256');
+  });
+
+  test("created_at_ms <= modified_at_ms", function() {
+    expect(res.body.created_at_ms).to.be.at.most(res.body.modified_at_ms);
+  });
+}
+
+docs {
+  ADR-048 PR-B3 status-poll endpoint. Pairs with
+  ``upload-pdf.bru`` — the upload sets ``scanId`` via
+  ``vars:post-response``, this request reads it.
+
+  Owner-only by default: the requesting JWT's ``sub`` must match
+  the row's ``created_by_user_id``, OR the token must carry
+  ``audittrace:admin``. Cross-tenant lookups return the same 404
+  shape as "unknown scan_id" — existence is not leaked.
+
+  Closed-set ``status`` values pinned by migration 012 +
+  ``tests/test_memory_routes.py::TestScanStatusCodes`` (PR-B1):
+    pending_scan / scanning / scanned_clean / rejected_malware
+    / scan_failed / scan_unrecoverable
+
+  State transitions (set by PR-B4's verdict consumer):
+    pending_scan → scanned_clean       (clean verdict)
+    pending_scan → rejected_malware    (rejected verdict)
+    pending_scan → scan_failed         (scan_failed verdict)
+    pending_scan → scan_unrecoverable  (DLX after x-delivery-limit)
+}

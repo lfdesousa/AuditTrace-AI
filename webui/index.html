@@ -96,6 +96,20 @@
     .chip.sig-expired { background: #3a311f; color: #e0c067; }
     .chip.sig-none { background: #2a2e35; color: var(--muted); }
     .chip.sig-runtime { background: #2a2e35; color: var(--muted); font-style: italic; }
+    /* scan_status chips — closed-set per ADR-048 migration 012.
+       Mirrors the 6-class taxonomy memory_items.scan_status pins:
+         pending_scan / scanning  → in-flight (warn yellow)
+         scanned_clean            → ok (green)
+         rejected_malware         → err (red, bold for SOC eyes)
+         scan_failed              → warn (yellow, distinct from pending)
+         scan_unrecoverable       → err (red, no retry path)
+    */
+    .chip.scan-pending      { background: #3a311f; color: #e0c067; }
+    .chip.scan-scanning     { background: #3a311f; color: #e0c067; }
+    .chip.scan-clean        { background: #1f3a26; color: var(--ok); }
+    .chip.scan-rejected     { background: #4a1f25; color: #ff5e72; font-weight: 600; }
+    .chip.scan-failed       { background: #3a311f; color: #e0c067; font-style: italic; }
+    .chip.scan-unrecoverable { background: #4a1f25; color: #ff5e72; }
 
     /* Top-level tabs (Chat / Memory) */
     .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin: 0 0 16px; }
@@ -262,6 +276,43 @@
       <pre id="memDetailContent">—</pre>
       <h2 style="margin-top:14px;">Manifest</h2>
       <pre id="memDetailManifest">—</pre>
+    </div>
+
+    <!-- ── PDF upload + scan status (ADR-048 PR-B5) ──────────────── -->
+    <!-- PDFs land in the quarantine prefix and return HTTP 202 with
+         a scan_id. Markdown / non-PDF uploads still go through the
+         legacy synchronous path and are not surfaced here. -->
+    <div class="panel" id="memPdfUploadPanel">
+      <h2>Upload PDF (ADR-048 content-control)</h2>
+      <p class="subtitle">
+        PDF uploads land in <code>quarantine/&lt;user&gt;/&lt;scan_id&gt;/</code>
+        and return HTTP 202. Content-control's sibling pod scans them
+        and promotes clean files to <code>episodic/papers/</code>.
+        Status chip updates as the verdict consumer back-writes.
+      </p>
+      <div class="row">
+        <div>
+          <label>PDF file</label>
+          <input type="file" id="pdfUploadFile" accept="application/pdf,.pdf">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button id="pdfUploadBtn">Upload</button>
+        </div>
+      </div>
+      <table class="memory-list" id="pdfUploadList" style="margin-top:12px;">
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th>scan_id</th>
+            <th>Status</th>
+            <th>Size</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="pdfUploadEmpty" class="subtitle">No PDF uploads in this session yet.</p>
     </div>
   </div>
 
@@ -922,6 +973,106 @@ $('memForm').addEventListener('submit', async (e) => {
     log('err', `form submit failed`, String(err));
   }
 });
+
+// ── PDF upload + scan-status (ADR-048 PR-B5) ────────────────────────────────
+// Closed-set chip mapping per migration 012's scan_status enum.
+const SCAN_STATUS_CHIPS = {
+  'pending_scan':       { cls: 'scan-pending',      label: 'pending_scan' },
+  'scanning':           { cls: 'scan-scanning',     label: 'scanning' },
+  'scanned_clean':      { cls: 'scan-clean',        label: 'scanned_clean' },
+  'rejected_malware':   { cls: 'scan-rejected',     label: 'rejected_malware' },
+  'scan_failed':        { cls: 'scan-failed',       label: 'scan_failed' },
+  'scan_unrecoverable': { cls: 'scan-unrecoverable', label: 'scan_unrecoverable' },
+};
+
+// In-session list of {scan_id, filename, status, size_bytes, created_at_ms}.
+// Lives only in the browser tab — refresh wipes it. The backing
+// truth is memory_items in Postgres; this is the operator's view.
+const pdfUploads = [];
+
+function renderScanChip(status) {
+  const cfg = SCAN_STATUS_CHIPS[status] || { cls: 'warn', label: status || '—' };
+  return `<span class="chip ${cfg.cls}">${cfg.label}</span>`;
+}
+
+function renderPdfUploadList() {
+  const tbody = document.querySelector('#pdfUploadList tbody');
+  tbody.innerHTML = '';
+  $('pdfUploadEmpty').style.display = pdfUploads.length ? 'none' : '';
+  for (const item of pdfUploads) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><code>${item.filename}</code></td>
+      <td><code style="font-size:11px;">${item.scan_id}</code></td>
+      <td>${renderScanChip(item.status)}</td>
+      <td>${item.size_bytes ?? '—'}</td>
+      <td><button class="secondary small" data-poll="${item.scan_id}">Poll</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  for (const btn of tbody.querySelectorAll('button[data-poll]')) {
+    btn.addEventListener('click', () => pollScanStatus(btn.dataset.poll));
+  }
+}
+
+async function uploadPdf() {
+  const file = $('pdfUploadFile').files[0];
+  if (!file) {
+    log('warn', 'pdf upload', 'no file selected');
+    return;
+  }
+  const form = new FormData();
+  form.append('file', file, file.name);
+  const c = cfg();
+  const token = SS_get('access_token');
+  const url = `${c.apiBase}/memory/upload?layer=episodic`;
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body: form,
+    });
+  } catch (err) {
+    log('err', 'pdf upload network failure', String(err));
+    return;
+  }
+  let body;
+  try { body = await r.json(); } catch { body = null; }
+  if (r.status !== 202) {
+    const detail = (body && (body.detail || JSON.stringify(body))) || `HTTP ${r.status}`;
+    log('err', 'pdf upload failed', `status=${r.status} detail=${detail}`);
+    return;
+  }
+  pdfUploads.unshift({
+    scan_id: body.scan_id,
+    filename: file.name,
+    status: body.status || 'pending_scan',
+    size_bytes: body.size_bytes ?? file.size,
+    created_at_ms: Date.now(),
+  });
+  renderPdfUploadList();
+  log('ok', 'pdf upload accepted', `scan_id=${body.scan_id} status=${body.status}`);
+  // Auto-poll once after ~1s — usually enough for a clean PDF in dev.
+  setTimeout(() => pollScanStatus(body.scan_id), 1000);
+}
+
+async function pollScanStatus(scanId) {
+  try {
+    const data = await memApi('GET', `/memory/upload/status?scan_id=${encodeURIComponent(scanId)}`);
+    const item = pdfUploads.find(u => u.scan_id === scanId);
+    if (item) {
+      item.status = data.status;
+      renderPdfUploadList();
+    }
+    log('info', 'scan status', `scan_id=${scanId} status=${data.status}`);
+  } catch (err) {
+    log('err', 'scan status fetch failed', String(err));
+  }
+}
+
+$('pdfUploadBtn').addEventListener('click', uploadPdf);
+renderPdfUploadList();
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 const existing = SS_get('access_token');

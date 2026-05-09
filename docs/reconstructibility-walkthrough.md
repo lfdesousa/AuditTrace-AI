@@ -464,6 +464,71 @@ Four hops, four API calls. Same `user_id` + `session_id` + `trace_id` across all
 
 ---
 
+## ADR-048 — rejected-PDF scenario (the parser-exploit close)
+
+The chat-completion path in §Scenario above is the happy case for an
+authenticated user asking a question. ADR-048 closes a different
+attack: a malicious PDF uploaded via `/memory/upload` that would
+otherwise be parsed inside the same pod that holds Postgres / MinIO /
+ChromaDB / JWKS / Vault credentials. A parser exploit there is total
+credential compromise. The fix moves PDF parsing into a sibling pod
+(`audittrace-content-control`) with a separate identity, separate
+MinIO IAM role, and a separate AMQP queue.
+
+### The trail for a single rejected upload
+
+A user uploads `evil.pdf` (EICAR test signature embedded). The trail:
+
+| Hop | Where | What you see |
+|---|---|---|
+| 1 | **HTTP response** | `POST /memory/upload` returns **HTTP 202** (not 200) with `{scan_id, status: "pending_scan", poll_url, object_uri, object_sha256}`. The user did not get an immediate verdict — that's the whole point. |
+| 2 | **MinIO** | Bytes land in `s3://memory-shared/quarantine/<user_id>/<scan_id>/evil.pdf`. Memory-server's MinIO client refuses any subsequent GET against `quarantine/*` (PR-B2 app-layer denylist; PR-B7 MinIO IAM split for bucket-policy enforcement). |
+| 3 | **Postgres `memory_items`** | One row inserted: `id=<scan_id>`, `scan_status='pending_scan'`, `published_at_ms=NULL` (outbox marker), `trace_id=<W3C from current span>`. The NULL marker survives a process restart — the janitor re-enqueues orphans older than 60s. |
+| 4 | **RabbitMQ** | `audittrace.scan` topic exchange, routing key `scan.requested`. Quorum queue with `x-delivery-limit=5` + DLX (declared by PR-B2.5's Helm topology Job). |
+| 5 | **`audittrace-content-control` worker** | Consumes from `audittrace.scan.requests`, fetches bytes from MinIO via the content-control IAM role (NOT memory-server's), pipes to clamd via UDS, gets `FOUND EICAR-Test-Signature`. Publishes `Verdict{kind=rejected, threats=[…]}` and `SecurityAuditRow` on two separate exchanges. Deletes the bytes from quarantine. |
+| 6 | **`memory_items.scan_status` flip** | PR-B4's `ScanVerdictConsumer` reads `audittrace.scan.verdicts`, maps `rejected → rejected_malware`, UPDATEs the row, leaves `key` pointing at the (now-deleted) quarantine path. |
+| 7 | **`interactions` audit row** | PR-B4's `ScanAuditConsumer` reads `audittrace.scan.audit`, INSERTs an `interactions` row with `event_class='security'`, `failure_class='rejected'`, `error_detail` JSON carrying scanner identity + sigdb hash + threat name + family + confidence. |
+| 8 | **Tempo / Langfuse** | The W3C `traceparent` header on every AMQP message stitches the cross-service trace: memory-server's upload route → `ScanRequestPublisher.basic_publish` → content-control's `ScanWorker._process_one` → memory-server's two consumer spans. One `trace_id` end-to-end. |
+| 9 | **WebUI chip** | PR-B5's PDF upload panel polls `GET /memory/upload/status?scan_id=<id>` and surfaces a `rejected_malware` chip (red, bold) so an operator scanning the page sees the rejection without clicking through. |
+
+### What the auditor pulls from a single `scan_id`
+
+Cross-link table for ADR-048-flavoured rows:
+
+| Identifier | Postgres `memory_items` | Postgres `interactions` | RabbitMQ | Tempo / Langfuse |
+|---|---|---|---|---|
+| `scan_id` UUID | `id` PK | `error_detail.scan_id` | message `scan_id` field | span `scan.id` attr |
+| `trace_id` 32-hex | `trace_id` col | `trace_id` col | `traceparent` AMQP header | OTel `trace_id` |
+| `object_sha256` | `document_sha256` col | `error_detail.object_sha256` | message `object.sha256` | span `scan.object_sha256` attr |
+| `verdict` kind | `scan_status` col | `failure_class` col + `event_class='security'` | message `kind` field | span `scan.verdict` attr |
+
+Prerequisite invariants (per migration 012 + the `Test*` closed-set
+tests pinning them):
+
+* `memory_items.scan_status ∈ { pending_scan, scanning, scanned_clean, rejected_malware, scan_failed, scan_unrecoverable }`
+* `interactions.event_class ∈ { interaction, security }` (the row above carries `security`; chat-completion rows carry `interaction`)
+
+### Why this matters for V&V
+
+The Sovereignty-Reconstructibility Gap from `main_signed.pdf §7`
+asks: "given a single user identifier and a timestamp, can you
+reconstruct what the system did and why?" The ADR-048 chain
+extends the same answer to security events: the auditor lands on
+the `interactions.event_class='security'` row, jumps to the
+`memory_items` manifest by `scan_id`, drills into Tempo by
+`trace_id`, and sees the full cross-service span tree without
+trusting either repo to faithfully report on itself — the rows
+agree because the same `scan_id` + `trace_id` flowed through
+both producer + consumer at every hop.
+
+PR-A4's operator surfaces (`/v1/scan/stats`, `/v1/scan/status`,
+`/v1/scan/retrigger`) live alongside the audit chain — they answer
+"what is the scanner doing right now" without requiring the
+operator to leave content-control or scrape Prometheus, useful
+during incident triage.
+
+---
+
 ## The operator view — "Sovereign AI Operations" dashboard
 
 When the auditor isn't drilling into a specific request, the Grafana dashboard shows the posture at a glance: latency percentiles, error rate by type, LLM tokens/sec, OTel Collector queue saturation, container logs. If any panel goes red, there's something to investigate — the dashboard is how the day-to-day operator knows the audit trail is intact.
@@ -485,3 +550,5 @@ When the auditor isn't drilling into a specific request, the Grafana dashboard s
 - **ADR-033** — three-audience error envelope, failure-class taxonomy
 - **ADR-034** — long-running generation, per-chunk idle timeout, `X-Thinking`
 - **ADR-037** — agent tool audit boundary (this doc's "what is NOT" section)
+- **ADR-048** — ingestion content-control (this doc's "rejected-PDF scenario" section)
+- **ADR-057** — RabbitMQ broker for scan-control transport
