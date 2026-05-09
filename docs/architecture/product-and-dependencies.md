@@ -26,31 +26,34 @@ flowchart LR
     subgraph Dependencies["Market-standard infrastructure (bring your own)"]
         IDP["1. Identity Provider<br/>OAuth2 / OIDC"]
         PG["2. PostgreSQL<br/>RLS-capable, HA"]
-        R["3. Redis<br/>token + tool cache"]
+        R["3. Redis<br/>token + tool cache<br/>+ scan request/verdict streams"]
         OS["4. Object Storage<br/>S3 API"]
         VDB["5. Vector Database<br/>similarity + filter"]
         SEC["6. Secret Manager<br/>Vault / SOPS / ESO"]
         LLM["7. LLM Inference<br/>OpenAI-compatible endpoint"]
         OBS["8. Observability<br/>OTel + Tempo + Loki<br/>+ Prometheus + Langfuse"]
+        CC["9. Ingestion Content-Control<br/>ClamAV / ICAP / pluggable<br/>(ADR-048)"]
     end
     MS -->|JWT validation| IDP
     MS -->|SELECT / INSERT| PG
-    MS -->|GET / SETEX| R
+    MS -->|GET / SETEX + Streams| R
     MS -->|S3 GetObject / PutObject| OS
     MS -->|similarity + scope filter| VDB
     MS -->|read at pod start| SEC
     MS -->|chat.completions| LLM
     MS -->|OTLP + SDK| OBS
+    MS -->|verdict consumer<br/>via Redis Streams| CC
+    CC -->|GET quarantine/<br/>PUT episodic/papers/| OS
 
     classDef prod fill:#065f46,stroke:#10b981,color:#ecfdf5
     classDef dep fill:#1f2937,stroke:#64748b,color:#f1f5f9
     class MS prod
-    class IDP,PG,R,OS,VDB,SEC,LLM,OBS dep
+    class IDP,PG,R,OS,VDB,SEC,LLM,OBS,CC dep
 ```
 
 The product is the green box. The grey boxes are the enterprise's responsibility. We do not resell them, we do not claim to improve them, and we do not attempt to rebuild them. We consume them through well-defined interfaces that the ADRs specify.
 
-## The eight dependencies — in detail
+## The nine dependencies — in detail
 
 For each dependency we state the *role* (what we need it for), the *interface* (the concrete contract), the *default* (what the current chart ships for a dev install), the *production alternatives* (what the enterprise is free to substitute), the *minimum security posture* (what must be true for the enterprise deployment to be defensible), and the *current gap* (what is not yet implemented in this direction).
 
@@ -142,9 +145,20 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 | **Minimum security posture** | Observability backend is inside the jurisdiction. Traces/logs/metrics carry `user.id` tagging (ADR-026). Retention policies documented per data category. |
 | **Current gap** | Only the sibling Docker Compose deployment is documented. An operator with an existing Grafana stack would need to merge in by hand. An "integration guide per major platform" is a documentation gap, not a code gap. |
 
+### 9. Ingestion Content-Control (ADR-048)
+
+| Aspect | Detail |
+|---|---|
+| **Role** | Scan and classify externally-supplied bytes (PDF uploads today; future MIME types) before memory-server is allowed to parse them. Closes the trust-boundary gap where a parser exploit in the memory-server pod would inherit the full credential set (Postgres / MinIO / ChromaDB / JWKS / Vault token). Sits between `quarantine/` and `episodic/papers/` MinIO prefixes; refuses-by-default when unavailable. |
+| **Interface** | (a) Synchronous HTTP RPC `POST /v1/scan` over Istio mTLS (caller waits — small / interactive uploads). (b) Asynchronous: MinIO event notification → Redis Stream `audittrace:scan:requests` consumer-group, verdict published to `audittrace:scan:verdicts` (default path — caller does not block). (c) Operator surfaces: `/v1/scan/status`, `/v1/scan/retrigger`, `/v1/scan/stats`. (d) Health/ready/version. Full schema in repo A's `contracts/v1.yaml`. |
+| **Default (dev)** | `audittrace-content-control` sibling Helm chart (separate repo `lfdesousa/audittrace-content-control`, OCI-distributed via Docker Hub Pro under the `lfds` namespace) with ClamAV daemon + freshclam sidecar + FastAPI control-plane + asyncio scan-worker + vault-agent. |
+| **Production alternatives** | ICAP gateway (RFC 3507) fronting Symantec / Trend Micro / McAfee / Cisco / Sophos. Cloud-native scanners (Google Cloud DLP, AWS Macie, Azure Defender for Storage, VirusTotal API — sovereignty-permitting). Sandboxed detonation (Cuckoo, CAPE, Joe Sandbox) for higher-tier deployments. Service interface stays the same; backend swaps via Pydantic Settings + factory. |
+| **Minimum security posture** | Separate Kubernetes ServiceAccount, separate Vault path (`kv/audittrace/content-control/*`), separate MinIO IAM role (`content_control` — read+delete `quarantine/*`, write `episodic/papers/*`). Memory-server's IAM role (`audittrace_app`) cannot read `quarantine/*` (PR-B7 enforces at bucket-policy layer). Refuse-by-default: when scanner is unavailable, new uploads return 503 — defensible audit posture. Every verdict (clean and rejected) emits an `interactions` row with `event_class: security`. |
+| **Current gap** | ADR-048 still **Proposed**; PR sequence in flight: PR-B1 contract scaffolding (this PR), PR-A1 repo skeleton, PR-B2 Vault tree + bucket-init, PR-A2 ClamAV adapter, PR-A3 + PR-B4 paired async pipeline, PR-A4 operator surfaces, PR-B5 WebUI/Bruno/walkthrough, PR-B7 MinIO IAM split flips ADR-048 to **Accepted**. v1 ships ClamAV only; v2 adds content classification (PII / DLP / sensitivity); v3 adds sandboxed detonation. |
+
 ## Deployment profiles
 
-The same Helm chart ships three deployment profiles. Each profile is a different answer to *"which of the eight dependencies do you bring, and which do we bundle?"*
+The same Helm chart ships three deployment profiles. Each profile is a different answer to *"which of the nine dependencies do you bring, and which do we bundle?"*
 
 ### Profile A — Z-book (consultant laptop)
 
@@ -160,6 +174,7 @@ Everything on one device. Used by a single consultant doing client work on-devic
 | Secret Manager | Plain K8s Secrets (acceptable on a local single-user machine) |
 | LLM Inference | Host-level llama.cpp services |
 | Observability | Bundled sibling Docker Compose stack on same host |
+| Content-Control | Bundled `audittrace-content-control` sibling chart with ClamAV (default backend) |
 
 ### Profile B — Single-host on-premises (small team)
 
@@ -175,10 +190,11 @@ Everything still on one host but backed by real services. The shared small-team 
 | Secret Manager | SOPS or ESO (no full Vault deployment warranted at this scale) |
 | LLM Inference | Single GPU node running vLLM |
 | Observability | Bundled sibling stack |
+| Content-Control | Bundled `audittrace-content-control` sibling chart with ClamAV |
 
 ### Profile C — Enterprise (bring your own everything)
 
-The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datadog/Grafana-Cloud, a GPU cluster running Triton. AuditTrace-AI is deployed as a stateless workload that consumes all eight via configuration.
+The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datadog/Grafana-Cloud, a GPU cluster running Triton. AuditTrace-AI is deployed as a stateless workload that consumes all nine via configuration.
 
 | Dependency | Source |
 |---|---|
@@ -190,14 +206,15 @@ The enterprise runs Vault, Okta, HA PostgreSQL, ElastiCache Redis, AWS S3, Datad
 | Secret Manager | Enterprise Vault |
 | LLM Inference | Enterprise GPU pool with Triton or vLLM |
 | Observability | Enterprise Grafana Cloud / Datadog / equivalent |
+| Content-Control | Enterprise ICAP gateway / commercial AV / sandboxed detonation. The `audittrace-content-control` interface accepts any backend; operator points it at their own scanner via Pydantic Settings. |
 
 The Helm chart toggles between profiles via values overlay (`values-zbook.yaml`, `values-onprem.yaml`, `values-enterprise.yaml`). Existing chart supports A and B today; C is Phase 1 + Phase 3 of the roadmap.
 
 ## The story for enterprise architects
 
-> AuditTrace-AI ships one thing — a memory-server that is audit-by-design for LLM deployments in regulated industries. It depends on eight components that your enterprise either already runs or can procure from the established market (IdP, Postgres, Redis, object storage, vector DB, secret manager, LLM inference, observability). We document each dependency's minimum security posture, the alternatives that work, and the interface contract. We do not resell, rebuild, or reinvent any of them. Our job stops at the memory-server's pod boundary.
+> AuditTrace-AI ships one thing — a memory-server that is audit-by-design for LLM deployments in regulated industries. It depends on nine components that your enterprise either already runs or can procure from the established market (IdP, Postgres, Redis, object storage, vector DB, secret manager, LLM inference, observability, ingestion content-control). We document each dependency's minimum security posture, the alternatives that work, and the interface contract. We do not resell, rebuild, or reinvent any of them. Our job stops at the memory-server's pod boundary.
 
-This framing — not a platform, not a suite, one well-scoped component with eight well-documented dependencies — is what makes AuditTrace-AI auditable. Platforms accumulate scope until nothing in them is auditable. This is the inverse bet.
+This framing — not a platform, not a suite, one well-scoped component with nine well-documented dependencies — is what makes AuditTrace-AI auditable. Platforms accumulate scope until nothing in them is auditable. This is the inverse bet.
 
 ## Gap assessment — consolidated
 

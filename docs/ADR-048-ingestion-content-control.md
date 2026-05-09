@@ -421,3 +421,84 @@ The ADR is accepted when:
   embedder) live behind a controlled interface; the scanner follows
   the same principle one level higher (separate process, not just
   separate function).
+
+## Design session 2026-05-10 — locked decisions
+
+The PR sequence was scoped, the cross-repo split was confirmed, and
+six decisions were locked in a session 2026-05-10 morning (rationale
+captured in auto-memory `project_adr048_design_session`). This
+section is the immutable design header; future PRs reference it
+rather than re-arguing.
+
+1. **Two repos.** Repo A (private) — `https://github.com/lfdesousa/audittrace-content-control`
+   ships the scanner service + sibling Helm chart. Repo B (this repo,
+   public) ships the consumer + manifest schema + chart-side wiring.
+2. **Verdict and scan-request transport: Redis Streams behind a
+   `VerdictPublisher` / `ScanRequestConsumer` ABC.** Reuses ADR-046's
+   XADD/XREADGROUP/DLQ pattern. No tenth named dependency. Swappable
+   to NATS JetStream later via factory; routes/worker never import
+   redis.
+3. **MinIO trigger via `mc event add` → Redis Stream
+   `audittrace:scan:requests` → content-control consumer.** Hohpe
+   Polling Consumer + Idempotent Receiver. Content-control exposes
+   no inbound webhook surface.
+4. **Image + chart distribution: Docker Hub Pro under namespace
+   `lfds`.** Image: `docker.io/lfds/audittrace-content-control`.
+   Chart: `oci://registry-1.docker.io/lfds/audittrace-content-control-chart`.
+   PAT lives at Vault path `kv/audittrace/docker-hub/pat`; Vault
+   Agent renders the cluster's `imagePullSecret`. Reachable off-LAN
+   for M5 demo rehearsal.
+5. **Cross-repo discipline: interface-snapshot tests.** Repo A ships
+   `contracts/v1.yaml` (OpenAPI fragment + JSON Schemas for
+   `ScanRequestStreamEntry` / `VerdictStreamEntry`). Both repos
+   snapshot-test against it (mirrors `tests/test_openapi_drift.py`).
+   Independent PR cadence except for contract-changing PRs which
+   pair-merge.
+6. **PR ordering:** PR-B1 → PR-A1 → PR-B2 → (PR-A2, PR-A3, PR-B3,
+   PR-B4 paired) → PR-A4 → PR-B5 → PR-B7. PR-B7 lands the actual
+   MinIO IAM split and flips ADR-048 from Proposed → Accepted.
+
+### Bucket-policy enforcement — Option A path
+
+The current MinIO deployment uses a single root credential. ADR-027 §8
+flags role-based IAM as Phase 4 work. ADR-048's §Decision rule #1
+("memory-server must NEVER read pre-scanned bytes — enforced by MinIO
+bucket policy and the application role's IAM, not by application
+discipline") is closed in two stages:
+
+- **PR-B2 — application-layer denylist (defense-in-depth).** Memory-
+  server's MinIO client wraps `get_object` to refuse `quarantine/*`
+  keys, raising a closed-set error code. Tested through the public
+  API.
+- **PR-B7 — MinIO IAM split (the genuine close).** Two roles
+  (`audittrace_app`, `content_control`) provisioned via
+  `mc admin policy create` + `mc admin user attach-policy`. The
+  acceptance-criterion §2 test asserts a memory-server-keyed MinIO
+  client receives **HTTP 403 from MinIO itself** when GETting
+  `quarantine/*` — not from app code. The application-layer
+  denylist stays as defense-in-depth.
+
+ADR-048 stays **Proposed** until PR-B7 lands. The ADR's "M5 demo
+path" can degrade to "designed + scoped + scanner live with
+application-layer enforcement; bucket-policy enforcement scheduled
+for PR-B7" without losing the customer story.
+
+### v1 / v2 / v3 split — what ships when
+
+- **v1** (this PR sequence): ClamAV default backend, sync `/v1/scan`,
+  async path through Redis Streams, four outcome paths, audit
+  trail emission, operator surfaces, refuse-by-default.
+- **v2**: PII / DLP / sensitivity classification — additive
+  `scan_modes` field; same contract.
+- **v3**: Sandboxed/behavioural detonation — pluggable backend;
+  same interface.
+
+### Diagram persistence
+
+The C4 / class / sequence diagrams for this work live in repo A's
+`docs/architecture/workspace.dsl` (Structurizr DSL — L1+L2+L3) and
+`docs/architecture/class-diagram-{ports,adapters,factories}.md`
+(Mermaid). Repo B's `docs/architecture/workspace.dsl` (this repo)
+adds `audittrace-content-control` as a peer system in PR-B1; the
+sequence diagram for the full quarantine→scan→verdict→manifest
+cycle ships in PR-B4 / PR-A3 paired.

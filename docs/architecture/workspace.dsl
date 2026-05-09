@@ -43,6 +43,16 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             tags "External"
         }
 
+        // ADR-048 ingestion content-control (PR-B1 lands as peer; full
+        // L2/L3 view lives in the audittrace-content-control repo's
+        // workspace.dsl). Ninth named dependency per ADR-041 — separate
+        // pod, separate ServiceAccount, separate Vault path, separate
+        // MinIO IAM role. Memory-server PUTs to a quarantine prefix
+        // that content-control reads; verdicts ride a Redis Stream.
+        contentControl = softwareSystem "audittrace-content-control" "Reads quarantined uploads from MinIO, scans for malware (ClamAV default; ICAP / cloud / sandbox alternatives), publishes verdicts via Redis Stream. Promotes clean objects to episodic/papers/. Refuses-by-default when scanner unavailable. Lives in a separate private repo (lfdesousa/audittrace-content-control) and ships as a sibling Helm chart." {
+            tags "External"
+        }
+
         // The system
         memoryServer = softwareSystem "audittrace-server" "Transparent augmentation proxy with 4-layer memory + Keycloak-delegated identity" {
 
@@ -185,6 +195,20 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         memoryServer.redisCache -> memoryServer.api.asyncPersistConsumer "XREADGROUP > / XCLAIM idle pending — multi-pod safe via consumer group" "Redis Streams"
         memoryServer.api.asyncPersistConsumer -> memoryServer.postgresDb "_persist_interaction + _flush_pending_tool_calls (reused from sync path) → XACK on success" "SQLAlchemy ORM"
         memoryServer.api.asyncPersistConsumer -> memoryServer.redisCache "XADD audittrace:persist:dlq + XACK on poison (parse fail or delivery_count > max_deliveries)" "Redis Streams"
+
+        // ADR-048 ingestion content-control (PR-B1 contract scaffolding;
+        // full flow lands in PR-A3 + PR-B4). Memory-server PUTs to
+        // quarantine/, MinIO `mc event add` publishes object-created
+        // events to scan:requests stream, content-control consumes and
+        // scans, publishes verdicts to scan:verdicts stream, memory-
+        // server's verdict consumer updates manifest + emits SECURITY
+        // audit row.
+        memoryServer.api -> memoryServer.minioStore "PUT s3://shared/quarantine/<user_id>/<uuid>/<file> (audittrace_app role; bucket-policy denies GET on this prefix in PR-B7)" "S3 API"
+        memoryServer.minioStore -> memoryServer.redisCache "Publishes s3:ObjectCreated:Put on quarantine/* to audittrace:scan:requests stream" "MinIO event notification (mc event add)"
+        memoryServer.redisCache -> contentControl "XREADGROUP audittrace:scan:requests consumer-group=content-control" "Redis Streams (RESP3, mTLS)"
+        contentControl -> memoryServer.minioStore "GET quarantine/, PUT episodic/papers/, DELETE quarantine/ (content_control role)" "S3 API"
+        contentControl -> memoryServer.redisCache "XADD audittrace:scan:verdicts (clean / rejected / scan_failed) + DLQ on max_deliveries" "Redis Streams (RESP3, mTLS)"
+        memoryServer.redisCache -> memoryServer.api "XREADGROUP audittrace:scan:verdicts consumer-group=audittrace-verdict-consumers — updates memory_items.scan_status, emits interactions.event_class='security'" "Redis Streams"
 
         // DI wiring
         memoryServer.api.diContainer -> memoryServer.api.contextBuilder "Injects"

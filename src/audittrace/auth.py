@@ -82,6 +82,18 @@ ALL_SCOPES: dict[str, str] = {
     "memory:conversational:read-own": (
         "Read your own past conversations from the conversational layer"
     ),
+    "memory:upload:write": (
+        "Upload bytes (PDFs, etc.) into the ingestion content-control "
+        "pipeline (ADR-048). Distinct from memory:episodic:write because "
+        "uploads land in a quarantine prefix the memory-server cannot "
+        "read; promotion to episodic/papers/ happens only after a "
+        "scanner verdict."
+    ),
+    "audittrace:scan:retrigger": (
+        "Force a re-scan of an object in the ingestion content-control "
+        "pipeline (ADR-048 operator surface). Admin-grade; never "
+        "granted by default."
+    ),
 }
 
 

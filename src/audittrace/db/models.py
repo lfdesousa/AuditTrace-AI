@@ -109,6 +109,16 @@ class InteractionRecord(Base):
     # span context; indexed because the lookup pattern is "find rows by
     # trace_id". 32-char lowercase hex string per OTel format.
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Migration 012 (2026-05-10, ADR-048 PR-B1): closed-set
+    # ``{"interaction", "security"}``. ``interaction`` (legacy implicit)
+    # is the chat-completion / tool-call default; ``security`` is added
+    # by PR-B4's verdict consumer to distinguish content-control verdict
+    # rows from interaction rows so SOC tooling can alert on
+    # ``rejected_malware`` outcomes without scanning every row. Pinned
+    # by ``tests/test_memory_routes.py::TestEventClassValues``.
+    event_class: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, index=True
+    )
 
 
 class ToolCall(Base):
@@ -224,6 +234,19 @@ class MemoryItem(Base):
     # unsigned / non-LTV-enabled documents.
     ltv_data: Mapped[dict[str, Any] | None] = mapped_column(
         _PdfWarningsType, nullable=True
+    )
+
+    # ── ADR-048 ingestion content-control (migration 012, PR-B1) ──────
+    # Closed-set per ADR-048 §Failure modes:
+    # ``{"pending_scan", "scanning", "scanned_clean", "rejected_malware",
+    #    "scan_failed", "scan_unrecoverable"}``. Existing rows
+    # pre-dating migration 012 read NULL (non-uploads, pre-ADR-048
+    # uploads). PR-B3's rewrite of /memory/upload writes
+    # ``pending_scan`` on insert; PR-B4's verdict consumer transitions
+    # it to one of the terminal states. Pinned by
+    # ``tests/test_memory_routes.py::TestScanStatusCodes``.
+    scan_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
     )
 
     __table_args__ = (

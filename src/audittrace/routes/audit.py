@@ -66,6 +66,11 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         "error_detail": row.error_detail,
         "duration_ms": row.duration_ms,
         "trace_id": row.trace_id,
+        # Migration 012 (ADR-048 PR-B1): NULL on rows pre-dating the
+        # column; PR-B4 backfills chat-completion rows with
+        # ``"interaction"`` and writes ``"security"`` for content-control
+        # verdict rows.
+        "event_class": row.event_class,
     }
 
 

@@ -3099,6 +3099,50 @@ class TestSignatureStatusCodes:
         assert _SIGNATURE_STATUS_CODES == expected
 
 
+class TestScanStatusCodes:
+    """Closed-set discipline on the ``memory_items.scan_status`` enum
+    (per ADR-048 §Failure modes). Adding a new status value without an
+    ADR-048 amendment is a quiet audit-taxonomy drift; this test pins
+    the set so the drift surfaces in CI. Mirrors
+    :class:`TestSignatureStatusCodes`."""
+
+    def test_scan_status_codes_match_adr_048_closed_set(self) -> None:
+        from audittrace.routes.memory import _SCAN_STATUS_CODES
+
+        # The exact 6 values documented in ADR-048 §Failure modes table.
+        # Adding a value: bump the ADR + add it here. Removing one:
+        # same. CI fails the diff if these drift.
+        expected = {
+            "pending_scan",
+            "scanning",
+            "scanned_clean",
+            "rejected_malware",
+            "scan_failed",
+            "scan_unrecoverable",
+        }
+        assert _SCAN_STATUS_CODES == expected
+
+
+class TestEventClassValues:
+    """Closed-set discipline on the ``interactions.event_class`` enum.
+    ADR-048 introduces ``security`` to distinguish content-control
+    verdict rows from interaction rows so SOC tooling can alert on
+    rejections without scanning every interaction row.
+
+    Adding a new event class is a SOC-tooling-shape change — pinned
+    here to force the conversation."""
+
+    def test_event_class_values_match_adr_048_closed_set(self) -> None:
+        from audittrace.routes.memory import _EVENT_CLASS_VALUES
+
+        # ``interaction`` is the legacy implicit value (chat completions,
+        # tool calls); ``security`` is added by ADR-048's verdict
+        # consumer. Migration 012 backfills existing rows with
+        # ``interaction`` so the closed set is non-null going forward.
+        expected = {"interaction", "security"}
+        assert _EVENT_CLASS_VALUES == expected
+
+
 class TestPdfIsEncrypted:
     """Direct unit tests for ``_pdf_is_encrypted`` (tier-B item #15)."""
 
