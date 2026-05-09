@@ -1,0 +1,83 @@
+meta {
+  name: POST /memory/upload — PDF (ADR-048 quarantine flow)
+  type: http
+  seq: 91
+}
+
+post {
+  url: {{baseUrl}}/memory/upload?layer=episodic
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  layer: episodic
+}
+
+body:multipart-form {
+  file: @file(/tmp/eicar.pdf)
+}
+
+vars:post-response {
+  scanId: res.body.scan_id
+}
+
+tests {
+  test("returns 202 Accepted (PDF quarantine path)", function() {
+    expect(res.getStatus()).to.equal(202);
+  });
+
+  test("response carries scan_id + pending_scan status + poll_url", function() {
+    expect(res.body).to.have.property('scan_id');
+    expect(res.body.status).to.equal('pending_scan');
+    expect(res.body.poll_url).to.match(/\/memory\/upload\/status\?scan_id=/);
+  });
+
+  test("object_uri targets quarantine prefix (NOT episodic/papers)", function() {
+    // ADR-048 §1: PDFs land in quarantine first, not episodic/papers.
+    // Content-control's verdict consumer (PR-B4) rewrites the manifest
+    // key to episodic/papers/<scan_id>/<filename> on clean verdict.
+    expect(res.body.object_uri).to.include('/quarantine/');
+    expect(res.body.object_uri).to.not.include('/episodic/papers/');
+  });
+
+  test("size_bytes + object_sha256 present", function() {
+    expect(res.body).to.have.property('size_bytes');
+    expect(res.body).to.have.property('object_sha256');
+    expect(res.body.object_sha256).to.have.lengthOf(64);
+  });
+}
+
+docs {
+  ADR-048 PR-B3 PDF flow. Detection is content-type
+  (``application/pdf``) PLUS magic-byte sniff (``%PDF-``). Both
+  must pass; spoofed content-type slipping through is precisely
+  the parser-exploit attack surface ADR-048 closes.
+
+  PDF uploads:
+    1. PUT bytes to ``s3://memory-shared/quarantine/<user>/<scan_id>/<filename>``
+    2. INSERT memory_items (scan_status=pending_scan,
+       published_at_ms=NULL, trace_id=<W3C from current span>)
+    3. asyncio.Queue.put for the ScanRequestPublisher to drain
+    4. Return HTTP 202 + {scan_id, status, poll_url, object_uri,
+       object_sha256, size_bytes}
+
+  Markdown / non-PDF uploads keep the legacy synchronous path:
+  see ``upload-legacy.bru`` (returns HTTP 200, no scan_id).
+
+  Prepare a fixture ``/tmp/eicar.pdf`` containing a real PDF
+  (start with ``%PDF-1.7``). For full E2E dev-cluster validation
+  use the EICAR test signature embedded in a legitimate PDF
+  shell so the verdict comes back ``rejected_malware``.
+
+  Authorization: per-layer write scope ``memory:episodic:write``
+  (or ``audittrace:admin``). Layer mismatch → 403.
+
+  Pipeline gate: returns HTTP 503 when
+  ``AUDITTRACE_SCAN_PIPELINE_ENABLED=false``. The chart-flip PR
+  that turns this true is the live-evidence step.
+}
