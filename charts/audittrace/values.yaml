@@ -450,6 +450,33 @@ secrets:
     kmsKey: ""
   keycloak:
     adminPassword: "admin"
+  # ── ADR-048 PR-B2 — Docker Hub Pro pull credentials ────────────────
+  # Used to render `audittrace-dockerhub-pull` Secret of type
+  # kubernetes.io/dockerconfigjson so the cluster can pull
+  # docker.io/lfds/audittrace-content-control:* (and any future
+  # private images under the same namespace). When vault.enabled=true,
+  # values are sourced from kv/audittrace/docker-hub/pat via Vault
+  # Agent and the chart's secret-dockerhub-pull.yaml is skipped.
+  # Operator-supplied via:
+  #   --set-file secrets.dockerHub.pat=secrets/docker_hub_pat.txt
+  # The secrets/ directory is gitignored.
+  dockerHub:
+    username: ""
+    pat: ""
+
+# -- ADR-048 ingestion content-control (PR-B2) ───────────────────────────────
+# Cross-repo coupling to the audittrace-content-control sibling chart.
+# This top-level block lets the AuditTrace-AI chart reference the
+# sibling without managing its lifecycle (the sibling is its own
+# Helm release). Used by Istio AuthorizationPolicy stubs to whitelist
+# the content-control ServiceAccount on MinIO + Redis paths.
+contentControl:
+  # The ServiceAccount name the audittrace-content-control sibling
+  # chart creates (its serviceaccount.yaml uses the chart's own name
+  # by default — `audittrace-content-control`). Used in this chart's
+  # Istio AuthorizationPolicies so the sibling can reach MinIO and
+  # Redis.
+  serviceAccountName: "audittrace-content-control"
 
 # -- Vault (ADR-043) ---------------------------------------------------------
 # When vault.enabled=true, secrets are sourced from in-cluster Vault via the

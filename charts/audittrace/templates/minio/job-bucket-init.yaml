@@ -1,0 +1,122 @@
+{{- /* ADR-048 PR-B2 — MinIO bucket-init Job.
+
+       Post-install / post-upgrade Helm hook that ensures the
+       memory-shared bucket has the `quarantine/` prefix
+       structure that ADR-048 expects. Idempotent: re-running
+       against an already-initialised bucket is a no-op.
+
+       The Job uses the bare `mc` client + the MinIO root credentials
+       (PR-B2 pre-dates PR-B7's IAM split, so there's only one
+       credential pair to use). Once PR-B7 lands the audittrace_app
+       and content_control roles, this Job's mc commands grow to
+       create the policies + users via `mc admin policy create` +
+       `mc admin user attach-policy`.
+
+       Why a Job, not a one-shot kubectl exec: idempotent re-runs
+       on every helm upgrade keep the bucket structure aligned with
+       the chart, which is the discipline `feedback_no_more_drifts`
+       names ("every chart/code change that introduces chart↔cluster
+       coupling needs an automated provisioner OR a drift-guard
+       test"). The Job IS the automated provisioner for the
+       bucket-prefix coupling.
+
+       NOTE on `mc event add`: ADR-048 originally specified
+       MinIO-event-notification → Redis Stream `audittrace:scan:requests`,
+       but MinIO's `notify_redis` target writes to a Redis LIST
+       (RPUSH), NOT a Stream (XADD). The pragmatic correction is for
+       memory-server's `/memory/upload` rewrite (PR-B3) to do the
+       XADD directly after the PUT + manifest INSERT. The
+       MinIO-event-notification path is dropped from PR-B2;
+       memory-server itself becomes the scan-request producer.
+       Crash-window between PUT and XADD is recoverable via
+       idempotent retry on the upload route (same SHA → same scan_id). */ -}}
+{{- if .Values.minio.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-minio-bucket-init
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    # Helm will delete the previous Job before installing this one
+    # so re-runs don't conflict on the same Job name.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.labels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-bucket-init
+      annotations:
+        # Skip the Istio sidecar — this Job runs once at install/upgrade
+        # and doesn't need mTLS scoping.
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MINIO_URL
+              value: "http://{{ .Release.Name }}-minio:9000"
+            - name: MINIO_ACCESS_KEY
+              value: "minioadmin"
+            - name: MINIO_SECRET_KEY
+              {{- if .Values.vault.enabled }}
+              # Vault Agent renders /vault/secrets/env (operator
+              # sets this up alongside setup-vault.sh).
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-secret
+                  key: root-password
+                  optional: true
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-secret
+                  key: root-password
+              {{- end }}
+            - name: SHARED_BUCKET
+              value: {{ .Values.memoryServer.env.AUDITTRACE_MINIO_SHARED_BUCKET | default "memory-shared" | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "▶ Waiting for MinIO at ${MINIO_URL}..."
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                mc alias set local "${MINIO_URL}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" >/dev/null 2>&1 \
+                  && mc admin info local >/dev/null 2>&1 \
+                  && break
+                sleep 2
+              done
+
+              echo "▶ Ensuring bucket ${SHARED_BUCKET} exists..."
+              if mc ls "local/${SHARED_BUCKET}" >/dev/null 2>&1; then
+                echo "  ✓ ${SHARED_BUCKET} already exists"
+              else
+                mc mb "local/${SHARED_BUCKET}"
+                echo "  ✓ created ${SHARED_BUCKET}"
+              fi
+
+              echo "▶ Ensuring quarantine/ prefix is present..."
+              # MinIO has no native concept of empty prefixes; we put
+              # an .keep marker so listing the bucket shows quarantine/
+              # exists and any operator can confirm via `mc ls`.
+              if mc stat "local/${SHARED_BUCKET}/quarantine/.keep" >/dev/null 2>&1; then
+                echo "  ✓ quarantine/.keep already present"
+              else
+                printf "ADR-048 PR-B2 — quarantine prefix marker. Do not delete.\n" \
+                  | mc pipe "local/${SHARED_BUCKET}/quarantine/.keep"
+                echo "  ✓ quarantine/.keep created"
+              fi
+
+              echo "▶ Listing top-level prefixes:"
+              mc ls "local/${SHARED_BUCKET}" || true
+
+              echo "✅ Bucket init complete."
+{{- end }}

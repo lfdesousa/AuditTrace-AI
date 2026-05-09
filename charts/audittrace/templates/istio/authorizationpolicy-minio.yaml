@@ -11,6 +11,8 @@ spec:
       app.kubernetes.io/component: minio
   action: ALLOW
   rules:
+    # memory-server: full bucket access today (PR-B7 will narrow this
+    # to the audittrace_app role's allowed prefixes via MinIO IAM).
     - from:
         - source:
             principals:
@@ -18,4 +20,20 @@ spec:
       to:
         - operation:
             ports: ["9000"]
+    # ADR-048 PR-B2: content-control sibling SA. mTLS-level allow;
+    # the actual bucket-prefix scoping (read-only on quarantine/,
+    # write on episodic/papers/, etc.) lands at the MinIO IAM layer
+    # in PR-B7 (`mc admin policy create content_control` +
+    # `mc admin user attach-policy`).
+    {{- if .Values.contentControl }}
+    {{- if .Values.contentControl.serviceAccountName }}
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.contentControl.serviceAccountName }}"
+      to:
+        - operation:
+            ports: ["9000"]
+    {{- end }}
+    {{- end }}
 {{- end }}

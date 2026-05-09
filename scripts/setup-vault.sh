@@ -204,6 +204,23 @@ seed_kv redis/main password=redis_password.txt
 seed_kv chromadb/main token=chroma_token.txt
 seed_kv minio/root secret_key=minio_secret_key.txt kms_master_key=minio_kms_key.txt
 
+# ── ADR-048 PR-B2 — Docker Hub Pro PAT + content-control paths ────────
+# Docker Hub PAT for the cluster's imagePullSecret (rendered by
+# secrets/secret-dockerhub-pull.yaml). Operator drops the PAT into
+# secrets/docker_hub_pat.txt (gitignored; .example template
+# committed) and re-runs setup-vault.sh.
+seed_kv docker-hub/pat username=docker_hub_username.txt pat=docker_hub_pat.txt
+
+# Content-control sibling service reads from these Vault paths via
+# its own Vault Agent annotations (audittrace-content-control's
+# charts/.../deployment.yaml). PR-B2 leaves this empty — the
+# RabbitMQ broker decision (ADR-057, lands in PR-B2.5) means
+# content-control reads from kv/audittrace/content-control/rabbitmq
+# (created in PR-B2.5), NOT Redis. For PR-A2 we may add a
+# `signature_db` path if ClamAV's freshclam needs auth, and PR-B7
+# will add dedicated `minio` IAM-role credentials when the
+# bucket-policy split lands.
+
 # ─── Bitnami Redis password sync (closes 2026-05-04 drift class) ─────
 # The Bitnami Redis subchart auto-generates the password into the k8s
 # secret '${RELEASE}-redis' on first install. The seed_kv call above
@@ -226,6 +243,9 @@ if [[ -n "${RPW_FROM_K8S}" ]]; then
   vault_exec kv put "${KV_MOUNT}/audittrace/redis/main" \
     password="${RPW_FROM_K8S}" >/dev/null
   echo "  ✓ ${KV_MOUNT}/audittrace/redis/main aligned to k8s secret '${RELEASE}-redis'"
+  # Content-control does NOT need Redis access (ADR-048 broker
+  # decision: RabbitMQ in PR-B2.5 / ADR-057). No content-control/redis
+  # alignment performed.
 else
   echo "  ⊝ k8s secret '${RELEASE}-redis' not found — skipping (chart not installed yet?)"
 fi
