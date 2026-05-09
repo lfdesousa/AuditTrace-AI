@@ -87,6 +87,20 @@
       "attributes": {
         "include.in.token.scope": "true"
       }
+    },
+    {
+      "name": "memory:upload:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "audittrace:scan:retrigger",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     }
   ],
   "clients": [

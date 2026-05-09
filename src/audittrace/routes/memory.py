@@ -74,11 +74,14 @@ from audittrace.models import (
 # (``from audittrace.routes.memory import _PDF_WARNING_CODES``) keep
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
+from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.services.embedder import SINGLETON_EMBEDDER
 from audittrace.services.memory_manifest import ManifestEntry
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
+_SCAN_STATUS_CODES = _scan._SCAN_STATUS_CODES
+_EVENT_CLASS_VALUES = _scan._EVENT_CLASS_VALUES
 _PDFA_PART_RE = _pdf._PDFA_PART_RE
 _PDFA_CONFORMANCE_RE = _pdf._PDFA_CONFORMANCE_RE
 _PEM_CERT_RE = _pdf._PEM_CERT_RE

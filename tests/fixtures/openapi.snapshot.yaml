@@ -657,6 +657,8 @@ components:
             audittrace:context: Read context-builder output for a query
             audittrace:index: Trigger semantic-store reindex (legacy dev client)
             audittrace:query: Issue chat completions and inference queries
+            audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
+              surface). Admin-grade; never granted by default.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
             memory:episodic:read: Read episodic-layer (ADR-style) documents
             memory:episodic:write: Create/update/delete episodic-layer documents
@@ -664,6 +666,9 @@ components:
             memory:procedural:write: Create/update/delete procedural-layer documents
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
+            memory:upload:write: Upload bytes (PDFs, etc.) into the ingestion content-control pipeline (ADR-048). Distinct
+              from memory:episodic:write because uploads land in a quarantine prefix the memory-server cannot read; promotion
+              to episodic/papers/ happens only after a scanner verdict.
           tokenUrl: /protocol/openid-connect/token
       type: oauth2
 info:
