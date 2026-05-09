@@ -502,6 +502,22 @@ secrets:
   minio:
     secretKey: ""
     kmsKey: ""
+    # ── ADR-048 PR-B7 — IAM split user credentials ─────────────────
+    # Two scoped users provisioned by the bucket-init Job and
+    # consumed by memory-server (audittrace_app) and
+    # content-control's sibling pod (content_control). Both
+    # passwords seeded by setup-vault.sh into
+    # kv/audittrace/minio/{audittrace_app,content_control}.
+    # Set the password values via --set-file at install time:
+    #   --set-file secrets.minio.audittraceAppPassword=secrets/minio_audittrace_app_password.txt
+    #   --set-file secrets.minio.contentControlPassword=secrets/minio_content_control_password.txt
+    # The username defaults match the policy + user names the
+    # bucket-init Job creates; override only if a deployment needs
+    # different identifiers.
+    audittraceAppUser: audittrace_app
+    audittraceAppPassword: ""
+    contentControlUser: content_control
+    contentControlPassword: ""
   keycloak:
     adminPassword: "admin"
   # ── ADR-048 PR-B2 — Docker Hub Pro pull credentials ────────────────

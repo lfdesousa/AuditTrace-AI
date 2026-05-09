@@ -1,16 +1,19 @@
-{{- /* ADR-048 PR-B2 — MinIO bucket-init Job.
+{{- /* ADR-048 PR-B2 + PR-B7 — MinIO bucket-init Job.
 
-       Post-install / post-upgrade Helm hook that ensures the
-       memory-shared bucket has the `quarantine/` prefix
-       structure that ADR-048 expects. Idempotent: re-running
-       against an already-initialised bucket is a no-op.
+       Post-install / post-upgrade Helm hook that:
+       1. Ensures the memory-shared bucket has the `quarantine/`
+          prefix structure that ADR-048 expects (PR-B2).
+       2. Provisions the IAM split per ADR-048 Decision rule §1:
+          two policies (audittrace_app + content_control) and two
+          users with the respective policy attached (PR-B7).
+       3. The audittrace_app policy explicitly DENIES read on
+          `quarantine/*` so memory-server cannot read pre-scanned
+          bytes even if its app-layer denylist (PR-B2's
+          QuarantineDenyingMinioClient) were bypassed.
 
-       The Job uses the bare `mc` client + the MinIO root credentials
-       (PR-B2 pre-dates PR-B7's IAM split, so there's only one
-       credential pair to use). Once PR-B7 lands the audittrace_app
-       and content_control roles, this Job's mc commands grow to
-       create the policies + users via `mc admin policy create` +
-       `mc admin user attach-policy`.
+       Idempotent: re-running against an already-provisioned MinIO
+       is a no-op (mc admin policy create / user add are
+       idempotent on existing names; create-or-update semantics).
 
        Why a Job, not a one-shot kubectl exec: idempotent re-runs
        on every helm upgrade keep the bucket structure aligned with
@@ -82,6 +85,39 @@ spec:
               {{- end }}
             - name: SHARED_BUCKET
               value: {{ .Values.memoryServer.env.AUDITTRACE_MINIO_SHARED_BUCKET | default "memory-shared" | quote }}
+            # PR-B7 — IAM split user credentials. Both come from
+            # Vault paths seeded by `scripts/setup-vault.sh`:
+            #   kv/audittrace/minio/audittrace_app
+            #   kv/audittrace/minio/content_control
+            # rendered into k8s Secrets by Vault Agent (or the
+            # `secrets/secret-minio-iam.yaml` template when
+            # vault.enabled=false). Optional secret refs so the
+            # chart still renders cleanly while operators are
+            # mid-bootstrap.
+            - name: AUDITTRACE_APP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-iam
+                  key: audittrace_app_user
+                  optional: true
+            - name: AUDITTRACE_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-iam
+                  key: audittrace_app_password
+                  optional: true
+            - name: CONTENT_CONTROL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-iam
+                  key: content_control_user
+                  optional: true
+            - name: CONTENT_CONTROL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-iam
+                  key: content_control_password
+                  optional: true
           command:
             - /bin/sh
             - -c
@@ -118,5 +154,104 @@ spec:
               echo "▶ Listing top-level prefixes:"
               mc ls "local/${SHARED_BUCKET}" || true
 
-              echo "✅ Bucket init complete."
+              # ── PR-B7 — IAM split provisioning ──────────────────────
+              if [ -z "${AUDITTRACE_APP_PASSWORD:-}" ] || [ -z "${CONTENT_CONTROL_PASSWORD:-}" ]; then
+                echo "  ⊝ IAM split passwords not supplied (secret '${RELEASE_NAME:-${SHARED_BUCKET}}-minio-iam' missing)"
+                echo "  ⊝ Skipping IAM split — memory-server + content-control will keep using root creds"
+                echo "  ⊝ Re-run after `setup-vault.sh` seeds kv/audittrace/minio/{audittrace_app,content_control}"
+                echo "✅ Bucket init complete (IAM split skipped)."
+                exit 0
+              fi
+
+              echo "▶ Materialising MinIO IAM policies (ADR-048 PR-B7)..."
+
+              # audittrace_app: PUT to quarantine/, full access to
+              # episodic/ + procedural/. EXPLICIT DENY on
+              # GET/quarantine/* so a memory-server bug or compromised
+              # adapter cannot read pre-scanned bytes.
+              cat >/tmp/audittrace_app.json <<JSON
+              {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::${SHARED_BUCKET}/quarantine/*"]
+                  },
+                  {
+                    "Effect": "Deny",
+                    "Action": ["s3:GetObject", "s3:DeleteObject"],
+                    "Resource": ["arn:aws:s3:::${SHARED_BUCKET}/quarantine/*"]
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+                      "s3:ListBucket"
+                    ],
+                    "Resource": [
+                      "arn:aws:s3:::${SHARED_BUCKET}",
+                      "arn:aws:s3:::${SHARED_BUCKET}/episodic/*",
+                      "arn:aws:s3:::${SHARED_BUCKET}/procedural/*",
+                      "arn:aws:s3:::${SHARED_BUCKET}/trust-store/*"
+                    ]
+                  }
+                ]
+              }
+              JSON
+
+              # content_control: GET + DELETE on quarantine/, PUT on
+              # episodic/papers/. EXPLICIT DENY on episodic/* outside
+              # papers/ + procedural/ + trust-store/ so a compromised
+              # content-control cannot read user data.
+              cat >/tmp/content_control.json <<JSON
+              {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+                    "Resource": [
+                      "arn:aws:s3:::${SHARED_BUCKET}",
+                      "arn:aws:s3:::${SHARED_BUCKET}/quarantine/*"
+                    ]
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::${SHARED_BUCKET}/episodic/papers/*"]
+                  },
+                  {
+                    "Effect": "Deny",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [
+                      "arn:aws:s3:::${SHARED_BUCKET}/procedural/*",
+                      "arn:aws:s3:::${SHARED_BUCKET}/trust-store/*"
+                    ]
+                  }
+                ]
+              }
+              JSON
+
+              mc admin policy create local audittrace_app /tmp/audittrace_app.json
+              echo "  ✓ policy audittrace_app created"
+              mc admin policy create local content_control /tmp/content_control.json
+              echo "  ✓ policy content_control created"
+
+              echo "▶ Provisioning IAM users + attaching policies..."
+              mc admin user add local "${AUDITTRACE_APP_USER}" "${AUDITTRACE_APP_PASSWORD}" \
+                || echo "  ⊝ user ${AUDITTRACE_APP_USER} may already exist (idempotent)"
+              mc admin user add local "${CONTENT_CONTROL_USER}" "${CONTENT_CONTROL_PASSWORD}" \
+                || echo "  ⊝ user ${CONTENT_CONTROL_USER} may already exist (idempotent)"
+              mc admin policy attach local audittrace_app --user "${AUDITTRACE_APP_USER}" \
+                || echo "  ⊝ audittrace_app already attached (idempotent)"
+              mc admin policy attach local content_control --user "${CONTENT_CONTROL_USER}" \
+                || echo "  ⊝ content_control already attached (idempotent)"
+              echo "  ✓ users + policies provisioned"
+
+              # Wipe credential files so the in-Job logs don't accidentally
+              # leak them on tail-time verbose output.
+              rm -f /tmp/audittrace_app.json /tmp/content_control.json
+
+              echo "✅ Bucket init complete (IAM split active)."
 {{- end }}

@@ -1,12 +1,24 @@
 # ADR-048 — Ingestion content-control service
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-10 — IAM split landed in PR-B7)
 **Date:** 2026-05-07
 **Deciders:** Luis Filipe de Sousa
+**Status history:**
+- 2026-05-07 — Proposed
+- 2026-05-10 — Accepted; PR-A1 + PR-A2 + PR-A3 + PR-A4 (repo
+  `audittrace-content-control`) and PR-B1 + PR-B2 + PR-B2.5 +
+  PR-B3 + PR-B4 + PR-B5 + PR-B7 (this repo) merged. The
+  Decision rule §1 invariant ("memory-server must NEVER read
+  pre-scanned bytes") is now enforced by MinIO bucket-policy IAM
+  via the `audittrace_app` policy's explicit `Deny` on
+  `s3:GetObject` against `quarantine/*`, in addition to the
+  application-layer `QuarantineDenyingMinioClient` shipped in
+  PR-B2 (defense-in-depth).
 **Related:** ADR-027 (MinIO object storage), ADR-029 (audit trail
 completeness), ADR-041 (product boundary — eight named dependencies),
 ADR-043 (Vault as sole secret store), ADR-046 (async chat-completion
-persistence — pattern reuse), ADR-047 (server-side embedding).
+persistence — pattern reuse), ADR-047 (server-side embedding),
+ADR-057 (RabbitMQ broker for scan-control transport — added 2026-05-10).
 
 ## Context
 
