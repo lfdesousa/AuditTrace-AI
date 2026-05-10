@@ -178,6 +178,25 @@ memoryServer:
     AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS: "eu_lotl,swiss_tsl"
     AUDITTRACE_PDF_TRUST_STORE_SWISS_TSLO_CERT_PATH: "/etc/audittrace/swiss-federal-tsl/CH-TL-cert.der"
     AUDITTRACE_PDF_TRUST_STORE_S3_KEY: "trust-store/eu-lotl-bundle.pem"
+    # ── ADR-048 PR-B3..B8 — async scan pipeline runtime configuration ──
+    # These 7 settings are the contract memory-server's lifespan reads
+    # to wire the scan pipeline. Without them the publisher / janitor /
+    # verdict consumer / audit consumer tasks never schedule.
+    # AUDITTRACE_SCAN_AMQP_URL is constructed in
+    # templates/memory-server/deployment.yaml (vault.enabled=false branch)
+    # or exported by Vault Agent (vault.enabled=true branch); see the
+    # vaultAnnotations.memoryServer helper.
+    AUDITTRACE_SCAN_PIPELINE_ENABLED: "true"
+    AUDITTRACE_SCAN_REQUEST_EXCHANGE: "audittrace.scan"
+    # Must match the topology bootstrap Job's binding pattern
+    # `scan.request.*` (templates/rabbitmq/job-amqp-topology-bootstrap.yaml).
+    # Earlier value `scan.requested` (singular, no segment) silently
+    # drops on the broker because no queue binding matches.
+    AUDITTRACE_SCAN_REQUEST_ROUTING_KEY: "scan.request.new"
+    AUDITTRACE_SCAN_QUARANTINE_PREFIX: "quarantine"
+    AUDITTRACE_SCAN_PUBLISHER_DRAIN_INTERVAL_MS: "100"
+    AUDITTRACE_SCAN_JANITOR_INTERVAL_SECONDS: "30"
+    AUDITTRACE_SCAN_JANITOR_GRACE_SECONDS: "60"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
     # OTEL_RESOURCE_ATTRIBUTES is templated in

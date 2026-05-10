@@ -36,4 +36,16 @@ spec:
             ports: ["9000"]
     {{- end }}
     {{- end }}
+    # ADR-048 PR-B8: bucket-init Job — runs `mc admin policy create`
+    # + `mc admin user add` on every helm install/upgrade. Needs mTLS
+    # access to port 9000 so MinIO accepts the management calls.
+    # Dedicated SA `<release>-bucket-init` keeps the principal scope
+    # tight (lifetime = chart hooks).
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-bucket-init"
+      to:
+        - operation:
+            ports: ["9000"]
 {{- end }}

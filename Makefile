@@ -155,6 +155,37 @@ k8s-deps: ## Update Helm chart dependencies (Bitnami subcharts)
 k8s-template: ## Render templates without installing (dry-run)
 	@helm template $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
 
+helm-lint: ## Mirror the CI helm-lint job locally (both vault.enabled={false,true} blocks). Run before any chart commit.
+	@echo "🪖  helm lint (vault.enabled=false)..."
+	@helm lint $(CHART_DIR) \
+	  --set vault.enabled=false \
+	  --set secrets.minio.secretKey=ci-test \
+	  --set secrets.minio.kmsKey=ci-test \
+	  --set secrets.chromadb.token=ci-test \
+	  --set secrets.keycloak.adminPassword=ci-test \
+	  --set secrets.postgres.appPassword=ci-test \
+	  --set secrets.postgres.password=ci-test \
+	  --set secrets.redis.password=ci-test \
+	  --set secrets.summariser.password=ci-test
+	@echo "🪖  helm template (vault.enabled=true) + vaultSecretFileGuard count..."
+	@helm template $(RELEASE) $(CHART_DIR) -n $(NAMESPACE) \
+	  --set vault.enabled=true \
+	  --set secrets.minio.secretKey=ci-test \
+	  --set secrets.minio.kmsKey=ci-test \
+	  --set secrets.chromadb.token=ci-test \
+	  --set secrets.keycloak.adminPassword=ci-test \
+	  --set secrets.postgres.appPassword=ci-test \
+	  --set secrets.postgres.password=ci-test \
+	  --set secrets.redis.password=ci-test \
+	  --set secrets.summariser.password=ci-test \
+	  > /tmp/audittrace-helm-rendered.yaml
+	@guards=$$(grep -c "Vault Agent did not inject /vault/secrets/env (exit 79)" /tmp/audittrace-helm-rendered.yaml || echo 0); \
+	  if [ "$$guards" -lt 3 ]; then \
+	    echo "❌ expected >=3 vaultSecretFileGuard occurrences, found $$guards"; \
+	    exit 1; \
+	  fi; \
+	  echo "✅ vaultSecretFileGuard present in $$guards workloads"
+
 deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + Vault injector probe (REQUIRED before any cluster mutation)
 	@TAG="$(TAG)" CHART_DIR=$(CHART_DIR) RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) \
 	  scripts/deploy-preflight.sh
@@ -162,8 +193,8 @@ deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + V
 verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /metrics, pg_isready, Tempo traces, Loki ERROR threshold (Phase C.12)
 	@RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) scripts/post-deploy-verify.sh
 
-k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported.
-	@scripts/setup-vault.sh
+k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported. SECRETS_DIR defaults to ~/work/audittrace-private/secrets/ — override to point elsewhere.
+	@SECRETS_DIR=$${SECRETS_DIR:-$$HOME/work/audittrace-private/secrets} scripts/setup-vault.sh
 	@scripts/setup-memory-scopes.sh
 
 sync-requirements: ## Regenerate requirements.txt from pyproject.toml (single source of truth). Run after touching dependencies; the requirements-sync hook + CI job block drifted state.

@@ -217,6 +217,10 @@ The CI gate still requires the PR body sections.
   `export VAULT_TOKEN=<root-or-operator-token> && make k8s-bootstrap-secrets`.
   Idempotent. Chains `setup-vault.sh` (Vault policies + roles + KV seeds)
   and `setup-memory-scopes.sh` (Keycloak `memory:*:write` scopes).
+  Operator seed files live in `~/work/audittrace-private/secrets/` (mode
+  600, never in-repo). Override the source dir with `SECRETS_DIR=… make
+  k8s-bootstrap-secrets`. The default in the Makefile target points at
+  the private dir.
 - **Verify gate (always run after any deploy):** `make verify-deploy`.
   9 checks including pod readiness, helm release status, `/health`,
   `/metrics`, `pg_isready`, Tempo / Loki, and a Vault drift guard

@@ -152,9 +152,22 @@ vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
   export AUDITTRACE_CHROMA_TOKEN='{{ "{{ .Data.data.token }}" }}'
   {{ "{{ end }}" }}
-  {{ "{{ with secret \"kv/data/audittrace/minio/root\" }}" }}
-  export AUDITTRACE_MINIO_SECRET_KEY='{{ "{{ .Data.data.secret_key }}" }}'
+  {{ "{{ with secret \"kv/data/audittrace/minio/audittrace_app\" }}" }}
+  # ADR-048 PR-B8 — memory-server's MinIO client uses the scoped
+  # `audittrace_app` user (not root). The IAM policy attached to this
+  # user has an explicit DENY on s3:GetObject against quarantine/*,
+  # which is the parser-exploit close (ADR-048 Decision rule §1).
+  export AUDITTRACE_MINIO_ACCESS_KEY='{{ "{{ .Data.data.username }}" }}'
+  export AUDITTRACE_MINIO_SECRET_KEY='{{ "{{ .Data.data.password }}" }}'
   {{ "{{ end }}" }}
+  # ADR-057 / PR-B8 — AUDITTRACE_RABBITMQ_PASSWORD + AUDITTRACE_SCAN_AMQP_URL
+  # are sourced from the Bitnami subchart's `<release>-rabbitmq` Secret
+  # via plain secretKeyRef + $() expansion in the deployment template
+  # (NOT via Vault Agent). Rationale: the Bitnami Secret is already the
+  # source of truth for RabbitMQ creds — Vault would just mirror it
+  # (same pattern as Redis). Keeps the audittrace-server Vault policy
+  # surface narrow and avoids a coupling that would force a policy
+  # upload on every chart upgrade.
 {{- end }}
 
 {{/*
