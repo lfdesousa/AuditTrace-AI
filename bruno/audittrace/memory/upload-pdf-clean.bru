@@ -1,0 +1,85 @@
+meta {
+  name: POST /memory/upload — clean PDF (ADR-048 happy path)
+  type: http
+  seq: 93
+}
+
+post {
+  url: {{baseUrl}}/memory/upload?layer=episodic
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  layer: episodic
+}
+
+body:multipart-form {
+  file: @file(/tmp/clean.pdf)
+}
+
+vars:post-response {
+  cleanScanId: res.body.scan_id
+}
+
+tests {
+  test("returns 202 Accepted (PDF quarantine path)", function() {
+    expect(res.getStatus()).to.equal(202);
+  });
+
+  test("response carries scan_id + pending_scan status + poll_url", function() {
+    expect(res.body).to.have.property('scan_id');
+    expect(res.body.status).to.equal('pending_scan');
+    expect(res.body.poll_url).to.match(/\/memory\/upload\/status\?scan_id=/);
+  });
+
+  test("object_uri targets quarantine prefix (NOT episodic/papers)", function() {
+    // ADR-048 §1: PDFs land in quarantine first, not episodic/papers.
+    // Content-control's verdict consumer (PR-B4) rewrites the manifest
+    // key to episodic/papers/<scan_id>/<filename> on clean verdict —
+    // verified by upload-status-clean.bru polling for scanned_clean.
+    expect(res.body.object_uri).to.include('/quarantine/');
+    expect(res.body.object_uri).to.not.include('/episodic/papers/');
+  });
+
+  test("size_bytes + object_sha256 present", function() {
+    expect(res.body).to.have.property('size_bytes');
+    expect(res.body).to.have.property('object_sha256');
+    expect(res.body.object_sha256).to.have.lengthOf(64);
+  });
+}
+
+docs {
+  ADR-048 PR-B3 PDF flow — happy (clean) path. Sibling of
+  ``upload-pdf.bru`` (which uses /tmp/eicar.pdf and exercises
+  the rejected_malware path). Together the two cover BOTH
+  closed-set terminal verdicts:
+
+    upload-pdf.bru        + upload-status.bru        → rejected_malware
+    upload-pdf-clean.bru  + upload-status-clean.bru  → scanned_clean
+
+  Detection is content-type (``application/pdf``) PLUS magic-byte
+  sniff (``%PDF-``). Both must pass; spoofed content-type
+  slipping through is precisely the parser-exploit attack
+  surface ADR-048 closes.
+
+  PDF uploads:
+    1. PUT bytes to ``s3://memory-shared/quarantine/<user>/<scan_id>/<filename>``
+    2. INSERT memory_items (scan_status=pending_scan,
+       published_at_ms=NULL, trace_id=<W3C from current span>)
+    3. asyncio.Queue.put for the ScanRequestPublisher to drain
+    4. Return HTTP 202 + {scan_id, status, poll_url, object_uri,
+       object_sha256, size_bytes}
+
+  Prepare a fixture ``/tmp/clean.pdf`` containing a real PDF
+  (start with ``%PDF-1.4`` or later). A minimal valid PDF works
+  (~400 bytes is enough — content_control scans the bytes, not
+  the document semantics).
+
+  Authorization: per-layer write scope ``memory:episodic:write``
+  (or ``audittrace:admin``). Layer mismatch → 403.
+}

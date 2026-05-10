@@ -1,0 +1,90 @@
+meta {
+  name: GET /memory/upload/status?scan_id — poll clean PDF scan verdict
+  type: http
+  seq: 94
+}
+
+get {
+  url: {{baseUrl}}/memory/upload/status?scan_id={{cleanScanId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  scan_id: {{cleanScanId}}
+}
+
+tests {
+  test("returns 200 OK", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("scan_id echoed in response", function() {
+    expect(res.body.scan_id).to.equal(bru.getVar("cleanScanId"));
+  });
+
+  test("scan_status is in the closed set (migration 012)", function() {
+    const allowed = new Set([
+      'pending_scan',
+      'scanning',
+      'scanned_clean',
+      'rejected_malware',
+      'scan_failed',
+      'scan_unrecoverable',
+    ]);
+    expect(allowed.has(res.body.status)).to.equal(true);
+  });
+
+  test("trace_id + size_bytes + object_sha256 present", function() {
+    expect(res.body).to.have.property('trace_id');
+    expect(res.body).to.have.property('size_bytes');
+    expect(res.body).to.have.property('object_sha256');
+  });
+
+  test("created_at_ms <= modified_at_ms", function() {
+    expect(res.body.created_at_ms).to.be.at.most(res.body.modified_at_ms);
+  });
+}
+
+docs {
+  ADR-048 PR-B3 status-poll endpoint — clean-PDF chain. Pairs
+  with ``upload-pdf-clean.bru`` — the upload sets ``cleanScanId``
+  via ``vars:post-response``, this request reads it.
+
+  Bruno asserts SHAPE (status is in the closed set, scan_id
+  echoed, fields present) — not TIMING. The actual flip from
+  pending_scan → scanned_clean takes ~2-4 s (RabbitMQ broker hop +
+  ClamAV scan + verdict consumer round trip). Validate the terminal
+  state via curl + poll-loop:
+
+  ```
+  for i in $(seq 1 10); do
+    STATUS=$(curl -k -sS \
+      "https://audittrace.local:30952/memory/upload/status?scan_id=$ID" \
+      -H "Authorization: Bearer $BEARER" \
+      | jq -r .status)
+    [ "$STATUS" = "scanned_clean" ] && break
+    sleep 2
+  done
+  ```
+
+  Owner-only by default (created_by_user_id == JWT.sub) OR
+  ``audittrace:admin`` scope. Cross-tenant lookups return 404
+  (existence is not leaked).
+
+  Closed-set ``status`` values pinned by migration 012 +
+  ``tests/test_memory_routes.py::TestScanStatusCodes`` (PR-B1):
+    pending_scan / scanning / scanned_clean / rejected_malware
+    / scan_failed / scan_unrecoverable
+
+  State transitions (set by PR-B4's verdict consumer in
+  memory-server, triggered by content-control's PR-A7
+  Verdict.scan_id echo):
+    pending_scan → scanned_clean       (clean verdict + promote)
+    pending_scan → rejected_malware    (rejected verdict + delete)
+    pending_scan → scan_failed         (scan_failed verdict)
+    pending_scan → scan_unrecoverable  (DLX after x-delivery-limit)
+}
