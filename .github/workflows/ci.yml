@@ -187,6 +187,7 @@ jobs:
           helm lint charts/audittrace \
             --set vault.enabled=true \
             --set secrets.minio.secretKey=ci-test \
+            --set secrets.minio.kmsKey=ci-test \
             --set secrets.chromadb.token=ci-test \
             --set secrets.keycloak.adminPassword=ci-test \
             --set secrets.postgres.appPassword=ci-test \
@@ -199,6 +200,7 @@ jobs:
           helm lint charts/audittrace \
             --set vault.enabled=false \
             --set secrets.minio.secretKey=ci-test \
+            --set secrets.minio.kmsKey=ci-test \
             --set secrets.chromadb.token=ci-test \
             --set secrets.keycloak.adminPassword=ci-test \
             --set secrets.postgres.appPassword=ci-test \
@@ -215,6 +217,7 @@ jobs:
           helm template audittrace charts/audittrace -n audittrace \
             --set vault.enabled=true \
             --set secrets.minio.secretKey=ci-test \
+            --set secrets.minio.kmsKey=ci-test \
             --set secrets.chromadb.token=ci-test \
             --set secrets.keycloak.adminPassword=ci-test \
             --set secrets.postgres.appPassword=ci-test \
