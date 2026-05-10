@@ -133,12 +133,18 @@ class TestTopologyBootstrapJob:
             "rabbitmq-topology"
         )
 
-    def test_job_skips_istio_injection(self, rendered: list[dict]) -> None:
-        # The bootstrap Job runs once per install; mTLS scoping doesn't
-        # buy anything for a one-shot.
+    def test_job_uses_istio_sidecar_with_quitquitquit(
+        self, rendered: list[dict]
+    ) -> None:
+        # STRICT mTLS in the namespace rejects the AMQP connection
+        # if the Job runs without a sidecar — the Job hangs forever.
+        # The Job exits cleanly via /quitquitquit so the sidecar
+        # doesn't keep the Pod alive after topology bootstrap.
         job = _find(rendered, "Job", "audittrace-rabbitmq-topology")
         anns = job["spec"]["template"]["metadata"]["annotations"]
-        assert anns.get("sidecar.istio.io/inject") == "false"
+        assert anns.get("sidecar.istio.io/inject") == "true"
+        cmd = " ".join(job["spec"]["template"]["spec"]["containers"][0]["command"])
+        assert "quitquitquit" in cmd
 
     def test_job_command_creates_required_topology(self, rendered: list[dict]) -> None:
         job = _find(rendered, "Job", "audittrace-rabbitmq-topology")

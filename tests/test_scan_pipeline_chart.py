@@ -39,7 +39,7 @@ CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 EXPECTED_SCAN_ENV = {
     "AUDITTRACE_SCAN_PIPELINE_ENABLED": "true",
     "AUDITTRACE_SCAN_REQUEST_EXCHANGE": "audittrace.scan",
-    "AUDITTRACE_SCAN_REQUEST_ROUTING_KEY": "scan.requested",
+    "AUDITTRACE_SCAN_REQUEST_ROUTING_KEY": "scan.request.new",
     "AUDITTRACE_SCAN_QUARANTINE_PREFIX": "quarantine",
     "AUDITTRACE_SCAN_PUBLISHER_DRAIN_INTERVAL_MS": "100",
     "AUDITTRACE_SCAN_JANITOR_INTERVAL_SECONDS": "30",
