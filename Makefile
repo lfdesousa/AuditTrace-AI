@@ -162,8 +162,8 @@ deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + V
 verify-deploy: ## Post-deploy gate: pods Ready, helm status deployed, /health, /metrics, pg_isready, Tempo traces, Loki ERROR threshold (Phase C.12)
 	@RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) scripts/post-deploy-verify.sh
 
-k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported.
-	@scripts/setup-vault.sh
+k8s-bootstrap-secrets: ## Post-helm bootstrap: Vault provisioning + Keycloak memory scopes (idempotent; run after every helm install/upgrade that touches operator-bound infra). Requires VAULT_TOKEN exported. SECRETS_DIR defaults to ~/work/audittrace-private/secrets/ — override to point elsewhere.
+	@SECRETS_DIR=$${SECRETS_DIR:-$$HOME/work/audittrace-private/secrets} scripts/setup-vault.sh
 	@scripts/setup-memory-scopes.sh
 
 sync-requirements: ## Regenerate requirements.txt from pyproject.toml (single source of truth). Run after touching dependencies; the requirements-sync hook + CI job block drifted state.

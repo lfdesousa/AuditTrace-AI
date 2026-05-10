@@ -28,7 +28,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SECRETS_DIR="${SCRIPT_DIR}/../secrets"
+# SECRETS_DIR honours an operator override so seed material can live
+# outside the repo (recommended: ~/work/audittrace-private/secrets/).
+# Default preserves the legacy in-repo location for back-compat.
+SECRETS_DIR="${SECRETS_DIR:-${SCRIPT_DIR}/../secrets}"
 
 NAMESPACE="${AUDITTRACE_NAMESPACE:-audittrace}"
 RELEASE="${AUDITTRACE_RELEASE:-audittrace}"

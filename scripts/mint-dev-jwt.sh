@@ -57,10 +57,14 @@ KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak:8080}"
 REALM="${REALM:-audittrace}"
 CLIENT_ID="${CLIENT_ID:-audittrace-dev}"
 
-# Secret: env var wins, falls back to secrets/dev_client_secret.txt.
+# Secret: env var wins, falls back to ${SECRETS_DIR}/dev_client_secret.txt.
+# SECRETS_DIR override matches setup-vault.sh — operator points at
+# ~/work/audittrace-private/secrets/ when seed material lives outside
+# the repo.
+SECRETS_DIR="${SECRETS_DIR:-${SCRIPT_DIR}/../secrets}"
 CLIENT_SECRET="${CLIENT_SECRET:-}"
 if [[ -z "${CLIENT_SECRET}" ]]; then
-    SECRET_FILE="${SCRIPT_DIR}/../secrets/dev_client_secret.txt"
+    SECRET_FILE="${SECRETS_DIR}/dev_client_secret.txt"
     if [[ -f "${SECRET_FILE}" ]]; then
         CLIENT_SECRET="$(cat "${SECRET_FILE}")"
     fi

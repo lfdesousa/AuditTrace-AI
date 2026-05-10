@@ -117,14 +117,41 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-redis
                   key: redis-password
+            # ADR-048 PR-B8 — MinIO ACCESS + SECRET sourced from the
+            # IAM-split Secret (audittrace_app user, parser-exploit
+            # close per ADR-048 Decision rule §1). The Bitnami root
+            # creds are no longer the memory-server's MinIO identity.
+            - name: AUDITTRACE_MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-minio-iam
+                  key: audittrace_app_user
             - name: AUDITTRACE_MINIO_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-minio-secret
-                  key: root-password
+                  name: {{ .Release.Name }}-minio-iam
+                  key: audittrace_app_password
             {{- end }}
-            - name: AUDITTRACE_MINIO_ACCESS_KEY
-              value: "minioadmin"
+            # vault.enabled=true branch — MinIO ACCESS/SECRET keys are
+            # exported by Vault Agent into /vault/secrets/env (see the
+            # vaultAnnotations.memoryServer helper).
+            #
+            # ADR-057 PR-B8 — RabbitMQ env vars are wired UNCONDITIONALLY
+            # (both vault.enabled branches) from the Bitnami subchart's
+            # `<release>-rabbitmq` Secret. Vault is intentionally NOT in
+            # the path: the Bitnami Secret is already the credential
+            # source of truth and adding a Vault mirror would force a
+            # policy upload on every chart upgrade. Order matters here:
+            # AUDITTRACE_RABBITMQ_PASSWORD MUST precede
+            # AUDITTRACE_SCAN_AMQP_URL because k8s env $(VAR) expansion
+            # only resolves variables declared earlier in the list.
+            - name: AUDITTRACE_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-rabbitmq
+                  key: rabbitmq-password
+            - name: AUDITTRACE_SCAN_AMQP_URL
+              value: "amqp://{{ .Values.rabbitmq.auth.username }}:$(AUDITTRACE_RABBITMQ_PASSWORD)@{{ .Release.Name }}-rabbitmq:5672/"
             # OTEL_RESOURCE_ATTRIBUTES is built from .Chart.AppVersion
             # (single chart-side source per ADR-055 §2). Operators who
             # need to override (e.g. for a different deployment env

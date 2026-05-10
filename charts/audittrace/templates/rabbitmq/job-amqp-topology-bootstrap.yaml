@@ -56,13 +56,33 @@ spec:
         {{- include "audittrace.labels" . | nindent 8 }}
         app.kubernetes.io/component: rabbitmq-topology
       annotations:
+        {{- if .Values.istio.enabled }}
+        # PR-B8 — Istio sidecar required: cluster's STRICT mTLS denies
+        # any non-mTLS caller, and RabbitMQ's AuthorizationPolicy only
+        # accepts SPIFFE-identified principals. The topology Job's SA
+        # (`<release>-rabbitmq-topology`) is allow-listed in
+        # `audittrace-allow-rabbitmq` for ports 5672 + 15672, but only
+        # if the request actually carries an mTLS identity. The
+        # holdApplicationUntilProxyStarts flag prevents the
+        # rabbitmqadmin container from racing istio-proxy on startup;
+        # quitquitquit at end-of-script tells istio-proxy to exit so
+        # the Job can transition Completed.
+        sidecar.istio.io/inject: "true"
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+        {{- else }}
         sidecar.istio.io/inject: "false"
+        {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-rabbitmq-topology
       restartPolicy: OnFailure
       containers:
         - name: rabbitmqadmin
-          image: bitnami/rabbitmq:3.13
+          # PR-B8 — match the rabbitmq subchart's image source. Operator
+          # may override via --set rabbitmq.image.repository=...
+          # (recommended: bitnamilegacy/rabbitmq when public bitnami/*
+          # tags are pulled by Bitnami's repo hardening).
+          image: "{{ .Values.rabbitmq.image.repository | default "bitnami/rabbitmq" }}:{{ .Values.rabbitmq.image.tag | default "3.13" }}"
           imagePullPolicy: IfNotPresent
           env:
             - name: RABBIT_HOST
@@ -161,7 +181,7 @@ spec:
               if [ -n "${CC_PASS:-}" ]; then
                 echo "▶ Configuring content-control user (${CC_USER}) and permissions..."
                 put "/api/users/${CC_USER}" \
-                    "{\"password\":\"${CC_PASS}\",\"tags\":\""}" >/dev/null || true
+                    "{\"password\":\"${CC_PASS}\",\"tags\":\"\"}" >/dev/null || true
                 # Vhost permissions: configure="" (no exchange/queue
                 # creation), write to scan.verdicts + scan.audit,
                 # read from scan.requests.
@@ -185,4 +205,13 @@ spec:
                 "http://${RABBIT_HOST}:${RABBIT_MGMT_PORT}/api/queues/${VHOST}" \
                 | python3 -c "import sys,json; [print('  ',q['name'],'-',q.get('arguments',{}).get('x-queue-type','classic')) for q in json.load(sys.stdin) if q['name'].startswith('audittrace.')]" \
                 || true
+
+              {{- if .Values.istio.enabled }}
+              # PR-B8 — istio-proxy quitquitquit so the Job pod
+              # transitions Completed (otherwise it hangs forever).
+              echo "▶ Asking istio-proxy to exit..."
+              curl -fsS -m 5 -X POST http://localhost:15020/quitquitquit \
+                && echo "  ✓ istio-proxy quitquitquit ack'd" \
+                || echo "  ⊝ quitquitquit failed (non-fatal)"
+              {{- end }}
 {{- end }}

@@ -54,11 +54,26 @@ spec:
         {{- include "audittrace.labels" . | nindent 8 }}
         app.kubernetes.io/component: minio-bucket-init
       annotations:
-        # Skip the Istio sidecar — this Job runs once at install/upgrade
-        # and doesn't need mTLS scoping.
+        {{- if .Values.istio.enabled }}
+        # ADR-048 PR-B8 — Istio sidecar required: under STRICT mTLS the
+        # cluster's MinIO AuthorizationPolicy denies any non-mTLS
+        # client. The Job's ServiceAccount (`<release>-bucket-init`)
+        # is allow-listed in `audittrace-allow-minio`. The
+        # `holdApplicationUntilProxyStarts` flag prevents the mc
+        # container from racing istio-proxy on startup; the
+        # quitquitquit curl at end-of-script tells istio-proxy to
+        # exit so the Job pod can transition Completed.
+        sidecar.istio.io/inject: "true"
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+        {{- else }}
         sidecar.istio.io/inject: "false"
+        {{- end }}
     spec:
       restartPolicy: OnFailure
+      {{- if .Values.istio.enabled }}
+      serviceAccountName: {{ .Release.Name }}-bucket-init
+      {{- end }}
       containers:
         - name: mc
           image: minio/mc:latest
@@ -68,32 +83,32 @@ spec:
               value: "http://{{ .Release.Name }}-minio:9000"
             - name: MINIO_ACCESS_KEY
               value: "minioadmin"
+            - name: SHARED_BUCKET
+              value: {{ .Values.memoryServer.env.AUDITTRACE_MINIO_SHARED_BUCKET | default "memory-shared" | quote }}
+            # Root password — sourced from the Bitnami Secret. Renders
+            # under both vault.enabled branches because PR-B8 dropped
+            # the gate on secret-minio-iam.yaml; secret-minio.yaml is
+            # still gated on vault.enabled=false, so this ref is
+            # marked optional. When vault.enabled=true the cluster's
+            # MinIO root pw lives in Vault; the bucket-init Job
+            # currently can't reach it (Istio constraints — see
+            # annotation note above), and the Vault root pw should
+            # match the operator-supplied secrets.minio.secretKey.
             - name: MINIO_SECRET_KEY
-              {{- if .Values.vault.enabled }}
-              # Vault Agent renders /vault/secrets/env (operator
-              # sets this up alongside setup-vault.sh).
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-secret
                   key: root-password
                   optional: true
-              {{- else }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-minio-secret
-                  key: root-password
-              {{- end }}
-            - name: SHARED_BUCKET
-              value: {{ .Values.memoryServer.env.AUDITTRACE_MINIO_SHARED_BUCKET | default "memory-shared" | quote }}
-            # PR-B7 — IAM split user credentials. Both come from
-            # Vault paths seeded by `scripts/setup-vault.sh`:
-            #   kv/audittrace/minio/audittrace_app
-            #   kv/audittrace/minio/content_control
-            # rendered into k8s Secrets by Vault Agent (or the
-            # `secrets/secret-minio-iam.yaml` template when
-            # vault.enabled=false). Optional secret refs so the
-            # chart still renders cleanly while operators are
-            # mid-bootstrap.
+            # PR-B7 — IAM split user credentials. Both come from the
+            # `<release>-minio-iam` Secret rendered by
+            # templates/secrets/secret-minio-iam.yaml (always — PR-B8
+            # dropped the vault.enabled=false gate). Operator supplies
+            # values via:
+            #   --set-file secrets.minio.audittraceAppPassword=...
+            #   --set-file secrets.minio.contentControlPassword=...
+            # Optional refs so the chart still renders cleanly while
+            # operators are mid-bootstrap.
             - name: AUDITTRACE_APP_USER
               valueFrom:
                 secretKeyRef:
@@ -187,7 +202,7 @@ spec:
                     "Effect": "Allow",
                     "Action": [
                       "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
-                      "s3:ListBucket"
+                      "s3:ListBucket", "s3:GetBucketLocation"
                     ],
                     "Resource": [
                       "arn:aws:s3:::${SHARED_BUCKET}",
@@ -210,7 +225,10 @@ spec:
                 "Statement": [
                   {
                     "Effect": "Allow",
-                    "Action": ["s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+                    "Action": [
+                      "s3:GetObject", "s3:DeleteObject",
+                      "s3:ListBucket", "s3:GetBucketLocation"
+                    ],
                     "Resource": [
                       "arn:aws:s3:::${SHARED_BUCKET}",
                       "arn:aws:s3:::${SHARED_BUCKET}/quarantine/*"
@@ -254,4 +272,19 @@ spec:
               rm -f /tmp/audittrace_app.json /tmp/content_control.json
 
               echo "✅ Bucket init complete (IAM split active)."
+
+              {{- if .Values.istio.enabled }}
+              # ADR-048 PR-B8 — tell the Istio sidecar to exit so the
+              # Job pod can transition Completed (otherwise istio-proxy
+              # keeps running and the Job hangs forever). The pilot-
+              # agent quitquitquit endpoint is a synchronous local
+              # call; failure is non-fatal (Job has already done its
+              # work — at worst the Job pod stays Running until
+              # backoffLimit forces a restart, but main container
+              # exit + restartPolicy: OnFailure handles that).
+              echo "▶ Asking istio-proxy to exit..."
+              curl -fsS -m 5 -X POST http://localhost:15020/quitquitquit \
+                && echo "  ✓ istio-proxy quitquitquit ack'd" \
+                || echo "  ⊝ quitquitquit failed (non-fatal)"
+              {{- end }}
 {{- end }}
