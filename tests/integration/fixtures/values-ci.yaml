@@ -1,0 +1,146 @@
+# AuditTrace-AI Helm values override for the kind-based PR-B10
+# integration smoke test.
+#
+# Goal: prove the full chart deploys cleanly in a fresh kind cluster
+# alongside the audittrace-content-control sibling chart, and that
+# memory-server reaches a Ready state. NOT (yet) a full upload-flow
+# test — that's PR-B11.
+#
+# Scope decisions:
+#   - vault.enabled=false       — no Vault Agent injector in kind
+#   - istio.enabled=false       — no Istio in kind (mTLS / AP are
+#                                 production-only)
+#   - keycloak.enabled=false    — heaviest subsystem; auth bypassed
+#                                 at the app level so memory-server
+#                                 doesn't talk to it
+#   - observability disabled    — no Langfuse / Tempo / Otel-Collector
+#   - tests.enabled=false       — the chart-bundled test-rls pod is
+#                                 gated on vault.enabled=true anyway
+#   - postgres/redis/rabbitmq/  — KEPT (memory-server's lifespan
+#     minio/chromadb               connects to all five at startup)
+#
+# Auth-at-the-app-level: every AUDITTRACE_AUTH_* env var below disables
+# Keycloak / JWT validation. The route handlers fall through with a
+# synthetic ``audittrace-anonymous`` user_id.
+
+# Tag matches what the workflow builds + kind-loads.
+memoryServer:
+  image:
+    repository: audittrace-memory-server
+    tag: ci
+    pullPolicy: Never
+  # Bypass Keycloak round-trip. JWT path is unit-tested elsewhere.
+  env:
+    AUDITTRACE_AUTH_ENABLED: "false"
+    AUDITTRACE_AUTH_REQUIRED: "false"
+    AUDITTRACE_LANGFUSE_ENABLED: "false"
+    AUDITTRACE_METRICS_ENABLED: "true"
+    AUDITTRACE_SUMMARIZER_ENABLED: "false"
+    AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED: "false"
+    AUDITTRACE_PDF_OCR_ENABLED: "false"
+    AUDITTRACE_SCAN_PIPELINE_ENABLED: "true"
+    # Match the chart's bindings — same exchange + routing-key as
+    # production. Catches the PR-A5 verdict-correlation drift class
+    # at the publish side.
+    AUDITTRACE_SCAN_REQUEST_EXCHANGE: "audittrace.scan"
+    AUDITTRACE_SCAN_REQUEST_ROUTING_KEY: "scan.request.new"
+
+# vault.enabled=false branch — memory-server reads creds from
+# the in-chart-rendered Secrets, NOT from /vault/secrets/env.
+vault:
+  enabled: false
+
+# No Istio in kind.
+istio:
+  enabled: false
+
+# Production posture would gate these out; for CI we keep them
+# OFF explicitly.
+keycloak:
+  enabled: false
+
+# Lightweight bitnami subcharts kept — memory-server connects at
+# startup; without them the pod never reaches Ready.
+postgresql:
+  enabled: true
+  primary:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+    persistence:
+      enabled: false
+
+redis:
+  enabled: true
+  master:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    persistence:
+      enabled: false
+  replica:
+    replicaCount: 0
+
+rabbitmq:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 768Mi
+  persistence:
+    enabled: false
+  clustering:
+    enabled: false
+
+# In-chart Deployments (no subchart) — lightened resources.
+minio:
+  enabled: true
+
+chromadb:
+  enabled: true
+
+# Built-in chart tests are gated on vault.enabled=true; flip off
+# explicitly to avoid render-time surprises.
+tests:
+  enabled: false
+
+# Dev-only secret values. The chart's productionMode=false (default)
+# accepts these.
+global:
+  hostNodeIP: "10.42.0.1"
+  productionMode: false
+  postgresql:
+    auth:
+      password: test-pg-pass
+      postgresPassword: test-pg-pass
+  redis:
+    password: test-redis-pass
+
+secrets:
+  chromadb:
+    token: test-chroma-token
+  keycloak:
+    adminPassword: test-keycloak-pass
+  minio:
+    secretKey: test-minio-key
+    # kmsKey: 32-byte base64-encoded value. Generated once for CI;
+    # rotated in production via Vault.
+    kmsKey: "Y2lLb3R0YS1raW5kLWNpLWttcy1rZXktMzItYnk="
+  postgres:
+    appPassword: test-pg-app-pass
+    password: test-pg-pass
+  redis:
+    password: test-redis-pass
+  summariser:
+    password: test-summariser-pass
