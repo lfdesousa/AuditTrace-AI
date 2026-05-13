@@ -199,7 +199,20 @@ secrets:
     audittraceAppPassword: test-minio-app-pass
     contentControlPassword: test-minio-cc-pass
   postgres:
-    appPassword: test-pg-app-pass
+    # appPassword MUST equal password until a chart-hardening PR
+    # injects AUDITTRACE_APP_PASSWORD into the postgres container.
+    # Why: configmap-initdb.yaml line 21 reads AUDITTRACE_APP_PASSWORD,
+    # falling back to POSTGRES_PASSWORD when unset. Nothing in the
+    # chart actually injects AUDITTRACE_APP_PASSWORD into the postgres
+    # container's env, so the audittrace_app role gets created with
+    # POSTGRES_PASSWORD (= secrets.postgres.password). Meanwhile
+    # memory-server's connect URL (_helpers.tpl `postgresAppUrl`) uses
+    # secrets.postgres.appPassword. If those diverge, memory-server
+    # gets `FATAL: password authentication failed for user
+    # "audittrace_app"` — trip-wired on PR-B10 CI run #4.
+    # Production probably works only because operators happen to set
+    # both to the same value. Tracked for follow-up hardening.
+    appPassword: test-pg-pass
     password: test-pg-pass
   redis:
     password: test-redis-pass
