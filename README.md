@@ -31,7 +31,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🔐 **EU + Swiss Trust Store** -- Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3-backed by default, Vault-future). EU LOTL walker via `pyhanko[etsi]` (ADR-052) + Swiss federal TSL fetcher (OFCOM/BAKOM, ADR-053) → composite ~897 EU + CH qualified-signature CAs. Refresh via `POST /system/trust-store/refresh` (`audittrace:admin`) or Helm post-install hook. As-of-signing-time retry with 5-min clock-skew tolerance (ADR-054) distinguishes `signed_expired` from `signed_untrusted`.
 - 👥 **Multi-user Identity** -- Keycloak-delegated OAuth2 + per-user `UserContext` plumbing + Postgres Row-Level Security + ChromaDB scoped wrapper. Non-superuser `audittrace_app` role means RLS actually bites at the DB layer (ADR-026). RLS-aware `app.current_user_id` ContextVar plumbed through background workers + CLIs (ADR-046).
 - 🔐 **External IdP Federation** -- Keycloak brokering to Google Workspace / Okta / EntraID for multi-tenant SSO (ADR-044). Multi-issuer JWT validation already in place (ADR-032 §2).
-- 🗄️ **Server-Mode Databases** -- PostgreSQL 16 + ChromaDB HTTP server + Redis 7, all with authentication (ADR-019, ADR-020).
+- 🗄️ **Server-Mode Databases** -- PostgreSQL 18 + ChromaDB HTTP server + Redis 8, all with authentication (ADR-019, ADR-020). (Bitnami subchart versions: postgresql `~16`, redis `~19`; container binaries are PG 18.3 + Redis 8.6.2 — verified live 2026-05-13.)
 - 🔒 **TLS Everywhere** -- Istio Gateway terminates TLS in production (NodePort 30952). Traefik v3 + mkcert in dev (ADR-021).
 - 🔑 **Secrets via Vault** -- HashiCorp Vault is the sole production secret store (ADR-043). Auto-unseal at boot via systemd unit. `.env` files only used in dev.
 - 🔍 **Reconstructible by Design** -- Every interaction + memory tool call traced via Langfuse + OpenTelemetry; one `tool_calls` audit row per memory invocation with `interaction_id` FK. Test + Evidence + Reconstructibility gate (ADR-049) enforces unit + live-system evidence on every meaningful change; CI parses PR bodies for the three required sections.
@@ -227,7 +227,7 @@ Client (HTTPS :30952, Bearer JWT)
   |  |  |  |  |  |                 +------------------+
   |  |  |  |  |  v
   |  |  |  |  |  +----------------+
-  |  |  |  |  |  | PostgreSQL 16  |  RLS + audittrace_app
+  |  |  |  |  |  | PostgreSQL 18  |  RLS + audittrace_app
   |  |  |  |  |  +----------------+  (NOSUPERUSER + NOBYPASSRLS)
   |  |  |  |  v
   |  |  |  |  +----------------+
@@ -235,7 +235,7 @@ Client (HTTPS :30952, Bearer JWT)
   |  |  |  |  +----------------+
   |  |  |  v
   |  |  |  +----------------+
-  |  |  |  | Redis 7        |  token:* + tool-result:* (disjoint prefixes)
+  |  |  |  | Redis 8        |  token:* + tool-result:* (disjoint prefixes)
   |  |  |  +----------------+
   |  |  v
   |  |  +----------------+
