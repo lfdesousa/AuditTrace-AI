@@ -79,6 +79,7 @@ echo "[preflight] (1/6) helm lint OK"
 echo "[preflight] (2/6) helm template ..."
 if ! helm template "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" \
         --set vault.enabled=true --set secrets.minio.secretKey=preflight \
+        --set secrets.minio.kmsKey=preflight \
         --set secrets.chromadb.token=preflight --set secrets.keycloak.adminPassword=preflight \
         --set secrets.postgres.appPassword=preflight --set secrets.postgres.password=preflight \
         --set secrets.redis.password=preflight --set secrets.summariser.password=preflight \
