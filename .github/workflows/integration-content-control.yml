@@ -155,19 +155,53 @@ jobs:
             --values tests/integration/fixtures/values-ci.yaml \
             --timeout=10m
 
+      - name: Wait for backing services Ready (postgres/redis/rabbitmq/chromadb/minio)
+        run: |
+          # memory-server starts immediately after `helm install` and
+          # tries to connect to all backing services at lifespan
+          # startup. If they're not yet Ready, its connections get
+          # refused at the kube-proxy level (Service has no Ready
+          # endpoints → kube-proxy doesn't route → ECONNREFUSED).
+          # Wait for each to be Ready before we move on so memory-
+          # server's next restart has a clean dependency surface.
+          # Trip-wired on PR-B10 CI run #6: memory-server crashed with
+          # `aio_pika.connect_robust` ConnectionRefusedError while
+          # RabbitMQ was still going through its readiness probe.
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=postgresql --timeout=3m
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=redis --timeout=3m
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=rabbitmq --timeout=3m
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/component=chromadb --timeout=3m
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/component=minio --timeout=3m
+
       - name: Wait for AMQP topology hook to complete
         run: |
           # The post-install hook Job materialises the exchanges
-          # memory-server needs at startup. Run + wait for it
-          # explicitly here so memory-server's first restart loop
-          # eventually sees the exchange in place.
+          # memory-server needs at startup. With backing services
+          # all Ready above, the hook can now run quickly against
+          # a healthy RabbitMQ.
           kubectl wait --for=condition=complete \
             job/audittrace-rabbitmq-topology --timeout=5m
 
-      - name: Wait for memory-server Ready (now that exchange exists)
+      - name: Restart memory-server to clear CrashLoopBackOff backoff
         run: |
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/component=memory-server --timeout=5m
+          # memory-server's first restarts happen IMMEDIATELY after
+          # `helm install`, before backing services are Ready. By the
+          # time deps + AMQP topology are all in place, memory-server
+          # is likely sitting in CrashLoopBackOff with 80-160s backoff
+          # before the next restart attempt. `rollout restart` creates
+          # a fresh pod with restart-count=0 so we don't have to wait
+          # for the accumulated backoff to expire.
+          kubectl rollout restart deployment audittrace-memory-server
+
+      - name: Wait for memory-server Ready (fresh pod, clean deps)
+        run: |
+          kubectl rollout status deployment audittrace-memory-server \
+            --timeout=5m
 
       - name: Helm install audittrace-content-control (OCI v0.0.7)
         run: |
