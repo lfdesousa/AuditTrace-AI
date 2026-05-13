@@ -1,0 +1,259 @@
+name: Integration — content-control smoke (kind)
+
+# Paired smoke test for the audittrace-content-control sibling chart.
+# Spins up a one-node kind cluster, installs both charts together
+# (audittrace from local source + audittrace-content-control from OCI
+# v0.0.7), and verifies the memory-server pod reaches Ready alongside
+# its dependencies.
+#
+# Scope (PR-B10 — smoke test only):
+#   - chart-install succeeds (catches PR-A8 OCI-collision class on
+#     the audittrace side + chart-rendering bugs)
+#   - memory-server pod reaches Ready (proves it can talk to
+#     PostgreSQL + MinIO + RabbitMQ + ChromaDB at startup)
+#   - content-control pod reaches Ready (proves the published v0.0.7
+#     OCI image actually runs)
+#   - GET /health returns 200 via port-forward
+#
+# NOT in scope for THIS PR:
+#   - POST /memory/upload end-to-end flow → that's PR-B11
+#   - JWT / Keycloak auth path → covered by unit tests; bypassed via
+#     AUDITTRACE_AUTH_ENABLED=false (auth-bypass is OK in CI; the
+#     production chart still mandates JWT)
+#   - Real Vault / Istio / Langfuse / Tempo → too heavy for CI; the
+#     production chart still uses them
+#
+# Companion workflow: audittrace-content-control/.github/workflows/
+# integration.yml (PR-A11) drives the full async scan pipeline.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-cc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Kind smoke (both charts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up kind
+        uses: helm/kind-action@v1.10.0
+        with:
+          version: v0.24.0
+          cluster_name: integration-cc
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.0
+
+      - name: Add Helm repos + build chart deps
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm dependency build charts/audittrace
+
+      - name: Show cluster info
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          free -m
+
+      - name: Build memory-server image
+        # --target runtime is mandatory: the Dockerfile has a `tests`
+        # stage AFTER `runtime` (used by the chart's helm-test hook,
+        # see Dockerfile:107). Without --target, docker builds the
+        # LAST stage which is `tests` — whose ENTRYPOINT is
+        # `pytest tests/test_rls_isolation.py`. The container then
+        # runs the RLS tests (which SKIP without localhost:15432),
+        # exits 0, kubelet restarts → CrashLoopBackOff with
+        # `Reason: Completed`. Trip-wired on PR-B10's third CI run.
+        # Production Makefile has the same gap (Makefile:131) —
+        # tracked as a follow-up production-hardening item.
+        run: docker build --target runtime -t audittrace-memory-server:ci .
+
+      - name: Load memory-server image into kind
+        run: kind load docker-image audittrace-memory-server:ci --name integration-cc
+
+      - name: Pre-pull + kind-load every cc-chart image
+        run: |
+          # Dynamic pre-pull mirrors the audittrace chart step below:
+          # render the cc chart against our values override, parse every
+          # `image:` line, pre-pull + kind-load each. Catches THREE images
+          # in cc-chart v0.0.7:
+          #   - docker.io/lfds/audittrace-content-control:<tag>   (control-plane)
+          #   - clamav/clamav:1.4                                  (clamd sidecar)
+          #   - docker.io/curlimages/curl:8.16.0                   (init container)
+          # Static pre-pull of only the control-plane image (the old step)
+          # missed the other two AND used the wrong registry-prefix form
+          # (`lfds/...` vs the chart-rendered `docker.io/lfds/...`).
+          # Trip-wired on PR-B10 CI run after `b7856e7`: ErrImageNeverPull
+          # on the control-plane container because kubelet treats
+          # `lfds/x` and `docker.io/lfds/x` as distinct refs under
+          # pullPolicy=Never.
+          set -e
+          helm pull oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
+            --version 0.0.7 \
+            --untar --untardir /tmp/cc-chart
+          images=$(helm template cc /tmp/cc-chart/audittrace-content-control-chart \
+            --namespace default \
+            --values tests/integration/fixtures/values-cc-ci.yaml \
+            | grep -E "^[[:space:]]+image:" \
+            | awk '{print $2}' \
+            | tr -d '"' | tr -d "'" \
+            | sort -u)
+          echo "cc-chart images to load:"
+          echo "$images"
+          echo
+          for img in $images; do
+            echo "▶ pull + kind-load $img"
+            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
+            kind load docker-image "$img" --name integration-cc || \
+              echo "::warning::failed to kind-load $img"
+          done
+
+      - name: Pre-pull + kind-load every chart-rendered image
+        run: |
+          # First CI run hit ImagePullBackOff on postgresql, redis,
+          # rabbitmq — Docker Hub anonymous-pull rate-limit (100/6h
+          # per shared GHA runner IP). Dynamic extraction: render the
+          # chart against values-ci.yaml, parse every `image:` line,
+          # pre-pull on the runner, kind-load into the cluster.
+          # Image refs follow whatever the chart says, so no
+          # hardcoded list to drift.
+          set -e
+          images=$(helm template audittrace charts/audittrace \
+            --namespace default \
+            --values tests/integration/fixtures/values-ci.yaml \
+            | grep -E "^[[:space:]]+image:" \
+            | awk '{print $2}' \
+            | tr -d '"' | tr -d "'" \
+            | sort -u)
+          echo "Images to load:"
+          echo "$images"
+          echo
+          for img in $images; do
+            # Skip locally-built images (already kind-loaded earlier).
+            case "$img" in
+              audittrace-memory-server:ci|lfds/audittrace-content-control:0.0.7)
+                echo "  ↻ skip $img (already loaded)"
+                continue
+                ;;
+            esac
+            echo "▶ pull + kind-load $img"
+            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
+            kind load docker-image "$img" --name integration-cc || \
+              echo "::warning::failed to kind-load $img"
+          done
+
+      - name: Helm install audittrace (chart)
+        run: |
+          # `--wait` is safe again now that memory-server's lifespan
+          # is resilient to connect-refused (retry-with-backoff) AND
+          # idempotently active-declares its AMQP exchange. The chart's
+          # `job-amqp-topology-bootstrap` post-install hook still
+          # creates queues + bindings; the exchange declare composes
+          # because RabbitMQ no-ops matching re-declares. See
+          # `src/audittrace/services/scan_amqp_client.py::ensure_connected`
+          # and `tests/test_scan_amqp_client.py::TestEnsureConnected`
+          # for the resilience contract + coverage.
+          helm install audittrace charts/audittrace \
+            --namespace default \
+            --values tests/integration/fixtures/values-ci.yaml \
+            --wait --timeout=15m
+
+      - name: Helm install audittrace-content-control (OCI v0.0.7)
+        run: |
+          # Read content-control's RabbitMQ + MinIO creds from the
+          # Secrets the audittrace chart rendered:
+          #   audittrace-rabbitmq-content-control → content-control user
+          #     password (provisioned by `secrets.rabbitmq.content
+          #     ControlPassword` in audittrace values-ci.yaml; AMQP
+          #     topology bootstrap Job creates the user in RabbitMQ
+          #     using these creds).
+          #   audittrace-minio-iam → content-control's MinIO IAM user
+          #     (split-IAM per ADR-048 PR-B7).
+          RABBIT_PASS=$(kubectl get secret audittrace-rabbitmq-content-control \
+            -o jsonpath='{.data.password}' | base64 -d)
+          MINIO_KEY=$(kubectl get secret audittrace-minio-iam \
+            -o jsonpath='{.data.content_control_user}' | base64 -d)
+          MINIO_SEC=$(kubectl get secret audittrace-minio-iam \
+            -o jsonpath='{.data.content_control_password}' | base64 -d)
+          kubectl create secret generic cc-audittrace-content-control-creds \
+            --from-literal=rabbitmq_password="${RABBIT_PASS}" \
+            --from-literal=minio_access_key="${MINIO_KEY}" \
+            --from-literal=minio_secret_key="${MINIO_SEC}"
+
+          # Use a values file (NOT --set) so empty collections parse
+          # as empty lists, not empty maps. Trip-wired on PR-B10 CI
+          # run #9: `--set istio.authorizationPolicy.allowedSourcePrincipals={}`
+          # produced an empty MAP (truthy), so the AuthorizationPolicy
+          # template rendered and the install failed with
+          #   "no matches for kind 'AuthorizationPolicy' in version
+          #   'security.istio.io/v1' — ensure CRDs are installed first".
+          helm install cc oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
+            --version 0.0.7 \
+            --namespace default \
+            --values tests/integration/fixtures/values-cc-ci.yaml \
+            --wait --timeout=10m
+
+      - name: Show deployed state
+        if: always()
+        run: |
+          kubectl get pods -o wide
+          kubectl get svc
+
+      - name: Smoke test — memory-server /health
+        run: |
+          kubectl port-forward svc/audittrace-memory-server 8765:8765 &
+          PF=$!
+          trap 'kill ${PF} 2>/dev/null || true' EXIT
+          sleep 3
+          curl -fsS http://localhost:8765/health
+          echo
+          echo "✓ memory-server /health responded"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "── all pods ──"
+          kubectl get pods -A -o wide
+          echo
+          echo "── memory-server logs ──"
+          kubectl logs -l app.kubernetes.io/component=memory-server --tail=300 || true
+          echo
+          echo "── content-control logs ──"
+          kubectl logs -l app.kubernetes.io/name=audittrace-content-control -c control-plane --tail=200 || true
+          echo
+          echo "── postgres logs ──"
+          kubectl logs -l app.kubernetes.io/name=postgresql --tail=80 || true
+          echo
+          echo "── rabbitmq logs ──"
+          kubectl logs -l app.kubernetes.io/name=rabbitmq --tail=80 || true
+          echo
+          echo "── minio logs ──"
+          kubectl logs audittrace-minio-0 --tail=80 || true
+          echo
+          echo "── chromadb logs ──"
+          kubectl logs audittrace-chromadb-0 --tail=80 || true
+          echo
+          echo "── pod describe (failed) ──"
+          for pod in $(kubectl get pods -o name | grep -v Running); do
+            kubectl describe "${pod}" || true
+          done

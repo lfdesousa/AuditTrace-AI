@@ -53,6 +53,27 @@ For cluster-deploy work see `docs/guides/deployment-runbook.md` and
   `AUDITTRACE_TEST_POSTGRES_URL` or fail.
 - **Doc drift guard:** `tests/test_docs_drift.py` pins forbidden stale
   terms in AGENTS.md (e.g. old `sovereign-*` names, replaced components).
+- **Kind integration (`.github/workflows/integration-content-control.yml`):**
+  smoke test that spins up a one-node kind cluster on every PR + push,
+  installs both `charts/audittrace` (local) and `audittrace-content-control`
+  (OCI v0.0.7), and verifies memory-server reaches Ready alongside the
+  subcharts (Postgres / Redis / RabbitMQ + in-chart MinIO / ChromaDB).
+  Catches deploy-time bugs that unit tests + helm-lint can't see (image
+  pulls, chart-rendering against a live cluster, cross-chart wiring).
+  Values override: `tests/integration/fixtures/values-ci.yaml` —
+  `vault.enabled=false`, `istio.enabled=false`, `keycloak.enabled=false`,
+  observability off, `AUDITTRACE_AUTH_ENABLED=false`. Full upload-flow
+  end-to-end is PR-B11 (next).
+  Reproduce locally:
+  ```
+  kind create cluster --name integration-cc
+  helm repo add bitnami https://charts.bitnami.com/bitnami
+  helm dependency build charts/audittrace
+  docker build -t audittrace-memory-server:ci .
+  kind load docker-image audittrace-memory-server:ci --name integration-cc
+  helm install audittrace charts/audittrace \
+    -f tests/integration/fixtures/values-ci.yaml --wait --timeout=12m
+  ```
 
 ## Architecture
 - **Package:** `src/audittrace/` (Julien Danjou style)

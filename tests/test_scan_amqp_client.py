@@ -19,13 +19,16 @@ def _patch_aio_pika() -> tuple[Any, Any, Any, Any]:
     connection = AsyncMock()
     channel = AsyncMock()
     exchange = AsyncMock()
-    channel.get_exchange = AsyncMock(return_value=exchange)
+    # PR-B10: switched from passive get_exchange → active
+    # declare_exchange. Mock the new entry point.
+    channel.declare_exchange = AsyncMock(return_value=exchange)
     channel.close = AsyncMock()
     connection.channel = AsyncMock(return_value=channel)
     connection.close = AsyncMock()
     aio_pika.connect_robust = AsyncMock(return_value=connection)
     aio_pika.Message = MagicMock()
     aio_pika.DeliveryMode.PERSISTENT = 2
+    aio_pika.ExchangeType.TOPIC = "topic"
     return aio_pika, connection, channel, exchange
 
 
@@ -44,15 +47,62 @@ class TestEnsureConnected:
             client = ScanAmqpClient(_settings())
             await client.ensure_connected()
             await client.ensure_connected()  # no-op second time
-        # connect_robust + channel + get_exchange each called once.
+        # connect_robust + channel + declare_exchange each called once.
         aio_pika.connect_robust.assert_awaited_once()
         conn.channel.assert_awaited_once()
-        ch.get_exchange.assert_awaited_once_with("audittrace.scan")
+        ch.declare_exchange.assert_awaited_once_with(
+            "audittrace.scan",
+            type="topic",
+            durable=True,
+        )
 
     async def test_missing_url_raises(self) -> None:
         client = ScanAmqpClient(_settings(url=""))
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await client.ensure_connected()
+
+    async def test_connect_retries_on_connection_refused(self) -> None:
+        """PR-B10 — fresh-cluster kube-proxy programming lag.
+
+        On a fresh kind cluster, the Service IP may not be routable
+        for ~1s after the kubelet marks the RabbitMQ pod Ready. The
+        first ``aio_pika.connect_robust`` call gets
+        ``ConnectionRefusedError``; subsequent retries succeed.
+        Verify the client retries with exponential backoff and
+        eventually returns a Connection.
+        """
+        aio_pika, conn, _ch, _ex = _patch_aio_pika()
+        # First two calls raise; third succeeds.
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=[
+                ConnectionRefusedError("kube-proxy not ready"),
+                ConnectionRefusedError("kube-proxy not ready"),
+                conn,
+            ]
+        )
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+                client = ScanAmqpClient(_settings())
+                await client.ensure_connected()
+        assert aio_pika.connect_robust.await_count == 3
+        # Backoff sleeps after attempt 1 (1s) and attempt 2 (2s).
+        sleep_mock.assert_any_await(1)
+        sleep_mock.assert_any_await(2)
+
+    async def test_connect_gives_up_after_max_attempts(self) -> None:
+        """If RabbitMQ stays unreachable past the retry budget, the
+        client raises ``RuntimeError`` so the lifespan fails fast and
+        kubelet restarts the pod. Better than silently hanging."""
+        aio_pika, _conn, _ch, _ex = _patch_aio_pika()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=ConnectionRefusedError("broker down")
+        )
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            with patch("asyncio.sleep", new=AsyncMock()):
+                client = ScanAmqpClient(_settings())
+                with pytest.raises(RuntimeError, match="connect failed after 6"):
+                    await client.ensure_connected()
+        assert aio_pika.connect_robust.await_count == 6
 
 
 class TestPublish:

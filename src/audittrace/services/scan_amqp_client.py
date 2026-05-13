@@ -50,23 +50,93 @@ class ScanAmqpClient:
         self._channel: Any = None
         self._exchange: Any = None
 
+    # PR-B10 — retry budget for the initial AMQP connection. The
+    # cumulative max wait is the sum of backoff sleeps:
+    #   1 + 2 + 4 + 8 + 16 + 32 = 63 s of sleeping
+    # plus up to 6 × CONNECT_TIMEOUT_SECONDS of in-flight connects.
+    # That bracket comfortably covers fresh-cluster cases where
+    # kube-proxy hasn't programmed the Service IP yet AND single-node
+    # kind boots where RabbitMQ readiness lags the chart install.
+    _CONNECT_MAX_ATTEMPTS: int = 6
+    _CONNECT_TIMEOUT_SECONDS: float = 10.0
+
     async def ensure_connected(self) -> None:
         """Open the connection + channel + exchange handle on first
-        call. Idempotent — repeat calls are no-ops."""
+        call. Idempotent — repeat calls are no-ops.
+
+        **Initial-connect resilience** (PR-B10): ``aio_pika.connect_robust``
+        auto-reconnects AFTER a first successful connection, but raises
+        on first-time ``ConnectionRefusedError`` /
+        ``AMQPConnectionError``. On a fresh cluster install, kube-proxy
+        may not have programmed the RabbitMQ Service IP yet by the time
+        memory-server's lifespan runs — the kubelet-level readiness
+        probe (and the chart's post-install hook) finish before kube-
+        proxy's reconciliation loop, so the Service IP exists but isn't
+        routable. We wrap the initial connect in an exponential-backoff
+        retry so transient ``OSError`` / ``ConnectionError`` from that
+        race window doesn't kill the lifespan.
+
+        **Idempotent exchange declare** (PR-B10): switched from
+        ``get_exchange(name, passive=True)`` to
+        ``declare_exchange(name, type=topic, durable=True)``. Active
+        declare is idempotent — RabbitMQ no-ops if the exchange
+        already exists with matching args. This eliminates the
+        chicken-and-egg between memory-server's lifespan and the
+        chart's ``job-amqp-topology-bootstrap`` post-install hook:
+        whichever side runs first declares the exchange; the other
+        side adopts the existing handle. The bootstrap Job still owns
+        queue + binding declaration.
+        """
         if self._exchange is not None:
             return
         if not self._settings.scan_amqp_url:
             raise RuntimeError(
                 "scan_amqp_url is required when scan_pipeline_enabled=true"
             )
+        import asyncio  # noqa: PLC0415
+
         import aio_pika  # noqa: PLC0415 — avoid import on disabled paths
 
-        self._connection = await aio_pika.connect_robust(self._settings.scan_amqp_url)
+        last_exc: Exception | None = None
+        for attempt in range(self._CONNECT_MAX_ATTEMPTS):
+            try:
+                self._connection = await aio_pika.connect_robust(
+                    self._settings.scan_amqp_url,
+                    timeout=self._CONNECT_TIMEOUT_SECONDS,
+                )
+                break
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                last_exc = exc
+                if attempt == self._CONNECT_MAX_ATTEMPTS - 1:
+                    break
+                delay = 2**attempt
+                logger.warning(
+                    "scan_amqp.connect_retry",
+                    extra={
+                        "attempt": attempt + 1,
+                        "max_attempts": self._CONNECT_MAX_ATTEMPTS,
+                        "delay_seconds": delay,
+                        "reason": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+        else:  # pragma: no cover — loop only exits via break or final-attempt
+            pass
+        if self._connection is None:
+            raise RuntimeError(
+                f"scan_amqp.connect failed after {self._CONNECT_MAX_ATTEMPTS} "
+                f"attempts (last error: {last_exc})"
+            ) from last_exc
+
         self._channel = await self._connection.channel()
-        # The topology bootstrap Job (PR-B2.5) declares this exchange
-        # via the management API. We just take a handle.
-        self._exchange = await self._channel.get_exchange(
-            self._settings.scan_request_exchange
+        # ``declare_exchange`` (active, not passive) so memory-server can
+        # bootstrap the exchange itself on fresh clusters. RabbitMQ
+        # idempotently accepts re-declares with matching arguments,
+        # so this composes safely with the chart's bootstrap Job.
+        self._exchange = await self._channel.declare_exchange(
+            self._settings.scan_request_exchange,
+            type=aio_pika.ExchangeType.TOPIC,
+            durable=True,
         )
         logger.info(
             "scan_amqp.connected",
