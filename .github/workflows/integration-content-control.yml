@@ -150,30 +150,37 @@ jobs:
 
       - name: Helm install audittrace-content-control (OCI v0.0.7)
         run: |
-          # The chart's deployment template references a Secret
-          # named <release>-<chart-id>-creds when vault.enabled=false.
-          # Provision it with the same RabbitMQ + MinIO credentials
-          # the bitnami subchart created above.
-          RABBIT_PASS=$(kubectl get secret audittrace-rabbitmq -o jsonpath='{.data.rabbitmq-password}' | base64 -d)
-          MINIO_KEY=$(kubectl get secret audittrace-minio-iam -o jsonpath='{.data.content_control_user}' 2>/dev/null | base64 -d || echo minio)
-          MINIO_SEC=$(kubectl get secret audittrace-minio-iam -o jsonpath='{.data.content_control_password}' 2>/dev/null | base64 -d || echo minio12345)
+          # Read content-control's RabbitMQ + MinIO creds from the
+          # Secrets the audittrace chart rendered:
+          #   audittrace-rabbitmq-content-control → content-control user
+          #     password (provisioned by `secrets.rabbitmq.content
+          #     ControlPassword` in audittrace values-ci.yaml; AMQP
+          #     topology bootstrap Job creates the user in RabbitMQ
+          #     using these creds).
+          #   audittrace-minio-iam → content-control's MinIO IAM user
+          #     (split-IAM per ADR-048 PR-B7).
+          RABBIT_PASS=$(kubectl get secret audittrace-rabbitmq-content-control \
+            -o jsonpath='{.data.password}' | base64 -d)
+          MINIO_KEY=$(kubectl get secret audittrace-minio-iam \
+            -o jsonpath='{.data.content_control_user}' | base64 -d)
+          MINIO_SEC=$(kubectl get secret audittrace-minio-iam \
+            -o jsonpath='{.data.content_control_password}' | base64 -d)
           kubectl create secret generic cc-audittrace-content-control-creds \
             --from-literal=rabbitmq_password="${RABBIT_PASS}" \
             --from-literal=minio_access_key="${MINIO_KEY}" \
             --from-literal=minio_secret_key="${MINIO_SEC}"
 
+          # Use a values file (NOT --set) so empty collections parse
+          # as empty lists, not empty maps. Trip-wired on PR-B10 CI
+          # run #9: `--set istio.authorizationPolicy.allowedSourcePrincipals={}`
+          # produced an empty MAP (truthy), so the AuthorizationPolicy
+          # template rendered and the install failed with
+          #   "no matches for kind 'AuthorizationPolicy' in version
+          #   'security.istio.io/v1' — ensure CRDs are installed first".
           helm install cc oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
             --version 0.0.7 \
             --namespace default \
-            --set image.pullPolicy=Never \
-            --set imagePullSecrets='[]' \
-            --set vault.enabled=false \
-            --set networkPolicy.enabled=false \
-            --set istio.mtls.mode="" \
-            --set 'istio.authorizationPolicy.allowedSourcePrincipals={}' \
-            --set settings.rabbitmq_host=audittrace-rabbitmq.default.svc \
-            --set settings.minio_endpoint=audittrace-minio.default.svc:9000 \
-            --set settings.rabbitmq_user=user \
+            --values tests/integration/fixtures/values-cc-ci.yaml \
             --wait --timeout=10m
 
       - name: Show deployed state

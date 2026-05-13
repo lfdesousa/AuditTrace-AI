@@ -1,0 +1,60 @@
+# Helm values override for the audittrace-content-control sibling
+# chart in PR-B10's kind smoke test.
+#
+# Use a YAML values file (not `--set` flags) so empty collections
+# parse as empty lists rather than empty maps — the chart's
+# AuthorizationPolicy template gates on
+#   {{- if .Values.istio.authorizationPolicy.allowedSourcePrincipals }}
+# which is FALSY for an empty list `[]` but TRUTHY for an empty
+# map `{}` (Helm `--set k={}` produces the latter). Trip-wired on
+# PR-B10 CI run #9 with:
+#   resource mapping not found for name "cc-audittrace-content-control"
+#   no matches for kind "AuthorizationPolicy" in version "security.istio.io/v1"
+#   ensure CRDs are installed first
+#
+# Mirrors the PR-A11 (content-control repo) values-ci.yaml posture:
+# istio + vault + networkPolicy disabled, sibling chart binds to
+# the audittrace chart's RabbitMQ + MinIO Services.
+
+image:
+  # ci tag is built by the workflow's earlier kind-load step (memory-server)
+  # ... but for content-control we use the published OCI image at
+  # registry-1.docker.io/lfds/audittrace-content-control:0.0.7, which the
+  # workflow pre-pulls + kind-loads. pullPolicy=Never ensures kubelet
+  # uses the loaded image, not Docker Hub.
+  pullPolicy: Never
+
+# We've kind-loaded the image; no pull secret needed.
+imagePullSecrets: []
+
+# No Vault in kind; the chart provisions creds from a hand-rolled
+# `cc-audittrace-content-control-creds` Secret that the workflow
+# creates before this install runs.
+vault:
+  enabled: false
+
+# kindnet (the default CNI for `kind`) does NOT enforce NetworkPolicy,
+# so leaving the policy enabled is harmless but adds noise. Disable
+# for clarity.
+networkPolicy:
+  enabled: false
+
+# No Istio in kind. Empty list (NOT empty map) so the chart's
+#   {{- if .Values.istio.authorizationPolicy.allowedSourcePrincipals }}
+# gate is falsy. Same for `peerauthentication.yaml` which gates on
+# `istio.mtls.mode`.
+istio:
+  mtls:
+    mode: ""
+  authorizationPolicy:
+    allowedSourcePrincipals: []
+
+# Point at the audittrace chart's in-cluster Services. The workflow
+# installs audittrace first; rabbitmq + minio are already Ready.
+# rabbitmq_user matches the user the AMQP topology bootstrap Job
+# creates from `secrets.rabbitmq.contentControlUser` in the
+# audittrace chart's values-ci.yaml.
+settings:
+  rabbitmq_host: audittrace-rabbitmq.default.svc
+  rabbitmq_user: content-control
+  minio_endpoint: audittrace-minio.default.svc:9000

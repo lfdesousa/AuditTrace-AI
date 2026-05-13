@@ -218,3 +218,11 @@ secrets:
     password: test-redis-pass
   summariser:
     password: test-summariser-pass
+  # ADR-057 — separate user for the content-control sibling chart.
+  # The chart's `secret-rabbitmq-content-control.yaml` only renders
+  # when contentControlPassword is set; without it the AMQP topology
+  # bootstrap Job can't create the user and content-control can't
+  # connect at startup. Provision both here.
+  rabbitmq:
+    contentControlUser: content-control
+    contentControlPassword: test-cc-rabbitmq-pass
