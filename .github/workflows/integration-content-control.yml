@@ -187,6 +187,31 @@ jobs:
           kubectl wait --for=condition=complete \
             job/audittrace-rabbitmq-topology --timeout=5m
 
+      - name: Verify cluster-internal connectivity to RabbitMQ + MinIO
+        run: |
+          # Pod `Ready` only means the kubelet's readiness probe
+          # passed; it does NOT guarantee that the Service IP is
+          # routable from a fresh pod (kube-proxy iptables / kindnet
+          # eBPF programming runs in a separate reconciliation loop).
+          # On PR-B10 CI runs #6-#7 memory-server got
+          # `ConnectionRefusedError` to audittrace-rabbitmq:5672 even
+          # after `kubectl wait pod Ready`. Probe from a one-shot pod
+          # so the next memory-server restart hits a fully-routable
+          # Service surface.
+          set -e
+          for svc_port in audittrace-rabbitmq:5672 audittrace-minio:9000; do
+            echo "▶ probing ${svc_port}"
+            kubectl run probe-${svc_port%:*} \
+              --image=busybox:1.36 --restart=Never --rm -i --quiet -- \
+              sh -c "for i in \$(seq 1 60); do
+                       if nc -zv ${svc_port/:/ } 2>&1 | grep -q open; then
+                         echo '  ✓ reachable'; exit 0
+                       fi
+                       sleep 1
+                     done
+                     echo '::error::${svc_port} not reachable after 60s'; exit 1"
+          done
+
       - name: Restart memory-server to clear CrashLoopBackOff backoff
         run: |
           # memory-server's first restarts happen IMMEDIATELY after
