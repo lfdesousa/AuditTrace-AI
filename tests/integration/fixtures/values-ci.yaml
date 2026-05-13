@@ -168,21 +168,17 @@ secrets:
     audittraceAppPassword: test-minio-app-pass
     contentControlPassword: test-minio-cc-pass
   postgres:
-    # appPassword MUST equal password until a chart-hardening PR
-    # injects AUDITTRACE_APP_PASSWORD into the postgres container.
-    # Why: configmap-initdb.yaml line 21 reads AUDITTRACE_APP_PASSWORD,
-    # falling back to POSTGRES_PASSWORD when unset. Nothing in the
-    # chart actually injects AUDITTRACE_APP_PASSWORD into the postgres
-    # container's env, so the audittrace_app role gets created with
-    # POSTGRES_PASSWORD (= secrets.postgres.password). Meanwhile
-    # memory-server's connect URL (_helpers.tpl `postgresAppUrl`) uses
-    # secrets.postgres.appPassword. If those diverge, memory-server
-    # gets `FATAL: password authentication failed for user
-    # "audittrace_app"` — trip-wired on PR-B10 CI run #4.
-    # Production probably works only because operators happen to set
-    # both to the same value. Tracked for follow-up hardening.
-    appPassword: test-pg-pass
-    password: test-pg-pass
+    # Chart-B (2026-05-13) — appPassword and password are now genuinely
+    # independent. Splitting them here is the CI verification gate:
+    # if memory-server still reaches Ready, the wiring is correct (the
+    # audittrace_app role was created with appPassword, and memory-server
+    # connects via the same value through `audittrace.postgresAppUrl`).
+    # Before Chart-B these values had to be equal — see
+    # `templates/postgres/secret-postgres-app.yaml` + values.yaml
+    # `postgresql.primary.extraEnvVars` for the wiring path. Anchor:
+    # project_postgres_app_password_wiring.
+    appPassword: test-app-pass-chart-b-verified
+    password: test-postgres-superuser-pass
   redis:
     password: test-redis-pass
   summariser:
