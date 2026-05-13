@@ -132,101 +132,21 @@ jobs:
               echo "::warning::failed to kind-load $img"
           done
 
-      - name: Helm install audittrace (no --wait; we orchestrate hook + ready manually)
+      - name: Helm install audittrace (chart)
         run: |
-          # IMPORTANT: do NOT pass `--wait` here.
-          # The chart's `job-amqp-topology-bootstrap` is a
-          # `post-install` Helm hook. With `--wait`, helm BLOCKS
-          # waiting for memory-server to become Ready BEFORE running
-          # post-install hooks. But memory-server's lifespan does a
-          # passive `get_exchange("audittrace.scan")` at startup —
-          # which fails until the hook creates the exchange.
-          # Deadlock: memory-server CrashLoopBackOff → never Ready
-          # → helm waits → hook never runs → exchange never exists.
-          # PR-B10 CI run #5 confirmed: 7 restarts at 12m, no
-          # `audittrace-rabbitmq-topology` pod in the pod list.
-          # In production this works because the cluster pre-exists
-          # the exchange is already there from a previous install
-          # (or the operator deploys with explicit phase
-          # ordering). On a fresh cluster the chicken-and-egg bites.
-          # Tracked as a chart-hardening follow-up.
+          # `--wait` is safe again now that memory-server's lifespan
+          # is resilient to connect-refused (retry-with-backoff) AND
+          # idempotently active-declares its AMQP exchange. The chart's
+          # `job-amqp-topology-bootstrap` post-install hook still
+          # creates queues + bindings; the exchange declare composes
+          # because RabbitMQ no-ops matching re-declares. See
+          # `src/audittrace/services/scan_amqp_client.py::ensure_connected`
+          # and `tests/test_scan_amqp_client.py::TestEnsureConnected`
+          # for the resilience contract + coverage.
           helm install audittrace charts/audittrace \
             --namespace default \
             --values tests/integration/fixtures/values-ci.yaml \
-            --timeout=10m
-
-      - name: Wait for backing services Ready (postgres/redis/rabbitmq/chromadb/minio)
-        run: |
-          # memory-server starts immediately after `helm install` and
-          # tries to connect to all backing services at lifespan
-          # startup. If they're not yet Ready, its connections get
-          # refused at the kube-proxy level (Service has no Ready
-          # endpoints → kube-proxy doesn't route → ECONNREFUSED).
-          # Wait for each to be Ready before we move on so memory-
-          # server's next restart has a clean dependency surface.
-          # Trip-wired on PR-B10 CI run #6: memory-server crashed with
-          # `aio_pika.connect_robust` ConnectionRefusedError while
-          # RabbitMQ was still going through its readiness probe.
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/name=postgresql --timeout=3m
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/name=redis --timeout=3m
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/name=rabbitmq --timeout=3m
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/component=chromadb --timeout=3m
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/component=minio --timeout=3m
-
-      - name: Wait for AMQP topology hook to complete
-        run: |
-          # The post-install hook Job materialises the exchanges
-          # memory-server needs at startup. With backing services
-          # all Ready above, the hook can now run quickly against
-          # a healthy RabbitMQ.
-          kubectl wait --for=condition=complete \
-            job/audittrace-rabbitmq-topology --timeout=5m
-
-      - name: Verify cluster-internal connectivity to RabbitMQ + MinIO
-        run: |
-          # Pod `Ready` only means the kubelet's readiness probe
-          # passed; it does NOT guarantee that the Service IP is
-          # routable from a fresh pod (kube-proxy iptables / kindnet
-          # eBPF programming runs in a separate reconciliation loop).
-          # On PR-B10 CI runs #6-#7 memory-server got
-          # `ConnectionRefusedError` to audittrace-rabbitmq:5672 even
-          # after `kubectl wait pod Ready`. Probe from a one-shot pod
-          # so the next memory-server restart hits a fully-routable
-          # Service surface.
-          set -e
-          for svc_port in audittrace-rabbitmq:5672 audittrace-minio:9000; do
-            echo "▶ probing ${svc_port}"
-            kubectl run probe-${svc_port%:*} \
-              --image=busybox:1.36 --restart=Never --rm -i --quiet -- \
-              sh -c "for i in \$(seq 1 60); do
-                       if nc -zv ${svc_port/:/ } 2>&1 | grep -q open; then
-                         echo '  ✓ reachable'; exit 0
-                       fi
-                       sleep 1
-                     done
-                     echo '::error::${svc_port} not reachable after 60s'; exit 1"
-          done
-
-      - name: Restart memory-server to clear CrashLoopBackOff backoff
-        run: |
-          # memory-server's first restarts happen IMMEDIATELY after
-          # `helm install`, before backing services are Ready. By the
-          # time deps + AMQP topology are all in place, memory-server
-          # is likely sitting in CrashLoopBackOff with 80-160s backoff
-          # before the next restart attempt. `rollout restart` creates
-          # a fresh pod with restart-count=0 so we don't have to wait
-          # for the accumulated backoff to expire.
-          kubectl rollout restart deployment audittrace-memory-server
-
-      - name: Wait for memory-server Ready (fresh pod, clean deps)
-        run: |
-          kubectl rollout status deployment audittrace-memory-server \
-            --timeout=5m
+            --wait --timeout=15m
 
       - name: Helm install audittrace-content-control (OCI v0.0.7)
         run: |
