@@ -132,15 +132,42 @@ jobs:
               echo "::warning::failed to kind-load $img"
           done
 
-      - name: Helm install audittrace (local chart)
+      - name: Helm install audittrace (no --wait; we orchestrate hook + ready manually)
         run: |
-          # 12-min timeout — Postgres + RabbitMQ + MinIO + ChromaDB
-          # subcharts all need to come up before memory-server can
-          # become Ready. Postgres init alone is ~30s; RabbitMQ ~45s.
+          # IMPORTANT: do NOT pass `--wait` here.
+          # The chart's `job-amqp-topology-bootstrap` is a
+          # `post-install` Helm hook. With `--wait`, helm BLOCKS
+          # waiting for memory-server to become Ready BEFORE running
+          # post-install hooks. But memory-server's lifespan does a
+          # passive `get_exchange("audittrace.scan")` at startup —
+          # which fails until the hook creates the exchange.
+          # Deadlock: memory-server CrashLoopBackOff → never Ready
+          # → helm waits → hook never runs → exchange never exists.
+          # PR-B10 CI run #5 confirmed: 7 restarts at 12m, no
+          # `audittrace-rabbitmq-topology` pod in the pod list.
+          # In production this works because the cluster pre-exists
+          # the exchange is already there from a previous install
+          # (or the operator deploys with explicit phase
+          # ordering). On a fresh cluster the chicken-and-egg bites.
+          # Tracked as a chart-hardening follow-up.
           helm install audittrace charts/audittrace \
             --namespace default \
             --values tests/integration/fixtures/values-ci.yaml \
-            --wait --timeout=12m
+            --timeout=10m
+
+      - name: Wait for AMQP topology hook to complete
+        run: |
+          # The post-install hook Job materialises the exchanges
+          # memory-server needs at startup. Run + wait for it
+          # explicitly here so memory-server's first restart loop
+          # eventually sees the exchange in place.
+          kubectl wait --for=condition=complete \
+            job/audittrace-rabbitmq-topology --timeout=5m
+
+      - name: Wait for memory-server Ready (now that exchange exists)
+        run: |
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/component=memory-server --timeout=5m
 
       - name: Helm install audittrace-content-control (OCI v0.0.7)
         run: |
