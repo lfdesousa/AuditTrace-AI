@@ -308,6 +308,29 @@ postgresql:
   primary:
     initdb:
       scriptsConfigMap: "{{ .Release.Name }}-initdb"
+    # Chart-B (2026-05-13): inject AUDITTRACE_APP_PASSWORD so the
+    # initdb script's init-audittrace-app-role.sh creates the
+    # audittrace_app role with the SAME password memory-server uses
+    # in its connection URL (helper `audittrace.postgresAppUrl`).
+    # Before this, the role was silently created with POSTGRES_PASSWORD
+    # and connections diverged whenever `secrets.postgres.appPassword
+    # != secrets.postgres.password`. Anchor:
+    # project_postgres_app_password_wiring.
+    #
+    # The Secret name is fixed at `audittrace-postgres-app` because
+    # Bitnami subchart values.yaml does not template Helm syntax —
+    # the chart's release name is conventionally `audittrace` (see
+    # AGENTS.md "Cluster operations"). When vault.enabled=true the
+    # Secret is not rendered (see templates/postgres/secret-postgres-app.yaml);
+    # operators using a Vault-managed credential should override this
+    # block with a Vault Agent injection equivalent.
+    extraEnvVars:
+      - name: AUDITTRACE_APP_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: audittrace-postgres-app
+            key: password
+            optional: true
     persistence:
       size: 10Gi
       storageClass: local-path
