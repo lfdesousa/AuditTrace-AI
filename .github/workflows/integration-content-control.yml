@@ -88,6 +88,40 @@ jobs:
           docker pull lfds/audittrace-content-control:0.0.7
           kind load docker-image lfds/audittrace-content-control:0.0.7 --name integration-cc
 
+      - name: Pre-pull + kind-load every chart-rendered image
+        run: |
+          # First CI run hit ImagePullBackOff on postgresql, redis,
+          # rabbitmq — Docker Hub anonymous-pull rate-limit (100/6h
+          # per shared GHA runner IP). Dynamic extraction: render the
+          # chart against values-ci.yaml, parse every `image:` line,
+          # pre-pull on the runner, kind-load into the cluster.
+          # Image refs follow whatever the chart says, so no
+          # hardcoded list to drift.
+          set -e
+          images=$(helm template audittrace charts/audittrace \
+            --namespace default \
+            --values tests/integration/fixtures/values-ci.yaml \
+            | grep -E "^[[:space:]]+image:" \
+            | awk '{print $2}' \
+            | tr -d '"' | tr -d "'" \
+            | sort -u)
+          echo "Images to load:"
+          echo "$images"
+          echo
+          for img in $images; do
+            # Skip locally-built images (already kind-loaded earlier).
+            case "$img" in
+              audittrace-memory-server:ci|lfds/audittrace-content-control:0.0.7)
+                echo "  ↻ skip $img (already loaded)"
+                continue
+                ;;
+            esac
+            echo "▶ pull + kind-load $img"
+            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
+            kind load docker-image "$img" --name integration-cc || \
+              echo "::warning::failed to kind-load $img"
+          done
+
       - name: Helm install audittrace (local chart)
         run: |
           # 12-min timeout — Postgres + RabbitMQ + MinIO + ChromaDB

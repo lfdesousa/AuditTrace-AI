@@ -103,12 +103,22 @@ rabbitmq:
   clustering:
     enabled: false
 
-# In-chart Deployments (no subchart) — lightened resources.
+# In-chart StatefulSets (no subchart). PR-B10 first-run trip-wire:
+# the chart defaults to storageClass=local-path; kind's default
+# StorageClass is "standard" (backed by local-path-provisioner).
+# Mismatch left both PVCs Pending forever. Smaller volume sizes
+# also keep the CI runner's disk happy.
 minio:
   enabled: true
+  persistence:
+    storageClass: "standard"
+    size: 1Gi
 
 chromadb:
   enabled: true
+  persistence:
+    storageClass: "standard"
+    size: 1Gi
 
 # Built-in chart tests are gated on vault.enabled=true; flip off
 # explicitly to avoid render-time surprises.
@@ -137,6 +147,15 @@ secrets:
     # kmsKey: 32-byte base64-encoded value. Generated once for CI;
     # rotated in production via Vault.
     kmsKey: "Y2lLb3R0YS1raW5kLWNpLWttcy1rZXktMzItYnk="
+    # ADR-048 PR-B7 — IAM-split users. memory-server's deployment
+    # references audittrace-minio-iam with keys audittrace_app_user
+    # / audittrace_app_password / content_control_user /
+    # content_control_password. The chart's secret-minio-iam.yaml
+    # only renders if at least one of the *Password values is set;
+    # without them the Secret is absent and memory-server fails to
+    # start with CreateContainerConfigError.
+    audittraceAppPassword: test-minio-app-pass
+    contentControlPassword: test-minio-cc-pass
   postgres:
     appPassword: test-pg-app-pass
     password: test-pg-pass
