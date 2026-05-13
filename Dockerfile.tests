@@ -1,0 +1,43 @@
+# Tests image — extends the runtime image with pytest + dev deps + tests/.
+#
+# Used by the chart's `helm.sh/hook: test` Pod (templates/tests/test-rls.yaml)
+# to run the RLS integration tests against the in-cluster Postgres via the
+# real Vault Agent + Istio mTLS path. ADR-043 §"test integration".
+#
+# Why a dedicated Dockerfile (Chart-A, 2026-05-13):
+#   When this lived as a third `FROM runtime AS tests` stage in the main
+#   Dockerfile, `docker build .` (no --target) silently produced the
+#   tests image — whose ENTRYPOINT is pytest. Kubelet then ran pytest
+#   once, exited 0, and CrashLoopBackOff'd with `Reason: Completed`.
+#   The bug trip-wired on PR-B10 CI run #3 (2026-05-13) and was
+#   shipped as the `--target runtime` workaround there. Chart-A
+#   removes the trap by splitting the test image out entirely.
+#
+# Usage:
+#   docker build -f Dockerfile.tests \
+#                --build-arg TESTS_BASE_IMAGE=audittrace-ai:latest \
+#                -t localhost:5000/audittrace/tests:latest .
+#
+# TESTS_BASE_IMAGE defaults to the same tag the local Makefile builds
+# (`audittrace-ai:latest`); CI / release pipelines should override to
+# the immutable published runtime tag they want to validate (e.g.
+# `lfds/audittrace-memory-server:v1.0.20`).
+
+ARG TESTS_BASE_IMAGE=audittrace-ai:latest
+FROM ${TESTS_BASE_IMAGE}
+
+USER root
+RUN pip install --no-cache-dir \
+    "pytest>=7.4.0" \
+    "pytest-asyncio>=0.23.0" \
+    "pytest-mock>=3.12.0" \
+    "psycopg2-binary"
+
+COPY tests/ /app/tests/
+COPY pyproject.toml /app/
+
+USER sovereign
+WORKDIR /app
+
+ENTRYPOINT ["pytest"]
+CMD ["tests/test_rls_isolation.py", "-v", "--no-cov"]

@@ -99,27 +99,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 # Entrypoint runs migrations then starts uvicorn
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-# Stage 3: Tests image
-# Inherits from runtime, adds dev deps + tests/. Used by the chart's
-# `helm.sh/hook: test` Pod (templates/tests/test-rls.yaml). Runs the
-# RLS integration tests against the in-cluster Postgres via the real
-# Vault Agent + Istio mTLS path. ADR-043 §"test integration".
-FROM runtime AS tests
-
-USER root
-RUN pip install --no-cache-dir \
-    "pytest>=7.4.0" \
-    "pytest-asyncio>=0.23.0" \
-    "pytest-mock>=3.12.0" \
-    "psycopg2-binary"
-
-COPY tests/ /app/tests/
-COPY pyproject.toml /app/
-
-USER sovereign
-WORKDIR /app
-
-# Default: run the RLS integration suite. Override via Pod args for
-# other test files.
-ENTRYPOINT ["pytest"]
-CMD ["tests/test_rls_isolation.py", "-v", "--no-cov"]
+# NOTE: the tests image was previously stage 3 of this Dockerfile. It
+# moved to a dedicated Dockerfile.tests (Chart-A, 2026-05-13) so that
+# `docker build .` (no --target) reliably produces the runtime image.
+# When tests was the LAST stage, a missing --target silently produced
+# an image whose ENTRYPOINT was pytest — the kubelet then ran it once,
+# exited 0, and CrashLoopBackOff'd with `Reason: Completed`. See
+# `Dockerfile.tests` for the chart helm-test image build.

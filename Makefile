@@ -100,14 +100,17 @@ test-watch: ## Run tests in watch mode
 	@echo "🧪 Running tests in watch mode..."
 	@.venv/bin/ptw --now . -- -v --cov=src --cov-report=term-missing
 
-test-integration: ## Run RLS integration suite as a Helm test Pod inside the k8s cluster (Vault Agent + Istio mTLS path)
-	# Builds + pushes the tests image, then runs `helm test audittrace`.
-	# Pod runs through the full production stack: Vault Agent injection,
-	# Istio mTLS, in-cluster service DNS, audittrace-postgresql:5432.
+test-integration: docker-build ## Run RLS integration suite as a Helm test Pod inside the k8s cluster (Vault Agent + Istio mTLS path)
+	# Builds + pushes the tests image (FROM the runtime image produced by
+	# `docker-build`), then runs `helm test audittrace`. Pod runs through
+	# the full production stack: Vault Agent injection, Istio mTLS,
+	# in-cluster service DNS, audittrace-postgresql:5432.
 	# WARNING: Postgres logs accumulate ERROR-by-design entries from the
 	# RLS-violation test case. For pollution-free runs use `make test-rls-local`.
-	@echo "🐳 Building tests image..."
-	@docker build --target tests -t localhost:5000/audittrace/tests:latest . > /dev/null
+	@echo "🐳 Building tests image (FROM audittrace-ai:latest)..."
+	@docker build -f Dockerfile.tests \
+	  --build-arg TESTS_BASE_IMAGE=audittrace-ai:latest \
+	  -t localhost:5000/audittrace/tests:latest . > /dev/null
 	@echo "📦 Pushing to local registry..."
 	@docker push localhost:5000/audittrace/tests:latest > /dev/null
 	@echo "🧪 Running helm test (Vault + Istio mTLS path)..."

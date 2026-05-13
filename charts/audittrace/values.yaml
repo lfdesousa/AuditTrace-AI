@@ -286,8 +286,20 @@ tls:
 # Subchart overrides
 # =============================================================================
 
+# Bitnami Docker Hub free-image sunset (August 2025) — pinned tags like
+# `bitnami/rabbitmq:3.13.7-debian-12-r2` 404 on Docker Hub. Bitnami
+# maintains the legacy images at `bitnamilegacy/*`; we redirect each
+# subchart's `image.repository` (+ `volumePermissions.image.repository`
+# + `metrics.image.repository`) to that namespace as the new default.
+# Operators with their own registry mirror can override per the
+# Bitnami `image.registry` / `image.repository` pattern.
+# Anchor: project_bitnami_images_deprecated; lifted to chart default in
+# Chart-A (2026-05-13) after PR-B10 trip-wired the prod exposure.
+
 postgresql:
   enabled: true
+  image:
+    repository: bitnamilegacy/postgresql
   auth:
     database: audittrace
     username: audittrace
@@ -306,9 +318,17 @@ postgresql:
       limits:
         cpu: 2000m
         memory: 4Gi
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/postgres-exporter
 
 redis:
   enabled: true
+  image:
+    repository: bitnamilegacy/redis
   auth:
     password: ""
   architecture: standalone
@@ -320,6 +340,12 @@ redis:
       requests:
         cpu: 100m
         memory: 256Mi
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/redis-exporter
 
 # -- RabbitMQ (ADR-057, ADR-048 scan-control broker) ───────────────────
 # Bitnami subchart wiring for the AMQP broker that carries scan
@@ -333,6 +359,8 @@ redis:
 # HA story.
 rabbitmq:
   enabled: true
+  image:
+    repository: bitnamilegacy/rabbitmq
   auth:
     username: audittrace
     password: ""
@@ -345,6 +373,11 @@ rabbitmq:
     storageClass: local-path
   metrics:
     enabled: true
+    image:
+      repository: bitnamilegacy/rabbitmq-exporter
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
   resources:
     requests:
       cpu: 100m
@@ -470,8 +503,9 @@ chromadb:
 # -- Tests (helm test) -------------------------------------------------------
 # Chart-managed `helm test` hook. Runs the RLS integration suite inside
 # the cluster via the real Vault Agent + Istio mTLS path. Image built
-# from the Dockerfile's `tests` target. Triggered by `helm test audittrace`
-# (or `make test-integration`). Disabled by default to keep dev installs
+# from `Dockerfile.tests` (Chart-A, 2026-05-13 — formerly the `tests`
+# stage of `Dockerfile`). Triggered by `helm test audittrace` (or
+# `make test-integration`). Disabled by default to keep dev installs
 # clean; flip to true on the laptop / CI deploy when you need it.
 tests:
   enabled: true
