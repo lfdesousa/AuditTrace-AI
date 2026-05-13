@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Data-compat validation harness — 2026-05-13
+# ─────────────────────────────────────────────────────────────────────────────
+# Test-locally-first rule (feedback_test_image_changes_locally_first):
+# before any helm upgrade that touches a subchart image tag, validate
+# the candidate binary against a captured PVC snapshot offline. Without
+# this harness, the only place "does the candidate read the existing
+# data" got answered was the cluster itself — and a failure there meant
+# CrashLoopBackOff on live state.
+#
+# Born from the 2026-05-13 chart-A bitnamilegacy/* flip that exposed
+# Bitnami's pre-sunset tag-mislabel (bitnami/postgresql:17.6.0
+# actually shipped PG 18.3, bitnami/redis:7.2.5 shipped Redis 8.6.2).
+# Post-sunset bitnamilegacy/* republished the same tag strings with
+# the LITERAL versions the tags promised — and refused to read the
+# pre-sunset data on disk.
+#
+# Wrapper: scripts/test-image-compat.sh <service> <image:tag> <snapshot-dir>
+# Snapshot capture: scripts/snapshot-pvc.sh <service> <output-dir>
+# See: tests/integration/data-compat/README.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Postgres candidate ────────────────────────────────────────────────────
+  # Bypasses the Bitnami init wrapper by invoking `postgres` directly with
+  # `-D <data-dir>`. This avoids the wrapper's retry/heal logic and surfaces
+  # the version-mismatch FATAL on stdout immediately:
+  #   FATAL:  database files are incompatible with server
+  #   DETAIL: The data directory was initialized by PostgreSQL version 18,
+  #           which is not compatible with this version 17.6.
+  # The wrapper would otherwise swallow this and retry the whole startup.
+  # Note: defaults are placeholders only — docker compose validates EVERY
+  # service's env when running any one of them, so each candidate needs a
+  # benign default. test-image-compat.sh sets the real value via env.
+  postgres-candidate:
+    image: ${PG_CANDIDATE_IMAGE:-set-PG_CANDIDATE_IMAGE-via-test-image-compat.sh}
+    entrypoint: ["/opt/bitnami/postgresql/bin/postgres"]
+    # Bitnami ships postgresql.conf at /opt/bitnami/postgresql/conf/
+    # (in the container image, NOT in the data dir). Without
+    # `-c config_file=...`, postgres tries to read
+    # `<datadir>/postgresql.conf` which doesn't exist in the
+    # captured snapshot and aborts with "could not access the
+    # server configuration file". This pointer matches what the
+    # Bitnami wrapper does at startup.
+    command:
+      - "-D"
+      - "/bitnami/postgresql/data"
+      - "-c"
+      - "config_file=/opt/bitnami/postgresql/conf/postgresql.conf"
+      - "-c"
+      - "hba_file=/opt/bitnami/postgresql/conf/pg_hba.conf"
+    # Bitnami images run as UID 1001. The snapshot's files are typically
+    # owned 1001:1001 (matching the in-cluster pod). If the harness can't
+    # match that, the chmod in test-image-compat.sh resolves it.
+    user: "1001:1001"
+    # snapshot-pvc.sh captures the entire bitnami mount root
+    # (`/bitnami/postgresql/{data,.user_scripts_initialized}`), so mount
+    # at that root and let postgres open its `data/` subdir below.
+    volumes:
+      - ${PG_SNAPSHOT_DIR:-/tmp/pg-snapshot-empty}:/bitnami/postgresql
+    # No port exposure; logs are the verdict surface. Run-then-log.
+
+  # ── Redis candidate ───────────────────────────────────────────────────────
+  # Bypasses the Bitnami wrapper similarly. The Redis binary itself emits
+  # the verdict on stdout — `Can't handle RDB format version 13` for an
+  # incompatible binary, or `Ready to accept connections` for a match.
+  redis-candidate:
+    image: ${REDIS_CANDIDATE_IMAGE:-set-REDIS_CANDIDATE_IMAGE-via-test-image-compat.sh}
+    entrypoint: ["redis-server"]
+    command:
+      - "--appendonly"
+      - "yes"
+      - "--dir"
+      - "/bitnami/redis/data"
+      - "--protected-mode"
+      - "no"
+    user: "1001:1001"
+    volumes:
+      - ${REDIS_SNAPSHOT_DIR:-/tmp/redis-snapshot-empty}:/bitnami/redis/data

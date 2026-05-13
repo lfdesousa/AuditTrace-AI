@@ -300,6 +300,24 @@ The CI gate still requires the PR body sections.
   for redis. Fresh-cluster installs (kind CI etc.) are unaffected.
   Full forensic at memory `project_bitnami_systemic_tag_mislabel`.
 
+### Data-compat harness — test before any subchart image swap
+
+Before any helm change that touches `postgresql.image.*`,
+`redis.image.*`, or the Chart.lock pin for either, validate the
+candidate binary can read the existing PVC data **offline**:
+
+```bash
+scripts/snapshot-pvc.sh postgres ~/work/audittrace-private/data-snapshots/$(date +%Y-%m-%d)
+scripts/test-image-compat.sh postgres <candidate-image:tag>
+# exit 0 = PASS (safe to deploy), 1 = FAIL (binary rejects on-disk data)
+```
+
+ADR-049 rule: any PR touching those values MUST cite a recent
+`test-image-compat.sh` PASS in its `## Validation` section. Without
+this harness, Chart-A's image-repo flip looked clean in CI (fresh
+PVCs) but exploded on prod's existing data — see
+`tests/integration/data-compat/README.md` for the full story.
+
 ## ADRs (full list in README)
 - [ADR-014](docs/ADR-014-python-package-structure.md) — Package layout
 - [ADR-014.4](docs/ADR-014.4-observability-logging-otel.md) — Observability
