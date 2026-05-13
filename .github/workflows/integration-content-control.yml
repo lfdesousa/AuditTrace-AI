@@ -76,17 +76,12 @@ jobs:
           free -m
 
       - name: Build memory-server image
-        # --target runtime is mandatory: the Dockerfile has a `tests`
-        # stage AFTER `runtime` (used by the chart's helm-test hook,
-        # see Dockerfile:107). Without --target, docker builds the
-        # LAST stage which is `tests` — whose ENTRYPOINT is
-        # `pytest tests/test_rls_isolation.py`. The container then
-        # runs the RLS tests (which SKIP without localhost:15432),
-        # exits 0, kubelet restarts → CrashLoopBackOff with
-        # `Reason: Completed`. Trip-wired on PR-B10's third CI run.
-        # Production Makefile has the same gap (Makefile:131) —
-        # tracked as a follow-up production-hardening item.
-        run: docker build --target runtime -t audittrace-memory-server:ci .
+        # `runtime` is the last stage in Dockerfile, so the default
+        # `docker build .` produces the runtime image. The test image
+        # moved to its own file (`Dockerfile.tests`) in Chart-A
+        # (2026-05-13) precisely so this build can't accidentally
+        # produce the tests image — trip-wired on PR-B10 CI run #3.
+        run: docker build -t audittrace-memory-server:ci .
 
       - name: Load memory-server image into kind
         run: kind load docker-image audittrace-memory-server:ci --name integration-cc

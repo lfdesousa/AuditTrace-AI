@@ -32,6 +32,23 @@ uvicorn audittrace.server:app --reload
 For cluster-deploy work see `docs/guides/deployment-runbook.md` and
 `make help`.
 
+### Docker images — two Dockerfiles, never mixed (Chart-A, 2026-05-13)
+
+- **`Dockerfile`** — produces the runtime image. `runtime` is the LAST
+  (and final) stage, so plain `docker build .` always yields the right
+  image. Use `make docker-build` for local development, or `make
+  k8s-build TAG=...` to push to the in-cluster registry.
+- **`Dockerfile.tests`** — produces the helm-test image (chart's RLS
+  integration suite). Built `FROM` the runtime image, so you must
+  build the runtime image first (`make test-integration` chains this).
+  Override `TESTS_BASE_IMAGE` via `--build-arg` to validate a specific
+  published runtime tag.
+- **Never** add an `AS tests` stage back to `Dockerfile`. When that
+  used to be the last stage, `docker build .` (no `--target`) silently
+  produced an image whose ENTRYPOINT was pytest — kubelet ran it once,
+  exited 0, CrashLoopBackOff'd with `Reason: Completed`. PR-B10 CI
+  trip-wired this on its third run.
+
 ## Test Strategy
 - **Coverage:** 90% **per-file** gate (every file stands on its own, not the
   average). Enforced via `scripts/check-per-file-coverage.py` in `make test`.
