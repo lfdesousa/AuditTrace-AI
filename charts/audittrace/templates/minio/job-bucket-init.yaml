@@ -69,6 +69,15 @@ spec:
         {{- else }}
         sidecar.istio.io/inject: "false"
         {{- end }}
+        {{- if .Values.vault.enabled }}
+        # 2026-05-13 fix — bucket-init reads MinIO root password from
+        # the SAME Vault path MinIO server uses (kv/audittrace/minio/root).
+        # Closes the operator-side drift where a values-rendered
+        # `audittrace-minio-secret.root-password` could diverge from
+        # Vault's actual value. See `audittrace.vaultAnnotations.bucketInit`
+        # helper + `bucket-init` Vault role in vault/configmap-policies.yaml.
+        {{- include "audittrace.vaultAnnotations.bucketInit" . | nindent 8 }}
+        {{- end }}
     spec:
       restartPolicy: OnFailure
       {{- if .Values.istio.enabled }}
@@ -138,6 +147,18 @@ spec:
             - -c
             - |
               set -eu
+              # 2026-05-13 fix — when vault.enabled=true, override
+              # MINIO_SECRET_KEY with the Vault-Agent-rendered
+              # MINIO_ROOT_PASSWORD. This is the SAME value MinIO
+              # server itself loads from /vault/secrets/env, so the
+              # bucket-init Job and MinIO server never diverge.
+              # /vault/secrets/env is created by the Vault Agent
+              # sidecar (annotations `audittrace.vaultAnnotations.bucketInit`).
+              if [ -f /vault/secrets/env ]; then
+                . /vault/secrets/env
+                MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-}}"
+                echo "▶ MinIO root password sourced from Vault Agent (/vault/secrets/env)"
+              fi
               echo "▶ Waiting for MinIO at ${MINIO_URL}..."
               for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
                 mc alias set local "${MINIO_URL}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" >/dev/null 2>&1 \
