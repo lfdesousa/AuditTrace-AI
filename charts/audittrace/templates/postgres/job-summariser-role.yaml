@@ -67,7 +67,13 @@ spec:
       serviceAccountName: default
       containers:
         - name: psql
-          image: bitnami/postgresql:16
+          # 2026-05-13 — was hardcoded `bitnami/postgresql:16`, which
+          # now 404s on Docker Hub after Bitnami's August-2025
+          # free-image sunset. Parameterised same as the rabbitmq
+          # AMQP bootstrap Job: prefer the subchart's image override
+          # (so a values-side flip propagates here), default to the
+          # bitnamilegacy mirror that still serves the pinned tags.
+          image: "{{ .Values.postgresql.image.repository | default "bitnamilegacy/postgresql" }}:{{ .Values.postgresql.image.tag | default "16" }}"
           env:
             - name: PGHOST
               value: "{{ .Release.Name }}-postgresql"

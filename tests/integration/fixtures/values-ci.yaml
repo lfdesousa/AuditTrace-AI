@@ -61,8 +61,22 @@ keycloak:
 
 # Lightweight bitnami subcharts kept — memory-server connects at
 # startup; without them the pod never reaches Ready.
+#
+# IMPORTANT (2026-05-13): Bitnami deprecated their free Docker Hub
+# images in August 2025. Pinned tags like
+# `docker.io/bitnami/rabbitmq:3.13.7-debian-12-r2` now 404 from
+# Docker Hub. Bitnami maintains the legacy tags at
+# `bitnamilegacy/*` — override the image.repository / metrics
+# image.repository / volumePermissions.image.repository on each
+# subchart to point at that namespace. Also a real production
+# concern — files a follow-up: the chart's default values.yaml
+# still references bitnami/* and any prod node restart / scale
+# event would hit the same 404. Track in:
+#   project_bitnami_images_deprecated.md
 postgresql:
   enabled: true
+  image:
+    repository: bitnamilegacy/postgresql
   primary:
     resources:
       requests:
@@ -73,9 +87,17 @@ postgresql:
         memory: 512Mi
     persistence:
       enabled: false
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/postgres-exporter
 
 redis:
   enabled: true
+  image:
+    repository: bitnamilegacy/redis
   master:
     resources:
       requests:
@@ -88,9 +110,17 @@ redis:
       enabled: false
   replica:
     replicaCount: 0
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/redis-exporter
 
 rabbitmq:
   enabled: true
+  image:
+    repository: bitnamilegacy/rabbitmq
   resources:
     requests:
       cpu: 100m
@@ -102,6 +132,12 @@ rabbitmq:
     enabled: false
   clustering:
     enabled: false
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/rabbitmq-exporter
 
 # In-chart StatefulSets (no subchart). PR-B10 first-run trip-wire:
 # the chart defaults to storageClass=local-path; kind's default
