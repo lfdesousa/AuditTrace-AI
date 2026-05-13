@@ -17,11 +17,17 @@
 # the audittrace chart's RabbitMQ + MinIO Services.
 
 image:
-  # ci tag is built by the workflow's earlier kind-load step (memory-server)
-  # ... but for content-control we use the published OCI image at
-  # registry-1.docker.io/lfds/audittrace-content-control:0.0.7, which the
-  # workflow pre-pulls + kind-loads. pullPolicy=Never ensures kubelet
-  # uses the loaded image, not Docker Hub.
+  # The chart's default image.tag is "0.0.1" (chart Chart.yaml hardcodes
+  # appVersion at 0.0.1, NOT derived from --version). We want to validate
+  # the published v0.0.7 image alongside chart v0.0.7, so override the tag.
+  # Also pin repository explicitly with the `docker.io/` prefix to MATCH
+  # the chart's default rendering — kubelet treats `lfds/x` and
+  # `docker.io/lfds/x` as distinct image refs when pullPolicy=Never.
+  # Trip-wired on PR-B10 CI run after `b7856e7`: chart rendered
+  # `docker.io/lfds/audittrace-content-control:0.0.1`, we'd only loaded
+  # `lfds/audittrace-content-control:0.0.7`, so ErrImageNeverPull.
+  repository: docker.io/lfds/audittrace-content-control
+  tag: "0.0.7"
   pullPolicy: Never
 
 # We've kind-loaded the image; no pull secret needed.

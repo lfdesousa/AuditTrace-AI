@@ -91,12 +91,42 @@ jobs:
       - name: Load memory-server image into kind
         run: kind load docker-image audittrace-memory-server:ci --name integration-cc
 
-      - name: Pre-pull + load audittrace-content-control image (v0.0.7)
+      - name: Pre-pull + kind-load every cc-chart image
         run: |
-          # Saves kubelet a Docker Hub pull during pod startup;
-          # makes the test deterministic against Hub flakes.
-          docker pull lfds/audittrace-content-control:0.0.7
-          kind load docker-image lfds/audittrace-content-control:0.0.7 --name integration-cc
+          # Dynamic pre-pull mirrors the audittrace chart step below:
+          # render the cc chart against our values override, parse every
+          # `image:` line, pre-pull + kind-load each. Catches THREE images
+          # in cc-chart v0.0.7:
+          #   - docker.io/lfds/audittrace-content-control:<tag>   (control-plane)
+          #   - clamav/clamav:1.4                                  (clamd sidecar)
+          #   - docker.io/curlimages/curl:8.16.0                   (init container)
+          # Static pre-pull of only the control-plane image (the old step)
+          # missed the other two AND used the wrong registry-prefix form
+          # (`lfds/...` vs the chart-rendered `docker.io/lfds/...`).
+          # Trip-wired on PR-B10 CI run after `b7856e7`: ErrImageNeverPull
+          # on the control-plane container because kubelet treats
+          # `lfds/x` and `docker.io/lfds/x` as distinct refs under
+          # pullPolicy=Never.
+          set -e
+          helm pull oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
+            --version 0.0.7 \
+            --untar --untardir /tmp/cc-chart
+          images=$(helm template cc /tmp/cc-chart/audittrace-content-control-chart \
+            --namespace default \
+            --values tests/integration/fixtures/values-cc-ci.yaml \
+            | grep -E "^[[:space:]]+image:" \
+            | awk '{print $2}' \
+            | tr -d '"' | tr -d "'" \
+            | sort -u)
+          echo "cc-chart images to load:"
+          echo "$images"
+          echo
+          for img in $images; do
+            echo "▶ pull + kind-load $img"
+            docker pull "$img" || { echo "::warning::failed to pull $img"; continue; }
+            kind load docker-image "$img" --name integration-cc || \
+              echo "::warning::failed to kind-load $img"
+          done
 
       - name: Pre-pull + kind-load every chart-rendered image
         run: |
