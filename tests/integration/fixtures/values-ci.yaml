@@ -180,9 +180,15 @@ secrets:
     adminPassword: test-keycloak-pass
   minio:
     secretKey: test-minio-key
-    # kmsKey: 32-byte base64-encoded value. Generated once for CI;
-    # rotated in production via Vault.
-    kmsKey: "Y2lLb3R0YS1raW5kLWNpLWttcy1rZXktMzItYnk="
+    # kmsKey: MUST decode to EXACTLY 32 raw bytes (MinIO AES-256
+    # KMS-master key). Old value `Y2lLb3R0YS1raW5kLWNpLWttcy1rZXktMzItYnk=`
+    # decoded to 29 bytes → MinIO StatefulSet exit-1'd at startup
+    # (CI run #3, 2026-05-13). This value decodes to
+    # b"abcdefghijklmnopqrstuvwxyz123456" — 32 bytes exactly.
+    # The chart's secret-minio.yaml prepends "audittrace-key:" so
+    # MINIO_KMS_SECRET_KEY ends up as "<name>:<base64>" — the
+    # format MinIO expects.
+    kmsKey: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
     # ADR-048 PR-B7 — IAM-split users. memory-server's deployment
     # references audittrace-minio-iam with keys audittrace_app_user
     # / audittrace_app_password / content_control_user /

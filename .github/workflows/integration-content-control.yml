@@ -76,7 +76,17 @@ jobs:
           free -m
 
       - name: Build memory-server image
-        run: docker build -t audittrace-memory-server:ci .
+        # --target runtime is mandatory: the Dockerfile has a `tests`
+        # stage AFTER `runtime` (used by the chart's helm-test hook,
+        # see Dockerfile:107). Without --target, docker builds the
+        # LAST stage which is `tests` — whose ENTRYPOINT is
+        # `pytest tests/test_rls_isolation.py`. The container then
+        # runs the RLS tests (which SKIP without localhost:15432),
+        # exits 0, kubelet restarts → CrashLoopBackOff with
+        # `Reason: Completed`. Trip-wired on PR-B10's third CI run.
+        # Production Makefile has the same gap (Makefile:131) —
+        # tracked as a follow-up production-hardening item.
+        run: docker build --target runtime -t audittrace-memory-server:ci .
 
       - name: Load memory-server image into kind
         run: kind load docker-image audittrace-memory-server:ci --name integration-cc
@@ -193,6 +203,12 @@ jobs:
           echo
           echo "── rabbitmq logs ──"
           kubectl logs -l app.kubernetes.io/name=rabbitmq --tail=80 || true
+          echo
+          echo "── minio logs ──"
+          kubectl logs audittrace-minio-0 --tail=80 || true
+          echo
+          echo "── chromadb logs ──"
+          kubectl logs audittrace-chromadb-0 --tail=80 || true
           echo
           echo "── pod describe (failed) ──"
           for pod in $(kubectl get pods -o name | grep -v Running); do
