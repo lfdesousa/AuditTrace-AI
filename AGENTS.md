@@ -286,6 +286,19 @@ The CI gate still requires the PR body sections.
   per ADR-035 amendment). Use `audittrace_app` (created via
   `scripts/init-audittrace-app-role.sh`) for anything where isolation
   matters.
+- **Bitnami tag mislabel (operator-caveat, 2026-05-13):** The chart's
+  Bitnami subcharts (`postgresql ~16`, `redis ~19`) declare image tags
+  `17.6.0-debian-12-r4` / `7.2.5-debian-12-r4` — but the pre-sunset
+  Bitnami Docker Hub images at those tags actually shipped
+  **PostgreSQL 18.3** + **Redis 8.6.2**. Post-Aug-2025 Bitnami
+  republished to `bitnamilegacy/*` with the LITERAL versions the tags
+  promised (PG 17.6.0 + Redis 7.2.5). Existing clusters bootstrapped
+  pre-Aug-2025 have PG 18 / Redis 8 data on disk; bitnamilegacy/*
+  binaries refuse to read it. **Operator fix on such clusters**: in
+  `values-local.yaml`, override `postgresql.image.repository: bitnami/postgresql`
+  + `pullPolicy: Never` (kubelet uses cached pre-sunset image). Same
+  for redis. Fresh-cluster installs (kind CI etc.) are unaffected.
+  Full forensic at memory `project_bitnami_systemic_tag_mislabel`.
 
 ## ADRs (full list in README)
 - [ADR-014](docs/ADR-014-python-package-structure.md) — Package layout

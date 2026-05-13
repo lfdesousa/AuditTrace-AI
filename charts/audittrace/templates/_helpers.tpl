@@ -205,6 +205,30 @@ vault.hashicorp.com/agent-inject-template-env: |
 {{- end }}
 
 {{/*
+Vault Agent Injector annotations — bucket-init Job (2026-05-13 fix).
+Emits MINIO_ROOT_PASSWORD for the bucket-init Job's mc admin commands.
+Uses a dedicated `bucket-init` Vault role bound to the
+`<release>-bucket-init` SA (see vault/configmap-policies.yaml). Replaces
+the prior pattern of reading from `audittrace-minio-secret.root-password`
+(a values-rendered Secret that drifted from MinIO server's actual
+Vault-sourced password). Single source of truth: kv/audittrace/minio/root.
+*/}}
+{{- define "audittrace.vaultAnnotations.bucketInit" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "bucket-init"
+# pre-populate-only=true: Vault Agent runs ONLY as init container,
+# does NOT run as a long-lived sidecar. Correct for a one-shot Job —
+# without this the agent sidecar keeps running indefinitely and the
+# pod cannot transition to Succeeded.
+vault.hashicorp.com/agent-pre-populate-only: "true"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/minio/root"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/minio/root\" }}" }}
+  export MINIO_ROOT_PASSWORD='{{ "{{ .Data.data.secret_key }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
 Vault Agent Injector annotations — RLS integration test Pod (ADR-043 §4).
 Emits export for POSTGRES_SUPERUSER_PASSWORD sourced from
 kv/audittrace/postgres/superuser. The Pod reuses the audittrace-server

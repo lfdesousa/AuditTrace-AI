@@ -70,6 +70,19 @@ data:
       capabilities = ["read"]
     }
 
+  bucket-init.hcl: |
+    # bucket-init Job (post-install/post-upgrade hook) needs the MinIO
+    # root password to run `mc admin user add` + `mc admin policy create`
+    # for the ADR-048 PR-B7 IAM split. Read-only on minio/* — least
+    # privilege scoped to the credentials this Job's mc commands need.
+    # The Job's SA `<release>-bucket-init` is bound to this policy via
+    # role-bucket-init below. Fixes the 2026-05-13 drift where the Job
+    # was reading MINIO_SECRET_KEY from a values-rendered Secret that
+    # diverged from MinIO server's actual Vault-sourced password.
+    path "{{ .Values.vault.audittrace.kvMount }}/data/{{ .Values.vault.audittrace.pathPrefix }}/minio/*" {
+      capabilities = ["read"]
+    }
+
   memory-scopes-job.hcl: |
     # Post-install/post-upgrade memory-scopes Job needs the Keycloak
     # admin password to authenticate kcadm.sh against the master
@@ -117,6 +130,13 @@ data:
     bound_service_account_names=default
     bound_service_account_namespaces={{ .Release.Namespace }}
     policies=summariser-job
+    ttl=1h
+    audience=https://kubernetes.default.svc.cluster.local
+
+  role-bucket-init.env: |
+    bound_service_account_names={{ .Release.Name }}-bucket-init
+    bound_service_account_namespaces={{ .Release.Namespace }}
+    policies=bucket-init
     ttl=1h
     audience=https://kubernetes.default.svc.cluster.local
 
