@@ -79,7 +79,13 @@ spec:
         {{- include "audittrace.vaultAnnotations.bucketInit" . | nindent 8 }}
         {{- end }}
     spec:
-      restartPolicy: OnFailure
+      # 2026-05-13: Never (not OnFailure) so that when the mc script
+      # sends quitquitquit to istio-proxy on success, istio-proxy
+      # exits and STAYS exited. OnFailure causes kubelet to restart
+      # the istio-proxy container as soon as it terminates, even
+      # though the mc work is done — Job stays active forever.
+      # Job-level backoffLimit (4) still retries on hard failure.
+      restartPolicy: Never
       {{- if .Values.istio.enabled }}
       serviceAccountName: {{ .Release.Name }}-bucket-init
       {{- end }}
@@ -301,11 +307,21 @@ spec:
               # agent quitquitquit endpoint is a synchronous local
               # call; failure is non-fatal (Job has already done its
               # work — at worst the Job pod stays Running until
-              # backoffLimit forces a restart, but main container
-              # exit + restartPolicy: OnFailure handles that).
-              echo "▶ Asking istio-proxy to exit..."
-              curl -fsS -m 5 -X POST http://localhost:15020/quitquitquit \
-                && echo "  ✓ istio-proxy quitquitquit ack'd" \
-                || echo "  ⊝ quitquitquit failed (non-fatal)"
+              # backoffLimit forces a restart).
+              #
+              # 2026-05-13: minio/mc:latest has no curl/wget/nc, but
+              # its /bin/sh IS bash, so we use bash's /dev/tcp built-in
+              # to POST a raw HTTP request. Avoids the prior failure
+              # mode where `curl: command not found` left istio-proxy
+              # running and the Job stuck active.
+              echo "▶ Asking istio-proxy to exit (via /dev/tcp)..."
+              if exec 3<>/dev/tcp/localhost/15020 2>/dev/null; then
+                printf 'POST /quitquitquit HTTP/1.0\r\nHost: localhost:15020\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' >&3
+                cat <&3 >/dev/null 2>&1 || true
+                exec 3<&-
+                echo "  ✓ istio-proxy quitquitquit sent"
+              else
+                echo "  ⊝ /dev/tcp failed to open — istio-proxy may not exit cleanly (non-fatal; mc work is complete)"
+              fi
               {{- end }}
 {{- end }}

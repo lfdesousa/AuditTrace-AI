@@ -216,7 +216,11 @@ Vault-sourced password). Single source of truth: kv/audittrace/minio/root.
 {{- define "audittrace.vaultAnnotations.bucketInit" -}}
 vault.hashicorp.com/agent-inject: "true"
 vault.hashicorp.com/role: "bucket-init"
-vault.hashicorp.com/agent-inject-status: "update"
+# pre-populate-only=true: Vault Agent runs ONLY as init container,
+# does NOT run as a long-lived sidecar. Correct for a one-shot Job —
+# without this the agent sidecar keeps running indefinitely and the
+# pod cannot transition to Succeeded.
+vault.hashicorp.com/agent-pre-populate-only: "true"
 vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/minio/root"
 vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/minio/root\" }}" }}

@@ -14,6 +14,7 @@
 #   - audittrace-chromadb                 → role chromadb
 #   - default                             → role summariser-job (post-install hook Job)
 #   - audittrace-memory-scopes-job        → role memory-scopes-job (post-upgrade hook Job)
+#   - audittrace-bucket-init              → role bucket-init (2026-05-13)
 #
 # The Vault Agent Injector itself does NOT reach :8200 — it only patches
 # pod specs at admission time. So the injector SA is intentionally absent
@@ -47,6 +48,7 @@ spec:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-chromadb"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-memory-scopes-job"
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-bucket-init"
       to:
         - operation:
             ports: ["8200"]

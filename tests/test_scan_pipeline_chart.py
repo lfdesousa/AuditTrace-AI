@@ -268,19 +268,38 @@ class TestVaultAgentSourcesNewPaths:
 
 
 class TestBucketInitJobIamSecretRefs:
-    """PR-B8: bucket-init Job reads IAM creds via plain secretKeyRef
-    (not Vault Agent). Earlier prototype used Vault Agent but the Job
-    can't carry an Istio sidecar cleanly (no graceful exit), and
-    going around Istio breaks Vault's mTLS posture. The k8s Secret
-    is the simpler source of truth; memory-server still reads from
-    Vault for its own credentials."""
+    """2026-05-13 update — bucket-init Job sources the MinIO root
+    password via Vault Agent (NOT the values-rendered `audittrace-minio-secret`
+    Secret). Same Vault path MinIO server reads: kv/audittrace/minio/root.
+    This eliminates the drift class where the values-rendered Secret
+    diverged from Vault's actual root password and the Job's mc commands
+    failed with SignatureDoesNotMatch.
 
-    def test_no_vault_agent_annotations(self, rendered_with_vault: list[dict]) -> None:
-        # Vault Agent injection MUST be absent from the bucket-init
-        # Job — IAM creds come from k8s Secret, not Vault.
+    The IAM-split user creds (audittrace_app_password,
+    content_control_password) still come from the `audittrace-minio-iam`
+    Secret — see test_iam_credentials_from_secret below for that contract."""
+
+    def test_vault_agent_annotations_when_vault_enabled(
+        self, rendered_with_vault: list[dict]
+    ) -> None:
+        # 2026-05-13 fix — Vault Agent injection IS now present so the
+        # Job reads MINIO_ROOT_PASSWORD from the same Vault path MinIO
+        # server uses (single source of truth). Before this change, the
+        # Job read from a values-rendered Secret which could drift from
+        # Vault's actual value.
         job = _bucket_init_job(rendered_with_vault)
         anns = job["spec"]["template"]["metadata"].get("annotations", {})
-        assert "vault.hashicorp.com/agent-inject" not in anns
+        assert anns.get("vault.hashicorp.com/agent-inject") == "true"
+        assert anns.get("vault.hashicorp.com/role") == "bucket-init"
+        assert (
+            anns.get("vault.hashicorp.com/agent-inject-secret-env")
+            == "kv/data/audittrace/minio/root"
+        )
+        # The template renders MINIO_ROOT_PASSWORD into the env file
+        # (script-side it gets sourced + used as MINIO_SECRET_KEY).
+        template = anns.get("vault.hashicorp.com/agent-inject-template-env", "")
+        assert "MINIO_ROOT_PASSWORD" in template
+        assert "kv/data/audittrace/minio/root" in template
 
     def test_istio_sidecar_enabled_when_istio_on(
         self, rendered_with_vault: list[dict]
