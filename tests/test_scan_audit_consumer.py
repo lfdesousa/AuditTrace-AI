@@ -115,9 +115,22 @@ class TestPersistAudit:
         assert row.failure_class == "scan_failed"
 
 
+def _aio_pika_mock() -> MagicMock:
+    """See ``tests/test_scan_verdict_consumer.py::_aio_pika_mock``;
+    same purpose — bind the REAL ``aio_pika.exceptions`` submodule to
+    a MagicMock so ``from aio_pika.exceptions import …`` resolves
+    inside ``_ensure_connected``."""
+    import aio_pika as _real_aio_pika  # noqa: PLC0415
+
+    aio_pika = MagicMock()
+    aio_pika.exceptions = _real_aio_pika.exceptions
+    sys.modules.setdefault("aio_pika.exceptions", _real_aio_pika.exceptions)
+    return aio_pika
+
+
 class TestEnsureConnected:
     def _patch_aio_pika(self) -> tuple[Any, Any, Any, Any]:
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         queue = AsyncMock()
@@ -148,6 +161,49 @@ class TestEnsureConnected:
         )
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
+
+    async def test_queue_not_found_retries_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Symmetric to scan_verdict_consumer's retry test — B4b
+        fresh-install race against the topology-bootstrap Job."""
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, conn, ch, queue = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(
+            side_effect=[ChannelNotFoundEntity("not_found"), queue]
+        )
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanAuditConsumer(
+                settings=_settings(),
+                session_factory=InMemoryPostgresFactory().get_session_factory(),
+            )
+            await consumer._ensure_connected()
+        assert ch.get_queue.await_count == 2
+        assert conn.channel.await_count == 2
+
+    async def test_queue_not_found_exhausts_attempts_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, _conn, ch, _q = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanAuditConsumer(
+                settings=_settings(),
+                session_factory=InMemoryPostgresFactory().get_session_factory(),
+            )
+            with pytest.raises(
+                RuntimeError,
+                match=r"audittrace\.scan\.audit.*not found after \d+ attempts",
+            ):
+                await consumer._ensure_connected()
+        assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
 class TestProcessOne:
@@ -181,7 +237,7 @@ class TestRunLoop:
     async def test_run_iterates_queue_and_cancels_cleanly(self) -> None:
         import asyncio as _asyncio
 
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         channel.set_qos = AsyncMock()
@@ -246,7 +302,7 @@ class TestRunLoop:
     ) -> None:
         import asyncio as _asyncio
 
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         channel.set_qos = AsyncMock()
@@ -310,7 +366,7 @@ class TestAclose:
         await consumer.aclose()
 
     async def test_aclose_closes_channel_and_connection(self) -> None:
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         queue = AsyncMock()

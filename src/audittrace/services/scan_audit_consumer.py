@@ -77,6 +77,10 @@ class ScanAuditConsumer:
         self._channel: Any = None
         self._queue: Any = None
 
+    # 2026-05-14 B4b — see scan_verdict_consumer for the symmetric
+    # rationale. Same fresh-install race; same retry budget.
+    _QUEUE_MAX_ATTEMPTS: int = 6
+
     async def _ensure_connected(self) -> None:
         if self._queue is not None:
             return
@@ -84,12 +88,43 @@ class ScanAuditConsumer:
             raise RuntimeError(
                 "scan_amqp_url is required when scan_pipeline_enabled=true"
             )
+        import asyncio  # noqa: PLC0415
+
         import aio_pika  # noqa: PLC0415
+        from aio_pika.exceptions import (  # noqa: PLC0415
+            ChannelNotFoundEntity,
+        )
 
         self._connection = await aio_pika.connect_robust(self._settings.scan_amqp_url)
-        self._channel = await self._connection.channel()
-        await self._channel.set_qos(prefetch_count=self._prefetch_count)
-        self._queue = await self._channel.get_queue(self._queue_name)
+        last_exc: Exception | None = None
+        for attempt in range(self._QUEUE_MAX_ATTEMPTS):
+            try:
+                self._channel = await self._connection.channel()
+                await self._channel.set_qos(prefetch_count=self._prefetch_count)
+                self._queue = await self._channel.get_queue(self._queue_name)
+                break
+            except ChannelNotFoundEntity as exc:
+                last_exc = exc
+                if attempt == self._QUEUE_MAX_ATTEMPTS - 1:
+                    break
+                delay = 2**attempt
+                logger.warning(
+                    "scan_audit_consumer.queue_not_found_retry",
+                    extra={
+                        "attempt": attempt + 1,
+                        "max_attempts": self._QUEUE_MAX_ATTEMPTS,
+                        "delay_seconds": delay,
+                        "queue": self._queue_name,
+                        "reason": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+        if self._queue is None:
+            raise RuntimeError(
+                f"scan_audit_consumer: queue {self._queue_name!r} not found "
+                f"after {self._QUEUE_MAX_ATTEMPTS} attempts "
+                f"(last error: {last_exc})"
+            ) from last_exc
         logger.info(
             "scan_audit_consumer.connected",
             extra={"queue": self._queue_name},

@@ -23,6 +23,22 @@ def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
     return s
 
 
+def _aio_pika_mock() -> MagicMock:
+    """Build a MagicMock for the lazy ``import aio_pika`` site.
+
+    `_ensure_connected` also does ``from aio_pika.exceptions import
+    ChannelNotFoundEntity`` — the mocked-package path can't satisfy
+    that submodule import on its own. Bind the REAL exceptions
+    module so test code can raise the genuine exception class via
+    ``ch.get_queue.side_effect=ChannelNotFoundEntity(...)``."""
+    import aio_pika as _real_aio_pika  # noqa: PLC0415
+
+    aio_pika = MagicMock()
+    aio_pika.exceptions = _real_aio_pika.exceptions
+    sys.modules.setdefault("aio_pika.exceptions", _real_aio_pika.exceptions)
+    return aio_pika
+
+
 def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
     with factory() as session:
         manifest_mod.insert_pending_scan(
@@ -170,7 +186,7 @@ class TestApplyVerdict:
 
 class TestEnsureConnected:
     def _patch_aio_pika(self) -> tuple[Any, Any, Any, Any]:
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         queue = AsyncMock()
@@ -202,6 +218,62 @@ class TestEnsureConnected:
         )
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
+
+    async def test_queue_not_found_retries_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """B4b race: chart's topology-bootstrap Job declares queues
+        as a post-install hook. On fresh kind installs the consumer
+        beats the bootstrap; ``get_queue`` raises
+        ``ChannelNotFoundEntity``. The retry loop should wait + retry
+        until the bootstrap completes, instead of crashing the task
+        and leaving the queue with ``consumers=0``."""
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        # Avoid 1+2+4+8+16 s of real sleep in the unit run.
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, conn, ch, queue = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(
+            side_effect=[ChannelNotFoundEntity("not_found"), queue]
+        )
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanVerdictConsumer(
+                settings=_settings(),
+                session_factory=InMemoryPostgresFactory().get_session_factory(),
+            )
+            await consumer._ensure_connected()
+        # Two channel-opens, two get_queue calls — first failed,
+        # second succeeded.
+        assert ch.get_queue.await_count == 2
+        assert conn.channel.await_count == 2
+
+    async def test_queue_not_found_exhausts_attempts_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bounded budget: the consumer must give up rather than
+        spin forever. If the queue genuinely never gets created
+        (e.g. topology bootstrap Job crashed or chart is misconfigured),
+        the consumer surfaces that as a RuntimeError naming the queue
+        so logs point operators directly at the broken
+        ``job-amqp-topology-bootstrap`` rather than the consumer."""
+        from aio_pika.exceptions import ChannelNotFoundEntity
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        aio_pika, conn, ch, queue = self._patch_aio_pika()
+        ch.get_queue = AsyncMock(side_effect=ChannelNotFoundEntity("not_found"))
+        with patch.dict(sys.modules, {"aio_pika": aio_pika}):
+            consumer = ScanVerdictConsumer(
+                settings=_settings(),
+                session_factory=InMemoryPostgresFactory().get_session_factory(),
+            )
+            with pytest.raises(
+                RuntimeError,
+                match=r"audittrace\.scan\.verdicts.*not found after \d+ attempts",
+            ):
+                await consumer._ensure_connected()
+        assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
 class TestProcessOne:
@@ -238,7 +310,7 @@ class TestRunLoop:
         # via CancelledError on shutdown.
         import asyncio as _asyncio
 
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         channel.set_qos = AsyncMock()
@@ -306,7 +378,7 @@ class TestRunLoop:
         # loop continues. CancelledError stops it cleanly.
         import asyncio as _asyncio
 
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         channel.set_qos = AsyncMock()
@@ -384,7 +456,7 @@ class TestAclose:
         conn.close.assert_awaited_once()
 
     def _patch(self) -> tuple[Any, Any, Any, Any]:
-        aio_pika = MagicMock()
+        aio_pika = _aio_pika_mock()
         connection = AsyncMock()
         channel = AsyncMock()
         queue = AsyncMock()
