@@ -34,6 +34,12 @@ on:
 
 permissions:
   contents: read
+  # 2026-05-14 B1.5 — pull ghcr.io/lfdesousa/audittrace-{postgresql,redis}
+  # mirror of the pre-sunset bitnami images that prod runs. Without
+  # this, GITHUB_TOKEN can't reach the private packages and the kind
+  # cluster fails to deploy postgres/redis. Packages are linked to
+  # this repo with Read role via the user's package settings.
+  packages: read
 
 concurrency:
   group: integration-cc-${{ github.ref }}
@@ -68,6 +74,18 @@ jobs:
           helm repo add bitnami https://charts.bitnami.com/bitnami
           helm repo add hashicorp https://helm.releases.hashicorp.com
           helm dependency build charts/audittrace
+
+      - name: Login to GitHub Container Registry (ghcr.io)
+        # Pre-pull step below renders the chart, parses every
+        # `image:` line, docker-pulls each. With B1.5 the postgres
+        # and redis refs point at `ghcr.io/lfdesousa/audittrace-*`
+        # (private packages). GITHUB_TOKEN has packages:read via the
+        # workflow's `permissions` block (top of file) AND the
+        # package's "Manage Actions access" allowlist includes this
+        # repo. Login here so the docker pull below authenticates.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Show cluster info
         run: |

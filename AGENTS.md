@@ -294,10 +294,19 @@ The CI gate still requires the PR body sections.
   republished to `bitnamilegacy/*` with the LITERAL versions the tags
   promised (PG 17.6.0 + Redis 7.2.5). Existing clusters bootstrapped
   pre-Aug-2025 have PG 18 / Redis 8 data on disk; bitnamilegacy/*
-  binaries refuse to read it. **Operator fix on such clusters**: in
-  `values-local.yaml`, override `postgresql.image.repository: bitnami/postgresql`
-  + `pullPolicy: Never` (kubelet uses cached pre-sunset image). Same
-  for redis. Fresh-cluster installs (kind CI etc.) are unaffected.
+  binaries refuse to read it.
+  **Permanent fix (2026-05-14, B1.5):** We extracted the pre-sunset
+  PG 18.3 + Redis 8.6.2 images from the cluster's containerd cache
+  and republished them privately to `ghcr.io/lfdesousa/audittrace-{postgresql,redis}`
+  with explicit `*-bitnami-frozen-apr17` tags. Both prod
+  (`values-local.yaml`) and kind CI (`tests/integration/fixtures/values-ci.yaml`)
+  pull from the SAME ghcr-hosted image — single source of truth, no
+  more cache-dependency fragility, no CI-vs-prod binary drift.
+  Prod-side authentication via a long-lived `ghcr-pull-secret` k8s
+  Secret referenced through `global.imagePullSecrets`; CI side via
+  the workflow's `GITHUB_TOKEN` + `packages: read` permission.
+  **Operator runbook for PAT lifecycle + Secret rotation:**
+  `~/work/audittrace-private/runbooks/12-ghcr-pull-secret.md` (private).
   Full forensic at memory `project_bitnami_systemic_tag_mislabel`.
 
 ### Data-compat harness — test before any subchart image swap

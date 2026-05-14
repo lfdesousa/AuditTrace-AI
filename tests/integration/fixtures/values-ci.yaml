@@ -68,6 +68,18 @@ keycloak:
 # persistence below so the kind cluster stays light.
 postgresql:
   enabled: true
+  # 2026-05-14 B1.5 — pin to the SAME ghcr-hosted frozen image that
+  # prod uses. Closes the CI-vs-prod binary drift the 2026-05-13
+  # Chart-A incident exposed: kind CI previously tested PG 17.6 (the
+  # chart's bitnamilegacy default) while prod runs PG 18.3 (the
+  # pre-sunset bitnami binary). Now both paths exercise PG 18.3.
+  # Workflow auths to ghcr via GITHUB_TOKEN.
+  # Anchor: project_bitnami_systemic_tag_mislabel.
+  image:
+    registry: ghcr.io
+    repository: lfdesousa/audittrace-postgresql
+    tag: 18.3-bitnami-frozen-apr17
+    pullPolicy: IfNotPresent
   primary:
     resources:
       requests:
@@ -81,6 +93,14 @@ postgresql:
 
 redis:
   enabled: true
+  # Same story as postgres — pre-sunset bitnami/redis:7.2.5 ships
+  # Redis 8.6.2 binary (RDB v13). Pinned to the ghcr-mirrored
+  # version so CI tests against the binary prod actually runs.
+  image:
+    registry: ghcr.io
+    repository: lfdesousa/audittrace-redis
+    tag: 8.6.2-bitnami-frozen-apr17
+    pullPolicy: IfNotPresent
   master:
     resources:
       requests:
@@ -135,6 +155,12 @@ tests:
 global:
   hostNodeIP: "10.42.0.1"
   productionMode: false
+  # Bitnami subchart 16.7.27+ refuses to render non-bitnami/* image
+  # refs ("Unrecognized images" abort). Documented escape hatch:
+  # github.com/bitnami/charts/issues/30850. Required because our
+  # ghcr.io/lfdesousa/* mirror isn't on bitnami's allowlist.
+  security:
+    allowInsecureImages: true
   postgresql:
     auth:
       password: test-pg-pass
