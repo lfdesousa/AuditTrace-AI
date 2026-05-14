@@ -17,17 +17,21 @@
 # the audittrace chart's RabbitMQ + MinIO Services.
 
 image:
-  # The chart's default image.tag is "0.0.1" (chart Chart.yaml hardcodes
-  # appVersion at 0.0.1, NOT derived from --version). We want to validate
-  # the published v0.0.7 image alongside chart v0.0.7, so override the tag.
-  # Also pin repository explicitly with the `docker.io/` prefix to MATCH
-  # the chart's default rendering — kubelet treats `lfds/x` and
-  # `docker.io/lfds/x` as distinct image refs when pullPolicy=Never.
-  # Trip-wired on PR-B10 CI run after `b7856e7`: chart rendered
-  # `docker.io/lfds/audittrace-content-control:0.0.1`, we'd only loaded
-  # `lfds/audittrace-content-control:0.0.7`, so ErrImageNeverPull.
+  # 2026-05-14 B6 downstream: dropped the explicit `tag:` pin.
+  # Chart v0.0.9+ templates image.tag default to .Chart.AppVersion,
+  # so the rendered tag is the chart's appVersion (== chart version,
+  # per the publish.yml lockstep gate). This is the whole point of
+  # B6 — the kind CI now exercises the auto-track behavior the way
+  # operators experience it in production.
+  #
+  # `pullPolicy: Never` because the chart-rendered images are
+  # pre-pulled + kind-loaded in the pre-pull step above. Repository
+  # pinned with the `docker.io/` prefix because kubelet treats
+  # `lfds/x` and `docker.io/lfds/x` as distinct refs under
+  # pullPolicy=Never (trip-wired on PR-B10 CI run after `b7856e7`:
+  # chart rendered `docker.io/lfds/...`, we'd only loaded `lfds/...`,
+  # so ErrImageNeverPull).
   repository: docker.io/lfds/audittrace-content-control
-  tag: "0.0.7"
   pullPolicy: Never
 
 # We've kind-loaded the image; no pull secret needed.
