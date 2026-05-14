@@ -1,53 +1,64 @@
 # audittrace-content-control — cross-repo interface contract v1.0
 #
-# VENDORED COPY — canonical source lives at
-# https://github.com/lfdesousa/audittrace-content-control
-# in `contracts/v1.yaml`. Placeholder published in PR-B1 (this repo);
-# real shape lands when PR-A1 in the audittrace-content-control repo
-# publishes v1.0. PR-B4 in this repo asserts (via snapshot test) that
-# memory-server's verdict-consumer Pydantic model + the producer code
-# in routes/memory.py for the scan-request stream entry match this
-# vendored copy.
+# VENDORED COPY. Canonical source lives in the
+# audittrace-content-control repo at `contracts/v1.yaml`. The
+# two MUST stay byte-aligned — any schema change is a paired-PR
+# moment (this repo + the cc repo). The
+# `tests/test_content_control_contract.py` drift guard enforces
+# that memory-server's own producer/consumer code matches every
+# field-shape pinned here; the cross-repo file sync is the
+# operator's discipline (PR-A12 in the cc repo for the
+# memory-server-side fix, PR-B12 here).
 #
-# Update gate: `CONTRACT_SNAPSHOT_UPDATE=1 pytest
-# tests/test_content_control_contract.py` regenerates from the
-# upstream repo's v1.yaml. Updates that touch the schema are
-# paired-PR moments (this repo + audittrace-content-control).
+# Transport: AMQP topic exchanges over RabbitMQ inside the Istio
+# mesh (mTLS STRICT). The pre-1.0 design used Redis Streams (RESP3
+# over the same mTLS path); ADR-057 swapped that to RabbitMQ
+# before v1.0 was reached. Queue names use the AMQP convention
+# (dot-separated), NOT the Redis-Stream convention
+# (colon-separated). The schema definitions below reflect the
+# *actual* running message shapes on both sides — verified
+# 2026-05-14 by reading the cc-v0.0.7 image's installed source.
 #
 # Diagram cross-reference:
-# - docs/architecture/workspace.dsl (this repo) — content-control as
-#   peer system at L1
+# - docs/architecture/workspace.dsl (this repo) — content-control
+#   as peer system at L1
 # - audittrace-content-control/docs/architecture/workspace.dsl
-#   (repo A) — full L1+L2+L3 + deployment views
-# - audittrace-content-control/docs/architecture/class-diagram-*.md
-#   (repo A) — Mermaid class diagrams for ports / adapters / factories
+#   — full L1+L2+L3 + deployment views
 
-contract_version: "1.0-placeholder"
+contract_version: "1.0"
 
 # ── HTTP surfaces (mTLS only, in-mesh) ─────────────────────────────────
-# Real OpenAPI 3.1 fragment lands in PR-A1. Repo B's snapshot test
-# vendors that fragment via this file. The five surfaces from
-# ADR-048 §"Service interface contract":
-#   POST /v1/scan         — sync RPC for waiting callers
-#   GET  /v1/scan/status  — query state by object_uri or scan_id
+# Synchronous RPC alternative to the async AMQP stream below; used
+# by Bruno + WebUI for ad-hoc scans. Memory-server's /memory/upload
+# always goes through the AMQP stream, NOT this surface, so the
+# drift guard tests in this repo only cover the streams block.
+# Endpoints (ADR-048 §"Service interface contract"):
+#   POST /v1/scan           — sync RPC, blocks until verdict
+#   GET  /v1/scan/status    — poll by object_uri or scan_id
 #   POST /v1/scan/retrigger — admin force-rescan (audittrace:admin)
-#   GET  /v1/scan/stats   — aggregated counts by verdict / scanner
+#   GET  /v1/scan/stats     — aggregated counts by verdict / scanner
 #   GET  /v1/{health,ready,version} — standard ops
 http:
   openapi: "3.1.0"
   info:
     title: "audittrace-content-control"
-    version: "1.0-placeholder"
-  paths: {}  # filled by PR-A1
+    version: "1.0"
+  paths: {}  # canonical spec lives in cc repo; vendored snapshot is streams-only
   components:
     schemas:
       Verdict:
         type: object
-        required: [scan_id, kind, scanner, signature_db_hash, scan_duration_ms, scan_ts]
+        required:
+          [
+            scan_id,
+            kind,
+            scanner,
+            signature_db_hash,
+            scan_duration_ms,
+            scan_ts,
+          ]
         properties:
-          scan_id:
-            type: string
-            format: uuid
+          scan_id: { type: string, format: uuid }
           kind:
             type: string
             enum: [clean, rejected, scan_failed]
@@ -57,12 +68,10 @@ http:
           signature_db_hash:
             type: string
             description: "sha256: prefix"
-          scan_duration_ms:
-            type: integer
+          scan_duration_ms: { type: integer }
           threats:
             type: array
-            items:
-              $ref: "#/components/schemas/Threat"
+            items: { $ref: "#/components/schemas/Threat" }
           scan_ts:
             type: string
             format: date-time
@@ -73,70 +82,62 @@ http:
           name: { type: string }
           family: { type: string }
           confidence: { type: number, minimum: 0, maximum: 1 }
-      SecurityAuditRow:
-        type: object
-        required: [scan_id, user_id, trace_id, event_class, verdict, scanner_name, scanner_version, signature_db_hash]
-        properties:
-          scan_id: { type: string, format: uuid }
-          user_id: { type: string }
-          trace_id: { type: string }
-          event_class:
-            type: string
-            const: "security"
-          verdict:
-            type: string
-            enum: [clean, rejected, scan_failed]
-          scanner_name: { type: string }
-          scanner_version: { type: string }
-          signature_db_hash: { type: string }
-          object_uri: { type: string }
-          object_sha256: { type: string }
-          object_size_bytes: { type: integer }
-          original_filename: { type: string }
-          claimed_content_type: { type: string }
-          detected_content_type: { type: string }
-          threat_name: { type: string }
-          threat_family: { type: string }
-          confidence: { type: number }
 
 # ── AMQP surfaces (RabbitMQ topic exchanges over Istio mTLS) ──────────
-# Two queues + DLQ counterparts. Field-level schemas pin the
-# producer/consumer contract on both sides of each repo boundary.
-# 2026-05-14: original placeholder claimed Redis Streams (RESP3);
-# ADR-057 swapped the transport to RabbitMQ before v1.0 was reached,
-# and the placeholder was never updated. Queue names use the AMQP
-# convention (dot-separated), not the Redis Stream convention
-# (colon-separated). Producer = memory-server; consumer for
-# `audittrace.scan.requests` = audittrace-content-control's
-# `RabbitMQScanRequestConsumer`.
+# Three streams + DLQ counterparts for the scan-requests queue.
+# All three live in the same vhost `/` on the audittrace-rabbitmq
+# StatefulSet. Producer / consumer for each:
+#
+#   audittrace.scan.requests   — memory-server publishes (publisher
+#                                 = src/audittrace/services/
+#                                 scan_request_publisher.py);
+#                                 cc consumes
+#                                 (RabbitMQScanRequestConsumer)
+#   audittrace.scan.verdicts   — cc publishes
+#                                 (RabbitMQVerdictPublisher);
+#                                 memory-server consumes
+#                                 (ScanVerdictConsumer)
+#   audittrace.scan.audit      — cc publishes
+#                                 (RabbitMQAuditEmitter);
+#                                 memory-server consumes
+#                                 (ScanAuditConsumer)
+#
+# Field-shape note: ScanRequest + Verdict are FLAT JSON. Audit
+# uses a NESTED `object` block because the cc-side
+# SecurityAuditRow Pydantic model owns the same `ObjectRef`
+# component that the v1 HTTP `Verdict` schema references (and
+# memory-server already reads `payload.get("object", {})` to map
+# back to its `error_detail` JSON column). The asymmetry is
+# deliberate; the drift guard tests in this repo pin both shapes
+# to their respective consumer code path.
 streams:
   scan_requests:
     name: "audittrace.scan.requests"
     consumer_group: "content-control"
     dlq: "audittrace.scan.requests.dlq"
-    field_schema:
-      $ref: "#/components/schemas/ScanRequestStreamEntry"
+    field_schema: { $ref: "#/components/schemas/ScanRequestStreamEntry" }
   scan_verdicts:
     name: "audittrace.scan.verdicts"
     consumer_group: "audittrace-verdict-consumers"
-    dlq: "audittrace.scan.verdicts.dlq"
-    field_schema:
-      $ref: "#/components/schemas/VerdictStreamEntry"
+    # No DLQ — verdicts are advisory; a failed delivery means the
+    # manifest stays in `pending_scan` and the janitor re-enqueues
+    # the scan request (which is what produces a fresh verdict).
+    field_schema: { $ref: "#/components/schemas/VerdictStreamEntry" }
+  scan_audit:
+    name: "audittrace.scan.audit"
+    consumer_group: "audittrace-audit-consumers"
+    # No DLQ — audit emissions are append-only telemetry; memory-
+    # server's consumer logs and continues on per-message failure.
+    field_schema: { $ref: "#/components/schemas/AuditStreamEntry" }
 
 components:
   schemas:
     ScanRequestStreamEntry:
-      # 2026-05-14 (B4b): the actual running shape on both sides.
       # FLAT JSON object on the AMQP message body. Producer:
       # `src/audittrace/services/scan_request_publisher.py::
       # ScanRequestEnvelope.as_amqp_payload`. Consumer:
       # `content_control.adapters.scan_request_consumer_rabbitmq::
-      # _parse_message` (verified against the cc v0.0.7 wheel).
-      # Earlier draft of this schema named the fields
-      # `expected_content_type`, `enqueued_ts`, and named the
-      # transport "Redis Stream" — both were 1.0-placeholder
-      # legacies from before ADR-057 swapped the transport to
-      # RabbitMQ and before the field names were locked.
+      # _parse_message`.
       type: object
       required:
         [
@@ -164,24 +165,96 @@ components:
           default: "application/octet-stream"
           description: "Claimed MIME type from the /memory/upload caller (the magic-byte sniff is server-side and not echoed here)"
         user_id: { type: string }
-        trace_id: { type: string, description: "OTel trace_id (32-char hex)" }
+        trace_id:
+          type: string
+          description: "OTel trace_id (32-char hex)"
         traceparent:
           type: string
           description: "W3C TraceContext header value"
         enqueued_at_ms:
           type: integer
           description: "Producer-side wall-clock at publish, millis since epoch"
+
     VerdictStreamEntry:
+      # FLAT JSON object emitted by cc-side after each scan.
+      # Producer: cc's `content_control.adapters.verdict_publisher_rabbitmq::
+      # _verdict_to_json`. Consumer:
+      # `src/audittrace/services/scan_verdict_consumer.py::
+      # _apply_verdict`. The consumer reads `scan_id` and `kind`
+      # directly; the remaining fields are advisory telemetry
+      # for span attributes / audit context.
       type: object
-      required: [scan_id, verdict_json, metadata_json, enqueued_ts, trace_id]
+      required:
+        [scan_id, kind, scanner, signature_db_hash, scan_duration_ms, scan_ts]
       properties:
         scan_id: { type: string, format: uuid }
-        verdict_json:
+        kind:
           type: string
-          description: "JSON-encoded Verdict object (see #/components/schemas/Verdict)"
-        metadata_json:
+          enum: [clean, rejected, scan_failed]
+        scanner:
           type: string
-          description: "JSON-encoded scanner metadata (scanner_name, scanner_version, signature_db_hash, scan_duration_ms)"
+          description: "name@version (e.g. 'clamav@1.4.0')"
+        signature_db_hash:
+          type: string
+          description: "sha256: prefix"
+        scan_duration_ms: { type: integer }
+        scan_ts:
+          type: string
+          format: date-time
+        threats:
+          type: array
+          items: { $ref: "#/components/schemas/Threat" }
+          description: "Empty when kind=clean; one or more entries when kind=rejected"
+
+    AuditStreamEntry:
+      # NESTED `object` block — diverges from ScanRequest /
+      # Verdict because cc-side serialises its `SecurityAuditRow`
+      # Pydantic model which embeds an `ObjectRef`. Producer:
+      # cc's `content_control.adapters.audit_emitter_rabbitmq::
+      # _audit_to_json`. Consumer:
+      # `src/audittrace/services/scan_audit_consumer.py::
+      # _persist_audit` (reads
+      # ``payload.get("object", {}).get("uri", "")`` etc.).
+      #
+      # The consumer is defensive: every field below is read via
+      # ``.get(...)`` with a default, so a missing optional doesn't
+      # poison the message. Only `scan_id` + `verdict` raise on
+      # absence — those two are the `required` set here.
+      type: object
+      required: [scan_id, verdict]
+      properties:
+        scan_id: { type: string, format: uuid }
+        verdict:
+          type: string
+          enum: [clean, rejected, scan_failed]
+        event_class:
+          type: string
+          const: "security"
+          description: "Always `security`; pinned for SOC tooling filtering"
+        user_id: { type: string }
         trace_id: { type: string }
         traceparent: { type: string }
-        enqueued_ts: { type: string, format: date-time }
+        object:
+          type: object
+          description: "Nested ObjectRef block (mirrors cc-side Pydantic model)"
+          properties:
+            uri: { type: string }
+            sha256: { type: string }
+            size_bytes: { type: integer }
+            claimed_content_type: { type: string }
+        scanner_name: { type: string }
+        scanner_version: { type: string }
+        signature_db_hash: { type: string }
+        scan_duration_ms: { type: integer }
+        threat_name:
+          type: ["string", "null"]
+          description: "Null when verdict=clean"
+        threat_family:
+          type: ["string", "null"]
+        confidence:
+          type: ["number", "null"]
+          minimum: 0
+          maximum: 1
+        detected_content_type:
+          type: ["string", "null"]
+          description: "MIME type as identified by the scanner (e.g. magic-byte sniff), distinct from the producer's claimed type"
