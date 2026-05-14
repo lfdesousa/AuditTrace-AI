@@ -216,14 +216,24 @@ class TestAuditConsumerMatchesContract:
         self, contract: dict[str, Any]
     ) -> None:
         schema = _schema(contract, "AuditStreamEntry")
-        obj_props = schema["properties"].get("object", {}).get("properties", {})
-        documented = set(obj_props.keys())
+        obj = schema["properties"].get("object", {})
+        # cc-side canonical uses ``$ref: ObjectRef`` for the nested
+        # block (shared with the HTTP-side Verdict surface). Follow
+        # the ref so the drift guard works whether the block is
+        # inlined or referenced.
+        ref = obj.get("$ref")
+        if ref:
+            ref_name = ref.rsplit("/", 1)[-1]
+            obj_schema = _schema(contract, ref_name)
+            documented = set(obj_schema["properties"].keys())
+        else:
+            documented = set(obj.get("properties", {}).keys())
         undocumented = sorted(self._CONSUMER_READS_NESTED_OBJECT - documented)
         assert not undocumented, (
             "Drift: memory-server's Audit consumer reads nested "
             "`object.{...}` keys the contract's nested `object` "
-            "block doesn't document. "
-            f"Undocumented: {undocumented}"
+            "block (or referenced ObjectRef schema) doesn't "
+            f"document. Undocumented: {undocumented}"
         )
 
 
