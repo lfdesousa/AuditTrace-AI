@@ -510,6 +510,153 @@ class TestNoIfBangRcCaptureAntipattern:
         )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 8. Secret-template render coverage. A template in templates/secrets/
+#    that NEVER renders in production mode (vault.enabled=true) is a
+#    silent dead-code class. The 2026-05-14 cc-rabbitmq incident: the
+#    `secret-rabbitmq-content-control.yaml` template was gated on
+#    `not .Values.vault.enabled` with a comment claiming a separate
+#    Vault Agent template took over in prod mode. No such template
+#    existed; the cc-chart's pod silently started with empty
+#    CONTENT_CONTROL_RABBITMQ_PASSWORD and its scan_worker was a
+#    zombie. /v1/health didn't probe AMQP so the pod stayed Ready.
+#
+#    This test renders the chart with vault.enabled=true (the
+#    production posture) + every secret value supplied, then asserts
+#    that every .yaml file under templates/secrets/ produced at least
+#    one rendered resource — using helm's `# Source:` provenance
+#    comments to attribute resources back to their template file.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _render_with_extras(extras: list[str]) -> str:
+    """Like _render() but returns the raw stdout (preserves Source: comments)."""
+    cmd = [
+        "helm",
+        "template",
+        RELEASE,
+        str(CHART_DIR),
+        "-n",
+        NAMESPACE,
+        "--set",
+        "vault.enabled=true",
+        "--set",
+        "istio.enabled=true",
+        *_LINT_SECRETS,
+        *extras,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"helm template failed (rc={result.returncode}):\n--- stderr ---\n{result.stderr}"
+        )
+    return result.stdout
+
+
+class TestSecretTemplatesAllRenderInProdMode:
+    # Templates documented to render only in vault-disabled mode.
+    # Each entry MUST cite the reason — drive-by skips are forbidden.
+    # If a template ever lands here, you ALSO need to verify (and
+    # capture the verification in the reason string) that NO rendered
+    # workload references the skipped Secret name via secretKeyRef in
+    # the prod-mode render — otherwise the skip is a silent dead-code
+    # bug of the cc-rabbitmq / dockerhub-pull class.
+    _SKIP_IN_VAULT_MODE: dict[str, str] = {
+        "secret-chromadb.yaml": (
+            "vault.enabled=true → chromadb token injected at runtime "
+            "via Vault Agent annotation in templates/_helpers.tpl "
+            "(audittrace.vaultAnnotations.chromadb → kv/audittrace/"
+            "chromadb/main). Verified 2026-05-14: no rendered workload "
+            "references `audittrace-chromadb-secret` by secretKeyRef "
+            "in prod-mode render."
+        ),
+        "secret-keycloak.yaml": (
+            "vault.enabled=true → admin password injected via "
+            "Vault Agent annotation in templates/_helpers.tpl "
+            "(audittrace.vaultAnnotations.keycloak → kv/audittrace/"
+            "keycloak/admin). Verified 2026-05-14: no rendered "
+            "workload references `audittrace-keycloak-secret` by "
+            "secretKeyRef in prod-mode render."
+        ),
+        "summariser-db.yaml": (
+            "vault.enabled=true → summariser DB password injected via "
+            "Vault Agent annotation in templates/_helpers.tpl "
+            "(audittrace.vaultAnnotations.summariserJob → kv/audittrace/"
+            "summariser/db). Verified 2026-05-14: no rendered workload "
+            "references `audittrace-summariser-db` by secretKeyRef "
+            "in prod-mode render."
+        ),
+    }
+
+    def test_every_secret_template_renders_at_least_one_resource_in_prod_mode(
+        self,
+    ) -> None:
+        # Supply every secret value the production-mode chart asks for
+        # so no template is skipped on an unsupplied-input technicality.
+        # Keep this in sync with secrets.* fields chart consumes — the
+        # other drift tests already enforce that coverage.
+        extras = [
+            "--set",
+            "secrets.rabbitmq.contentControlUser=content-control",
+            "--set",
+            "secrets.rabbitmq.contentControlPassword=ci-test",
+            "--set",
+            "secrets.minio.audittraceAppPassword=ci-test",
+            "--set",
+            "secrets.minio.contentControlPassword=ci-test",
+            # Docker Hub creds — render gate for
+            # secret-dockerhub-pull.yaml. Empty defaults skip the
+            # template, so supply throwaway values to force-render.
+            "--set",
+            "secrets.dockerHub.username=ci-test",
+            "--set",
+            "secrets.dockerHub.pat=ci-test",
+            # Summariser role provisioning — required for the
+            # vault-disabled fallback path (the only secret-rendering
+            # path) but harmless when vault.enabled=true (the legit-
+            # skip allowlist covers it).
+            "--set",
+            "memoryServer.summariser.manageRole=true",
+        ]
+        out = _render_with_extras(extras)
+
+        # Helm prefixes every rendered resource with a comment like
+        # `# Source: audittrace/templates/secrets/secret-minio.yaml`.
+        # Parse the set of templates that produced at least one resource.
+        producing_templates: set[str] = set()
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# Source:"):
+                src = stripped.removeprefix("# Source:").strip()
+                producing_templates.add(src)
+
+        secrets_dir = CHART_DIR / "templates" / "secrets"
+        expected_paths = sorted(
+            f"audittrace/templates/secrets/{p.name}" for p in secrets_dir.glob("*.yaml")
+        )
+
+        non_rendering = [
+            p
+            for p in expected_paths
+            if p not in producing_templates
+            and Path(p).name not in self._SKIP_IN_VAULT_MODE
+        ]
+        assert not non_rendering, (
+            "Drift: these templates under templates/secrets/ rendered "
+            "ZERO resources in production mode (vault.enabled=true with "
+            "every secret value supplied). Either they're dead code OR "
+            "they're gated on `not .Values.vault.enabled` with no "
+            "Vault Agent counterpart actually doing the work — the exact "
+            "shape of the 2026-05-14 cc-rabbitmq incident "
+            "(`project_amqp_topology_bootstrap`). If a template "
+            "intentionally only renders in vault-disabled mode (e.g. "
+            "because Vault Agent template injects the equivalent Secret "
+            "elsewhere), add its filename to _SKIP_IN_VAULT_MODE WITH A "
+            "REASON pointing at the alternative path. "
+            "Non-rendering: " + ", ".join(non_rendering)
+        )
+
+
 class TestMinIOConnectorsInMinIOAP:
     def test_every_workload_referencing_minio_has_sa_in_minio_ap(self) -> None:
         docs = _render()
