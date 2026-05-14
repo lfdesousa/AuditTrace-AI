@@ -147,18 +147,23 @@ fi
 # Only relevant if the deploy will use vault.enabled=true (the prod path).
 echo "[preflight] (4/6) vault-injector probe ..."
 if [ -x "$SCRIPT_DIR/check-vault-injector.sh" ]; then
-    if ! NAMESPACE="$NAMESPACE" "$SCRIPT_DIR/check-vault-injector.sh"; then
-        rc=$?
-        if [ "$rc" = "1" ]; then
-            echo "[preflight] WARN: vault-injector probe could not run (cluster unreachable)" >&2
-            echo "[preflight]       — skipping. CI without cluster will hit this branch." >&2
-        else
-            echo "[preflight] ERROR: vault-injector probe FAILED (exit 3)" >&2
-            echo "[preflight]        DO NOT proceed with deploy — pods would crash." >&2
-            exit 3
-        fi
-    else
+    # `cmd; rc=$?; if …` instead of `if ! cmd; then rc=$?` — inside an
+    # `if !` body `$?` is the negated result (always 0), so the old form
+    # always took the ERROR branch even when the probe meant SKIP. Plain
+    # capture preserves the probe's actual exit code (1 = skip, ≥2 = fail).
+    set +e
+    NAMESPACE="$NAMESPACE" "$SCRIPT_DIR/check-vault-injector.sh"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
         echo "[preflight] (4/6) vault-injector probe OK"
+    elif [ "$rc" -eq 1 ]; then
+        echo "[preflight] WARN: vault-injector probe could not run (cluster unreachable)" >&2
+        echo "[preflight]       — skipping. CI without cluster will hit this branch." >&2
+    else
+        echo "[preflight] ERROR: vault-injector probe FAILED (exit 3)" >&2
+        echo "[preflight]        DO NOT proceed with deploy — pods would crash." >&2
+        exit 3
     fi
 else
     echo "[preflight] WARN: $SCRIPT_DIR/check-vault-injector.sh not executable" >&2
@@ -171,18 +176,19 @@ fi
 # 30+ min per incident if not caught pre-deploy.
 echo "[preflight] (5/6) istiod readiness probe ..."
 if [ -x "$SCRIPT_DIR/check-istiod-readiness.sh" ]; then
-    if ! "$SCRIPT_DIR/check-istiod-readiness.sh"; then
-        rc=$?
-        if [ "$rc" = "1" ]; then
-            echo "[preflight] WARN: istiod probe could not run (no cluster / no Istio)" >&2
-            echo "[preflight]       — skipping." >&2
-        else
-            echo "[preflight] ERROR: istiod probe FAILED (exit 4)" >&2
-            echo "[preflight]        DO NOT proceed — workload identity would fail to bootstrap." >&2
-            exit 4
-        fi
-    else
+    set +e
+    "$SCRIPT_DIR/check-istiod-readiness.sh"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
         echo "[preflight] (5/6) istiod probe OK"
+    elif [ "$rc" -eq 1 ]; then
+        echo "[preflight] WARN: istiod probe could not run (no cluster / no Istio)" >&2
+        echo "[preflight]       — skipping." >&2
+    else
+        echo "[preflight] ERROR: istiod probe FAILED (exit 4)" >&2
+        echo "[preflight]        DO NOT proceed — workload identity would fail to bootstrap." >&2
+        exit 4
     fi
 fi
 
@@ -193,19 +199,20 @@ fi
 # generally have nodeCount > replicaCount but the gate is universal.
 echo "[preflight] (6/6) anti-affinity deadlock probe ..."
 if [ -x "$SCRIPT_DIR/check-anti-affinity-deadlock.sh" ]; then
-    if ! CHART_DIR="$CHART_DIR" RELEASE="$RELEASE" NAMESPACE="$NAMESPACE" \
-            VALUES_FILE="$CHART_DIR/values-local.yaml" \
-            "$SCRIPT_DIR/check-anti-affinity-deadlock.sh"; then
-        rc=$?
-        if [ "$rc" = "1" ]; then
-            echo "[preflight] WARN: anti-affinity probe could not run; skipping." >&2
-        else
-            echo "[preflight] ERROR: anti-affinity deadlock detected (exit 5)" >&2
-            echo "[preflight]        DO NOT proceed — pods would hang in Pending." >&2
-            exit 5
-        fi
-    else
+    set +e
+    CHART_DIR="$CHART_DIR" RELEASE="$RELEASE" NAMESPACE="$NAMESPACE" \
+        VALUES_FILE="$CHART_DIR/values-local.yaml" \
+        "$SCRIPT_DIR/check-anti-affinity-deadlock.sh"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
         echo "[preflight] (6/6) anti-affinity probe OK"
+    elif [ "$rc" -eq 1 ]; then
+        echo "[preflight] WARN: anti-affinity probe could not run; skipping." >&2
+    else
+        echo "[preflight] ERROR: anti-affinity deadlock detected (exit 5)" >&2
+        echo "[preflight]        DO NOT proceed — pods would hang in Pending." >&2
+        exit 5
     fi
 fi
 
