@@ -65,6 +65,15 @@ spec:
     spec:
       restartPolicy: OnFailure
       serviceAccountName: default
+      {{- with .Values.global.imagePullSecrets }}
+      # 2026-05-14 B1.5 — when postgres pulls from a private
+      # registry (e.g. ghcr.io/lfdesousa/audittrace-postgresql),
+      # this Job needs the same auth Secret. Mirror the subchart's
+      # imagePullSecrets from the global key. No-op when
+      # global.imagePullSecrets is empty.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: psql
           # 2026-05-13 — was hardcoded `bitnami/postgresql:16`, which
@@ -73,7 +82,12 @@ spec:
           # AMQP bootstrap Job: prefer the subchart's image override
           # (so a values-side flip propagates here), default to the
           # bitnamilegacy mirror that still serves the pinned tags.
-          image: "{{ .Values.postgresql.image.repository | default "bitnamilegacy/postgresql" }}:{{ .Values.postgresql.image.tag | default "16" }}"
+          # 2026-05-14 — include the registry too, since the subchart
+          # now uses the registry/repository split (e.g.
+          # `ghcr.io` + `lfdesousa/audittrace-postgresql`). Without
+          # this, the bare `lfdesousa/…` form resolves to
+          # `docker.io/lfdesousa/…` which doesn't exist.
+          image: "{{ .Values.postgresql.image.registry | default "docker.io" }}/{{ .Values.postgresql.image.repository | default "bitnamilegacy/postgresql" }}:{{ .Values.postgresql.image.tag | default "16" }}"
           env:
             - name: PGHOST
               value: "{{ .Release.Name }}-postgresql"

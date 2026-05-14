@@ -76,13 +76,23 @@ spec:
     spec:
       serviceAccountName: {{ .Release.Name }}-rabbitmq-topology
       restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      # 2026-05-14 B1.5 — mirror the subchart's imagePullSecrets
+      # so the same registry-auth works for this bootstrap Job
+      # if rabbitmq.image.registry ever points at a private registry.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: rabbitmqadmin
           # PR-B8 — match the rabbitmq subchart's image source. Operator
           # may override via --set rabbitmq.image.repository=...
           # (recommended: bitnamilegacy/rabbitmq when public bitnami/*
           # tags are pulled by Bitnami's repo hardening).
-          image: "{{ .Values.rabbitmq.image.repository | default "bitnami/rabbitmq" }}:{{ .Values.rabbitmq.image.tag | default "3.13" }}"
+          # 2026-05-14 — include registry too (subcharts use the
+          # registry/repository split; bare repository resolves to
+          # docker.io which is wrong for any non-Docker-Hub registry).
+          image: "{{ .Values.rabbitmq.image.registry | default "docker.io" }}/{{ .Values.rabbitmq.image.repository | default "bitnami/rabbitmq" }}:{{ .Values.rabbitmq.image.tag | default "3.13" }}"
           imagePullPolicy: IfNotPresent
           env:
             - name: RABBIT_HOST
