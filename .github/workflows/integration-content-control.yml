@@ -242,6 +242,172 @@ jobs:
           echo
           echo "✓ memory-server /health responded"
 
+      - name: Deploy mock LLM (kind-only, replaces external host-running llama)
+        run: |
+          # `externalLLM.enabled=false` in values-ci.yaml suppressed the
+          # chart's headless Service+Endpoints for `audittrace-llm-chat`.
+          # This fixture creates a Service with the SAME NAME at the
+          # SAME PORT, so memory-server's chart-hardcoded
+          # `AUDITTRACE_LLAMA_URL=http://audittrace-llm-chat:11435/v1`
+          # transparently resolves to the in-cluster mock.
+          kubectl apply -f tests/integration/fixtures/mock-llm-configmap.yaml \
+                        -f tests/integration/fixtures/mock-llm-deployment.yaml \
+                        -f tests/integration/fixtures/mock-llm-service.yaml
+          # Mock installs fastapi+uvicorn on first start (~10s); the
+          # readinessProbe has 30×2s = 60s of grace.
+          kubectl rollout status deployment/mock-llm --timeout=120s
+          echo "✓ mock-llm Ready"
+          # Sanity probe through the chart-rendered Service name (proves
+          # the wiring): hit /health via port-forward.
+          kubectl port-forward svc/audittrace-llm-chat 11435:11435 &
+          PF_LLM=$!
+          trap 'kill ${PF_LLM} 2>/dev/null || true' EXIT
+          sleep 2
+          curl -fsS http://localhost:11435/health
+          echo
+          echo "✓ audittrace-llm-chat resolves to mock-llm"
+
+      - name: B4 E2E — POST /memory/upload (clean + eicar) → terminal verdict
+        run: |
+          # Mirrors the Bruno collection:
+          #   bruno/audittrace/memory/upload-pdf-clean.bru
+          #   bruno/audittrace/memory/upload-status-clean.bru
+          #   bruno/audittrace/memory/upload-pdf.bru
+          #   bruno/audittrace/memory/upload-status.bru
+          # Auth: AUDITTRACE_AUTH_ENABLED=false in CI → sentinel admin
+          # user, no JWT needed. In prod the same flow goes via the
+          # Istio Gateway with a Keycloak-minted bearer token.
+          set -euo pipefail
+
+          # Generate the two test PDFs. The proper-PDF EICAR pattern was
+          # proven 2026-05-14: a bare-signature non-PDF fails clamd's
+          # PDF-aware extraction (returns clean even though the bytes
+          # are there). Putting the EICAR signature as the raw stream
+          # body of a PDF object reliably triggers
+          # `Eicar-Test-Signature FOUND`.
+          python3 - <<'PYEOF'
+          import pathlib
+
+          def build_pdf(stream_body: bytes) -> bytes:
+              header = b"%PDF-1.4\n"
+              o1 = b"1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n"
+              o2 = b"2 0 obj\n<</Type/Pages/Count 1/Kids[3 0 R]>>\nendobj\n"
+              o3 = b"3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R>>\nendobj\n"
+              o4 = (
+                  b"4 0 obj\n<</Length " + str(len(stream_body)).encode() + b">>\n"
+                  b"stream\n" + stream_body + b"\nendstream\nendobj\n"
+              )
+              body = header + o1 + o2 + o3 + o4
+              offsets = [
+                  len(header),
+                  len(header) + len(o1),
+                  len(header) + len(o1) + len(o2),
+                  len(header) + len(o1) + len(o2) + len(o3),
+              ]
+              xref_offset = len(body)
+              xref = b"xref\n0 5\n0000000000 65535 f \n"
+              for off in offsets:
+                  xref += f"{off:010d} 00000 n \n".encode()
+              trailer = (
+                  b"trailer\n<</Size 5/Root 1 0 R>>\nstartxref\n"
+                  + str(xref_offset).encode() + b"\n%%EOF\n"
+              )
+              return body + xref + trailer
+
+          eicar = b'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+          pathlib.Path("/tmp/clean.pdf").write_bytes(build_pdf(b"benign-test-content"))
+          pathlib.Path("/tmp/eicar.pdf").write_bytes(build_pdf(eicar))
+          print(f"clean.pdf: {pathlib.Path('/tmp/clean.pdf').stat().st_size}B")
+          print(f"eicar.pdf: {pathlib.Path('/tmp/eicar.pdf').stat().st_size}B")
+          PYEOF
+
+          # Port-forward to memory-server (already done by previous step's
+          # background process, but that one's about to be torn down by
+          # the EXIT trap — re-establish in THIS step's scope).
+          kubectl port-forward svc/audittrace-memory-server 8765:8765 &
+          PF=$!
+          trap 'kill ${PF} 2>/dev/null || true' EXIT
+          sleep 3
+
+          BASE="http://localhost:8765"
+
+          poll_until_terminal() {
+            local scan_id="$1" expected="$2" fixture="$3"
+            local status=""
+            for i in $(seq 1 60); do
+              status=$(curl -fsS "${BASE}/memory/upload/status?scan_id=${scan_id}" | jq -r .status)
+              echo "  [${fixture} poll $i/60] status=${status}"
+              case "${status}" in
+                "${expected}") return 0 ;;
+                pending_scan|scanning) sleep 2; continue ;;
+                *)
+                  echo "✗ ${fixture}: terminal status ${status} != expected ${expected}"
+                  return 1
+                  ;;
+              esac
+            done
+            echo "✗ ${fixture}: timeout waiting for ${expected} (last status=${status})"
+            return 1
+          }
+
+          for fixture in clean eicar; do
+            if [ "${fixture}" = "clean" ]; then
+              expected="scanned_clean"
+            else
+              expected="rejected_malware"
+            fi
+            echo "── POST /memory/upload (${fixture}.pdf) ──"
+            RESP=$(curl -fsS -X POST \
+              -F "file=@/tmp/${fixture}.pdf;type=application/pdf" \
+              "${BASE}/memory/upload?layer=episodic")
+            echo "${RESP}" | jq .
+            SCAN_ID=$(echo "${RESP}" | jq -r .scan_id)
+            [ -n "${SCAN_ID}" ] && [ "${SCAN_ID}" != "null" ] \
+              || { echo "✗ no scan_id in 202 body"; exit 1; }
+            # Bruno upload-pdf{,-clean}.bru shape assertions:
+            echo "${RESP}" | jq -e '.status == "pending_scan"' >/dev/null \
+              || { echo "✗ initial status != pending_scan"; exit 1; }
+            echo "${RESP}" | jq -e '.poll_url | test("/memory/upload/status\\?scan_id=")' >/dev/null \
+              || { echo "✗ poll_url shape wrong"; exit 1; }
+            echo "${RESP}" | jq -e '.object_uri | contains("/quarantine/")' >/dev/null \
+              || { echo "✗ object_uri not in /quarantine/"; exit 1; }
+            echo "${RESP}" | jq -e '(.object_uri | contains("/episodic/papers/")) | not' >/dev/null \
+              || { echo "✗ object_uri leaked into /episodic/papers/"; exit 1; }
+            echo "${RESP}" | jq -e '.object_sha256 | length == 64' >/dev/null \
+              || { echo "✗ sha256 length != 64"; exit 1; }
+            echo "  ✓ ${fixture} POST shape OK; scan_id=${SCAN_ID}"
+            poll_until_terminal "${SCAN_ID}" "${expected}" "${fixture}"
+            echo "✓ ${fixture}.pdf → ${expected}"
+          done
+
+      - name: B4 E2E — POST /v1/chat/completions via mock LLM
+        run: |
+          # Mirrors bruno/audittrace/chat/02-chat-completions.bru.
+          # Hits memory-server's chat-completions handler which proxies
+          # to audittrace-llm-chat:11435 (the mock). Per
+          # `feedback_openai_schema_inviolate` the response must keep
+          # the OpenAI choices[0].message shape exactly.
+          set -euo pipefail
+          kubectl port-forward svc/audittrace-memory-server 8765:8765 &
+          PF=$!
+          trap 'kill ${PF} 2>/dev/null || true' EXIT
+          sleep 3
+
+          BODY='{"model":"audittrace-default","messages":[{"role":"user","content":"Reply with a single word: bruno"}],"stream":false,"max_tokens":256}'
+          RESP=$(curl -fsS -X POST \
+            -H "Content-Type: application/json" \
+            -d "${BODY}" \
+            "http://localhost:8765/v1/chat/completions")
+          echo "${RESP}" | jq .
+          # Bruno chat-completions.bru shape assertions:
+          echo "${RESP}" | jq -e '.choices | type == "array"' >/dev/null \
+            || { echo "✗ choices is not an array"; exit 1; }
+          echo "${RESP}" | jq -e '.choices[0].message.role == "assistant"' >/dev/null \
+            || { echo "✗ message.role != assistant"; exit 1; }
+          echo "${RESP}" | jq -e '.choices[0].message.content | type == "string"' >/dev/null \
+            || { echo "✗ message.content not a string"; exit 1; }
+          echo "✓ /v1/chat/completions OpenAI shape preserved via mock-llm"
+
       - name: Diagnostics on failure
         if: failure()
         run: |
@@ -254,11 +420,28 @@ jobs:
           echo "── content-control logs ──"
           kubectl logs -l app.kubernetes.io/name=audittrace-content-control -c control-plane --tail=200 || true
           echo
+          echo "── mock-llm logs ──"
+          kubectl logs -l app.kubernetes.io/name=mock-llm --tail=80 || true
+          echo
           echo "── postgres logs ──"
           kubectl logs -l app.kubernetes.io/name=postgresql --tail=80 || true
           echo
           echo "── rabbitmq logs ──"
           kubectl logs -l app.kubernetes.io/name=rabbitmq --tail=80 || true
+          echo
+          echo "── rabbitmq queue state (scan pipeline) ──"
+          # Mirror what the B4a forensic used to identify the
+          # silently-stuck queue (`audittrace.scan.requests msgs=N
+          # consumers=0`). Surfaces the cc-worker-not-attached class.
+          RMQ_PW=$(kubectl get secret audittrace-rabbitmq \
+            -o jsonpath='{.data.rabbitmq-password}' | base64 -d 2>/dev/null || echo "")
+          if [ -n "${RMQ_PW}" ]; then
+            kubectl port-forward svc/audittrace-rabbitmq 15672:15672 >/dev/null 2>&1 &
+            sleep 2
+            curl -fsS -u "audittrace:${RMQ_PW}" "http://localhost:15672/api/queues" 2>/dev/null \
+              | jq -r '.[] | select(.name | startswith("audittrace.")) | "  \(.name) msgs=\(.messages // 0) consumers=\(.consumers // 0)"' \
+              || echo "  (mgmt API unreachable)"
+          fi
           echo
           echo "── minio logs ──"
           kubectl logs audittrace-minio-0 --tail=80 || true

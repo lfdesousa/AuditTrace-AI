@@ -1,3 +1,4 @@
+{{- if .Values.externalLLM.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -26,3 +27,4 @@ subsets:
       - port: {{ .Values.externalLLM.embed.port }}
         protocol: TCP
         name: http
+{{- end }}

@@ -1,0 +1,90 @@
+# Mock LLM fixture (2 of 3) — Deployment.
+#
+# Why this fixture exists
+# -----------------------
+# The production chart wires memory-server's AUDITTRACE_LLAMA_URL at
+# `http://<release>-llm-chat:<port>/v1` against a headless Service
+# whose Endpoints point at a host-running llama-server. kind has no
+# such host LLM. To exercise `/v1/chat/completions` end-to-end in CI
+# without an external dependency, this fixture deploys an in-cluster
+# mock that responds with OpenAI-shape JSON.
+#
+# Wiring trick
+# ------------
+# values-ci.yaml flips `externalLLM.enabled=false` so the chart skips
+# rendering its own Service+Endpoints. The Service in
+# mock-llm-service.yaml is named EXACTLY `audittrace-llm-chat` at the
+# SAME PORT (`11435`) so the chart's hardcoded
+# `AUDITTRACE_LLAMA_URL=http://audittrace-llm-chat:11435/v1` resolves
+# transparently to this mock.
+#
+# Contract served
+# ---------------
+# Bruno chat shape — bruno/audittrace/chat/02-chat-completions.bru:
+#   GET  /v1/models           → list of mock models
+#   POST /v1/chat/completions → OpenAI-strict-superset response, content="bruno"
+# Plus a /health probe used by the workflow's sanity check.
+#
+# Determinism
+# -----------
+# The mock returns canned content so workflow assertions stay stable.
+# The actual LLM behaviour is unit-tested elsewhere; CI's job here is
+# to prove the proxy/auth/RLS pipeline that wraps the LLM call.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm
+  labels:
+    app.kubernetes.io/name: mock-llm
+    app.kubernetes.io/component: ci-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mock-llm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mock-llm
+      annotations:
+        # Bypass istio sidecar — CI runs istio.enabled=false anyway,
+        # but explicit annotation keeps this fixture portable.
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: mock-llm
+          image: python:3.12-slim
+          # pip install once, then run uvicorn. The image cache
+          # survives pod restarts within a kind cluster — first start
+          # adds ~10 s to install fastapi + uvicorn, subsequent
+          # restarts boot in <2 s.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              pip install --quiet --no-cache-dir 'fastapi==0.115.0' 'uvicorn[standard]==0.32.0'
+              exec uvicorn server:app --app-dir=/app --host=0.0.0.0 --port=11435
+          ports:
+            - containerPort: 11435
+              name: http
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 11435
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            failureThreshold: 30  # ~60 s of grace for pip install
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: mock-llm-script

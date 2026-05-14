@@ -212,6 +212,11 @@ memoryServer:
 # works on any network. Override explicitly only if llama.cpp runs on a
 # different host (e.g. a separate workstation on your LAN). See ADR-045.
 externalLLM:
+  # 2026-05-14 B4b — disable the headless Service+Endpoints that bridge
+  # to a host-running LLM when CI deploys its own in-cluster mock as
+  # `<release>-llm-chat` (same name; kind has no host LLM). Default
+  # `true` preserves prod posture; values-ci.yaml flips to false.
+  enabled: true
   hostIP: ""
   chat:
     name: llm-chat

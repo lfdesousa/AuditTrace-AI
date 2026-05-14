@@ -68,18 +68,31 @@ class ScanRequestEnvelope:
     traceparent: str
 
     def as_amqp_payload(self) -> dict[str, Any]:
-        """Translate to the cross-repo ScanRequest contract (v1.yaml)."""
+        """Translate to the cross-repo ScanRequest contract (v1.yaml).
+
+        FLAT shape (2026-05-14, B4b CI catch): content-control v0.0.7's
+        ``scan_request_consumer_rabbitmq._parse_message`` reads the
+        keys ``object_uri``, ``object_sha256``, ``object_size_bytes``
+        — not a nested ``object.{uri,sha256,size_bytes}``. The prior
+        nested shape silently dead-lettered on the consumer side
+        (``poison_message: 'object_uri'`` KeyError → DLX). Prod's
+        ``v1.0.20-flat`` image was built from a branch that patched
+        this to flat but the patch was never merged to main, so
+        every memory-server build off main since
+        ``1f4967a feat(adr-048): /memory/upload PDF rewrite`` has
+        been silently incompatible with cc-v0.0.7. CI is where it
+        bit, hence the ``-flat`` suffix on the in-prod image tag.
+        Anchor: ``feedback_no_more_drifts``, B4b PR.
+        """
         return {
             "scan_id": self.scan_id,
             "user_id": self.user_id,
             "trace_id": self.trace_id,
             "traceparent": self.traceparent,
-            "object": {
-                "uri": self.object_uri,
-                "sha256": self.object_sha256,
-                "size_bytes": self.size_bytes,
-                "claimed_content_type": self.claimed_content_type,
-            },
+            "object_uri": self.object_uri,
+            "object_sha256": self.object_sha256,
+            "object_size_bytes": self.size_bytes,
+            "claimed_content_type": self.claimed_content_type,
             "enqueued_at_ms": _now_ms(),
         }
 

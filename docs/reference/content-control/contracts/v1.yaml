@@ -99,47 +99,78 @@ http:
           threat_family: { type: string }
           confidence: { type: number }
 
-# ── Redis Stream surfaces (RESP3 over Istio mTLS) ──────────────────────
-# Two streams + DLQ counterparts. Field-level schemas pin the
+# ── AMQP surfaces (RabbitMQ topic exchanges over Istio mTLS) ──────────
+# Two queues + DLQ counterparts. Field-level schemas pin the
 # producer/consumer contract on both sides of each repo boundary.
+# 2026-05-14: original placeholder claimed Redis Streams (RESP3);
+# ADR-057 swapped the transport to RabbitMQ before v1.0 was reached,
+# and the placeholder was never updated. Queue names use the AMQP
+# convention (dot-separated), not the Redis Stream convention
+# (colon-separated). Producer = memory-server; consumer for
+# `audittrace.scan.requests` = audittrace-content-control's
+# `RabbitMQScanRequestConsumer`.
 streams:
   scan_requests:
-    name: "audittrace:scan:requests"
+    name: "audittrace.scan.requests"
     consumer_group: "content-control"
-    dlq: "audittrace:scan:requests:dlq"
+    dlq: "audittrace.scan.requests.dlq"
     field_schema:
       $ref: "#/components/schemas/ScanRequestStreamEntry"
   scan_verdicts:
-    name: "audittrace:scan:verdicts"
+    name: "audittrace.scan.verdicts"
     consumer_group: "audittrace-verdict-consumers"
-    dlq: "audittrace:scan:verdicts:dlq"
+    dlq: "audittrace.scan.verdicts.dlq"
     field_schema:
       $ref: "#/components/schemas/VerdictStreamEntry"
 
 components:
   schemas:
     ScanRequestStreamEntry:
-      # Flat string→string fields per Redis Stream entry shape.
-      # Mirrors async_persist.py:178–184 producer pattern.
+      # 2026-05-14 (B4b): the actual running shape on both sides.
+      # FLAT JSON object on the AMQP message body. Producer:
+      # `src/audittrace/services/scan_request_publisher.py::
+      # ScanRequestEnvelope.as_amqp_payload`. Consumer:
+      # `content_control.adapters.scan_request_consumer_rabbitmq::
+      # _parse_message` (verified against the cc v0.0.7 wheel).
+      # Earlier draft of this schema named the fields
+      # `expected_content_type`, `enqueued_ts`, and named the
+      # transport "Redis Stream" — both were 1.0-placeholder
+      # legacies from before ADR-057 swapped the transport to
+      # RabbitMQ and before the field names were locked.
       type: object
-      required: [scan_id, object_uri, expected_content_type, user_id, trace_id, traceparent, enqueued_ts]
+      required:
+        [
+          scan_id,
+          object_uri,
+          object_sha256,
+          object_size_bytes,
+          user_id,
+          trace_id,
+          traceparent,
+        ]
       properties:
         scan_id: { type: string, format: uuid }
         object_uri:
           type: string
-          description: "s3://shared/quarantine/<user_id>/<uuid>/<filename>"
-        expected_content_type:
+          description: "s3://memory-shared/quarantine/<user_id>/<scan_id>/<filename>"
+        object_sha256:
           type: string
-          description: "Claimed MIME type from /memory/upload caller"
+          description: "SHA-256 of the object body, hex-encoded (64 chars)"
+        object_size_bytes:
+          type: integer
+          description: "Byte count of the uploaded object"
+        claimed_content_type:
+          type: string
+          default: "application/octet-stream"
+          description: "Claimed MIME type from the /memory/upload caller (the magic-byte sniff is server-side and not echoed here)"
         user_id: { type: string }
         trace_id: { type: string, description: "OTel trace_id (32-char hex)" }
         traceparent:
           type: string
           description: "W3C TraceContext header value"
-        enqueued_ts: { type: string, format: date-time }
-        scan_modes:
-          type: string
-          description: "Comma-separated subset of {malware, structure, classification}; default 'malware' for v1"
+        enqueued_at_ms:
+          type: integer
+          description: "Producer-side wall-clock at publish, millis since epoch"
     VerdictStreamEntry:
       type: object
       required: [scan_id, verdict_json, metadata_json, enqueued_ts, trace_id]

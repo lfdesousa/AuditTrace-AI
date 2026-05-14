@@ -45,6 +45,14 @@ memoryServer:
     AUDITTRACE_SCAN_REQUEST_EXCHANGE: "audittrace.scan"
     AUDITTRACE_SCAN_REQUEST_ROUTING_KEY: "scan.request.new"
 
+# External LLM Services (headless + Endpoints to host IP) are
+# disabled in kind. tests/integration/fixtures/mock-llm.yaml deploys
+# an in-cluster mock that registers a Service with the same name
+# the chart hardcodes into AUDITTRACE_LLAMA_URL — memory-server's
+# chat handler transparently resolves to it. (B4b, 2026-05-14.)
+externalLLM:
+  enabled: false
+
 # vault.enabled=false branch — memory-server reads creds from
 # the in-chart-rendered Secrets, NOT from /vault/secrets/env.
 vault:

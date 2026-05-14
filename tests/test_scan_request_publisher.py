@@ -32,18 +32,24 @@ def _envelope(scan_id: str = "scan-1") -> ScanRequestEnvelope:
 
 class TestEnvelopePayload:
     def test_amqp_payload_shape_matches_contract(self) -> None:
+        # 2026-05-14 B4b: flipped from nested `object.{uri,sha256,size_bytes}`
+        # to the FLAT cross-repo contract shape that
+        # content-control v0.0.7's scan_request_consumer_rabbitmq
+        # actually parses. The nested form was silently incompatible
+        # since PR-B3 (1f4967a); prod's image `v1.0.20-flat` was
+        # built from a never-merged branch patching this. See the
+        # docstring on `ScanRequestEnvelope.as_amqp_payload`.
         env = _envelope()
         p = env.as_amqp_payload()
         assert p["scan_id"] == "scan-1"
         assert p["user_id"] == "alice"
         assert p["trace_id"] == "trace-abc"
         assert p["traceparent"] == "00-abc-def-01"
-        assert p["object"] == {
-            "uri": "s3://memory-shared/quarantine/alice/scan-1/paper.pdf",
-            "sha256": "0" * 64,
-            "size_bytes": 12,
-            "claimed_content_type": "application/pdf",
-        }
+        assert p["object_uri"] == "s3://memory-shared/quarantine/alice/scan-1/paper.pdf"
+        assert p["object_sha256"] == "0" * 64
+        assert p["object_size_bytes"] == 12
+        assert p["claimed_content_type"] == "application/pdf"
+        assert "object" not in p, "regression: nested object key resurfaced"
         assert isinstance(p["enqueued_at_ms"], int)
 
 
