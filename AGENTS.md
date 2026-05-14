@@ -308,6 +308,26 @@ The CI gate still requires the PR body sections.
   **Operator runbook for PAT lifecycle + Secret rotation:**
   `~/work/audittrace-private/runbooks/12-ghcr-pull-secret.md` (private).
   Full forensic at memory `project_bitnami_systemic_tag_mislabel`.
+- **`global.security.allowInsecureImages: true` (operator-caveat, 2026-05-14):**
+  Set in both `charts/audittrace/values-local.yaml` and
+  `tests/integration/fixtures/values-ci.yaml`. The name is misleading
+  — it does **NOT** disable any actual security control. It only
+  suppresses Bitnami subchart 16.7.27+'s built-in `verify-images`
+  template, which refuses to render any postgres/redis image ref
+  that doesn't sit under `bitnami/*` or `bitnamilegacy/*`. Bitnami's
+  documented escape hatch for downstream operators republishing images
+  to their own registry: github.com/bitnami/charts/issues/30850.
+  We need it because our frozen PG 18.3 + Redis 8.6.2 images live at
+  `ghcr.io/lfdesousa/audittrace-{postgresql,redis}` (see the bullet
+  above). The actual image content is unchanged — same OCI digest
+  as the pre-sunset Bitnami images — so "insecure" here is a Bitnami
+  vendor-convention check, not a CVE-class one. **Do not** set this
+  flag as a blanket default; scope it to values files that override
+  postgres/redis image references. The chart drift guard
+  (`tests/test_chart_drift_guards.py`) catches AP/role coverage drift
+  but does not flag a missing `allowInsecureImages` — if a fresh
+  override is added and helm template aborts with "Unrecognized
+  images", this is the flag to set in the same values file.
 
 ### Data-compat harness — test before any subchart image swap
 
