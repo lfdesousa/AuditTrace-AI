@@ -121,8 +121,13 @@ jobs:
           # `lfds/x` and `docker.io/lfds/x` as distinct refs under
           # pullPolicy=Never.
           set -e
+          # 2026-05-14 B6 downstream: bumped 0.0.7 -> 0.0.9. cc-chart
+          # v0.0.9 templates image.tag default to .Chart.AppVersion
+          # (also 0.0.9), so the rendered image is the published
+          # `lfds/audittrace-content-control:0.0.9` automatically —
+          # no separate image.tag pin in values-cc-ci.yaml needed.
           helm pull oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
-            --version 0.0.7 \
+            --version 0.0.9 \
             --untar --untardir /tmp/cc-chart
           images=$(helm template cc /tmp/cc-chart/audittrace-content-control-chart \
             --namespace default \
@@ -221,7 +226,7 @@ jobs:
           #   "no matches for kind 'AuthorizationPolicy' in version
           #   'security.istio.io/v1' — ensure CRDs are installed first".
           helm install cc oci://registry-1.docker.io/lfds/audittrace-content-control-chart \
-            --version 0.0.7 \
+            --version 0.0.9 \
             --namespace default \
             --values tests/integration/fixtures/values-cc-ci.yaml \
             --wait --timeout=10m
