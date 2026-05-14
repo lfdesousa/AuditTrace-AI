@@ -1,0 +1,23 @@
+# Mock LLM fixture (3 of 3) — Service.
+#
+# Service named EXACTLY as the chart-hardcoded AUDITTRACE_LLAMA_URL
+# expects: `audittrace-llm-chat`. Port matches the chart default
+# `externalLLM.chat.port: 11435`. memory-server's chat handler
+# resolves `http://audittrace-llm-chat:11435/v1` → this mock.
+#
+# See mock-llm-deployment.yaml for the wiring rationale.
+apiVersion: v1
+kind: Service
+metadata:
+  name: audittrace-llm-chat
+  labels:
+    app.kubernetes.io/name: mock-llm
+    app.kubernetes.io/component: ci-mock
+spec:
+  selector:
+    app.kubernetes.io/name: mock-llm
+  ports:
+    - port: 11435
+      targetPort: 11435
+      protocol: TCP
+      name: http
