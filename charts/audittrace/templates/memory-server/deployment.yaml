@@ -28,7 +28,13 @@ spec:
       {{- end }}
       containers:
         - name: memory-server
-          image: "{{ .Values.memoryServer.image.repository }}:{{ .Values.memoryServer.image.tag }}"
+          # Image tag defaults to .Chart.AppVersion so chart upgrades
+          # automatically track a matching image without operators
+          # having to bump values.yaml in lockstep. Same pattern as
+          # cc-repo's PR-A14 / B6 — see Chart.AppVersion sync test
+          # for the drift guard. Operators can still override with
+          # --set memoryServer.image.tag=<explicit> for pinning.
+          image: "{{ .Values.memoryServer.image.repository }}:{{ .Values.memoryServer.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.memoryServer.image.pullPolicy }}
           {{- if .Values.vault.enabled }}
           # entrypoint.sh handles Vault-injected secret sourcing internally

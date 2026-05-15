@@ -60,15 +60,22 @@ global:
 memoryServer:
   replicaCount: 1
   image:
-    repository: localhost:5000/audittrace/memory-server
-    tag: latest
-    # Default is Always because the default tag is the mutable "latest".
-    # With IfNotPresent + latest, kubelet never re-pulls on rollout (the
-    # tag is the key, not the digest), so developers iterating on code
-    # silently keep running the stale image — a trap that cost us 20 min
-    # on 2026-04-18. Override to IfNotPresent when you pin to an
-    # immutable digest or a semver-tagged release.
-    pullPolicy: Always
+    # Published by .github/workflows/publish.yml on every v*.*.* tag —
+    # multi-arch (linux/amd64,linux/arm64). Operators with an internal
+    # mirror or local-registry workflow override `repository` per-deploy
+    # (e.g. localhost:5000 for the dev `kind` cluster).
+    repository: docker.io/lfds/audittrace-memory-server
+    # Empty default → chart template uses .Chart.AppVersion. Bumping
+    # the chart's appVersion auto-tracks the matching image without
+    # operators having to remember to bump tag in lockstep. Same B6
+    # pattern as cc-repo's chart. Override with --set
+    # memoryServer.image.tag=<explicit> to pin to a specific build.
+    tag: ""
+    # IfNotPresent is now safe because the default tag is the immutable
+    # release version (chart's appVersion), not "latest". Operators who
+    # explicitly --set image.tag=latest should also flip pullPolicy back
+    # to Always — same 2026-04-18 trap.
+    pullPolicy: IfNotPresent
   summariser:
     # When true, a post-install/post-upgrade Helm hook provisions a
     # dedicated, minimum-privilege `audittrace_summariser` role with
