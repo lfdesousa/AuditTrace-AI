@@ -21,7 +21,7 @@ body:json {
       { "role": "user", "content": "Reply with a single word: bruno" }
     ],
     "stream": false,
-    "max_tokens": 256
+    "max_tokens": 512
   }
 }
 
@@ -51,6 +51,26 @@ tests {
     expect(body.choices[0].message.role).to.equal("assistant");
     expect(body.choices[0].message.content).to.be.a("string");
   });
+  test("finish_reason is 'stop' (not 'length' — caught 2026-05-15 v1.0.22 E2E)", function() {
+    const body = res.getBody();
+    expect(body.choices[0].finish_reason).to.equal("stop");
+  });
+  test("user-visible answer non-empty after stripping <think> reasoning", function() {
+    // Reasoning models (Qwen3 / o1 / DeepSeek-R1) emit <think>...</think>
+    // before the answer. The user sees only what's AFTER the closing
+    // tag. A test that only checks content non-empty would pass on a
+    // truncated <think>-only response (the 2026-05-15 trap).
+    const raw = res.getBody().choices[0].message.content;
+    const visible = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    expect(visible).to.not.be.empty;
+  });
+  test("prompt_tokens > 100 (memory augmentation actually ran)", function() {
+    // A bare /v1/chat/completions without the memory-server's
+    // augmentation pipeline would be ~10-20 prompt tokens. >100
+    // proves the system context + episodic/procedural recall
+    // ran ahead of the LLM call.
+    expect(res.getBody().usage.prompt_tokens).to.be.above(100);
+  });
 }
 
 docs {
@@ -58,4 +78,12 @@ docs {
   byte-compatible (`feedback_openai_schema_inviolate`). Header-based
   extensions (e.g. ADR-046's `X-Persist-Mode: async` once shipped)
   are additive; the default shape never changes.
+
+  **max_tokens=512 is deliberate** (caught live 2026-05-15): the
+  Qwen3.6-35B reasoning model emits a `<think>...</think>` reasoning
+  prefix before the answer. With max_tokens=60 the test returned
+  HTTP 200 + finish_reason="length" + content that was only the
+  unfinished `<think>` block — looked like success at the HTTP
+  layer but the model never actually answered. The
+  `feedback_e2e_includes_llm_call` memory captures the lesson.
 }

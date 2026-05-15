@@ -37,11 +37,28 @@ docs {
   the PDF corpus (caught live 2026-05-06: bulk mode hits Istio's
   NotReady threshold mid-rebuild).
 
+  **Contract (caught live 2026-05-15):** in single-file mode BOTH
+  query params are required:
+    - ``file=<layer>/<key>``      — the MinIO source (layer ∈ {episodic, procedural})
+    - ``collections=<one-name>``  — the SINGLE ChromaDB target collection
+  Sending ``?file=...`` without ``?collections=...`` returns
+  ``HTTP 400 — "?file= requires exactly one collection in
+  ?collections= (single-file mode is per-collection)."`` The
+  ai_research_papers example above shows the PDF→PDF-corpus path;
+  the sibling file ``index-single-file-md-to-decisions.bru`` shows
+  the EOD-memo→decisions path that motivated the v1.0.22 scope-grant
+  PRs (#87 / #88).
+
   Authorization: requires the per-layer write scope matching the
   file's MinIO prefix — e.g. ``file=episodic/...`` requires
   ``memory:episodic:write``. ``audittrace:admin`` continues to work.
   A token with the wrong layer's write scope returns 403 with the
-  missing scope name in the detail.
+  missing scope name in the detail. The target ``collections=`` value
+  is NOT scope-gated by collection today (per ADR-058 candidate);
+  ``memory:semantic:write`` covers all ChromaDB collections at the
+  runtime check. ``memory:decisions:write`` and ``memory:skills:write``
+  are issued by Keycloak (v1.0.22) and advertised in the OpenAPI
+  spec but bind to per-collection enforcement in a future PR.
 
   This is the per-layer scope flow added by backlog #14 (2026-05-08)
   for the M3 LibreChat user-driven upload path: end-user UI sessions
