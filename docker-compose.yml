@@ -1,11 +1,37 @@
 # audittrace-stack — Docker Compose
-# Phase 1-2: memory-server + PostgreSQL + ChromaDB + MinIO + Traefik + Keycloak
-# Langfuse runs as a sibling stack (ADR-021.2)
+#
+# B7 step 1 (2026-05-15) — rebuilt from scratch to match the
+# Helm chart's deployed posture:
+#   * SAME images: ghcr-frozen Bitnami pg/redis/rabbitmq + upstream
+#     chromadb/keycloak/minio/traefik. Compose now exercises the
+#     exact bytes prod runs. Anchor: project_pickup_20260515_b7.
+#   * SAME conventions: Bitnami env-vars (POSTGRESQL_*, REDIS_*,
+#     RABBITMQ_*) + Bitnami volume paths (/bitnami/*).
+#   * RabbitMQ added — required since v1.0.7 (scan_amqp_client
+#     lifespan blocks without it).
+#   * Network is compose-managed (no `external: true`).
+#
+# OPERATOR CAVEAT — WIPE VOLUMES ON FIRST UP AFTER B7 STEP 1:
+#   The previous compose used vanilla `postgres:16-alpine` writing
+#   to /var/lib/postgresql/data and `redis:7-alpine` with command-
+#   line auth. Bitnami pins are PG 18.3 / Redis 8.6.2 (same binary
+#   prod runs) and write to /bitnami/postgresql + /bitnami/redis/data.
+#   The OLD volumes are incompatible. From a stopped stack:
+#     docker compose down -v --remove-orphans
+#   That clears postgres_data + audittrace_redis_data + chroma_data
+#   + minio_data so the next `up` initialises against the new images
+#   cleanly. Acceptable because compose is dev-only — k8s/Helm is
+#   the canonical production path.
 
 services:
 
   memory-server:
-    build: .
+    # B7 step 1 — pin to the published multi-arch image (same image
+    # prod pulls). Dev iteration via docker-compose.dev.yml overlay
+    # which re-introduces `build: .` + bind-mounts /src for hot
+    # reload. Override the tag for local dev builds with:
+    #   AUDITTRACE_IMAGE_TAG=dev docker compose up -d
+    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.0.22}
     container_name: audittrace-server
     entrypoint: ["/app/scripts/entrypoint.sh"]
     depends_on:
@@ -15,6 +41,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
       keycloak:
         condition: service_healthy
       minio:
@@ -22,48 +50,36 @@ services:
     environment:
       - AUDITTRACE_CHROMA_URL=http://chromadb:8000
       - AUDITTRACE_CHROMA_TOKEN=${AUDITTRACE_CHROMA_TOKEN}
-      # DESIGN §16 Phase 4: the memory-server connects as the
-      # non-superuser `audittrace_app` role so Postgres RLS policies
-      # actually apply to its queries. The `audittrace` superuser role
-      # is retained for admin tasks but not used on the hot path.
-      # See scripts/init-audittrace-app-role.sh for the role setup.
+      # DESIGN §16 Phase 4 — connect as the non-superuser
+      # `audittrace_app` role so Postgres RLS policies apply to the
+      # hot path. `audittrace` superuser stays for admin tasks /
+      # summariser RLS-bypass only. Init scripts under
+      # scripts/init-audittrace-app-role.sh create the role on
+      # first DB init.
       - AUDITTRACE_POSTGRES_URL=postgresql+psycopg2://audittrace_app:${AUDITTRACE_APP_PASSWORD:-${AUDITTRACE_POSTGRES_PASSWORD}}@postgres:5432/audittrace
       - AUDITTRACE_LLAMA_URL=http://host.docker.internal:11435/v1
       - AUDITTRACE_EMBED_URL=http://host.docker.internal:11436/v1
-      # ADR-030: dedicated summariser endpoint (Mistral 7B Instruct v0.3)
-      # on port 11437. Separate process so background summarisation does
-      # not contend with the interactive tool-loop on the Qwen slot.
-      # Disable without editing the image by setting
-      # AUDITTRACE_SUMMARIZER_ENABLED=false.
+      # ADR-030 dedicated summariser endpoint
       - AUDITTRACE_SUMMARIZER_URL=${AUDITTRACE_SUMMARIZER_URL:-http://host.docker.internal:11437/v1}
       - AUDITTRACE_SUMMARIZER_MODEL=${AUDITTRACE_SUMMARIZER_MODEL:-mistral-7b-summarizer}
       - AUDITTRACE_SUMMARIZER_ENABLED=${AUDITTRACE_SUMMARIZER_ENABLED:-true}
       - AUDITTRACE_SUMMARIZER_IDLE_MINUTES=${AUDITTRACE_SUMMARIZER_IDLE_MINUTES:-15}
       - AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES=${AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES:-5}
       - AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE=${AUDITTRACE_SUMMARIZER_MAX_PER_CYCLE:-10}
-      # Summariser uses the ``audittrace`` owner role (not ``audittrace_app``)
-      # so ``SET LOCAL row_security = off`` in its eligibility txn
-      # actually bypasses FORCE RLS on the audit tables. This is the
-      # admin-batch-worker split flagged in docker-compose.yml line 28.
       - AUDITTRACE_SUMMARIZER_POSTGRES_URL=postgresql+psycopg2://audittrace:${AUDITTRACE_POSTGRES_PASSWORD}@postgres:5432/audittrace
-      # ADR-028: OTLP export → OTel Collector. Traces fan out to Tempo
-      # (call chain) AND Langfuse (LLM-specific) via dual processors on
-      # the Langfuse TracerProvider. See telemetry.py init_telemetry.
-      - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-http://otel-collector:4318}
-      # OTel SDK resource attributes — read by the default
-      # OTELResourceDetector, which runs regardless of which provider
-      # (ours or Langfuse's) ends up installed as global. Gets us a
-      # correct ``service.name`` on every trace's Resource.
+      # ADR-057 scan-control AMQP broker. Lifespan calls
+      # scan_amqp_client.ensure_connected() — without rabbitmq the
+      # pod crash-loops. PR #84 startupProbe handles slow connect.
+      - AUDITTRACE_SCAN_AMQP_URL=amqp://audittrace:${AUDITTRACE_RABBITMQ_PASSWORD}@rabbitmq:5672/
+      - AUDITTRACE_RABBITMQ_PASSWORD=${AUDITTRACE_RABBITMQ_PASSWORD}
+      - AUDITTRACE_SCAN_PIPELINE_ENABLED=${AUDITTRACE_SCAN_PIPELINE_ENABLED:-true}
+      - AUDITTRACE_SCAN_REQUEST_EXCHANGE=${AUDITTRACE_SCAN_REQUEST_EXCHANGE:-audittrace.scan}
+      - AUDITTRACE_SCAN_REQUEST_ROUTING_KEY=${AUDITTRACE_SCAN_REQUEST_ROUTING_KEY:-scan.request.new}
+      # ADR-028 OTLP export — wired ONLY when the obs profile runs;
+      # otel-collector service is in a future B7 step.
+      - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-}
       - OTEL_SERVICE_NAME=audittrace-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=0.3.1,deployment.environment=${AUDITTRACE_ENV:-local}
-      # HTTP semconv migration (1.25+). `http/dup` makes the httpx and
-      # urllib3 instrumentors emit BOTH the old attrs (http.url,
-      # net.peer.name) and the new stable ones (server.address,
-      # url.full). Tempo's service-graph peer_attributes can then use
-      # `server.address` for clean node labels (keycloak/langfuse/minio
-      # etc.) instead of dirty full URLs. Drop to `http` to stop
-      # emitting the legacy keys once all downstream consumers are on
-      # the new semconv.
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.0.22},deployment.environment=${AUDITTRACE_ENV:-local}
       - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
       - AUDITTRACE_METRICS_ENABLED=${AUDITTRACE_METRICS_ENABLED:-true}
       - AUDITTRACE_LANGFUSE_HOST=${AUDITTRACE_LANGFUSE_HOST:-http://langfuse-web:3000}
@@ -72,46 +88,21 @@ services:
       - AUDITTRACE_LANGFUSE_ENABLED=${AUDITTRACE_LANGFUSE_ENABLED:-false}
       - AUDITTRACE_LOG_LEVEL=${AUDITTRACE_LOG_LEVEL:-INFO}
       - AUDITTRACE_AUTH_ENABLED=${AUDITTRACE_AUTH_ENABLED:-true}
-      # llama.cpp proxy read timeout. Default (120s) is too tight for
-      # cold model reload + inject-mode memory blobs that blow up the
-      # prompt-eval time. Bumped to 300s so a cold start on Qwen3.5-35B
-      # + a few thousand prompt tokens doesn't trip httpcore.ReadTimeout
-      # mid-stream. If this bites again, flip AUDITTRACE_MEMORY_MODE=tools
-      # (ADR-025) to pay the memory cost only when the LLM asks for it.
       - AUDITTRACE_LLAMA_PROXY_TIMEOUT=${AUDITTRACE_LLAMA_PROXY_TIMEOUT:-300}
-      # ADR-034: per-chunk idle timeout replaces the flat proxy timeout for
-      # streaming. If no SSE chunk arrives within this window, the stream
-      # is considered stalled and a 504 + audit row are emitted.
       - AUDITTRACE_LLAMA_CHUNK_TIMEOUT=${AUDITTRACE_LLAMA_CHUNK_TIMEOUT:-120}
-      # ADR-034: SSE keep-alive comment frames emitted during quiet periods
-      # (e.g. Qwen <think> reasoning). Holds connections through proxies.
       - AUDITTRACE_SSE_KEEPALIVE_INTERVAL=${AUDITTRACE_SSE_KEEPALIVE_INTERVAL:-15}
-      # DESIGN §16 Phase 5b: auth required by default — every request
-      # must carry a valid Keycloak JWT. Override with
-      # `AUDITTRACE_AUTH_REQUIRED=false` for the migration bypass if
-      # your client isn't Keycloak-ready yet. The Python test suite
-      # clears all AUDITTRACE_* env vars in conftest.py so its sentinel
-      # path is unaffected by this default.
       - AUDITTRACE_AUTH_REQUIRED=${AUDITTRACE_AUTH_REQUIRED:-true}
       - AUDITTRACE_KEYCLOAK_ISSUER=http://keycloak:8080/realms/audittrace
       - AUDITTRACE_KEYCLOAK_JWKS_URL=http://keycloak:8080/realms/audittrace/protocol/openid-connect/certs
-      # ADR-032: Device-Flow tokens ride the Traefik-exposed URL and
-      # carry a different ``iss`` than the internal docker-network one
-      # used by service-account flows. Accepting both keeps the
-      # memory-server usable from BOTH token families without
-      # relaxing validation to skip issuer entirely.
       - AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS=["http://localhost/realms/audittrace","https://localhost/realms/audittrace"]
       - AUDITTRACE_JWT_AUDIENCE=audittrace-server
-      # Redis-backed token cache (ADR-026 §15.4)
       - AUDITTRACE_REDIS_URL=redis://redis:6379/0
       - AUDITTRACE_REDIS_PASSWORD=${AUDITTRACE_REDIS_PASSWORD}
       - AUDITTRACE_TOKEN_CACHE_TTL_SECONDS=${AUDITTRACE_TOKEN_CACHE_TTL_SECONDS:-300}
-      # Memory-as-tools (ADR-025) — kill switch + loop cap + tool result cache
       - AUDITTRACE_MEMORY_MODE=${AUDITTRACE_MEMORY_MODE:-inject}
       - AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS=${AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS:-5}
       - AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS=${AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS:-900}
       - AUDITTRACE_TOOLS_CONFIG_PATH=${AUDITTRACE_TOOLS_CONFIG_PATH:-tools.toml}
-      # MinIO S3 object storage (ADR-027) — replaces filesystem bind mounts
       - AUDITTRACE_MINIO_URL=http://minio:9000
       - AUDITTRACE_MINIO_ACCESS_KEY=${AUDITTRACE_MINIO_ACCESS_KEY:-minioadmin}
       - AUDITTRACE_MINIO_SECRET_KEY=${AUDITTRACE_MINIO_SECRET_KEY}
@@ -131,37 +122,52 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16-alpine
+    # B7 step 1 — Bitnami PG 18.3 (same binary prod runs). The tag
+    # `17.6.0-...` is mislabelled and ships PG 18.3 — see
+    # `project_bitnami_systemic_tag_mislabel`. Our ghcr-frozen
+    # mirror (B1.5) preserves the moment-in-time bytes so CI / kind /
+    # prod / compose all run the SAME binary.
+    image: ghcr.io/lfdesousa/audittrace-postgresql:18.3-bitnami-frozen-apr17
     container_name: audittrace-postgres
     ports:
       - "15432:5432"
     environment:
-      POSTGRES_DB: audittrace
-      POSTGRES_USER: audittrace
-      POSTGRES_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
-      # Passed through to init-audittrace-app-role.sh so the app role
-      # gets a dedicated password. Falls back to POSTGRES_PASSWORD if
-      # the operator doesn't set it explicitly (dev-simple default).
+      # Bitnami conventions (NOT vanilla POSTGRES_*) — same env
+      # surface the Bitnami subchart wires in prod. The user-config
+      # role `audittrace_app` is created post-init by the script
+      # mounted below.
+      POSTGRESQL_DATABASE: audittrace
+      POSTGRESQL_USERNAME: audittrace
+      POSTGRESQL_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
+      # Superuser password — bitnami separates the `postgres` role's
+      # password from the application role's. Set to the same value
+      # for compose-simplicity; prod Vault-derives them separately.
+      POSTGRESQL_POSTGRES_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
+      # Passed through to init-audittrace-app-role.sh
       AUDITTRACE_APP_PASSWORD: ${AUDITTRACE_APP_PASSWORD:-${AUDITTRACE_POSTGRES_PASSWORD}}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Bitnami path (was /var/lib/postgresql/data on vanilla). The
+      # `postgres_data` named volume name is preserved; new image
+      # initialises it from scratch on first up.
+      - postgres_data:/bitnami/postgresql
+      # Bitnami's postgres image runs `/docker-entrypoint-initdb.d/*.sh`
+      # AFTER the cluster is initialised — same convention as vanilla.
       - ./scripts/init-keycloak-db.sql:/docker-entrypoint-initdb.d/01-init-keycloak-db.sql:ro
-      # DESIGN §16 Phase 4: create the non-superuser audittrace_app role
-      # on first init. Runs AFTER keycloak DB creation (alphabetical
-      # ordering via the 01-/02- prefixes). Idempotent — safe to re-run
-      # manually via `docker exec` on an existing volume.
       - ./scripts/init-audittrace-app-role.sh:/docker-entrypoint-initdb.d/02-init-audittrace-app-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U audittrace -d audittrace"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     networks:
       - audittrace-net
     restart: unless-stopped
 
   chromadb:
-    image: chromadb/chroma:1.5.8
+    # Chart's chromadb is in-chart (not a subchart). Pin matches
+    # `charts/audittrace/values.yaml::chromadb.image.tag`.
+    image: chromadb/chroma:1.5.7
     container_name: audittrace-chromadb
     ports:
       - "18000:8000"
@@ -181,6 +187,8 @@ services:
     restart: unless-stopped
 
   keycloak:
+    # Chart-aligned (quay.io/keycloak/keycloak:24.0 — already
+    # matched pre-B7; preserved here).
     image: quay.io/keycloak/keycloak:24.0
     container_name: audittrace-keycloak
     command: start-dev --import-realm --health-enabled=true
@@ -194,13 +202,6 @@ services:
       KC_DB_PASSWORD: ${AUDITTRACE_POSTGRES_PASSWORD}
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      # ADR-032: Keycloak is fronted by Traefik on :443. Without
-      # these, Keycloak renders login redirects as http://localhost
-      # (no scheme awareness) and the browser hits :80 which nothing
-      # listens on — broken Device Flow. Setting KC_HOSTNAME_URL
-      # forces https-qualified URLs everywhere and KC_PROXY=edge
-      # tells Keycloak to trust Traefik's X-Forwarded-* headers so
-      # the TLS-termination is transparent.
       KC_HOSTNAME_URL: https://localhost
       KC_HOSTNAME_ADMIN_URL: https://localhost
       KC_PROXY: edge
@@ -223,54 +224,85 @@ services:
     restart: unless-stopped
 
   redis:
-    # ADR-026 §15.4 — Redis-backed token cache.
-    # Dedicated to audittrace-server; NOT shared with the Langfuse
-    # Redis (which lives in the sibling Langfuse compose stack). Keeping
-    # the two decoupled avoids cross-system coupling and lets each
-    # scale independently.
-    image: redis:7-alpine
+    # B7 step 1 — Bitnami Redis 8.6.2 (same binary prod runs; the
+    # `7.2.5-...` tag is mislabelled per the systemic Bitnami forensic
+    # — see `project_bitnami_systemic_tag_mislabel`). ghcr-frozen
+    # mirror (B1.5) preserves the bytes.
+    image: ghcr.io/lfdesousa/audittrace-redis:8.6.2-bitnami-frozen-apr17
     container_name: audittrace-redis
-    command:
-      - redis-server
-      - --requirepass
-      - ${AUDITTRACE_REDIS_PASSWORD}
-      - --appendonly
-      - "no"  # token cache is ephemeral by design
-      - --maxmemory
-      - "256mb"
-      - --maxmemory-policy
-      - allkeys-lru
+    # Bitnami's redis image takes config via env vars (not via
+    # `--requirepass` on a command). REDIS_AOF_ENABLED=no makes the
+    # token cache ephemeral by design (was `--appendonly no`).
+    environment:
+      REDIS_PASSWORD: ${AUDITTRACE_REDIS_PASSWORD}
+      REDIS_AOF_ENABLED: "no"
+      REDIS_DISABLE_COMMANDS: ""
+      # 256 MB cap matches the previous --maxmemory; bitnami exposes
+      # this via REDIS_EXTRA_FLAGS so we can pass arbitrary flags
+      # without overriding the wrapper.
+      REDIS_EXTRA_FLAGS: "--maxmemory 256mb --maxmemory-policy allkeys-lru"
     volumes:
-      - audittrace_redis_data:/data
+      # Bitnami path (was /data on vanilla).
+      - audittrace_redis_data:/bitnami/redis/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $$AUDITTRACE_REDIS_PASSWORD ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  rabbitmq:
+    # B7 step 1 — NEW service. memory-server's lifespan blocks on
+    # scan_amqp_client.ensure_connected() since v1.0.7 — without
+    # rabbitmq the pod crash-loops past PR #84's startupProbe budget.
+    # ghcr-frozen Bitnami 3.13.7 (the tag IS honest here, verified
+    # via `rabbitmqctl version`; B1.6 still freezes the bytes for
+    # registry control + binary parity with prod).
+    image: ghcr.io/lfdesousa/audittrace-rabbitmq:3.13.7-debian-12-r2-bitnami-frozen-may15
+    container_name: audittrace-rabbitmq
     environment:
-      - AUDITTRACE_REDIS_PASSWORD=${AUDITTRACE_REDIS_PASSWORD}
+      RABBITMQ_USERNAME: audittrace
+      RABBITMQ_PASSWORD: ${AUDITTRACE_RABBITMQ_PASSWORD}
+      # Deterministic cookie so a `docker compose down` + `up` (which
+      # keeps the volume) doesn't break clustering. Single-node still
+      # needs it for `rabbitmqctl` introspection across runs.
+      RABBITMQ_ERLANG_COOKIE: ${AUDITTRACE_RABBITMQ_ERLANG_COOKIE:-audittrace-compose-cookie}
+      # Plugins required for the chart's scan-pipeline binding shape
+      # (topic exchange + DLX). The Bitnami image already enables
+      # rabbitmq_management by default; nothing extra needed today.
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # mgmt UI (dev only)
+    volumes:
+      - rabbitmq_data:/bitnami/rabbitmq/mnesia
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
     networks:
       - audittrace-net
     restart: unless-stopped
 
   minio:
-    # ADR-027 — S3-compatible object storage for memory layers 1+2.
-    # Replaces host filesystem bind mounts (12-factor VI: stateless processes).
-    # Encryption at rest via SSE-S3 (MINIO_KMS_SECRET_KEY).
+    # ADR-027 — S3-compatible storage. Chart pin is `minio/minio:latest`
+    # (upstream — NOT bitnami). Preserved here so compose matches.
     image: minio/minio:latest
     container_name: audittrace-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${AUDITTRACE_MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${AUDITTRACE_MINIO_SECRET_KEY}
-      # Encryption at rest — SSE-S3 with auto-managed keys (ADR-027 §3)
       MINIO_KMS_SECRET_KEY: "audittrace-key:${AUDITTRACE_MINIO_KMS_KEY}"
     volumes:
       - minio_data:/data
     ports:
-      - "19000:9000"    # S3 API (internal — not exposed via Traefik)
-      - "19001:9001"    # Console (dev only)
+      - "19000:9000"
+      - "19001:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -302,9 +334,15 @@ volumes:
   postgres_data:
   chroma_data:
   audittrace_redis_data:
+  rabbitmq_data:
   minio_data:
 
 networks:
+  # B7 step 1 — compose-managed (was `external: true`). The
+  # previous posture required an out-of-band `docker network create
+  # audittrace-net` before `compose up`. Now `compose up` provisions
+  # the network itself; `compose down` cleans it up. Operators who
+  # need to bridge into an existing network can override with a
+  # `docker-compose.network-external.yaml` overlay.
   audittrace-net:
     name: audittrace-net
-    external: true

@@ -4,10 +4,24 @@
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d memory-server
 #
 # Editing any .py file under src/ triggers a uvicorn reload within ~2s.
-# Production `docker compose up -d` (no overlay) keeps the baked image.
+# Production `docker compose up -d` (no overlay) pulls the published
+# multi-arch image at docker.io/lfds/audittrace-memory-server:1.0.22.
+#
+# B7 step 1 (2026-05-15) — the base docker-compose.yml flipped from
+# `build: .` to `image: docker.io/lfds/audittrace-memory-server:...`
+# so the default compose stack runs the SAME bytes as prod. This
+# overlay re-introduces `build: .` so a developer iterating on src/
+# rebuilds against their local Dockerfile + sources.
 
 services:
   memory-server:
+    # Re-enable local build so the bind-mounts below have something
+    # to overwrite + uvicorn reload has a writable /app/src.
+    build: .
+    # Explicit image: tag override under dev so a stale published
+    # 1.0.22 doesn't shadow the freshly-built local image. The dev
+    # build tags as `lfds/audittrace-memory-server:dev` by convention.
+    image: docker.io/lfds/audittrace-memory-server:dev
     volumes:
       - ./src:/app/src:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
