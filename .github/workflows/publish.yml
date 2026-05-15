@@ -166,11 +166,23 @@ jobs:
 
           echo "── pulling image (amd64 runner gets amd64 variant from manifest list) ──"
           docker pull "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}"
+          # AuditTrace-AI's Dockerfile uses ENTRYPOINT (not CMD) — see
+          # Dockerfile:100: `ENTRYPOINT ["/app/scripts/entrypoint.sh"]`.
+          # The collision regression we're guarding against (chart push
+          # overwriting image ref — the PR-A8 class) produces an artefact
+          # with NEITHER ENTRYPOINT nor CMD set, because helm chart tarballs
+          # have no container-image semantics. So check both fields and
+          # fail only if BOTH are empty. cc-repo's verify uses Cmd because
+          # cc's Dockerfile uses CMD — same check, different field, same
+          # invariant.
           IMAGE_CMD=$(docker inspect "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}" \
             --format '{{.Config.Cmd}}')
-          echo "  image Cmd: ${IMAGE_CMD}"
-          if [ "${IMAGE_CMD}" = "[]" ]; then
-            echo "::error::Image at ref :${{ steps.ver.outputs.version }} has empty Cmd"
+          IMAGE_ENTRYPOINT=$(docker inspect "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}" \
+            --format '{{.Config.Entrypoint}}')
+          echo "  image Cmd:        ${IMAGE_CMD}"
+          echo "  image Entrypoint: ${IMAGE_ENTRYPOINT}"
+          if [ "${IMAGE_CMD}" = "[]" ] && [ "${IMAGE_ENTRYPOINT}" = "[]" ]; then
+            echo "::error::Image at ref :${{ steps.ver.outputs.version }} has empty Cmd AND empty Entrypoint"
             echo "::error::Likely the chart push overwrote the image (the PR-A8 class regression)"
             exit 1
           fi
