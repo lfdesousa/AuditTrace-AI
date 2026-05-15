@@ -47,6 +47,7 @@ Anchors:
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -747,4 +748,137 @@ class TestMemoryServerStartupProbeBudget:
             "periodSeconds × failureThreshold up OR reduce the AMQP "
             "retry budget in scan_amqp_client.py. See STARTUP-PROFILE.md "
             "§3 for the calculation."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 8. Keycloak realm — memory write scopes on user-facing clients
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _rendered_realm_json(docs: list[dict]) -> dict:
+    """Return the parsed realm JSON from the rendered keycloak-realm
+    ConfigMap. The chart loads files/realm-audittrace.json via
+    ``tpl .Files.Get`` so the chart-shipped file is rendered (not raw)
+    on deploy — this helper mirrors that rendering path."""
+    name = f"{RELEASE}-keycloak-realm"
+    for d in docs:
+        if d.get("kind") != "ConfigMap":
+            continue
+        if d.get("metadata", {}).get("name") != name:
+            continue
+        raw = (d.get("data") or {}).get("realm.json", "")
+        if not raw:
+            raise AssertionError(
+                f"ConfigMap {name} has no data.realm.json — render regression"
+            )
+        return json.loads(raw)
+    raise AssertionError(f"ConfigMap {name} not in render")
+
+
+class TestKeycloakOpencodeMemoryWriteScopes:
+    """``audittrace-opencode`` and ``audittrace-webui`` MUST have all five
+    memory write scopes available as ``optionalClientScopes`` so a Device
+    Flow / Auth Code + PKCE login can request them via ``scope=...``.
+
+    Without this, EOD memo writes to the ``/memory/index`` endpoint with
+    ``?file=semantic/foo.md`` (or decisions/skills/...) 403 because the
+    JWT lacks the required ``memory:<layer>:write`` claim — exactly the
+    failure that motivated this guard's parent PR
+    (``project_pickup_20260515_b7`` → "Keycloak audittrace-opencode
+    scope grant").
+
+    The provisioner script ``scripts/setup-memory-scopes.sh`` runs the
+    same grant against existing clusters; its SCOPES array is asserted
+    by the sibling test below.
+    """
+
+    _EXPECTED_WRITE_SCOPES: frozenset[str] = frozenset(
+        {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:decisions:write",
+            "memory:skills:write",
+        }
+    )
+
+    _CLIENT_IDS: tuple[str, ...] = ("audittrace-opencode", "audittrace-webui")
+
+    def test_realm_declares_all_memory_write_scopes(self) -> None:
+        realm = _rendered_realm_json(_render())
+        declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+        missing = self._EXPECTED_WRITE_SCOPES - declared
+        assert not missing, (
+            "Drift: realm.json::clientScopes is missing scope entries that "
+            "the OR-scopes mapping in server.py expects to issue. Add "
+            "client-scope objects for: " + ", ".join(sorted(missing)) + " — "
+            "see charts/audittrace/files/realm-audittrace.json and the "
+            "sibling keycloak/realm-audittrace.json (dev import)."
+        )
+
+    @pytest.mark.parametrize("client_id", ["audittrace-opencode", "audittrace-webui"])
+    def test_user_facing_client_has_all_memory_write_scopes(
+        self, client_id: str
+    ) -> None:
+        realm = _rendered_realm_json(_render())
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") != client_id:
+                continue
+            optional = set(c.get("optionalClientScopes") or [])
+            missing = self._EXPECTED_WRITE_SCOPES - optional
+            assert not missing, (
+                f"Drift: client {client_id!r} optionalClientScopes is "
+                f"missing: {sorted(missing)}. Add them to "
+                "charts/audittrace/files/realm-audittrace.json AND the "
+                "sibling keycloak/realm-audittrace.json so the realm-import "
+                "Helm hook + the dev standalone import stay congruent."
+            )
+            return
+        raise AssertionError(
+            f"Client {client_id!r} not found in rendered realm — "
+            "rename or removal regression"
+        )
+
+    def test_provisioner_script_grants_match_realm_grants(self) -> None:
+        """scripts/setup-memory-scopes.sh and the chart's in-cluster Job
+        ConfigMap both maintain a SCOPES array. They must mirror each
+        other AND must contain every scope this PR added — otherwise a
+        re-run of the script (the catch-up path for existing clusters)
+        would skip new scopes silently."""
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+
+        def _scopes_in(text: str) -> set[str]:
+            # Match lines like `      "memory:foo:write"` inside the
+            # SCOPES=( ... ) block. Both files share the same syntax.
+            return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', text))
+
+        # Constrain to the SCOPES=( ... ) blocks to avoid catching scope
+        # mentions in comments elsewhere.
+        def _scopes_block(text: str) -> str:
+            m = re.search(r"SCOPES=\(([^)]*)\)", text)
+            if m is None:
+                raise AssertionError(f"SCOPES=( ... ) block not in: {text[:200]}")
+            return m.group(1)
+
+        script_scopes = _scopes_in(_scopes_block(script_path.read_text()))
+        cm_scopes = _scopes_in(_scopes_block(cm_path.read_text()))
+
+        assert script_scopes == cm_scopes, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent SCOPES arrays. Script: {sorted(script_scopes)}. "
+            f"ConfigMap: {sorted(cm_scopes)}. They must mirror — one is "
+            "the dev/local provisioner, the other is the in-cluster Job."
+        )
+
+        missing = self._EXPECTED_WRITE_SCOPES - script_scopes
+        assert not missing, (
+            f"Drift: provisioner SCOPES array does not grant: {sorted(missing)}. "
+            "Add to both scripts/setup-memory-scopes.sh and the ConfigMap "
+            "mirror, so existing-cluster re-runs pick up the new scopes."
         )
