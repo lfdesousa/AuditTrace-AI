@@ -89,6 +89,20 @@
       }
     },
     {
+      "name": "memory:decisions:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:skills:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:upload:write",
       "protocol": "openid-connect",
       "attributes": {
@@ -240,6 +254,8 @@
         "memory:episodic:write",
         "memory:procedural:write",
         "memory:semantic:write",
+        "memory:decisions:write",
+        "memory:skills:write",
         "audittrace:admin"
       ],
       "protocolMappers": [
@@ -345,6 +361,8 @@
         "memory:episodic:write",
         "memory:procedural:write",
         "memory:semantic:write",
+        "memory:decisions:write",
+        "memory:skills:write",
         "audittrace:admin"
       ],
       "protocolMappers": [

@@ -117,6 +117,8 @@ SCOPES=(
   "memory:episodic:write"
   "memory:procedural:write"
   "memory:semantic:write"
+  "memory:decisions:write"
+  "memory:skills:write"
   "audittrace:admin"
 )
 
