@@ -47,25 +47,38 @@ set -euo pipefail
 
 # B7 step 1 (2026-05-15) — compose now runs Bitnami postgres (same
 # image the chart deploys). Bitnami exposes POSTGRESQL_* env vars
-# (NOT vanilla POSTGRES_*). Support both so this script works under:
-#   - compose pre-B7 (vanilla postgres:16-alpine, POSTGRES_*)  [legacy]
-#   - compose post-B7 (Bitnami, POSTGRESQL_*)
-#   - chart-side bring-up (Bitnami via subchart, POSTGRESQL_*)
-POSTGRES_USER="${POSTGRES_USER:-${POSTGRESQL_USERNAME:-audittrace}}"
-POSTGRES_DB="${POSTGRES_DB:-${POSTGRESQL_DATABASE:-audittrace}}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}"
-APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD}}"
+# (NOT vanilla POSTGRES_*) AND creates POSTGRESQL_USERNAME as a
+# NON-superuser. CREATE ROLE requires CREATEROLE/SUPERUSER, so we
+# must connect as the bootstrap `postgres` superuser (its password
+# is in POSTGRESQL_POSTGRES_PASSWORD, set by compose to the same
+# value as AUDITTRACE_POSTGRES_PASSWORD).
+#
+# Vanilla pre-B7 compose set POSTGRES_USER=audittrace as a SUPERUSER,
+# so the legacy fallback path connects as that role directly.
+if [[ -n "${POSTGRESQL_POSTGRES_PASSWORD:-}" ]]; then
+    # Bitnami path — connect as postgres superuser
+    SUPERUSER="postgres"
+    SUPERUSER_PASSWORD="${POSTGRESQL_POSTGRES_PASSWORD}"
+    POSTGRES_DB="${POSTGRESQL_DATABASE:-audittrace}"
+    APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRESQL_PASSWORD:-}}"
+else
+    # Vanilla path — POSTGRES_USER itself is the superuser
+    SUPERUSER="${POSTGRES_USER:-audittrace}"
+    SUPERUSER_PASSWORD="${POSTGRES_PASSWORD:-}"
+    POSTGRES_DB="${POSTGRES_DB:-audittrace}"
+    APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+fi
 
 # Bitnami postgres uses md5 auth even for local connections during init.
 # Export PGPASSWORD so psql can authenticate non-interactively.
-export PGPASSWORD="${POSTGRES_PASSWORD}"
+export PGPASSWORD="${SUPERUSER_PASSWORD}"
 
 if [[ -z "${APP_PASSWORD}" ]]; then
     echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2
     exit 1
 fi
 
-echo "[init-audittrace-app-role] Creating non-superuser app role..."
+echo "[init-audittrace-app-role] Creating non-superuser app role (as ${SUPERUSER})..."
 
 # We pass the password to psql as a ``--set`` variable, then promote
 # it into a session GUC (``audittrace.app_password``) with
@@ -73,7 +86,7 @@ echo "[init-audittrace-app-role] Creating non-superuser app role..."
 # ``current_setting``. This avoids string-interpolation into the
 # literal SQL body, which is both ugly and SQL-injection-prone.
 psql \
-    --username="${POSTGRES_USER}" \
+    --username="${SUPERUSER}" \
     --dbname="${POSTGRES_DB}" \
     --set ON_ERROR_STOP=on \
     --set "app_password=${APP_PASSWORD}" \
