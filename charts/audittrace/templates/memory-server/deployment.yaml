@@ -171,6 +171,26 @@ spec:
             - name: swiss-federal-tsl
               mountPath: /etc/audittrace/swiss-federal-tsl
               readOnly: true
+          # startupProbe covers the cold-cluster boot path where
+          # the lifespan blocks on ``ScanAmqpClient.ensure_connected``
+          # (server.py:326). PR-B10 added a retry-with-backoff for
+          # the kube-proxy Service-IP-not-routable race; that retry
+          # has a documented worst-case budget of ~91 s (6 attempts
+          # × 10 s timeout + 1+2+4+8+16 = 31 s of sleeps). The
+          # liveness probe's 45 s budget is too tight for that — the
+          # kubelet would kill the pod mid-retry on a cold cluster.
+          # startupProbe gives 150 s (5 s × 30) before failing,
+          # which comfortably covers the AMQP retry budget AND keeps
+          # liveness tight (45 s) for catching real post-boot hangs.
+          # Anchor: ~/work/audittrace-evidence/20260515-memory-server-startup-race/STARTUP-PROFILE.md.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /health

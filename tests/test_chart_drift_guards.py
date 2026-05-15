@@ -676,3 +676,75 @@ class TestMinIOConnectorsInMinIOAP:
             "templates/istio/authorizationpolicy-minio.yaml. "
             "Missing: " + "; ".join(missing)
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 7. memory-server boot-budget probe coverage
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _memory_server_container(docs: list[dict]) -> dict:
+    """Return the memory-server container spec from the rendered chart."""
+    name = f"{RELEASE}-memory-server"
+    for d in docs:
+        if d.get("kind") != "Deployment":
+            continue
+        if d.get("metadata", {}).get("name") != name:
+            continue
+        containers = (
+            d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            or []
+        )
+        for c in containers:
+            if c.get("name") == "memory-server":
+                return c
+        raise AssertionError(
+            f"Deployment {name} has no container named 'memory-server'"
+        )
+    raise AssertionError(f"Deployment {name} not in render")
+
+
+class TestMemoryServerStartupProbeBudget:
+    """memory-server's FastAPI lifespan blocks on
+    ``ScanAmqpClient.ensure_connected`` (server.py:326), whose PR-B10
+    retry-with-backoff has a worst-case budget of ~91 s on a cold
+    cluster (6 attempts × 10 s timeout + 1+2+4+8+16 = 31 s of sleeps).
+    The liveness probe's 45 s budget is too tight to cover that; the
+    container is killed mid-retry and restarts twice before stabilising
+    on a fresh kind install. The fix is a ``startupProbe`` with a
+    budget ≥ the AMQP retry budget so the kubelet suspends liveness
+    until the slow-boot work finishes once.
+
+    Anchor: ~/work/audittrace-evidence/20260515-memory-server-startup-race/STARTUP-PROFILE.md.
+    """
+
+    _MIN_BUDGET_SECONDS = 100
+
+    def test_memory_server_has_startup_probe(self) -> None:
+        container = _memory_server_container(_render())
+        assert "startupProbe" in container, (
+            "Drift: memory-server Deployment has no startupProbe. The "
+            "FastAPI lifespan blocks on the AMQP connect (worst case "
+            "~91 s on a cold cluster); without startupProbe the "
+            "kubelet kills the pod mid-retry and the pod restarts "
+            "twice before stabilising. Add a startupProbe in "
+            "templates/memory-server/deployment.yaml — see "
+            "STARTUP-PROFILE.md for the calculation."
+        )
+
+    def test_memory_server_startup_probe_budget_covers_amqp_retry(self) -> None:
+        container = _memory_server_container(_render())
+        probe = container.get("startupProbe", {})
+        initial = int(probe.get("initialDelaySeconds", 0))
+        period = int(probe.get("periodSeconds", 10))
+        threshold = int(probe.get("failureThreshold", 3))
+        budget = initial + period * threshold
+        assert budget >= self._MIN_BUDGET_SECONDS, (
+            f"Drift: memory-server startupProbe budget is {budget} s "
+            f"(initialDelaySeconds={initial} + periodSeconds={period} "
+            f"× failureThreshold={threshold}), below the {self._MIN_BUDGET_SECONDS} s "
+            "floor needed to cover the AMQP retry budget. Either tune "
+            "periodSeconds × failureThreshold up OR reduce the AMQP "
+            "retry budget in scan_amqp_client.py. See STARTUP-PROFILE.md "
+            "§3 for the calculation."
+        )
