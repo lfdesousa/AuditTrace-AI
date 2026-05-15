@@ -492,3 +492,221 @@ class TestComposeTestScripts:
             "via `bash tests/integration/compose/<script>.sh`. "
             "Offending lines:\n" + "\n".join(suspicious[:5])
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B7 steps 6-9 — profile gating drift guards
+# ─────────────────────────────────────────────────────────────────────
+
+# Services that are part of the default-up stack (no profile gate).
+# Adding a new core service means adding it here AND keeping it
+# without a `profiles:` key in compose. Removing one means deleting
+# from here AND putting it under a profile.
+_CORE_SERVICES: frozenset[str] = frozenset(
+    {
+        "memory-server",
+        "postgres",
+        "chromadb",
+        "keycloak",
+        "redis",
+        "rabbitmq",
+        "minio",
+        "traefik",
+    }
+)
+
+# Documented opt-in profiles + the services each enables. Asserted
+# below as the load-bearing "operators know what to expect" claim.
+_EXPECTED_PROFILES: dict[str, frozenset[str]] = {
+    "mock-llm": frozenset({"mock-llm"}),
+    "vault": frozenset({"vault"}),
+    "obs": frozenset({"otel-collector", "tempo", "loki", "grafana"}),
+    "langfuse": frozenset({"langfuse-web", "langfuse-postgres"}),
+    "content-control": frozenset({"cc-clamd", "cc-control-plane"}),
+}
+
+
+class TestComposeProfileGating:
+    """B7 step 11 — every compose service belongs to EITHER the
+    core default-up list OR a documented profile. Catches:
+
+      - New service added without a profile gate → would run on
+        every `docker compose up` and bloat the default-CI cost
+      - Service moved to a new profile name that operators don't
+        know about (drift between AGENTS.md table and the file)
+      - Documented profile that no service actually uses (orphan
+        profile name in AGENTS.md)
+
+    Anchors:
+      - docs/architecture/b7-docker-compose-revive-plan.md §3 (Q1)
+      - AGENTS.md "Compose profiles" table
+      - feedback_no_more_drifts
+    """
+
+    COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+
+    def _compose_doc(self) -> dict:
+        with self.COMPOSE_FILE.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+
+    def test_every_service_is_core_or_profiled(self) -> None:
+        doc = self._compose_doc()
+        services = doc.get("services", {})
+        unaccounted = []
+        for name, svc in services.items():
+            if name in _CORE_SERVICES:
+                continue
+            profiles = svc.get("profiles") or []
+            if not profiles:
+                unaccounted.append(name)
+        assert not unaccounted, (
+            f"Compose services missing a profile gate (and not in _CORE_SERVICES): "
+            f"{unaccounted}. Either add them to _CORE_SERVICES (if they should "
+            "run by default) or wire them under a `profiles: [...]` key. "
+            "Bloating the default-up stack costs CI RAM."
+        )
+
+    def test_no_orphan_core_service_in_compose(self) -> None:
+        doc = self._compose_doc()
+        services = set(doc.get("services", {}).keys())
+        orphans = _CORE_SERVICES - services
+        assert not orphans, (
+            f"Compose missing services declared core in _CORE_SERVICES: "
+            f"{sorted(orphans)}. Either restore the service or remove "
+            "the name from the expected core set."
+        )
+
+    @pytest.mark.parametrize(
+        "profile,expected_services",
+        sorted(_EXPECTED_PROFILES.items()),
+    )
+    def test_profile_has_documented_services(
+        self, profile: str, expected_services: frozenset[str]
+    ) -> None:
+        doc = self._compose_doc()
+        services = doc.get("services", {})
+        actual = {
+            name
+            for name, svc in services.items()
+            if profile in (svc.get("profiles") or [])
+        }
+        # `mock-llm` may also include the `ci` profile alias; that
+        # doesn't matter for this membership check.
+        missing = expected_services - actual
+        extra = actual - expected_services
+        assert not missing, (
+            f"Profile {profile!r} missing services: {sorted(missing)}. "
+            "Either restore the service definition or update "
+            "_EXPECTED_PROFILES + AGENTS.md."
+        )
+        assert not extra, (
+            f"Profile {profile!r} has extra services not in the docs: "
+            f"{sorted(extra)}. Update AGENTS.md's profile table "
+            "AND tests/test_compose_drift.py::_EXPECTED_PROFILES."
+        )
+
+    def test_agents_md_documents_every_profile(self) -> None:
+        """AGENTS.md's profile table must mention every profile name
+        from _EXPECTED_PROFILES. Catches the drift where a service
+        is added under a new profile but the docs don't catch up."""
+        agents_md = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        missing = [p for p in _EXPECTED_PROFILES if f"`{p}`" not in agents_md]
+        assert not missing, (
+            f"AGENTS.md is missing documentation for profile(s): {missing}. "
+            "Add a row to the 'Compose profiles' table under the "
+            "'docker-compose stack' subsection."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B7 step 11 — obs config file existence
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestObsConfigFiles:
+    """B7 step 7 wired the obs profile to mount config files from
+    config/compose/{otel-collector,tempo,loki,grafana}/. The
+    services would refuse to start if those files are missing;
+    this guard catches the deletion at PR time."""
+
+    CONFIG_ROOT = REPO_ROOT / "config" / "compose"
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "otel-collector/otel-collector-config.yaml",
+            "tempo/tempo.yaml",
+            "loki/loki-config.yaml",
+            "grafana/provisioning/datasources/audittrace.yaml",
+        ],
+    )
+    def test_obs_config_file_exists(self, rel_path: str) -> None:
+        path = self.CONFIG_ROOT / rel_path
+        assert path.exists(), (
+            f"Obs profile config file missing: {path}. The "
+            "{otel-collector,tempo,loki,grafana} services mount it "
+            "via docker-compose.yml; without it the service fails to start."
+        )
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "otel-collector/otel-collector-config.yaml",
+            "tempo/tempo.yaml",
+            "loki/loki-config.yaml",
+            "grafana/provisioning/datasources/audittrace.yaml",
+        ],
+    )
+    def test_obs_config_file_parses_as_yaml(self, rel_path: str) -> None:
+        path = self.CONFIG_ROOT / rel_path
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                yaml.safe_load(fh)
+        except yaml.YAMLError as e:
+            raise AssertionError(
+                f"Obs profile config {path} is not valid YAML: {e!r}"
+            ) from e
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B7 step 9 — content-control fixtures
+# ─────────────────────────────────────────────────────────────────────
+
+_CC_FIXTURE_FILES = (
+    "eicar.txt",
+    "clean-memo.md",
+)
+
+
+class TestContentControlFixtures:
+    """B7 step 9 commits compose-side fixtures for the
+    content-control profile's eventual scan-pipeline E2E test.
+    Fixtures must exist on PR time so a future step 9b can drive
+    them without re-generating."""
+
+    FIXTURES_DIR = REPO_ROOT / "tests" / "integration" / "compose" / "fixtures"
+
+    @pytest.mark.parametrize("name", _CC_FIXTURE_FILES)
+    def test_fixture_exists(self, name: str) -> None:
+        path = self.FIXTURES_DIR / name
+        assert path.exists(), (
+            f"Content-control fixture missing: {path}. B7 step 9 commits "
+            "these for the eventual scan-pipeline E2E test. Restore from "
+            "git history or regenerate."
+        )
+
+    def test_eicar_fixture_has_canonical_signature(self) -> None:
+        """The EICAR fixture must contain the canonical 68-byte
+        EICAR signature string so any conforming AV (clamd
+        included) flags it as malware."""
+        path = self.FIXTURES_DIR / "eicar.txt"
+        if not path.exists():
+            return
+        content = path.read_text(encoding="utf-8")
+        assert "EICAR-STANDARD-ANTIVIRUS-TEST-FILE" in content, (
+            f"eicar.txt at {path} does not contain the canonical "
+            "EICAR signature. Replace with the standard string: "
+            r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+        )

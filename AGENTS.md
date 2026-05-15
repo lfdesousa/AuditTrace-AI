@@ -408,6 +408,47 @@ unchanged. The application's AMQP behaviour is identical against
 either wrapper — `aio_pika.connect_robust` doesn't care about
 loopback policy as long as the user can authenticate.
 
+**Compose profiles (B7 steps 2 / 6-9, 2026-05-15):** the compose
+stack now has 5 opt-in profiles for heavyweight services. Default
+`docker compose up` brings up the 8 core services + `mock-llm`
+(via `.env.ci`'s `COMPOSE_PROFILES=mock-llm`). The 11 remaining
+services are dormant unless explicitly activated.
+
+| Profile | Services added | Use case |
+|---|---|---|
+| `mock-llm` | mock-llm (1) | CI + dev-without-host-llama |
+| `vault` | vault (1) | Local-dev secret-rotation rehearsal |
+| `obs` | otel-collector, tempo, loki, grafana (4) | Local trace+log dashboards |
+| `langfuse` | langfuse-web, langfuse-postgres (2) | LLM observability — heavy |
+| `content-control` | cc-control-plane, cc-clamd (2) | Local scan-pipeline E2E — clamd ≥1 GB RAM |
+
+Profiles compose: `COMPOSE_PROFILES=obs,langfuse docker compose up -d`
+activates both. CI uses ONLY `mock-llm` (CI doesn't need the rest;
+chart+kind covers them). All profile services have explicit
+`profiles: [...]` lists asserted by
+`tests/test_compose_drift.py::TestComposeProfileGating`.
+
+**Operator workflow examples:**
+
+```bash
+# Minimal CI-shaped stack (mock LLM, no obs, no cc)
+docker compose --env-file .env.ci up -d --wait
+
+# Dev with host llama-server + local Grafana/Tempo dashboards
+cp .env.dev-real-llm.example .env  # edit, fill ###CHANGE###
+COMPOSE_PROFILES=obs docker compose up -d --wait
+
+# Full operator-rehearsal: every profile active
+COMPOSE_PROFILES=mock-llm,vault,obs,langfuse,content-control \
+  docker compose up -d --wait
+```
+
+**Shared test scripts** in `tests/integration/compose/`:
+`test-health.sh`, `test-chat-completion.sh`, `test-models.sh` are
+runnable locally against any compose-up state.
+`.github/workflows/e2e-compose.yml` calls the same scripts so CI
+and local dev exercise identical contracts.
+
 ### Data-compat harness — test before any subchart image swap
 
 Before any helm change that touches `postgresql.image.*`,

@@ -68,6 +68,24 @@ jobs:
             -days 1 -nodes \
             -subj "/CN=localhost" 2>/dev/null
 
+      - name: Pull images (retry on registry flake)
+        # Docker Hub returns 502 Bad Gateway on parallel pulls
+        # often enough to break CI roughly weekly. Pull explicitly
+        # with up to 3 attempts BEFORE `up --wait`, so a registry
+        # flake is treated as a retry, not a job failure. mock-llm
+        # is a local build (no pull) so this skips it.
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --quiet --ignore-buildable; then
+              echo "compose pull OK on attempt ${attempt}"
+              exit 0
+            fi
+            echo "compose pull failed on attempt ${attempt}; sleeping 15s"
+            sleep 15
+          done
+          echo "::error::docker compose pull failed 3 times — registry outage?"
+          exit 1
+
       - name: Bring up compose stack with `mock-llm` profile
         # .env.ci sets COMPOSE_PROFILES=mock-llm so the mock-llm
         # service joins the up command. --wait blocks until all

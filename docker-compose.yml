@@ -382,6 +382,196 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # ─── B7 step 6 — Vault dev-mode (profile: vault) ─────────────────
+  # Hashicorp Vault in dev mode: auto-unsealed, in-memory storage,
+  # root token printed at startup. memory-server in compose does NOT
+  # talk to Vault (it reads creds directly from .env via compose env
+  # substitution). This service exists for OPERATORS who want to
+  # exercise the Vault Agent injection flow locally — e.g. ahead of
+  # a prod chart upgrade that adds a Vault-rendered Secret.
+  # See AGENTS.md "docker-compose stack — B7 step 1 rebuild" for the
+  # full compose-vs-helm posture rationale.
+  vault:
+    image: hashicorp/vault:1.20.1
+    container_name: audittrace-vault
+    profiles: ["vault"]
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${AUDITTRACE_VAULT_DEV_TOKEN:-audittrace-dev-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8200/v1/sys/health || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  # ─── B7 step 7 — Observability stack (profile: obs) ──────────────
+  # otel-collector + tempo + loki + grafana. Opt-in via
+  # COMPOSE_PROFILES=obs (Q4 decision: off in CI by default — saves
+  # ~3 GB RAM per PR run for a property already tested in chart+kind).
+  # Operators who want local dashboards bring this up and then set
+  # AUDITTRACE_OTLP_ENDPOINT=http://otel-collector:4318 in their .env.
+  # Config files committed under config/compose/{otel-collector,tempo,
+  # loki,grafana}/ — minimum-viable single-binary configs.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    container_name: audittrace-otel-collector
+    profiles: ["obs"]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config/compose/otel-collector/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    expose:
+      - "4317"   # OTLP gRPC
+      - "4318"   # OTLP HTTP
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: audittrace-tempo
+    profiles: ["obs"]
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./config/compose/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"  # tempo HTTP (TraceQL search UI proxied via Grafana)
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: audittrace-loki
+    profiles: ["obs"]
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./config/compose/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: audittrace-grafana
+    profiles: ["obs"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${AUDITTRACE_GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./config/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+      - loki
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  # ─── B7 step 8 — Langfuse (profile: langfuse) ────────────────────
+  # Langfuse-web + a dedicated postgres for langfuse's own data
+  # (NOT shared with audittrace's main pg). Heavy — opt-in only.
+  langfuse-postgres:
+    image: ghcr.io/lfdesousa/audittrace-postgresql:18.3-bitnami-frozen-apr17
+    container_name: audittrace-langfuse-postgres
+    profiles: ["langfuse"]
+    environment:
+      POSTGRESQL_DATABASE: langfuse
+      POSTGRESQL_USERNAME: langfuse
+      POSTGRESQL_PASSWORD: ${AUDITTRACE_LANGFUSE_DB_PASSWORD:-langfuse-dev-password}
+      POSTGRESQL_POSTGRES_PASSWORD: ${AUDITTRACE_LANGFUSE_DB_PASSWORD:-langfuse-dev-password}
+    volumes:
+      - langfuse_postgres_data:/bitnami/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  langfuse-web:
+    image: langfuse/langfuse:2
+    container_name: audittrace-langfuse-web
+    profiles: ["langfuse"]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:${AUDITTRACE_LANGFUSE_DB_PASSWORD:-langfuse-dev-password}@langfuse-postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${AUDITTRACE_LANGFUSE_NEXTAUTH_SECRET:-langfuse-dev-nextauth-secret-32chars-min!!}
+      SALT: ${AUDITTRACE_LANGFUSE_SALT:-langfuse-dev-salt-32chars-min-padding!!}
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "13000:3000"   # langfuse web UI (mapped off-3000 to avoid grafana clash)
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  # ─── B7 step 9 — Content-control sibling (profile: content-control) ─
+  # cc-control-plane consumes scan.requests from RabbitMQ, scans via
+  # clamd, publishes verdicts back. Same image the chart deploys at
+  # docker.io/lfds/audittrace-content-control:0.0.9 (multi-arch from
+  # cc-side PR-A14). clamd is the malware scanner — ≥1 GB RAM floor
+  # per the PR-A11 OOMKill forensic; profile-only because of cost.
+  cc-clamd:
+    image: clamav/clamav:1.4
+    container_name: audittrace-cc-clamd
+    profiles: ["content-control"]
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s   # clamd DB load is slow on first boot
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
+  cc-control-plane:
+    image: docker.io/lfds/audittrace-content-control:0.0.9
+    container_name: audittrace-cc-control-plane
+    profiles: ["content-control"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      cc-clamd:
+        condition: service_healthy
+    environment:
+      # cc reads CONTENT_CONTROL_* env vars per ADR-048
+      CONTENT_CONTROL_RABBITMQ_HOST: rabbitmq
+      CONTENT_CONTROL_RABBITMQ_USER: ${AUDITTRACE_CC_RABBITMQ_USER:-content-control}
+      CONTENT_CONTROL_RABBITMQ_PASSWORD: ${AUDITTRACE_CC_RABBITMQ_PASSWORD:-cc-dev-password}
+      CONTENT_CONTROL_MINIO_ENDPOINT: minio:9000
+      CONTENT_CONTROL_MINIO_ACCESS_KEY: ${AUDITTRACE_CC_MINIO_ACCESS_KEY:-${AUDITTRACE_MINIO_ACCESS_KEY:-minioadmin}}
+      CONTENT_CONTROL_MINIO_SECRET_KEY: ${AUDITTRACE_CC_MINIO_SECRET_KEY:-${AUDITTRACE_MINIO_SECRET_KEY}}
+      CONTENT_CONTROL_CLAMD_HOST: cc-clamd
+      CONTENT_CONTROL_CLAMD_PORT: "3310"
+    networks:
+      - audittrace-net
+    restart: unless-stopped
+
   traefik:
     image: traefik:v3.6
     container_name: audittrace-traefik
@@ -405,6 +595,12 @@ volumes:
   audittrace_redis_data:
   rabbitmq_data:
   minio_data:
+  # B7 step 7 — obs profile
+  tempo_data:
+  loki_data:
+  grafana_data:
+  # B7 step 8 — langfuse profile
+  langfuse_postgres_data:
 
 networks:
   # B7 step 1 — compose-managed (was `external: true`). The
