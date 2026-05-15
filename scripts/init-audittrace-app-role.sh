@@ -45,13 +45,20 @@
 
 set -euo pipefail
 
-POSTGRES_USER="${POSTGRES_USER:-audittrace}"
-POSTGRES_DB="${POSTGRES_DB:-audittrace}"
-APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+# B7 step 1 (2026-05-15) — compose now runs Bitnami postgres (same
+# image the chart deploys). Bitnami exposes POSTGRESQL_* env vars
+# (NOT vanilla POSTGRES_*). Support both so this script works under:
+#   - compose pre-B7 (vanilla postgres:16-alpine, POSTGRES_*)  [legacy]
+#   - compose post-B7 (Bitnami, POSTGRESQL_*)
+#   - chart-side bring-up (Bitnami via subchart, POSTGRESQL_*)
+POSTGRES_USER="${POSTGRES_USER:-${POSTGRESQL_USERNAME:-audittrace}}"
+POSTGRES_DB="${POSTGRES_DB:-${POSTGRESQL_DATABASE:-audittrace}}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}"
+APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD}}"
 
 # Bitnami postgres uses md5 auth even for local connections during init.
 # Export PGPASSWORD so psql can authenticate non-interactively.
-export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+export PGPASSWORD="${POSTGRES_PASSWORD}"
 
 if [[ -z "${APP_PASSWORD}" ]]; then
     echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2
