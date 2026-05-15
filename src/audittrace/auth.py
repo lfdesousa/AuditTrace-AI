@@ -79,6 +79,16 @@ ALL_SCOPES: dict[str, str] = {
     "memory:procedural:write": "Create/update/delete procedural-layer documents",
     "memory:semantic:read": "Read semantic-layer (vector) documents",
     "memory:semantic:write": "Create/update/delete semantic-layer documents",
+    "memory:decisions:write": (
+        "Create/update/delete documents in the ``decisions`` ChromaDB "
+        "collection (ADR/decision records — vector-searchable via "
+        "/memory/index single-file mode and recall_semantic)."
+    ),
+    "memory:skills:write": (
+        "Create/update/delete documents in the ``skills`` ChromaDB "
+        "collection (SKILL/procedural records — vector-searchable via "
+        "/memory/index single-file mode and recall_semantic)."
+    ),
     "memory:conversational:read-own": (
         "Read your own past conversations from the conversational layer"
     ),
