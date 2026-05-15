@@ -1,0 +1,196 @@
+name: E2E (compose, mock LLM)
+
+# B7 step 4 — load-bearing GHA workflow for the compose stack.
+#
+# Sibling to .github/workflows/e2e.yml (NOT a replacement — per
+# Q3 of the B7 plan and `feedback_docker_compose_retained`). The
+# two contracts differ:
+#
+#   e2e.yml         — minimal smoke. No LLM. Asserts /health,
+#                     /context, /metrics; chat-completions expected
+#                     to return 502 (no LLM in the stack).
+#
+#   e2e-compose.yml — FULL stack with mock LLM. Brings up the
+#                     `mock-llm` profile via `.env.ci`. Proves
+#                     POST /v1/chat/completions returns 200 with
+#                     content="bruno", finish_reason="stop". The
+#                     first time compose actually exercises the
+#                     LLM round-trip in CI.
+#
+# Anchor: docs/architecture/b7-docker-compose-revive-plan.md §4.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  # Required to docker-login ghcr.io with GITHUB_TOKEN so the runner
+  # can pull `ghcr.io/lfdesousa/audittrace-{postgresql,redis}` (B1.5
+  # private packages). Same pattern as the kind workflow.
+  packages: read
+
+jobs:
+  compose-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        # Without this, the postgres + redis pulls (ghcr-frozen
+        # private packages from B1.5) 404 on the docker-pull step.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Stage .env from .env.ci
+        # Compose reads `.env` by default; copy our committed CI
+        # parameterisation surface (.env.ci) into place so `docker
+        # compose up` picks up COMPOSE_PROFILES=mock-llm + the
+        # deterministic test credentials. Single source of truth
+        # for "what CI sets" lives in .env.ci, NOT in this workflow.
+        run: cp .env.ci .env
+
+      - name: Generate self-signed TLS cert for Traefik
+        # memory-server is only reachable through Traefik on :443.
+        # Traefik needs a cert; for CI we generate a one-day
+        # self-signed cert + use `curl -k` to bypass verification.
+        # Mirrors e2e.yml's posture.
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout certs/sovereign-key.pem \
+            -out certs/sovereign.pem \
+            -days 1 -nodes \
+            -subj "/CN=localhost" 2>/dev/null
+
+      - name: Bring up compose stack with `mock-llm` profile
+        # .env.ci sets COMPOSE_PROFILES=mock-llm so the mock-llm
+        # service joins the up command. --wait blocks until all
+        # services with healthchecks report healthy. --wait-timeout
+        # 300s covers mock-llm's first-run pip-install (~10s) +
+        # keycloak's realm import (~20s) + AMQP topology
+        # convergence + memory-server lifespan.
+        run: docker compose up -d --wait --wait-timeout 300
+
+      - name: Show container status
+        if: always()
+        run: |
+          docker compose ps
+          echo
+          echo "=== health summary ==="
+          for c in $(docker compose ps --services); do
+            state=$(docker inspect --format '{{.State.Health.Status}}' \
+              "audittrace-${c}" 2>/dev/null || echo "<no-healthcheck>")
+            echo "  ${c}: ${state}"
+          done
+
+      - name: Wait for /health (memory-server via Traefik)
+        # Stack is up (compose --wait succeeded) but /health may
+        # take a few more seconds — Istio-like ordering: memory-
+        # server lifespan completes AMQP connect after rabbitmq
+        # healthy, then uvicorn serves /health.
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 5 -k https://localhost/health > /dev/null; then
+              echo "memory-server /health 200 after $((i * 3))s"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::memory-server /health never returned 200"
+          exit 1
+
+      - name: Smoke — GET /health (assert shape)
+        run: |
+          response=$(curl -sf --max-time 10 -k https://localhost/health)
+          echo "Response: ${response}"
+          echo "${response}" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          assert d['status'] == 'ok', f'Unexpected: {d}'
+          print('OK: status==ok, version=' + d.get('version','<unknown>'))
+          "
+
+      - name: B7 step 4 — POST /v1/chat/completions against mock LLM
+        # The load-bearing E2E test. Auth is disabled in .env.ci
+        # (AUDITTRACE_AUTH_ENABLED=false), so no JWT needed. The
+        # request goes Traefik → memory-server proxy → in-network
+        # mock-llm:11435 → canned response with content="bruno".
+        # Asserts:
+        #   - HTTP 200
+        #   - OpenAI shape preserved (choices[0].message.role=assistant)
+        #   - finish_reason=="stop"  (vs "length", which would mean
+        #     the proxy truncated — see feedback_e2e_includes_llm_call)
+        #   - content non-empty after stripping <think> (mock returns
+        #     a plain string, no <think> block; this assertion proves
+        #     the visible-content extraction logic also works for
+        #     non-reasoning models)
+        run: |
+          response=$(curl -sf --max-time 30 -k https://localhost/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "audittrace-default",
+              "messages": [{"role":"user","content":"hello"}],
+              "max_tokens": 32,
+              "stream": false
+            }')
+          echo "Response: ${response}"
+          echo "${response}" | python3 -c "
+          import json,re,sys
+          d = json.load(sys.stdin)
+          assert d['choices'][0]['message']['role'] == 'assistant', \
+            f'wrong role: {d!r}'
+          content = d['choices'][0]['message']['content']
+          visible = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+          assert visible, f'visible content empty (mock returned <think>-only?): {content!r}'
+          assert d['choices'][0]['finish_reason'] == 'stop', \
+            f'finish_reason should be stop, got {d[\"choices\"][0][\"finish_reason\"]!r}'
+          assert d.get('usage', {}).get('total_tokens', 0) > 0, \
+            f'no token usage reported: {d.get(\"usage\")!r}'
+          print('OK: chat-completion shape valid, content=' + visible[:80])
+          "
+
+      - name: Smoke — GET /v1/models (via Traefik to mock LLM)
+        # Sanity check the model-list endpoint also routes correctly
+        # through the proxy. Mock LLM returns id=audittrace-default.
+        run: |
+          response=$(curl -sf --max-time 10 -k https://localhost/v1/models)
+          echo "Response: ${response}"
+          echo "${response}" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          ids = {m['id'] for m in d.get('data', [])}
+          assert 'audittrace-default' in ids, f'missing audittrace-default in {ids!r}'
+          print('OK: /v1/models returned ' + ', '.join(sorted(ids)))
+          "
+
+      - name: Capture logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/compose-logs
+          docker compose logs --tail=300 > /tmp/compose-logs/all-services.log
+          docker compose ps > /tmp/compose-logs/ps.txt
+          for c in $(docker compose ps --services); do
+            docker inspect "audittrace-${c}" \
+              > "/tmp/compose-logs/${c}-inspect.json" 2>/dev/null || true
+          done
+          echo "==="
+          echo "Capture summary:"
+          ls -la /tmp/compose-logs/
+
+      - name: Upload logs artefact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs-${{ github.run_id }}
+          path: /tmp/compose-logs/
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans
