@@ -7,6 +7,7 @@ metadata:
 data:
   server.py: |
     """Mock OpenAI-compat LLM. Returns canned responses for kind CI."""
+
     from __future__ import annotations
 
     import time
@@ -15,6 +16,7 @@ data:
     from fastapi import FastAPI
 
     app = FastAPI()
+
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
@@ -29,6 +31,7 @@ data:
                 }
             ],
         }
+
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: dict[str, Any]) -> dict[str, Any]:
@@ -50,6 +53,7 @@ data:
                 "total_tokens": 5,
             },
         }
+
 
     @app.get("/health")
     async def health() -> dict[str, str]:

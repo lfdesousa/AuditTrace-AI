@@ -1,0 +1,52 @@
+"""Mock OpenAI-compat LLM. Returns canned responses for kind CI."""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/v1/models")
+async def models() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "audittrace-default",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "audittrace-mock",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-mock-b4",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.get("model", "audittrace-default"),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "bruno"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 4,
+            "completion_tokens": 1,
+            "total_tokens": 5,
+        },
+    }
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
