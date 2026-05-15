@@ -57,11 +57,17 @@ services:
       # scripts/init-audittrace-app-role.sh create the role on
       # first DB init.
       - AUDITTRACE_POSTGRES_URL=postgresql+psycopg2://audittrace_app:${AUDITTRACE_APP_PASSWORD:-${AUDITTRACE_POSTGRES_PASSWORD}}@postgres:5432/audittrace
-      - AUDITTRACE_LLAMA_URL=http://host.docker.internal:11435/v1
-      - AUDITTRACE_EMBED_URL=http://host.docker.internal:11436/v1
-      # ADR-030 dedicated summariser endpoint
-      - AUDITTRACE_SUMMARIZER_URL=${AUDITTRACE_SUMMARIZER_URL:-http://host.docker.internal:11437/v1}
-      - AUDITTRACE_SUMMARIZER_MODEL=${AUDITTRACE_SUMMARIZER_MODEL:-mistral-7b-summarizer}
+      # B7 step 2 — LLM URL defaults flipped from host.docker.internal
+      # (real llama-server on the dev box) to the in-compose `mock-llm`
+      # service (Q1 decision: compose profiles). Operators with a
+      # host-running llama-server set these env vars in their `.env` to
+      # point at host.docker.internal, OR enable the `real-llm` profile
+      # (future B7 step). Mock-llm satisfies /v1/models +
+      # /v1/chat/completions + /health with canned responses.
+      - AUDITTRACE_LLAMA_URL=${AUDITTRACE_LLAMA_URL:-http://mock-llm:11435/v1}
+      - AUDITTRACE_EMBED_URL=${AUDITTRACE_EMBED_URL:-http://mock-llm:11435/v1}
+      - AUDITTRACE_SUMMARIZER_URL=${AUDITTRACE_SUMMARIZER_URL:-http://mock-llm:11435/v1}
+      - AUDITTRACE_SUMMARIZER_MODEL=${AUDITTRACE_SUMMARIZER_MODEL:-audittrace-default}
       - AUDITTRACE_SUMMARIZER_ENABLED=${AUDITTRACE_SUMMARIZER_ENABLED:-true}
       - AUDITTRACE_SUMMARIZER_IDLE_MINUTES=${AUDITTRACE_SUMMARIZER_IDLE_MINUTES:-15}
       - AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES=${AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES:-5}
@@ -328,6 +334,52 @@ services:
       start_period: 10s
     networks:
       - audittrace-net
+    restart: unless-stopped
+
+  mock-llm:
+    # B7 step 2 (2026-05-15) — in-compose mock LLM under the
+    # `mock-llm` profile. Mirrors the kind-CI mock (tests/integration/
+    # fixtures/mock-llm-{configmap,deployment,service}.yaml) so compose
+    # + kind exercise the SAME mock contract: /v1/models +
+    # /v1/chat/completions (returns content="bruno", finish_reason=
+    # "stop") + /health. The Python source is duplicated (NOT
+    # symlinked — Q6 decision) and asserted byte-identical by
+    # tests/test_compose_drift.py::TestMockLlmScriptParity.
+    #
+    # Profile gating: this service ONLY runs under the `mock-llm`
+    # profile. Default `docker compose up -d` leaves it dormant
+    # (operators with host llama-server want this). Activate with:
+    #   docker compose --profile mock-llm up -d
+    # OR set COMPOSE_PROFILES=mock-llm in the .env.
+    image: python:3.12-slim
+    container_name: audittrace-mock-llm
+    profiles: ["mock-llm", "ci"]
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./tests/integration/fixtures/compose/mock-llm/server.py:/app/server.py:ro
+    # Install fastapi/uvicorn once, then serve the mounted script.
+    # Mirrors the kind Deployment's args (mock-llm-deployment.yaml).
+    # Boot time on a cold runner: ~10s for pip install, ~2s for
+    # uvicorn ready. Pinned versions match the kind fixture so the
+    # two paths produce byte-identical responses.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        pip install --quiet --no-cache-dir 'fastapi==0.115.0' 'uvicorn[standard]==0.32.0'
+        exec uvicorn server:app --app-dir=/app --host=0.0.0.0 --port=11435
+    networks:
+      - audittrace-net
+    expose:
+      - "11435"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:11435/health',timeout=2).status==200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
     restart: unless-stopped
 
   traefik:
