@@ -273,9 +273,15 @@ services:
       # Bitnami's rabbitmq image defaults to applying loopback restriction
       # to RABBITMQ_USERNAME, so cross-container connections (the whole
       # point of compose) fail with "PLAIN login refused: user can only
-      # connect via localhost". Set to "none" to allow remote PLAIN
-      # auth — same posture as the chart's bitnami subchart deploys.
+      # connect via localhost". Two-pronged override:
+      #   - RABBITMQ_LOOPBACK_USERS=none (env var, if bitnami honors it)
+      #   - RABBITMQ_EXTRA_CONF appending `loopback_users = none` to
+      #     rabbitmq.conf, which is authoritative regardless of env-var
+      #     handling. The setting takes effect at broker startup and
+      #     applies to ALL users including ones already created.
       RABBITMQ_LOOPBACK_USERS: "none"
+      RABBITMQ_EXTRA_CONF: |
+        loopback_users = none
       # Plugins required for the chart's scan-pipeline binding shape
       # (topic exchange + DLX). The Bitnami image already enables
       # rabbitmq_management by default; nothing extra needed today.

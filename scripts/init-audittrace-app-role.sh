@@ -150,6 +150,25 @@ ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
 ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO audittrace_app;
 
+-- B7 step 1 — REVERSE default privileges. Under Bitnami, migrations
+-- run as audittrace_app (the AUDITTRACE_POSTGRES_URL role) so
+-- audittrace_app OWNS the tables that get created. The summariser
+-- connects as `audittrace` (AUDITTRACE_SUMMARIZER_POSTGRES_URL) for
+-- cross-user reads, but `audittrace` has no GRANTS on tables it
+-- doesn't own → "permission denied for table sessions". Grant SELECT
+-- on audittrace_app-created tables to audittrace via DEFAULT
+-- PRIVILEGES so future migration tables propagate the grant
+-- automatically. Also covers existing tables in case the script
+-- re-runs against an already-migrated database.
+ALTER DEFAULT PRIVILEGES FOR ROLE audittrace_app IN SCHEMA public
+    GRANT SELECT ON TABLES TO audittrace;
+ALTER DEFAULT PRIVILEGES FOR ROLE audittrace_app IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO audittrace;
+-- Backfill: any tables already present in public schema (e.g. on
+-- re-run against a migrated DB) get SELECT granted to audittrace.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO audittrace;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO audittrace;
+
 -- ────────── Ownership transfer for RLS-protected tables ─────────
 -- audittrace_app MUST own these tables so ALTER TABLE + FORCE ROW
 -- LEVEL SECURITY apply to its own queries (FORCE is evaluated
