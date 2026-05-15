@@ -1,0 +1,58 @@
+meta {
+  name: POST /memory/index?file=episodic/...&collections=decisions — md → decisions
+  type: http
+  seq: 93
+}
+
+post {
+  url: {{baseUrl}}/memory/index?collections=decisions&file=episodic/{{exampleAdrFile}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  collections: decisions
+  file: episodic/{{exampleAdrFile}}
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("indexed exactly one chunk into the decisions collection", function() {
+    const body = res.getBody();
+    expect(body.status).to.equal("indexed");
+    expect(body.collections).to.be.an("object");
+    expect(body.collections.decisions).to.be.a("number");
+    expect(body.collections.decisions).to.be.at.least(1);
+  });
+}
+
+docs {
+  The EOD-memo → decisions flow proven live 2026-05-15 with v1.0.22
+  + the Keycloak scope grant (PR #87 / #88). A markdown file is
+  uploaded to MinIO under ``episodic/`` (typical operator use:
+  end-of-day ADR or memo) then re-indexed into the ``decisions``
+  ChromaDB collection for semantic recall.
+
+  Last night's 403 on this same flow was the motivating bug for
+  the v1.0.22 scope-grant cycle — the audittrace-opencode JWT lacked
+  the right scope to call /memory/index. Today: 200, evidence at
+  ~/work/audittrace-evidence/20260515-v1.0.22-e2e/.
+
+  Pre-req: the file must already be in MinIO. Use the sibling
+  bru ``upload-pdf.bru`` (despite the name it accepts .md too) OR
+  ``audittrace-login``-then-curl POST /memory/upload?layer=episodic
+  to land the file under episodic/.
+
+  Authorization: ``memory:episodic:write`` — gated on the FILE's
+  MinIO prefix, not the target collection. ``memory:decisions:write``
+  is in the issued token (cluster.bru env, v1.0.22+) but not
+  runtime-required for this call today — see the doc on
+  ``index-single-file.bru`` for the forward-looking enforcement
+  story.
+}
