@@ -407,6 +407,53 @@ class TestComposeTestScripts:
             f"`bash {ref}`."
         )
 
+    @pytest.mark.parametrize("script", _EXPECTED_SCRIPTS)
+    def test_embedded_python_parses(self, script: str) -> None:
+        """The shell scripts embed Python via `python3 -c '...'`.
+        Without ast-parsing the embedded source, a SyntaxError only
+        surfaces when the script actually runs — i.e. when CI hits
+        the step. This test catches it at PR time.
+
+        Caught regression (2026-05-15): test-chat-completion.sh had
+        `f"... {d.get(\\"usage\\")!r}"` — escaped double quotes
+        inside an f-string expression are a Python SyntaxError.
+        Inside shell single-quoted `python3 -c '...'`, the right
+        form is plain `d.get("usage")` (no shell escape needed).
+        """
+        import ast
+
+        path = COMPOSE_SCRIPTS_DIR / script
+        text = path.read_text(encoding="utf-8")
+        # Extract content between `python3 -c '` and the matching
+        # closing single quote on its own line. Brittle but precise
+        # for the convention these scripts follow.
+        lines = text.splitlines()
+        py_lines: list[str] = []
+        in_py = False
+        for line in lines:
+            if "python3 -c '" in line and not in_py:
+                in_py = True
+                continue
+            if in_py and line.strip() == "'":
+                break
+            if in_py:
+                py_lines.append(line)
+        if not py_lines:
+            return  # script doesn't embed Python — exempt
+        source = "\n".join(py_lines)
+        try:
+            ast.parse(source)
+        except SyntaxError as e:
+            raise AssertionError(
+                f"Embedded Python in {path} has a SyntaxError: {e!r}. "
+                "Common causes:\n"
+                '  - escaped quotes (`\\"`) inside f-string expressions — '
+                "use plain double quotes inside shell single-quoted "
+                "python3 -c '...' blocks\n"
+                "  - mismatched braces inside f-string `{...}` parts\n"
+                f"\nProblematic snippet:\n{source}"
+            ) from e
+
     def test_workflow_has_no_inline_curl_command(self) -> None:
         """Catches the regression where a `curl` command is inlined
         into the workflow YAML instead of being moved into a shared

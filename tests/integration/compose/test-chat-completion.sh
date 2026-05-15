@@ -51,8 +51,9 @@ assert visible, \
 finish = d["choices"][0]["finish_reason"]
 assert finish == "stop", \
     f"finish_reason should be stop, got {finish!r}"
-total = d.get("usage", {}).get("total_tokens", 0)
-assert total > 0, f"no token usage reported: {d.get(\"usage\")!r}"
+usage = d.get("usage", {})
+total = usage.get("total_tokens", 0)
+assert total > 0, f"no token usage reported: {usage!r}"
 print("  OK: chat-completion shape valid")
 print("      content: " + visible[:80])
 print("      finish_reason: " + finish)
