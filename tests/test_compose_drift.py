@@ -23,6 +23,7 @@ Anchors:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -200,4 +201,132 @@ class TestComposeMockLlmServiceWiring:
             f"AUDITTRACE_LLAMA_URL ({llama!r}) is hardcoded instead of "
             "env-substituted. Use ${VAR:-default} form so a host-LLM "
             "operator can override via their .env without conflicts."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B7 step 3 — .env file coverage drift guards
+# ─────────────────────────────────────────────────────────────────────
+
+ENV_CI_PATH = REPO_ROOT / ".env.ci"
+ENV_DEV_REAL_LLM_PATH = REPO_ROOT / ".env.dev-real-llm.example"
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal .env-style parser: KEY=VALUE per line, ignore comments
+    + blank lines. Doesn't handle quoting or multi-line values — fine
+    for our deterministic-shape .env files."""
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Strip inline trailing comments after the value.
+        # Use the first '#' that follows a space — `foo=bar # comment`.
+        if " #" in line:
+            line = line.split(" #", 1)[0].rstrip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _compose_required_env_vars() -> set[str]:
+    """Compose `${VAR}` references WITHOUT a `:-default` fallback —
+    i.e. the load-bearing vars that compose fails to substitute
+    cleanly if unset. Vars with `${VAR:-default}` are tunable knobs
+    that operators don't need to declare in their .env files; their
+    defaults are explicit and sensible.
+
+    The test asserts both .env files declare the load-bearing set.
+    A missing knob doesn't break compose; a missing load-bearing
+    var produces an empty substitution and the downstream service
+    crashes 30s later with a confusing error."""
+    text = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    # Match `${VAR}` but NOT `${VAR:-...}`. Negative lookahead on `:-`.
+    return set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)(?!:-)\}", text))
+
+
+class TestEnvFileCoverage:
+    """B7 step 3 — `.env.ci` and `.env.dev-real-llm.example` must
+    declare every env-var the compose file substitutes. Catches the
+    operator gotcha "compose silently substitutes blank for an
+    unset var and a service breaks 30s into startup with a cryptic
+    error."
+
+    Anchors:
+      - docs/architecture/b7-docker-compose-revive-plan.md §5.
+      - feedback_no_more_drifts.
+    """
+
+    # COMPOSE_PROFILES is special — only meaningful at the docker
+    # compose CLI level (NOT a service env var substituted in any
+    # service definition). Exempt from the strict-coverage rule.
+    _EXEMPT: frozenset[str] = frozenset()
+
+    def test_env_ci_file_exists(self) -> None:
+        assert ENV_CI_PATH.exists(), (
+            f".env.ci missing at {ENV_CI_PATH}. B7 step 3 commits this "
+            "file as the canonical CI parameterisation surface. "
+            "Restore from git history."
+        )
+
+    def test_env_dev_real_llm_example_exists(self) -> None:
+        assert ENV_DEV_REAL_LLM_PATH.exists(), (
+            f".env.dev-real-llm.example missing at {ENV_DEV_REAL_LLM_PATH}."
+            " B7 step 3 commits this as the operator template."
+        )
+
+    def test_env_ci_covers_every_compose_substitution(self) -> None:
+        required = _compose_required_env_vars() - self._EXEMPT
+        declared = set(_parse_env_file(ENV_CI_PATH).keys())
+        missing = required - declared
+        assert not missing, (
+            ".env.ci does not declare every env var that docker-compose.yml "
+            f"substitutes. Missing: {sorted(missing)}. Each compose "
+            "${VAR:-default} reference needs a corresponding line in "
+            ".env.ci, even if the value is left empty (to suppress the "
+            "compose 'variable is not set' warning in CI logs)."
+        )
+
+    def test_env_dev_example_covers_every_compose_substitution(self) -> None:
+        required = _compose_required_env_vars() - self._EXEMPT
+        declared = set(_parse_env_file(ENV_DEV_REAL_LLM_PATH).keys())
+        missing = required - declared
+        assert not missing, (
+            ".env.dev-real-llm.example does not declare every env var "
+            "that docker-compose.yml substitutes. Missing: "
+            f"{sorted(missing)}. Add a placeholder ###CHANGE### line "
+            "for each so operators copy-and-edit the template without "
+            "discovering missing vars at runtime."
+        )
+
+    def test_env_ci_has_no_change_placeholder_values(self) -> None:
+        """The CI file should NEVER contain the dev-template's
+        ###CHANGE### sentinel — those values would break the test
+        env at runtime. Catches a likely copy-paste mistake when
+        someone duplicates the template."""
+        kvs = _parse_env_file(ENV_CI_PATH)
+        tainted = [k for k, v in kvs.items() if "###CHANGE###" in v]
+        assert not tainted, (
+            f".env.ci contains ###CHANGE### placeholder values for: "
+            f"{tainted}. Replace with deterministic test values. "
+            "###CHANGE### is the dev-template's TODO marker, NOT a "
+            "valid CI value — anything substituted with this string "
+            "would break compose at runtime."
+        )
+
+    def test_env_ci_activates_mock_llm_profile(self) -> None:
+        """COMPOSE_PROFILES must include mock-llm in .env.ci so the
+        CI workflow doesn't have to pass `--profile mock-llm` on the
+        command line. Step 4 will rely on this."""
+        kvs = _parse_env_file(ENV_CI_PATH)
+        profiles = kvs.get("COMPOSE_PROFILES", "")
+        assert "mock-llm" in profiles, (
+            f"COMPOSE_PROFILES in .env.ci ({profiles!r}) does not include "
+            "'mock-llm'. Without it, `docker compose --env-file .env.ci "
+            "up -d` leaves the mock-llm service dormant and memory-server "
+            "tries to reach host.docker.internal:11435 — which doesn't "
+            "exist in CI runners."
         )
