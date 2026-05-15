@@ -105,69 +105,28 @@ jobs:
           echo "::error::memory-server /health never returned 200"
           exit 1
 
-      - name: Smoke — GET /health (assert shape)
-        run: |
-          response=$(curl -sf --max-time 10 -k https://localhost/health)
-          echo "Response: ${response}"
-          echo "${response}" | python3 -c "
-          import json,sys
-          d = json.load(sys.stdin)
-          assert d['status'] == 'ok', f'Unexpected: {d}'
-          print('OK: status==ok, version=' + d.get('version','<unknown>'))
-          "
+      # B7 step 5 — assertions moved to shared scripts under
+      # tests/integration/compose/. Operators can re-run the same
+      # checks locally without the GHA YAML wrapper:
+      #   bash tests/integration/compose/test-health.sh
+      #   bash tests/integration/compose/test-chat-completion.sh
+      #   bash tests/integration/compose/test-models.sh
+      # The scripts default AUDITTRACE_BASE_URL=https://localhost and
+      # CURL_OPTS=-k; override via env for non-localhost runs.
+
+      - name: Smoke — /health shape (tests/integration/compose/test-health.sh)
+        run: bash tests/integration/compose/test-health.sh
 
       - name: B7 step 4 — POST /v1/chat/completions against mock LLM
-        # The load-bearing E2E test. Auth is disabled in .env.ci
-        # (AUDITTRACE_AUTH_ENABLED=false), so no JWT needed. The
-        # request goes Traefik → memory-server proxy → in-network
-        # mock-llm:11435 → canned response with content="bruno".
-        # Asserts:
-        #   - HTTP 200
-        #   - OpenAI shape preserved (choices[0].message.role=assistant)
-        #   - finish_reason=="stop"  (vs "length", which would mean
-        #     the proxy truncated — see feedback_e2e_includes_llm_call)
-        #   - content non-empty after stripping <think> (mock returns
-        #     a plain string, no <think> block; this assertion proves
-        #     the visible-content extraction logic also works for
-        #     non-reasoning models)
-        run: |
-          response=$(curl -sf --max-time 30 -k https://localhost/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "audittrace-default",
-              "messages": [{"role":"user","content":"hello"}],
-              "max_tokens": 32,
-              "stream": false
-            }')
-          echo "Response: ${response}"
-          echo "${response}" | python3 -c "
-          import json,re,sys
-          d = json.load(sys.stdin)
-          assert d['choices'][0]['message']['role'] == 'assistant', \
-            f'wrong role: {d!r}'
-          content = d['choices'][0]['message']['content']
-          visible = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-          assert visible, f'visible content empty (mock returned <think>-only?): {content!r}'
-          assert d['choices'][0]['finish_reason'] == 'stop', \
-            f'finish_reason should be stop, got {d[\"choices\"][0][\"finish_reason\"]!r}'
-          assert d.get('usage', {}).get('total_tokens', 0) > 0, \
-            f'no token usage reported: {d.get(\"usage\")!r}'
-          print('OK: chat-completion shape valid, content=' + visible[:80])
-          "
+        # The load-bearing E2E test. Auth is disabled in .env.ci, so
+        # no JWT needed. Request goes Traefik → memory-server proxy →
+        # in-network mock-llm:11435 → canned "bruno" response.
+        # See script for the reasoning-model trap assertions
+        # (feedback_e2e_includes_llm_call).
+        run: bash tests/integration/compose/test-chat-completion.sh
 
-      - name: Smoke — GET /v1/models (via Traefik to mock LLM)
-        # Sanity check the model-list endpoint also routes correctly
-        # through the proxy. Mock LLM returns id=audittrace-default.
-        run: |
-          response=$(curl -sf --max-time 10 -k https://localhost/v1/models)
-          echo "Response: ${response}"
-          echo "${response}" | python3 -c "
-          import json,sys
-          d = json.load(sys.stdin)
-          ids = {m['id'] for m in d.get('data', [])}
-          assert 'audittrace-default' in ids, f'missing audittrace-default in {ids!r}'
-          print('OK: /v1/models returned ' + ', '.join(sorted(ids)))
-          "
+      - name: Smoke — /v1/models (via Traefik to mock LLM)
+        run: bash tests/integration/compose/test-models.sh
 
       - name: Capture logs on failure
         if: failure()

@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -329,4 +330,165 @@ class TestEnvFileCoverage:
             "up -d` leaves the mock-llm service dormant and memory-server "
             "tries to reach host.docker.internal:11435 — which doesn't "
             "exist in CI runners."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B7 step 5 — shared test-script drift guards
+# ─────────────────────────────────────────────────────────────────────
+
+COMPOSE_SCRIPTS_DIR = REPO_ROOT / "tests" / "integration" / "compose"
+E2E_COMPOSE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e-compose.yml"
+
+# The set of shared scripts step 5 commits. Adding a new test script
+# means adding it here AND wiring it into the workflow — the drift
+# guards below catch either side dropping out of sync.
+_EXPECTED_SCRIPTS: tuple[str, ...] = (
+    "test-health.sh",
+    "test-chat-completion.sh",
+    "test-models.sh",
+)
+
+
+class TestComposeTestScripts:
+    """B7 step 5 — every assertion the e2e-compose workflow uses
+    must live in a shared script under tests/integration/compose/
+    so operators can re-run the same checks locally. Catches:
+
+      - Workflow inlines new bash instead of using the shared script
+        (regression of the operator-rerun discipline)
+      - Script committed but not executable (chmod silently dropped)
+      - Workflow references a script that doesn't exist (typo)
+
+    Anchors:
+      - docs/architecture/b7-docker-compose-revive-plan.md §7 step 5
+      - feedback_no_more_drifts
+    """
+
+    def test_compose_scripts_dir_exists(self) -> None:
+        assert COMPOSE_SCRIPTS_DIR.is_dir(), (
+            f"tests/integration/compose/ missing at {COMPOSE_SCRIPTS_DIR}. "
+            "B7 step 5 commits shared test scripts here."
+        )
+
+    @pytest.mark.parametrize("script", _EXPECTED_SCRIPTS)
+    def test_expected_script_exists(self, script: str) -> None:
+        path = COMPOSE_SCRIPTS_DIR / script
+        assert path.exists(), (
+            f"Expected compose test script missing: {path}. "
+            "Either restore it or remove the reference from "
+            "tests/test_compose_drift.py::_EXPECTED_SCRIPTS."
+        )
+
+    @pytest.mark.parametrize("script", _EXPECTED_SCRIPTS)
+    def test_expected_script_is_executable(self, script: str) -> None:
+        import os
+
+        path = COMPOSE_SCRIPTS_DIR / script
+        assert os.access(path, os.X_OK), (
+            f"Compose test script not executable: {path}. "
+            "Run `chmod +x` on the file; git stores the executable "
+            "bit so the commit + re-clone propagates correctly."
+        )
+
+    @pytest.mark.parametrize("script", _EXPECTED_SCRIPTS)
+    def test_workflow_references_script(self, script: str) -> None:
+        """e2e-compose.yml must invoke each shared script. Catches
+        the regression where a developer copies a script's contents
+        back into the workflow inline (defeating the share)."""
+        if not E2E_COMPOSE_WORKFLOW.exists():
+            return  # pre-step-4 state — exempt
+        text = E2E_COMPOSE_WORKFLOW.read_text(encoding="utf-8")
+        ref = f"tests/integration/compose/{script}"
+        assert ref in text, (
+            f"e2e-compose.yml does not reference {ref}. The shared script "
+            "exists but the workflow inlines its assertions instead of "
+            "delegating. Replace the inline bash with "
+            f"`bash {ref}`."
+        )
+
+    @pytest.mark.parametrize("script", _EXPECTED_SCRIPTS)
+    def test_embedded_python_parses(self, script: str) -> None:
+        """The shell scripts embed Python via `python3 -c '...'`.
+        Without ast-parsing the embedded source, a SyntaxError only
+        surfaces when the script actually runs — i.e. when CI hits
+        the step. This test catches it at PR time.
+
+        Caught regression (2026-05-15): test-chat-completion.sh had
+        `f"... {d.get(\\"usage\\")!r}"` — escaped double quotes
+        inside an f-string expression are a Python SyntaxError.
+        Inside shell single-quoted `python3 -c '...'`, the right
+        form is plain `d.get("usage")` (no shell escape needed).
+        """
+        import ast
+
+        path = COMPOSE_SCRIPTS_DIR / script
+        text = path.read_text(encoding="utf-8")
+        # Extract content between `python3 -c '` and the matching
+        # closing single quote on its own line. Brittle but precise
+        # for the convention these scripts follow.
+        lines = text.splitlines()
+        py_lines: list[str] = []
+        in_py = False
+        for line in lines:
+            if "python3 -c '" in line and not in_py:
+                in_py = True
+                continue
+            if in_py and line.strip() == "'":
+                break
+            if in_py:
+                py_lines.append(line)
+        if not py_lines:
+            return  # script doesn't embed Python — exempt
+        source = "\n".join(py_lines)
+        try:
+            ast.parse(source)
+        except SyntaxError as e:
+            raise AssertionError(
+                f"Embedded Python in {path} has a SyntaxError: {e!r}. "
+                "Common causes:\n"
+                '  - escaped quotes (`\\"`) inside f-string expressions — '
+                "use plain double quotes inside shell single-quoted "
+                "python3 -c '...' blocks\n"
+                "  - mismatched braces inside f-string `{...}` parts\n"
+                f"\nProblematic snippet:\n{source}"
+            ) from e
+
+    def test_workflow_has_no_inline_curl_command(self) -> None:
+        """Catches the regression where a `curl` command is inlined
+        into the workflow YAML instead of being moved into a shared
+        script. The parametrized `test_workflow_references_script`
+        test (above) catches "script not used"; this catches the
+        weaker form "script used AND new bash inlined alongside."
+
+        Curl commands inside the shared scripts are fine — this
+        test only inspects the workflow file, not the .sh files.
+
+        Exception: the curl in step "Wait for /health" is a polling
+        loop with retry logic that's awkward to extract; allow that
+        one specific pattern."""
+        if not E2E_COMPOSE_WORKFLOW.exists():
+            return
+        text = E2E_COMPOSE_WORKFLOW.read_text(encoding="utf-8")
+        # Strip comments + blank lines so we focus on actual commands.
+        non_comment_lines = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        # Curl commands that aren't part of the health-poll retry loop.
+        # The health-poll's `curl -sf --max-time 5 -k .../health` is
+        # the one allowed inline curl (retry semantics don't translate
+        # cleanly to a one-shot script).
+        suspicious = [
+            line
+            for line in non_comment_lines
+            if "curl " in line and "/health" not in line  # poll-loop exception
+        ]
+        assert not suspicious, (
+            "e2e-compose.yml has inline `curl` command(s) outside the "
+            "health-poll retry loop. Move to a shared script under "
+            "tests/integration/compose/ and delegate from the workflow "
+            "via `bash tests/integration/compose/<script>.sh`. "
+            "Offending lines:\n" + "\n".join(suspicious[:5])
         )
