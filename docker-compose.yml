@@ -270,6 +270,12 @@ services:
       # keeps the volume) doesn't break clustering. Single-node still
       # needs it for `rabbitmqctl` introspection across runs.
       RABBITMQ_ERLANG_COOKIE: ${AUDITTRACE_RABBITMQ_ERLANG_COOKIE:-audittrace-compose-cookie}
+      # Bitnami's rabbitmq image defaults to applying loopback restriction
+      # to RABBITMQ_USERNAME, so cross-container connections (the whole
+      # point of compose) fail with "PLAIN login refused: user can only
+      # connect via localhost". Set to "none" to allow remote PLAIN
+      # auth — same posture as the chart's bitnami subchart deploys.
+      RABBITMQ_LOOPBACK_USERS: "none"
       # Plugins required for the chart's scan-pipeline binding shape
       # (topic exchange + DLX). The Bitnami image already enables
       # rabbitmq_management by default; nothing extra needed today.

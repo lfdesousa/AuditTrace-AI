@@ -94,6 +94,28 @@ psql \
 -- Hoist the psql variable into a session GUC the DO block can read.
 SELECT set_config('audittrace.app_password', :'app_password', false);
 
+-- ───────────── Grant BYPASSRLS to the `audittrace` role ─────────────
+-- The session summariser (server.py:228) connects with this role and
+-- needs to read across user rows (cross-tenant aggregation). Under
+-- pre-B7 vanilla postgres:16-alpine, POSTGRES_USER=audittrace was a
+-- SUPERUSER → had BYPASSRLS implicitly. Under Bitnami the role is
+-- plain LOGIN → RLS blocks the cross-user SELECT with:
+--   ERROR: query would be affected by row-level security policy for
+--   table "interactions"
+-- Granting BYPASSRLS restores the summariser's capability without
+-- granting full SUPERUSER. The chart-side equivalent is a separate
+-- `audittrace_summariser` role provisioned via the
+-- job-summariser-role.yaml Helm hook; compose grants BYPASSRLS to
+-- `audittrace` directly for simplicity (single role, dev-only runtime).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'audittrace' AND rolbypassrls = true) THEN
+        ALTER ROLE audittrace WITH BYPASSRLS;
+        RAISE NOTICE 'Granted BYPASSRLS to audittrace (summariser cross-user read path)';
+    END IF;
+END
+$$;
+
 -- ────────────────────── Create or rotate role ───────────────────────
 DO $$
 DECLARE
