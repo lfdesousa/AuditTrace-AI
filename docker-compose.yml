@@ -270,20 +270,15 @@ services:
       # keeps the volume) doesn't break clustering. Single-node still
       # needs it for `rabbitmqctl` introspection across runs.
       RABBITMQ_ERLANG_COOKIE: ${AUDITTRACE_RABBITMQ_ERLANG_COOKIE:-audittrace-compose-cookie}
-      # Bitnami's rabbitmq image defaults to applying loopback restriction
-      # to RABBITMQ_USERNAME, so cross-container connections (the whole
-      # point of compose) fail with "PLAIN login refused: user can only
-      # connect via localhost". Round-4 attempt with the broad
-      # `loopback_users = none` setting did NOT take effect — bitnami's
-      # init must be adding a more-specific `loopback_users.audittrace =
-      # true` entry that wins via rabbitmq.conf's dot-notation
-      # specificity. Round-5: target the specific user explicitly.
-      # Belt-and-braces: also set the env var, the broad rabbitmq.conf
-      # entry, AND the per-user override.
-      RABBITMQ_LOOPBACK_USERS: "none"
-      RABBITMQ_EXTRA_CONF: |
-        loopback_users = none
-        loopback_users.audittrace = false
+      # Bitnami's rabbitmq image applies loopback restriction to the
+      # RABBITMQ_USERNAME user, blocking cross-container access. Rounds
+      # 3b-5 (env vars + RABBITMQ_EXTRA_CONF) all failed — bitnami's
+      # auto-generated rabbitmq.conf must include
+      # `loopback_users.audittrace = true` after our appends and wins.
+      # Round 6 (this commit): mount an explicit rabbitmq.conf via the
+      # bitnami-documented override path /bitnami/rabbitmq/conf/rabbitmq.conf.
+      # When that file is present bitnami uses it verbatim and skips
+      # auto-generation entirely. See ./rabbitmq/rabbitmq.conf.
       # Plugins required for the chart's scan-pipeline binding shape
       # (topic exchange + DLX). The Bitnami image already enables
       # rabbitmq_management by default; nothing extra needed today.
@@ -292,6 +287,10 @@ services:
       - "15672:15672"   # mgmt UI (dev only)
     volumes:
       - rabbitmq_data:/bitnami/rabbitmq/mnesia
+      # B7 step 1 round 6 — full rabbitmq.conf override via bitnami's
+      # documented mount path. Bypasses bitnami's auto-generation so
+      # loopback_users.audittrace = false sticks.
+      - ./rabbitmq/rabbitmq.conf:/bitnami/rabbitmq/conf/rabbitmq.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
       interval: 10s
