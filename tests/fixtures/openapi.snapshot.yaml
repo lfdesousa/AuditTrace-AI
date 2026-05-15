@@ -660,12 +660,16 @@ components:
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
+            memory:decisions:write: Create/update/delete documents in the ``decisions`` ChromaDB collection (ADR/decision
+              records — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:episodic:read: Read episodic-layer (ADR-style) documents
             memory:episodic:write: Create/update/delete episodic-layer documents
             memory:procedural:read: Read procedural-layer (SKILL-style) documents
             memory:procedural:write: Create/update/delete procedural-layer documents
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
+            memory:skills:write: Create/update/delete documents in the ``skills`` ChromaDB collection (SKILL/procedural records
+              — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:upload:write: Upload bytes (PDFs, etc.) into the ingestion content-control pipeline (ADR-048). Distinct
               from memory:episodic:write because uploads land in a quarantine prefix the memory-server cannot read; promotion
               to episodic/papers/ happens only after a scanner verdict.
