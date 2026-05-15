@@ -1,0 +1,35 @@
+# Backlog #13 — operator-vendored static trust roots (ADR-052 §3).
+#
+# Closes the SwissSign 2020-2 root gap that backlog #13 deferred
+# on 2026-05-08 (reCAPTCHA blocked the website download). The
+# root certificate was extracted at zero-trust from the embedded
+# PAdES chain of `main_signed.pdf` — the same signed reference
+# document the project anchors live signature evidence against —
+# guaranteeing chain-of-custody back to the SwissSign QES path
+# used for the framework's qualified signature.
+#
+# The StaticTrustStoreBuilder concatenates every .pem / .crt in
+# the mount directory; the composite trust-store builder picks it
+# up alongside `eu_lotl` and `swiss_tsl` (see config.py default
+# `pdf_trust_store_composite_builders = "eu_lotl,swiss_tsl,static"`
+# bumped in this PR).
+#
+# Add additional operator roots by dropping new .pem files under
+# `charts/audittrace/trust-store/static-roots/` — `helm upgrade`
+# re-renders this ConfigMap with the new fingerprints. There is no
+# size-bump or hot-reload concern for typical operator volumes
+# (well below the k8s 1 MiB-per-CM limit).
+#
+# PEM is text, so `data:` is correct (binaryData would also work
+# but defeats the human-diff intent of inspecting `kubectl get cm`).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-static-roots
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "trust-store/static-roots/*.pem" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}

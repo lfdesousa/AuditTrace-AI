@@ -280,10 +280,11 @@ class Settings(BaseSettings):
     # When ``pdf_trust_store_builder == "composite"`` this is the
     # comma-separated list of inner builders (in order). Each entry
     # must be one of {``eu_lotl``, ``swiss_tsl``, ``static``}.
-    # Default ``eu_lotl,swiss_tsl`` covers the EU + CH
-    # jurisdictions in one bundle — the right default for a
-    # Swiss-located, EU-customer-serving product.
-    pdf_trust_store_composite_builders: str = "eu_lotl,swiss_tsl"
+    # Default ``eu_lotl,swiss_tsl,static`` covers the EU + CH
+    # jurisdictions plus operator-vendored roots (Backlog #13
+    # closed 2026-05-15: SwissSign 2020-2 root extracted from
+    # `main_signed.pdf` PAdES chain and shipped via the chart).
+    pdf_trust_store_composite_builders: str = "eu_lotl,swiss_tsl,static"
     # Filesystem path to the Swiss TSLO (Trust List Operator)
     # signing certificate, vendored in the chart at
     # ``charts/audittrace/trust-store/swiss-federal-tsl/CH-TL-cert.der``
@@ -306,10 +307,11 @@ class Settings(BaseSettings):
     pdf_trust_store_s3_key: str = "trust-store/eu-lotl-bundle.pem"
     # Static-Builder source directory. Operator-supplied PEMs
     # under this path are concatenated by
-    # ``StaticTrustStoreBuilder``. Empty string = the static
-    # builder is unavailable (default; the EU LOTL builder is the
-    # primary path).
-    pdf_trust_store_static_dir: str = ""
+    # ``StaticTrustStoreBuilder``. Default points at the chart-
+    # mounted ConfigMap (`configmap-static-roots.yaml`), which
+    # ships the SwissSign 2020-2 root by default (Backlog #13).
+    # Empty string disables the static builder.
+    pdf_trust_store_static_dir: str = "/etc/audittrace/static-roots"
 
     # ─────────────── PDF OCR (gap-inventory #1, ADR-050 tier-B) ───────────
     # Tesseract-backed OCR fallback for raster-only pages
