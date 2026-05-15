@@ -344,6 +344,70 @@ The CI gate still requires the PR body sections.
   override is added and helm template aborts with "Unrecognized
   images", this is the flag to set in the same values file.
 
+### docker-compose stack — B7 step 1 rebuild (2026-05-15)
+
+`docker-compose.yml` is the **parallel dev runtime** per
+`feedback_docker_compose_retained` — NOT a competing production
+path; the Helm chart in `charts/audittrace/` remains canonical.
+
+After B7 step 1 the compose stack pulls the SAME images Helm
+deploys in prod: `ghcr.io/lfdesousa/audittrace-{postgresql,redis,
+rabbitmq}` (B1.5 / B1.6 frozen Bitnami), `chromadb/chroma:1.5.7`
+(chart pin), `quay.io/keycloak/keycloak:24.0`, `minio/minio:latest`,
+`docker.io/lfds/audittrace-memory-server:1.0.22` (published).
+Configuration follows Bitnami conventions (`POSTGRESQL_*`,
+`REDIS_*`, `RABBITMQ_*` env vars; `/bitnami/{postgresql,redis,
+rabbitmq}` volume paths) so the runtime contract matches the
+Bitnami subcharts the Helm chart deploys.
+
+**Operator caveat — first up after B7 step 1 wipes data.** The
+previous compose used vanilla `postgres:16-alpine` (PG 16 on disk
+at `/var/lib/postgresql/data`) and `redis:7-alpine` with cmdline
+auth. The new images write PG 18.3 / Redis 8.6.2 to `/bitnami/*`.
+The OLD named volumes are incompatible; do this BEFORE first up:
+
+```
+docker compose down -v --remove-orphans
+```
+
+Clears `postgres_data` / `audittrace_redis_data` / `chroma_data` /
+`minio_data` so the next `docker compose up` initialises against
+the new images cleanly. Acceptable because compose is dev-only.
+
+**Dev hot-reload** still works via the dev overlay:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d memory-server
+```
+
+The overlay re-enables `build: .` and tags the result as
+`docker.io/lfds/audittrace-memory-server:dev` so it doesn't shadow
+the base's `:1.0.22` pin in other operators' shells.
+
+**Network is compose-managed** (was `external: true` pre-B7). An
+operator who needs to bridge into an existing network can override
+with a sibling overlay (`docker-compose.network-external.yaml`).
+
+Subsequent B7 steps (mock-LLM profile, GHA workflow, obs stack,
+content-control sibling) are tracked in
+`docs/architecture/b7-docker-compose-revive-plan.md`.
+
+**RabbitMQ deviation (operator caveat, 2026-05-15, B7 step 1 round 7):**
+Compose's rabbitmq service runs `rabbitmq:3.13-management-alpine`
+(upstream image), NOT the ghcr-frozen Bitnami mirror the chart uses
+(`ghcr.io/lfdesousa/audittrace-rabbitmq:3.13.7-debian-12-r2-bitnami-frozen-may15`).
+**Binary parity preserved** — both images ship RabbitMQ 3.13.7
+(verified `rabbitmqctl version`). **Wrapper differs** because the
+Bitnami image applies `loopback_users.<RABBITMQ_USERNAME> = true`
+by default in its auto-generated rabbitmq.conf, blocking cross-
+container PLAIN auth. Six rounds of env-var + RABBITMQ_EXTRA_CONF
++ mounted-conf-file overrides all failed (the bitnami libfile
+re-writes the conf after our overrides). Pragmatic compromise:
+compose deviates to upstream; chart's prod path keeps bitnami
+unchanged. The application's AMQP behaviour is identical against
+either wrapper — `aio_pika.connect_robust` doesn't care about
+loopback policy as long as the user can authenticate.
+
 ### Data-compat harness — test before any subchart image swap
 
 Before any helm change that touches `postgresql.image.*`,

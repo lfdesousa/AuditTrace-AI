@@ -45,20 +45,40 @@
 
 set -euo pipefail
 
-POSTGRES_USER="${POSTGRES_USER:-audittrace}"
-POSTGRES_DB="${POSTGRES_DB:-audittrace}"
-APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+# B7 step 1 (2026-05-15) — compose now runs Bitnami postgres (same
+# image the chart deploys). Bitnami exposes POSTGRESQL_* env vars
+# (NOT vanilla POSTGRES_*) AND creates POSTGRESQL_USERNAME as a
+# NON-superuser. CREATE ROLE requires CREATEROLE/SUPERUSER, so we
+# must connect as the bootstrap `postgres` superuser (its password
+# is in POSTGRESQL_POSTGRES_PASSWORD, set by compose to the same
+# value as AUDITTRACE_POSTGRES_PASSWORD).
+#
+# Vanilla pre-B7 compose set POSTGRES_USER=audittrace as a SUPERUSER,
+# so the legacy fallback path connects as that role directly.
+if [[ -n "${POSTGRESQL_POSTGRES_PASSWORD:-}" ]]; then
+    # Bitnami path — connect as postgres superuser
+    SUPERUSER="postgres"
+    SUPERUSER_PASSWORD="${POSTGRESQL_POSTGRES_PASSWORD}"
+    POSTGRES_DB="${POSTGRESQL_DATABASE:-audittrace}"
+    APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRESQL_PASSWORD:-}}"
+else
+    # Vanilla path — POSTGRES_USER itself is the superuser
+    SUPERUSER="${POSTGRES_USER:-audittrace}"
+    SUPERUSER_PASSWORD="${POSTGRES_PASSWORD:-}"
+    POSTGRES_DB="${POSTGRES_DB:-audittrace}"
+    APP_PASSWORD="${AUDITTRACE_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+fi
 
 # Bitnami postgres uses md5 auth even for local connections during init.
 # Export PGPASSWORD so psql can authenticate non-interactively.
-export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+export PGPASSWORD="${SUPERUSER_PASSWORD}"
 
 if [[ -z "${APP_PASSWORD}" ]]; then
     echo "ERROR: Neither AUDITTRACE_APP_PASSWORD nor POSTGRES_PASSWORD is set" >&2
     exit 1
 fi
 
-echo "[init-audittrace-app-role] Creating non-superuser app role..."
+echo "[init-audittrace-app-role] Creating non-superuser app role (as ${SUPERUSER})..."
 
 # We pass the password to psql as a ``--set`` variable, then promote
 # it into a session GUC (``audittrace.app_password``) with
@@ -66,13 +86,35 @@ echo "[init-audittrace-app-role] Creating non-superuser app role..."
 # ``current_setting``. This avoids string-interpolation into the
 # literal SQL body, which is both ugly and SQL-injection-prone.
 psql \
-    --username="${POSTGRES_USER}" \
+    --username="${SUPERUSER}" \
     --dbname="${POSTGRES_DB}" \
     --set ON_ERROR_STOP=on \
     --set "app_password=${APP_PASSWORD}" \
     <<'EOSQL'
 -- Hoist the psql variable into a session GUC the DO block can read.
 SELECT set_config('audittrace.app_password', :'app_password', false);
+
+-- ───────────── Grant BYPASSRLS to the `audittrace` role ─────────────
+-- The session summariser (server.py:228) connects with this role and
+-- needs to read across user rows (cross-tenant aggregation). Under
+-- pre-B7 vanilla postgres:16-alpine, POSTGRES_USER=audittrace was a
+-- SUPERUSER → had BYPASSRLS implicitly. Under Bitnami the role is
+-- plain LOGIN → RLS blocks the cross-user SELECT with:
+--   ERROR: query would be affected by row-level security policy for
+--   table "interactions"
+-- Granting BYPASSRLS restores the summariser's capability without
+-- granting full SUPERUSER. The chart-side equivalent is a separate
+-- `audittrace_summariser` role provisioned via the
+-- job-summariser-role.yaml Helm hook; compose grants BYPASSRLS to
+-- `audittrace` directly for simplicity (single role, dev-only runtime).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'audittrace' AND rolbypassrls = true) THEN
+        ALTER ROLE audittrace WITH BYPASSRLS;
+        RAISE NOTICE 'Granted BYPASSRLS to audittrace (summariser cross-user read path)';
+    END IF;
+END
+$$;
 
 -- ────────────────────── Create or rotate role ───────────────────────
 DO $$
@@ -107,6 +149,25 @@ ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO audittrace_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE audittrace IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO audittrace_app;
+
+-- B7 step 1 — REVERSE default privileges. Under Bitnami, migrations
+-- run as audittrace_app (the AUDITTRACE_POSTGRES_URL role) so
+-- audittrace_app OWNS the tables that get created. The summariser
+-- connects as `audittrace` (AUDITTRACE_SUMMARIZER_POSTGRES_URL) for
+-- cross-user reads, but `audittrace` has no GRANTS on tables it
+-- doesn't own → "permission denied for table sessions". Grant SELECT
+-- on audittrace_app-created tables to audittrace via DEFAULT
+-- PRIVILEGES so future migration tables propagate the grant
+-- automatically. Also covers existing tables in case the script
+-- re-runs against an already-migrated database.
+ALTER DEFAULT PRIVILEGES FOR ROLE audittrace_app IN SCHEMA public
+    GRANT SELECT ON TABLES TO audittrace;
+ALTER DEFAULT PRIVILEGES FOR ROLE audittrace_app IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO audittrace;
+-- Backfill: any tables already present in public schema (e.g. on
+-- re-run against a migrated DB) get SELECT granted to audittrace.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO audittrace;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO audittrace;
 
 -- ────────── Ownership transfer for RLS-protected tables ─────────
 -- audittrace_app MUST own these tables so ALTER TABLE + FORCE ROW
