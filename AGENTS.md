@@ -308,6 +308,21 @@ The CI gate still requires the PR body sections.
   **Operator runbook for PAT lifecycle + Secret rotation:**
   `~/work/audittrace-private/runbooks/12-ghcr-pull-secret.md` (private).
   Full forensic at memory `project_bitnami_systemic_tag_mislabel`.
+- **RabbitMQ ghcr-frozen mirror (operator-caveat, 2026-05-15, B1.6):**
+  Same posture as B1.5 extended to the third subchart. The chart's
+  `rabbitmq ~14` subchart pulls `bitnamilegacy/rabbitmq:3.13.7-debian-12-r2`
+  by default. Unlike PG/Redis, the rabbitmq tag is NOT mislabelled
+  (verified: `rabbitmqctl version` inside the running container
+  returns 3.13.7, matching the tag claim). But the same single-source-
+  of-truth discipline applies — control the registry, freeze the
+  binary moment-in-time, mirror into kind CI so compose B7 + kind
+  + prod all exercise the same bytes. Frozen image at
+  `ghcr.io/lfdesousa/audittrace-rabbitmq:3.13.7-debian-12-r2-bitnami-frozen-may15`.
+  Both `values-local.yaml` and `tests/integration/fixtures/values-ci.yaml`
+  pin it. Same auth posture as B1.5 (ghcr-pull-secret prod-side,
+  GITHUB_TOKEN CI-side). Anchor memory:
+  `project_pickup_20260515_b7` — Luis: "use the exact same images
+  we are using today for all the components".
 - **`global.security.allowInsecureImages: true` (operator-caveat, 2026-05-14):**
   Set in both `charts/audittrace/values-local.yaml` and
   `tests/integration/fixtures/values-ci.yaml`. The name is misleading

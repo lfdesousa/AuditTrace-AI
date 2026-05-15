@@ -124,6 +124,20 @@ redis:
 
 rabbitmq:
   enabled: true
+  # 2026-05-15 B1.6 — pin to the same ghcr-hosted frozen image that
+  # prod runs (`charts/audittrace/values-local.yaml`). Extends B1.5's
+  # single-source-of-truth posture to the third subchart so all paths
+  # (kind CI, prod, future compose B7) pull the same binary moment-
+  # in-time. Anchor: project_pickup_20260515_b7 — Luis: "use the
+  # exact same images we are using today for all the components".
+  # The rabbitmq tag itself is NOT mislabelled (3.13.7-debian-12-r2
+  # actually ships RabbitMQ 3.13.7) — the discipline is registry
+  # control, not binary recovery.
+  image:
+    registry: ghcr.io
+    repository: lfdesousa/audittrace-rabbitmq
+    tag: 3.13.7-debian-12-r2-bitnami-frozen-may15
+    pullPolicy: IfNotPresent
   resources:
     requests:
       cpu: 100m
