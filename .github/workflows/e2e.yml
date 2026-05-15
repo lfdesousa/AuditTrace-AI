@@ -13,6 +13,11 @@ on:
 
 permissions:
   contents: read
+  # B7 step 1 — required to docker-login ghcr.io with GITHUB_TOKEN so
+  # the runner can pull `ghcr.io/lfdesousa/audittrace-{postgresql,
+  # redis,rabbitmq}` (B1.5 / B1.6 private packages). Same pattern as
+  # the kind workflow (integration-content-control.yml).
+  packages: read
 
 jobs:
   e2e:
@@ -22,8 +27,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Create Docker network
-        run: docker network create audittrace-net
+      # B7 step 1 — Login to ghcr.io BEFORE compose pulls images.
+      # Without this the rabbitmq pull fails with HTTP 401 unauth.
+      # GITHUB_TOKEN suffices because the packages are linked to
+      # this repo (Manage Actions access -> AuditTrace-AI read role).
+      - name: Login to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Generate test secrets
         run: |
@@ -44,6 +55,7 @@ jobs:
           AUDITTRACE_POSTGRES_PASSWORD=test-postgres-password
           AUDITTRACE_CHROMA_TOKEN=test-chroma-token
           AUDITTRACE_REDIS_PASSWORD=test-redis-password
+          AUDITTRACE_RABBITMQ_PASSWORD=test-rabbitmq-password
           AUDITTRACE_MINIO_SECRET_KEY=test-minio-secret-key-32chars!!
           AUDITTRACE_MINIO_ACCESS_KEY=minioadmin
           AUDITTRACE_MINIO_KMS_KEY=dGVzdC1rbXMta2V5LWV4YWN0bHktMzItYnl0ZXMhISE=
@@ -56,12 +68,18 @@ jobs:
           # Remove leading whitespace from heredoc (YAML indentation artifact)
           sed -i 's/^[[:space:]]*//' .env
 
+      # B7 step 1 — compose owns the audittrace-net network now (was
+      # `external: true` pre-step-1, requiring an out-of-band create
+      # which the workflow used to do). Pulling now: compose declares
+      # `name: audittrace-net` without external, so up creates it
+      # and down --remove-orphans tears it down.
       - name: Build and start stack
         run: docker compose up -d --build
         env:
           AUDITTRACE_POSTGRES_PASSWORD: test-postgres-password
           AUDITTRACE_CHROMA_TOKEN: test-chroma-token
           AUDITTRACE_REDIS_PASSWORD: test-redis-password
+          AUDITTRACE_RABBITMQ_PASSWORD: test-rabbitmq-password
 
       - name: Show container status
         if: always()
