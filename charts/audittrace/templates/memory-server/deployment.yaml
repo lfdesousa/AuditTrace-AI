@@ -177,6 +177,18 @@ spec:
             - name: swiss-federal-tsl
               mountPath: /etc/audittrace/swiss-federal-tsl
               readOnly: true
+            # Backlog #13 — operator-vendored static trust roots
+            # (ADR-052 §3). Loaded by `StaticTrustStoreBuilder`
+            # alongside the EU LOTL + Swiss federal TSL builders
+            # via the composite trust-store builder. Closes the
+            # SwissSign 2020-2 root gap (reCAPTCHA-blocked website
+            # download); root extracted from `main_signed.pdf`'s
+            # embedded PAdES chain. Drop additional .pem files
+            # under `charts/audittrace/trust-store/static-roots/`
+            # to extend.
+            - name: static-roots
+              mountPath: /etc/audittrace/static-roots
+              readOnly: true
           # startupProbe covers the cold-cluster boot path where
           # the lifespan blocks on ``ScanAmqpClient.ensure_connected``
           # (server.py:326). PR-B10 added a retry-with-backoff for
@@ -221,3 +233,8 @@ spec:
         - name: swiss-federal-tsl
           configMap:
             name: {{ .Release.Name }}-swiss-federal-tsl
+        # Backlog #13 — operator-vendored static trust roots
+        # rendered as `data:` (PEM is text) by configmap-static-roots.yaml.
+        - name: static-roots
+          configMap:
+            name: {{ .Release.Name }}-static-roots

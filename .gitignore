@@ -50,6 +50,12 @@ env/
 !/secrets/*.example
 *.pem
 *.key
+# Chart-vendored public trust roots are explicit exceptions —
+# these are public CA certificates (no private key material).
+# Backlog #13 anchor: SwissSign 2020-2 root extracted from
+# `main_signed.pdf` PAdES chain.
+!charts/audittrace/trust-store/static-roots/*.pem
+!charts/audittrace/trust-store/static-roots/*.crt
 
 # Docker
 docker-compose.override.yml

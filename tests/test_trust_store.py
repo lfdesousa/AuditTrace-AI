@@ -309,6 +309,90 @@ class TestStaticTrustStoreBuilder:
         assert first_idx < second_idx
 
 
+# ───── Chart-vendored static roots (Backlog #13 — SwissSign 2020-2) ────
+
+
+class TestChartVendoredStaticRoots:
+    """Backlog #13 closure: the SwissSign Signature Services Root 2020-2
+    certificate was extracted from `main_signed.pdf`'s embedded PAdES
+    chain (the signed framework reference document) and vendored at
+    `charts/audittrace/trust-store/static-roots/`. The chart's
+    `configmap-static-roots.yaml` mounts the directory at
+    `/etc/audittrace/static-roots`; `StaticTrustStoreBuilder` reads it.
+
+    These tests pin:
+      - the vendored PEM parses as a valid X.509 certificate;
+      - the subject + issuer match (i.e. it IS a self-signed root);
+      - the CN matches the SwissSign 2020-2 product name verbatim;
+      - the SHA-256 fingerprint is byte-stable across rebuilds
+        (so a swap-in attempt would fail loudly in CI).
+
+    Anchor: project_backlog_13_deferred_oob_verification (CLOSED
+    2026-05-15).
+    """
+
+    VENDORED_PEM = (
+        Path(__file__).parent.parent
+        / "charts"
+        / "audittrace"
+        / "trust-store"
+        / "static-roots"
+        / "swisssign-services-root-2020-2.pem"
+    )
+
+    # SHA-256 fingerprint pinned from the cert extracted from
+    # `main_signed.pdf.sig0` on 2026-05-15. A new cert bump must
+    # update this constant explicitly.
+    EXPECTED_FPR_SHA256 = (
+        "B8:7F:29:2A:4D:9F:EA:CE:2D:66:91:59:EB:26:F5:6D:"
+        "85:EC:77:C1:9E:01:09:8C:D7:54:E8:AB:B3:10:CD:E5"
+    )
+
+    def test_vendored_pem_exists(self) -> None:
+        assert self.VENDORED_PEM.exists(), (
+            f"vendored SwissSign 2020-2 root missing: {self.VENDORED_PEM}"
+        )
+
+    def test_vendored_pem_is_self_signed_root(self) -> None:
+        from cryptography import x509
+
+        pem_bytes = self.VENDORED_PEM.read_bytes()
+        cert = x509.load_pem_x509_certificate(pem_bytes)
+        # Self-signed root: subject == issuer.
+        assert cert.subject == cert.issuer
+        # CN must match the SwissSign 2020-2 product name verbatim;
+        # a swap to a different SwissSign root would fail loudly.
+        cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
+        assert cn == "SwissSign Signature Services Root 2020 - 2"
+
+    def test_vendored_pem_fingerprint_pinned(self) -> None:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        pem_bytes = self.VENDORED_PEM.read_bytes()
+        cert = x509.load_pem_x509_certificate(pem_bytes)
+        fpr = cert.fingerprint(hashes.SHA256())
+        actual = ":".join(f"{b:02X}" for b in fpr)
+        assert actual == self.EXPECTED_FPR_SHA256, (
+            f"SwissSign 2020-2 root fingerprint drift!\n"
+            f"  expected: {self.EXPECTED_FPR_SHA256}\n"
+            f"  actual:   {actual}\n"
+            f"If this is an intentional swap, update the constant."
+        )
+
+    def test_static_builder_loads_vendored_root(self) -> None:
+        # Real end-to-end through the StaticTrustStoreBuilder against
+        # the chart's vendored directory. Proves the operator-facing
+        # path works (no fixtures).
+        directory = self.VENDORED_PEM.parent
+        builder = StaticTrustStoreBuilder(directory=directory)
+        bundle = asyncio.run(builder.build())
+        assert bundle.metadata.builder_id == "static"
+        assert bundle.metadata.cert_count >= 1
+        # Bytes round-trip: the PEM file content is in the bundle.
+        assert self.VENDORED_PEM.read_bytes().rstrip() in bundle.pem_bytes
+
+
 # ───────────────────── EuLotlTrustStoreBuilder ─────────────────────────
 
 
