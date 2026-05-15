@@ -1,0 +1,222 @@
+name: Publish
+
+# Triggered on tag push (v*.*.*) — builds + pushes the OCI image and
+# the Helm chart to Docker Hub Pro under namespace `lfds`. Mirrors
+# the audittrace-content-control sibling repo's publish.yml so the
+# operator-facing release motion is identical across both services.
+#
+# Uses the repo secrets DOCKER_HUB_USERNAME + DOCKER_HUB_TOKEN —
+# Luis adds these as fine-grained Docker Hub tokens with write
+# permission on the `lfds` namespace before the first tag push.
+#
+# Drift-guard: the workflow asserts pyproject.toml::version and
+# Chart.yaml::{version,appVersion} all equal the tag. ADR-055
+# pattern — a single source of truth for the version, with CI
+# failing on drift.
+#
+# Image at:  docker.io/lfds/audittrace-memory-server:<version>
+# Chart at:  oci://registry-1.docker.io/lfds/audittrace-chart:<version>
+#
+# The chart's Chart.yaml::name is mutated to `audittrace-chart` at
+# publish time so the helm OCI ref doesn't collide with the image
+# ref. Same trick cc-repo uses (PR-A8 — chart push silently overwrote
+# image manifest on v0.0.3/v0.0.4 before the rename trick landed).
+#
+# Multi-arch from day one (linux/amd64 + linux/arm64) — arm64 built
+# via QEMU emulation on the amd64 runner. See cc-repo PR-A14 for the
+# trade-off discussion (~5-10× slower than native amd64; acceptable
+# at per-tag cadence).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + push image + chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          # Strip the leading 'v' from the tag (refs/tags/v1.0.22 -> 1.0.22).
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify pyproject.toml + Chart.yaml versions match the tag
+        run: |
+          set -euo pipefail
+          tag_version="${{ steps.ver.outputs.version }}"
+          pyproject_version="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          chart_version="$(awk '/^version:/ {print $2; exit}' charts/audittrace/Chart.yaml)"
+          chart_app_version="$(awk '/^appVersion:/ {gsub(/"/,""); print $2; exit}' charts/audittrace/Chart.yaml)"
+
+          fail=0
+          if [ "${pyproject_version}" != "${tag_version}" ]; then
+            echo "::error::pyproject.toml version (${pyproject_version}) != tag (${tag_version})"
+            fail=1
+          fi
+          if [ "${chart_version}" != "${tag_version}" ]; then
+            echo "::error::Chart.yaml::version (${chart_version}) != tag (${tag_version})"
+            fail=1
+          fi
+          if [ "${chart_app_version}" != "${tag_version}" ]; then
+            echo "::error::Chart.yaml::appVersion (${chart_app_version}) != tag (${tag_version})"
+            fail=1
+          fi
+          if [ "${fail}" -ne 0 ]; then
+            echo "Bump all version sites in lockstep before pushing the tag."
+            exit 1
+          fi
+          echo "All version sites match: ${tag_version}"
+
+      - name: Set up QEMU (for arm64 emulation on amd64 runners)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Build + push image (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          # Multi-arch from day one. arm64 is built via QEMU on the
+          # amd64 runner; ~5-10× slower than native but acceptable at
+          # this per-tag cadence. Switch to `runs-on: ubuntu-24.04-arm`
+          # for native arm64 when GitHub-hosted arm64 runners settle.
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}
+            docker.io/lfds/audittrace-memory-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.16.0'
+
+      - name: Helm package + repackage with -chart suffix
+        run: |
+          set -euo pipefail
+          # `helm push` derives the OCI ref from `Chart.yaml::name`
+          # inside the .tgz. Without intervention, the chart would
+          # land at `lfds/audittrace:<ver>` — colliding with the
+          # image ref pattern (and re-creating the same PR-A8 mistake
+          # cc-repo already debugged). The rename trick: mutate the
+          # chart's `name` to add a `-chart` suffix so `helm push`
+          # lands it at a SEPARATE OCI ref:
+          # `lfds/audittrace-chart:<ver>`.
+          helm package charts/audittrace --destination /tmp/
+
+          cd /tmp/
+          tar -xzf "audittrace-${{ steps.ver.outputs.version }}.tgz"
+          sed -i 's/^name: audittrace$/name: audittrace-chart/' \
+            audittrace/Chart.yaml
+          mv audittrace audittrace-chart
+          helm package audittrace-chart --destination /tmp/
+
+          echo "── repackaged chart metadata ──"
+          helm show chart "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
+            | grep -E "^name:|^version:|^appVersion:"
+          test "$(helm show chart "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
+            | awk '/^name:/ {print $2; exit}')" = "audittrace-chart"
+
+      - name: Helm registry login (Docker Hub OCI)
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.DOCKER_HUB_TOKEN }}" \
+            | helm registry login registry-1.docker.io \
+                -u "${{ secrets.DOCKER_HUB_USERNAME }}" \
+                --password-stdin
+
+      - name: Helm push (OCI)
+        run: |
+          set -euo pipefail
+          helm push \
+            "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
+            "oci://registry-1.docker.io/lfds"
+
+      - name: Verify image + chart resolve at distinct OCI refs
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/verify/
+
+          echo "── pulling image (amd64 runner gets amd64 variant from manifest list) ──"
+          docker pull "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}"
+          IMAGE_CMD=$(docker inspect "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}" \
+            --format '{{.Config.Cmd}}')
+          echo "  image Cmd: ${IMAGE_CMD}"
+          if [ "${IMAGE_CMD}" = "[]" ]; then
+            echo "::error::Image at ref :${{ steps.ver.outputs.version }} has empty Cmd"
+            echo "::error::Likely the chart push overwrote the image (the PR-A8 class regression)"
+            exit 1
+          fi
+
+          echo "── manifest-list inspection: both arches present? ──"
+          docker buildx imagetools inspect \
+            "docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}" \
+            | tee /tmp/verify/manifest.txt
+          grep -q "linux/amd64" /tmp/verify/manifest.txt \
+            || { echo "::error::amd64 missing from manifest list"; exit 1; }
+          grep -q "linux/arm64" /tmp/verify/manifest.txt \
+            || { echo "::error::arm64 missing from manifest list"; exit 1; }
+
+          echo "── pulling chart ──"
+          helm pull "oci://registry-1.docker.io/lfds/audittrace-chart" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --destination /tmp/verify/
+          test -f "/tmp/verify/audittrace-chart-${{ steps.ver.outputs.version }}.tgz"
+
+          echo "── confirm image ref does NOT resolve as a chart ──"
+          if helm pull "oci://registry-1.docker.io/lfds/audittrace-memory-server" \
+              --version "${{ steps.ver.outputs.version }}" \
+              --destination /tmp/verify/ 2>/dev/null; then
+            CHART_FROM_IMAGE_REF=$(helm show chart \
+              "/tmp/verify/audittrace-memory-server-${{ steps.ver.outputs.version }}.tgz" 2>/dev/null \
+              | awk '/^name:/ {print $2; exit}' || true)
+            if [ "${CHART_FROM_IMAGE_REF}" = "audittrace" ]; then
+              echo "::error::Image ref :${{ steps.ver.outputs.version }} returns a chart manifest — collision regression"
+              exit 1
+            fi
+          fi
+
+          echo "✅ image (multi-arch) + chart at separate OCI refs (verified)"
+
+      - name: Summary
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Published
+
+          Image (multi-arch) and chart land at SEPARATE OCI refs
+          (chart's \`Chart.yaml::name\` is mutated to \`audittrace-chart\`
+          before \`helm push\` so it doesn't overwrite the image).
+
+          - Image: \`docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
+            - Platforms: linux/amd64, linux/arm64
+          - Chart: \`oci://registry-1.docker.io/lfds/audittrace-chart:${{ steps.ver.outputs.version }}\`
+          - Tag:   \`${{ steps.ver.outputs.tag }}\`
+          - Commit: \`${{ github.sha }}\`
+          EOF
