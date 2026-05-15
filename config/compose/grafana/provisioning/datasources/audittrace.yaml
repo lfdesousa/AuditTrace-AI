@@ -1,0 +1,25 @@
+# B7 step 7 — Grafana datasource auto-provisioning for compose `obs` profile.
+# Auto-wires Tempo + Loki so the operator's `obs` profile boot has working
+# dashboards immediately (no manual "add datasource" step).
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    editable: false
+    uid: loki
