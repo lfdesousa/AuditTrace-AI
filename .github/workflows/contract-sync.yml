@@ -1,0 +1,46 @@
+name: Contract Sync
+
+# Cross-repo contract drift detector — AT-AI side.
+#
+# AT-AI vendors a copy of audittrace-content-control's canonical
+# contracts/v1.yaml at docs/reference/content-control/contracts/v1.yaml.
+# B5 PR-B12 asserts shape parity at test-run time; this workflow closes
+# the second half — that the vendored file is the CURRENT canonical,
+# not a stale snapshot.
+#
+# cc-repo is private, so the cross-repo raw fetch needs a token. The
+# operator must add a repo secret named ``CONTRACT_SYNC_TOKEN`` with
+# at least ``repo:contents:read`` scope on lfdesousa/audittrace-content-control
+# before either job can succeed. Until then the workflow fails loudly
+# (silent skip would mask the gap).
+#
+# Paired with the symmetric guard in the cc-repo at
+# .github/workflows/contract-sync.yml (cc-side reads its own canonical
+# natively + anonymously reads AT-AI's public vendored copy).
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Daily at 08:00 UTC catches drift even when AT-AI is otherwise
+    # quiet (e.g. cc lands a contract change while AT-AI is idle for
+    # a week). The per-PR job covers the merge-blocking shape.
+    - cron: "0 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  check-contract-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Diff vendored vs cc canonical
+        env:
+          GH_TOKEN: ${{ secrets.CONTRACT_SYNC_TOKEN }}
+        run: ./scripts/check-contracts-sync.sh
