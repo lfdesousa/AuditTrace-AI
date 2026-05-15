@@ -255,42 +255,46 @@ services:
     restart: unless-stopped
 
   rabbitmq:
-    # B7 step 1 — NEW service. memory-server's lifespan blocks on
-    # scan_amqp_client.ensure_connected() since v1.0.7 — without
-    # rabbitmq the pod crash-loops past PR #84's startupProbe budget.
-    # ghcr-frozen Bitnami 3.13.7 (the tag IS honest here, verified
-    # via `rabbitmqctl version`; B1.6 still freezes the bytes for
-    # registry control + binary parity with prod).
-    image: ghcr.io/lfdesousa/audittrace-rabbitmq:3.13.7-debian-12-r2-bitnami-frozen-may15
+    # B7 step 1 round 7 — PLAN-B switch to upstream rabbitmq image.
+    #
+    # Background: rounds 3b through 6 all tried to disable bitnami's
+    # default loopback restriction for RABBITMQ_USERNAME (env vars,
+    # RABBITMQ_EXTRA_CONF appends, mounted rabbitmq.conf at the
+    # documented override path). None took effect — the bitnami image
+    # writes `loopback_users.<RABBITMQ_USERNAME> = true` after our
+    # overrides and wins. Empirical evidence: 4 consecutive CI runs
+    # against bitnami all failed at the same AMQP login step.
+    #
+    # Trade-off accepted: deviate from Luis's "exact same images" steer
+    # for compose's rabbitmq only. The BINARY is identical (RabbitMQ
+    # 3.13.7 — verified pre-B1.6 via `rabbitmqctl version` against the
+    # cluster's bitnami pod). Only the wrapper image differs. Upstream
+    # rabbitmq:3.13-management-alpine has straightforward env-var
+    # conventions (RABBITMQ_DEFAULT_USER/PASS) and no
+    # loopback-by-default behaviour. The chart keeps bitnami for prod;
+    # compose deviates here as a dev-runtime pragmatic compromise.
+    #
+    # Anchor: project_pickup_20260515_b7. Flag this for Luis's review
+    # — if he prefers we keep bitnami at any cost, we'd need to step
+    # back and audit the bitnami libfile source to find the missing
+    # override hook (or fork the image).
+    image: rabbitmq:3.13-management-alpine
     container_name: audittrace-rabbitmq
     environment:
-      RABBITMQ_USERNAME: audittrace
-      RABBITMQ_PASSWORD: ${AUDITTRACE_RABBITMQ_PASSWORD}
+      # Upstream conventions: RABBITMQ_DEFAULT_USER/PASS/VHOST.
+      # No loopback restriction on these by default.
+      RABBITMQ_DEFAULT_USER: audittrace
+      RABBITMQ_DEFAULT_PASS: ${AUDITTRACE_RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /
       # Deterministic cookie so a `docker compose down` + `up` (which
-      # keeps the volume) doesn't break clustering. Single-node still
-      # needs it for `rabbitmqctl` introspection across runs.
+      # keeps the volume) doesn't break clustering.
       RABBITMQ_ERLANG_COOKIE: ${AUDITTRACE_RABBITMQ_ERLANG_COOKIE:-audittrace-compose-cookie}
-      # Bitnami's rabbitmq image applies loopback restriction to the
-      # RABBITMQ_USERNAME user, blocking cross-container access. Rounds
-      # 3b-5 (env vars + RABBITMQ_EXTRA_CONF) all failed — bitnami's
-      # auto-generated rabbitmq.conf must include
-      # `loopback_users.audittrace = true` after our appends and wins.
-      # Round 6 (this commit): mount an explicit rabbitmq.conf via the
-      # bitnami-documented override path /bitnami/rabbitmq/conf/rabbitmq.conf.
-      # When that file is present bitnami uses it verbatim and skips
-      # auto-generation entirely. See ./rabbitmq/rabbitmq.conf.
-      # Plugins required for the chart's scan-pipeline binding shape
-      # (topic exchange + DLX). The Bitnami image already enables
-      # rabbitmq_management by default; nothing extra needed today.
     ports:
       - "5672:5672"     # AMQP
       - "15672:15672"   # mgmt UI (dev only)
     volumes:
-      - rabbitmq_data:/bitnami/rabbitmq/mnesia
-      # B7 step 1 round 6 — full rabbitmq.conf override via bitnami's
-      # documented mount path. Bypasses bitnami's auto-generation so
-      # loopback_users.audittrace = false sticks.
-      - ./rabbitmq/rabbitmq.conf:/bitnami/rabbitmq/conf/rabbitmq.conf:ro
+      # Upstream path (was /bitnami/rabbitmq/mnesia on the bitnami image).
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
       interval: 10s

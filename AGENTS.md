@@ -392,6 +392,22 @@ Subsequent B7 steps (mock-LLM profile, GHA workflow, obs stack,
 content-control sibling) are tracked in
 `docs/architecture/b7-docker-compose-revive-plan.md`.
 
+**RabbitMQ deviation (operator caveat, 2026-05-15, B7 step 1 round 7):**
+Compose's rabbitmq service runs `rabbitmq:3.13-management-alpine`
+(upstream image), NOT the ghcr-frozen Bitnami mirror the chart uses
+(`ghcr.io/lfdesousa/audittrace-rabbitmq:3.13.7-debian-12-r2-bitnami-frozen-may15`).
+**Binary parity preserved** — both images ship RabbitMQ 3.13.7
+(verified `rabbitmqctl version`). **Wrapper differs** because the
+Bitnami image applies `loopback_users.<RABBITMQ_USERNAME> = true`
+by default in its auto-generated rabbitmq.conf, blocking cross-
+container PLAIN auth. Six rounds of env-var + RABBITMQ_EXTRA_CONF
++ mounted-conf-file overrides all failed (the bitnami libfile
+re-writes the conf after our overrides). Pragmatic compromise:
+compose deviates to upstream; chart's prod path keeps bitnami
+unchanged. The application's AMQP behaviour is identical against
+either wrapper — `aio_pika.connect_robust` doesn't care about
+loopback policy as long as the user can authenticate.
+
 ### Data-compat harness — test before any subchart image swap
 
 Before any helm change that touches `postgresql.image.*`,
