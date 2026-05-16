@@ -1,0 +1,43 @@
+{{/*
+RabbitMQ Prometheus exporter — host-reachable NodePort
+
+The Bitnami rabbitmq sub-chart's built-in `rabbitmq_prometheus`
+plugin already serves Prometheus-format metrics on container port
+9419, included in the auto-created `audittrace-rabbitmq` Service.
+That Service is ClusterIP, so the host-side Prometheus (in the
+`observability-stack` Docker stack) cannot scrape it directly.
+
+This Service is a metrics-only NodePort that selects the rabbitmq
+pods and exposes JUST port 9419 at pinned NodePort 30919, so
+`observability-stack/prometheus/prometheus.yml` can scrape
+`host.docker.internal:30919` exactly like it scrapes the OTel
+collector on 30888/30889.
+
+Pinning the NodePort means the scrape target stays stable across
+helm upgrades — re-rendering the chart will not bump the port
+and silently break the scrape job. Range 30900-30999 is the
+reserved observability bridge band (OTel uses 30888/30889).
+
+Gated on `rabbitmq.enabled` so disabling the sub-chart cleanly
+drops this Service too.
+*/}}
+{{- if .Values.rabbitmq.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-rabbitmq-metrics-nodeport
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq-metrics-bridge
+spec:
+  type: NodePort
+  ports:
+    - name: metrics
+      port: 9419
+      targetPort: 9419
+      protocol: TCP
+      nodePort: 30919
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: rabbitmq
+{{- end }}
