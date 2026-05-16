@@ -1,0 +1,45 @@
+{{/*
+Redis-exporter — host-reachable NodePort
+
+The Bitnami redis sub-chart's exporter sidecar (enabled via
+`redis.metrics.enabled=true` in values.yaml) exposes
+Prometheus-format metrics on container port 9121. The sub-chart
+auto-creates an `audittrace-redis-metrics` ClusterIP Service for
+this, but the sub-chart's template does NOT support pinning a
+NodePort number (only `port:`, not `nodePort:` — see
+charts/redis-19.6.4.tgz::templates/metrics-svc.yaml line 37).
+
+This Service is therefore declared in the parent chart and pins
+NodePort 30921 so the host-side Prometheus (in the
+`observability-stack` Docker stack) can scrape
+`host.docker.internal:30921` with a stable target.
+
+Pinning the NodePort means the scrape target stays stable across
+helm upgrades — re-rendering the chart will not bump the port
+and silently break the scrape job. Range 30900-30999 is the
+reserved observability bridge band (RabbitMQ uses 30919).
+
+Gated on `redis.enabled` AND `redis.metrics.enabled` so disabling
+either cleanly drops this Service too.
+*/}}
+{{- if and .Values.redis.enabled .Values.redis.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-redis-metrics-nodeport
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-metrics-bridge
+spec:
+  type: NodePort
+  ports:
+    - name: metrics
+      port: 9121
+      targetPort: metrics
+      protocol: TCP
+      nodePort: 30921
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: master
+{{- end }}

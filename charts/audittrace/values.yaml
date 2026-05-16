@@ -368,6 +368,13 @@ redis:
     password: ""
   architecture: standalone
   master:
+    # Istio interception applies to all inbound ports by default. The
+    # redis-exporter sidecar listens on 9121 for the host-side Prometheus
+    # scrape via NodePort 30921 — that path is out-of-mesh (no sidecar
+    # client identity), so we exclude ONLY :9121 from Istio iptables
+    # redirection. Redis protocol (:6379) stays mesh-protected.
+    podAnnotations:
+      traffic.sidecar.istio.io/excludeInboundPorts: "9121"
     persistence:
       size: 1Gi
       storageClass: local-path
@@ -379,6 +386,13 @@ redis:
     image:
       repository: bitnamilegacy/os-shell
   metrics:
+    # Enables the Bitnami redis-exporter sidecar on Redis pods,
+    # exposing Prometheus-format metrics on container port 9121.
+    # The chart-side NodePort Service in
+    # templates/observability/service-redis-metrics-nodeport.yaml
+    # exposes this to the host-side Prometheus (observability-stack
+    # repo) at pinned NodePort 30921.
+    enabled: true
     image:
       repository: bitnamilegacy/redis-exporter
 
@@ -396,6 +410,15 @@ rabbitmq:
   enabled: true
   image:
     repository: bitnamilegacy/rabbitmq
+  # Istio interception applies to all inbound ports by default. The
+  # built-in `rabbitmq_prometheus` plugin listens on 9419 for the
+  # host-side Prometheus scrape via NodePort 30919 — that path is
+  # out-of-mesh (no sidecar client identity), so we exclude ONLY :9419
+  # from Istio iptables redirection. AMQP (:5672), AMQPS (:5671),
+  # epmd (:4369), dist (:25672), and management (:15672) stay
+  # mesh-protected.
+  podAnnotations:
+    traffic.sidecar.istio.io/excludeInboundPorts: "9419"
   auth:
     username: audittrace
     password: ""
