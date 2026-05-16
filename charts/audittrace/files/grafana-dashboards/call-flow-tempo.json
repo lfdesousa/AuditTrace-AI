@@ -1,0 +1,181 @@
+{
+  "annotations": { "list": [] },
+  "description": "Cross-service call flow for AuditTrace-AI — node graph fed by Tempo's service-graph metrics_generator, plus top operations by latency, per-edge request/error rates, and a live trace list. All data derives from OTel spans emitted by the memory-server; the node graph is driven by traces_service_graph_* metrics remote-written from Tempo into Prometheus.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Service Map (call flow)",
+      "type": "nodeGraph",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "serviceMap",
+          "refId": "A",
+          "serviceMapQuery": "{}"
+        }
+      ],
+      "description": "Live call graph between services and outbound clients (httpx, redis, sqlalchemy, minio). Click a node → jump to traces. Requires Tempo metrics_generator processors service-graphs + span-metrics remote-writing to Prometheus (configured in tempo.yml)."
+    },
+    {
+      "title": "Top Operations — P95 Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket[5m])) by (le, span_name)))",
+          "legendFormat": "{{span_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "description": "Top 10 span names by P95 latency, derived from Tempo span-metrics. Tells you which operation is dragging request latency."
+    },
+    {
+      "title": "Operation Call Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "topk(10, sum(rate(traces_spanmetrics_calls_total[5m])) by (span_name))",
+          "legendFormat": "{{span_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "description": "Top 10 most-called spans per second. Pairs with the latency panel to show hot paths."
+    },
+    {
+      "title": "Service-to-Service Edges — Request Rate",
+      "type": "table",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (client, server) (rate(traces_service_graph_request_total[5m]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "source": true },
+            "renameByName": { "client": "From", "server": "To", "Value": "req/s" }
+          }
+        }
+      ],
+      "description": "Every call edge emitted by Tempo's service-graph processor. Shows the topology as a flat table."
+    },
+    {
+      "title": "Service-to-Service — Error Rate",
+      "type": "table",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (client, server) (rate(traces_service_graph_request_failed_total[5m])) / clamp_min(sum by (client, server) (rate(traces_service_graph_request_total[5m])), 1)",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "source": true },
+            "renameByName": { "client": "From", "server": "To", "Value": "error fraction" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit" }
+      },
+      "description": "Fraction of failed edges per route. clamp_min denominator so edges with zero traffic don't NaN the whole row."
+    },
+    {
+      "title": "Edge P95 Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, client, server) (rate(traces_service_graph_request_server_seconds_bucket[5m])))",
+          "legendFormat": "{{client}} → {{server}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "description": "P95 of server-side response time per edge. Matches what the node graph shows on hover."
+    },
+    {
+      "title": "Recent Traces — audittrace-server",
+      "type": "table",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 39 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{ resource.service.name=\"audittrace-server\" }",
+          "tableType": "traces",
+          "limit": 20,
+          "filters": []
+        }
+      ],
+      "description": "Live trace list filtered to the memory-server service. Click any traceID to jump to the full flame graph + trace-to-logs via the Loki derived-field.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "traceID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Trace view",
+                    "url": "/explore?left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22queryType%22:%22traceID%22,%22query%22:%22${__value.raw}%22%7D%5D%7D",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["tempo", "tracing", "call-flow", "audittrace-ai"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AuditTrace-AI — Call Flow (Tempo)",
+  "uid": "audittrace-call-flow-tempo",
+  "version": 1,
+  "weekStart": ""
+}
