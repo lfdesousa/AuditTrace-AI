@@ -124,26 +124,35 @@
       "description": "P95 of server-side response time per edge. Matches what the node graph shows on hover."
     },
     {
-      "title": "Recent Traces — audittrace-server",
+      "title": "Recent POST Traces — audittrace-server",
       "type": "table",
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 39 },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 39 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
         {
           "refId": "A",
           "queryType": "traceql",
-          "query": "{ resource.service.name=\"audittrace-server\" }",
+          "query": "{ resource.service.name=\"audittrace-server\" && span.http.method=\"POST\" }",
           "tableType": "traces",
-          "limit": 20,
+          "limit": 50,
           "filters": []
         }
       ],
-      "description": "Live trace list filtered to the memory-server service. Click any traceID to jump to the full flame graph + trace-to-logs via the Loki derived-field.",
+      "description": "Live POST trace list (OPTIONS preflights filtered out — they're dropped at the OTel collector now per the filter/drop-options-traces processor). Click traceID for the flame graph + trace-to-logs via Loki derived field. Panel is scrollable; raise `limit` if 50 isn't enough.",
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "show": true,
+          "reducer": ["count"],
+          "fields": ["traceID"]
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "custom": {
             "align": "auto",
-            "displayMode": "auto"
+            "displayMode": "auto",
+            "inspect": true
           }
         },
         "overrides": [

@@ -538,6 +538,12 @@ $('chatBtn').addEventListener('click', async () => {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
+        // X-Source identifies the calling client so the server's
+        // _detect_source picks "webui" instead of falling through
+        // to "unknown" (no UA marker matches a Mozilla string).
+        // session_id then starts with "webui-..." instead of
+        // "unknown-...".
+        'X-Source': 'webui',
       },
       body: JSON.stringify({
         model: 'audittrace-default',

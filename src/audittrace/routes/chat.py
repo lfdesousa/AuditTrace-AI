@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -290,8 +291,29 @@ def _resolve_project(request: Request, payload: dict[str, Any]) -> str:
     return "default"
 
 
+_VALID_SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
 def _detect_source(request: Request) -> str:
-    """Best-effort agent identification from the User-Agent header."""
+    """Identify the calling client.
+
+    Order of precedence (2026-05-16 — explicit-header path added):
+
+    1. Explicit ``X-Source`` request header. Value lowercased then
+       validated against ``[a-z0-9][a-z0-9_-]{0,31}``. Lets browser-
+       side clients (audittrace-webui SPA, future LibreChat) self-
+       identify cleanly instead of falling through UA detection
+       (every browser UA is ``Mozilla/5.0 ...`` and would otherwise
+       resolve to ``"unknown"``).
+    2. ``User-Agent`` substring match for known terminal-side agents
+       (opencode, continue, roocode, openai, curl, httpx).
+    3. ``"unknown"`` fallback. This is what produces the ugly
+       ``session_id`` prefix ``"unknown-..."`` — anything that hits
+       it is a client we don't recognise.
+    """
+    raw = (request.headers.get("x-source") or "").strip().lower()
+    if raw and _VALID_SOURCE_RE.match(raw):
+        return raw
     ua = (request.headers.get("user-agent") or "").lower()
     for marker in ("opencode", "continue", "roocode", "openai", "curl", "httpx"):
         if marker in ua:

@@ -17,6 +17,38 @@ data:
       batch:
         timeout: 5s
 
+      # Drop CORS preflight traces (HTTP OPTIONS) — every browser
+      # POST triggers an OPTIONS preflight that costs ~500µs and
+      # produces a 3-span trace with no audit value. Without this
+      # filter, Tempo's Recent-Traces panel is dominated by OPTIONS
+      # rows and the real POST traces are hard to find (2026-05-16
+      # demo finding). The filter matches OTel HTTP-semconv span
+      # names ("OPTIONS /v1/chat/completions" etc.) AND the
+      # method attribute as a belt-and-suspenders.
+      filter/drop-options-traces:
+        error_mode: ignore
+        traces:
+          span:
+            - 'IsMatch(name, "^OPTIONS .*")'
+            - 'attributes["http.method"] == "OPTIONS"'
+            - 'attributes["http.request.method"] == "OPTIONS"'
+
+      # Some OTel SDK versions emit `http_client_duration_milliseconds`
+      # with subtly different HELP strings (e.g. httpx vs urllib3
+      # instrumentations carry slightly different descriptions).
+      # The Prometheus exporter then logs `collected metric ... has
+      # help "..."` on every scrape — pure noise that drowns real
+      # ERROR-level logs in the dashboard. We normalise the
+      # description so the exporter sees a single registration.
+      transform/normalise-http-client-help:
+        error_mode: ignore
+        metric_statements:
+          - context: metric
+            statements:
+              - >-
+                set(description, "Duration of HTTP client requests")
+                where name == "http_client_duration_milliseconds"
+
     exporters:
       prometheus:
         endpoint: "0.0.0.0:8889"
@@ -27,10 +59,13 @@ data:
       pipelines:
         traces:
           receivers: [otlp]
-          processors: [batch]
+          # filter/drop-options-traces BEFORE batch so dropped spans
+          # don't burn batch-buffer space. Order matters in the OTel
+          # collector pipeline.
+          processors: [filter/drop-options-traces, batch]
           exporters: [otlphttp/tempo]
         metrics:
           receivers: [otlp]
-          processors: [batch]
+          processors: [transform/normalise-http-client-help, batch]
           exporters: [prometheus]
 {{- end }}
