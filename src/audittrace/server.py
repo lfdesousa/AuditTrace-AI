@@ -531,6 +531,12 @@ def create_app() -> FastAPI:
                 "X-Memory-Mode",
                 "X-Thinking",
                 "X-Async",
+                # Added 2026-05-16 — consumed by chat.py:_detect_source
+                # to identify browser clients (webui SPA, future
+                # LibreChat) that no UA marker would catch. Without
+                # CORS allow-list, the browser preflight fails before
+                # the SPA can send the header — TypeError NetworkError.
+                "X-Source",
             ],
             expose_headers=["X-Trace-Id"],
         )
