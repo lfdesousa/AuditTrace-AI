@@ -15,12 +15,17 @@ name: Publish
 # failing on drift.
 #
 # Image at:  docker.io/lfds/audittrace-memory-server:<version>
-# Chart at:  oci://registry-1.docker.io/lfds/audittrace-chart:<version>
+# Chart at:  oci://registry-1.docker.io/lfds/audittrace:<version>
 #
-# The chart's Chart.yaml::name is mutated to `audittrace-chart` at
-# publish time so the helm OCI ref doesn't collide with the image
-# ref. Same trick cc-repo uses (PR-A8 — chart push silently overwrote
-# image manifest on v0.0.3/v0.0.4 before the rename trick landed).
+# Image and chart land at distinct OCI repositories by virtue of the
+# image being named `audittrace-memory-server` (not `audittrace`) —
+# no rename of `Chart.yaml::name` is required, and none is performed.
+# (cc-repo applies a rename trick because its image is named
+# `audittrace-content-control`, which would collide with the chart's
+# Chart.yaml::name. That collision does not apply here.) Avoiding
+# the rename keeps rendered K8s labels stable across upgrades, since
+# `app.kubernetes.io/name` is derived from `.Chart.Name` and
+# Deployment selectors are immutable.
 #
 # Multi-arch from day one (linux/amd64 + linux/arm64) — arm64 built
 # via QEMU emulation on the amd64 runner. See cc-repo PR-A14 for the
@@ -118,31 +123,20 @@ jobs:
         with:
           version: 'v3.16.0'
 
-      - name: Helm package + repackage with -chart suffix
+      - name: Helm package
         run: |
           set -euo pipefail
-          # `helm push` derives the OCI ref from `Chart.yaml::name`
-          # inside the .tgz. Without intervention, the chart would
-          # land at `lfds/audittrace:<ver>` — colliding with the
-          # image ref pattern (and re-creating the same PR-A8 mistake
-          # cc-repo already debugged). The rename trick: mutate the
-          # chart's `name` to add a `-chart` suffix so `helm push`
-          # lands it at a SEPARATE OCI ref:
-          # `lfds/audittrace-chart:<ver>`.
+          # The chart packages at its natural identity (`audittrace`).
+          # Pushing to `oci://...lfds/` lands at `lfds/audittrace:<ver>`,
+          # which is a separate OCI repository from the image
+          # (`lfds/audittrace-memory-server`) — no collision.
           helm package charts/audittrace --destination /tmp/
 
-          cd /tmp/
-          tar -xzf "audittrace-${{ steps.ver.outputs.version }}.tgz"
-          sed -i 's/^name: audittrace$/name: audittrace-chart/' \
-            audittrace/Chart.yaml
-          mv audittrace audittrace-chart
-          helm package audittrace-chart --destination /tmp/
-
-          echo "── repackaged chart metadata ──"
-          helm show chart "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
+          echo "── chart metadata ──"
+          helm show chart "/tmp/audittrace-${{ steps.ver.outputs.version }}.tgz" \
             | grep -E "^name:|^version:|^appVersion:"
-          test "$(helm show chart "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
-            | awk '/^name:/ {print $2; exit}')" = "audittrace-chart"
+          test "$(helm show chart "/tmp/audittrace-${{ steps.ver.outputs.version }}.tgz" \
+            | awk '/^name:/ {print $2; exit}')" = "audittrace"
 
       - name: Helm registry login (Docker Hub OCI)
         run: |
@@ -156,7 +150,7 @@ jobs:
         run: |
           set -euo pipefail
           helm push \
-            "/tmp/audittrace-chart-${{ steps.ver.outputs.version }}.tgz" \
+            "/tmp/audittrace-${{ steps.ver.outputs.version }}.tgz" \
             "oci://registry-1.docker.io/lfds"
 
       - name: Verify image + chart resolve at distinct OCI refs
@@ -197,10 +191,10 @@ jobs:
             || { echo "::error::arm64 missing from manifest list"; exit 1; }
 
           echo "── pulling chart ──"
-          helm pull "oci://registry-1.docker.io/lfds/audittrace-chart" \
+          helm pull "oci://registry-1.docker.io/lfds/audittrace" \
             --version "${{ steps.ver.outputs.version }}" \
             --destination /tmp/verify/
-          test -f "/tmp/verify/audittrace-chart-${{ steps.ver.outputs.version }}.tgz"
+          test -f "/tmp/verify/audittrace-${{ steps.ver.outputs.version }}.tgz"
 
           echo "── confirm image ref does NOT resolve as a chart ──"
           if helm pull "oci://registry-1.docker.io/lfds/audittrace-memory-server" \
@@ -215,20 +209,22 @@ jobs:
             fi
           fi
 
-          echo "✅ image (multi-arch) + chart at separate OCI refs (verified)"
+          echo "✅ image (multi-arch) + chart at separate OCI repositories (verified)"
 
       - name: Summary
         run: |
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
           ## Published
 
-          Image (multi-arch) and chart land at SEPARATE OCI refs
-          (chart's \`Chart.yaml::name\` is mutated to \`audittrace-chart\`
-          before \`helm push\` so it doesn't overwrite the image).
+          Image (multi-arch) and chart land at distinct OCI repositories
+          by virtue of the image name (\`audittrace-memory-server\`)
+          differing from the chart name (\`audittrace\`). No rename of
+          \`Chart.yaml::name\` is performed; rendered K8s labels stay
+          stable across upgrades.
 
           - Image: \`docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
             - Platforms: linux/amd64, linux/arm64
-          - Chart: \`oci://registry-1.docker.io/lfds/audittrace-chart:${{ steps.ver.outputs.version }}\`
+          - Chart: \`oci://registry-1.docker.io/lfds/audittrace:${{ steps.ver.outputs.version }}\`
           - Tag:   \`${{ steps.ver.outputs.tag }}\`
           - Commit: \`${{ github.sha }}\`
           EOF
