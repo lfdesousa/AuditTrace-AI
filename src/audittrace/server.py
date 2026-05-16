@@ -143,7 +143,7 @@ def make_httpx_async_peer_service_hook(
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
     settings = get_settings()
-    setup_logging(level=settings.log_level, structured=False)
+    setup_logging(level=settings.log_level, structured=(settings.log_format == "json"))
 
     telemetry.init_telemetry(
         service_name=settings.otel_service_name,

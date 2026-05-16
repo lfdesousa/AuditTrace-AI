@@ -1,6 +1,7 @@
 import logging
 import os
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,6 +31,18 @@ class Settings(BaseSettings):
     port: int = 8765
     workers: int = 1
     log_level: str = "INFO"
+    log_format: Literal["json", "plain"] = "json"
+    """
+    Structured-log emission shape. "json" (the default since
+    2026-05-16) is the production-correct mode — every log line is a
+    single JSON object carrying ``trace_id`` + ``span_id`` + ``service``
+    at top level, so Loki's ``{...} | json | trace_id="..."`` selector
+    works directly. "plain" is the legacy human-readable mode for
+    interactive dev only. The reconstructibility walkthrough
+    (docs/reconstructibility-walkthrough.md, Hop 5) hard-depends on
+    the "json" shape; flipping this back to "plain" breaks the
+    documented operator drill.
+    """
 
     # LLM servers (external, on host machine)
     llama_url: str = "http://host.docker.internal:11435/v1"

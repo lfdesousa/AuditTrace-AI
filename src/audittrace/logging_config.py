@@ -48,7 +48,24 @@ def reset_langgraph_step() -> None:
 
 
 class StructuredFormatter(logging.Formatter):
-    """JSON formatter for structured logging to stdout."""
+    """JSON formatter for structured logging to stdout.
+
+    Field names map to Loki's ``| json | field="..."`` filter so the
+    reconstructibility walkthrough (docs/reconstructibility-walkthrough.md
+    Hop 5) works directly. ``trace_id`` is the canonical top-level
+    name; OTel's ``LoggingInstrumentor`` attaches it as ``otelTraceID``
+    on each ``LogRecord`` and we rename it here so operators do not
+    have to remember the SDK's internal attr name.
+    """
+
+    # Map OTel LoggingInstrumentor attribute name → doc-canonical
+    # top-level JSON field. Centralised so an OTel SDK rename only
+    # changes this dict.
+    _OTEL_FIELD_RENAMES: dict[str, str] = {
+        "otelTraceID": "trace_id",
+        "otelSpanID": "span_id",
+        "otelServiceName": "service",
+    }
 
     def format(self, record: logging.LogRecord) -> str:
         log_data: dict[str, Any] = {
@@ -57,11 +74,10 @@ class StructuredFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        # OTel LoggingInstrumentor attaches these automatically when a span
-        # is active; surface them so logs can be correlated with traces.
-        for attr in ("otelTraceID", "otelSpanID", "otelServiceName"):
-            if hasattr(record, attr):
-                log_data[attr] = getattr(record, attr)
+        for src, dst in self._OTEL_FIELD_RENAMES.items():
+            value = getattr(record, src, None)
+            if value:
+                log_data[dst] = value
         for attr in ("request_id", "duration", "operation"):
             if hasattr(record, attr):
                 log_data[attr] = getattr(record, attr)
