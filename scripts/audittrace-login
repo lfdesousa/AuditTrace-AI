@@ -32,10 +32,16 @@ set -euo pipefail
 
 # ───────────────────────────── config ─────────────────────────────
 
-# Keycloak is fronted by Traefik on :443 (see docker-compose.yml). The
-# bare :8080 port is Traefik's own dashboard. Override if you're
-# running Keycloak standalone on another host.
-KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://localhost}"
+# Keycloak is fronted by Istio Gateway on NodePort 30952 (per the
+# audittrace chart's Gateway + VirtualService). The previous default
+# of `https://localhost` (Traefik-fronted, pre-k8s-migration) is
+# dead — nothing listens on host:443. Override via env if you point
+# the script at a non-local cluster (e.g.
+# KEYCLOAK_BASE=https://audittrace.allaboutdata.eu:30952 for the
+# operator-facing prod-like hostname). 2026-05-16 — anchor:
+# `feedback_no_security_control_shortcuts` style, also addresses
+# the "broken-out-of-the-box on first run" friction.
+KEYCLOAK_BASE="${KEYCLOAK_BASE:-https://audittrace.local:30952}"
 REALM="${KEYCLOAK_REALM:-audittrace}"
 CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
 
@@ -299,7 +305,7 @@ Usage:
   audittrace-login --logout              Delete the saved token pair
 
 Environment overrides:
-  KEYCLOAK_BASE            (default https://localhost — Traefik-fronted)
+  KEYCLOAK_BASE            (default https://audittrace.local:30952 — k3s Istio Gateway)
   KEYCLOAK_REALM           (default audittrace)
   CLIENT_ID                (default audittrace-opencode)
   AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
