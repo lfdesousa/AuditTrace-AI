@@ -38,6 +38,10 @@ EXPECTED_DASHBOARDS: dict[str, dict[str, str]] = {
         "uid": "audittrace-call-flow-tempo",
         "title_prefix": "AuditTrace-AI",
     },
+    "audittrace-scan-pipeline.json": {
+        "uid": "audittrace-scan-pipeline",
+        "title_prefix": "AuditTrace-AI",
+    },
 }
 
 
