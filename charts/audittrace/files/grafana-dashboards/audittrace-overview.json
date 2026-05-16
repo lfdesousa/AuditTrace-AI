@@ -1,0 +1,182 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Request Latency — P50 / P95 / P99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(sovereign_operation_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(sovereign_operation_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sovereign_operation_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Operation Duration by Function",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(sovereign_operation_duration_seconds_bucket[5m])) by (le, operation))",
+          "legendFormat": "{{ operation }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 5 }
+        }
+      }
+    },
+    {
+      "title": "HTTP Server — Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count[5m])) by (http_route, http_response_status_code)",
+          "legendFormat": "{{ http_route }} {{ http_response_status_code }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "llama-server — Tokens per Second",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(llamacpp:predicted_tokens_seconds[5m])",
+          "legendFormat": "tokens/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "llama-server — Peak Tokens per Request (KV high-water)",
+      "description": "llamacpp:n_tokens_max is a counter — the all-time peak tokens consumed by a single request's KV cache, NOT a current usage ratio. Max is the chat-llm n_ctx (65536 — verify via curl http://localhost:11435/props if the llama-server config changes).",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "llamacpp:n_tokens_max",
+          "legendFormat": "peak tokens"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 65536 }
+      }
+    },
+    {
+      "title": "OTel Collector — Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(otelcol_exporter_sent_metric_points[5m]))",
+          "legendFormat": "metrics/s"
+        },
+        {
+          "expr": "sum(rate(otelcol_exporter_sent_spans[5m]))",
+          "legendFormat": "spans/s"
+        },
+        {
+          "expr": "sum(rate(otelcol_exporter_sent_log_records[5m])) or vector(0)",
+          "legendFormat": "logs/s"
+        },
+        {
+          "expr": "sum(rate(otelcol_exporter_send_failed_metric_points[5m])) or vector(0)",
+          "legendFormat": "failed metrics/s"
+        },
+        {
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans[5m])) or vector(0)",
+          "legendFormat": "failed spans/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "OTel Collector — Queue Saturation",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(otelcol_exporter_queue_size) by (exporter)",
+          "legendFormat": "queued {{exporter}}"
+        },
+        {
+          "expr": "max(otelcol_exporter_queue_capacity) by (exporter)",
+          "legendFormat": "capacity {{exporter}}"
+        }
+      ]
+    },
+    {
+      "title": "Container Logs (ERROR level)",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{namespace=\"audittrace\"} |= \"ERROR\"",
+          "legendFormat": "k3s"
+        },
+        {
+          "refId": "B",
+          "expr": "{compose_service=~\".+\", compose_service!~\"loki|grafana\"} |= \"ERROR\"",
+          "legendFormat": "compose"
+        },
+        {
+          "refId": "C",
+          "expr": "{service_name=~\".+\", service_name!~\".*loki|.*grafana\"} |= \"ERROR\"",
+          "legendFormat": "service_name"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["audittrace-ai", "observability"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AuditTrace-AI — Operations",
+  "uid": "audittrace-overview",
+  "version": 1
+}
