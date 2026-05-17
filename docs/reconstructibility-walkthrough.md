@@ -31,7 +31,7 @@ flowchart LR
 
     Server -. OTLP spans .-> OTel["OTel Collector<br/>DaemonSet"]
     Server -. Langfuse SDK .-> Langfuse["Langfuse<br/>trace + observations"]
-    OTel --> Tempo["Tempo<br/>74 spans / trace"]
+    OTel --> Tempo["Tempo<br/>~60 spans / trace"]
     OTel --> Prom["Prometheus<br/>metrics"]
     Server -.stdout.-> Promtail["Promtail DS"]
     Promtail --> Loki["Loki<br/>structured logs"]
@@ -48,7 +48,7 @@ Every arrow carries the same `trace_id` + `user_id` + `session_id`. The three so
 
 ## Scenario
 
-A user fires one chat request against `POST /v1/chat/completions`. The prompt deliberately triggers two memory tools (`recall_decisions` and `recall_semantic`) so every layer wakes up.
+A user fires one chat request against `POST /v1/chat/completions`. The prompt deliberately invokes three memory tools (`recall_decisions`, `recall_semantic`, `recall_skills`) so every layer wakes up and the audit trail exercises the full surface in one go. Served by **Qwen 3.6 35B-A3B-Q4_K_M on Vulkan** (see [[vulkan-backend-swap]] — backend swapped from ROCm to Vulkan on 2026-05-17) hosted on the local Strix Halo iGPU.
 
 **The request:**
 
@@ -58,25 +58,29 @@ curl -sk \
   -H "Authorization: Bearer $BEARER" \
   -H "Content-Type: application/json" \
   -H "X-Project: reconstructibility-demo" \
-  -X POST https://audittrace.local:30952/v1/chat/completions \
+  -H "X-Source: cli-reconstructibility" \
+  -X POST https://audittrace.allaboutdata.eu:30952/v1/chat/completions \
   -d '{
     "model": "qwen3.6-35b-a3b",
     "stream": false,
+    "max_tokens": 600,
     "messages": [{"role": "user", "content":
-      "Consult recall_decisions and recall_semantic to answer: what did ADR-027 decide about memory storage? Keep it to two short sentences."
+      "Build the answer from THREE memory sources, citing each explicitly: (1) Use recall_decisions to quote ADR-026 on RLS posture. (2) Use recall_semantic to find any ADR that references SPIFFE workload identity in the corpus. (3) Use recall_skills to surface any operational skill documented for rotating a database credential. List each tool contribution as one short labelled sentence."
     }]
   }'
 ```
 
+The external-facing Istio Gateway is `audittrace.allaboutdata.eu:30952`; the internal cluster alias `audittrace.local:30952` resolves to the same gateway and works for in-LAN demos.
+
 **The five identifiers that link every system downstream:**
 
-| Identifier | Value (this run) | Emitted by |
+| Identifier | Value (this run, 2026-05-17) | Emitted by |
 |---|---|---|
 | `user_id` | `0b0cdd4d-04c3-428f-ab9d-37b47429c381` | Keycloak `sub` claim on the JWT |
-| `session_id` | `curl-2026-04-18-8eb7151d4a63bfa79e8c88c53afae3e1` | `_compute_session_id(source, first_user, user_id)` — sha256 over the tuple |
-| `interaction_id` | `72` | Postgres `interactions.id` serial |
-| `trace_id` | `bf8373a8539e2d908e810adbcb00285d` | OpenTelemetry trace id, also used as Langfuse trace id |
-| `response_id` | `chatcmpl-QGdqKxVD3TMmliKPDh1GFzKZxz7TjWQ7` | OpenAI schema, returned in the `id` field |
+| `session_id` | `cli-reconstructibility-2026-05-17-0b9144018db8e1f0f8195ce857c28fe81f32ed4f4e8e4a9e3274cbf0003a9205` | `_compute_session_id(source, first_user, user_id)` — sha256 over the tuple |
+| `interaction_id` | `402` | Postgres `interactions.id` serial |
+| `trace_id` | `53433318df31af06a22590dd277bded8` | OpenTelemetry trace id, also used as Langfuse trace id |
+| `response_id` | `chatcmpl-jJSuogYACPvraMxHduLnx3pFmSPQnBNd` | OpenAI schema, returned in the `id` field |
 
 These five travel together through every hop. Any two of them let you cross-link two systems.
 
@@ -88,26 +92,27 @@ The first and simplest audit query: `GET /interactions` returns the structured r
 
 ```bash
 $ curl -sk -H "Authorization: Bearer $BEARER" \
-    "https://audittrace.local:30952/interactions?project=reconstructibility-demo&limit=1"
+    "https://audittrace.allaboutdata.eu:30952/interactions?project=reconstructibility-demo&limit=1"
 ```
 
 ```json
 {
-  "id": 72,
+  "id": 402,
   "user_id": "0b0cdd4d-04c3-428f-ab9d-37b47429c381",
-  "session_id": "curl-2026-04-18-8eb7151d4a63bfa79e8c88c53afae3e1",
+  "session_id": "cli-reconstructibility-2026-05-17-0b9144018db8e1f0f8195ce857c28fe81f32ed4f4e8e4a9e3274cbf0003a9205",
   "project": "reconstructibility-demo",
-  "source": "curl",
+  "source": "cli-reconstructibility",
   "status": "success",
   "failure_class": null,
   "error_detail": null,
-  "duration_ms": 67565,
+  "duration_ms": 38542,
   "model": "Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf",
-  "prompt_tokens": 2261,
-  "completion_tokens": 1189,
-  "timestamp": "2026-04-18T09:04:58.376665",
-  "question": "Consult recall_decisions and recall_semantic to answer: what did ADR-027 decide about memory storage? Keep it to two short sentences.",
-  "answer": "<think>\nThe semantic search returned..."
+  "prompt_tokens": 6427,
+  "completion_tokens": 501,
+  "timestamp": "2026-05-17T12:00:14.810969",
+  "trace_id": "53433318df31af06a22590dd277bded8",
+  "question": "Build the answer from THREE memory sources, citing each explicitly: (1) Use recall_decisions to quote ADR-026 on RLS posture. (2) Use recall_semantic to find any ADR that references SPIFFE workload identity in the corpus. (3) Use recall_skills to surface any operational skill documented for rotating a database credential. List each tool contribution as one short labelled sentence.",
+  "answer": "<think>\nThe `recall_skills` search returned general skills (ARCHITECTURE, CLOUD-APP-PATTERNS, ...) ..."
 }
 ```
 
@@ -126,23 +131,23 @@ After the summariser runs (async, every 5 min on idle sessions), the conversatio
 
 ```bash
 $ curl -sk -H "Authorization: Bearer $BEARER" \
-    "https://audittrace.local:30952/sessions?project=reconstructibility-demo&limit=1"
+    "https://audittrace.allaboutdata.eu:30952/sessions?project=reconstructibility-demo&limit=1"
 ```
 
 ```json
 {
-  "id": "curl-2026-04-18-8eb7151d4a63bfa79e8c88c53afae3e1",
+  "id": "cli-reconstructibility-2026-05-17-0b9144018db8e1f0f8195ce857c28fe81f32ed4f4e8e4a9e3274cbf0003a9205",
   "project": "reconstructibility-demo",
-  "date": "2026-04-18T09:04:58.376665",
-  "summary": "The user asked about ADR-027. The assistant cited MinIO object storage...",
-  "key_points": "[\"ADR-027: MinIO object storage\", \"stateless memory layers\", \"SSE-S3 encryption at rest\"]",
-  "model": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+  "date": "2026-05-17T12:18:59.498818",
+  "summary": "The recall_decisions tool provided information about ADR-026 defining the multi-user identity, scopes, and cross-user isolation posture, accepted on 2026-04-11. The recall_semantic tool returned zero matches for SPIFFE workload identity, and recall_skills returned only general skill catalogues without a dedicated database-credential rotation procedure.",
+  "key_points": "[\"ADR-026 multi-user identity\", \"RLS scoped wrappers\", \"recall_semantic empty for SPIFFE\", \"no dedicated DB-credential rotation skill\"]",
+  "model": "mistral-7b-summarizer",
   "user_id": "0b0cdd4d-04c3-428f-ab9d-37b47429c381",
-  "summarized_at": "2026-04-18T09:09:00.123456"
+  "summarized_at": "2026-05-17T12:18:59.498818"
 }
 ```
 
-The session row cross-references Hop 1 via the same `session_id`. The `key_points` JSON gives you a structured abstract; the `summary` gives you the prose version. Filter with `?summarised=false` to find freshly-created sessions awaiting summarisation.
+The summariser runs ~5 minutes after the last interaction in a session via the Mistral 7B service (also on Vulkan since 2026-05-17 — see [[vulkan-backend-swap]]). The session row cross-references Hop 1 via the same `session_id`. The `key_points` JSON gives you a structured abstract; the `summary` gives you the prose version. Filter with `?summarised=false` to find freshly-created sessions awaiting summarisation.
 
 ---
 
@@ -167,14 +172,18 @@ flowchart TB
     Extract["chat-extract-query"]
     Merge["chat-merge-system"]
     Prep["sovereign-chat-request<br/>tools advertised"]
-    LLM1["llm.chat.completions #1<br/>gen_ai.model + prompt + completion"]
-    LLM2["llm.chat.completions #2<br/>after decisions tool_result"]
-    LLM3["llm.chat.completions #3<br/>final answer"]
+    LLM1["llm.chat.completions #1<br/>initial — tools advertised"]
+    LLM2["llm.chat.completions #2<br/>after recall_decisions result"]
+    LLM3["llm.chat.completions #3<br/>after recall_semantic result"]
+    LLM4["llm.chat.completions #4<br/>final synthesis"]
     Tool1["memory_tool.recall_decisions<br/>input: args  /  output: result"]
     Tool2["memory_tool.recall_semantic<br/>input: args  /  output: result"]
+    Tool3["memory_tool.recall_skills<br/>input: args  /  output: result"]
+    S3a["memory-episodic-search"]
+    S3b["memory-episodic-load"]
     Chroma["memory-semantic-search<br/>ChromaDB query"]
-    S3a["S3EpisodicService.search"]
-    S3b["S3EpisodicService.load"]
+    Proc1["memory-procedural-search"]
+    Proc2["memory-procedural-load"]
 
     Root --> Auth
     Auth --> JWKS
@@ -182,22 +191,26 @@ flowchart TB
     Root --> Extract
     Root --> Merge
     Root --> Prep
-    Prep --> S3a
-    Prep --> S3b
     Prep --> LLM1
     LLM1 --> Tool1
+    Tool1 --> S3a
+    Tool1 --> S3b
     Prep --> LLM2
     LLM2 --> Tool2
     Tool2 --> Chroma
     Prep --> LLM3
+    LLM3 --> Tool3
+    Tool3 --> Proc1
+    Tool3 --> Proc2
+    Prep --> LLM4
 
     classDef llm fill:#065f46,stroke:#10b981,color:#ecfdf5
     classDef tool fill:#5b21b6,stroke:#a78bfa,color:#f5f3ff
     classDef store fill:#1f2937,stroke:#475569,color:#f1f5f9
     classDef root fill:#0c4a6e,stroke:#38bdf8,color:#f0f9ff
-    class LLM1,LLM2,LLM3 llm
-    class Tool1,Tool2 tool
-    class Chroma,S3a,S3b store
+    class LLM1,LLM2,LLM3,LLM4 llm
+    class Tool1,Tool2,Tool3 tool
+    class S3a,S3b,Chroma,Proc1,Proc2 store
     class Root root
 ```
 
@@ -225,71 +238,85 @@ The `memory_tool.recall_decisions` observation (commit `65a5965`) shows the tool
 
 What this hop proves:
 
-- **Which memory layers fired** — two tool spans (`recall_decisions`, `recall_semantic`) are visible as distinct children, each with the tool arguments the model passed and the result the tool returned.
-- **How the model iterated** — three `llm.chat.completions` spans show the model round-tripped three times (initial question → after decisions result → after semantic result → final answer).
+- **Which memory layers fired** — three tool spans (`recall_decisions`, `recall_semantic`, `recall_skills`) are visible as distinct children, each with the tool arguments the model passed and the result the tool returned. The model honestly reports empty results — `recall_semantic` for "SPIFFE" returned zero matches and `recall_skills` for "rotate database credential" returned only general skill catalogues; both are captured in the Output as plain prose so the auditor can verify the model did not hallucinate a result.
+- **How the model iterated** — four `llm.chat.completions` spans show the model round-tripped four times (initial question → after decisions result → after semantic result → after skills result → final synthesis).
 - **What the LLM saw and produced** — input and output populated at both trace level and on the root observation.
-- **User attribution at every level** — every observation carries `langfuse.user.id` (commit `8d32440`) so the Langfuse user filter surfaces the whole tree, not just the root.
+- **User attribution at every level** — every observation carries `langfuse.user.id` AND `user.id` (commit `8d32440`) so the Langfuse user filter surfaces the whole tree, not just the root.
+- **Cache visibility** — the `tool.cache_hit` attribute on each `memory_tool.*` observation discloses whether the layer was actually touched (`false` — 11 ms layer hit) or served from the Redis tool-result cache (`true`); both fired `false` on this run.
 
 ---
 
 ## Hop 4 — Tempo (full OTel call tree, every outbound edge)
 
-Tempo stores the same trace with **every** span the OTel SDK and auto-instrumentors emitted — including database queries, Redis SETEX, MinIO S3 calls, and every outbound HTTP. For the probe in this walkthrough: **74 spans** (29 visible in the single-frame capture below; the rest are HTTP send/receive leaves collapsed under their parents).
+Tempo stores the same trace with **every** span the OTel SDK and auto-instrumentors emitted — including database queries, Redis SETEX, ChromaDB queries, and every outbound HTTP. For the probe in this walkthrough: **59 spans** (the multi-tool prompt fires 3 memory layers + 4 LLM round-trips + the persistence + audit edges).
 
-### The flamegraph — one image, the whole call chain
+### The waterfall — one image, the whole call chain
 
-![Tempo trace flamegraph showing every span](images/reconstructibility/07-tempo-flamegraph.png)
+![Tempo trace waterfall showing every span, dominant bars are the four LLM calls](images/reconstructibility/07-tempo-flamegraph.png)
 
-This is the image to put in the deck. It reads top-to-bottom as the request's life:
+This is the image to put in the deck (Grafana labels this view "Spans" — it is the standard waterfall/Gantt). It reads top-to-bottom as the request's life:
 
-1. **`audittrace.auth.require_user`** (12.98 ms) — JWT validated against Keycloak. The nested `audittrace.auth._fetch_jwks_keys` + `GET` + `SETEX` show the JWKS fetch + Redis-cache write the first time a new kid is seen.
-2. **`di-context-builder`** (156 μs), **`chat-extract-query`** (72 μs), **`chat-merge-system`** (121 μs), **`sovereign-chat-request`** (307 μs) — the proxy prep layer, all sub-millisecond.
-3. **`llm.chat.completions`** (1 m 3 s — the dominant bar) — nested `qwen-chat-llm POST` shows the actual outbound LLM call with the `peer.service=qwen-chat-llm` label. Everything else on the trace is microseconds; LLM inference is the only slow thing, and that's the trade-off the user is paying for.
-4. **Postgres writes** — `di-postgres-factory`, `db-postgres-session-factory`, `connect`, `SELECT audittrace` x3, `INSERT audittrace` — the audit-row persistence on the success path, all under 1 ms.
-5. **`langfuse POST`** (9 ms) — the explicit `/api/public/ingestion` call (commit `e7005e0`) that writes trace-level Input/Output to Langfuse.
+1. **`audittrace.auth.require_user`** (821 μs) — JWT validated against Keycloak. The nested `GET` (498 μs) is the JWKS fetch (cached after the first request — see Hop 8).
+2. **`di-context-builder`** (119 μs), **`chat-extract-query`** (71 μs), **`sovereign-chat-request`** (352 μs), **`chat-merge-system`** (106 μs) — the proxy prep layer, all sub-millisecond.
+3. **Four `llm.chat.completions` bars** (10.43 s + 14.67 s + 1.03 s + 11.66 s ≈ **the entire 38.59 s** wall-time) — each nested under a `qwen-chat-llm POST` child, the outbound HTTP to the local Vulkan-served Qwen 3.6 service. Every iteration is `peer.service=qwen-chat-llm`.
+4. **Three `memory_tool.*` bars** between the LLM calls — each with its layer-specific children:
+   - `memory_tool.recall_decisions` (11.26 ms) → `memory-episodic-search` (8.78 ms) + `memory-episodic-load` (3.98 ms) + `SETEX` (732 μs Redis tool-result cache write).
+   - `memory_tool.recall_semantic` (117 ms) → `memory-semantic-search` (113 ms) which itself wraps four nested `POST` / `GET` HTTPs against ChromaDB.
+   - `memory_tool.recall_skills` (~20 ms) → `memory-procedural-search` + `memory-procedural-load`.
+5. **Postgres writes** at the bottom under the final LLM call — `di-postgres-factory`, `db-postgres-session-factory`, `INSERT audittrace` — the synchronous audit-row persistence on the success path.
 
-Every span carries `user.id` (commit `8d32440`), so `{ span.user.id = "<sub>" }` in TraceQL pulls only that user's activity out of Tempo.
+Every span carries `user.id` (commit `8d32440`), so `{ span.user.id = "<sub>" }` in TraceQL pulls only that user's activity out of Tempo. Span count and exact bar widths depend on the model's tool-call choices for a given prompt — a single-tool probe lands around 45 spans, a four-tool probe up to ~80.
 
-### The service map — eight edges, named
+### The service map — two hubs, named edges
 
-![Tempo service map with 8 peer.service edges](images/reconstructibility/06-tempo-service-map.png)
+![Tempo service map showing audittrace-server and audittrace-content-control hubs with their peer.service edges](images/reconstructibility/06-tempo-service-map.png)
 
-Tempo's metrics-generator derives a service graph from the spans' `peer.service` attributes. Every outbound edge memory-server makes is named, including the Langfuse ingestion edge (`peer.service=langfuse`, commit `93de0ca`):
+Tempo's metrics-generator derives a service graph from the spans' `peer.service` attributes. Since [ADR-048](ADR-048-content-control.md) shipped (2026-05-10), the runtime is a **two-hub topology** — `audittrace-server` (memory-server, chat + memory routes) and `audittrace-content-control` (PDF scanner, separate identity + IAM split) — each calling its own subset of the storage layer:
 
 ```mermaid
 flowchart LR
     U["user"] --> S["audittrace-server"]
-    S --> PG["audittrace-postgresql"]
-    S --> CH["audittrace-chromadb"]
-    S --> R["audittrace-redis-master"]
-    S --> M["audittrace-minio"]
+    U --> CC["audittrace-content-control"]
     S --> K["audittrace-keycloak"]
     S --> Q["qwen-chat-llm"]
+    S --> MS["mistral-summariser-llm"]
+    S --> R["audittrace-redis-master"]
     S --> LF["langfuse"]
+    S --> PG["audittrace-postgresql"]
+    S --> CH["audittrace-chromadb"]
+    S --> M["audittrace-minio"]
+    CC --> PG
+    CC --> M
+    CC --> CH
 
     classDef server fill:#0c4a6e,stroke:#38bdf8,color:#f0f9ff
+    classDef scanner fill:#7c2d12,stroke:#fb923c,color:#fff7ed
     classDef peer fill:#1f2937,stroke:#475569,color:#f1f5f9
     class S server
-    class PG,CH,R,M,K,Q,LF peer
+    class CC scanner
+    class PG,CH,R,M,K,Q,MS,LF peer
 ```
 
-Inventory for the probe:
+The metrics-generator only shows edges that fired within its time window — for the screenshot above (Last 6 hours) the dominant edges are the recently exercised ones (LLM, Keycloak, Redis, Langfuse on the chat hub; Postgres / MinIO / ChromaDB on the scan hub). The two LLM-side edges — `qwen-chat-llm` (chat) and `mistral-summariser-llm` (session summariser) — are both served by the local `llama-server.service` and `llama-summarizer.service` units that were swapped from ROCm to Vulkan on 2026-05-17 (see [[vulkan-backend-swap]]).
+
+Inventory for the probe (multi-tool, 59 spans):
 
 | Span name | Count | What it proves |
 |---|---:|---|
 | `POST /v1/chat/completions` | 1 | Root FastAPI span (wall time + HTTP attrs) |
 | `audittrace.auth.require_user` | 1 | Auth gate latency |
-| `audittrace.auth._fetch_jwks_keys` | 1 | Keycloak JWKS hit |
 | `sovereign-chat-request` | 1 | Langfuse-recognised parent |
-| `llm.chat.completions` | 3 | Three LLM round-trips (commit `fa5198a` / `2ef15c3`) |
+| `llm.chat.completions` | 4 | Four LLM round-trips (initial + after each tool result) |
+| `qwen-chat-llm POST` | 4 | Outbound HTTP to the local Vulkan-served Qwen 3.6 — one per LLM round-trip |
 | `memory_tool.recall_decisions` | 1 | Decisions tool invocation (commit `65a5965`) |
 | `memory_tool.recall_semantic` | 1 | Semantic tool invocation |
-| `memory-semantic-search` | 1 | ChromaDB similarity search (nested under tool) |
-| `S3EpisodicService.search` / `.load` | 2 | MinIO episodic reads |
-| `SELECT audittrace` | 4 | Postgres reads (incl. RLS-gated) |
-| `INSERT audittrace` | 2 | `interactions` + `tool_calls` writes |
-| `SETEX` | 3 | Redis cache writes (token cache + tool-result cache) |
-| `POST` / `GET` / `connect` | 42 | Outbound HTTP (Qwen, nomic, Langfuse, Tempo, Loki) |
+| `memory_tool.recall_skills` | 1 | Skills (procedural) tool invocation |
+| `memory-episodic-search` / `.load` | 2 | MinIO episodic reads under `recall_decisions` |
+| `memory-semantic-search` | 1 | ChromaDB similarity search under `recall_semantic` (nested 4 HTTPs to Chroma) |
+| `memory-procedural-search` / `.load` | 2 | MinIO procedural reads under `recall_skills` |
+| `INSERT audittrace` / `db-postgres-session-factory` | several | Audit-row persistence on success path |
+| `SETEX` | ≥1 | Redis cache writes (token cache + tool-result cache) |
+| `GET` / `POST` / `connect` | balance | Outbound HTTP leaves under each parent |
 
 ---
 
@@ -305,7 +332,7 @@ $ curl -s --get "http://192.168.1.231:3100/loki/api/v1/query_range" \
 ```
 
 ```
-2026-04-18 09:04:58  INFO  127.0.0.6:42963 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-05-17 11:59:36  INFO  127.0.0.6:46855 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 ```
 
 And ERROR-grade lines for any failure. An auditor investigating a failure can:
@@ -433,14 +460,15 @@ This is not a gap to close; it's an honest trust boundary. The memory-server aud
 BEARER=$(scripts/audittrace-login --show)
 RESPONSE=$(curl -sk -H "Authorization: Bearer $BEARER" \
   -H "X-Project: reconstructibility-demo" \
+  -H "X-Source: cli-reconstructibility" \
   -H "Content-Type: application/json" \
-  -X POST https://audittrace.local:30952/v1/chat/completions \
+  -X POST https://audittrace.allaboutdata.eu:30952/v1/chat/completions \
   -d '{"model":"qwen3.6-35b-a3b","stream":false,"messages":[{"role":"user","content":"hello"}]}')
 
 # 2. Pull the row (Hop 1).
 curl -sk -H "Authorization: Bearer $BEARER" \
-  "https://audittrace.local:30952/interactions?project=reconstructibility-demo&limit=1" \
-  | jq '.interactions[0] | {id, user_id, session_id, duration_ms, status}'
+  "https://audittrace.allaboutdata.eu:30952/interactions?project=reconstructibility-demo&limit=1" \
+  | jq '.interactions[0] | {id, user_id, session_id, trace_id, duration_ms, status}'
 
 # 3. Find the Langfuse trace (Hop 3). Copy the trace_id.
 curl -s -u "$PK:$SK" \
@@ -529,26 +557,51 @@ during incident triage.
 
 ---
 
-## The operator view — "Sovereign AI Operations" dashboard
+## The operator view — two Grafana dashboards
 
-When the auditor isn't drilling into a specific request, the Grafana dashboard shows the posture at a glance: latency percentiles, error rate by type, LLM tokens/sec, OTel Collector queue saturation, container logs. If any panel goes red, there's something to investigate — the dashboard is how the day-to-day operator knows the audit trail is intact.
+When the auditor isn't drilling into a specific request, the Grafana dashboards show the operational posture at a glance.
 
-![Sovereign AI Operations dashboard, all panels green](images/reconstructibility/08-grafana-sovereign-ops.png)
+### "Sovereign AI Operations" — chat / memory hub
+
+Request latency percentiles (P50 / P95 / P99), HTTP request rate by route (with status-code split — `200` vs `400` vs `404`), operation duration by function (`ChromaSemanticService.search`, `S3EpisodicService.load/.read/.search`, factory wiring), OTel Collector queue saturation + throughput (metrics / spans / logs ops/s, plus failed-metrics + failed-spans counters), `llama-server` tokens-per-second + peak KV usage, container ERROR-level logs.
+
+![Sovereign AI Operations dashboard — chat + memory hub](images/reconstructibility/08-grafana-sovereign-ops.png)
+
+(The dashboard title still reads "Sovereign AI Operations" — preserved from before the 2026-04-17 [ADR-035](ADR-035-rename-package.md) package rename; the underlying queries target `audittrace-*` series.)
+
+### "AuditTrace Scan Pipeline" — content-control hub (ADR-048 / Path B)
+
+Yesterday's Path B work (2026-05-16, vendored in chart v1.1.4) added a second operator dashboard wired to the `audittrace-content-control` sibling service via RabbitMQ exporter + Redis exporter scraping. It surfaces queue depths on `audittrace.scan.*` exchanges, in-flight scan-id correlation, and the `content_control_verdicts_total{verdict=...}` counter so an operator can see at a glance whether the scanner is keeping up and what verdict mix it is producing.
+
+![AuditTrace Scan Pipeline dashboard — content-control hub (Path B)](images/reconstructibility/09-grafana-scan-pipeline.png)
+
+If any panel on either dashboard goes red, there's something to investigate — together they cover both hubs of the two-hub topology shown in Hop 4's service map.
 
 ---
 
 ## References
 
+- **ADR-022** — Keycloak realm + scoped client design
+- **ADR-023** — JWT validation + JWKS caching (Hop 8 Redis `audittrace:token:*`)
 - **ADR-024** — proxy pass-through, Langfuse trace decoupling
 - **ADR-025** — memory-as-tools, tool-result cache, Decision 8 (cache-hit audit skip)
 - **ADR-026** — multi-user identity, RLS posture, scoped wrappers
 - **ADR-027** — MinIO object storage, SSE-S3 encryption at rest
 - **ADR-028** — observability aggregation stack (Tempo + Prometheus + Loki + Grafana + Langfuse)
 - **ADR-029** — end-to-end audit trail, `X-Project` tag, `/interactions` browser
-- **ADR-030** — session summariser (Mistral 7B)
+- **ADR-030** — session summariser (Mistral 7B — now Vulkan-served, [[vulkan-backend-swap]])
 - **ADR-032** — OAuth2 Device Flow for human agents
 - **ADR-033** — three-audience error envelope, failure-class taxonomy
 - **ADR-034** — long-running generation, per-chunk idle timeout, `X-Thinking`
+- **ADR-035** — package rename (`sovereign_memory` → `audittrace`); legacy `Sovereign AI Operations` dashboard title preserved from this era
 - **ADR-037** — agent tool audit boundary (this doc's "what is NOT" section)
-- **ADR-048** — ingestion content-control (this doc's "rejected-PDF scenario" section)
+- **ADR-042** — OIDC Authorization Code + PKCE (WebUI sign-in flow)
+- **ADR-043** — Vault as sole secret store
+- **ADR-044** — external IdP federation (Google Workspace OIDC, M2 demo path)
+- **ADR-046** — async chat persistence (opt-in; default sync per `feedback_openai_schema_inviolate`)
+- **ADR-048** — ingestion content-control (this doc's "rejected-PDF scenario" + the second hub on the Hop 4 service map)
+- **ADR-049** — test + evidence + reconstructibility gate (the discipline that produced this doc's re-capture exercise)
+- **ADR-052** — PAdES trust store + signature-failure-class taxonomy
+- **ADR-053** — Swiss federal TSL + composite trust store
+- **ADR-054** — PAdES as-of-signing-time validation
 - **ADR-057** — RabbitMQ broker for scan-control transport
