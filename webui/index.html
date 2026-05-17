@@ -428,6 +428,17 @@ function jwtScopes() {
   const c = decodeJwt(t);
   return new Set((c.scope || '').split(/\s+/).filter(Boolean));
 }
+function tokenIsValid(token) {
+  // Guard bootstrap restore: an `access_token` in localStorage from an old
+  // session is meaningless once `exp` has passed. Without this check the
+  // page shows "logged in" for an expired token until the first API call
+  // returns 401 — confusing and silent. 5s leeway covers the round-trip
+  // from the Date.now() snapshot to the first outbound request.
+  if (!token) return false;
+  const c = decodeJwt(token);
+  if (!c || !c.exp) return false;
+  return c.exp > (Date.now() / 1000) + 5;
+}
 function jwtUserLabel() {
   const t = SS_get('access_token');
   if (!t) return '';
@@ -475,6 +486,9 @@ async function handleCallback() {
   if (!code) return;
   if (state !== SS_get('oidc_state')) {
     log('err', 'state mismatch — possible CSRF', `expected=${SS_get('oidc_state')} got=${state}`);
+    // Strip the dirty `?code=&state=` so a reload doesn't re-trigger the same
+    // mismatch forever. Without this the SPA wedges silently.
+    history.replaceState({}, '', window.location.pathname);
     return;
   }
   const c = JSON.parse(SS_get('cfg'));
@@ -503,6 +517,7 @@ async function handleCallback() {
   const data = await r.json();
   if (!r.ok) {
     log('err', `token endpoint returned ${r.status}`, JSON.stringify(data));
+    history.replaceState({}, '', window.location.pathname);
     return;
   }
   SS_set('access_token', data.access_token);
@@ -1082,7 +1097,17 @@ renderPdfUploadList();
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 const existing = SS_get('access_token');
-if (existing) showToken(existing);
+if (existing && tokenIsValid(existing)) {
+  showToken(existing);
+} else if (existing) {
+  // Stored token but `exp` has passed — clear it before the UI shows the
+  // logged-in state. Forces a fresh sign-in instead of a silent 401 on
+  // the next API call.
+  const claims = decodeJwt(existing);
+  log('info', 'stored token expired — clearing, re-login required',
+      `exp=${claims?.exp} now=${Math.floor(Date.now() / 1000)}`);
+  SS_clear();
+}
 log('info', 'webui ready', `now=${new Date().toISOString()}`);
 handleCallback();
 </script>
