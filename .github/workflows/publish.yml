@@ -87,7 +87,7 @@ jobs:
           echo "All version sites match: ${tag_version}"
 
       - name: Set up QEMU (for arm64 emulation on amd64 runners)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
