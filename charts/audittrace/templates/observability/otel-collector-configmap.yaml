@@ -1,4 +1,5 @@
 {{- if .Values.observability.otelCollector.enabled }}
+{{- $tempoHost := required "observability.external.tempoHost (FQDN) is required when observability.otelCollector.enabled=true — see ADR-045 (FQDN-only). Set to empty + otelCollector.enabled=false to disable tracing entirely." .Values.observability.external.tempoHost }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -53,7 +54,7 @@ data:
       prometheus:
         endpoint: "0.0.0.0:8889"
       otlphttp/tempo:
-        endpoint: "http://{{ .Values.observability.external.tempoIP | default .Values.global.hostNodeIP }}:{{ .Values.observability.external.tempoOtlpPort | default 14318 }}"
+        endpoint: "http://{{ $tempoHost }}:{{ .Values.observability.external.tempoOtlpPort | default 14318 }}"
 
     service:
       pipelines:

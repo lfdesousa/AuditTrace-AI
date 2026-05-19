@@ -193,7 +193,11 @@ jobs:
             --set secrets.postgres.appPassword=ci-test \
             --set secrets.postgres.password=ci-test \
             --set secrets.redis.password=ci-test \
-            --set secrets.summariser.password=ci-test
+            --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid
 
       - name: helm lint (vault.enabled=false — dev fallback path)
         run: |
@@ -206,7 +210,11 @@ jobs:
             --set secrets.postgres.appPassword=ci-test \
             --set secrets.postgres.password=ci-test \
             --set secrets.redis.password=ci-test \
-            --set secrets.summariser.password=ci-test
+            --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid
 
       - name: helm template (assert renders cleanly + contains vaultSecretFileGuard)
         # Renders the chart and grep-asserts the 2026-05-03 guard helper
@@ -224,6 +232,10 @@ jobs:
             --set secrets.postgres.password=ci-test \
             --set secrets.redis.password=ci-test \
             --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid \
             > /tmp/helm-rendered.yaml
           # Every chart that sources /vault/secrets/env MUST include the
           # guard. Count occurrences and assert >= 3 (chromadb, keycloak,

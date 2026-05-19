@@ -1,10 +1,10 @@
 # ADR-045 — Laptop-first deployment: no LAN hardcodes in the chart
 
-**Status:** Proposed
-**Date:** 2026-04-23
+**Status:** Accepted (Rule 2 mechanism revised — see *Amendment 2026-05-19* below)
+**Date:** 2026-04-23 (initial); 2026-05-19 (amendment)
 **Supersedes / amends:** ADR-028 (observability aggregation stack),
 partially realises ADR-041 Profile A ("Z-book, everything bundled")
-**Related:** ADR-033/034 (k3s migration), ADR-042 (OIDC BFF for browser UIs)
+**Related:** ADR-033/034 (k3s migration), ADR-042 (OIDC BFF for browser UIs), [[adr-007-llm-runtime]] (AWS LLM EC2 + NLB-TLS), [[adr-008-observability]] (AWS observability EC2 + NLB-TLS)
 
 ## Context
 
@@ -43,26 +43,40 @@ units), never a Pod, never dockerized by AuditTrace-AI.
 LibreChat (ADR-042) follows the same pattern: sibling compose on host,
 not a chart workload.
 
-### Rule 2 — No LAN-specific address in the chart
+### Rule 2 — No literal IP address in the chart (FQDN-only)
 
-The chart must never ship with a hardcoded `192.168.x.y` default. Every
-pod-to-host coupling resolves via `global.hostNodeIP`, which defaults to
-`10.42.0.1` (the k3s flannel `cni0` bridge gateway — stable regardless
-of upstream network state). Operators who want to egress to a different
-host override with `--set global.hostNodeIP=...` (or
-`--set externalLLM.hostIP=...` for the LLM alone).
+> **Revised 2026-05-19** — see *Amendment 2026-05-19* below for the
+> shift from "IP fallback via `global.hostNodeIP`" to "FQDN-only via
+> `Service kind=ExternalName`". The intent ("no LAN hardcode") is
+> unchanged; the mechanism is improved.
 
-### Pattern — the three DNS primitives
+The chart must never ship with a literal IPv4 address in any values
+field or rendered manifest — neither a `192.168.x.y` LAN address nor a
+`10.42.0.1` CNI-bridge address. Every pod-to-host coupling resolves
+via a fully-qualified domain name supplied by the operator:
+
+- `externalLLM.host` — FQDN of the host running the three
+  `llama-server` ports (chat 11435 / embed 11436 / summarizer 11437).
+- `observability.external.langfuseHost` / `tempoHost` / `lokiHost` /
+  `prometheusHost` — FQDNs of the observability backend hosts.
+
+The chart consumes these via `Service kind=ExternalName`, which
+returns a CNAME at cluster DNS lookup time. Resolution of the CNAME
+is the operator's responsibility: Route53 in the cloud, k3s CoreDNS
+rewrite (or `/etc/hosts` on the host plus host-network resolver) on
+the laptop.
+
+### Pattern — the four DNS primitives (post 2026-05-19 amendment)
 
 | Purpose | Mechanism | Address |
 |---|---|---|
 | Browser / CLI → Istio Gateway | `/etc/hosts` | `127.0.0.1 audittrace.local` |
-| Pod → host (sibling stacks + llama.cpp) | k3s `cni0` bridge | `global.hostNodeIP` (default `10.42.0.1`) |
+| Pod → out-of-cluster host (llama.cpp + obs backends) | k3s CoreDNS rewrite → operator-managed FQDN → resolves to a host on the LAN OR to an internal NLB on AWS | `externalLLM.host`, `observability.external.*Host` — FQDNs only |
 | Pod → pod (in-cluster services) | k3s CoreDNS | `*.audittrace.svc.cluster.local` |
 | LibreChat container → Istio Gateway | Docker `extra_hosts` | `audittrace.local:host-gateway` |
 
 Nothing else — no mDNS, no avahi, no `host.docker.internal`, no
-environment-dependent DNS trickery.
+environment-dependent DNS trickery, no `global.hostNodeIP` fallback.
 
 ## Consequences
 
@@ -259,6 +273,98 @@ Never touch the management layer. The runbook's
 §Airplane-mode smoke has a warning box repeating this rule;
 `scripts/phase4-airplane-test.sh` aborts fast if `default route`
 is not empty, which is the only reliable "the cut took" check.
+
+## Amendment 2026-05-19 — FQDN-only (Rule 2 mechanism revised)
+
+### Trigger
+
+Designing the `aws-loadtest` substrate ([[adr-007-llm-runtime]],
+[[adr-008-observability]]) exposed the fact that the IP-fallback
+mechanism of Rule 2 does not extend to the cloud cleanly:
+
+- AWS internal NLBs are addressed by their Route53 alias (a CNAME to
+  the NLB's auto-generated AZ-bound A records), **not** by a stable
+  IP. Forcing an IP into the chart means resolving the NLB at apply
+  time and writing the resolved address into a Helm value, which is
+  brittle (NLB IPs can change across maintenance windows).
+- The headless `Service` + `Endpoints` shape with
+  `addresses[].ip: <X>` that the chart used to render is a literal-IP
+  shape by Kubernetes contract — `Endpoints` rejects hostnames.
+
+The cloud-substrate shape ([[adr-007-llm-runtime]]) is therefore an
+internal NLB with ACM-DNS-01 cert, fronted by a public-resolvable
+FQDN `audittrace-loadtest-llm.allaboutdata.eu`. The chart must consume
+that FQDN directly, not its resolved IP.
+
+### What changed
+
+| Surface | Before (≤ 2026-05-18) | After (≥ 2026-05-19) |
+|---|---|---|
+| Values shape | `global.hostNodeIP="10.42.0.1"`, `externalLLM.hostIP=""`, `observability.external.{langfuse,tempo,loki,prometheus}IP=""` | `externalLLM.host=""`, `observability.external.{langfuse,tempo,loki,prometheus}Host=""`. No `global.hostNodeIP` at all. |
+| LLM Service templates | `kind: Service` (`clusterIP: None`) + `kind: Endpoints` (`addresses[].ip: <IP>`) | `kind: Service` (`type: ExternalName`, `spec.externalName: <FQDN>`) |
+| Langfuse Service template | Same headless+Endpoints with IP fallback | `kind: Service` (`type: ExternalName`), gated on `langfuseHost` truthiness |
+| OTel collector configmap | tempo endpoint via `tempoIP \| default hostNodeIP` | tempo endpoint via `tempoHost` (`required` when `otelCollector.enabled=true`) |
+| Promtail configmap | loki url via `lokiIP \| default hostNodeIP` | loki url via `lokiHost` (`required` when `promtail.enabled=true`) |
+| memory-server `AUDITTRACE_LANGFUSE_HOST` env | Constructed from `langfuseIP \| default hostNodeIP` | Emitted only when `langfuseHost` is set; absent otherwise |
+| Local-dev DNS | Pod → host via flannel `cni0` bridge IP `10.42.0.1` | Pod → host via operator-provided FQDN; resolution via k3s CoreDNS `rewrite` plugin OR a sibling `audittrace-host.local` entry the operator installs on the host's resolver |
+
+### Why this preserves Rule 1 (sibling stacks stay sibling)
+
+Nothing about the sibling-compose posture changes. Langfuse and the
+observability stack still run as independent docker-compose projects.
+llama.cpp still runs as `systemd --user` on the host. Only the
+mechanism by which the chart references those endpoints changes —
+from "IP fallback" to "operator-resolved FQDN."
+
+### Operator burden delta
+
+The laptop operator now installs **one extra DNS primitive** before
+`helm install`: an FQDN entry that resolves to the host running the
+sibling stacks. The recommended laptop pattern:
+
+1. Choose a sentinel FQDN such as `host.audittrace.local`.
+2. Add a CoreDNS rewrite in k3s pointing it to the cni0 bridge IP
+   (the same `10.42.0.1` that used to be the chart default), via a
+   k3s CoreDNS `Corefile` snippet or a `NodeHosts` ConfigMap entry.
+3. `helm install ... --set externalLLM.host=host.audittrace.local
+   --set observability.external.langfuseHost=host.audittrace.local
+   --set observability.external.tempoHost=host.audittrace.local
+   --set observability.external.lokiHost=host.audittrace.local`.
+
+The IP that used to live in the chart now lives once in CoreDNS,
+where it belongs.
+
+### Why the trade-off is positive
+
+- **Cloud and laptop now use the same chart shape.** No IP-vs-FQDN
+  branch in any template. The cloud uses Route53; the laptop uses a
+  CoreDNS rewrite; both feed an `ExternalName` Service. Cargo cult
+  removed: the chart no longer pretends to know how the operator
+  resolves the FQDN.
+- **No "auto-detect" script needed.** `scripts/detect-k3s-bridge.sh`
+  is removed; CoreDNS does the indirection.
+- **One fewer way to silently misconfigure.** A wrong IP in the old
+  shape rendered a Service with a wrong `addresses[].ip` and failed
+  at first connection. A wrong FQDN in the new shape fails at DNS
+  lookup with a clean NXDOMAIN — diagnosis is `dig` instead of
+  `tcpdump`.
+
+### Verification gates (updated)
+
+1. **Static grep:** `grep -rE '10\.42\.0\.1|192\.168\.1\.(100|231)|hostNodeIP|hostIP|langfuseIP|tempoIP|lokiIP'
+   charts/ scripts/ Makefile .github/` returns empty.
+2. **Default-render gate:** `helm template charts/audittrace
+   --set externalLLM.host=... --set observability.external.langfuseHost=...
+   --set observability.external.tempoHost=... --set observability.external.lokiHost=...`
+   produces no `192.168.*` and no `10.42.*` strings (all four `--set`
+   flags are required, by design — the chart fails fast without them).
+3. **Render-without-FQDN gate:** `helm template charts/audittrace` (no
+   FQDN flags) fails with four `required` errors naming the missing
+   FQDN values — proving operators cannot silently install a broken
+   chart.
+4. **Airplane smoke** (unchanged from original Rule 2): laptop with
+   external interfaces down still reaches the local CoreDNS-resolved
+   FQDNs and produces a valid `/v1/chat/completions` response.
 
 ## References
 

@@ -139,7 +139,10 @@ kubectl -n audittrace create secret tls audittrace-tls \
 
 helm upgrade --install audittrace ./charts/audittrace \
   -n audittrace \
-  --set global.hostNodeIP=$(./scripts/detect-k3s-bridge.sh) \
+  --set externalLLM.host=host.audittrace.local \
+  --set observability.external.langfuseHost=host.audittrace.local \
+  --set observability.external.tempoHost=host.audittrace.local \
+  --set observability.external.lokiHost=host.audittrace.local \
   --set secrets.postgres.password=test-pg-pass \
   --set secrets.postgres.appPassword=test-pg-pass \
   --set secrets.summariser.password=test-summariser-pw \
@@ -148,6 +151,33 @@ helm upgrade --install audittrace ./charts/audittrace \
   --set secrets.minio.secretKey=test-minio-key \
   --set-file secrets.minio.kmsKey=secrets/minio_kms_key.txt
 ```
+
+> **FQDN prerequisite (ADR-045 amended 2026-05-19).** The chart is
+> FQDN-only — `externalLLM.host` and the three `observability.external.*Host`
+> values must resolve to a host that runs llama.cpp + the sibling
+> docker-compose observability stack. On a laptop, install a
+> k3s CoreDNS rewrite that maps `host.audittrace.local` to the cni0
+> bridge IP (`10.42.0.1`) by appending the following to the k3s
+> CoreDNS ConfigMap (`kubectl -n kube-system edit configmap coredns`)
+> under the `Corefile:` entry:
+>
+> ```
+> .:53 {
+>     ...
+>     hosts {
+>       10.42.0.1 host.audittrace.local
+>       fallthrough
+>     }
+>     ...
+> }
+> ```
+>
+> After the edit, restart the CoreDNS deployment:
+> `kubectl -n kube-system rollout restart deploy/coredns`. Validate
+> from any pod: `kubectl exec -n audittrace ... -- dig +short
+> host.audittrace.local` should return `10.42.0.1`. The four `--set
+> *Host` flags then point ExternalName Services at this single
+> CoreDNS-resolved name.
 
 > The seven `secrets.*` values above are the repo-wide dev defaults (see
 > the SECURITY NOTICE at the top of `charts/audittrace/values.yaml`).
@@ -234,24 +264,32 @@ then wait ~90 s for pods to re-converge.
 
 ## Overrides for the home-workstation case
 
-If you want a Helm install to egress to the obs box at `192.168.1.231` and
-the llama.cpp workstation at `192.168.1.100` instead of using the local
-laptop bridge, override via `--set`:
+If you want a Helm install to egress to the obs box at `192.168.1.231`
+and the llama.cpp workstation at `192.168.1.100` instead of using the
+local laptop bridge, the FQDN-only mechanism (ADR-045 amended
+2026-05-19) means you point the FQDNs at the right hosts via DNS:
+either add the entries to the k3s CoreDNS rewrite, or use distinct
+FQDNs that resolve to the right hosts on your local resolver. Example:
 
 ```bash
 helm upgrade --install audittrace ./charts/audittrace -n audittrace \
-  --set global.hostNodeIP=192.168.1.231 \
-  --set externalLLM.hostIP=192.168.1.100
+  --set externalLLM.host=llm.home.audittrace.local \
+  --set observability.external.langfuseHost=obs.home.audittrace.local \
+  --set observability.external.tempoHost=obs.home.audittrace.local \
+  --set observability.external.lokiHost=obs.home.audittrace.local
 ```
 
-The chart does not ship a `values-homelab.yaml`; the explicit `--set`
-flags are the documented homelab pattern.
+with the corresponding CoreDNS `hosts {}` entries pointing
+`llm.home.audittrace.local` → `192.168.1.100` and
+`obs.home.audittrace.local` → `192.168.1.231`. The chart does not
+ship a `values-homelab.yaml`; the explicit `--set` flags + CoreDNS
+mapping are the documented homelab pattern.
 
 ## Troubleshooting
 
 - **`cni0` missing** → k3s isn't running, or uses a non-flannel CNI. Start
-  k3s (`sudo systemctl start k3s`). `detect-k3s-bridge.sh` will fall back to
-  `10.42.0.1` regardless.
+  k3s (`sudo systemctl start k3s`). The chart no longer auto-detects a
+  bridge IP — see the FQDN prerequisite above (CoreDNS rewrite).
 - **Pods ImagePullBackOff `localhost:5000/...`** → start the local
   registry or switch `memoryServer.image.repository` to a pullable image.
 - **Keycloak 502 via gateway** → gateway → keycloak pod path is in-cluster

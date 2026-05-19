@@ -44,13 +44,6 @@
 # -- Global -------------------------------------------------------------------
 global:
   namespace: audittrace
-  # Address at which k3s Pods reach the host. Default is the flannel cni0
-  # bridge gateway, which is stable regardless of upstream network state
-  # (WiFi / hotspot / airplane). Auto-detect at install time with
-  # scripts/detect-k3s-bridge.sh and inject via --set global.hostNodeIP=.
-  # Used as the fallback for externalLLM.hostIP and every
-  # observability.external.*IP — see ADR-045.
-  hostNodeIP: "10.42.0.1"
   # Set to true for production deploys. When true, the chart refuses to
   # render if any `secrets.*` value matches a known dev default. See the
   # SECURITY NOTICE above.
@@ -213,18 +206,26 @@ memoryServer:
     # token to something stale — bumping pyproject + Chart.yaml is
     # the single source of truth.
 
-# -- External LLM (host-network endpoints) -----------------------------------
-# hostIP is optional. When empty, templates fall back to global.hostNodeIP,
-# which reaches the laptop host via the k3s cni0 bridge — the pattern that
-# works on any network. Override explicitly only if llama.cpp runs on a
-# different host (e.g. a separate workstation on your LAN). See ADR-045.
+# -- External LLM (FQDN-resolved out-of-cluster host) ------------------------
+# The chart renders one `Service kind=ExternalName` per port (chat / embed /
+# summarizer), each aliasing `host` via cluster DNS. ExternalName Services
+# return a CNAME at lookup time — the operator's DNS infrastructure (Route53
+# in the cloud, CoreDNS rewrite / NodeHosts on a laptop) is responsible for
+# resolving `host` to whatever runs llama.cpp. The chart never sees, embeds,
+# nor falls back to a literal IP. See ADR-045 (FQDN-only).
 externalLLM:
-  # 2026-05-14 B4b — disable the headless Service+Endpoints that bridge
+  # 2026-05-14 B4b — disable the ExternalName Services that bridge
   # to a host-running LLM when CI deploys its own in-cluster mock as
   # `<release>-llm-chat` (same name; kind has no host LLM). Default
   # `true` preserves prod posture; values-ci.yaml flips to false.
   enabled: true
-  hostIP: ""
+  # Required when enabled=true. The FQDN under which the three llama-server
+  # ports (chat / embed / summarizer) are reachable. The chart fails to
+  # render if enabled=true and host is empty.
+  # Examples:
+  #   * cloud: audittrace-loadtest-llm.allaboutdata.eu  (NLB-TLS in front)
+  #   * dev:   llm.audittrace.local                     (resolved via local CoreDNS rewrite)
+  host: ""
   chat:
     name: llm-chat
     port: 11435
@@ -276,17 +277,20 @@ observability:
         cpu: 200m
         memory: 256Mi
   external:
-    # *IP fields are optional. When empty, every consumer falls back to
-    # global.hostNodeIP (the k3s cni0 bridge → laptop host). Override
-    # explicitly only when egressing to a separate obs host on your LAN.
+    # FQDN-only — the chart never falls back to an IP. The langfuse
+    # ExternalName Service skips when langfuseHost is empty. The
+    # otel-collector ConfigMap and the promtail ConfigMap skip when
+    # their respective host fields are empty (the OTel pipeline is
+    # rendered without the tempo exporter; promtail without the loki
+    # client). Operators with no observability stack leave these empty.
     # See ADR-045 + ADR-028 amendment.
-    langfuseIP: ""
+    langfuseHost: ""
     langfusePort: 3000
-    tempoIP: ""
+    tempoHost: ""
     tempoOtlpPort: 14318
-    prometheusIP: ""
+    prometheusHost: ""
     prometheusPort: 19090
-    lokiIP: ""
+    lokiHost: ""
     lokiPort: 3100
 
 # -- TLS ----------------------------------------------------------------------
