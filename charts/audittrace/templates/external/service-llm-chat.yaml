@@ -1,4 +1,5 @@
 {{- if .Values.externalLLM.enabled }}
+{{- $host := required "externalLLM.host (FQDN) is required when externalLLM.enabled=true — see ADR-045 (FQDN-only)" .Values.externalLLM.host }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,24 +8,11 @@ metadata:
     {{- include "audittrace.labels" . | nindent 4 }}
     app.kubernetes.io/component: llm-chat
 spec:
-  clusterIP: None
+  type: ExternalName
+  externalName: {{ $host | quote }}
   ports:
     - port: {{ .Values.externalLLM.chat.port }}
       targetPort: {{ .Values.externalLLM.chat.port }}
       protocol: TCP
       name: http
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: {{ .Release.Name }}-llm-chat
-  labels:
-    {{- include "audittrace.labels" . | nindent 4 }}
-subsets:
-  - addresses:
-      - ip: {{ .Values.externalLLM.hostIP | default .Values.global.hostNodeIP }}
-    ports:
-      - port: {{ .Values.externalLLM.chat.port }}
-        protocol: TCP
-        name: http
 {{- end }}

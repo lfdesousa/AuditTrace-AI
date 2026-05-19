@@ -7,9 +7,72 @@ Logging and telemetry are configured once per test session so that the
 
 import logging
 import os
+import subprocess  # noqa: S404 — used only for chart-rendering test injection below
 
 import pytest
 from fastapi.testclient import TestClient
+
+# ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
+# ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
+# and `observability.external.{langfuse,tempo,loki}Host` are `required`
+# whenever the corresponding feature flag is on (the default). 13+ tests
+# shell out to `helm template` to render the chart and inspect manifests;
+# threading the four --set flags through every test would be brittle drift
+# bait. Instead we monkey-patch subprocess.run *here* so any invocation that
+# matches `<helm> template ...` gets the FQDN flags appended transparently.
+# Tests that already pass them get harmless duplication (last --set wins).
+_FQDN_INJECT_FLAGS = (
+    "--set",
+    "externalLLM.host=llm.test.invalid",
+    "--set",
+    "observability.external.langfuseHost=langfuse.test.invalid",
+    "--set",
+    "observability.external.tempoHost=tempo.test.invalid",
+    "--set",
+    "observability.external.lokiHost=loki.test.invalid",
+)
+_FQDN_KEYS = (
+    "externalLLM.host=",
+    "observability.external.langfuseHost=",
+    "observability.external.tempoHost=",
+    "observability.external.lokiHost=",
+)
+
+
+def _maybe_inject_fqdn_flags(args):
+    """If ``args`` is a `helm template ...` argv, append the four FQDN
+    --set flags so the chart's `required` guards are satisfied. Idempotent:
+    if any of the four FQDN --set flags are already present, leave args
+    alone (the test is being deliberate)."""
+    if not isinstance(args, (list, tuple)):
+        return args
+    a = list(args)
+    if len(a) < 2:
+        return args
+    # Match by argv[1] == "template" AND argv[0] looks like a helm binary.
+    if a[1] != "template":
+        return args
+    arg0 = str(a[0])
+    if not (arg0.endswith("/helm") or arg0 == "helm"):
+        return args
+    joined = " ".join(str(x) for x in a)
+    if any(k in joined for k in _FQDN_KEYS):
+        return args  # already FQDN-aware
+    return a + list(_FQDN_INJECT_FLAGS)
+
+
+_orig_subprocess_run = subprocess.run
+
+
+def _patched_subprocess_run(*args, **kwargs):
+    if args:
+        args = (_maybe_inject_fqdn_flags(args[0]),) + args[1:]
+    elif "args" in kwargs:
+        kwargs["args"] = _maybe_inject_fqdn_flags(kwargs["args"])
+    return _orig_subprocess_run(*args, **kwargs)
+
+
+subprocess.run = _patched_subprocess_run
 
 # Test isolation: clear all AUDITTRACE_* env vars so a developer's local .env
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.

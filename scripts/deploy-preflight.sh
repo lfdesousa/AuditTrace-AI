@@ -65,9 +65,14 @@ done
 # ── 1. helm lint ────────────────────────────────────────────────────────────
 echo "[preflight] (1/6) helm lint ..."
 if ! helm lint "$CHART_DIR" --set vault.enabled=true --set secrets.minio.secretKey=preflight \
+        --set secrets.minio.kmsKey=preflight \
         --set secrets.chromadb.token=preflight --set secrets.keycloak.adminPassword=preflight \
         --set secrets.postgres.appPassword=preflight --set secrets.postgres.password=preflight \
         --set secrets.redis.password=preflight --set secrets.summariser.password=preflight \
+        --set externalLLM.host=preflight.invalid \
+        --set observability.external.langfuseHost=preflight.invalid \
+        --set observability.external.tempoHost=preflight.invalid \
+        --set observability.external.lokiHost=preflight.invalid \
         > /tmp/audittrace-helm-lint.out 2>&1; then
     echo "[preflight] ERROR: helm lint failed (exit 2)" >&2
     cat /tmp/audittrace-helm-lint.out >&2
@@ -83,6 +88,10 @@ if ! helm template "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" \
         --set secrets.chromadb.token=preflight --set secrets.keycloak.adminPassword=preflight \
         --set secrets.postgres.appPassword=preflight --set secrets.postgres.password=preflight \
         --set secrets.redis.password=preflight --set secrets.summariser.password=preflight \
+        --set externalLLM.host=preflight.invalid \
+        --set observability.external.langfuseHost=preflight.invalid \
+        --set observability.external.tempoHost=preflight.invalid \
+        --set observability.external.lokiHost=preflight.invalid \
         --set memoryServer.image.tag="$TAG" \
         > /tmp/audittrace-helm-rendered.yaml 2>/tmp/audittrace-helm-template.err; then
     echo "[preflight] ERROR: helm template failed (exit 2)" >&2

@@ -28,6 +28,10 @@ CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 
 # Throwaway secret values to satisfy the chart's productionMode hygiene
 # gate. Mirror values used by the CI helm-lint job.
+#
+# Also pass the FQDNs the chart now requires for the LLM and the
+# observability sinks (ADR-045 — FQDN-only). The chart fails to render
+# without them when the corresponding feature flag is on (the default).
 _LINT_SECRETS = [
     "--set",
     "secrets.minio.secretKey=ci-test",
@@ -45,6 +49,17 @@ _LINT_SECRETS = [
     "secrets.redis.password=ci-test",
     "--set",
     "secrets.summariser.password=ci-test",
+    # FQDN-only host fields (ADR-045). All four are deliberately
+    # unresolvable .invalid names — rendering is what we exercise here;
+    # actual resolution is integration-test surface.
+    "--set",
+    "externalLLM.host=llm.test.invalid",
+    "--set",
+    "observability.external.langfuseHost=langfuse.test.invalid",
+    "--set",
+    "observability.external.tempoHost=tempo.test.invalid",
+    "--set",
+    "observability.external.lokiHost=loki.test.invalid",
 ]
 
 

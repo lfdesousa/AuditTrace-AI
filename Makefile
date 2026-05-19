@@ -169,7 +169,11 @@ helm-lint: ## Mirror the CI helm-lint job locally (both vault.enabled={false,tru
 	  --set secrets.postgres.appPassword=ci-test \
 	  --set secrets.postgres.password=ci-test \
 	  --set secrets.redis.password=ci-test \
-	  --set secrets.summariser.password=ci-test
+	  --set secrets.summariser.password=ci-test \
+	  --set externalLLM.host=llm.test.invalid \
+	  --set observability.external.langfuseHost=langfuse.test.invalid \
+	  --set observability.external.tempoHost=tempo.test.invalid \
+	  --set observability.external.lokiHost=loki.test.invalid
 	@echo "🪖  helm template (vault.enabled=true) + vaultSecretFileGuard count..."
 	@helm template $(RELEASE) $(CHART_DIR) -n $(NAMESPACE) \
 	  --set vault.enabled=true \
@@ -181,6 +185,10 @@ helm-lint: ## Mirror the CI helm-lint job locally (both vault.enabled={false,tru
 	  --set secrets.postgres.password=ci-test \
 	  --set secrets.redis.password=ci-test \
 	  --set secrets.summariser.password=ci-test \
+	  --set externalLLM.host=llm.test.invalid \
+	  --set observability.external.langfuseHost=langfuse.test.invalid \
+	  --set observability.external.tempoHost=tempo.test.invalid \
+	  --set observability.external.lokiHost=loki.test.invalid \
 	  > /tmp/audittrace-helm-rendered.yaml
 	@guards=$$(grep -c "Vault Agent did not inject /vault/secrets/env (exit 79)" /tmp/audittrace-helm-rendered.yaml || echo 0); \
 	  if [ "$$guards" -lt 3 ]; then \

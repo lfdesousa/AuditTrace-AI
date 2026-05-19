@@ -49,6 +49,15 @@ _HELM_SET_ARGS = (
     "secrets.redis.password=ci-test",
     "--set",
     "secrets.summariser.password=ci-test",
+    # FQDN-only host fields (ADR-045 amended 2026-05-19).
+    "--set",
+    "externalLLM.host=llm.test.invalid",
+    "--set",
+    "observability.external.langfuseHost=langfuse.test.invalid",
+    "--set",
+    "observability.external.tempoHost=tempo.test.invalid",
+    "--set",
+    "observability.external.lokiHost=loki.test.invalid",
 )
 
 EXPECTED_BRIDGES: dict[str, dict] = {

@@ -43,6 +43,18 @@ def _helm_template(extra_sets: list[str] | None = None) -> subprocess.CompletedP
         "secrets.minio.secretKey=dummy-minio-secret-for-render",
         "--set",
         "secrets.minio.kmsKey=dummy-minio-kms-for-render",
+        # FQDN-only host fields (ADR-045 amended 2026-05-19). All four
+        # are render-time `required` when the corresponding feature
+        # flag is on (default). Tests only care about the production-
+        # mode hygiene gate, so .invalid sentinels are sufficient.
+        "--set",
+        "externalLLM.host=llm.test.invalid",
+        "--set",
+        "observability.external.langfuseHost=langfuse.test.invalid",
+        "--set",
+        "observability.external.tempoHost=tempo.test.invalid",
+        "--set",
+        "observability.external.lokiHost=loki.test.invalid",
     ]
     if extra_sets:
         for kv in extra_sets:

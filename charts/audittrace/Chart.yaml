@@ -2,11 +2,11 @@ apiVersion: v2
 name: audittrace
 description: AuditTrace-AI — audit-trail-first memory augmentation platform
 type: application
-version: 1.1.7
+version: 1.2.0
 # appVersion MUST track pyproject.toml::version. Pinned by
 # tests/test_version_drift.py (ADR-055 — single chart-side source
 # for runtime observability + k8s labels + OTEL service.version).
-appVersion: "1.1.7"
+appVersion: "1.2.0"
 keywords:
   - ai
   - audit

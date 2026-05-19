@@ -52,6 +52,15 @@ def rendered() -> list[dict]:
             "secrets.minio.secretKey=dummy-minio-secret-for-render",
             "--set",
             "secrets.minio.kmsKey=dummy-minio-kms-for-render",
+            # FQDN-only host fields (ADR-045 amended 2026-05-19).
+            "--set",
+            "externalLLM.host=llm.test.invalid",
+            "--set",
+            "observability.external.langfuseHost=langfuse.test.invalid",
+            "--set",
+            "observability.external.tempoHost=tempo.test.invalid",
+            "--set",
+            "observability.external.lokiHost=loki.test.invalid",
         ]
     )
 
