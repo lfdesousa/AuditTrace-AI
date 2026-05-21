@@ -201,72 +201,99 @@ class TestS3ProceduralService:
 # ── _create_minio_client (dependencies.py) ────────────────────────────────────
 
 
-class TestCreateMinioClient:
-    """Tests for _create_minio_client in dependencies.py."""
+class TestCreateObjectStorageProvider:
+    """Tests for _create_object_storage_provider in dependencies.py.
 
-    def test_raises_when_secret_key_empty(self):
-        """Since the 2026-05-03 sweep, MinIO is mandatory — missing secret
-        key surfaces as a startup-time RuntimeError, not a silent FS
-        fallback. See ``feedback_storage_always_s3``."""
-        from audittrace.dependencies import _create_minio_client
+    ADR-006 renamed _create_minio_client to _create_object_storage_provider.
+    The old name remains as an alias for one release.
+    """
 
+    def _base_settings(self, backend: str = "minio") -> MagicMock:
         settings = MagicMock()
+        settings.object_storage_backend = backend
+        settings.minio_url = "http://minio:9000"
+        settings.minio_access_key = "minioadmin"
+        settings.minio_secret_key = "secret123"
+        # AWS branch defaults — irrelevant unless backend == "aws"
+        settings.aws_region = ""
+        settings.aws_bucket = ""
+        settings.aws_endpoint_url = ""
+        settings.aws_use_irsa = True
+        settings.aws_access_key_id = ""
+        settings.aws_secret_access_key = ""
+        return settings
+
+    def test_minio_raises_when_secret_key_empty(self):
+        """MinIO backend requires a secret key — startup-time RuntimeError,
+        not silent fallback. See ``feedback_storage_always_s3``."""
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = self._base_settings(backend="minio")
         settings.minio_secret_key = ""
-        with pytest.raises(RuntimeError, match="MinIO is required"):
-            _create_minio_client(settings)
+        with pytest.raises(RuntimeError, match="AUDITTRACE_MINIO_SECRET_KEY"):
+            _create_object_storage_provider(settings)
 
-    def test_returns_client_when_configured(self):
-        from audittrace.dependencies import _create_minio_client
+    def test_minio_returns_wrapped_provider_when_configured(self):
+        """Happy-path MinIO: returns a QuarantineDenyingObjectStorageClient
+        wrapping a MinIOObjectStorageProvider."""
+        from audittrace.dependencies import _create_object_storage_provider
+        from audittrace.services.quarantine_denying_provider import (
+            QuarantineDenyingObjectStorageClient,
+        )
 
-        settings = MagicMock()
-        settings.minio_url = "http://minio:9000"
-        settings.minio_access_key = "minioadmin"
-        settings.minio_secret_key = "secret123"
+        settings = self._base_settings(backend="minio")
+        with patch("audittrace_object_storage.minio_backend.Minio"):
+            wrapped = _create_object_storage_provider(settings)
+        assert isinstance(wrapped, QuarantineDenyingObjectStorageClient)
 
-        with patch("audittrace.dependencies.Minio") as mock_minio:
-            mock_minio.return_value = MagicMock()
-            client = _create_minio_client(settings)
-            assert client is not None
-            mock_minio.assert_called_once_with(
-                "minio:9000",
-                access_key="minioadmin",
-                secret_key="secret123",
-                secure=False,
-            )
+    def test_minio_init_error_wrapped_as_runtime_error(self):
+        """A Minio-construction failure surfaces as RuntimeError with the
+        canonical error message."""
+        from audittrace.dependencies import _create_object_storage_provider
 
-    def test_raises_on_client_init_error(self):
-        """Construction failure is surfaced as RuntimeError, not silently
-        swallowed — same rule as the missing-secret-key branch."""
-        from audittrace.dependencies import _create_minio_client
-
-        settings = MagicMock()
-        settings.minio_url = "http://minio:9000"
-        settings.minio_access_key = "minioadmin"
-        settings.minio_secret_key = "secret123"
-
+        settings = self._base_settings(backend="minio")
         with patch(
-            "audittrace.dependencies.Minio",
+            "audittrace_object_storage.minio_backend.Minio",
             side_effect=Exception("minio not installed"),
         ):
             with pytest.raises(
-                RuntimeError, match="MinIO client initialisation failed"
+                RuntimeError,
+                match="object-storage provider initialisation failed",
             ):
-                _create_minio_client(settings)
+                _create_object_storage_provider(settings)
 
-    def test_https_url_sets_secure_true(self):
-        from audittrace.dependencies import _create_minio_client
+    def test_aws_raises_when_region_missing(self):
+        from audittrace.dependencies import _create_object_storage_provider
 
-        settings = MagicMock()
-        settings.minio_url = "https://minio.prod:9000"
-        settings.minio_access_key = "admin"
-        settings.minio_secret_key = "secret"
+        settings = self._base_settings(backend="aws")
+        settings.aws_region = ""  # missing
+        settings.aws_bucket = "test-bucket"
+        with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_REGION"):
+            _create_object_storage_provider(settings)
 
-        with patch("audittrace.dependencies.Minio") as mock_minio:
-            mock_minio.return_value = MagicMock()
-            _create_minio_client(settings)
-            mock_minio.assert_called_once_with(
-                "minio.prod:9000",
-                access_key="admin",
-                secret_key="secret",
-                secure=True,
-            )
+    def test_aws_raises_when_bucket_missing(self):
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = self._base_settings(backend="aws")
+        settings.aws_region = "eu-central-2"
+        settings.aws_bucket = ""  # missing
+        with pytest.raises(RuntimeError, match="AUDITTRACE_AWS_REGION"):
+            _create_object_storage_provider(settings)
+
+    def test_unknown_backend_raises(self):
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = self._base_settings(backend="swift")
+        with pytest.raises(
+            RuntimeError, match="unknown AUDITTRACE_OBJECT_STORAGE_BACKEND"
+        ):
+            _create_object_storage_provider(settings)
+
+    def test_legacy_alias_still_works(self):
+        """Backwards-compat: _create_minio_client is an alias."""
+        from audittrace.dependencies import (
+            _create_minio_client,
+            _create_object_storage_provider,
+        )
+
+        assert _create_minio_client is _create_object_storage_provider

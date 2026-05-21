@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 if TYPE_CHECKING:
+    from audittrace_object_storage import S3ObjectStorageProvider
+
     from audittrace.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ def quarantine_uri(*, bucket: str, key: str) -> str:
 def put_quarantine(
     *,
     settings: Settings,
-    minio_client: object,
+    minio_client: S3ObjectStorageProvider,
     user_id: str,
     scan_id: str,
     filename: str,
@@ -89,20 +91,26 @@ def put_quarantine(
 
     Errors return 502 — the upload route translates them. Logs
     include scan_id but NOT bytes so the audit trail stays clean.
+
+    ``minio_client`` keeps its parameter name for backwards compatibility
+    with the pre-ADR-006 call sites; the runtime type is now the
+    ABC-shaped :class:`S3ObjectStorageProvider`.
     """
-    bucket = settings.minio_shared_bucket
+    bucket = (
+        settings.aws_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_shared_bucket
+    )
     key = quarantine_key(user_id=user_id, scan_id=scan_id, filename=filename)
 
     # contextlib.closing on BytesIO so the buffer is released
     # deterministically (PEP 343 + feedback_use_context_managers
     # — every resource cleanup goes through `with`, never relies on
-    # GC). minio-py reads the stream eagerly so the close after
+    # GC). The provider reads the stream eagerly so the close after
     # the call is safe.
     try:
         with io.BytesIO(content) as buf:
-            # Duck-typed Minio client (the prod minio-py client + the
-            # in-memory test fake both implement put_object).
-            minio_client.put_object(  # type: ignore[attr-defined]
+            minio_client.put_object(
                 bucket,
                 key,
                 buf,

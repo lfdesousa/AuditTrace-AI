@@ -25,6 +25,7 @@ from audittrace.services.scan_request_publisher import ScanRequestEnvelope
 if TYPE_CHECKING:
     import asyncio
 
+    from audittrace_object_storage import S3ObjectStorageProvider
     from sqlalchemy.orm import Session, sessionmaker
 
     from audittrace.config import Settings
@@ -53,7 +54,7 @@ def _current_traceparent() -> tuple[str, str]:
 async def handle_pdf_upload(
     *,
     settings: Settings,
-    minio_client: object,
+    minio_client: S3ObjectStorageProvider,
     session_factory: sessionmaker[Session],
     queue: asyncio.Queue[ScanRequestEnvelope],
     user: UserContext,

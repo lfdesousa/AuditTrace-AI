@@ -46,6 +46,17 @@ from audittrace.services.procedural import (
     ProceduralService,
     S3ProceduralService,
 )
+
+# ADR-006 — direct ``minio.Minio`` import removed; the bare client is
+# constructed inside the shared ``audittrace_object_storage`` package
+# (MinIOObjectStorageProvider). dependencies.py only orchestrates the
+# factory call.
+from audittrace.services.semantic import (
+    ChromaSemanticService,
+    MockSemanticService,
+    SemanticService,
+    UserScopedSemanticService,
+)
 from audittrace.services.trust_store import (
     CompositeTrustStoreBuilder,
     EuLotlTrustStoreBuilder,
@@ -55,23 +66,6 @@ from audittrace.services.trust_store import (
     SwissTslTrustStoreBuilder,
     TrustStoreBuilder,
     TrustStoreProvider,
-)
-
-try:
-    from minio import Minio
-except ImportError:  # pragma: no cover - optional dep
-    # The suppression below is required because mypy sees `Minio` as
-    # `type[Minio]` from the try-branch import; the None fallback is
-    # intentional for the optional-dep import-failure case (which only
-    # happens in degenerate build environments — minio is a real
-    # runtime dep).
-    Minio = None  # type: ignore[assignment, misc]
-
-from audittrace.services.semantic import (
-    ChromaSemanticService,
-    MockSemanticService,
-    SemanticService,
-    UserScopedSemanticService,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,80 +141,134 @@ def register_default_dependencies(settings: Settings | None = None) -> None:
     _register_memory_services(settings, pg_factory)
 
 
-def _create_minio_client(settings: Settings) -> object:
-    """Create a MinIO client. Required — there is no FS fallback (ADR-027,
-    ``feedback_storage_always_s3``).
+def _create_object_storage_provider(settings: Settings) -> object:
+    """Create the object-storage provider for episodic + procedural layers.
 
-    Wraps the bare ``Minio`` instance in
-    ``QuarantineDenyingMinioClient`` (ADR-048 PR-B2) which refuses
-    ``get_object`` calls whose key starts with ``quarantine/``. This
-    is the application-layer half of the trust-boundary enforcement;
-    PR-B7 lands the MinIO IAM split that puts ``Effect: Deny`` on
-    ``quarantine/*`` for the ``audittrace_app`` role at the
-    bucket-policy layer. Two layers of enforcement on the same
-    invariant (defense in depth).
+    Reads ``settings.object_storage_backend`` to dispatch to:
 
-    Raises ``RuntimeError`` if MinIO is not configured (missing secret key)
-    or the client fails to initialise. Layers 1 + 2 are S3-only by design;
-    a missing client is a startup-time error, not a silent degradation.
+    - **MinIO** (default): ``settings.minio_*`` fields. ``minio_secret_key``
+      MUST be non-empty (no filesystem fallback —
+      ``feedback_storage_always_s3``, 2026-05-03).
+    - **AWS S3**: ``settings.aws_region`` + ``aws_bucket`` required;
+      ``aws_use_irsa=True`` (default) means boto3 picks up
+      ``AWS_ROLE_ARN`` + ``AWS_WEB_IDENTITY_TOKEN_FILE`` from the EKS
+      pod-identity webhook (no key plumbing).
+
+    Wraps the resulting provider in
+    :class:`QuarantineDenyingObjectStorageClient` (ADR-048 PR-B2) which
+    refuses ``get_object`` calls whose key starts with ``quarantine/``.
+    Application-layer half of the trust-boundary enforcement; the
+    AWS-IAM / MinIO-IAM bucket-policy layer is the second half (PR-B7
+    precedent).
+
+    Raises :class:`RuntimeError` on misconfiguration. Startup-time
+    failure is intentional — silent degradation would let a misrouted
+    request hit anonymous storage.
     """
-    if not settings.minio_secret_key:
-        raise RuntimeError(
-            "MinIO is required for episodic + procedural memory layers. "
-            "Set AUDITTRACE_MINIO_SECRET_KEY (and AUDITTRACE_MINIO_ACCESS_KEY / "
-            "AUDITTRACE_MINIO_URL). Filesystem fallback removed in 2026-05-03 "
-            "stabilization sweep — see feedback_storage_always_s3."
-        )
-    try:
-        from urllib.parse import urlparse  # noqa: E402
+    from urllib.parse import urlparse  # noqa: E402
 
-        from audittrace.services.quarantine_guard import (  # noqa: E402
-            QuarantineDenyingMinioClient,
-        )
+    from audittrace_object_storage import (  # noqa: E402
+        ObjectStorageConfig,
+        create_provider,
+    )
 
+    from audittrace.services.quarantine_denying_provider import (  # noqa: E402
+        QuarantineDenyingObjectStorageClient,
+    )
+
+    backend = settings.object_storage_backend.lower()
+
+    if backend == "minio":
+        if not settings.minio_secret_key:
+            raise RuntimeError(
+                "MinIO backend selected but AUDITTRACE_MINIO_SECRET_KEY is empty. "
+                "Either provide the key, or switch AUDITTRACE_OBJECT_STORAGE_BACKEND "
+                "to 'aws'. Filesystem fallback removed in 2026-05-03 stabilization "
+                "sweep — see feedback_storage_always_s3."
+            )
         parsed = urlparse(settings.minio_url)
-        endpoint = parsed.netloc or parsed.path
-        secure = parsed.scheme == "https"
-        bare_client = Minio(
-            endpoint,
+        config = ObjectStorageConfig(
+            backend="minio",
+            endpoint=(parsed.netloc or parsed.path),
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
-            secure=secure,
+            secure=(parsed.scheme == "https"),
         )
-        client = QuarantineDenyingMinioClient(bare_client)
+    elif backend == "aws":
+        if not settings.aws_region or not settings.aws_bucket:
+            raise RuntimeError(
+                "AWS backend selected but AUDITTRACE_AWS_REGION or AUDITTRACE_AWS_BUCKET "
+                "is empty. Set both. With aws_use_irsa=True (default) no other secrets "
+                "are needed — boto3 resolves IRSA from the pod's ServiceAccount."
+            )
+        config = ObjectStorageConfig(
+            backend="aws",
+            region=settings.aws_region,
+            endpoint_url=settings.aws_endpoint_url or None,
+            use_irsa=settings.aws_use_irsa,
+            access_key_id=settings.aws_access_key_id or None,
+            secret_access_key=settings.aws_secret_access_key or None,
+        )
+    else:
+        raise RuntimeError(
+            f"unknown AUDITTRACE_OBJECT_STORAGE_BACKEND={backend!r}; "
+            "expected 'minio' or 'aws'."
+        )
+
+    try:
+        inner = create_provider(config)
+        wrapped = QuarantineDenyingObjectStorageClient(inner)
         logger.info(
-            "MinIO client initialised — endpoint=%s, quarantine-deny=%s",
-            endpoint,
-            client.quarantine_prefix,
+            "object-storage provider initialised — backend=%s, quarantine-deny=%s",
+            backend,
+            wrapped.quarantine_prefix,
         )
-        return client
+        return wrapped
     except Exception as exc:
         raise RuntimeError(
-            f"MinIO client initialisation failed: {exc}. "
+            f"object-storage provider initialisation failed (backend={backend}): {exc}. "
             "Layers 1+2 are S3-only — no filesystem fallback."
         ) from exc
+
+
+# Backwards-compatibility alias for one release — same behaviour as
+# the renamed function above. Drop in the follow-up PR after the grep
+# audit confirms zero non-test callers.
+_create_minio_client = _create_object_storage_provider
 
 
 @log_call(logger=logger)
 def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -> None:
     """Register all 4 memory layer services + context builder (ADR-018, ADR-027).
 
-    Layers 1 + 2 are **always S3-backed** (MinIO). There is no filesystem
-    fallback — see ``feedback_storage_always_s3``.
+    Layers 1 + 2 are **always object-store-backed** — MinIO by default
+    (laptop/homelab/k3s) or AWS S3 on EKS. The backend is selected by
+    ``settings.object_storage_backend``; no filesystem fallback
+    (``feedback_storage_always_s3``).
     """
-    minio_client = _create_minio_client(settings)
+    object_store = _create_object_storage_provider(settings)
+    effective_bucket = (
+        settings.aws_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_shared_bucket
+    )
+    container._instances["object_storage"] = object_store
 
     episodic: EpisodicService = S3EpisodicService(
-        minio_client=minio_client,
-        bucket=settings.minio_shared_bucket,
+        minio_client=object_store,
+        bucket=effective_bucket,
         prefix="episodic/",
     )
     procedural: ProceduralService = S3ProceduralService(
-        minio_client=minio_client,
-        bucket=settings.minio_shared_bucket,
+        minio_client=object_store,
+        bucket=effective_bucket,
         prefix="procedural/",
     )
-    logger.info("Memory layers 1+2: S3-backed (MinIO)")
+    logger.info(
+        "Memory layers 1+2: %s-backed (bucket=%s)",
+        settings.object_storage_backend,
+        effective_bucket,
+    )
 
     conversational = PostgresConversationalService(
         session_factory=pg_factory.get_session_factory(),
@@ -267,8 +315,8 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     trust_store_provider: TrustStoreProvider
     if settings.pdf_trust_store_provider == "s3":
         trust_store_provider = S3TrustStoreProvider(
-            minio_client=minio_client,
-            bucket=settings.minio_shared_bucket,
+            minio_client=object_store,
+            bucket=effective_bucket,
             pem_key=settings.pdf_trust_store_s3_key,
         )
     elif settings.pdf_trust_store_provider == "file":

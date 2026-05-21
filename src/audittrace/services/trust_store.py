@@ -48,6 +48,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from audittrace_object_storage import ObjectNotFoundError
+
 from audittrace.logging_config import log_call
 
 logger = logging.getLogger(__name__)
@@ -257,15 +259,12 @@ class S3TrustStoreProvider(TrustStoreProvider):
                 pem_bytes = response.read()
             with client.get_object(self._bucket, self._metadata_key) as response:
                 metadata_json = response.read().decode("utf-8")
-        except Exception as exc:
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                raise FileNotFoundError(
-                    f"trust store not provisioned at "
-                    f"s3://{self._bucket}/{self._pem_key} "
-                    f"(POST /system/trust-store/refresh to populate)"
-                ) from exc
-            raise
+        except ObjectNotFoundError as exc:
+            raise FileNotFoundError(
+                f"trust store not provisioned at "
+                f"s3://{self._bucket}/{self._pem_key} "
+                f"(POST /system/trust-store/refresh to populate)"
+            ) from exc
         import json
 
         meta_dict = json.loads(metadata_json)
@@ -309,11 +308,8 @@ class S3TrustStoreProvider(TrustStoreProvider):
         try:
             with client.get_object(self._bucket, self._metadata_key) as response:
                 metadata_json = response.read().decode("utf-8")
-        except Exception as exc:
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                return None
-            raise
+        except ObjectNotFoundError:
+            return None
         import json
 
         meta_dict = json.loads(metadata_json)

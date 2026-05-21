@@ -29,6 +29,7 @@ sqlalchemy>=2.0.25
 psycopg2-binary>=2.9.9
 redis>=5.0.0
 aio-pika>=9.4.0
+audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@v0.1.1
 minio>=7.2.0
 pymupdf>=1.24.0
 pyhanko[etsi,async-http]>=0.35.1

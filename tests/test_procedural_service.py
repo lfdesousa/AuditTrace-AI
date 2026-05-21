@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from audittrace_object_storage import ObjectNotFoundError
 
 from audittrace.services.procedural import (
     MockProceduralService,
@@ -19,12 +20,10 @@ from audittrace.services.procedural import (
 )
 
 # ── Fake MinIO client ────────────────────────────────────────────────────────
-
-
-class _FakeS3Error(Exception):
-    def __init__(self, code: str, message: str = "") -> None:
-        super().__init__(message or code)
-        self.code = code
+#
+# ADR-006: fakes raise ObjectNotFoundError (shared package) rather than
+# the old minio-shaped S3Error("NoSuchKey", ...). Matches the
+# post-ADR-006 contract that the services catch.
 
 
 class _FakeObject:
@@ -73,7 +72,7 @@ class _FakeMinio:
     def get_object(self, bucket: str, key: str) -> _FakeResponse:
         del bucket
         if key not in self._objects:
-            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+            raise ObjectNotFoundError(f"Object does not exist: {key}")
         return _FakeResponse(self._objects[key])
 
     def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
@@ -83,7 +82,7 @@ class _FakeMinio:
     def stat_object(self, bucket: str, key: str) -> object:
         del bucket
         if key not in self._objects:
-            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+            raise ObjectNotFoundError(f"Object does not exist: {key}")
         return object()
 
     def remove_object(self, bucket: str, key: str) -> None:

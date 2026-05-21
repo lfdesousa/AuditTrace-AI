@@ -190,9 +190,9 @@ class _FakeMinioClient:
 
     def get_object(self, bucket: str, key: str) -> _FakeMinioResponse:
         if (bucket, key) not in self.objects:
-            err = Exception(f"NoSuchKey: {bucket}/{key}")
-            err.code = "NoSuchKey"  # type: ignore[attr-defined]
-            raise err
+            from audittrace_object_storage import ObjectNotFoundError
+
+            raise ObjectNotFoundError(f"{bucket}/{key}")
         return _FakeMinioResponse(self.objects[(bucket, key)])
 
     def put_object(

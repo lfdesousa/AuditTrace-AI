@@ -54,11 +54,30 @@ class _FakeMinioClient:
     def remove_object(self, bucket: str, key: str) -> None:
         self.calls.append(("remove_object", (bucket, key), {}))
 
-    def list_objects(
-        self, bucket: str, prefix: str = "", recursive: bool = False
-    ) -> list:
-        self.calls.append(("list_objects", (bucket, prefix), {"recursive": recursive}))
+    def list_objects(self, bucket: str, prefix: str = "") -> list:
+        # Post-ADR-006: the ABC's list_objects no longer takes a
+        # `recursive` kwarg — recursion is the contract.
+        self.calls.append(("list_objects", (bucket, prefix), {}))
         return []
+
+    def stat_object(self, bucket: str, key: str) -> Any:
+        self.calls.append(("stat_object", (bucket, key), {}))
+        return SimpleNamespace(size=0, etag="abc")
+
+    def copy_object(
+        self,
+        src_bucket: str,
+        src_key: str,
+        dst_bucket: str,
+        dst_key: str,
+    ) -> None:
+        self.calls.append(
+            ("copy_object", (src_bucket, src_key, dst_bucket, dst_key), {})
+        )
+
+    def health_check(self) -> bool:
+        self.calls.append(("health_check", (), {}))
+        return True
 
 
 class TestQuarantineDenyingMinioClient:
@@ -103,20 +122,30 @@ class TestQuarantineDenyingMinioClient:
     def test_list_objects_delegates(self) -> None:
         inner = _FakeMinioClient()
         client = QuarantineDenyingMinioClient(inner)
-        result = client.list_objects(
-            "memory-shared", prefix="episodic/", recursive=True
-        )
+        result = client.list_objects("memory-shared", prefix="episodic/")
         assert result == []
+        assert inner.calls == [("list_objects", ("memory-shared", "episodic/"), {})]
+
+    def test_stat_object_delegates(self) -> None:
+        inner = _FakeMinioClient()
+        client = QuarantineDenyingMinioClient(inner)
+        result = client.stat_object("memory-shared", "episodic/x.md")
+        assert result.etag == "abc"
+        assert inner.calls == [("stat_object", ("memory-shared", "episodic/x.md"), {})]
+
+    def test_copy_object_delegates(self) -> None:
+        inner = _FakeMinioClient()
+        client = QuarantineDenyingMinioClient(inner)
+        client.copy_object("src-b", "src-k", "dst-b", "dst-k")
         assert inner.calls == [
-            ("list_objects", ("memory-shared", "episodic/"), {"recursive": True})
+            ("copy_object", ("src-b", "src-k", "dst-b", "dst-k"), {})
         ]
 
-    def test_arbitrary_attribute_delegated(self) -> None:
+    def test_health_check_delegates(self) -> None:
         inner = _FakeMinioClient()
-        inner.bucket_exists = lambda b: True  # type: ignore[attr-defined]
         client = QuarantineDenyingMinioClient(inner)
-        # Method that exists on inner but not on proxy — falls through __getattr__.
-        assert client.bucket_exists("memory-shared") is True
+        assert client.health_check() is True
+        assert inner.calls == [("health_check", (), {})]
 
 
 class TestPrefixValidation:
