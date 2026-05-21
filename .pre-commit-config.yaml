@@ -41,6 +41,10 @@ repos:
           # two gates agree on whether `type: ignore` comments are needed
           # (was a 2026-05-03 stabilisation pickup).
           - minio
+          # ADR-006 — audittrace-object-storage ships py.typed from
+          # v0.1.1; include it so pre-commit's mypy resolves the ABC
+          # types and downstream subclass checks succeed.
+          - audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@v0.1.1
         args: [--ignore-missing-imports]
         exclude: ^(scripts/|tests/)
 

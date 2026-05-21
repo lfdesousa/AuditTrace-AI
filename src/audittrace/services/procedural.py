@@ -16,6 +16,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from audittrace_object_storage import ObjectNotFoundError
 from langchain_core.documents import Document
 
 from audittrace.identity import UserContext
@@ -170,10 +171,11 @@ class S3ProceduralService(ProceduralService):
         try:
             with client.get_object(self._bucket, key) as response:
                 content = response.read().decode("utf-8")
+        except ObjectNotFoundError:
+            return None
         except Exception as exc:
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                return None
+            # Network / auth / transient — preserved dual-arm behaviour
+            # so a backend hiccup does NOT surface as a 500 to the caller.
             logger.warning("S3ProceduralService.read(%r) failed: %s", file, exc)
             return None
         return Document(
@@ -220,10 +222,9 @@ class S3ProceduralService(ProceduralService):
         key = f"{self._prefix}{file}"
         try:
             client.stat_object(self._bucket, key)
+        except ObjectNotFoundError:
+            return False
         except Exception as exc:
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                return False
             logger.warning(
                 "S3ProceduralService.delete(%r): stat failed (%s) — "
                 "attempting remove regardless",

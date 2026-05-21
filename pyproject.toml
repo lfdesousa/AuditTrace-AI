@@ -48,6 +48,13 @@ dependencies = [
     # (PR-B3 ScanRequestPublisher + PR-B4 verdict/audit consumers).
     # ADR-046 chat persistence stays on redis-py via Redis Streams.
     "aio-pika>=9.4.0",
+    # ADR-006 — shared object-storage abstraction. v0.1.0 ships
+    # S3ObjectStorageProvider ABC + MinIO + AWS S3 backends (IRSA-native
+    # via botocore's default credential chain). `minio` stays as a direct
+    # dep because the shared package re-uses it for the MinIO backend AND
+    # for graceful migration of the existing call sites — drop it in a
+    # follow-up once the grep audit confirms zero direct references.
+    "audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@v0.1.1",
     "minio>=7.2.0",
     "pymupdf>=1.24.0",
     # pyhanko: PAdES / PDF signature validation (gap-inventory item #12).

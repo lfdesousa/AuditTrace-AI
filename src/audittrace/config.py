@@ -122,14 +122,34 @@ class Settings(BaseSettings):
     # prompt eval + any genuine upstream hang.
     sse_keepalive_interval: int = 15  # seconds — SSE keep-alive interval (ADR-034)
 
-    # MinIO / S3 object storage (ADR-027) — replaces filesystem bind mounts.
-    # When minio_secret_key is non-empty, S3*Services activate and read from
-    # MinIO buckets. When empty, File*Services use the filesystem paths above.
+    # Object storage (ADR-027 + ADR-006) — replaces filesystem bind mounts.
+    #
+    # ``object_storage_backend`` selects the backend at startup; the factory
+    # in ``audittrace.dependencies`` dispatches to either
+    # :class:`MinIOObjectStorageProvider` (default, laptop/homelab/k3s) or
+    # :class:`AWSObjectStorageProvider` (EKS, IRSA-native).
+    #
+    # MinIO path: requires ``minio_secret_key`` (else fail fast at startup).
+    # AWS path: requires ``aws_region`` + ``aws_bucket``;
+    # ``aws_use_irsa=True`` (default) means boto3 reads
+    # ``AWS_ROLE_ARN`` + ``AWS_WEB_IDENTITY_TOKEN_FILE`` from the
+    # EKS pod-identity webhook — no key plumbing needed.
+    #
+    # No filesystem fallback (``feedback_storage_always_s3``, 2026-05-03).
+    object_storage_backend: str = "minio"  # "minio" | "aws"
+    # MinIO fields (legacy names preserved for backwards compatibility)
     minio_url: str = "http://localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = ""
     minio_shared_bucket: str = "memory-shared"
     minio_private_bucket: str = "memory-private"
+    # AWS S3 fields (used only when object_storage_backend = "aws")
+    aws_region: str = ""
+    aws_bucket: str = ""  # When set, overrides minio_shared_bucket for AWS path
+    aws_endpoint_url: str = ""  # Optional — for S3-compatible non-AWS endpoints
+    aws_use_irsa: bool = True
+    aws_access_key_id: str = ""  # Only when aws_use_irsa=False
+    aws_secret_access_key: str = ""  # Only when aws_use_irsa=False
 
     # ─────────────── ADR-025 — memory-as-tools ──────────────────────────────
     # Kill switch (§Decision.4). During the rollout the default is the legacy

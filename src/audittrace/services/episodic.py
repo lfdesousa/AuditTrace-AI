@@ -17,6 +17,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from audittrace_object_storage import ObjectNotFoundError
 from langchain_core.documents import Document
 
 from audittrace.identity import UserContext
@@ -185,10 +186,11 @@ class S3EpisodicService(EpisodicService):
         try:
             with client.get_object(self._bucket, key) as response:
                 content = response.read().decode("utf-8")
-        except Exception as exc:  # MinIO raises S3Error on missing/etc
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                return None
+        except ObjectNotFoundError:
+            return None
+        except Exception as exc:
+            # Network / auth / transient — preserved dual-arm behaviour
+            # so a backend hiccup does NOT surface as a 500 to the caller.
             logger.warning("S3EpisodicService.read(%r) failed: %s", file, exc)
             return None
         return Document(
@@ -238,10 +240,9 @@ class S3EpisodicService(EpisodicService):
         # but we want the explicit signal back to the caller.
         try:
             client.stat_object(self._bucket, key)
+        except ObjectNotFoundError:
+            return False
         except Exception as exc:
-            code = getattr(exc, "code", "")
-            if code == "NoSuchKey":
-                return False
             # On any other stat failure, attempt the delete anyway; if
             # it succeeds we return True, else propagate.
             logger.warning(

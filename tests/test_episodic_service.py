@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from audittrace_object_storage import ObjectNotFoundError
 
 from audittrace.services.episodic import (
     EpisodicService,
@@ -23,14 +24,13 @@ from audittrace.services.episodic import (
 )
 
 # ── Fake MinIO client ────────────────────────────────────────────────────────
-
-
-class _FakeS3Error(Exception):
-    """Stand-in for ``minio.error.S3Error`` — only the ``code`` attribute matters."""
-
-    def __init__(self, code: str, message: str = "") -> None:
-        super().__init__(message or code)
-        self.code = code
+#
+# ADR-006 migration note: the four services now catch
+# :class:`ObjectNotFoundError` (from the shared package), NOT the
+# old minio-shaped ``S3Error`` with ``.code == "NoSuchKey"``. The
+# fakes below were updated to raise ``ObjectNotFoundError`` to match
+# the post-ADR-006 contract. The class shape + bucket-agnostic
+# storage is otherwise preserved.
 
 
 class _FakeObject:
@@ -86,7 +86,7 @@ class _FakeMinio:
     def get_object(self, bucket: str, key: str) -> _FakeResponse:
         del bucket
         if key not in self._objects:
-            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+            raise ObjectNotFoundError(f"Object does not exist: {key}")
         return _FakeResponse(self._objects[key])
 
     def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
@@ -96,7 +96,7 @@ class _FakeMinio:
     def stat_object(self, bucket: str, key: str) -> object:
         del bucket
         if key not in self._objects:
-            raise _FakeS3Error("NoSuchKey", f"Object does not exist: {key}")
+            raise ObjectNotFoundError(f"Object does not exist: {key}")
         return object()  # opaque "exists" sentinel
 
     def remove_object(self, bucket: str, key: str) -> None:

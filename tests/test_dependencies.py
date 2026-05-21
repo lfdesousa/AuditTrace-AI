@@ -85,8 +85,14 @@ def test_register_default_dependencies_no_pg(monkeypatch):
         "HTTPChromaDBFactory",
         lambda url, token=None: MockChromaDBFactory(),
     )
-    # MinIO is mandatory — stub the client creation so this test doesn't need
-    # a real MinIO server.
+    # Object storage is mandatory (ADR-006 + ADR-027); stub the factory
+    # so this test doesn't need a real backend. Patch the canonical name
+    # AND the back-compat alias to be safe.
+    monkeypatch.setattr(
+        deps_module,
+        "_create_object_storage_provider",
+        lambda settings: object(),
+    )
     monkeypatch.setattr(deps_module, "_create_minio_client", lambda settings: object())
 
     settings = Settings(chroma_url="http://localhost:8000")
@@ -118,7 +124,7 @@ def test_register_default_dependencies_raises_when_minio_missing(monkeypatch):
     deps_module.container = deps_module.DependencyContainer()
 
     settings = Settings(chroma_url="http://localhost:8000", minio_secret_key="")
-    with pytest.raises(RuntimeError, match="MinIO is required"):
+    with pytest.raises(RuntimeError, match="AUDITTRACE_MINIO_SECRET_KEY"):
         register_default_dependencies(settings)
 
 

@@ -515,26 +515,38 @@ class TestChunking:
 
 
 class TestGetMinioClient:
-    """Cover the _get_minio_client factory function."""
+    """Cover the _get_minio_client helper.
 
-    def test_creates_minio_client(self) -> None:
+    Post-ADR-006 the helper returns the DI-container's singleton
+    object-storage provider, with a fallback that builds one on demand
+    via the shared factory. The Minio class is no longer imported in
+    routes/memory.py.
+    """
+
+    def test_returns_cached_provider_from_container(self) -> None:
+        from audittrace.dependencies import container
         from audittrace.routes.memory import _get_minio_client
 
-        with patch("audittrace.routes.memory.get_settings") as mock_gs:
-            mock_gs.return_value = MagicMock(
-                minio_url="http://minio:9000",
-                minio_access_key="key",
-                minio_secret_key="secret",
-            )
-            with patch("audittrace.routes.memory.Minio") as mock_minio:
-                mock_minio.return_value = MagicMock()
-                _get_minio_client()
-                mock_minio.assert_called_once_with(
-                    "minio:9000",
-                    access_key="key",
-                    secret_key="secret",
-                    secure=False,
-                )
+        sentinel = object()
+        container._instances["object_storage"] = sentinel
+        try:
+            assert _get_minio_client() is sentinel
+        finally:
+            container._instances.pop("object_storage", None)
+
+    def test_falls_back_to_factory_when_container_empty(self) -> None:
+        from audittrace.dependencies import container
+        from audittrace.routes.memory import _get_minio_client
+
+        # Ensure the container has no cached provider.
+        container._instances.pop("object_storage", None)
+
+        fake_provider = object()
+        with patch(
+            "audittrace.dependencies._create_object_storage_provider",
+            return_value=fake_provider,
+        ):
+            assert _get_minio_client() is fake_provider
 
 
 # ── index error-path tests ──────────────────────────────────────────────────
@@ -608,13 +620,21 @@ class TestIndexErrorPaths:
         assert response.status_code == 200
         assert response.json()["collections"]["skills"] == 0
 
-    def test_list_objects_uses_recursive_listing(self, client: TestClient) -> None:
-        """MinIO's default ``list_objects`` returns only direct
-        children of *prefix*. Nested files (the ai_research_papers
-        corpus stores PDFs at e.g. ``episodic/papers/books/foo.pdf``)
-        would silently return zero objects without ``recursive=True``.
-        Caught live 2026-05-06: a /memory/index?collections=ai_research_papers
-        returned 0 chunks even though 13 PDFs were sitting in MinIO."""
+    def test_list_objects_walks_full_subtree(self, client: TestClient) -> None:
+        """Post-ADR-006: the ABC contract for ``list_objects`` GUARANTEES
+        full-subtree walking; the legacy ``recursive=True`` kwarg is no
+        longer accepted (or needed) by the provider. The MinIO backend
+        passes ``recursive=True`` internally to minio-py; the AWS backend
+        uses the boto3 paginator which is naturally recursive. So this
+        test now asserts that the route DOES NOT pass ``recursive=``
+        explicitly (would TypeError on the new ABC) and the call still
+        succeeds — proving the contract is upstream of the route.
+
+        Caught live 2026-05-06: pre-ADR-006 the route had to pass
+        ``recursive=True``; ai_research_papers corpus PDFs at
+        ``episodic/papers/books/foo.pdf`` would otherwise silently
+        return zero objects.
+        """
         mock_minio = MagicMock()
         mock_minio.list_objects.return_value = []
         mock_chroma = MagicMock()
@@ -632,12 +652,13 @@ class TestIndexErrorPaths:
         ):
             client.post("/memory/index", params={"collections": "decisions"})
 
-        # Every list_objects call must request recursive listing.
+        # The route must NOT pass `recursive=` — the ABC's contract
+        # guarantees recursion. Any explicit kwarg would crash on AWS.
         assert mock_minio.list_objects.call_count >= 1
         for call in mock_minio.list_objects.call_args_list:
-            assert call.kwargs.get("recursive") is True, (
-                f"non-recursive list_objects call: {call!r}. "
-                "Nested files (papers/, etc.) will be silently skipped."
+            assert "recursive" not in call.kwargs, (
+                f"route passed recursive= explicitly: {call!r}. "
+                "Drop it — the ABC handles recursion contractually."
             )
 
     def test_index_rejects_unknown_collection(self, client: TestClient) -> None:

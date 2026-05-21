@@ -34,7 +34,6 @@ import logging
 import time
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -48,8 +47,10 @@ from fastapi import (
     Security,
     UploadFile,
 )
-from minio import Minio
 
+# ADR-006 — direct ``minio.Minio`` import removed; routes/memory.py
+# now consumes the ABC-shaped provider from the DI container via
+# :func:`_get_minio_client`.
 from audittrace.auth import require_user, validate_jwt
 from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
@@ -172,21 +173,27 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
 
 
 def _get_minio_client() -> Any:
-    """Build a MinIO client from the configured settings.
+    """Return the singleton object-storage provider from the DI container.
 
-    Uses the same pattern as ``dependencies._create_minio_client`` but
-    always returns a client (raises on failure rather than returning None).
+    Post-ADR-006: returns the ``S3ObjectStorageProvider`` (MinIO OR AWS
+    S3 backend, transparently — selected by
+    ``AUDITTRACE_OBJECT_STORAGE_BACKEND``). Wrapped in
+    ``QuarantineDenyingObjectStorageClient`` so any quarantine/* GET
+    fires the defense-in-depth denial.
+
+    Keeps the legacy function name so existing call sites in this file
+    (the routes layer) don't need rewiring within this PR.
+
+    Falls back to a freshly-constructed provider if the DI container
+    has not yet been initialised (e.g. test isolation) — the call site
+    behaviour is preserved.
     """
-    settings = get_settings()
-    parsed = urlparse(settings.minio_url)
-    endpoint = parsed.netloc or parsed.path
-    secure = parsed.scheme == "https"
-    return Minio(
-        endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=secure,
-    )
+    from audittrace.dependencies import _create_object_storage_provider, container
+
+    cached = container._instances.get("object_storage")
+    if cached is not None:
+        return cached
+    return _create_object_storage_provider(get_settings())
 
 
 def _list_objects_from_minio(
@@ -196,16 +203,14 @@ def _list_objects_from_minio(
 
     Returns a list of ``{"key": ..., "filename": ...}`` dicts.
 
-    ``recursive=True`` walks the full subtree. Without it, MinIO's
-    default returns only direct children of *prefix*, hiding files
-    in subdirectories. The pre-existing .md corpus was flat
-    (``episodic/ADR-NNN.md``) and got away with non-recursive
-    listing; the ai_research_papers corpus uses nested paths
-    (``episodic/papers/books/foo.pdf``) and would otherwise return
-    zero objects (caught live, 2026-05-06).
+    The ABC's ``list_objects`` paginates AND recurses transparently
+    (MinIO backend uses ``recursive=True``; boto3 paginator walks every
+    page). Before ADR-006 this helper also passed ``recursive=True``
+    explicitly to the minio-py client; that kwarg no longer exists on
+    the ABC because the contract guarantees full-subtree walking.
     """
     objects: list[dict[str, str]] = []
-    for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+    for obj in client.list_objects(bucket, prefix=prefix):
         key = obj.object_name or ""
         filename = key.rsplit("/", 1)[-1] if "/" in key else key
         if filename:
@@ -329,7 +334,14 @@ async def upload_memory_file(
         return body
 
     # ── Legacy synchronous path (markdown, etc.) ────────────────
-    bucket = settings.minio_shared_bucket
+    # ADR-006 — effective bucket switches between MinIO (default) and
+    # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
+    # variable name in settings is kept for backwards compatibility.
+    bucket = (
+        settings.aws_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_shared_bucket
+    )
     key = f"{layer.value}/{target_filename}"
 
     try:
@@ -552,7 +564,14 @@ def index_memory(
         )
 
     settings = get_settings()
-    bucket = settings.minio_shared_bucket
+    # ADR-006 — effective bucket switches between MinIO (default) and
+    # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
+    # variable name in settings is kept for backwards compatibility.
+    bucket = (
+        settings.aws_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_shared_bucket
+    )
     minio_client = _get_minio_client()
     chroma_client = get_chromadb()
 
