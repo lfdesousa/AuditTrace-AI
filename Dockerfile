@@ -3,6 +3,14 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
+# git is required to fetch the audittrace-object-storage shared
+# package (ADR-006) from its git+https URL pin. Apt-cache cleanup
+# inline so the layer stays small; the runtime stage does not carry
+# git (the shared package is installed into /root/.local in this
+# stage and copied across).
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install from the locked requirements file so the image always matches
 # pyproject.toml. The previous hard-coded list silently omitted
 # opentelemetry-instrumentation-fastapi + opentelemetry-instrumentation-logging,
