@@ -79,8 +79,38 @@ spec:
               value: "http://{{ .Release.Name }}-chromadb:8000"
             - name: AUDITTRACE_REDIS_URL
               value: "redis://{{ .Release.Name }}-redis-master:6379/0"
+            # ── Object storage (ADR-006) — backend selector + per-backend envs ──
+            - name: AUDITTRACE_OBJECT_STORAGE_BACKEND
+              value: {{ include "audittrace.objectStorageBackend" . | quote }}
+            {{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}
             - name: AUDITTRACE_MINIO_URL
               value: "http://{{ .Release.Name }}-minio:9000"
+            - name: AUDITTRACE_MINIO_SHARED_BUCKET
+              value: {{ .Values.objectStorage.minio.sharedBucket | quote }}
+            - name: AUDITTRACE_MINIO_PRIVATE_BUCKET
+              value: {{ .Values.objectStorage.minio.privateBucket | quote }}
+            {{- else if eq (include "audittrace.objectStorageBackend" .) "aws" }}
+            - name: AUDITTRACE_AWS_REGION
+              value: {{ .Values.objectStorage.aws.region | quote }}
+            - name: AUDITTRACE_AWS_BUCKET
+              value: {{ .Values.objectStorage.aws.bucket | quote }}
+            {{- if .Values.objectStorage.aws.endpointUrl }}
+            - name: AUDITTRACE_AWS_ENDPOINT_URL
+              value: {{ .Values.objectStorage.aws.endpointUrl | quote }}
+            {{- end }}
+            - name: AUDITTRACE_AWS_USE_IRSA
+              value: {{ .Values.objectStorage.aws.useIRSA | quote }}
+            # The static-key envs are emitted only when useIRSA=false
+            # (out-of-EKS testing). In production useIRSA=true and boto3's
+            # default credential chain reads the EKS-injected
+            # AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN env vars instead.
+            {{- if not .Values.objectStorage.aws.useIRSA }}
+            - name: AUDITTRACE_AWS_ACCESS_KEY_ID
+              value: {{ .Values.objectStorage.aws.accessKeyId | quote }}
+            - name: AUDITTRACE_AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.objectStorage.aws.secretAccessKey | quote }}
+            {{- end }}
+            {{- end }}
             - name: AUDITTRACE_KEYCLOAK_ISSUER
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL
@@ -127,10 +157,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-redis
                   key: redis-password
+            {{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}
             # ADR-048 PR-B8 — MinIO ACCESS + SECRET sourced from the
             # IAM-split Secret (audittrace_app user, parser-exploit
             # close per ADR-048 Decision rule §1). The Bitnami root
             # creds are no longer the memory-server's MinIO identity.
+            # ADR-006 — only rendered when objectStorage.backend=minio.
+            # When backend=aws the AWS_* envs above carry the credential
+            # path (IRSA or static), and there is no MinIO Secret to ref.
             - name: AUDITTRACE_MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -141,6 +175,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-minio-iam
                   key: audittrace_app_password
+            {{- end }}
             {{- end }}
             # vault.enabled=true branch — MinIO ACCESS/SECRET keys are
             # exported by Vault Agent into /vault/secrets/env (see the

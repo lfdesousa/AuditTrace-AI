@@ -124,6 +124,40 @@ http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-conne
 {{- end }}
 
 {{/*
+Object-storage backend selector (ADR-006). Returns "minio" or "aws".
+Anything else fails `objectStorageAssertAws` below.
+*/}}
+{{- define "audittrace.objectStorageBackend" -}}
+{{- default "minio" .Values.objectStorage.backend -}}
+{{- end -}}
+
+{{/*
+Assert the AWS-backend required fields when objectStorage.backend=aws.
+Called from NOTES.txt so it fires on every helm template / install /
+upgrade — fail-fast with a clear diagnostic instead of leaving the
+operator with an unrenderable Deployment template downstream.
+*/}}
+{{- define "audittrace.objectStorageAssertAws" -}}
+{{- $backend := include "audittrace.objectStorageBackend" . -}}
+{{- if and (ne $backend "minio") (ne $backend "aws") -}}
+  {{- fail (printf "objectStorage.backend=%q is invalid. Accepted values: \"minio\", \"aws\" (ADR-006)." $backend) -}}
+{{- end -}}
+{{- if eq $backend "aws" -}}
+  {{- if not .Values.objectStorage.aws.region -}}
+    {{- fail "objectStorage.backend=aws but objectStorage.aws.region is empty. Set it to the AWS region the bucket lives in (e.g. eu-central-2). ADR-006." -}}
+  {{- end -}}
+  {{- if not .Values.objectStorage.aws.bucket -}}
+    {{- fail "objectStorage.backend=aws but objectStorage.aws.bucket is empty. Set it to the Terraform-provisioned bucket name. ADR-006." -}}
+  {{- end -}}
+  {{- if not .Values.objectStorage.aws.useIRSA -}}
+    {{- if or (not .Values.objectStorage.aws.accessKeyId) (not .Values.objectStorage.aws.secretAccessKey) -}}
+      {{- fail "objectStorage.aws.useIRSA=false requires objectStorage.aws.accessKeyId AND objectStorage.aws.secretAccessKey to be set. In production prefer useIRSA=true (default) so EKS injects credentials via STS-via-AssumeRoleWithWebIdentity. ADR-006." -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Vault Agent Injector annotations — memory-server (ADR-043 §4).
 Emits /vault/secrets/env as shell-sourceable exports for the four
 secret-sourced env vars the memory-server consumes (postgres URL,
@@ -152,6 +186,7 @@ vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
   export AUDITTRACE_CHROMA_TOKEN='{{ "{{ .Data.data.token }}" }}'
   {{ "{{ end }}" }}
+  {{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}
   {{ "{{ with secret \"kv/data/audittrace/minio/audittrace_app\" }}" }}
   # ADR-048 PR-B8 — memory-server's MinIO client uses the scoped
   # `audittrace_app` user (not root). The IAM policy attached to this
@@ -160,6 +195,11 @@ vault.hashicorp.com/agent-inject-template-env: |
   export AUDITTRACE_MINIO_ACCESS_KEY='{{ "{{ .Data.data.username }}" }}'
   export AUDITTRACE_MINIO_SECRET_KEY='{{ "{{ .Data.data.password }}" }}'
   {{ "{{ end }}" }}
+  {{- end }}
+  # ADR-006 — when objectStorage.backend=aws the MinIO secret block above
+  # is skipped; boto3's default credential chain resolves STS-via-
+  # AssumeRoleWithWebIdentity from the EKS IRSA env vars instead. No
+  # Vault MinIO secret is needed because there is no MinIO running.
   # ADR-057 / PR-B8 — AUDITTRACE_RABBITMQ_PASSWORD + AUDITTRACE_SCAN_AMQP_URL
   # are sourced from the Bitnami subchart's `<release>-rabbitmq` Secret
   # via plain secretKeyRef + $() expansion in the deployment template

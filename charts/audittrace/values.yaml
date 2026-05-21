@@ -107,6 +107,16 @@ memoryServer:
   serviceAccount:
     create: true
     name: memory-server
+    # Annotations applied to the memory-server ServiceAccount. Empty
+    # default keeps in-cluster MinIO deployments unaffected. When
+    # objectStorage.backend=aws, the operator MUST set:
+    #   annotations:
+    #     eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<role>
+    # so the EKS IRSA webhook resolves boto3's default credential
+    # chain to STS-via-AssumeRoleWithWebIdentity. Deployment-side
+    # Terraform late-binds the role ARN through values overlay so the
+    # chart doesn't hardcode account numbers. ADR-006 §Deployment-side.
+    annotations: {}
   port: 8765
   resources:
     requests:
@@ -142,8 +152,10 @@ memoryServer:
     # bounds initial prompt eval + any genuine upstream hang.
     AUDITTRACE_LLAMA_CHUNK_TIMEOUT: "600"
     AUDITTRACE_SSE_KEEPALIVE_INTERVAL: "15"
-    AUDITTRACE_MINIO_SHARED_BUCKET: "memory-shared"
-    AUDITTRACE_MINIO_PRIVATE_BUCKET: "memory-private"
+    # AUDITTRACE_MINIO_SHARED_BUCKET + AUDITTRACE_MINIO_PRIVATE_BUCKET
+    # moved to objectStorage.minio.{sharedBucket,privateBucket} so they
+    # only render when objectStorage.backend=minio. When backend=aws,
+    # AUDITTRACE_AWS_BUCKET takes their place — see objectStorage below.
     AUDITTRACE_TOOLS_CONFIG_PATH: "tools.toml"
     # CORS allowed-origins for the FastAPI middleware. JSON array literal —
     # parsed by pydantic-settings into ``list[str]``. Empty list disables
@@ -205,6 +217,54 @@ memoryServer:
     # so operators cannot accidentally override the service.version
     # token to something stale — bumping pyproject + Chart.yaml is
     # the single source of truth.
+
+# -- Object storage (ADR-006) ------------------------------------------------
+# Backend selector for memory layers 1 + 2. Defaults to in-cluster MinIO
+# so single-node / laptop deployments work out-of-the-box. AWS S3 (boto3
+# via IRSA) is selected with objectStorage.backend=aws — the chart skips
+# the MinIO StatefulSet / Service / bucket-init Job entirely and wires
+# the memory-server's env to AWS_* settings instead. The in-tree MinIO
+# subchart block (below at `minio:`) stays so backend=minio remains a
+# zero-edit default. See ADR-006 + audittrace-object-storage v0.1.1.
+objectStorage:
+  # "minio" (default — in-cluster MinIO StatefulSet) or "aws" (boto3 against
+  # AWS S3 or any S3-compatible endpoint). Anything else fails the
+  # NOTES.txt assertion.
+  backend: "minio"
+
+  # MinIO-backend settings. Bucket names previously lived in
+  # memoryServer.env; they moved here so the rendered Deployment only
+  # carries them when backend=minio.
+  minio:
+    sharedBucket: "memory-shared"
+    privateBucket: "memory-private"
+
+  # AWS-backend settings. Required when backend=aws.
+  aws:
+    # Terraform-provisioned bucket name, e.g.
+    # `audittrace-loadtest-objects-243107681235-eu-central-2`. ADR-006
+    # §Deployment-side. Empty string + backend=aws fails the
+    # NOTES.txt assertion to keep the error loud.
+    bucket: ""
+    # AWS region the bucket lives in (e.g. "eu-central-2"). Required
+    # when backend=aws.
+    region: ""
+    # Optional S3-compatible endpoint override. Leave empty for AWS S3.
+    # Set when targeting OVH Object Storage / MinIO-as-AWS / LocalStack.
+    endpointUrl: ""
+    # IRSA-native auth. boto3's default credential chain resolves
+    # `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` automatically when
+    # the EKS IRSA webhook injects them on pods carrying the
+    # `eks.amazonaws.com/role-arn` ServiceAccount annotation (wired via
+    # memoryServer.serviceAccount.annotations). No static keys needed
+    # in production. ADR-006.
+    useIRSA: true
+    # Only used when useIRSA=false (out-of-EKS testing / LocalStack /
+    # moto). Production deployments leave these empty; the operator
+    # is responsible for delivering them via Vault Agent or external-
+    # secrets if they ever flip useIRSA off.
+    accessKeyId: ""
+    secretAccessKey: ""
 
 # -- External LLM (FQDN-resolved out-of-cluster host) ------------------------
 # The chart renders one `Service kind=ExternalName` per port (chat / embed /

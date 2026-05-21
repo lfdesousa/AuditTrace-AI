@@ -33,7 +33,7 @@
        memory-server itself becomes the scan-request producer.
        Crash-window between PUT and XADD is recoverable via
        idempotent retry on the upload route (same SHA → same scan_id). */ -}}
-{{- if .Values.minio.enabled }}
+{{- if eq (include "audittrace.objectStorageBackend" .) "minio" }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -99,7 +99,7 @@ spec:
             - name: MINIO_ACCESS_KEY
               value: "minioadmin"
             - name: SHARED_BUCKET
-              value: {{ .Values.memoryServer.env.AUDITTRACE_MINIO_SHARED_BUCKET | default "memory-shared" | quote }}
+              value: {{ .Values.objectStorage.minio.sharedBucket | default "memory-shared" | quote }}
             # Root password — sourced from the Bitnami Secret. Renders
             # under both vault.enabled branches because PR-B8 dropped
             # the gate on secret-minio-iam.yaml; secret-minio.yaml is

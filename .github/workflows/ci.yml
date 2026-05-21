@@ -216,6 +216,116 @@ jobs:
             --set observability.external.tempoHost=tempo.test.invalid \
             --set observability.external.lokiHost=loki.test.invalid
 
+      # ADR-006 — second matrix axis: objectStorage.backend=aws. The MinIO
+      # StatefulSet / Service / bucket-init Job MUST NOT render under this
+      # branch. Both vault.enabled paths covered so the vault-annotation
+      # gate (no MinIO secret block when backend=aws) also lints clean.
+      - name: helm lint (objectStorage.backend=aws — vault.enabled=true)
+        run: |
+          helm lint charts/audittrace \
+            --set vault.enabled=true \
+            --set objectStorage.backend=aws \
+            --set objectStorage.aws.region=eu-central-2 \
+            --set objectStorage.aws.bucket=audittrace-loadtest-objects-ci \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid
+
+      - name: helm lint (objectStorage.backend=aws — vault.enabled=false)
+        run: |
+          helm lint charts/audittrace \
+            --set vault.enabled=false \
+            --set objectStorage.backend=aws \
+            --set objectStorage.aws.region=eu-central-2 \
+            --set objectStorage.aws.bucket=audittrace-loadtest-objects-ci \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid
+
+      - name: helm template (backend=aws asserts MinIO templates skip + AWS envs present)
+        # ADR-006 acceptance criterion — when backend=aws the chart must
+        # render NO `*-minio` StatefulSet/Service/Job and the memory-server
+        # Deployment must carry AUDITTRACE_AWS_BUCKET + region (and NOT
+        # AUDITTRACE_MINIO_URL). Regression for backend=minio leak.
+        run: |
+          helm template audittrace charts/audittrace -n audittrace \
+            --set vault.enabled=false \
+            --set objectStorage.backend=aws \
+            --set objectStorage.aws.region=eu-central-2 \
+            --set objectStorage.aws.bucket=audittrace-loadtest-objects-ci \
+            --set secrets.chromadb.token=ci-test \
+            --set secrets.keycloak.adminPassword=ci-test \
+            --set secrets.postgres.appPassword=ci-test \
+            --set secrets.postgres.password=ci-test \
+            --set secrets.redis.password=ci-test \
+            --set secrets.summariser.password=ci-test \
+            --set externalLLM.host=llm.test.invalid \
+            --set observability.external.langfuseHost=langfuse.test.invalid \
+            --set observability.external.tempoHost=tempo.test.invalid \
+            --set observability.external.lokiHost=loki.test.invalid \
+            > /tmp/helm-rendered-aws.yaml
+          # No MinIO templates may render when backend=aws.
+          if grep -E '^kind: (StatefulSet|Job|Service)$' -A2 /tmp/helm-rendered-aws.yaml | grep -E 'name: audittrace-minio'; then
+            echo "::error::backend=aws leaked a MinIO template into the rendered output (StatefulSet/Service/Job named *-minio)"
+            exit 1
+          fi
+          # AUDITTRACE_AWS_BUCKET must be present on the memory-server Deployment.
+          if ! grep -q "name: AUDITTRACE_AWS_BUCKET" /tmp/helm-rendered-aws.yaml; then
+            echo "::error::backend=aws but AUDITTRACE_AWS_BUCKET env not present on rendered Deployment"
+            exit 1
+          fi
+          # AUDITTRACE_MINIO_URL must NOT be present.
+          if grep -q "name: AUDITTRACE_MINIO_URL" /tmp/helm-rendered-aws.yaml; then
+            echo "::error::backend=aws but AUDITTRACE_MINIO_URL still rendered (cleanup gate missing)"
+            exit 1
+          fi
+          echo "backend=aws rendering clean — no MinIO leak, AWS envs wired"
+
+      # ADR-006 — assert backend=aws fails fast when required fields are
+      # missing (region / bucket). Catches operator misconfiguration at
+      # `helm template` time instead of letting the pod boot loop on a
+      # broken settings load.
+      - name: helm template (backend=aws missing region — must fail with clear diag)
+        run: |
+          if helm template audittrace charts/audittrace -n audittrace \
+              --set vault.enabled=false \
+              --set objectStorage.backend=aws \
+              --set objectStorage.aws.bucket=audittrace-loadtest-objects-ci \
+              --set secrets.chromadb.token=ci-test \
+              --set secrets.keycloak.adminPassword=ci-test \
+              --set secrets.postgres.appPassword=ci-test \
+              --set secrets.postgres.password=ci-test \
+              --set secrets.redis.password=ci-test \
+              --set secrets.summariser.password=ci-test \
+              --set externalLLM.host=llm.test.invalid \
+              --set observability.external.langfuseHost=langfuse.test.invalid \
+              --set observability.external.tempoHost=tempo.test.invalid \
+              --set observability.external.lokiHost=loki.test.invalid \
+              > /tmp/helm-missing-region.yaml 2>/tmp/helm-missing-region.err; then
+            echo "::error::helm template should have FAILED for missing objectStorage.aws.region but rendered"
+            exit 1
+          fi
+          grep -q "objectStorage.aws.region is empty" /tmp/helm-missing-region.err || {
+            echo "::error::fail message did not mention objectStorage.aws.region"
+            cat /tmp/helm-missing-region.err
+            exit 1
+          }
+          echo "backend=aws missing-region fail-fast OK"
+
       - name: helm template (assert renders cleanly + contains vaultSecretFileGuard)
         # Renders the chart and grep-asserts the 2026-05-03 guard helper
         # is present in the args of every workload that sources
