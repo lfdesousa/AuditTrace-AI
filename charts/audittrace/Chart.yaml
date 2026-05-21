@@ -2,10 +2,15 @@ apiVersion: v2
 name: audittrace
 description: AuditTrace-AI — audit-trail-first memory augmentation platform
 type: application
-version: 1.2.1
+version: 1.3.0
 # appVersion MUST track pyproject.toml::version. Pinned by
 # tests/test_version_drift.py (ADR-055 — single chart-side source
 # for runtime observability + k8s labels + OTEL service.version).
+# NB: helm chart `version:` (above) is decoupled from `appVersion:` —
+# v1.3.0 of the chart introduces the `objectStorage` backend selector
+# (ADR-006) without bumping the app image. Python at 1.2.1 already
+# honours AUDITTRACE_OBJECT_STORAGE_BACKEND (defaults to "minio";
+# behaviour byte-identical to v1.2.1 when objectStorage.backend=minio).
 appVersion: "1.2.1"
 keywords:
   - ai
