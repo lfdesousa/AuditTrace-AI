@@ -195,6 +195,14 @@ class PostgresConversationalService(ConversationalService):
         ``load_sessions`` calls for the same user see it, and with the
         caller-supplied ``session_id`` so the ADR-030 hybrid-recall join
         (SessionRecord.id == InteractionRecord.session_id) lines up.
+
+        Idempotent on ``session_id`` (primary key) — re-calling with the
+        same id updates the existing row's summary/key_points/date in
+        place. This matches the Bruno collection contract documented in
+        ``session/01-save-session.bru`` ("Re-running with the same
+        session_id is idempotent (UPSERT)") and is required so the
+        background summariser (ADR-030) can revise its draft for an
+        ongoing session without crashing on the second pass.
         """
         with self._session_factory() as session:
             try:
@@ -207,7 +215,13 @@ class PostgresConversationalService(ConversationalService):
                     model="sovereign-memory",
                     user_id=user_context.user_id,
                 )
-                session.add(record)
+                # session.merge() is SQLAlchemy ORM's PK-based UPSERT:
+                # if a row with this id exists, copy the new field values
+                # onto it; otherwise insert. Replaces the previous bare
+                # session.add() which 500'd on the second call with
+                # IntegrityError: duplicate key value violates unique
+                # constraint "sessions_pkey".
+                session.merge(record)
                 session.commit()
                 return session_id
             except Exception:
