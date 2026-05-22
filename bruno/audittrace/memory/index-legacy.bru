@@ -21,7 +21,13 @@ tests {
   test("returns per-collection chunk counts", function() {
     const body = res.getBody();
     expect(body.collections).to.be.an("object");
-    expect(body.elapsed_seconds).to.be.a("number");
+    // Server returns `duration_s` (seconds, float). The earlier
+    // `elapsed_seconds` field name was outdated — never matched
+    // the actual route response. Confirmed 2026-05-22 via direct
+    // curl: {"status":"indexed", "collections":{...},
+    // "total_chunks":<int>, "duration_s":<float>}.
+    expect(body.duration_s).to.be.a("number");
+    expect(body.total_chunks).to.be.a("number");
   });
 }
 
