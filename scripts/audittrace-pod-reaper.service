@@ -1,0 +1,36 @@
+[Unit]
+Description=AuditTrace-AI terminal-pod reaper at boot
+Documentation=file:///home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-pod-reaper.sh
+# Soft dependency on k3s.service (NOT Requires=) — same pattern as
+# audittrace-vault-auto-unseal.service. Requires= would cancel this
+# unit if k3s's first start failed; Wants= lets us run regardless and
+# the script's k3s-readiness probe handles the wait. See
+# feedback_systemd_requires_vs_wants for the 2026-05-07 incident
+# that anchored this rule.
+After=k3s.service network-online.target
+Wants=k3s.service network-online.target
+# Mild retry policy — the script is idempotent (re-runs do no harm)
+# but should not loop forever if k3s itself is broken.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=lfdesousa
+Group=lfdesousa
+Environment=KUBECONFIG=/home/lfdesousa/.kube/config
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-pod-reaper.sh
+# RemainAfterExit so `systemctl status audittrace-pod-reaper` reports
+# active after the oneshot completes — eases boot-time debugging.
+RemainAfterExit=yes
+# Retry on transient cluster-startup failures. The k3s-readiness wait
+# inside the script handles slow boots, but a flat-out unreachable
+# kubelet should retry.
+Restart=on-failure
+RestartSec=30s
+# 240s k3s wait + 60s reconciliation grace + reaper work = comfortable
+# 360s budget on a degraded boot.
+TimeoutStartSec=360s
+
+[Install]
+WantedBy=multi-user.target
