@@ -181,6 +181,53 @@ class TestPostgresConversationalService:
         sessions = empty_service.load_sessions(user_context, "P")
         assert sessions[0]["key_points"] == []
 
+    def test_save_session_is_idempotent_on_session_id(
+        self, empty_service, user_context
+    ):
+        """Regression test for the 2026-05-22 /session/summary 500.
+
+        The route handler ``save_session_summary`` accepts an explicit
+        ``session_id`` from the client and forwards it to
+        ``conversational.save_session``. With the pre-fix bare
+        ``session.add()``, a second call with the same id raised
+        ``IntegrityError: duplicate key value violates unique constraint
+        "sessions_pkey"`` which surfaced as HTTP 500. ADR-030's
+        background summariser also re-summarises ongoing sessions; the
+        same crash would have hit it on every revision.
+
+        The fix swapped ``session.add()`` → ``session.merge()`` (the
+        SQLAlchemy ORM PK-based UPSERT). This test pins the contract:
+        save_session under the SAME id must succeed twice AND the second
+        call's payload must overwrite the first.
+        """
+        # First write — creates the row.
+        empty_service.save_session(
+            user_context,
+            "AuditTrace",
+            "first draft",
+            ["initial-key"],
+            session_id="upsert-fixture",
+        )
+        first_load = empty_service.load_sessions(user_context, "AuditTrace")
+        assert len(first_load) == 1
+        assert first_load[0]["summary"] == "first draft"
+        assert first_load[0]["key_points"] == ["initial-key"]
+
+        # Second write — same session_id, different content. Pre-fix
+        # this raised IntegrityError; post-fix it updates in place.
+        empty_service.save_session(
+            user_context,
+            "AuditTrace",
+            "revised draft",
+            ["updated-key", "added-key"],
+            session_id="upsert-fixture",
+        )
+        second_load = empty_service.load_sessions(user_context, "AuditTrace")
+        # Still exactly one row — UPSERT did not duplicate.
+        assert len(second_load) == 1
+        assert second_load[0]["summary"] == "revised draft"
+        assert second_load[0]["key_points"] == ["updated-key", "added-key"]
+
     def test_as_context_returns_formatted_string(self, service, user_context):
         ctx = service.as_context(user_context, "AuditTrace")
         assert "Recent Sessions" in ctx
