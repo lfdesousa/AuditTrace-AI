@@ -31,12 +31,21 @@ tests {
     expect(e.layer).to.equal("episodic");
     expect(e.key).to.equal(bru.getEnvVar("exampleAdrFile"));
     expect(e.created_at_ms).to.be.a("number");
-    expect(e.created_at_ms).to.equal(e.modified_at_ms);
+    expect(e.modified_at_ms).to.be.a("number");
+    // revive-from-soft-delete is documented (see docs block below):
+    // on re-run, the existing row is revived — created_at_ms keeps its
+    // original value, modified_at_ms gets bumped. deleted_at_ms is
+    // cleared either way. The (deprecated) created_at_ms === modified_at_ms
+    // assertion only held on the very first run.
     expect(e.deleted_at_ms).to.equal(null);
   });
-  test("created_at_ms is recent (within 5s of Date.now())", function() {
+  test("modified_at_ms is recent (within 5s of Date.now())", function() {
+    // Use modified_at_ms instead of created_at_ms — modified_at_ms is
+    // freshly bumped on every CREATE/UPDATE/REVIVE, whereas created_at_ms
+    // sticks to the very first INSERT (audit semantics). The previous
+    // assertion on created_at_ms broke on re-runs after the first.
     const e = res.getBody();
-    expect(Math.abs(Date.now() - e.created_at_ms)).to.be.lessThan(5000);
+    expect(Math.abs(Date.now() - e.modified_at_ms)).to.be.lessThan(5000);
   });
 }
 

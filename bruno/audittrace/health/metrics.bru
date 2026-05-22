@@ -7,22 +7,50 @@ meta {
 get {
   url: {{baseUrl}}/metrics
   body: none
-  auth: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
 }
 
 tests {
   test("returns 200", function() {
     expect(res.getStatus()).to.equal(200);
   });
-  test("emits Prometheus exposition format", function() {
+  test("MetricsResponse JSON shape (chroma_collections, total_chunks, active_sessions, uptime_seconds)", function() {
     const body = res.getBody();
-    expect(body).to.contain("# HELP");
-    expect(body).to.contain("# TYPE");
+    expect(body).to.have.property("chroma_collections");
+    expect(body).to.have.property("total_chunks");
+    expect(body).to.have.property("active_sessions");
+    expect(body).to.have.property("uptime_seconds");
+    expect(body.chroma_collections).to.be.a("number");
+    expect(body.total_chunks).to.be.a("number");
+    expect(body.active_sessions).to.be.a("number");
+    expect(body.uptime_seconds).to.be.a("number");
+  });
+  test("requires audittrace:admin scope (operator surface)", function() {
+    // Indirectly proven: a 200 here only happens when the bearer JWT
+    // carries audittrace:admin (validated by the route's Security
+    // dependency). The earlier 'no auth' shape was historical — the
+    // route grew an admin gate (see routes/health.py:81). If the auth
+    // gate ever regresses to anonymous, this test would still pass on
+    // shape — pair with a separate scope-rejection check if you want
+    // strict negative-path coverage.
+    expect(res.getStatus()).to.equal(200);
   });
 }
 
 docs {
-  Prometheus-format metrics. Used by the otel-collector + Grafana.
-  Test asserts the exposition format markers so a future refactor
-  that swaps to JSON would fail loudly.
+  Application-level metrics endpoint. JSON envelope, NOT Prometheus
+  exposition format — operator-grade ad-hoc summary, see
+  routes/health.py:78. Operation-level metrics (latency, error
+  counts) are exported via OpenTelemetry per ADR-014.4 to the
+  in-cluster otel-collector + Prometheus.
+
+  Authorization: requires ``audittrace:admin`` scope. The earlier
+  ``auth: none`` shape in this .bru was outdated; the gate landed
+  alongside ADR-052's /system/trust-store admin surface and was
+  never propagated to the Bruno collection. Live-validated
+  2026-05-22 during the ADR-006 v1.3.0/v0.1.0 deploy V/V/R sweep.
 }

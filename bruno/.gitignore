@@ -1,0 +1,4 @@
+# Bruno CLI artifacts (e.g. created by `bru run --output console`).
+# Live, not checked in.
+console/
+audittrace/console/
