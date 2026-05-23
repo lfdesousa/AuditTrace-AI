@@ -140,7 +140,7 @@ spec:
             # from initialising against an unreachable default).
             {{- if .Values.observability.external.langfuseHost }}
             - name: AUDITTRACE_LANGFUSE_HOST
-              value: "http://{{ .Values.observability.external.langfuseHost }}:{{ .Values.observability.external.langfusePort | default 3000 }}"
+              value: "{{ .Values.observability.external.scheme | default "http" }}://{{ .Values.observability.external.langfuseHost }}:{{ .Values.observability.external.langfusePort | default 3000 }}"
             {{- end }}
             # ── Secret-sourced ────────────────────────────────────────
             {{- if not .Values.vault.enabled }}

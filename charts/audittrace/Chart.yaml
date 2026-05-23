@@ -2,7 +2,15 @@ apiVersion: v2
 name: audittrace
 description: AuditTrace-AI — audit-trail-first memory augmentation platform
 type: application
-version: 1.3.1
+# v1.4.0: adds `observability.external.scheme` (default `http`) — used
+# by otel-collector + promtail + memory-server templates to compose
+# tempo / loki / langfuse egress URLs. Cloud deployments where the
+# obs stack sits behind a TLS-terminating load balancer (e.g. AWS NLB
+# with ACM cert per ADR-008) override to `https`. Backward-compatible
+# for laptop dev (default stays http). 2026-05-23 burn: chart pods
+# couldn't reach AWS-loadtest obs NLB on TLS listeners.
+# Chart-only change — no app code touched, so appVersion stays at 1.3.1.
+version: 1.4.0
 # appVersion MUST track pyproject.toml::version. Pinned by
 # tests/test_version_drift.py (ADR-055 — single chart-side source
 # for runtime observability + k8s labels + OTEL service.version).

@@ -1,5 +1,6 @@
 {{- if .Values.observability.promtail.enabled }}
 {{- $lokiHost := required "observability.external.lokiHost (FQDN) is required when observability.promtail.enabled=true — see ADR-045 (FQDN-only). Set to empty + promtail.enabled=false to disable log shipping entirely." .Values.observability.external.lokiHost }}
+{{- $scheme := .Values.observability.external.scheme | default "http" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,7 +18,7 @@ data:
       filename: /run/promtail/positions.yaml
 
     clients:
-      - url: http://{{ $lokiHost }}:{{ .Values.observability.external.lokiPort | default 3100 }}/loki/api/v1/push
+      - url: {{ $scheme }}://{{ $lokiHost }}:{{ .Values.observability.external.lokiPort | default 3100 }}/loki/api/v1/push
 
     scrape_configs:
       - job_name: kubernetes-pods
