@@ -352,6 +352,17 @@ observability:
     prometheusPort: 19090
     lokiHost: ""
     lokiPort: 3100
+    # scheme: URL scheme for telemetry egress to the obs stack
+    # (tempo / loki / langfuse). Defaults to `http` for laptop dev
+    # convenience (sibling docker-compose obs stack ships plain HTTP).
+    # Cloud deployments where the obs stack sits behind a TLS-
+    # terminating load balancer (e.g. AWS NLB with ACM cert, per
+    # ADR-008) MUST override to `https`. mTLS inside the cluster is
+    # Istio's job; this scheme governs the egress hop OUT of the
+    # mesh to the obs perimeter. v1.4.0 burn: 2026-05-23 aws-loadtest
+    # chart pods couldn't reach obs NLB on TLS listeners because
+    # otel-collector + promtail + memory-server hardcoded http://.
+    scheme: "http"
 
 # -- TLS ----------------------------------------------------------------------
 tls:
