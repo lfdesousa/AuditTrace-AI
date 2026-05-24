@@ -296,6 +296,34 @@ externalLLM:
     name: llm-summarizer
     port: 11437
 
+# -- LLM stub (in-cluster, wiring/integration tests only) ---------------------
+# An in-cluster OpenAI-compatible stub that serves deterministic canned
+# responses, so the memory-server proxy / auth / RLS / telemetry pipeline
+# can be exercised end-to-end without a real llama-server or any GPU.
+# One Deployment fronted by three Services (`<release>-llm-chat` / `-llm-embed`
+# / `-llm-summarizer`) that shadow the same names the ExternalName Services
+# would use — so memory-server's AUDITTRACE_LLAMA_URL / _EMBED_URL /
+# _SUMMARIZER_URL resolve to the stub. Used by the kind integration test and
+# the docker-compose `mock-llm` profile.
+#
+# MUST be paired with externalLLM.enabled=false (same Service names collide) —
+# enforced by the audittrace.assertLlmStub guard. Never enable in production.
+llmStub:
+  enabled: false
+  image:
+    repository: docker.io/lfds/audittrace-llm-stub
+    # Defaults to .Chart.Version when empty (the stub image is published
+    # per chart release tag, not per appVersion).
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
 # -- Istio --------------------------------------------------------------------
 istio:
   enabled: true

@@ -88,12 +88,14 @@ jobs:
 
       - name: Bring up compose stack with `mock-llm` profile
         # .env.ci sets COMPOSE_PROFILES=mock-llm so the mock-llm
-        # service joins the up command. --wait blocks until all
-        # services with healthchecks report healthy. --wait-timeout
-        # 300s covers mock-llm's first-run pip-install (~10s) +
-        # keycloak's realm import (~20s) + AMQP topology
-        # convergence + memory-server lifespan.
-        run: docker compose up -d --wait --wait-timeout 300
+        # service joins the up command. --build builds the mock-llm
+        # image from images/llm-stub (the pull step --ignore-buildable
+        # skips it). --wait blocks until all services with healthchecks
+        # report healthy. --wait-timeout 300s covers keycloak's realm
+        # import (~20s) + AMQP topology convergence + memory-server
+        # lifespan (the stub itself starts in <2s — deps baked at
+        # build time, no pip-at-boot).
+        run: docker compose up -d --build --wait --wait-timeout 300
 
       - name: Show container status
         if: always()
@@ -138,7 +140,7 @@ jobs:
       - name: B7 step 4 — POST /v1/chat/completions against mock LLM
         # The load-bearing E2E test. Auth is disabled in .env.ci, so
         # no JWT needed. Request goes Traefik → memory-server proxy →
-        # in-network mock-llm:11435 → canned "bruno" response.
+        # in-network mock-llm:8080 → canned "bruno" response.
         # See script for the reasoning-model trap assertions
         # (feedback_e2e_includes_llm_call).
         run: bash tests/integration/compose/test-chat-completion.sh

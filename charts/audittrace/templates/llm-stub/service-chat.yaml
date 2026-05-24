@@ -1,0 +1,26 @@
+{{- /*
+  Stub chat Service — named EXACTLY as memory-server's
+  AUDITTRACE_LLAMA_URL host (templates/memory-server/deployment.yaml),
+  so when llmStub.enabled=true + externalLLM.enabled=false the chat
+  calls resolve to the in-cluster stub. Port mirrors
+  externalLLM.chat.port (single source for the port number);
+  targetPort is the stub's single listen port 8080.
+*/ -}}
+{{- if .Values.llmStub.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-llm-chat
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+spec:
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+  ports:
+    - port: {{ .Values.externalLLM.chat.port }}
+      targetPort: 8080
+      protocol: TCP
+      name: http
+{{- end }}

@@ -2,6 +2,8 @@
 {{- include "audittrace.assertProductionSecrets" . -}}
 {{- /* Gate: refuses to render if objectStorage.backend is unknown or AWS required fields are missing (ADR-006). */ -}}
 {{- include "audittrace.objectStorageAssertAws" . -}}
+{{- /* Gate: refuses to render if llmStub.enabled=true AND externalLLM.enabled=true (Service name collision). */ -}}
+{{- include "audittrace.assertLlmStub" . -}}
 AuditTrace-AI deployed to namespace {{ .Release.Namespace }}.
 
 Memory server: https://{{ (index .Values.istio.gateway.hosts 0) }}/health

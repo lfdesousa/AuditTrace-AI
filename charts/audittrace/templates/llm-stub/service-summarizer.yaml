@@ -1,0 +1,24 @@
+{{- /*
+  Stub summarizer Service — shadows memory-server's
+  AUDITTRACE_SUMMARIZER_URL host. Summarizer is a /v1/chat/completions
+  call (same route the stub serves for chat), just on its own
+  service/port.
+*/ -}}
+{{- if .Values.llmStub.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-llm-summarizer
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+spec:
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+  ports:
+    - port: {{ .Values.externalLLM.summarizer.port }}
+      targetPort: 8080
+      protocol: TCP
+      name: http
+{{- end }}

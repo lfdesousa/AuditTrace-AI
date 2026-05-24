@@ -1,0 +1,62 @@
+{{- /*
+  LLM stub Deployment — in-cluster OpenAI-compatible stub that serves
+  canned responses for wiring/integration tests (no GPU, no inference).
+  Gated by llmStub.enabled (default false). When enabled, externalLLM
+  MUST be disabled (the three llm Services below shadow the same names
+  the ExternalName Services would use) — enforced by the
+  audittrace.assertLlmStub guard in _helpers.tpl.
+
+  No sidecar.istio.io/inject annotation: in a mesh-enabled namespace
+  the sidecar is injected (memory-server -> stub is mTLS, exercising the
+  mesh path); in kind CI (istio disabled) injection is simply skipped.
+*/ -}}
+{{- if .Values.llmStub.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-llm-stub
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: llm-stub
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: llm-stub
+    spec:
+      containers:
+        - name: llm-stub
+          image: "{{ .Values.llmStub.image.repository }}:{{ .Values.llmStub.image.tag | default .Chart.Version }}"
+          imagePullPolicy: {{ .Values.llmStub.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.llmStub.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- end }}

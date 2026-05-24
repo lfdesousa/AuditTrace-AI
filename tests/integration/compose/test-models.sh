@@ -3,7 +3,7 @@
 #
 # Asserts the mock LLM is reachable via the memory-server proxy.
 # Returns the model list; we expect `audittrace-default` (the
-# canned id from tests/integration/fixtures/compose/mock-llm/server.py).
+# canned id from images/llm-stub/server.py).
 #
 # Used by .github/workflows/e2e-compose.yml AND runnable locally
 # after `docker compose --env-file .env.ci --profile mock-llm up -d`.

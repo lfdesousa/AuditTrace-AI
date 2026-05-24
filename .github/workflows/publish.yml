@@ -15,6 +15,7 @@ name: Publish
 # failing on drift.
 #
 # Image at:  docker.io/lfds/audittrace-memory-server:<version>
+# Stub at:   docker.io/lfds/audittrace-llm-stub:<version>  (wiring-test only)
 # Chart at:  oci://registry-1.docker.io/lfds/audittrace:<version>
 #
 # Image and chart land at distinct OCI repositories by virtue of the
@@ -115,6 +116,24 @@ jobs:
           tags: |
             docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}
             docker.io/lfds/audittrace-memory-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push LLM stub image (multi-arch)
+        # The in-cluster wiring-test stub (chart `llmStub.enabled`).
+        # Tagged with the chart/release version so the chart's default
+        # `llmStub.image.tag = .Chart.Version` resolves to a real tag.
+        # Pre-req: the `lfds/audittrace-llm-stub` repo must exist on
+        # Docker Hub before the first tag push.
+        uses: docker/build-push-action@v6
+        with:
+          context: images/llm-stub
+          file: images/llm-stub/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            docker.io/lfds/audittrace-llm-stub:${{ steps.ver.outputs.version }}
+            docker.io/lfds/audittrace-llm-stub:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -224,6 +243,7 @@ jobs:
 
           - Image: \`docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
             - Platforms: linux/amd64, linux/arm64
+          - Stub:  \`docker.io/lfds/audittrace-llm-stub:${{ steps.ver.outputs.version }}\` (wiring-test only; also \`:latest\`)
           - Chart: \`oci://registry-1.docker.io/lfds/audittrace:${{ steps.ver.outputs.version }}\`
           - Tag:   \`${{ steps.ver.outputs.tag }}\`
           - Commit: \`${{ github.sha }}\`

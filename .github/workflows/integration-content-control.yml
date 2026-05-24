@@ -104,6 +104,16 @@ jobs:
       - name: Load memory-server image into kind
         run: kind load docker-image audittrace-memory-server:ci --name integration-cc
 
+      - name: Build LLM stub image
+        # Single stub source (images/llm-stub) — same Dockerfile the
+        # published lfds/audittrace-llm-stub image is built from. The
+        # chart's llmStub component (values-ci.yaml) references this as
+        # audittrace-llm-stub:ci with pullPolicy=Never.
+        run: docker build -t audittrace-llm-stub:ci images/llm-stub
+
+      - name: Load LLM stub image into kind
+        run: kind load docker-image audittrace-llm-stub:ci --name integration-cc
+
       - name: Pre-pull + kind-load every cc-chart image
         run: |
           # Dynamic pre-pull mirrors the audittrace chart step below:
@@ -169,7 +179,7 @@ jobs:
           for img in $images; do
             # Skip locally-built images (already kind-loaded earlier).
             case "$img" in
-              audittrace-memory-server:ci|lfds/audittrace-content-control:0.0.7)
+              audittrace-memory-server:ci|audittrace-llm-stub:ci|lfds/audittrace-content-control:0.0.7)
                 echo "  ↻ skip $img (already loaded)"
                 continue
                 ;;
@@ -247,30 +257,24 @@ jobs:
           echo
           echo "✓ memory-server /health responded"
 
-      - name: Deploy mock LLM (kind-only, replaces external host-running llama)
+      - name: Verify LLM stub Ready (chart-rendered llmStub component)
         run: |
-          # `externalLLM.enabled=false` in values-ci.yaml suppressed the
-          # chart's headless Service+Endpoints for `audittrace-llm-chat`.
-          # This fixture creates a Service with the SAME NAME at the
-          # SAME PORT, so memory-server's chart-hardcoded
-          # `AUDITTRACE_LLAMA_URL=http://audittrace-llm-chat:11435/v1`
-          # transparently resolves to the in-cluster mock.
-          kubectl apply -f tests/integration/fixtures/mock-llm-configmap.yaml \
-                        -f tests/integration/fixtures/mock-llm-deployment.yaml \
-                        -f tests/integration/fixtures/mock-llm-service.yaml
-          # Mock installs fastapi+uvicorn on first start (~10s); the
-          # readinessProbe has 30×2s = 60s of grace.
-          kubectl rollout status deployment/mock-llm --timeout=120s
-          echo "✓ mock-llm Ready"
-          # Sanity probe through the chart-rendered Service name (proves
-          # the wiring): hit /health via port-forward.
+          # values-ci.yaml sets llmStub.enabled=true + externalLLM.enabled
+          # =false, so `helm install audittrace` above already rendered the
+          # stub Deployment (audittrace-llm-stub) + the three Services
+          # (audittrace-llm-chat/-llm-embed/-llm-summarizer) that shadow the
+          # names memory-server hardcodes. No separate fixture apply needed.
+          kubectl rollout status deployment/audittrace-llm-stub --timeout=120s
+          echo "✓ audittrace-llm-stub Ready"
+          # Sanity probe through the chart-rendered Service name (proves the
+          # wiring): hit /health via port-forward (svc 11435 -> stub 8080).
           kubectl port-forward svc/audittrace-llm-chat 11435:11435 &
           PF_LLM=$!
           trap 'kill ${PF_LLM} 2>/dev/null || true' EXIT
           sleep 2
           curl -fsS http://localhost:11435/health
           echo
-          echo "✓ audittrace-llm-chat resolves to mock-llm"
+          echo "✓ audittrace-llm-chat resolves to the stub"
 
       - name: B4 E2E — POST /memory/upload (clean + eicar) → terminal verdict
         run: |
@@ -385,11 +389,11 @@ jobs:
             echo "✓ ${fixture}.pdf → ${expected}"
           done
 
-      - name: B4 E2E — POST /v1/chat/completions via mock LLM
+      - name: B4 E2E — POST /v1/chat/completions via LLM stub
         run: |
           # Mirrors bruno/audittrace/chat/02-chat-completions.bru.
           # Hits memory-server's chat-completions handler which proxies
-          # to audittrace-llm-chat:11435 (the mock). Per
+          # to audittrace-llm-chat:11435 (the stub). Per
           # `feedback_openai_schema_inviolate` the response must keep
           # the OpenAI choices[0].message shape exactly.
           set -euo pipefail
@@ -411,7 +415,7 @@ jobs:
             || { echo "✗ message.role != assistant"; exit 1; }
           echo "${RESP}" | jq -e '.choices[0].message.content | type == "string"' >/dev/null \
             || { echo "✗ message.content not a string"; exit 1; }
-          echo "✓ /v1/chat/completions OpenAI shape preserved via mock-llm"
+          echo "✓ /v1/chat/completions OpenAI shape preserved via llm-stub"
 
       - name: Diagnostics on failure
         if: failure()
@@ -425,8 +429,8 @@ jobs:
           echo "── content-control logs ──"
           kubectl logs -l app.kubernetes.io/name=audittrace-content-control -c control-plane --tail=200 || true
           echo
-          echo "── mock-llm logs ──"
-          kubectl logs -l app.kubernetes.io/name=mock-llm --tail=80 || true
+          echo "── llm-stub logs ──"
+          kubectl logs -l app.kubernetes.io/component=llm-stub --tail=80 || true
           echo
           echo "── postgres logs ──"
           kubectl logs -l app.kubernetes.io/name=postgresql --tail=80 || true
