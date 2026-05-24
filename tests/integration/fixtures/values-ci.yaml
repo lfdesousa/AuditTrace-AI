@@ -47,12 +47,24 @@ memoryServer:
 
 # External LLM Services (ExternalName aliases to a host-running
 # llama.cpp via FQDN, ADR-045) are disabled in kind.
-# tests/integration/fixtures/mock-llm.yaml deploys an in-cluster mock
-# that registers a Service with the same name the chart hardcodes into
-# AUDITTRACE_LLAMA_URL — memory-server's chat handler transparently
-# resolves to it. (B4b, 2026-05-14.)
+# The chart's `llmStub` component (below) deploys an in-cluster stub
+# whose Services shadow the names memory-server hardcodes into
+# AUDITTRACE_LLAMA_URL / _EMBED_URL / _SUMMARIZER_URL, so the chat
+# handler transparently resolves to it. externalLLM stays disabled
+# (mutually exclusive with llmStub — same Service names).
 externalLLM:
   enabled: false
+
+# In-cluster LLM stub for the kind integration test. The workflow
+# builds images/llm-stub as `audittrace-llm-stub:ci` and `kind load`s
+# it; pullPolicy=Never makes kubelet use the loaded image (no registry
+# pull). Replaces the retired pip-at-boot mock-llm-*.yaml fixtures.
+llmStub:
+  enabled: true
+  image:
+    repository: audittrace-llm-stub
+    tag: ci
+    pullPolicy: Never
 
 # Observability sinks (Langfuse / Tempo / Loki) live off-cluster in
 # real deployments and require FQDN values (ADR-045). CI runs in kind

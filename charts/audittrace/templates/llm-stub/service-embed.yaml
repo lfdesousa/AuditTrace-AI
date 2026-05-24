@@ -1,0 +1,24 @@
+{{- /*
+  Stub embed Service — shadows memory-server's AUDITTRACE_EMBED_URL host.
+  (Embed is dormant in memory-server — embeddings run in-process via
+  ONNX MiniLM — but the Service is rendered for completeness so the
+  AUDITTRACE_EMBED_URL resolves rather than dangling.)
+*/ -}}
+{{- if .Values.llmStub.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-llm-embed
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+spec:
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-stub
+  ports:
+    - port: {{ .Values.externalLLM.embed.port }}
+      targetPort: 8080
+      protocol: TCP
+      name: http
+{{- end }}

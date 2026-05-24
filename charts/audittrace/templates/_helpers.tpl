@@ -393,3 +393,20 @@ vault.hashicorp.com/agent-inject-template-env: |
   export KEYCLOAK_ADMIN_PASSWORD='{{ "{{ .Data.data.password }}" }}'
   {{ "{{ end }}" }}
 {{- end }}
+
+{{/*
+LLM stub mutual-exclusion gate.
+
+llmStub.enabled deploys three in-cluster Services named
+`<release>-llm-chat` / `-llm-embed` / `-llm-summarizer`. externalLLM.enabled
+renders ExternalName Services with the SAME names. Both at once is a name
+collision (and a logic error — point memory-server at a real out-of-cluster
+llama-server OR at the in-cluster stub, never both). Refuse to render.
+Called from templates/NOTES.txt so it evaluates on every helm template /
+install / upgrade.
+*/}}
+{{- define "audittrace.assertLlmStub" -}}
+{{- if and .Values.llmStub.enabled .Values.externalLLM.enabled -}}
+  {{- fail "llmStub.enabled=true requires externalLLM.enabled=false — the stub Services shadow the same names as the ExternalName Services. Set externalLLM.enabled=false for stub/wiring tests." -}}
+{{- end -}}
+{{- end -}}

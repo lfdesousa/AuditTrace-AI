@@ -6,14 +6,13 @@ cluster needed; pure file reads).
 
 Drift classes covered (step 2):
 
-* **Mock-LLM script parity** — the Python source served by the
-  in-cluster mock-LLM (``tests/integration/fixtures/mock-llm-configmap.yaml``)
-  and the compose mock-LLM (``tests/integration/fixtures/compose/mock-llm/server.py``)
-  MUST be byte-identical. Q6 of the B7 plan (`docs/architecture/
-  b7-docker-compose-revive-plan.md` §10.6) explicitly chose
-  "duplicate the script + add a drift-guard test" over symlinking
-  (cross-platform concern + clearer intent). This test is the
-  load-bearing half of that decision.
+* **Mock-LLM build source** — the compose ``mock-llm`` service and the
+  chart's ``llmStub`` component + the published image are now built
+  from a SINGLE source (``images/llm-stub/``). The old byte-parity
+  guard (compose .py vs kind ConfigMap .py) is retired: there is no
+  longer a duplicated script to drift. This guard instead asserts the
+  compose service builds from ``images/llm-stub`` so the three paths
+  (compose / kind / published image) cannot diverge.
 
 Anchors:
 - `feedback_no_more_drifts`
@@ -30,109 +29,48 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-KIND_CONFIGMAP_PATH = (
-    REPO_ROOT / "tests" / "integration" / "fixtures" / "mock-llm-configmap.yaml"
-)
-COMPOSE_SCRIPT_PATH = (
-    REPO_ROOT
-    / "tests"
-    / "integration"
-    / "fixtures"
-    / "compose"
-    / "mock-llm"
-    / "server.py"
-)
+LLM_STUB_DIR = REPO_ROOT / "images" / "llm-stub"
 
 
-def _extract_kind_script() -> str:
-    """Pull the embedded Python source out of the kind ConfigMap.
+class TestLlmStubSingleSource:
+    """The compose ``mock-llm`` service, the chart's ``llmStub``
+    component, and the published ``lfds/audittrace-llm-stub`` image are
+    all built from the SINGLE stub source at ``images/llm-stub/``.
+    There is no duplicated Python script to drift (the old byte-parity
+    guard between a compose .py and a kind ConfigMap .py is retired).
 
-    The ConfigMap stores the script as a multi-line YAML scalar
-    under ``data["server.py"]``. PyYAML preserves the string
-    verbatim (modulo the YAML indentation strip that the parser
-    handles automatically), so this returns the script as it
-    appears at runtime inside the kind pod.
-    """
-    with KIND_CONFIGMAP_PATH.open("r", encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
-    if doc.get("kind") != "ConfigMap":
-        raise AssertionError(
-            f"Expected ConfigMap at {KIND_CONFIGMAP_PATH}, got kind={doc.get('kind')!r}"
-        )
-    data = doc.get("data", {})
-    script = data.get("server.py")
-    if not isinstance(script, str):
-        raise AssertionError(
-            f"ConfigMap data.server.py not a string at {KIND_CONFIGMAP_PATH} — "
-            f"got {type(script).__name__}"
-        )
-    return script
-
-
-def _extract_compose_script() -> str:
-    """Read the standalone .py the compose service mounts."""
-    return COMPOSE_SCRIPT_PATH.read_text(encoding="utf-8")
-
-
-class TestMockLlmScriptParity:
-    """The compose mock-LLM script and the kind ConfigMap mock-LLM
-    script MUST be byte-identical. Drift would mean one path emits
-    a different ``/v1/chat/completions`` response than the other —
-    silently breaking the symmetric-test posture the B7 step-4
-    GHA workflow will rely on (compose vs kind running the SAME
-    contract).
-
-    Q6 decision (B7 plan §10.6) — duplicate the file rather than
-    symlink because:
-      - Linux symlinks across the project work but Windows dev
-        environments break on them
-      - The kind ConfigMap is a YAML wrapper; the compose mount
-        is a bare .py file. Symlinking a .py into YAML-data is
-        not portable.
-      - Drift cost is one test; symlink-fragility cost is
-        operator hours debugging "why does kind work but
-        compose doesn't?" silently.
+    This guard asserts the single source exists and that compose builds
+    from it — so the three consumers cannot diverge.
     """
 
-    def test_compose_script_exists(self) -> None:
-        assert COMPOSE_SCRIPT_PATH.exists(), (
-            f"Compose mock-LLM script missing at {COMPOSE_SCRIPT_PATH}. "
-            "B7 step 2 expects this file alongside the kind ConfigMap. "
-            "Restore from git history or re-port from the kind fixture."
-        )
+    COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 
-    def test_kind_configmap_exists(self) -> None:
-        assert KIND_CONFIGMAP_PATH.exists(), (
-            f"Kind mock-LLM ConfigMap missing at {KIND_CONFIGMAP_PATH}. "
-            "PR-B11's mock-LLM fixture is missing from the tree."
-        )
+    def _compose_doc(self) -> dict:
+        with self.COMPOSE_FILE.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
 
-    def test_compose_and_kind_mock_llm_scripts_are_byte_identical(self) -> None:
-        kind_script = _extract_kind_script()
-        compose_script = _extract_compose_script()
-
-        if kind_script == compose_script:
-            return  # passes
-
-        # Produce a useful diff in the assertion message so the
-        # operator can immediately see what diverged.
-        import difflib
-
-        diff = "\n".join(
-            difflib.unified_diff(
-                kind_script.splitlines(),
-                compose_script.splitlines(),
-                fromfile=str(KIND_CONFIGMAP_PATH) + "::data.server.py",
-                tofile=str(COMPOSE_SCRIPT_PATH),
-                lineterm="",
+    def test_stub_source_exists(self) -> None:
+        for name in ("server.py", "Dockerfile"):
+            path = LLM_STUB_DIR / name
+            assert path.exists(), (
+                f"LLM stub source missing: {path}. The compose mock-llm "
+                "service, the chart llmStub component, and the published "
+                "image all build from images/llm-stub/. Restore from git."
             )
+
+    def test_compose_mock_llm_builds_from_single_source(self) -> None:
+        svc = self._compose_doc()["services"]["mock-llm"]
+        build = svc.get("build")
+        assert build, (
+            "compose mock-llm must `build:` from images/llm-stub (single "
+            "stub source), not pull a generic image + mount a script. "
+            f"Got build={build!r}."
         )
-        raise AssertionError(
-            "Drift: kind mock-LLM ConfigMap and compose mock-LLM script "
-            "have diverged. Either re-sync one to match the other (the "
-            "kind file is conventionally the source of truth since the "
-            "mock was born there in PR-B11) or update both intentionally. "
-            "Diff:\n" + diff
+        context = build.get("context") if isinstance(build, dict) else build
+        assert context and "images/llm-stub" in str(context), (
+            f"compose mock-llm build.context ({context!r}) must point at "
+            "images/llm-stub so compose, kind, and the published image "
+            "share one source and cannot drift."
         )
 
 
@@ -159,8 +97,7 @@ class TestComposeMockLlmServiceWiring:
             "docker-compose.yml is missing the `mock-llm` service required "
             "by B7 step 2. Operators activating COMPOSE_PROFILES=mock-llm "
             "would get a runtime DNS miss + memory-server lifespan failure. "
-            "Restore the service definition + the volume mount of "
-            "tests/integration/fixtures/compose/mock-llm/server.py."
+            "Restore the service definition (build: images/llm-stub)."
         )
 
     def test_mock_llm_service_gated_by_profile(self) -> None:
