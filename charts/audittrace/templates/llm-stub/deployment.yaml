@@ -10,7 +10,7 @@
   the sidecar is injected (memory-server -> stub is mTLS, exercising the
   mesh path); in kind CI (istio disabled) injection is simply skipped.
 */ -}}
-{{- if .Values.llmStub.enabled }}
+{{- if (.Values.llmStub | default dict).enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
