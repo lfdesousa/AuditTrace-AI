@@ -1,6 +1,7 @@
 {{- if .Values.observability.otelCollector.enabled }}
 {{- $tempoHost := required "observability.external.tempoHost (FQDN) is required when observability.otelCollector.enabled=true — see ADR-045 (FQDN-only). Set to empty + otelCollector.enabled=false to disable tracing entirely." .Values.observability.external.tempoHost }}
 {{- $scheme := .Values.observability.external.scheme | default "http" }}
+{{- $promHost := .Values.observability.external.prometheusHost }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -56,6 +57,18 @@ data:
         endpoint: "0.0.0.0:8889"
       otlphttp/tempo:
         endpoint: "{{ $scheme }}://{{ $tempoHost }}:{{ .Values.observability.external.tempoOtlpPort | default 14318 }}"
+      {{- if $promHost }}
+      # Cloud push path: a remote obs Prometheus cannot SCRAPE into a private
+      # EKS cluster, so application metrics are PUSHED via remote-write —
+      # mirroring how traces push to Tempo above. The laptop dev stack leaves
+      # prometheusHost empty and keeps scraping the :8889 exporter (NodePort),
+      # so this exporter is absent there and there is no double-count. The obs
+      # Prometheus must run with --web.enable-remote-write-receiver (it does).
+      # Panels query bare metric names aggregated by (le)/(operation)/(http_route)
+      # so no scrape-added job/instance labels are required. (2026-05-27, #217)
+      prometheusremotewrite/obs:
+        endpoint: "{{ $scheme }}://{{ $promHost }}:{{ .Values.observability.external.prometheusPort | default 19090 }}/api/v1/write"
+      {{- end }}
 
     service:
       pipelines:
@@ -69,5 +82,5 @@ data:
         metrics:
           receivers: [otlp]
           processors: [transform/normalise-http-client-help, batch]
-          exporters: [prometheus]
+          exporters: [prometheus{{ if $promHost }}, prometheusremotewrite/obs{{ end }}]
 {{- end }}

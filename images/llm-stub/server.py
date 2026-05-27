@@ -38,6 +38,40 @@ _CANNED_EMBEDDING = [0.1] * _EMBEDDING_DIM
 _MODEL_ID = "audittrace-default"
 _CANNED_CONTENT = "bruno"
 
+# ~4 characters per token — OpenAI's published rule-of-thumb. Good enough
+# for a stub: we only need prompt_tokens to scale with the real payload,
+# not to match any specific tokenizer.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_prompt_tokens(messages: Any) -> int:
+    """Estimate prompt_tokens from the request messages (~4 chars/token).
+
+    The real llama-server reports prompt_tokens that grows when the
+    memory-server injects retrieved context, so assertions that infer
+    "augmentation ran" from a large prompt_tokens (Bruno chat pack) only
+    held against a real model. A fixed constant (the old `4`) made that
+    check impossible to pass against the stub. Deriving the count from the
+    actual payload makes the stub honest without a tokenizer dependency:
+    a bare prompt stays small, an augmented one crosses the threshold
+    naturally. Deterministic. (#218)
+    """
+    if not isinstance(messages, list):
+        return 1
+    chars = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            # OpenAI multimodal shape: list of {type, text, ...} parts.
+            for part in content:
+                if isinstance(part, dict):
+                    chars += len(str(part.get("text", "")))
+    return max(1, chars // _CHARS_PER_TOKEN)
+
 
 @app.get("/v1/models")
 async def models() -> dict[str, Any]:
@@ -56,7 +90,15 @@ async def models() -> dict[str, Any]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: dict[str, Any]) -> dict[str, Any]:
-    """Chat + summarizer path. Canned assistant content = "bruno"."""
+    """Chat + summarizer path. Canned assistant content = "bruno".
+
+    Reports a prompt_tokens estimated from the actual request payload so
+    memory-augmentation assertions hold against the stub (see
+    `_estimate_prompt_tokens`, #218). completion_tokens reflects the canned
+    answer. Deterministic for a given request.
+    """
+    prompt_tokens = _estimate_prompt_tokens(req.get("messages", []))
+    completion_tokens = max(1, len(_CANNED_CONTENT) // _CHARS_PER_TOKEN)
     return {
         "id": "chatcmpl-stub",
         "object": "chat.completion",
@@ -70,9 +112,9 @@ async def chat_completions(req: dict[str, Any]) -> dict[str, Any]:
             }
         ],
         "usage": {
-            "prompt_tokens": 4,
-            "completion_tokens": 1,
-            "total_tokens": 5,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
