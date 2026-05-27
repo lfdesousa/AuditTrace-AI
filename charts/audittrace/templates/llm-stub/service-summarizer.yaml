@@ -4,7 +4,7 @@
   call (same route the stub serves for chat), just on its own
   service/port.
 */ -}}
-{{- if .Values.llmStub.enabled }}
+{{- if (.Values.llmStub | default dict).enabled }}
 apiVersion: v1
 kind: Service
 metadata:

@@ -406,7 +406,7 @@ Called from templates/NOTES.txt so it evaluates on every helm template /
 install / upgrade.
 */}}
 {{- define "audittrace.assertLlmStub" -}}
-{{- if and .Values.llmStub.enabled .Values.externalLLM.enabled -}}
+{{- if and (.Values.llmStub | default dict).enabled (.Values.externalLLM | default dict).enabled -}}
   {{- fail "llmStub.enabled=true requires externalLLM.enabled=false — the stub Services shadow the same names as the ExternalName Services. Set externalLLM.enabled=false for stub/wiring tests." -}}
 {{- end -}}
 {{- end -}}

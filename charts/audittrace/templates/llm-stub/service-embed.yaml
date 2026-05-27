@@ -4,7 +4,7 @@
   ONNX MiniLM — but the Service is rendered for completeness so the
   AUDITTRACE_EMBED_URL resolves rather than dangling.)
 */ -}}
-{{- if .Values.llmStub.enabled }}
+{{- if (.Values.llmStub | default dict).enabled }}
 apiVersion: v1
 kind: Service
 metadata:

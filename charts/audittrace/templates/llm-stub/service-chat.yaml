@@ -6,7 +6,7 @@
   externalLLM.chat.port (single source for the port number);
   targetPort is the stub's single listen port 8080.
 */ -}}
-{{- if .Values.llmStub.enabled }}
+{{- if (.Values.llmStub | default dict).enabled }}
 apiVersion: v1
 kind: Service
 metadata:
