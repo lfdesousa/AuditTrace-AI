@@ -96,12 +96,15 @@ class TestRegistration:
         async def recall_skills(user_context, args):
             return {"called": True}
 
-        # Direct call still works
+        # Direct call still works. Use asyncio.run() rather than the
+        # deprecated get_event_loop().run_until_complete(): on Python 3.12
+        # get_event_loop() raises "no current event loop" when none is set
+        # in the thread (tightened in a 3.12.x patch — green on local 3.12.3,
+        # red on CI 3.12.13). asyncio.run() creates+manages its own loop and
+        # is robust regardless of ambient loop state.
         import asyncio
 
-        result = asyncio.get_event_loop().run_until_complete(
-            recall_skills(sentinel_user_context(), {})
-        )
+        result = asyncio.run(recall_skills(sentinel_user_context(), {}))
         assert result == {"called": True}
 
     def test_duplicate_name_raises(self):
