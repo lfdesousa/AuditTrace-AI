@@ -2,6 +2,15 @@ apiVersion: v2
 name: audittrace
 description: AuditTrace-AI — audit-trail-first memory augmentation platform
 type: application
+# v1.5.3: the memory-server's accepted-issuer set (ISSUER_EXTRAS) now
+# AUTO-includes the issuer derived from keycloak.hostnameUrl via the
+# audittrace.keycloakIssuerExtras helper, deduped with the explicit
+# keycloak.externalIssuers list. Tokens carry iss=<hostnameUrl>/realms/
+# audittrace; previously externalIssuers had to be hand-synced with
+# hostnameUrl, so overriding hostnameUrl alone (e.g. to a :9443 operator
+# tunnel port) produced a 401 — the token's iss was not in the accept
+# list. Now they can't drift. No app-code change. (2026-05-28 cloud
+# Tier-0 login burn)
 # v1.5.2: harden the llmStub templates against `helm upgrade
 # --reuse-values` from a pre-1.5.0 release. Such an upgrade leaves
 # `.Values.llmStub` entirely absent (nil), and the 1.5.0 guards did a
@@ -34,7 +43,7 @@ type: application
 # for laptop dev (default stays http). 2026-05-23 burn: chart pods
 # couldn't reach AWS-loadtest obs NLB on TLS listeners.
 # Chart-only change — no app code touched, so appVersion stays at 1.3.1.
-version: 1.5.2
+version: 1.5.3
 # appVersion MUST track pyproject.toml::version. Pinned by
 # tests/test_version_drift.py (ADR-055 — single chart-side source
 # for runtime observability + k8s labels + OTEL service.version).
@@ -43,7 +52,7 @@ version: 1.5.2
 # behind the shared audittrace-object-storage@v0.1.1 ABC. When
 # objectStorage.backend=minio (default), behaviour is byte-identical
 # to v1.2.1; backend=aws activates the IRSA-native boto3 path.
-appVersion: "1.5.2"
+appVersion: "1.5.3"
 keywords:
   - ai
   - audit

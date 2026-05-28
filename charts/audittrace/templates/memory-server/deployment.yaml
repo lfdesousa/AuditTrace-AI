@@ -115,12 +115,14 @@ spec:
               value: {{ include "audittrace.keycloakIssuer" . | quote }}
             - name: AUDITTRACE_KEYCLOAK_JWKS_URL
               value: {{ include "audittrace.keycloakJwksUrl" . | quote }}
-            # Sourced from values: keycloak.externalIssuers. Override per
-            # deployment to add hostname-specific issuer entries (e.g.
-            # `audittrace.allaboutdata.eu:30952` for Google federation).
-            # See `keycloak.externalIssuers` documentation in values.yaml.
+            # keycloak.externalIssuers MERGED with the issuer derived from
+            # keycloak.hostnameUrl (tokens carry iss=<hostnameUrl>/realms/
+            # audittrace), deduped — see audittrace.keycloakIssuerExtras.
+            # The hostnameUrl issuer is auto-included so overriding
+            # hostnameUrl (e.g. to a :9443 operator-tunnel port) can never
+            # drift from the accepted-issuer set (2026-05-28 401 burn).
             - name: AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS
-              value: {{ .Values.keycloak.externalIssuers | toJson | quote }}
+              value: {{ include "audittrace.keycloakIssuerExtras" . | quote }}
             - name: AUDITTRACE_JWT_AUDIENCE
               value: "audittrace-server"
             - name: AUDITTRACE_LLAMA_URL
