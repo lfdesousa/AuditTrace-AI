@@ -124,6 +124,24 @@ http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-conne
 {{- end }}
 
 {{/*
+Accepted token issuers for the memory-server JWT validator (JSON list).
+ALWAYS includes the issuer derived from keycloak.hostnameUrl — tokens
+carry iss=<hostnameUrl>/realms/audittrace — MERGED with the explicit
+keycloak.externalIssuers list, deduped. This guarantees hostnameUrl and
+the accepted-issuer set can never drift: previously externalIssuers had
+to be hand-synced with hostnameUrl, and overriding hostnameUrl alone
+(e.g. to a :9443 operator-tunnel port) produced a 401 because the token's
+iss was not in externalIssuers. 2026-05-28 burn (cloud Tier-0 login).
+*/}}
+{{- define "audittrace.keycloakIssuerExtras" -}}
+{{- $extras := .Values.keycloak.externalIssuers | default (list) -}}
+{{- with .Values.keycloak.hostnameUrl -}}
+{{- $extras = append $extras (printf "%s/realms/audittrace" (trimSuffix "/" .)) -}}
+{{- end -}}
+{{- $extras | uniq | toJson -}}
+{{- end }}
+
+{{/*
 Object-storage backend selector (ADR-006). Returns "minio" or "aws".
 Anything else fails `objectStorageAssertAws` below.
 */}}
