@@ -75,15 +75,25 @@ jobs:
         # flake is treated as a retry, not a job failure. mock-llm
         # is a local build (no pull) so this skips it.
         run: |
-          for attempt in 1 2 3; do
+          # Exponential backoff (15s,30s,60s,120s,240s) over 5 attempts so a
+          # Docker Hub registry/auth blip (auth.docker.io token timeouts) is
+          # absorbed as a retry, not a job failure. A 2026-05-29 outage
+          # outlasted the old 3×15s (~45s) window — a DIFFERENT image timed
+          # out each attempt; the images themselves were fine. mock-llm is a
+          # local build (no pull) so this skips it.
+          delay=15
+          for attempt in 1 2 3 4 5; do
             if docker compose pull --quiet --ignore-buildable; then
               echo "compose pull OK on attempt ${attempt}"
               exit 0
             fi
-            echo "compose pull failed on attempt ${attempt}; sleeping 15s"
-            sleep 15
+            if [ "${attempt}" -lt 5 ]; then
+              echo "compose pull failed on attempt ${attempt}; sleeping ${delay}s"
+              sleep "${delay}"
+              delay=$((delay * 2))
+            fi
           done
-          echo "::error::docker compose pull failed 3 times — registry outage?"
+          echo "::error::docker compose pull failed 5 times (~7min of backoff) — likely a Docker Hub registry outage; re-run the job"
           exit 1
 
       - name: Bring up compose stack with `mock-llm` profile

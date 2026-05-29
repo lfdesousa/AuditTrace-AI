@@ -1,0 +1,30 @@
+name: structurizr-validate
+
+# Lints the C4 model so the DSL can never silently drift out of parse-clean
+# (both AuditTrace workspaces shipped a latent parse bug before this gate —
+# they had never been linted). Headless `validate` = exit non-zero on any
+# error; uses the new tooling (structurizr/cli is deprecated).
+on:
+  pull_request:
+    paths:
+      - "docs/architecture/**.dsl"
+      - ".github/workflows/structurizr-validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/architecture/**.dsl"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: structurizr validate (C4 DSL)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/docs/architecture":/usr/local/structurizr \
+            structurizr/structurizr:2026.05.16 validate \
+            -workspace /usr/local/structurizr/workspace.dsl

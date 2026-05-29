@@ -92,3 +92,14 @@ repos:
         language: script
         stages: [commit-msg]
         pass_filenames: true
+
+      # C4 model lint — both workspaces shipped a latent parse bug because
+      # they had never been linted. Only fires when a Structurizr .dsl
+      # changes; runs the headless validate via the new tooling (requires a
+      # local Docker daemon). Mirrors the structurizr-validate CI job.
+      - id: structurizr-validate
+        name: structurizr validate (C4 DSL)
+        entry: bash -c 'docker run --rm -v "$PWD/docs/architecture":/usr/local/structurizr structurizr/structurizr:2026.05.16 validate -workspace /usr/local/structurizr/workspace.dsl'
+        language: system
+        files: ^docs/architecture/.*\.dsl$
+        pass_filenames: false
