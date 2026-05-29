@@ -1,6 +1,5 @@
 workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs" {
 
-    !identifiers hierarchical
     !impliedRelationships true
 
     model {
@@ -129,82 +128,82 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
         agent -> keycloak "Token refresh + service-account client_credentials (audittrace-dev)" "HTTPS/OIDC"
         agent -> opencodeProxy "OpenCode-only path: POST /v1/chat/completions (Bearer JWT) — plain HTTP on 127.0.0.1:11434" "HTTP/JSON"
-        opencodeProxy -> memoryServer.api "Forwards over verified TLS, Host=audittrace.local, cert pinned to local CA bundle" "HTTPS/JSON"
-        agent -> memoryServer.api "Direct path for non-OpenCode clients (Continue, Roo Code, curl) — full TLS at the client" "HTTPS/JSON"
-        architect -> memoryServer.minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
-        memoryServer.api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
-        memoryServer.api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
-        memoryServer.api -> langfuse "Exports traces via Langfuse SDK (ADR-024)" "HTTP/OTLP"
-        memoryServer.api -> observability "Exports metrics + logs via OTLP to OTel Collector (ADR-028)" "HTTP/OTLP"
-        memoryServer.api -> vault "Reads dependency creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
+        opencodeProxy -> api "Forwards over verified TLS, Host=audittrace.local, cert pinned to local CA bundle" "HTTPS/JSON"
+        agent -> api "Direct path for non-OpenCode clients (Continue, Roo Code, curl) — full TLS at the client" "HTTPS/JSON"
+        architect -> minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
+        api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
+        api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
+        api -> langfuse "Exports traces via Langfuse SDK (ADR-024)" "HTTP/OTLP"
+        api -> observability "Exports metrics + logs via OTLP to OTel Collector (ADR-028)" "HTTP/OTLP"
+        api -> vault "Reads dependency creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
         keycloak -> vault "Reads admin password + DB creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
 
         // Relationships — identity layer (DESIGN §15)
-        memoryServer.api.chatRoute -> memoryServer.api.requireUser "depends on (Phase 5 cutover)"
-        memoryServer.api.contextRoute -> memoryServer.api.requireUser "depends on (Phase 5 cutover)"
-        memoryServer.api.requireUser -> memoryServer.api.tokenCache "hot path: get(sha256(token))"
-        memoryServer.api.requireUser -> keycloak "cold path: validate JWT against JWKS" "HTTP/JSON"
-        memoryServer.api.requireUser -> memoryServer.api.tokenCache "cold path: put(sha256(token), UserContext, TTL)"
-        memoryServer.api.tokenCache -> memoryServer.redisCache "GET/SETEX/SCAN under audittrace:token:*" "Redis protocol"
+        chatRoute -> requireUser "depends on (Phase 5 cutover)"
+        contextRoute -> requireUser "depends on (Phase 5 cutover)"
+        requireUser -> tokenCache "hot path: get(sha256(token))"
+        requireUser -> keycloak "cold path: validate JWT against JWKS" "HTTP/JSON"
+        requireUser -> tokenCache "cold path: put(sha256(token), UserContext, TTL)"
+        tokenCache -> redisCache "GET/SETEX/SCAN under audittrace:token:*" "Redis protocol"
 
         // Legacy JWT path (kept for backwards compat until Phase 7)
-        memoryServer.api.contextRoute -> memoryServer.api.requireScope "legacy: returns raw payload dict"
-        memoryServer.api.requireScope -> keycloak "Fetch JWKS (shared cache)" "HTTP/JSON"
+        contextRoute -> requireScope "legacy: returns raw payload dict"
+        requireScope -> keycloak "Fetch JWKS (shared cache)" "HTTP/JSON"
 
         // Relationships — chat completion flow (inject mode — memory_mode=inject)
-        memoryServer.api.chatRoute -> memoryServer.api.contextBuilder "inject mode: build_system_context(UserContext, project, query)"
-        memoryServer.api.contextRoute -> memoryServer.api.contextBuilder "build_system_context_with_stats()"
-        memoryServer.api.chatRoute -> llamaServer "async httpx.AsyncClient.stream() (ADR-024)"
-        memoryServer.api.chatRoute -> memoryServer.api.telemetry "@observe span + post-stream Langfuse update"
+        chatRoute -> contextBuilder "inject mode: build_system_context(UserContext, project, query)"
+        contextRoute -> contextBuilder "build_system_context_with_stats()"
+        chatRoute -> llamaServer "async httpx.AsyncClient.stream() (ADR-024)"
+        chatRoute -> telemetry "@observe span + post-stream Langfuse update"
 
         // Relationships — chat completion flow (tools mode — memory_mode=tools, ADR-025)
-        memoryServer.api.chatRoute -> memoryServer.api.memoryToolRegistry "tools mode: tools_visible_to(user) — scope-filtered tool list"
-        memoryServer.api.chatRoute -> memoryServer.api.contextBuilder "tools mode: build_ambient_context(user, project, tools)"
-        memoryServer.api.chatRoute -> memoryServer.api.memoryToolLoop "tools mode: run_memory_tool_loop(...)"
-        memoryServer.api.memoryToolLoop -> llamaServer "non-streaming POST per iteration (bounded by max_iterations)"
-        memoryServer.api.memoryToolLoop -> memoryServer.api.memoryToolRegistry "get_tool_by_name + invoke_tool dispatch"
-        memoryServer.api.memoryToolRegistry -> memoryServer.api.toolResultCache "cache.get / cache.put (skip on exception)"
-        memoryServer.api.memoryToolRegistry -> memoryServer.api.memoryHandlers "await tool.handler(user_context, args)"
-        memoryServer.api.toolResultCache -> memoryServer.redisCache "GET/SETEX/SCAN under audittrace:tool-result:*" "Redis protocol"
+        chatRoute -> memoryToolRegistry "tools mode: tools_visible_to(user) — scope-filtered tool list"
+        chatRoute -> contextBuilder "tools mode: build_ambient_context(user, project, tools)"
+        chatRoute -> memoryToolLoop "tools mode: run_memory_tool_loop(...)"
+        memoryToolLoop -> llamaServer "non-streaming POST per iteration (bounded by max_iterations)"
+        memoryToolLoop -> memoryToolRegistry "get_tool_by_name + invoke_tool dispatch"
+        memoryToolRegistry -> toolResultCache "cache.get / cache.put (skip on exception)"
+        memoryToolRegistry -> memoryHandlers "await tool.handler(user_context, args)"
+        toolResultCache -> redisCache "GET/SETEX/SCAN under audittrace:tool-result:*" "Redis protocol"
 
         // Memory tool handlers wrap the existing 4-layer services
-        memoryServer.api.memoryHandlers -> memoryServer.api.episodicSvc "recall_decisions → search(user, query)"
-        memoryServer.api.memoryHandlers -> memoryServer.api.proceduralSvc "recall_skills → search(user, query)"
-        memoryServer.api.memoryHandlers -> memoryServer.api.conversationalSvc "recall_recent_sessions → load_sessions(user, project, n)"
-        memoryServer.api.memoryHandlers -> memoryServer.api.semanticSvc "recall_semantic → search(user, query, k)"
+        memoryHandlers -> episodicSvc "recall_decisions → search(user, query)"
+        memoryHandlers -> proceduralSvc "recall_skills → search(user, query)"
+        memoryHandlers -> conversationalSvc "recall_recent_sessions → load_sessions(user, project, n)"
+        memoryHandlers -> semanticSvc "recall_semantic → search(user, query, k)"
 
         // 4-layer memory retrieval (inject mode path)
-        memoryServer.api.contextBuilder -> memoryServer.api.episodicSvc "search(user_context, query)"
-        memoryServer.api.contextBuilder -> memoryServer.api.proceduralSvc "search(user_context, query)"
-        memoryServer.api.contextBuilder -> memoryServer.api.conversationalSvc "as_context(user_context, project)"
-        memoryServer.api.contextBuilder -> memoryServer.api.semanticSvc "search(user_context, query, k)"
+        contextBuilder -> episodicSvc "search(user_context, query)"
+        contextBuilder -> proceduralSvc "search(user_context, query)"
+        contextBuilder -> conversationalSvc "as_context(user_context, project)"
+        contextBuilder -> semanticSvc "search(user_context, query, k)"
 
-        memoryServer.api.episodicSvc -> memoryServer.minioStore "Lists + downloads ADR-*.md from memory-shared/episodic/" "S3 API"
-        memoryServer.api.proceduralSvc -> memoryServer.minioStore "Lists + downloads SKILL-*.md from memory-shared/procedural/" "S3 API"
-        memoryServer.api.conversationalSvc -> memoryServer.postgresDb "SELECT/INSERT sessions" "SQLAlchemy ORM"
-        memoryServer.api.semanticSvc -> memoryServer.chromaDb "query()" "HTTP + Bearer token"
-        memoryServer.chromaDb -> embedServer "Embedding vectors" "HTTP/OpenAI-compat"
+        episodicSvc -> minioStore "Lists + downloads ADR-*.md from memory-shared/episodic/" "S3 API"
+        proceduralSvc -> minioStore "Lists + downloads SKILL-*.md from memory-shared/procedural/" "S3 API"
+        conversationalSvc -> postgresDb "SELECT/INSERT sessions" "SQLAlchemy ORM"
+        semanticSvc -> chromaDb "query()" "HTTP + Bearer token"
+        chromaDb -> embedServer "Embedding vectors" "HTTP/OpenAI-compat"
 
         // Session summariser (ADR-030)
-        memoryServer.api.sessionSummarizer -> memoryServer.postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
-        memoryServer.api.sessionSummarizer -> memoryServer.api.conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
-        memoryServer.api.sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
+        sessionSummarizer -> postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
+        sessionSummarizer -> conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
+        sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
 
         // PAdES trust store (ADR-052, Accepted)
-        memoryServer.api.adminRoute -> memoryServer.api.requireUser "Auth: scope audittrace:admin"
-        memoryServer.api.adminRoute -> memoryServer.api.trustStoreBuilder "build() — synchronous; returns TrustStoreBundle(pem_bytes, metadata)"
-        memoryServer.api.adminRoute -> memoryServer.api.trustStoreProvider "store(bundle) — persist + invalidate ValidationContext singleton"
-        memoryServer.api.trustStoreBuilder -> euLotl "lotl_to_registry(lotl_xml=None) — fetch + verify XAdES + walk member-state TSLs (transient, only during refresh)" "HTTPS/XML"
-        memoryServer.api.trustStoreProvider -> memoryServer.minioStore "GET/PUT memory-shared/trust-store/eu-lotl-bundle.pem" "S3 API"
-        memoryServer.api.diContainer -> memoryServer.api.trustStoreProvider "Injects (default S3TrustStoreProvider; settings select impl)"
-        memoryServer.api.diContainer -> memoryServer.api.trustStoreBuilder "Injects (default EuLotlTrustStoreBuilder; settings select impl)"
+        adminRoute -> requireUser "Auth: scope audittrace:admin"
+        adminRoute -> trustStoreBuilder "build() — synchronous; returns TrustStoreBundle(pem_bytes, metadata)"
+        adminRoute -> trustStoreProvider "store(bundle) — persist + invalidate ValidationContext singleton"
+        trustStoreBuilder -> euLotl "lotl_to_registry(lotl_xml=None) — fetch + verify XAdES + walk member-state TSLs (transient, only during refresh)" "HTTPS/XML"
+        trustStoreProvider -> minioStore "GET/PUT memory-shared/trust-store/eu-lotl-bundle.pem" "S3 API"
+        diContainer -> trustStoreProvider "Injects (default S3TrustStoreProvider; settings select impl)"
+        diContainer -> trustStoreBuilder "Injects (default EuLotlTrustStoreBuilder; settings select impl)"
 
         // Async chat-completion persistence (ADR-046, Accepted)
-        memoryServer.api.chatRoute -> memoryServer.api.asyncPersistProducer "On X-Persist-Mode: async — serialise InteractionRecord kwargs + tool_calls"
-        memoryServer.api.asyncPersistProducer -> memoryServer.redisCache "XADD audittrace:persist:stream" "Redis Streams"
-        memoryServer.redisCache -> memoryServer.api.asyncPersistConsumer "XREADGROUP > / XCLAIM idle pending — multi-pod safe via consumer group" "Redis Streams"
-        memoryServer.api.asyncPersistConsumer -> memoryServer.postgresDb "_persist_interaction + _flush_pending_tool_calls (reused from sync path) → XACK on success" "SQLAlchemy ORM"
-        memoryServer.api.asyncPersistConsumer -> memoryServer.redisCache "XADD audittrace:persist:dlq + XACK on poison (parse fail or delivery_count > max_deliveries)" "Redis Streams"
+        chatRoute -> asyncPersistProducer "On X-Persist-Mode: async — serialise InteractionRecord kwargs + tool_calls"
+        asyncPersistProducer -> redisCache "XADD audittrace:persist:stream" "Redis Streams"
+        redisCache -> asyncPersistConsumer "XREADGROUP > / XCLAIM idle pending — multi-pod safe via consumer group" "Redis Streams"
+        asyncPersistConsumer -> postgresDb "_persist_interaction + _flush_pending_tool_calls (reused from sync path) → XACK on success" "SQLAlchemy ORM"
+        asyncPersistConsumer -> redisCache "XADD audittrace:persist:dlq + XACK on poison (parse fail or delivery_count > max_deliveries)" "Redis Streams"
 
         // ADR-048 + ADR-057 ingestion content-control (broker = RabbitMQ).
         // Producer pattern (memory-server, PR-B3): /memory/upload PUTs
@@ -220,25 +219,25 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         // audittrace.scan.audit. Memory-server's verdict consumer +
         // audit consumer (PR-B4) update memory_items.scan_status +
         // INSERT interactions(event_class='security').
-        memoryServer.api -> memoryServer.minioStore "PUT s3://shared/quarantine/<user_id>/<uuid>/<file> (audittrace_app role; bucket-policy denies GET on this prefix in PR-B7)" "S3 API"
-        memoryServer.api -> rabbitmq "basic_publish to audittrace.scan exchange (routing key scan.request.*) — Hohpe Outbox + Danjou asyncio.Queue (PR-B3)" "AMQP 0-9-1 (mTLS)"
+        api -> minioStore "PUT s3://shared/quarantine/<user_id>/<uuid>/<file> (audittrace_app role; bucket-policy denies GET on this prefix in PR-B7)" "S3 API"
+        api -> rabbitmq "basic_publish to audittrace.scan exchange (routing key scan.request.*) — Hohpe Outbox + Danjou asyncio.Queue (PR-B3)" "AMQP 0-9-1 (mTLS)"
         rabbitmq -> contentControl "Delivers from audittrace.scan.requests quorum queue (basic_consume + manual ack)" "AMQP 0-9-1 (mTLS)"
-        contentControl -> memoryServer.minioStore "GET quarantine/, PUT episodic/papers/, DELETE quarantine/ (content_control role)" "S3 API"
+        contentControl -> minioStore "GET quarantine/, PUT episodic/papers/, DELETE quarantine/ (content_control role)" "S3 API"
         contentControl -> rabbitmq "basic_publish to audittrace.scan.verdicts (verdict) + audittrace.scan.audit (SECURITY row)" "AMQP 0-9-1 (mTLS)"
-        rabbitmq -> memoryServer.api "Delivers from audittrace.scan.verdicts + audittrace.scan.audit quorum queues — updates memory_items.scan_status, INSERT interactions(event_class='security')" "AMQP 0-9-1 (mTLS)"
+        rabbitmq -> api "Delivers from audittrace.scan.verdicts + audittrace.scan.audit quorum queues — updates memory_items.scan_status, INSERT interactions(event_class='security')" "AMQP 0-9-1 (mTLS)"
 
         // DI wiring
-        memoryServer.api.diContainer -> memoryServer.api.contextBuilder "Injects"
-        memoryServer.api.diContainer -> memoryServer.api.episodicSvc "Injects"
-        memoryServer.api.diContainer -> memoryServer.api.proceduralSvc "Injects"
-        memoryServer.api.diContainer -> memoryServer.api.conversationalSvc "Injects"
-        memoryServer.api.diContainer -> memoryServer.api.semanticSvc "Injects"
-        memoryServer.api.diContainer -> memoryServer.api.pgFactory "Injects"
-        memoryServer.api.pgFactory -> memoryServer.postgresDb "create_engine() + sessionmaker" "SQLAlchemy"
+        diContainer -> contextBuilder "Injects"
+        diContainer -> episodicSvc "Injects"
+        diContainer -> proceduralSvc "Injects"
+        diContainer -> conversationalSvc "Injects"
+        diContainer -> semanticSvc "Injects"
+        diContainer -> pgFactory "Injects"
+        pgFactory -> postgresDb "create_engine() + sessionmaker" "SQLAlchemy"
 
         // Audit writes (post-stream / post-loop, synchronous — async persistence deferred to a separate ADR, see §12 brainstorm)
-        memoryServer.api.chatRoute -> memoryServer.postgresDb "INSERT interactions (user_id = Keycloak sub)"
-        memoryServer.api.chatRoute -> memoryServer.postgresDb "INSERT tool_calls (ADR-025: one row per memory tool invocation; cache hits skip)"
+        chatRoute -> postgresDb "INSERT interactions (user_id = Keycloak sub)"
+        chatRoute -> postgresDb "INSERT tool_calls (ADR-025: one row per memory tool invocation; cache hits skip)"
 
         // Deployment — Kubernetes + Istio
         deploymentEnvironment "Kubernetes" {
@@ -256,23 +255,23 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                     }
 
                     deploymentNode "audittrace-server Deployment" "FastAPI application pod" "Python 3.12 / uvicorn" {
-                        apiInstance = containerInstance memoryServer.api
+                        apiInstance = containerInstance api
                     }
 
                     deploymentNode "postgresql StatefulSet" "Audit + sessions — interactions, sessions, tool_calls (DESIGN §15)" "PostgreSQL 16 Alpine" {
-                        pgInstance = containerInstance memoryServer.postgresDb
+                        pgInstance = containerInstance postgresDb
                     }
 
                     deploymentNode "redis StatefulSet" "Shared cache: audittrace:token:* (DESIGN §15.4) + audittrace:tool-result:* (ADR-025 §Decision.8). Dedicated — NOT shared with Langfuse Redis." "Redis 7 Alpine" {
-                        redisInstance = containerInstance memoryServer.redisCache
+                        redisInstance = containerInstance redisCache
                     }
 
                     deploymentNode "chromadb StatefulSet" "Vector store — token auth" "ChromaDB HTTP Server" {
-                        chromaInstance = containerInstance memoryServer.chromaDb
+                        chromaInstance = containerInstance chromaDb
                     }
 
                     deploymentNode "minio StatefulSet" "S3 object storage — SSE-S3 encryption at rest, per-user isolation via path prefix (ADR-027)" "MinIO" {
-                        minioInstance = containerInstance memoryServer.minioStore
+                        minioInstance = containerInstance minioStore
                     }
 
                     deploymentNode "keycloak Deployment" "Identity provider — owns users/roles/JWT issuance" "Keycloak 24" {
@@ -310,8 +309,6 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             apiInstance -> vaultServerInstance "Reads dependency creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
             keycloakInstance -> vaultServerInstance "Reads admin pw + DB creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
             apiInstance -> keycloakInstance "JWKS fetch (cached)" "HTTP/JSON"
-            apiInstance -> redisInstance "Token cache GET/SETEX" "Redis protocol"
-            apiInstance -> minioInstance "S3 API — memory-shared + memory-private buckets (ADR-027)" "HTTP/S3"
             apiInstance -> llamaInstance "Proxies augmented requests (streaming)" "HTTP/SSE"
             apiInstance -> summarizerInstance "Background summariser loop — non-streaming JSON (ADR-030)" "HTTP/JSON"
             apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
@@ -332,7 +329,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             autolayout lr
         }
 
-        component memoryServer.api "Components" "FastAPI application — 4-layer memory + Keycloak-delegated identity" {
+        component api "Components" "FastAPI application — 4-layer memory + Keycloak-delegated identity" {
             include *
             autolayout tb
         }
