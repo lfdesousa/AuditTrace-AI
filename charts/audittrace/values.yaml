@@ -51,7 +51,10 @@ global:
 
 # -- Memory Server (our app) -------------------------------------------------
 memoryServer:
-  replicaCount: 1
+  # Production default = 3 (HA, one per AZ via topologySpreadConstraints in the
+  # deployment template). Single-node dev / laptop k3s + CI override with
+  # `--set memoryServer.replicaCount=1` (ScheduleAnyway makes 3-on-1-node safe).
+  replicaCount: 3
   image:
     # Published by .github/workflows/publish.yml on every v*.*.* tag —
     # multi-arch (linux/amd64,linux/arm64). Operators with an internal

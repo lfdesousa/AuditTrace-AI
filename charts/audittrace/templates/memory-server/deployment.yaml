@@ -23,6 +23,17 @@ spec:
         {{- include "audittrace.vaultAnnotations.memoryServer" . | nindent 8 }}
         {{- end }}
     spec:
+      # Spread replicas across zones (one per AZ on a 3-AZ cloud) for HA.
+      # ScheduleAnyway (not DoNotSchedule) so single-node dev / laptop k3s
+      # still schedules every replica — no anti-affinity deadlock.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "audittrace.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: memory-server
       {{- if .Values.memoryServer.serviceAccount.create }}
       serviceAccountName: {{ .Values.memoryServer.serviceAccount.name }}
       {{- end }}
@@ -239,8 +250,11 @@ spec:
           # liveness probe's 45 s budget is too tight for that — the
           # kubelet would kill the pod mid-retry on a cold cluster.
           # startupProbe gives 150 s (5 s × 30) before failing,
-          # which comfortably covers the AMQP retry budget AND keeps
-          # liveness tight (45 s) for catching real post-boot hangs.
+          # which comfortably covers the AMQP retry budget. Liveness +
+          # readiness carry EXPLICIT timeoutSeconds + failureThreshold: the
+          # k8s implicit defaults (1 s / 3) can kill a busy-but-alive pod
+          # whose event loop is briefly slow under load. Relaxed to ~90 s
+          # liveness grace; startupProbe (150 s) still covers cold start.
           # Anchor: ~/work/audittrace-evidence/20260515-memory-server-startup-race/STARTUP-PROFILE.md.
           startupProbe:
             httpGet:
@@ -256,12 +270,16 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.memoryServer.resources | nindent 12 }}
       volumes:
