@@ -34,7 +34,10 @@ dependencies = [
     # langchain-core is retained explicitly so the dataclass import keeps
     # working without pulling the full Langchain + langchain-community tree.
     "langchain-core>=0.1.0",
-    "chromadb>=0.5.5",
+    # chromadb 1.x — provides AsyncHttpClient (memory-server uses the async
+    # Chroma client so vector I/O never blocks the event loop). The .venv is
+    # already on 1.5.7 and the suite is green on it.
+    "chromadb>=1.5,<2",
     "python-jose[cryptography]>=3.3.0",
     "python-multipart>=0.0.6",
     "httpx>=0.25.0",
