@@ -1,14 +1,21 @@
-"""PostgreSQL factory pattern for dependency injection — ADR-020.
+"""Async PostgreSQL factory pattern for dependency injection — ADR-020.
 
-Mirrors the ChromaDB factory in db/factory.py. All public entry points
-emit observability events via @log_call.
+Async-only data layer (asyncpg in production, aiosqlite in tests) so the
+FastAPI event loop is never blocked on DB I/O under load. Consumers always
+use the session via an ``async with`` context manager (PYTHON-ENGINEERING §1
+— deterministic cleanup, no try/finally, no leaked connections). All public
+entry points emit observability events via @log_call.
 """
 
 import logging
 from abc import ABC, abstractmethod
 
-from sqlalchemy import Engine, create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 from audittrace.db.models import Base
@@ -18,104 +25,127 @@ logger = logging.getLogger(__name__)
 
 
 class PostgresFactory(ABC):
-    """Abstract factory for PostgreSQL engine/session creation."""
+    """Abstract factory for async PostgreSQL engine/session creation."""
 
     @abstractmethod
-    def get_engine(self) -> Engine:
-        """Return the SQLAlchemy engine."""
+    def get_engine(self) -> AsyncEngine:
+        """Return the async SQLAlchemy engine."""
 
     @abstractmethod
-    def get_session_factory(self) -> sessionmaker[Session]:
-        """Return a sessionmaker bound to the engine."""
+    def get_session_factory(self) -> async_sessionmaker[AsyncSession]:
+        """Return an async_sessionmaker bound to the engine.
+
+        The returned factory is used as ``async with factory() as session:``
+        — the AsyncSession is an async context manager that closes the
+        connection deterministically on every exit path.
+        """
+
+    async def create_schema(self) -> None:
+        """Create ORM tables. No-op for the URL factory (Alembic owns the
+        prod schema); the in-memory test factories build the schema here.
+        Awaited once at app/test startup."""
+        return None
 
 
 class URLPostgresFactory(PostgresFactory):
-    """Production factory — connects via URL with connection pooling."""
+    """Production factory — async engine via URL with connection pooling."""
 
     def __init__(self, url: str, pool_size: int = 5):
         self._url = url
         self._pool_size = pool_size
-        self._engine: Engine | None = None
-        self._session_factory: sessionmaker[Session] | None = None
+        self._engine: AsyncEngine | None = None
+        self._session_factory: async_sessionmaker[AsyncSession] | None = None
 
     @log_call(logger=logger)
-    def get_engine(self) -> Engine:
+    def get_engine(self) -> AsyncEngine:
         if self._engine is None:
-            self._engine = create_engine(
+            self._engine = create_async_engine(
                 self._url,
                 pool_size=self._pool_size,
                 pool_pre_ping=True,
             )
-            # Per-engine SQLAlchemy instrumentation gives statement-level
-            # spans (SELECT/INSERT/UPDATE with db.statement). The global
-            # SQLAlchemyInstrumentor().instrument() in server.lifespan
-            # only catches connect events — engine=... is the supported
-            # hook for query events. Safe to call once per engine.
+            # Statement-level OTel spans. The async engine wraps a sync
+            # Engine at .sync_engine — that's what the instrumentor hooks.
             try:
                 from opentelemetry.instrumentation.sqlalchemy import (
                     SQLAlchemyInstrumentor,
                 )
 
-                SQLAlchemyInstrumentor().instrument(engine=self._engine)
+                SQLAlchemyInstrumentor().instrument(engine=self._engine.sync_engine)
             except Exception as exc:  # pragma: no cover - optional dep
                 logger.warning("SQLAlchemy engine instrumentation failed: %s", exc)
         return self._engine
 
     @log_call(logger=logger)
-    def get_session_factory(self) -> sessionmaker[Session]:
+    def get_session_factory(self) -> async_sessionmaker[AsyncSession]:
         if self._session_factory is None:
-            self._session_factory = sessionmaker(bind=self.get_engine())
+            # expire_on_commit=False: attributes stay usable after commit
+            # without an extra (async) refresh round-trip.
+            self._session_factory = async_sessionmaker(
+                bind=self.get_engine(), expire_on_commit=False
+            )
         return self._session_factory
 
 
 class InMemoryPostgresFactory(PostgresFactory):
-    """Test-only factory — SQLite in-memory engine running SQLAlchemy ORM.
+    """Test-only factory — aiosqlite in-memory engine running the ORM.
 
-    Uses ``StaticPool`` so every connection (including those opened from
-    FastAPI's thread-pool workers when sync code runs in async handlers)
-    shares the same in-memory database. Without it, SQLite ``:memory:``
-    creates a fresh empty DB per thread and our tables vanish.
+    ``StaticPool`` so every connection shares the one in-memory database
+    (otherwise SQLite ``:memory:`` gives a fresh empty DB per connection and
+    the tables vanish). The schema is built by ``await create_schema()`` at
+    startup since ``create_all`` must run through the async engine.
     """
 
     def __init__(self) -> None:
-        self._engine = create_engine(
-            "sqlite://",
+        self._engine: AsyncEngine = create_async_engine(
+            "sqlite+aiosqlite://",
             echo=False,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(self._engine)
-        self._session_factory = sessionmaker(bind=self._engine)
+        self._session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+            bind=self._engine, expire_on_commit=False
+        )
+
+    async def create_schema(self) -> None:
+        async with self._engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
     @log_call(logger=logger)
-    def get_engine(self) -> Engine:
+    def get_engine(self) -> AsyncEngine:
         return self._engine
 
     @log_call(logger=logger)
-    def get_session_factory(self) -> sessionmaker[Session]:
+    def get_session_factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory
 
 
 class MockPostgresFactory(PostgresFactory):
-    """Mock factory for unit testing — tracks calls, no real connections."""
+    """Mock factory for unit testing — tracks calls, aiosqlite in-memory."""
 
     def __init__(self) -> None:
         self.call_count: int = 0
-        self._engine = create_engine(
-            "sqlite://",
+        self._engine: AsyncEngine = create_async_engine(
+            "sqlite+aiosqlite://",
             echo=False,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        self._session_factory = sessionmaker(bind=self._engine)
+        self._session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+            bind=self._engine, expire_on_commit=False
+        )
+
+    async def create_schema(self) -> None:
+        async with self._engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
     @log_call(logger=logger)
-    def get_engine(self) -> Engine:
+    def get_engine(self) -> AsyncEngine:
         self.call_count += 1
         return self._engine
 
     @log_call(logger=logger)
-    def get_session_factory(self) -> sessionmaker[Session]:
+    def get_session_factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory
 
     def reset(self) -> None:
