@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC
 from io import BytesIO
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -204,7 +204,9 @@ class TestIndexAuth:
         # auth gate fires first regardless, which is what this test asserts.
         mock_minio.list_objects.return_value = iter([])
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
         with (
             patch("audittrace.auth.get_settings") as mock_settings,
             patch("audittrace.auth._get_jwks_keys") as mock_jwks,
@@ -400,10 +402,16 @@ class TestIndex:
     ) -> None:
         """Full flow: list objects, read content, chunk, upsert to ChromaDB."""
         mock_minio = self._mock_minio_with_objects()
-        mock_collection = MagicMock()
+        # AsyncMock: the real chroma client is async (AsyncHttpClient), so
+        # get_or_create_collection + the collection's upsert/get/count are
+        # coroutines. A sync MagicMock here masked the #263 gap where the
+        # sync /memory/index handler never awaited them → 'coroutine' object
+        # has no attribute 'upsert' (live laptop 500, 2026-05-31).
+        mock_collection = AsyncMock()
         mock_collection.count.return_value = 0
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
 
         with (
             patch(
@@ -434,9 +442,11 @@ class TestIndex:
     def test_index_default_collections(self, client: TestClient) -> None:
         """Without the collections param, defaults to decisions/skills/semantic."""
         mock_minio = self._mock_minio_with_objects()
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -463,6 +473,9 @@ class TestIndex:
         mock_minio = MagicMock()
         mock_minio.list_objects.return_value = []
         mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -568,6 +581,9 @@ class TestIndexErrorPaths:
         mock_minio.get_object.side_effect = Exception("network error")
 
         mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -601,6 +617,9 @@ class TestIndexErrorPaths:
         mock_minio.get_object.side_effect = Exception("timeout")
 
         mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -638,7 +657,9 @@ class TestIndexErrorPaths:
         mock_minio = MagicMock()
         mock_minio.list_objects.return_value = []
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -667,6 +688,9 @@ class TestIndexErrorPaths:
         mock_minio = MagicMock()
         mock_minio.list_objects.return_value = []
         mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -696,7 +720,9 @@ class TestIndexErrorPaths:
         mock_minio = MagicMock()
         mock_minio.list_objects.return_value = []
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -735,9 +761,11 @@ class TestIndexErrorPaths:
         response_obj.read.return_value = b"%PDF-1.4 ... pretend bytes"
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         # Mock pymupdf — two pages with non-empty text. The route
         # uses ``with pymupdf.open(...) as doc:`` (deterministic
@@ -808,9 +836,11 @@ class TestIndexErrorPaths:
         response_obj.read.return_value = b"# A note\nbody"
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -912,10 +942,11 @@ class TestIndexErrorPaths:
         response_obj.read.return_value = b"# ADR\ncontent"
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.delete_collection.side_effect = Exception("not found")
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.delete_collection = AsyncMock(side_effect=Exception("not found"))
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         with (
             patch(
@@ -985,9 +1016,11 @@ class TestPdfProvenance:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         # Realistic page rect — US Letter portrait (612 × 792 pt).
         # Set rect attrs explicitly so float(rect.x0) returns the
@@ -1087,9 +1120,11 @@ class TestPdfProvenance:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         # Three pages with the same rect.
         rect = MagicMock(x0=0.0, y0=0.0, x1=595.0, y1=842.0)  # A4
@@ -1197,9 +1232,13 @@ class TestPdfBombDefense:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._build_minio_with_pdf(b"some bytes here")
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
             fake_pymupdf = MagicMock()
 
             with (
@@ -1237,9 +1276,13 @@ class TestPdfBombDefense:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             # Doc claims 2 pages; cap is 1 → reject.
             fake_doc = self._build_doc(page_count=2, xref_length=10, page_text="body")
@@ -1279,9 +1322,13 @@ class TestPdfBombDefense:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             fake_doc = self._build_doc(page_count=1, xref_length=100, page_text="body")
             fake_pymupdf = MagicMock()
@@ -1319,9 +1366,13 @@ class TestPdfBombDefense:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             fake_doc = self._build_doc(page_count=10, xref_length=10, page_text="body")
             fake_pymupdf = MagicMock()
@@ -1363,9 +1414,13 @@ class TestPdfBombDefense:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._build_minio_with_pdf(b"%PDF-1.4")
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             rect = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
             small_page = MagicMock()
@@ -1451,9 +1506,11 @@ class TestPdfRedactions:
         """Default policy=reject: whole document is skipped on first
         redaction-bearing page; no chunks are emitted."""
         mock_minio = self._mk_minio_with_one_pdf()
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         redact_annot = self._mk_redact_annot((100.0, 100.0, 200.0, 200.0))
@@ -1503,9 +1560,13 @@ class TestPdfRedactions:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._mk_minio_with_one_pdf()
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
             # Redaction at (100,100)-(200,200).
@@ -1568,9 +1629,11 @@ class TestPdfRedactions:
         """Page with zero redaction annotations: chunk metadata has
         redaction_status='none' (the v1 default)."""
         mock_minio = self._mk_minio_with_one_pdf()
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()
@@ -1618,9 +1681,13 @@ class TestPdfRedactions:
         config_mod.get_settings.cache_clear()
         try:
             mock_minio = self._mk_minio_with_one_pdf()
-            mock_collection = MagicMock()
+            mock_collection = AsyncMock()
             mock_chroma = MagicMock()
-            mock_chroma.get_or_create_collection.return_value = mock_collection
+            mock_chroma.get_or_create_collection = AsyncMock(
+                return_value=mock_collection
+            )
+            mock_chroma.delete_collection = AsyncMock()
+            mock_chroma.list_collections = AsyncMock(return_value=[])
 
             rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
             redact_annot = self._mk_redact_annot((100.0, 100.0, 200.0, 200.0))
@@ -2109,9 +2176,11 @@ class TestPdfSignatureValidation:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()
@@ -3212,7 +3281,7 @@ class TestPdfEncryptedReject:
     """Tier-B item #15 — encrypted PDFs refuse with 0 chunks +
     extraction_warning, no password endpoint exposed."""
 
-    def test_encrypted_pdf_yields_zero_chunks_and_warning(
+    async def test_encrypted_pdf_yields_zero_chunks_and_warning(
         self, client: TestClient
     ) -> None:
         # Direct-ish unit test: feed an encrypted document into the
@@ -3230,7 +3299,8 @@ class TestPdfEncryptedReject:
         # Flush a manifest with the encrypted-warning shape and
         # verify the structured entry.
         manifest = MagicMock()
-        _flush_pdf_manifest(
+        manifest.upsert_pdf_metadata = AsyncMock()
+        await _flush_pdf_manifest(
             manifest_service=manifest,
             layer="episodic",
             key="episodic/locked.pdf",
@@ -3533,9 +3603,11 @@ class TestPdfManifestColumnsLive:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()
@@ -3614,9 +3686,11 @@ class TestPdfManifestColumnsLive:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         fake_doc = MagicMock()
         fake_doc.__enter__.return_value = fake_doc
@@ -3680,7 +3754,7 @@ class TestPdfFlushManifest:
             document_sha256="hash",
         )
 
-    def test_service_failure_is_swallowed(self) -> None:
+    async def test_service_failure_is_swallowed(self) -> None:
         """Postgres outage during manifest write must not undo the
         ChromaDB chunk writes already committed. Per ADR-050 §#22."""
         from unittest.mock import MagicMock
@@ -3688,9 +3762,9 @@ class TestPdfFlushManifest:
         from audittrace.routes.memory import _flush_pdf_manifest
 
         manifest = MagicMock()
-        manifest.upsert_pdf_metadata.side_effect = RuntimeError("pg down")
+        manifest.upsert_pdf_metadata = AsyncMock(side_effect=RuntimeError("pg down"))
         # Should NOT raise.
-        _flush_pdf_manifest(
+        await _flush_pdf_manifest(
             manifest_service=manifest,
             layer="episodic",
             key="x.pdf",
@@ -3882,11 +3956,11 @@ class TestPdfFlushManifestDetailsLog:
     """ADR-056 #24 — _flush_pdf_manifest appends a per-document outcome
     when ``details_log`` is provided."""
 
-    def test_details_log_appended_success(self) -> None:
+    async def test_details_log_appended_success(self) -> None:
         from audittrace.routes.memory import _flush_pdf_manifest
 
         log: list[dict] = []
-        _flush_pdf_manifest(
+        await _flush_pdf_manifest(
             manifest_service=None,
             layer="episodic",
             key="papers/foo.pdf",
@@ -3919,11 +3993,11 @@ class TestPdfFlushManifestDetailsLog:
         assert entry["pdf_author"] == "Doc Author"
         assert entry["pdf_creator"] == "MS Word"
 
-    def test_details_log_failure_outcome(self) -> None:
+    async def test_details_log_failure_outcome(self) -> None:
         from audittrace.routes.memory import _flush_pdf_manifest
 
         log: list[dict] = []
-        _flush_pdf_manifest(
+        await _flush_pdf_manifest(
             manifest_service=None,
             layer="episodic",
             key="papers/corrupt.pdf",
@@ -4213,9 +4287,11 @@ class TestPdfIndexDryRun:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()
@@ -4301,7 +4377,7 @@ class TestPdfIndexCorruptionExceptionPath:
     (memory_pdf/pipeline.py) and the per-file 90% gate needs a
     direct unit test to exercise the exception branch."""
 
-    def test_pymupdf_raise_is_classified_and_flushed(self) -> None:
+    async def test_pymupdf_raise_is_classified_and_flushed(self) -> None:
         from unittest.mock import MagicMock, patch
 
         from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
@@ -4318,13 +4394,14 @@ class TestPdfIndexCorruptionExceptionPath:
         fake_pymupdf = MagicMock()
         fake_pymupdf.open.side_effect = RuntimeError("invalid xref offset")
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
 
         details_log: list[dict] = []
 
         with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
-            chunks = _index_pdf_objects(
+            chunks = await _index_pdf_objects(
                 collection=mock_collection,
                 minio_client=mock_minio,
                 bucket="memory-shared",
@@ -4377,9 +4454,11 @@ class TestPdfIndexDetailsResponseShape:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()
@@ -4441,9 +4520,11 @@ class TestPdfIndexDetailsResponseShape:
         response_obj.__enter__.return_value = response_obj
         mock_minio.get_object.return_value = response_obj
 
-        mock_collection = MagicMock()
+        mock_collection = AsyncMock()
         mock_chroma = MagicMock()
-        mock_chroma.get_or_create_collection.return_value = mock_collection
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
 
         rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
         fake_page = MagicMock()

@@ -27,6 +27,7 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 (semantic).
 """
 
+import asyncio
 import contextlib
 import hashlib
 import io
@@ -378,12 +379,13 @@ async def upload_memory_file(
 # ── POST /memory/index ──────────────────────────────────────────────────────
 
 
-def _upsert_in_batches(
+async def _upsert_in_batches(
     collection: Any,
     ids: list[str],
     documents: list[str],
     metadatas: list[dict[str, Any]],
 ) -> None:
+    # async: the chroma client is async (AsyncHttpClient) — await the upsert.
     """``collection.upsert`` in fixed-size slices.
 
     Upsert (vs. add) so the single-file ?file= mode is idempotent —
@@ -393,7 +395,7 @@ def _upsert_in_batches(
     """
     for start in range(0, len(ids), _INDEX_BATCH_SIZE):
         end = min(start + _INDEX_BATCH_SIZE, len(ids))
-        collection.upsert(
+        await collection.upsert(
             ids=ids[start:end],
             documents=documents[start:end],
             metadatas=metadatas[start:end],
@@ -417,7 +419,7 @@ def _read_minio_object(client: Any, bucket: str, key: str) -> bytes | None:
         return None
 
 
-def _index_md_objects(
+async def _index_md_objects(
     collection: Any,
     minio_client: Any,
     bucket: str,
@@ -434,7 +436,9 @@ def _index_md_objects(
     for obj in objects:
         if not obj["filename"].endswith(".md"):
             continue
-        raw = _read_minio_object(minio_client, bucket, obj["key"])
+        raw = await asyncio.to_thread(
+            _read_minio_object, minio_client, bucket, obj["key"]
+        )
         if raw is None:
             continue
         content = raw.decode("utf-8", errors="replace")
@@ -455,7 +459,7 @@ def _index_md_objects(
             skill_name = obj["filename"].replace("SKILL-", "").replace(".md", "")
             for m in metadatas:
                 m["skill"] = skill_name
-        _upsert_in_batches(collection, ids, chunks, metadatas)
+        await _upsert_in_batches(collection, ids, chunks, metadatas)
         total += len(chunks)
     return total
 
@@ -464,7 +468,7 @@ def _index_md_objects(
 
 
 @router.post("/index")
-def index_memory(
+async def index_memory(
     collections: str | None = Query(None),
     file: str | None = Query(
         None,
@@ -634,15 +638,15 @@ def index_memory(
         # collection — no delete-and-recreate side-effect.
         if not single_file_mode and not dry_run:
             with contextlib.suppress(Exception):
-                chroma_client.delete_collection(col_name)
-        collection = chroma_client.get_or_create_collection(
+                await chroma_client.delete_collection(col_name)
+        collection = await chroma_client.get_or_create_collection(
             name=col_name,
             embedding_function=SINGLETON_EMBEDDER,
         )
 
         chunk_count = 0
         if col_name in ("decisions", "semantic"):
-            chunk_count += _index_md_objects(
+            chunk_count += await _index_md_objects(
                 collection,
                 minio_client,
                 bucket,
@@ -651,7 +655,7 @@ def index_memory(
                 category="episodic",
             )
         if col_name in ("skills", "semantic"):
-            chunk_count += _index_md_objects(
+            chunk_count += await _index_md_objects(
                 collection,
                 minio_client,
                 bucket,
@@ -667,7 +671,7 @@ def index_memory(
             # accumulator collects per-doc outcomes for the
             # ?details=true response shape.
             manifest_service = get_memory_manifest_service()
-            chunk_count += _index_pdf_objects(
+            chunk_count += await _index_pdf_objects(
                 collection,
                 minio_client,
                 bucket,
@@ -681,7 +685,7 @@ def index_memory(
                 details_log=details_log,
                 dry_run=dry_run,
             )
-            chunk_count += _index_pdf_objects(
+            chunk_count += await _index_pdf_objects(
                 collection,
                 minio_client,
                 bucket,
@@ -1211,18 +1215,18 @@ async def _merge_semantic_with_chroma(
         target_cols = [collection]
     else:
         try:
-            target_cols = [c.name for c in chroma.list_collections()][:5]
+            target_cols = [c.name for c in await chroma.list_collections()][:5]
         except Exception as exc:
             logger.warning("ChromaDB list_collections failed: %s", exc)
             return items
 
     for col_name in target_cols:
         try:
-            col = chroma.get_or_create_collection(
+            col = await chroma.get_or_create_collection(
                 name=col_name,
                 embedding_function=SINGLETON_EMBEDDER,
             )
-            res = col.get(
+            res = await col.get(
                 limit=_SEMANTIC_DISCOVERY_LIMIT,
                 include=["documents", "metadatas"],
             )

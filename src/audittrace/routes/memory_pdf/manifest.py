@@ -25,7 +25,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _flush_pdf_manifest(
+async def _flush_pdf_manifest(
     *,
     manifest_service: Any | None,
     layer: str,
@@ -88,7 +88,7 @@ def _flush_pdf_manifest(
     if manifest_service is None:
         return
     try:
-        manifest_service.upsert_pdf_metadata(
+        await manifest_service.upsert_pdf_metadata(
             layer,
             key,
             user_id=user_id,

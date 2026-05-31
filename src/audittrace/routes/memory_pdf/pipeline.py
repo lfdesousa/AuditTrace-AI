@@ -29,6 +29,7 @@ the pod's perspective — state lives in the external stores.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -60,7 +61,7 @@ from audittrace.routes.memory_pdf.toc import _build_toc_index
 logger = logging.getLogger(__name__)
 
 
-def _index_pdf_objects(
+async def _index_pdf_objects(
     collection: Any,
     minio_client: Any,
     bucket: str,
@@ -126,7 +127,9 @@ def _index_pdf_objects(
     for obj in objects:
         if not obj["filename"].lower().endswith(".pdf"):
             continue
-        raw = _read_minio_object(minio_client, bucket, obj["key"])
+        raw = await asyncio.to_thread(
+            _read_minio_object, minio_client, bucket, obj["key"]
+        )
         if raw is None:
             continue
 
@@ -175,7 +178,7 @@ def _index_pdf_objects(
                     "cap_bytes": max_size_bytes,
                 }
             )
-            _flush_pdf_manifest(
+            await _flush_pdf_manifest(
                 manifest_service=manifest_service,
                 layer=manifest_layer,
                 key=obj["key"],
@@ -225,7 +228,7 @@ def _index_pdf_objects(
                         extra={"file": obj["key"], "reason": "encrypted"},
                     )
                     warnings.append({"code": "encrypted", "page": None})
-                    _flush_pdf_manifest(
+                    await _flush_pdf_manifest(
                         manifest_service=manifest_service,
                         layer=manifest_layer,
                         key=obj["key"],
@@ -279,7 +282,7 @@ def _index_pdf_objects(
                             "cap": settings.pdf_max_pages,
                         }
                     )
-                    _flush_pdf_manifest(
+                    await _flush_pdf_manifest(
                         manifest_service=manifest_service,
                         layer=manifest_layer,
                         key=obj["key"],
@@ -322,7 +325,7 @@ def _index_pdf_objects(
                             "cap": settings.pdf_max_xref_count,
                         }
                     )
-                    _flush_pdf_manifest(
+                    await _flush_pdf_manifest(
                         manifest_service=manifest_service,
                         layer=manifest_layer,
                         key=obj["key"],
@@ -572,7 +575,7 @@ def _index_pdf_objects(
                         if md.get("toc_section") is None:
                             md.pop("toc_section", None)
                     if not dry_run:
-                        _upsert_in_batches(collection, ids, chunks, metadatas)
+                        await _upsert_in_batches(collection, ids, chunks, metadatas)
                         total += len(chunks)
                     # Tier-C #23 — chunks_written_doc reflects what
                     # *would* have been written, so dry-run response
@@ -582,7 +585,7 @@ def _index_pdf_objects(
             ocr_coverage_pct: float | None = None
             if page_count_doc and page_count_doc > 0:
                 ocr_coverage_pct = round((ocr_pages_doc / page_count_doc) * 100.0, 2)
-            _flush_pdf_manifest(
+            await _flush_pdf_manifest(
                 manifest_service=None if dry_run else manifest_service,
                 layer=manifest_layer,
                 key=obj["key"],
@@ -620,7 +623,7 @@ def _index_pdf_objects(
                 extra={"file": obj["key"], "reason": code},
             )
             warnings.append({"code": code, "page": None})
-            _flush_pdf_manifest(
+            await _flush_pdf_manifest(
                 manifest_service=manifest_service,
                 layer=manifest_layer,
                 key=obj["key"],
