@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Security
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.auth import require_user, validate_jwt
 from audittrace.identity import UserContext
@@ -26,7 +26,7 @@ from audittrace.routes.memory_upload.manifest import get_by_scan_id
 router = APIRouter(prefix="/memory/upload", tags=["memory"])
 
 
-def _get_session_factory() -> sessionmaker[Session]:
+def _get_session_factory() -> async_sessionmaker[AsyncSession]:
     """Lazy lookup of the FastAPI app's session factory.
 
     Imported lazily so test harnesses that wire the upload
@@ -35,7 +35,9 @@ def _get_session_factory() -> sessionmaker[Session]:
     """
     from audittrace.dependencies import get_postgres_factory  # noqa: PLC0415
 
-    factory: sessionmaker[Session] = get_postgres_factory().get_session_factory()
+    factory: async_sessionmaker[AsyncSession] = (
+        get_postgres_factory().get_session_factory()
+    )
     return factory
 
 
@@ -44,7 +46,7 @@ async def get_upload_status(
     scan_id: str = Query(..., description="Scan ID returned by POST /memory/upload"),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
     user: UserContext = Depends(require_user),
-    session_factory: sessionmaker[Session] = Depends(_get_session_factory),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(_get_session_factory),
 ) -> dict[str, Any]:
     """Return the current scan_status of the named upload.
 
@@ -53,8 +55,8 @@ async def get_upload_status(
     requesting user is the same one who created the row OR an
     admin — content-control verdicts shouldn't leak across
     tenant boundaries even pre-PR-B7 IAM split."""
-    with session_factory() as session:
-        row = get_by_scan_id(session, scan_id)
+    async with session_factory() as session:
+        row = await get_by_scan_id(session, scan_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
     if not (

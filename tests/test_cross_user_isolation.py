@@ -147,7 +147,7 @@ def _fresh_handlers_registry():
 class TestCrossUserIsolation:
     """Consolidated end-to-end per-user isolation proof."""
 
-    def test_episodic_is_shared_corpus_not_per_user(self, container, alice, bob):
+    async def test_episodic_is_shared_corpus_not_per_user(self, container, alice, bob):
         """ADRs are shared architectural knowledge — both users see
         the whole corpus. Per-user filtering is NOT meaningful here.
         The test proves the plumbing doesn't crash and both users
@@ -158,27 +158,29 @@ class TestCrossUserIsolation:
             title="ADR-009",
             file="ADR-009.md",
         )
-        alice_matches = episodic.search(alice, "cache compression")
-        bob_matches = episodic.search(bob, "cache compression")
+        alice_matches = await episodic.search(alice, "cache compression")
+        bob_matches = await episodic.search(bob, "cache compression")
         assert len(alice_matches) == 1
         assert len(bob_matches) == 1
         assert alice_matches[0].metadata["title"] == bob_matches[0].metadata["title"]
 
-    def test_procedural_is_shared_corpus_not_per_user(self, container, alice, bob):
+    async def test_procedural_is_shared_corpus_not_per_user(
+        self, container, alice, bob
+    ):
         """SKILL files are shared procedural knowledge — same semantics
         as episodic. Both users see the full corpus."""
         procedural = container._instances["procedural"]
         procedural.add_document(
             "OAuth2 OIDC JWT patterns", skill="IAM", file="SKILL-IAM.md"
         )
-        alice_matches = procedural.search(alice, "OAuth2")
-        bob_matches = procedural.search(bob, "OAuth2")
+        alice_matches = await procedural.search(alice, "OAuth2")
+        bob_matches = await procedural.search(bob, "OAuth2")
         assert len(alice_matches) == 1
         assert len(bob_matches) == 1
 
     # ──────────────────── Layer 3 — Conversational ────────────────────
 
-    def test_conversational_alice_cannot_read_bobs_sessions(
+    async def test_conversational_alice_cannot_read_bobs_sessions(
         self, container, alice, bob
     ):
         """Alice writes a session, Bob writes a session, they're in
@@ -187,14 +189,14 @@ class TestCrossUserIsolation:
         Phase 2."""
         conv = container._instances["conversational"]
 
-        conv.save_session(
+        await conv.save_session(
             alice,
             "shared-project",
             "alice: KV cache notes",
             ["a1"],
             session_id="alice-kv-1",
         )
-        conv.save_session(
+        await conv.save_session(
             bob,
             "shared-project",
             "bob: OAuth2 notes",
@@ -202,8 +204,8 @@ class TestCrossUserIsolation:
             session_id="bob-oauth-1",
         )
 
-        alice_sessions = conv.load_sessions(alice, "shared-project", n=10)
-        bob_sessions = conv.load_sessions(bob, "shared-project", n=10)
+        alice_sessions = await conv.load_sessions(alice, "shared-project", n=10)
+        bob_sessions = await conv.load_sessions(bob, "shared-project", n=10)
 
         assert len(alice_sessions) == 1
         assert "alice" in alice_sessions[0]["summary"]
@@ -211,32 +213,32 @@ class TestCrossUserIsolation:
         assert "bob" in bob_sessions[0]["summary"]
 
         # And the as_context() helper respects the same filter.
-        alice_ctx = conv.as_context(alice, "shared-project")
-        bob_ctx = conv.as_context(bob, "shared-project")
+        alice_ctx = await conv.as_context(alice, "shared-project")
+        bob_ctx = await conv.as_context(bob, "shared-project")
         assert "alice" in alice_ctx
         assert "bob" not in alice_ctx
         assert "bob" in bob_ctx
         assert "alice" not in bob_ctx
 
-    def test_conversational_save_persists_user_id(self, container, alice):
+    async def test_conversational_save_persists_user_id(self, container, alice):
         """Side-effect confirmation: the row actually lands with
         `user_id=alice.user_id`, not NULL or sentinel."""
         conv = container._instances["conversational"]
-        conv.save_session(alice, "P", "A", ["k"], session_id="alice-persist-1")
+        await conv.save_session(alice, "P", "A", ["k"], session_id="alice-persist-1")
         # Mock stores it in self._sessions with user_id field
         assert conv._sessions[-1]["user_id"] == alice.user_id
 
     # ────────────────────── Layer 4 — Semantic ────────────────────────
 
-    def test_semantic_chroma_filter_isolates_non_admin_users(
+    async def test_semantic_chroma_filter_isolates_non_admin_users(
         self, container, alice, bob
     ):
         """Non-admin callers get a `where={"user_id"}` filter in the
         Chroma query. Alice's docs are tagged with her user_id, Bob's
         with his; searching as alice returns only alice's rows."""
-        client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="audittrace")
-        col.add(
+        client = await container._factories["chromadb"].get_client()
+        col = await client.get_or_create_collection(name="audittrace")
+        await col.add(
             ids=["a1", "b1", "legacy"],
             documents=[
                 "alice private note about KV cache compression",
@@ -253,8 +255,8 @@ class TestCrossUserIsolation:
             client=client, default_collections=["audittrace"]
         )
 
-        alice_results = semantic.search(alice, "cache", k=10)
-        bob_results = semantic.search(bob, "cache", k=10)
+        alice_results = await semantic.search(alice, "cache", k=10)
+        bob_results = await semantic.search(bob, "cache", k=10)
 
         alice_contents = [d.page_content for d in alice_results]
         bob_contents = [d.page_content for d in bob_results]
@@ -264,15 +266,15 @@ class TestCrossUserIsolation:
         assert any("bob" in c for c in bob_contents)
         assert not any("alice" in c for c in bob_contents)
 
-    def test_semantic_wrapper_enforces_binding_by_construction(
+    async def test_semantic_wrapper_enforces_binding_by_construction(
         self, container, alice, bob
     ):
         """UserScopedSemanticService binds a user at construction time
         and ignores whatever user_context is passed at call time.
         Proves the Phase 4 'isolation by construction' property."""
-        client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="audittrace")
-        col.add(
+        client = await container._factories["chromadb"].get_client()
+        col = await client.get_or_create_collection(name="audittrace")
+        await col.add(
             ids=["a1", "b1"],
             documents=[
                 "alice's cache note",
@@ -288,7 +290,7 @@ class TestCrossUserIsolation:
 
         # Call with bob's context — the wrapper must ignore it and
         # use its bound (alice) identity.
-        results = alice_wrapper.search(bob, "cache", k=10)
+        results = await alice_wrapper.search(bob, "cache", k=10)
         contents = [d.page_content for d in results]
         assert any("alice" in c for c in contents)
         assert not any("bob" in c for c in contents)
@@ -306,7 +308,7 @@ class TestCrossUserIsolation:
 
     # ────────────────────── Context builder ───────────────────────────
 
-    def test_context_builder_per_request_aggregates_per_user(
+    async def test_context_builder_per_request_aggregates_per_user(
         self, container, alice, bob
     ):
         """get_context_builder(user) returns a per-request builder
@@ -314,10 +316,10 @@ class TestCrossUserIsolation:
         context includes the caller's conversational data but not
         the other user's."""
         conv = container._instances["conversational"]
-        conv.save_session(
+        await conv.save_session(
             alice, "shared-project", "alice KV cache", [], session_id="alice-builder-1"
         )
-        conv.save_session(
+        await conv.save_session(
             bob, "shared-project", "bob OAuth2", [], session_id="bob-builder-1"
         )
 
@@ -332,10 +334,10 @@ class TestCrossUserIsolation:
 
         # And the aggregated `build_system_context_with_stats` output
         # carries each user's conversational data separately.
-        alice_ctx, _ = alice_builder.build_system_context_with_stats(
+        alice_ctx, _ = await alice_builder.build_system_context_with_stats(
             alice, project="shared-project", query="cache"
         )
-        bob_ctx, _ = bob_builder.build_system_context_with_stats(
+        bob_ctx, _ = await bob_builder.build_system_context_with_stats(
             bob, project="shared-project", query="cache"
         )
         assert "alice KV cache" in alice_ctx
@@ -354,14 +356,14 @@ class TestCrossUserIsolation:
         the per-user filter. Proves the Phase 3 tool-handler layer
         honours isolation end-to-end through invoke_tool."""
         conv = container._instances["conversational"]
-        conv.save_session(
+        await conv.save_session(
             alice,
             "shared-project",
             "alice KV cache session",
             ["x"],
             session_id="alice-handler-1",
         )
-        conv.save_session(
+        await conv.save_session(
             bob,
             "shared-project",
             "bob OAuth2 session",
@@ -392,7 +394,7 @@ class TestCrossUserIsolation:
 
     # ──────────── Admin bypass — sentinel sees everything ───────────
 
-    def test_admin_sentinel_sees_everything(self, container, alice, bob):
+    async def test_admin_sentinel_sees_everything(self, container, alice, bob):
         """The sentinel bypass UserContext (is_admin=True) should
         bypass every per-user filter. This is the behaviour
         `AUDITTRACE_AUTH_REQUIRED=false` depends on — existing tests
@@ -407,10 +409,14 @@ class TestCrossUserIsolation:
         # "no admin god read"; admin admin-ness is about scopes, not
         # data.
         conv = container._instances["conversational"]
-        conv.save_session(alice, "shared", "alice", [], session_id="alice-admin-1")
-        conv.save_session(bob, "shared", "bob", [], session_id="bob-admin-1")
-        conv.save_session(admin, "shared", "admin's own", [], session_id="admin-own-1")
-        admin_sessions = conv.load_sessions(admin, "shared", n=10)
+        await conv.save_session(
+            alice, "shared", "alice", [], session_id="alice-admin-1"
+        )
+        await conv.save_session(bob, "shared", "bob", [], session_id="bob-admin-1")
+        await conv.save_session(
+            admin, "shared", "admin's own", [], session_id="admin-own-1"
+        )
+        admin_sessions = await conv.load_sessions(admin, "shared", n=10)
         assert len(admin_sessions) == 1
         assert admin_sessions[0]["summary"] == "admin's own"
 
@@ -418,9 +424,9 @@ class TestCrossUserIsolation:
         # per ADR-025 §Decision so the 4-layer context dump in
         # inject mode still works. Seed tagged rows and verify admin
         # sees them all.
-        client = container._factories["chromadb"].get_client()
-        col = client.get_or_create_collection(name="audittrace")
-        col.add(
+        client = await container._factories["chromadb"].get_client()
+        col = await client.get_or_create_collection(name="audittrace")
+        await col.add(
             ids=["a1", "b1"],
             documents=["alice cache", "bob cache"],
             metadatas=[
@@ -431,5 +437,5 @@ class TestCrossUserIsolation:
         semantic = ChromaSemanticService(
             client=client, default_collections=["audittrace"]
         )
-        admin_results = semantic.search(admin, "cache", k=10)
+        admin_results = await semantic.search(admin, "cache", k=10)
         assert len(admin_results) == 2  # admin bypass returns both

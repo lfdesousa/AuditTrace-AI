@@ -71,7 +71,7 @@ class ContextBuilderService(ABC):
     """Abstract context builder — aggregates all 4 memory layers."""
 
     @abstractmethod
-    def build_system_context(
+    async def build_system_context(
         self,
         user_context: UserContext,
         project: str | None = None,
@@ -80,7 +80,7 @@ class ContextBuilderService(ABC):
         """Build a structured context string from all memory layers."""
 
     @abstractmethod
-    def build_system_context_with_stats(
+    async def build_system_context_with_stats(
         self,
         user_context: UserContext,
         project: str | None = None,
@@ -109,18 +109,20 @@ class DefaultContextBuilder(ContextBuilderService):
         self._semantic = semantic
 
     @log_call(logger=logger)
-    def build_system_context(
+    async def build_system_context(
         self,
         user_context: UserContext,
         project: str | None = None,
         query: str | None = None,
     ) -> str:
         """Build context string. Delegates to build_system_context_with_stats."""
-        ctx, _ = self.build_system_context_with_stats(user_context, project, query)
+        ctx, _ = await self.build_system_context_with_stats(
+            user_context, project, query
+        )
         return str(ctx)
 
     @log_call(logger=logger)
-    def build_system_context_with_stats(
+    async def build_system_context_with_stats(
         self,
         user_context: UserContext,
         project: str | None = None,
@@ -147,7 +149,7 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 1: Episodic — ADRs
         try:
-            matched_adrs = self._episodic.search(user_context, query)
+            matched_adrs = await self._episodic.search(user_context, query)
             if matched_adrs:
                 adr_lines = ["## Architecture Decisions"]
                 for adr in matched_adrs:
@@ -163,7 +165,7 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 2: Procedural — Skills
         try:
-            matched_skills = self._procedural.search(user_context, query)
+            matched_skills = await self._procedural.search(user_context, query)
             if matched_skills:
                 skill_lines = ["## Relevant Skills"]
                 for s in matched_skills:
@@ -179,10 +181,10 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 3: Conversational — Sessions
         try:
-            ctx_str = self._conversational.as_context(user_context, project or "")
+            ctx_str = await self._conversational.as_context(user_context, project or "")
             if ctx_str:
                 sections.append(ctx_str)
-            sessions = self._conversational.load_sessions(
+            sessions = await self._conversational.load_sessions(
                 user_context, project or "", n=3
             )
             layer_stats["conversational"] = len(sessions)
@@ -192,7 +194,7 @@ class DefaultContextBuilder(ContextBuilderService):
 
         # Layer 4: Semantic — ChromaDB RAG
         try:
-            rag_docs = self._semantic.search(user_context, query, k=4)
+            rag_docs = await self._semantic.search(user_context, query, k=4)
             if rag_docs:
                 rag_lines = ["## Relevant Context (RAG)"]
                 for d in rag_docs:
@@ -327,7 +329,7 @@ class MockContextBuilder(ContextBuilderService):
         self._static_context = static_context
 
     @log_call(logger=logger)
-    def build_system_context(
+    async def build_system_context(
         self,
         user_context: UserContext,
         project: str | None = None,
@@ -337,7 +339,7 @@ class MockContextBuilder(ContextBuilderService):
         return self._static_context
 
     @log_call(logger=logger)
-    def build_system_context_with_stats(
+    async def build_system_context_with_stats(
         self,
         user_context: UserContext,
         project: str | None = None,

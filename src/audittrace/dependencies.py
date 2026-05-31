@@ -4,6 +4,8 @@ ADR-020: PostgreSQL replaces SQLite. ChromaDB is server-mode only.
 No file-based databases from this point forward.
 """
 
+import asyncio
+import inspect
 import logging
 from typing import Any, cast
 
@@ -71,6 +73,25 @@ from audittrace.services.trust_store import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_coroutine(coro: Any) -> Any:
+    """Run an awaitable to completion from synchronous code.
+
+    The DI container's ``create_instance`` is synchronous but the ChromaDB
+    factories are ``async def`` (#263). With no running loop (test-container
+    build) use ``asyncio.run``; if a loop IS running (FastAPI lifespan)
+    offload to a fresh loop on a worker thread so the active loop isn't
+    blocked.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro)).result()
+
+
 class DependencyContainer:
     """Container for dependency injection."""
 
@@ -92,6 +113,12 @@ class DependencyContainer:
     def create_instance(self, name: str) -> Any:
         factory = self.get_factory(name)
         instance = factory.get_client()
+        # #263: ChromaDB factories are ``async def get_client``. Resolve the
+        # coroutine to a concrete client so the synchronous container API
+        # keeps returning a usable instance (callers run before/outside the
+        # request event loop).
+        if inspect.iscoroutine(instance):
+            instance = _resolve_coroutine(instance)
         self._instances[name] = instance
         return instance
 

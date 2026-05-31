@@ -21,8 +21,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import InteractionRecord, SessionRecord
 from audittrace.identity import UserContext
@@ -35,13 +35,13 @@ class ConversationalService(ABC):
     """Abstract conversational memory service — session history."""
 
     @abstractmethod
-    def load_sessions(
+    async def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
     ) -> list[dict[str, Any]]:
         """Load the N most recent sessions for a project."""
 
     @abstractmethod
-    def save_session(
+    async def save_session(
         self,
         user_context: UserContext,
         project: str,
@@ -62,18 +62,18 @@ class ConversationalService(ABC):
         """
 
     @abstractmethod
-    def as_context(self, user_context: UserContext, project: str) -> str:
+    async def as_context(self, user_context: UserContext, project: str) -> str:
         """Return recent sessions formatted as context string."""
 
 
 class PostgresConversationalService(ConversationalService):
     """PostgreSQL-backed conversational memory service via SQLAlchemy ORM."""
 
-    def __init__(self, session_factory: sessionmaker[Session]):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self._session_factory = session_factory
 
     @log_call(logger=logger)
-    def load_sessions(
+    async def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
     ) -> list[dict[str, Any]]:
         """Load the N most recent sessions — hybrid real + synthetic (ADR-030 Part 1).
@@ -90,14 +90,19 @@ class PostgresConversationalService(ConversationalService):
         for sessions produced by the summariser — that's how the two
         tables join without a side table.
         """
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             # Step 1 — real summaries, already ordered and limited.
             real_rows = (
-                session.query(SessionRecord)
-                .filter(SessionRecord.project == project)
-                .filter(SessionRecord.user_id == user_context.user_id)
-                .order_by(SessionRecord.date.desc())
-                .limit(n)
+                (
+                    await session.execute(
+                        select(SessionRecord)
+                        .filter(SessionRecord.project == project)
+                        .filter(SessionRecord.user_id == user_context.user_id)
+                        .order_by(SessionRecord.date.desc())
+                        .limit(n)
+                    )
+                )
+                .scalars()
                 .all()
             )
             real_ids: set[str] = {row.id for row in real_rows}
@@ -116,7 +121,7 @@ class PostgresConversationalService(ConversationalService):
             # summarised). Ordered by most recent interaction first, at
             # most ``n`` — never need more since we truncate after merge.
             eligible_q = (
-                session.query(
+                select(
                     InteractionRecord.session_id,
                     func.max(InteractionRecord.timestamp).label("last_ts"),
                 )
@@ -130,10 +135,12 @@ class PostgresConversationalService(ConversationalService):
                     InteractionRecord.session_id.notin_(real_ids)
                 )
             eligible = (
-                eligible_q.order_by(func.max(InteractionRecord.timestamp).desc())
-                .limit(n)
-                .all()
-            )
+                await session.execute(
+                    eligible_q.order_by(
+                        func.max(InteractionRecord.timestamp).desc()
+                    ).limit(n)
+                )
+            ).all()
 
             # Step 3 — pull the anchor interactions (first Q, last A) for
             # each eligible session in a single query; group in Python.
@@ -141,11 +148,19 @@ class PostgresConversationalService(ConversationalService):
             if eligible:
                 eligible_ids = [row.session_id for row in eligible]
                 anchor_rows = (
-                    session.query(InteractionRecord)
-                    .filter(InteractionRecord.project == project)
-                    .filter(InteractionRecord.user_id == user_context.user_id)
-                    .filter(InteractionRecord.session_id.in_(eligible_ids))
-                    .order_by(InteractionRecord.session_id, InteractionRecord.timestamp)
+                    (
+                        await session.execute(
+                            select(InteractionRecord)
+                            .filter(InteractionRecord.project == project)
+                            .filter(InteractionRecord.user_id == user_context.user_id)
+                            .filter(InteractionRecord.session_id.in_(eligible_ids))
+                            .order_by(
+                                InteractionRecord.session_id,
+                                InteractionRecord.timestamp,
+                            )
+                        )
+                    )
+                    .scalars()
                     .all()
                 )
                 by_session: dict[str, list[InteractionRecord]] = {}
@@ -180,7 +195,7 @@ class PostgresConversationalService(ConversationalService):
             return combined[:n]
 
     @log_call(logger=logger)
-    def save_session(
+    async def save_session(
         self,
         user_context: UserContext,
         project: str,
@@ -204,7 +219,7 @@ class PostgresConversationalService(ConversationalService):
         background summariser (ADR-030) can revise its draft for an
         ongoing session without crashing on the second pass.
         """
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             try:
                 record = SessionRecord(
                     id=session_id,
@@ -221,17 +236,17 @@ class PostgresConversationalService(ConversationalService):
                 # session.add() which 500'd on the second call with
                 # IntegrityError: duplicate key value violates unique
                 # constraint "sessions_pkey".
-                session.merge(record)
-                session.commit()
+                await session.merge(record)
+                await session.commit()
                 return session_id
             except Exception:
-                session.rollback()
+                await session.rollback()
                 raise
 
     @log_call(logger=logger)
-    def as_context(self, user_context: UserContext, project: str) -> str:
+    async def as_context(self, user_context: UserContext, project: str) -> str:
         """Return recent sessions formatted as a context section."""
-        sessions = self.load_sessions(user_context, project, n=3)
+        sessions = await self.load_sessions(user_context, project, n=3)
         if not sessions:
             return ""
         lines = ["## Recent Sessions"]
@@ -256,7 +271,7 @@ class MockConversationalService(ConversationalService):
         self._sessions: list[dict[str, Any]] = []
 
     @log_call(logger=logger)
-    def load_sessions(
+    async def load_sessions(
         self, user_context: UserContext, project: str, n: int = 5
     ) -> list[dict[str, Any]]:
         filtered = [
@@ -267,7 +282,7 @@ class MockConversationalService(ConversationalService):
         return filtered[-n:]
 
     @log_call(logger=logger)
-    def save_session(
+    async def save_session(
         self,
         user_context: UserContext,
         project: str,
@@ -289,8 +304,8 @@ class MockConversationalService(ConversationalService):
         return session_id
 
     @log_call(logger=logger)
-    def as_context(self, user_context: UserContext, project: str) -> str:
-        sessions = self.load_sessions(user_context, project, n=3)
+    async def as_context(self, user_context: UserContext, project: str) -> str:
+        sessions = await self.load_sessions(user_context, project, n=3)
         if not sessions:
             return ""
         lines = ["## Recent Sessions"]

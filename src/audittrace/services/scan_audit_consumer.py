@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any
 from audittrace.db.models import InteractionRecord
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from audittrace.config import Settings
 
@@ -65,7 +65,7 @@ class ScanAuditConsumer:
         self,
         *,
         settings: Settings,
-        session_factory: sessionmaker[Any],
+        session_factory: async_sessionmaker[AsyncSession],
         queue_name: str = "audittrace.scan.audit",
         prefetch_count: int = 16,
     ) -> None:
@@ -130,7 +130,7 @@ class ScanAuditConsumer:
             extra={"queue": self._queue_name},
         )
 
-    def _persist_audit(self, payload: dict[str, Any]) -> None:
+    async def _persist_audit(self, payload: dict[str, Any]) -> None:
         """Synchronous INSERT — wrapped in ``asyncio.to_thread`` by
         the caller. Raises on parse / DB errors so the AMQP CM
         nacks."""
@@ -173,9 +173,9 @@ class ScanAuditConsumer:
             error_detail=detail,
             event_class="security",
         )
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             session.add(row)
-            session.commit()
+            await session.commit()
         logger.info(
             "scan_audit_consumer.persisted",
             extra={
@@ -188,7 +188,7 @@ class ScanAuditConsumer:
     async def _process_one(self, message: Any) -> None:
         async with message.process(requeue=False):
             payload = json.loads(message.body.decode("utf-8"))
-            await asyncio.to_thread(self._persist_audit, payload)
+            await self._persist_audit(payload)
 
     async def run(self) -> None:
         await self._ensure_connected()

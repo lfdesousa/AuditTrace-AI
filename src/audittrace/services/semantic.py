@@ -28,7 +28,7 @@ class SemanticService(ABC):
     """Abstract semantic memory service — vector search."""
 
     @abstractmethod
-    def search(
+    async def search(
         self,
         user_context: UserContext,
         query: str,
@@ -38,11 +38,11 @@ class SemanticService(ABC):
         """Search for relevant documents across collections."""
 
     @abstractmethod
-    def available_collections(self) -> list[str]:
+    async def available_collections(self) -> list[str]:
         """List available ChromaDB collections."""
 
     @abstractmethod
-    def upsert(
+    async def upsert(
         self,
         user_context: UserContext,
         collection: str,
@@ -58,7 +58,7 @@ class SemanticService(ABC):
         ``where`` filter in ``search()`` continues to apply."""
 
     @abstractmethod
-    def delete_document(
+    async def delete_document(
         self,
         user_context: UserContext,
         collection: str,
@@ -69,7 +69,7 @@ class SemanticService(ABC):
         it didn't exist."""
 
     @abstractmethod
-    def get_document(
+    async def get_document(
         self,
         user_context: UserContext,
         collection: str,
@@ -91,7 +91,7 @@ class ChromaSemanticService(SemanticService):
         self._default_collections = default_collections or ["audittrace"]
 
     @log_call(logger=logger)
-    def search(
+    async def search(
         self,
         user_context: UserContext,
         query: str,
@@ -115,10 +115,10 @@ class ChromaSemanticService(SemanticService):
 
         for col_name in target_collections:
             try:
-                collection = self._client.get_or_create_collection(
+                collection = await self._client.get_or_create_collection(
                     name=col_name, embedding_function=SINGLETON_EMBEDDER
                 )
-                count = collection.count()
+                count = await collection.count()
                 if count == 0:
                     continue
                 query_kwargs: dict[str, Any] = {
@@ -128,11 +128,11 @@ class ChromaSemanticService(SemanticService):
                 }
                 if where is not None:
                     query_kwargs["where"] = where
-                results = collection.query(**query_kwargs)
+                results = await collection.query(**query_kwargs)
                 for i in range(len(results["ids"][0])):
-                    doc_content = results["documents"][0][i]  # type: ignore[index]
+                    doc_content = results["documents"][0][i]
                     doc_metadata = (
-                        results["metadatas"][0][i] if results.get("metadatas") else {}  # type: ignore[index]
+                        results["metadatas"][0][i] if results.get("metadatas") else {}
                     )
                     all_docs.append(
                         Document(
@@ -148,15 +148,15 @@ class ChromaSemanticService(SemanticService):
         return all_docs
 
     @log_call(logger=logger)
-    def available_collections(self) -> list[str]:
+    async def available_collections(self) -> list[str]:
         """List all collections in ChromaDB."""
         try:
-            return [c.name for c in self._client.list_collections()]  # type: ignore[attr-defined]
+            return [c.name for c in await self._client.list_collections()]  # type: ignore[attr-defined]
         except Exception:
             return []
 
     @log_call(logger=logger)
-    def upsert(
+    async def upsert(
         self,
         user_context: UserContext,
         collection: str,
@@ -169,44 +169,44 @@ class ChromaSemanticService(SemanticService):
         # are honoured if the caller provided their own user_id.
         meta = dict(metadata or {})
         meta.setdefault("user_id", user_context.user_id)
-        col = self._client.get_or_create_collection(
+        col = await self._client.get_or_create_collection(
             name=collection, embedding_function=SINGLETON_EMBEDDER
         )
         # ChromaDB's `upsert` is exactly what we want — insert or replace.
-        col.upsert(ids=[document_id], documents=[text], metadatas=[meta])
+        await col.upsert(ids=[document_id], documents=[text], metadatas=[meta])
 
     @log_call(logger=logger)
-    def delete_document(
+    async def delete_document(
         self,
         user_context: UserContext,
         collection: str,
         document_id: str,
     ) -> bool:
         del user_context  # operator-side write; not user-scoped
-        col = self._client.get_or_create_collection(
+        col = await self._client.get_or_create_collection(
             name=collection, embedding_function=SINGLETON_EMBEDDER
         )
         # ChromaDB's `delete` is silently idempotent (deleting a non-
         # existent ID does not raise). To return a faithful boolean we
         # check existence first.
-        existing = col.get(ids=[document_id], include=["documents"])
+        existing = await col.get(ids=[document_id], include=["documents"])
         if not existing.get("ids"):
             return False
-        col.delete(ids=[document_id])
+        await col.delete(ids=[document_id])
         return True
 
     @log_call(logger=logger)
-    def get_document(
+    async def get_document(
         self,
         user_context: UserContext,
         collection: str,
         document_id: str,
     ) -> Document | None:
         del user_context  # operator-side read; admin scope gates the route
-        col = self._client.get_or_create_collection(
+        col = await self._client.get_or_create_collection(
             name=collection, embedding_function=SINGLETON_EMBEDDER
         )
-        result = col.get(ids=[document_id], include=["documents", "metadatas"])
+        result = await col.get(ids=[document_id], include=["documents", "metadatas"])
         if not result.get("ids"):
             return None
         documents = result.get("documents") or []
@@ -246,7 +246,7 @@ class UserScopedSemanticService(SemanticService):
         self._bound_user = user_context
 
     @log_call(logger=logger)
-    def search(
+    async def search(
         self,
         user_context: UserContext,
         query: str,
@@ -256,14 +256,14 @@ class UserScopedSemanticService(SemanticService):
         # Ignore the per-call user_context in favour of the bound one.
         # This is deliberate — see class docstring.
         del user_context
-        return self._inner.search(self._bound_user, query, k, collections)
+        return await self._inner.search(self._bound_user, query, k, collections)
 
     @log_call(logger=logger)
-    def available_collections(self) -> list[str]:
-        return self._inner.available_collections()
+    async def available_collections(self) -> list[str]:
+        return await self._inner.available_collections()
 
     @log_call(logger=logger)
-    def upsert(
+    async def upsert(
         self,
         user_context: UserContext,
         collection: str,
@@ -272,27 +272,31 @@ class UserScopedSemanticService(SemanticService):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         del user_context
-        self._inner.upsert(self._bound_user, collection, document_id, text, metadata)
+        await self._inner.upsert(
+            self._bound_user, collection, document_id, text, metadata
+        )
 
     @log_call(logger=logger)
-    def delete_document(
+    async def delete_document(
         self,
         user_context: UserContext,
         collection: str,
         document_id: str,
     ) -> bool:
         del user_context
-        return self._inner.delete_document(self._bound_user, collection, document_id)
+        return await self._inner.delete_document(
+            self._bound_user, collection, document_id
+        )
 
     @log_call(logger=logger)
-    def get_document(
+    async def get_document(
         self,
         user_context: UserContext,
         collection: str,
         document_id: str,
     ) -> Document | None:
         del user_context
-        return self._inner.get_document(self._bound_user, collection, document_id)
+        return await self._inner.get_document(self._bound_user, collection, document_id)
 
 
 class MockSemanticService(SemanticService):
@@ -302,7 +306,7 @@ class MockSemanticService(SemanticService):
         self._docs: dict[str, list[Document]] = {}
 
     @log_call(logger=logger)
-    def add_document(
+    async def add_document(
         self, content: str, source: str = "mock", collection: str = "default"
     ) -> None:
         """Add a document to a collection for testing."""
@@ -316,7 +320,7 @@ class MockSemanticService(SemanticService):
         )
 
     @log_call(logger=logger)
-    def search(
+    async def search(
         self,
         user_context: UserContext,
         query: str,
@@ -337,11 +341,11 @@ class MockSemanticService(SemanticService):
         return results[:k]
 
     @log_call(logger=logger)
-    def available_collections(self) -> list[str]:
+    async def available_collections(self) -> list[str]:
         return list(self._docs.keys())
 
     @log_call(logger=logger)
-    def upsert(
+    async def upsert(
         self,
         user_context: UserContext,
         collection: str,
@@ -363,7 +367,7 @@ class MockSemanticService(SemanticService):
         self._docs[collection].append(Document(page_content=text, metadata=meta))
 
     @log_call(logger=logger)
-    def delete_document(
+    async def delete_document(
         self,
         user_context: UserContext,
         collection: str,
@@ -377,7 +381,7 @@ class MockSemanticService(SemanticService):
         return False
 
     @log_call(logger=logger)
-    def get_document(
+    async def get_document(
         self,
         user_context: UserContext,
         collection: str,

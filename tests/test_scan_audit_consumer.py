@@ -16,6 +16,12 @@ from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.services.scan_audit_consumer import ScanAuditConsumer
 
 
+async def _make_factory():
+    _f = InMemoryPostgresFactory()
+    await _f.create_schema()
+    return _f.get_session_factory()
+
+
 def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
     s = MagicMock()
     s.scan_amqp_url = url
@@ -48,16 +54,20 @@ def _audit_payload(
 
 
 class TestPersistAudit:
-    def test_clean_writes_success_row_with_event_class_security(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
+    async def test_clean_writes_success_row_with_event_class_security(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
-        consumer._persist_audit(_audit_payload(verdict="clean"))
+        await consumer._persist_audit(_audit_payload(verdict="clean"))
 
-        with factory() as session:
+        async with factory() as session:
             rows = (
-                session.execute(
-                    select(InteractionRecord).where(
-                        InteractionRecord.event_class == "security"
+                (
+                    await session.execute(
+                        select(InteractionRecord).where(
+                            InteractionRecord.event_class == "security"
+                        )
                     )
                 )
                 .scalars()
@@ -81,15 +91,21 @@ class TestPersistAudit:
         assert detail["signature_db_hash"] == "deadbeef"
         assert detail["threat_name"] is None
 
-    def test_rejected_writes_failed_status_with_threat_metadata(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
+    async def test_rejected_writes_failed_status_with_threat_metadata(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
-        consumer._persist_audit(_audit_payload(verdict="rejected", scan_id="scan-r"))
+        await consumer._persist_audit(
+            _audit_payload(verdict="rejected", scan_id="scan-r")
+        )
 
-        with factory() as session:
-            row = session.execute(
-                select(InteractionRecord).where(
-                    InteractionRecord.event_class == "security"
+        async with factory() as session:
+            row = (
+                await session.execute(
+                    select(InteractionRecord).where(
+                        InteractionRecord.event_class == "security"
+                    )
                 )
             ).scalar_one()
         assert row.status == "failed"
@@ -100,15 +116,19 @@ class TestPersistAudit:
         assert detail["threat_family"] == "test"
         assert detail["confidence"] == 1.0
 
-    def test_scan_failed_writes_failed_status(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
+    async def test_scan_failed_writes_failed_status(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
-        consumer._persist_audit(_audit_payload(verdict="scan_failed"))
+        await consumer._persist_audit(_audit_payload(verdict="scan_failed"))
 
-        with factory() as session:
-            row = session.execute(
-                select(InteractionRecord).where(
-                    InteractionRecord.event_class == "security"
+        async with factory() as session:
+            row = (
+                await session.execute(
+                    select(InteractionRecord).where(
+                        InteractionRecord.event_class == "security"
+                    )
                 )
             ).scalar_one()
         assert row.status == "failed"
@@ -147,7 +167,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
             await consumer._ensure_connected()
@@ -157,7 +177,7 @@ class TestEnsureConnected:
     async def test_missing_url_raises(self) -> None:
         consumer = ScanAuditConsumer(
             settings=_settings(url=""),
-            session_factory=InMemoryPostgresFactory().get_session_factory(),
+            session_factory=await _make_factory(),
         )
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
@@ -178,7 +198,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
         assert ch.get_queue.await_count == 2
@@ -196,7 +216,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             with pytest.raises(
                 RuntimeError,
@@ -208,7 +228,9 @@ class TestEnsureConnected:
 
 class TestProcessOne:
     async def test_message_process_owns_ack_nack(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
         message = MagicMock()
         process_cm = AsyncMock()
@@ -220,11 +242,13 @@ class TestProcessOne:
         await consumer._process_one(message)
 
         message.process.assert_called_once_with(requeue=False)
-        with factory() as session:
+        async with factory() as session:
             count = (
-                session.execute(
-                    select(InteractionRecord).where(
-                        InteractionRecord.event_class == "security"
+                (
+                    await session.execute(
+                        select(InteractionRecord).where(
+                            InteractionRecord.event_class == "security"
+                        )
                     )
                 )
                 .scalars()
@@ -276,7 +300,9 @@ class TestRunLoop:
         queue.iterator = MagicMock(return_value=_FakeIter())
         channel.get_queue = AsyncMock(return_value=queue)
 
-        factory = InMemoryPostgresFactory().get_session_factory()
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
             task = _asyncio.create_task(consumer.run())
@@ -285,11 +311,13 @@ class TestRunLoop:
             with pytest.raises(_asyncio.CancelledError):
                 await task
 
-        with factory() as session:
+        async with factory() as session:
             count = (
-                session.execute(
-                    select(InteractionRecord).where(
-                        InteractionRecord.event_class == "security"
+                (
+                    await session.execute(
+                        select(InteractionRecord).where(
+                            InteractionRecord.event_class == "security"
+                        )
                     )
                 )
                 .scalars()
@@ -347,7 +375,7 @@ class TestRunLoop:
             ) as mock_err:
                 consumer = ScanAuditConsumer(
                     settings=_settings(),
-                    session_factory=InMemoryPostgresFactory().get_session_factory(),
+                    session_factory=await _make_factory(),
                 )
                 task = _asyncio.create_task(consumer.run())
                 await _asyncio.sleep(0.05)
@@ -361,7 +389,7 @@ class TestAclose:
     async def test_aclose_idempotent_when_not_connected(self) -> None:
         consumer = ScanAuditConsumer(
             settings=_settings(),
-            session_factory=InMemoryPostgresFactory().get_session_factory(),
+            session_factory=await _make_factory(),
         )
         await consumer.aclose()
 
@@ -379,7 +407,7 @@ class TestAclose:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
             await consumer.aclose()

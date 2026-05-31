@@ -7,8 +7,12 @@ use the session via an ``async with`` context manager (PYTHON-ENGINEERING §1
 entry points emit observability events via @log_call.
 """
 
+import atexit
 import logging
+import os
+import tempfile
 from abc import ABC, abstractmethod
+from typing import Any
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -16,7 +20,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from audittrace.db.models import Base
 from audittrace.logging_config import log_call
@@ -59,11 +63,16 @@ class URLPostgresFactory(PostgresFactory):
     @log_call(logger=logger)
     def get_engine(self) -> AsyncEngine:
         if self._engine is None:
-            self._engine = create_async_engine(
-                self._url,
-                pool_size=self._pool_size,
-                pool_pre_ping=True,
-            )
+            # pool_size is only valid for a real queue-pooled engine. The
+            # sqlite/aiosqlite test URL uses StaticPool, which rejects
+            # pool_size — so only pass it for non-sqlite (Postgres) engines.
+            kwargs: dict[str, Any] = {"pool_pre_ping": True}
+            if not self._url.startswith("sqlite"):
+                kwargs["pool_size"] = self._pool_size
+            else:
+                kwargs["connect_args"] = {"check_same_thread": False}
+                kwargs["poolclass"] = StaticPool
+            self._engine = create_async_engine(self._url, **kwargs)
             # Statement-level OTel spans. The async engine wraps a sync
             # Engine at .sync_engine — that's what the instrumentor hooks.
             try:
@@ -97,15 +106,54 @@ class InMemoryPostgresFactory(PostgresFactory):
     """
 
     def __init__(self) -> None:
+        # File-backed temp SQLite DB (not ``:memory:``). Rationale: under
+        # the async stack the TestClient runs the app lifespan in its own
+        # anyio-portal thread + event-loop, while async test bodies run in
+        # pytest-asyncio's loop. An ``:memory:`` DB (even shared-cache) is
+        # bound to the connection/loop that created it and the tables are
+        # invisible to the other loop — manifesting as "no such table".
+        # A real file on disk is visible to every thread, connection and
+        # event-loop, so writes from the handler loop are seen by the test
+        # loop. The temp file is removed at process exit — throwaway.
+        self._tmp = tempfile.NamedTemporaryFile(
+            prefix="audittrace_test_", suffix=".sqlite", delete=False
+        )
+        self._tmp.close()
+        self._db_path = self._tmp.name
+        atexit.register(self._cleanup_file)
+        url = f"sqlite+aiosqlite:///{self._db_path}"
+        # NullPool (not StaticPool): a file-backed DB lets every event-loop
+        # open its own fresh connection to the same file. StaticPool caches
+        # ONE connection bound to the loop that created it, so the TestClient
+        # lifespan loop and the pytest-asyncio test loop would fight over it.
         self._engine: AsyncEngine = create_async_engine(
-            "sqlite+aiosqlite://",
+            url,
             echo=False,
             connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+            poolclass=NullPool,
         )
         self._session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
             bind=self._engine, expire_on_commit=False
         )
+
+        # Classic test setup: build the ORM schema on the file NOW, via a
+        # throwaway SYNC engine, so the tables exist before any request or
+        # test body queries them — independent of when the async app
+        # lifespan happens to call ``create_schema()``. ``create_schema()``
+        # below stays available and is idempotent (CREATE ... IF NOT EXISTS).
+        from sqlalchemy import create_engine as _create_sync_engine
+
+        _sync_engine = _create_sync_engine(f"sqlite:///{self._db_path}")
+        try:
+            Base.metadata.create_all(_sync_engine)
+        finally:
+            _sync_engine.dispose()
+
+    def _cleanup_file(self) -> None:
+        try:
+            os.unlink(self._db_path)
+        except OSError:
+            pass
 
     async def create_schema(self) -> None:
         async with self._engine.begin() as conn:

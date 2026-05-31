@@ -17,6 +17,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Security
+from sqlalchemy import func, select
 
 from audittrace.auth import require_user, validate_jwt
 from audittrace.db.models import InteractionRecord as InteractionRow
@@ -120,23 +121,33 @@ async def list_interactions(
         raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
 
     session_factory = pg.get_session_factory()
-    with session_factory() as db:
-        q = db.query(InteractionRow)
+    async with session_factory() as db:
+        stmt = select(InteractionRow)
         if project is not None:
-            q = q.filter(InteractionRow.project == project)
+            stmt = stmt.where(InteractionRow.project == project)
         if user_id is not None:
-            q = q.filter(InteractionRow.user_id == user_id)
+            stmt = stmt.where(InteractionRow.user_id == user_id)
         if session_id is not None:
-            q = q.filter(InteractionRow.session_id == session_id)
+            stmt = stmt.where(InteractionRow.session_id == session_id)
         if source is not None:
-            q = q.filter(InteractionRow.source == source)
+            stmt = stmt.where(InteractionRow.source == source)
         if since is not None:
-            q = q.filter(InteractionRow.timestamp >= since)
+            stmt = stmt.where(InteractionRow.timestamp >= since)
         if status is not None:
-            q = q.filter(InteractionRow.status == status)
+            stmt = stmt.where(InteractionRow.status == status)
 
-        total = q.count()
-        rows = q.order_by(InteractionRow.id.desc()).offset(offset).limit(limit).all()
+        total = (
+            await db.execute(select(func.count()).select_from(stmt.subquery()))
+        ).scalar_one()
+        rows = (
+            (
+                await db.execute(
+                    stmt.order_by(InteractionRow.id.desc()).offset(offset).limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     return {
         "interactions": [_row_to_dict(r) for r in rows],
@@ -239,21 +250,31 @@ async def list_sessions(
         raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
 
     session_factory = pg.get_session_factory()
-    with session_factory() as db:
-        q = db.query(SessionRow)
+    async with session_factory() as db:
+        stmt = select(SessionRow)
         if project is not None:
-            q = q.filter(SessionRow.project == project)
+            stmt = stmt.where(SessionRow.project == project)
         if user_id is not None:
-            q = q.filter(SessionRow.user_id == user_id)
+            stmt = stmt.where(SessionRow.user_id == user_id)
         if since is not None:
-            q = q.filter(SessionRow.date >= since)
+            stmt = stmt.where(SessionRow.date >= since)
         if summarised is True:
-            q = q.filter(SessionRow.summarized_at.is_not(None))
+            stmt = stmt.where(SessionRow.summarized_at.is_not(None))
         elif summarised is False:
-            q = q.filter(SessionRow.summarized_at.is_(None))
+            stmt = stmt.where(SessionRow.summarized_at.is_(None))
 
-        total = q.count()
-        rows = q.order_by(SessionRow.date.desc()).offset(offset).limit(limit).all()
+        total = (
+            await db.execute(select(func.count()).select_from(stmt.subquery()))
+        ).scalar_one()
+        rows = (
+            (
+                await db.execute(
+                    stmt.order_by(SessionRow.date.desc()).offset(offset).limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     return {
         "sessions": [_session_row_to_dict(r) for r in rows],

@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
@@ -38,7 +38,7 @@ from audittrace.db.models import MemoryItem
 from audittrace.services.scan_request_publisher import ScanRequestEnvelope
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from audittrace.config import Settings
 
@@ -59,20 +59,20 @@ class ScanRequestJanitor:
         self,
         *,
         settings: Settings,
-        session_factory: sessionmaker[Any],
+        session_factory: async_sessionmaker[AsyncSession],
         queue: asyncio.Queue[ScanRequestEnvelope],
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._queue = queue
 
-    def _scan_orphans(self) -> list[ScanRequestEnvelope]:
+    async def _scan_orphans(self) -> list[ScanRequestEnvelope]:
         """One DB poll. Returns up to ``_JANITOR_BATCH_SIZE`` envelopes
         ready to re-enqueue. Synchronous Session — wrap in to_thread
         at the call site."""
         cutoff = _now_ms() - (self._settings.scan_janitor_grace_seconds * 1000)
         envelopes: list[ScanRequestEnvelope] = []
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             stmt = (
                 select(MemoryItem)
                 .where(MemoryItem.published_at_ms.is_(None))
@@ -80,7 +80,7 @@ class ScanRequestJanitor:
                 .where(MemoryItem.deleted_at_ms.is_(None))
                 .limit(_JANITOR_BATCH_SIZE)
             )
-            for row in session.execute(stmt).scalars():
+            for row in (await session.execute(stmt)).scalars():
                 envelopes.append(
                     ScanRequestEnvelope(
                         scan_id=row.id,
@@ -100,7 +100,7 @@ class ScanRequestJanitor:
 
     async def _tick_once(self) -> int:
         """One janitor cycle. Returns count re-enqueued."""
-        envelopes = await asyncio.to_thread(self._scan_orphans)
+        envelopes = await self._scan_orphans()
         for env in envelopes:
             await self._queue.put(env)
         if envelopes:

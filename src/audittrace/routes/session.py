@@ -67,7 +67,7 @@ async def save_session_summary(
     # from the client when they know it (summarising a real chat), or
     # generate a UUID for standalone admin-style summaries.
     resolved_session_id = request.session_id or str(uuid.uuid4())
-    session_id = conversational.save_session(
+    session_id = await conversational.save_session(
         user,
         project=request.project,
         summary=request.summary,

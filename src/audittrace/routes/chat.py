@@ -431,7 +431,7 @@ def _current_trace_id_hex() -> str | None:
     return None
 
 
-def _persist_interaction(
+async def _persist_interaction(
     project: str,
     source: str,
     question: str,
@@ -479,7 +479,7 @@ def _persist_interaction(
             trace_id = _current_trace_id_hex()
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
-        with session_factory() as db:
+        async with session_factory() as db:
             record = InteractionRecord(
                 project=project,
                 source=source,
@@ -498,8 +498,8 @@ def _persist_interaction(
                 trace_id=trace_id,
             )
             db.add(record)
-            db.commit()
-            db.refresh(record)
+            await db.commit()
+            await db.refresh(record)
             logger.info(
                 "interaction persisted id=%s user=%s status=%s project=%s model=%s duration_ms=%s",
                 record.id,
@@ -515,7 +515,7 @@ def _persist_interaction(
         return None
 
 
-def _flush_pending_tool_calls(
+async def _flush_pending_tool_calls(
     pending: list[PendingToolCall],
     interaction_id: int | None,
 ) -> None:
@@ -537,7 +537,7 @@ def _flush_pending_tool_calls(
     try:
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
-        with session_factory() as db:
+        async with session_factory() as db:
             for rec in pending:
                 db.add(
                     ToolCall(
@@ -553,7 +553,7 @@ def _flush_pending_tool_calls(
                         granted_scope=rec.granted_scope,
                     )
                 )
-            db.commit()
+            await db.commit()
             logger.info(
                 "tool_calls persisted count=%d interaction_id=%s",
                 len(pending),
@@ -615,9 +615,9 @@ async def _persist_or_enqueue(
         # Producer failed — fall through to sync to preserve the audit
         # invariant (feedback_traceability_requirement).
 
-    interaction_id = _persist_interaction(**kwargs)
+    interaction_id = await _persist_interaction(**kwargs)
     if pending_tool_calls:
-        _flush_pending_tool_calls(pending_tool_calls, interaction_id)
+        await _flush_pending_tool_calls(pending_tool_calls, interaction_id)
     telemetry.set_current_span_attributes({"audittrace.persist.mode": "sync"})
     return interaction_id
 
@@ -732,7 +732,7 @@ def _merge_system_message(
 
 
 @_lf_observe(name="sovereign-chat-request")
-def _build_memory_context_with_trace(
+async def _build_memory_context_with_trace(
     context_builder: ContextBuilderService,
     payload: dict[str, Any],
     query: str,
@@ -755,7 +755,7 @@ def _build_memory_context_with_trace(
     _set_genai_request_attributes(
         payload, query, session_id, source, user_context.user_id
     )
-    memory_context = context_builder.build_system_context(
+    memory_context = await context_builder.build_system_context(
         user_context,
         project=payload.get("project"),
         query=query,
@@ -1128,7 +1128,7 @@ async def _handle_tools_mode(
             timeout_seconds=settings.llama_chunk_timeout,
         )
     except httpx.TimeoutException as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1148,7 +1148,7 @@ async def _handle_tools_mode(
             detail=(f"llama-server timeout after {settings.llama_chunk_timeout}s"),
         ) from exc
     except httpx.HTTPStatusError as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1168,7 +1168,7 @@ async def _handle_tools_mode(
             detail=f"llama-server returned {exc.response.status_code}",
         ) from exc
     except httpx.ConnectError as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1188,7 +1188,7 @@ async def _handle_tools_mode(
             detail=f"llama-server unreachable at {llama_url}",
         ) from exc
     except Exception as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1376,8 +1376,7 @@ async def chat_completions(
     # Build memory context inside an @observe span (off-loop because the
     # context builder hits ChromaDB and disk synchronously) and capture an
     # explicit trace_id for the post-stream Langfuse update.
-    memory_context, trace_id = await asyncio.to_thread(
-        _build_memory_context_with_trace,
+    memory_context, trace_id = await _build_memory_context_with_trace(
         context_builder,
         payload,
         query,
@@ -1455,7 +1454,7 @@ async def chat_completions(
                     f"llama-server idle timeout after {settings.llama_chunk_timeout}s",
                     504,
                 )
-                _persist_interaction(
+                await _persist_interaction(
                     project=project,
                     source=source,
                     question=query,
@@ -1477,7 +1476,7 @@ async def chat_completions(
                     f"llama-server unreachable at {llama_url}",
                     502,
                 )
-                _persist_interaction(
+                await _persist_interaction(
                     project=project,
                     source=source,
                     question=query,
@@ -1499,7 +1498,7 @@ async def chat_completions(
                     f"llama-server returned status {exc.response.status_code}",
                     502,
                 )
-                _persist_interaction(
+                await _persist_interaction(
                     project=project,
                     source=source,
                     question=query,
@@ -1522,7 +1521,7 @@ async def chat_completions(
                     "Internal error during streaming.",
                     500,
                 )
-                _persist_interaction(
+                await _persist_interaction(
                     project=project,
                     source=source,
                     question=query,
@@ -1644,7 +1643,7 @@ async def chat_completions(
             except Exception:  # pragma: no cover - defensive serialisation
                 pass
     except httpx.ConnectError as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1664,7 +1663,7 @@ async def chat_completions(
             detail=f"llama-server unreachable at {llama_url}",
         ) from exc
     except httpx.TimeoutException as exc:
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,
@@ -1692,7 +1691,7 @@ async def chat_completions(
     err_envelope = body.get("error") if isinstance(body, dict) else None
     if isinstance(err_envelope, dict):
         usage = body.get("usage") or {}
-        _persist_interaction(
+        await _persist_interaction(
             project=project,
             source=source,
             question=query,

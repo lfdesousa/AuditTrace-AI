@@ -140,26 +140,30 @@ def s3_episodic(fake_bucket_objects: dict[str, bytes]) -> S3EpisodicService:
 
 
 class TestS3EpisodicService:
-    def test_load_returns_all_adrs(self, s3_episodic: S3EpisodicService, user_context):
-        docs = s3_episodic.load(user_context)
-        assert len(docs) == 3
-
-    def test_load_extracts_title_from_heading(
+    async def test_load_returns_all_adrs(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        docs = s3_episodic.load(user_context)
+        docs = await s3_episodic.load(user_context)
+        assert len(docs) == 3
+
+    async def test_load_extracts_title_from_heading(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        docs = await s3_episodic.load(user_context)
         titles = [d.metadata["title"] for d in docs]
         assert "ADR-001: Use ROCm for GPU Acceleration" in titles
         assert "ADR-009: KV Cache Compression" in titles
 
-    def test_load_sets_metadata(self, s3_episodic: S3EpisodicService, user_context):
-        docs = s3_episodic.load(user_context)
+    async def test_load_sets_metadata(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        docs = await s3_episodic.load(user_context)
         for d in docs:
             assert d.metadata["source"] == "episodic"
             assert d.metadata["file"].startswith("ADR-")
             assert d.metadata["file"].endswith(".md")
 
-    def test_load_skips_non_adr_keys(self, user_context):
+    async def test_load_skips_non_adr_keys(self, user_context):
         """Objects that don't match ADR-*.md must be ignored."""
         client = _FakeMinio(
             {
@@ -168,15 +172,15 @@ class TestS3EpisodicService:
             }
         )
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
-        docs = service.load(user_context)
+        docs = await service.load(user_context)
         files = [d.metadata["file"] for d in docs]
         assert files == ["ADR-001-x.md"]
 
-    def test_load_handles_empty_bucket(self, user_context):
+    async def test_load_handles_empty_bucket(self, user_context):
         service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert service.load(user_context) == []
+        assert await service.load(user_context) == []
 
-    def test_load_handles_client_exception(self, user_context):
+    async def test_load_handles_client_exception(self, user_context):
         """An unexpected client error logs + returns []. No exception bubbles."""
 
         class _Broken:
@@ -184,22 +188,22 @@ class TestS3EpisodicService:
                 raise RuntimeError("connection refused")
 
         service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
-        assert service.load(user_context) == []
+        assert await service.load(user_context) == []
 
-    def test_search_filters_by_query(
+    async def test_search_filters_by_query(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        results = s3_episodic.search(user_context, "cache compression")
+        results = await s3_episodic.search(user_context, "cache compression")
         assert len(results) >= 1
         titles = [d.metadata["title"] for d in results]
         assert any("Cache" in t for t in titles)
 
-    def test_search_no_match_returns_empty(
+    async def test_search_no_match_returns_empty(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        assert s3_episodic.search(user_context, "quantum entanglement") == []
+        assert await s3_episodic.search(user_context, "quantum entanglement") == []
 
-    def test_search_no_arbitrary_cap(self, user_context):
+    async def test_search_no_arbitrary_cap(self, user_context):
         """If 5 ADRs match, all 5 should be returned — no cap."""
         objs = {
             f"episodic/ADR-{i:03d}-server-config-{i}.md": (
@@ -209,34 +213,34 @@ class TestS3EpisodicService:
             for i in range(1, 6)
         }
         service = S3EpisodicService(_FakeMinio(objs), bucket="b", prefix="episodic/")
-        results = service.search(user_context, "server configuration")
+        results = await service.search(user_context, "server configuration")
         assert len(results) == 5
 
-    def test_search_short_query_returns_empty(
+    async def test_search_short_query_returns_empty(
         self, s3_episodic: S3EpisodicService, user_context
     ):
         """Short keywords (≤3 chars) yield nothing — avoids spam matches."""
-        assert s3_episodic.search(user_context, "hi a") == []
+        assert await s3_episodic.search(user_context, "hi a") == []
 
-    def test_as_context_returns_formatted_string(
+    async def test_as_context_returns_formatted_string(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        ctx = s3_episodic.as_context(user_context, "cache")
+        ctx = await s3_episodic.as_context(user_context, "cache")
         assert "Architecture Decisions" in ctx
         assert "KV Cache" in ctx
 
-    def test_as_context_empty_when_no_match(
+    async def test_as_context_empty_when_no_match(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        assert s3_episodic.as_context(user_context, "quantum entanglement") == ""
+        assert await s3_episodic.as_context(user_context, "quantum entanglement") == ""
 
-    def test_load_handles_adr_with_no_h1_header(self, user_context):
+    async def test_load_handles_adr_with_no_h1_header(self, user_context):
         """An ADR file without a `# ` H1 line still loads — title is the stem."""
         client = _FakeMinio(
             {"episodic/ADR-100-no-header.md": b"Just body text, no H1 line.\n"}
         )
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
-        docs = service.load(user_context)
+        docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["title"] == "ADR-100-no-header"
 
@@ -244,13 +248,13 @@ class TestS3EpisodicService:
 class TestS3EpisodicServiceRead:
     """``read(file)`` — full-content fetch by exact filename (Phase A.1)."""
 
-    def test_read_existing_file_returns_full_content(
+    async def test_read_existing_file_returns_full_content(
         self,
         s3_episodic: S3EpisodicService,
         fake_bucket_objects: dict[str, bytes],
         user_context,
     ):
-        doc = s3_episodic.read(user_context, "ADR-009-kv-cache-compression.md")
+        doc = await s3_episodic.read(user_context, "ADR-009-kv-cache-compression.md")
         assert doc is not None
         expected = fake_bucket_objects[
             "episodic/ADR-009-kv-cache-compression.md"
@@ -260,12 +264,12 @@ class TestS3EpisodicServiceRead:
         assert doc.metadata["title"] == "ADR-009: KV Cache Compression"
         assert doc.metadata["source"] == "episodic"
 
-    def test_read_missing_file_returns_none(
+    async def test_read_missing_file_returns_none(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        assert s3_episodic.read(user_context, "ADR-999-nope.md") is None
+        assert await s3_episodic.read(user_context, "ADR-999-nope.md") is None
 
-    def test_read_rejects_path_traversal(
+    async def test_read_rejects_path_traversal(
         self, s3_episodic: S3EpisodicService, user_context
     ):
         for bad in [
@@ -274,19 +278,21 @@ class TestS3EpisodicServiceRead:
             "subdir/ADR-001.md",
             "..\\windows.md",
         ]:
-            assert s3_episodic.read(user_context, bad) is None
+            assert await s3_episodic.read(user_context, bad) is None
 
-    def test_read_rejects_non_md(self, s3_episodic: S3EpisodicService, user_context):
-        assert s3_episodic.read(user_context, "ADR-001") is None
-        assert s3_episodic.read(user_context, "ADR-001.txt") is None
-
-    def test_read_rejects_empty_or_non_string(
+    async def test_read_rejects_non_md(
         self, s3_episodic: S3EpisodicService, user_context
     ):
-        assert s3_episodic.read(user_context, "") is None
-        assert s3_episodic.read(user_context, None) is None  # type: ignore[arg-type]
+        assert await s3_episodic.read(user_context, "ADR-001") is None
+        assert await s3_episodic.read(user_context, "ADR-001.txt") is None
 
-    def test_read_handles_unexpected_exception(self, user_context):
+    async def test_read_rejects_empty_or_non_string(
+        self, s3_episodic: S3EpisodicService, user_context
+    ):
+        assert await s3_episodic.read(user_context, "") is None
+        assert await s3_episodic.read(user_context, None) is None  # type: ignore[arg-type]
+
+    async def test_read_handles_unexpected_exception(self, user_context):
         """Non-NoSuchKey errors log + return None — caller never sees a raise."""
 
         class _Broken:
@@ -294,14 +300,14 @@ class TestS3EpisodicServiceRead:
                 raise RuntimeError("connection reset")
 
         service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
-        assert service.read(user_context, "ADR-001.md") is None
+        assert await service.read(user_context, "ADR-001.md") is None
 
-    def test_read_returns_full_untruncated_content(self, user_context):
+    async def test_read_returns_full_untruncated_content(self, user_context):
         """Regression for the ADR-025 bug: full content, no 400-char limit."""
         big = ("# ADR-025\n\n" + ("body line.\n" * 5000)).encode()
         client = _FakeMinio({"episodic/ADR-025.md": big})
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
-        doc = service.read(user_context, "ADR-025.md")
+        doc = await service.read(user_context, "ADR-025.md")
         assert doc is not None
         assert len(doc.page_content) == len(big.decode())
         assert len(doc.page_content) > 5000  # well over the old 400-char cap
@@ -311,40 +317,40 @@ class TestS3EpisodicServiceRead:
 
 
 class TestMockEpisodicService:
-    def test_mock_starts_empty(self, user_context):
+    async def test_mock_starts_empty(self, user_context):
         service = MockEpisodicService()
-        assert service.load(user_context) == []
-        assert service.search(user_context, "anything") == []
+        assert await service.load(user_context) == []
+        assert await service.search(user_context, "anything") == []
 
-    def test_mock_add_and_load(self, user_context):
+    async def test_mock_add_and_load(self, user_context):
         service = MockEpisodicService()
         service.add_document(
             "ADR content about cache", title="ADR-009", file="ADR-009.md"
         )
-        docs = service.load(user_context)
+        docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["title"] == "ADR-009"
 
-    def test_mock_search_filters(self, user_context):
+    async def test_mock_search_filters(self, user_context):
         service = MockEpisodicService()
         service.add_document("KV cache compression", title="ADR-009", file="ADR-009.md")
         service.add_document("ROCm GPU setup", title="ADR-001", file="ADR-001.md")
-        results = service.search(user_context, "cache")
+        results = await service.search(user_context, "cache")
         assert len(results) == 1
         assert results[0].metadata["title"] == "ADR-009"
 
-    def test_mock_reset(self, user_context):
+    async def test_mock_reset(self, user_context):
         service = MockEpisodicService()
         service.add_document("test", title="T", file="T.md")
         service.reset()
-        assert service.load(user_context) == []
+        assert await service.load(user_context) == []
 
     def test_abstract_interface(self):
         """Verify MockEpisodicService is a valid EpisodicService."""
         service = MockEpisodicService()
         assert isinstance(service, EpisodicService)
 
-    def test_mock_as_context_renders_matched(self, user_context):
+    async def test_mock_as_context_renders_matched(self, user_context):
         """as_context with results renders the section header + content slice."""
         service = MockEpisodicService()
         service.add_document(
@@ -352,39 +358,39 @@ class TestMockEpisodicService:
             title="ADR-009",
             file="ADR-009.md",
         )
-        out = service.as_context(user_context, "compression")
+        out = await service.as_context(user_context, "compression")
         assert "## Architecture Decisions" in out
         assert "ADR-009" in out
         assert "compression" in out
 
-    def test_mock_search_short_query_returns_empty(self, user_context):
+    async def test_mock_search_short_query_returns_empty(self, user_context):
         """Queries with no keywords > 3 chars must return [] (no spam matches)."""
         service = MockEpisodicService()
         service.add_document("anything", title="T", file="T.md")
-        assert service.search(user_context, "hi a") == []
+        assert await service.search(user_context, "hi a") == []
 
-    def test_mock_as_context_no_match_returns_empty_string(self, user_context):
+    async def test_mock_as_context_no_match_returns_empty_string(self, user_context):
         """as_context returns "" when search yields nothing."""
         service = MockEpisodicService()
         service.add_document("body", title="T", file="T.md")
-        assert service.as_context(user_context, "nothing-matches-here") == ""
+        assert await service.as_context(user_context, "nothing-matches-here") == ""
 
-    def test_mock_read_returns_matching_document(self, user_context):
+    async def test_mock_read_returns_matching_document(self, user_context):
         service = MockEpisodicService()
         service.add_document("contents", title="ADR-007", file="ADR-007.md")
-        doc = service.read(user_context, "ADR-007.md")
+        doc = await service.read(user_context, "ADR-007.md")
         assert doc is not None
         assert doc.page_content == "contents"
 
-    def test_mock_read_returns_none_when_missing(self, user_context):
+    async def test_mock_read_returns_none_when_missing(self, user_context):
         service = MockEpisodicService()
         service.add_document("contents", title="ADR-007", file="ADR-007.md")
-        assert service.read(user_context, "ADR-999.md") is None
+        assert await service.read(user_context, "ADR-999.md") is None
 
-    def test_mock_read_rejects_path_traversal(self, user_context):
+    async def test_mock_read_rejects_path_traversal(self, user_context):
         service = MockEpisodicService()
         service.add_document("contents", title="ADR-007", file="ADR-007.md")
-        assert service.read(user_context, "../etc/passwd.md") is None
+        assert await service.read(user_context, "../etc/passwd.md") is None
 
 
 # ── write / delete / invalidate_cache (PR A — CRUD backoffice) ──────────────
@@ -395,95 +401,99 @@ class TestS3EpisodicServiceWriteDelete:
     invalidate the in-memory cache so subsequent load()/read() see
     the change."""
 
-    def test_write_creates_object_and_invalidates_cache(self, user_context) -> None:
+    async def test_write_creates_object_and_invalidates_cache(
+        self, user_context
+    ) -> None:
         client = _FakeMinio({})
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         # Warm the cache
-        assert service.load(user_context) == []
+        assert await service.load(user_context) == []
         # Write
-        doc = service.write(user_context, "ADR-100.md", "# ADR-100\n\nbody\n")
+        doc = await service.write(user_context, "ADR-100.md", "# ADR-100\n\nbody\n")
         assert doc.metadata["file"] == "ADR-100.md"
         assert doc.metadata["title"] == "ADR-100"
         # Object landed in the fake MinIO
         assert "episodic/ADR-100.md" in client._objects
         # Cache was invalidated → next load() sees the new doc
         assert any(
-            d.metadata["file"] == "ADR-100.md" for d in service.load(user_context)
+            d.metadata["file"] == "ADR-100.md" for d in await service.load(user_context)
         )
 
-    def test_write_replaces_existing(self, user_context) -> None:
+    async def test_write_replaces_existing(self, user_context) -> None:
         client = _FakeMinio({"episodic/ADR-x.md": b"# v1\n"})
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
-        service.write(user_context, "ADR-x.md", "# v2\n")
+        await service.write(user_context, "ADR-x.md", "# v2\n")
         # Re-fetch
-        doc = service.read(user_context, "ADR-x.md")
+        doc = await service.read(user_context, "ADR-x.md")
         assert doc is not None
         assert doc.page_content == "# v2\n"
 
-    def test_write_rejects_invalid_filename(self, user_context) -> None:
+    async def test_write_rejects_invalid_filename(self, user_context) -> None:
         service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
         with pytest.raises(ValueError):
-            service.write(user_context, "../escape.md", "x")
+            await service.write(user_context, "../escape.md", "x")
 
-    def test_delete_removes_existing(self, user_context) -> None:
+    async def test_delete_removes_existing(self, user_context) -> None:
         client = _FakeMinio({"episodic/ADR-d.md": b"# bye\n"})
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         # Warm cache
-        service.load(user_context)
-        deleted = service.delete(user_context, "ADR-d.md")
+        await service.load(user_context)
+        deleted = await service.delete(user_context, "ADR-d.md")
         assert deleted is True
         assert "episodic/ADR-d.md" not in client._objects
         # Cache invalidated → not found
-        assert service.read(user_context, "ADR-d.md") is None
+        assert await service.read(user_context, "ADR-d.md") is None
 
-    def test_delete_missing_returns_false(self, user_context) -> None:
+    async def test_delete_missing_returns_false(self, user_context) -> None:
         service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert service.delete(user_context, "never.md") is False
+        assert await service.delete(user_context, "never.md") is False
 
-    def test_delete_rejects_invalid_filename(self, user_context) -> None:
+    async def test_delete_rejects_invalid_filename(self, user_context) -> None:
         service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert service.delete(user_context, "../escape.md") is False
+        assert await service.delete(user_context, "../escape.md") is False
 
-    def test_invalidate_cache_explicit(self, user_context) -> None:
+    async def test_invalidate_cache_explicit(self, user_context) -> None:
         client = _FakeMinio({"episodic/ADR-c.md": b"# c\n"})
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
-        service.load(user_context)  # warm
+        await service.load(user_context)  # warm
         # Backdoor an extra object straight into MinIO
         client._objects["episodic/ADR-side.md"] = b"# side\n"
         # Without invalidation, cache hides it
-        files_before = {d.metadata["file"] for d in service.load(user_context)}
+        files_before = {d.metadata["file"] for d in await service.load(user_context)}
         assert "ADR-side.md" not in files_before
         service.invalidate_cache()
-        files_after = {d.metadata["file"] for d in service.load(user_context)}
+        files_after = {d.metadata["file"] for d in await service.load(user_context)}
         assert "ADR-side.md" in files_after
 
 
 class TestMockEpisodicServiceWriteDelete:
     """Mock variants — used by route tests + the in-process pytest stack."""
 
-    def test_write_then_read(self, user_context) -> None:
+    async def test_write_then_read(self, user_context) -> None:
         service = MockEpisodicService()
-        doc = service.write(user_context, "ADR-7.md", "# Seven\n")
+        doc = await service.write(user_context, "ADR-7.md", "# Seven\n")
         assert doc.metadata["title"] == "Seven"
         # Read back
-        assert service.read(user_context, "ADR-7.md").page_content == "# Seven\n"
+        assert (
+            await service.read(user_context, "ADR-7.md")
+        ).page_content == "# Seven\n"
 
-    def test_write_replaces(self, user_context) -> None:
+    async def test_write_replaces(self, user_context) -> None:
         service = MockEpisodicService()
-        service.write(user_context, "ADR-7.md", "v1")
-        service.write(user_context, "ADR-7.md", "v2")
-        assert len(service.load(user_context)) == 1
-        assert service.read(user_context, "ADR-7.md").page_content == "v2"
+        await service.write(user_context, "ADR-7.md", "v1")
+        await service.write(user_context, "ADR-7.md", "v2")
+        assert len(await service.load(user_context)) == 1
+        assert (await service.read(user_context, "ADR-7.md")).page_content == "v2"
 
-    def test_delete_existing_returns_true(self, user_context) -> None:
+    async def test_delete_existing_returns_true(self, user_context) -> None:
         service = MockEpisodicService()
-        service.write(user_context, "ADR-7.md", "x")
-        assert service.delete(user_context, "ADR-7.md") is True
-        assert service.read(user_context, "ADR-7.md") is None
+        await service.write(user_context, "ADR-7.md", "x")
+        assert await service.delete(user_context, "ADR-7.md") is True
+        assert await service.read(user_context, "ADR-7.md") is None
 
-    def test_delete_missing_returns_false(self, user_context) -> None:
+    async def test_delete_missing_returns_false(self, user_context) -> None:
         service = MockEpisodicService()
-        assert service.delete(user_context, "never.md") is False
+        assert await service.delete(user_context, "never.md") is False
 
     def test_invalidate_cache_is_no_op(self, user_context) -> None:
         # Mock has no cache; calling should not error.

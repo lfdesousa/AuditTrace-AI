@@ -61,7 +61,7 @@ class TestS3EpisodicService:
         )
         return S3EpisodicService(minio_client=client, bucket="memory-shared")
 
-    def test_load_returns_adr_documents(self):
+    async def test_load_returns_adr_documents(self):
         svc = self._make_service(
             {
                 "episodic/ADR-018-four-layer-memory-port.md": "# Four-Layer Memory\n\nContent here.",
@@ -69,12 +69,12 @@ class TestS3EpisodicService:
             }
         )
         user = _make_user()
-        docs = svc.load(user)
+        docs = await svc.load(user)
         assert len(docs) == 2
         assert docs[0].metadata["file"] == "ADR-018-four-layer-memory-port.md"
         assert docs[0].metadata["title"] == "Four-Layer Memory"
 
-    def test_load_ignores_non_adr_files(self):
+    async def test_load_ignores_non_adr_files(self):
         svc = self._make_service(
             {
                 "episodic/ADR-018.md": "# ADR\n\nContent.",
@@ -82,11 +82,11 @@ class TestS3EpisodicService:
                 "episodic/README.md": "Not an ADR.",
             }
         )
-        docs = svc.load(_make_user())
+        docs = await svc.load(_make_user())
         assert len(docs) == 1
         assert docs[0].metadata["file"] == "ADR-018.md"
 
-    def test_search_filters_by_keyword(self):
+    async def test_search_filters_by_keyword(self):
         svc = self._make_service(
             {
                 "episodic/ADR-009.md": "# KV Cache\n\nKV cache compression reduces memory by 75%.",
@@ -94,37 +94,37 @@ class TestS3EpisodicService:
             }
         )
         user = _make_user()
-        results = svc.search(user, "cache compression")
+        results = await svc.search(user, "cache compression")
         assert len(results) == 1
         assert "KV cache" in results[0].page_content
 
-    def test_as_context_formats_results(self):
+    async def test_as_context_formats_results(self):
         svc = self._make_service(
             {
                 "episodic/ADR-009.md": "# KV Cache\n\nContent about caching.",
             }
         )
-        ctx = svc.as_context(_make_user(), "cache")
+        ctx = await svc.as_context(_make_user(), "cache")
         assert "## Architecture Decisions" in ctx
         assert "KV Cache" in ctx
 
-    def test_load_caches_on_first_call(self):
+    async def test_load_caches_on_first_call(self):
         svc = self._make_service(
             {
                 "episodic/ADR-018.md": "# ADR\n\nContent.",
             }
         )
         user = _make_user()
-        docs1 = svc.load(user)
-        docs2 = svc.load(user)
+        docs1 = await svc.load(user)
+        docs2 = await svc.load(user)
         assert docs1 == docs2
         # list_objects should only be called once (cached)
         assert svc._client.list_objects.call_count == 1
 
-    def test_shared_content_no_user_prefix(self):
+    async def test_shared_content_no_user_prefix(self):
         """Shared bucket: list_objects uses 'episodic/' prefix, not user_id."""
         svc = self._make_service({})
-        svc.load(_make_user(user_id="kc-john-001"))
+        await svc.load(_make_user(user_id="kc-john-001"))
         call_args = svc._client.list_objects.call_args
         assert call_args[0] == ("memory-shared",)
         # Should NOT contain user_id — shared content has no per-user prefix
@@ -143,58 +143,58 @@ class TestS3ProceduralService:
         )
         return S3ProceduralService(minio_client=client, bucket="memory-shared")
 
-    def test_load_returns_skill_documents(self):
+    async def test_load_returns_skill_documents(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-ARCHITECTURE.md": "Architecture skill content.",
                 "procedural/SKILL-GENAI.md": "GenAI skill content about agents and RAG.",
             }
         )
-        docs = svc.load(_make_user())
+        docs = await svc.load(_make_user())
         assert len(docs) == 2
         assert docs[0].metadata["skill"] == "ARCHITECTURE"
         assert docs[1].metadata["skill"] == "GENAI"
 
-    def test_load_ignores_non_skill_files(self):
+    async def test_load_ignores_non_skill_files(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "IAM content.",
                 "procedural/README.md": "Not a skill.",
             }
         )
-        docs = svc.load(_make_user())
+        docs = await svc.load(_make_user())
         assert len(docs) == 1
 
-    def test_search_matches_skill_name_and_content(self):
+    async def test_search_matches_skill_name_and_content(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "OAuth2 OIDC JWT validation patterns.",
                 "procedural/SKILL-GENAI.md": "Agent design and RAG patterns.",
             }
         )
-        results = svc.search(_make_user(), "OAuth2 validation")
+        results = await svc.search(_make_user(), "OAuth2 validation")
         assert len(results) == 1
         assert results[0].metadata["skill"] == "IAM"
 
-    def test_as_context_formats_skill_list(self):
+    async def test_as_context_formats_skill_list(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-ARCHITECTURE.md": "C4 model patterns.",
             }
         )
-        ctx = svc.as_context(_make_user(), "architecture patterns")
+        ctx = await svc.as_context(_make_user(), "architecture patterns")
         assert "## Relevant Skills" in ctx
         assert "ARCHITECTURE" in ctx
 
-    def test_load_caches_results(self):
+    async def test_load_caches_results(self):
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "IAM content.",
             }
         )
         user = _make_user()
-        svc.load(user)
-        svc.load(user)
+        await svc.load(user)
+        await svc.load(user)
         assert svc._client.list_objects.call_count == 1
 
 

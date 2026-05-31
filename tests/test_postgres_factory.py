@@ -6,10 +6,9 @@ Uses SQLite in-memory engine for tests — no real PostgreSQL required.
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from audittrace.db.models import Base, SessionRecord
+from audittrace.db.models import SessionRecord
 from audittrace.db.postgres import (
     InMemoryPostgresFactory,
     MockPostgresFactory,
@@ -34,7 +33,7 @@ class TestPostgresFactoryABC:
 
     def test_subclass_must_implement_get_session_factory(self):
         class PartialImpl(PostgresFactory):
-            def get_engine(self) -> Engine:
+            def get_engine(self) -> AsyncEngine:
                 return None  # type: ignore
 
         with pytest.raises(TypeError):
@@ -46,24 +45,23 @@ class TestPostgresFactoryABC:
 
 class TestURLPostgresFactory:
     def test_creates_engine_with_url(self):
-        factory = URLPostgresFactory("sqlite://")
+        factory = URLPostgresFactory("sqlite+aiosqlite://")
         engine = factory.get_engine()
-        assert isinstance(engine, Engine)
-        assert str(engine.url) == "sqlite://"
+        assert isinstance(engine, AsyncEngine)
+        assert "sqlite" in str(engine.url)
 
     def test_engine_is_singleton(self):
-        factory = URLPostgresFactory("sqlite://")
+        factory = URLPostgresFactory("sqlite+aiosqlite://")
         assert factory.get_engine() is factory.get_engine()
 
-    def test_session_factory_returns_sessions(self):
-        factory = URLPostgresFactory("sqlite://")
+    async def test_session_factory_returns_sessions(self):
+        factory = URLPostgresFactory("sqlite+aiosqlite://")
         session_factory = factory.get_session_factory()
-        session = session_factory()
-        assert isinstance(session, Session)
-        session.close()
+        async with session_factory() as session:
+            assert isinstance(session, AsyncSession)
 
     def test_pool_pre_ping_enabled(self):
-        factory = URLPostgresFactory("sqlite://")
+        factory = URLPostgresFactory("sqlite+aiosqlite://")
         engine = factory.get_engine()
         assert engine.pool._pre_ping is True
 
@@ -75,37 +73,36 @@ class TestInMemoryPostgresFactory:
     def test_creates_sqlite_in_memory_engine(self):
         factory = InMemoryPostgresFactory()
         engine = factory.get_engine()
-        assert isinstance(engine, Engine)
+        assert isinstance(engine, AsyncEngine)
         assert "sqlite" in str(engine.url)
 
-    def test_creates_tables_on_init(self):
+    async def test_creates_tables_on_init(self):
         factory = InMemoryPostgresFactory()
+        await factory.create_schema()
         session_factory = factory.get_session_factory()
-        session = session_factory()
-        # Tables should already exist — query should not raise
-        result = session.execute(text("SELECT count(*) FROM sessions"))
-        assert result.scalar() == 0
-        session.close()
+        async with session_factory() as session:
+            # Tables should exist after create_schema() — query must not raise
+            result = await session.execute(text("SELECT count(*) FROM sessions"))
+            assert result.scalar() == 0
 
-    def test_crud_works(self):
+    async def test_crud_works(self):
         factory = InMemoryPostgresFactory()
+        await factory.create_schema()
         session_factory = factory.get_session_factory()
-        session = session_factory()
-        Base.metadata.create_all(factory.get_engine())
-        record = SessionRecord(
-            id="test_1",
-            project="P",
-            date="d",
-            summary="s",
-            key_points="[]",
-            model="m",
-        )
-        session.add(record)
-        session.commit()
-        loaded = session.get(SessionRecord, "test_1")
-        assert loaded is not None
-        assert loaded.project == "P"
-        session.close()
+        async with session_factory() as session:
+            record = SessionRecord(
+                id="test_1",
+                project="P",
+                date="d",
+                summary="s",
+                key_points="[]",
+                model="m",
+            )
+            session.add(record)
+            await session.commit()
+            loaded = await session.get(SessionRecord, "test_1")
+            assert loaded is not None
+            assert loaded.project == "P"
 
 
 # ── MockPostgresFactory tests ─────────────────────────────────────────────────

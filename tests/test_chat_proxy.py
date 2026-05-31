@@ -11,6 +11,7 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from audittrace.identity import SENTINEL_SUBJECT
 from audittrace.routes.chat import (
@@ -490,7 +491,7 @@ class TestChatProxy:
         assert usage_chunk["usage"]["total_tokens"] == 962
         assert body.rfind("[DONE]") > body.rfind('"usage"')
 
-    def test_chat_proxy_streams_tool_call_deltas(self, client):
+    async def test_chat_proxy_streams_tool_call_deltas(self, client):
         """ADR-024 regression: streamed delta.tool_calls must be (a) forwarded
         byte-equal so OpenCode sees them, (b) accumulated by index so the
         persisted answer reflects the tool call, not an empty string."""
@@ -535,15 +536,15 @@ class TestChatProxy:
         # (b) persisted answer includes the rendered tool_call line so the
         # audit trail is meaningful even when the model emits zero text content
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         assert rows, "interaction was not persisted"
         latest = rows[-1]
         assert "[tool_call]" in latest.answer
         assert "bash" in latest.answer
         assert "wc -l" in latest.answer
 
-    def test_chat_proxy_persists_interaction(self, client):
+    async def test_chat_proxy_persists_interaction(self, client):
         """A successful chat completion writes a row to interactions."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -578,8 +579,8 @@ class TestChatProxy:
 
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         assert len(rows) >= 1
         latest = rows[-1]
         assert latest.project == "AuditTrace"
@@ -606,7 +607,7 @@ class TestChatProxy:
 
         assert response.status_code == 200
 
-    def test_chat_proxy_x_project_header_wins_over_body(self, client):
+    async def test_chat_proxy_x_project_header_wins_over_body(self, client):
         """ADR-029: X-Project header is authoritative over body.project."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -624,16 +625,20 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
         assert row.project == "HeaderProject"
 
-    def test_chat_proxy_metadata_project_used_when_no_header(self, client):
+    async def test_chat_proxy_metadata_project_used_when_no_header(self, client):
         """ADR-029: body.metadata.project is the second-tier source."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -650,16 +655,20 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
         assert row.project == "FromMetadata"
 
-    def test_chat_proxy_defaults_project_when_none_provided(self, client):
+    async def test_chat_proxy_defaults_project_when_none_provided(self, client):
         """ADR-029: project defaults to "default" (not "unknown") when caller omits it."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -675,10 +684,14 @@ class TestChatProxy:
             )
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
+        async with pg.get_session_factory()() as db:
             row = (
-                db.query(InteractionRecord)
-                .order_by(InteractionRecord.id.desc())
+                (
+                    await db.execute(
+                        select(InteractionRecord).order_by(InteractionRecord.id.desc())
+                    )
+                )
+                .scalars()
                 .first()
             )
         assert row is not None
@@ -704,7 +717,7 @@ class TestChatProxy:
         )
         assert response.status_code == 422
 
-    def test_chat_proxy_renders_tool_calls_in_non_streaming(self, client):
+    async def test_chat_proxy_renders_tool_calls_in_non_streaming(self, client):
         """Non-streaming branch must render tool_calls into the persisted answer."""
         from audittrace.db.models import InteractionRecord
         from audittrace.dependencies import get_postgres_factory
@@ -752,8 +765,8 @@ class TestChatProxy:
 
         assert response.status_code == 200
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            rows = db.query(InteractionRecord).all()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
         latest = rows[-1]
         assert "[tool_call]" in latest.answer
         assert "bash" in latest.answer
@@ -1050,7 +1063,9 @@ class TestToolsModeIntegration:
         """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test."""
         yield from self._flip_to_tools_mode(monkeypatch)
 
-    def test_tools_mode_trivial_prompt_single_llama_call(self, client, _tools_mode):
+    async def test_tools_mode_trivial_prompt_single_llama_call(
+        self, client, _tools_mode
+    ):
         """A prompt that doesn't trigger any tool_calls results in exactly
         one POST to llama-server and no ToolCall audit rows."""
         from audittrace.db.models import InteractionRecord, ToolCall
@@ -1086,14 +1101,16 @@ class TestToolsModeIntegration:
 
         # Interaction persisted with user_id, no ToolCall rows (trivial).
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            interactions = db.query(InteractionRecord).all()
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert len(interactions) >= 1
         assert interactions[-1].user_id == SENTINEL_SUBJECT
         assert tool_calls_rows == []
 
-    def test_tools_mode_memory_prompt_fires_loop_and_audits(self, client, _tools_mode):
+    async def test_tools_mode_memory_prompt_fires_loop_and_audits(
+        self, client, _tools_mode
+    ):
         """Prompt that triggers recall_decisions: TWO POSTs, final text
         answer, ToolCall audit row written with user_id + granted_scope."""
         from audittrace.db.models import InteractionRecord, ToolCall
@@ -1125,9 +1142,9 @@ class TestToolsModeIntegration:
 
         # Interaction row persisted + ONE ToolCall audit row
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            interactions = db.query(InteractionRecord).all()
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert len(interactions) >= 1
         latest_interaction = interactions[-1]
         assert latest_interaction.user_id == SENTINEL_SUBJECT
@@ -1223,7 +1240,9 @@ class TestToolsModeIntegration:
         assert body["metadata"]["prompt_tokens"] == 20
         assert body["metadata"]["completion_tokens"] == 8
 
-    def test_tools_mode_passes_through_external_tool_call(self, client, _tools_mode):
+    async def test_tools_mode_passes_through_external_tool_call(
+        self, client, _tools_mode
+    ):
         """A `bash` tool call from the client must reach the client
         unchanged — the proxy cannot execute bash, and the loop's
         external-tool exit branch must kick in. Zero ToolCall audit
@@ -1294,8 +1313,8 @@ class TestToolsModeIntegration:
         )
         # Zero memory tool_calls rows — nothing was dispatched
         pg = get_postgres_factory()
-        with pg.get_session_factory()() as db:
-            tool_calls_rows = db.query(ToolCall).all()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
         assert tool_calls_rows == []
 
 

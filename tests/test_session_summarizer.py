@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 
 import httpx
 import pytest
+import pytest_asyncio
+from sqlalchemy import func, select
 
 from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
@@ -81,16 +83,17 @@ def _mock_summariser_client(
 # ──────────────────────────── Fixtures ───────────────────────────────
 
 
-@pytest.fixture
-def pg_factory() -> InMemoryPostgresFactory:
-    return InMemoryPostgresFactory()
+@pytest_asyncio.fixture
+async def pg_factory() -> InMemoryPostgresFactory:
+    f = InMemoryPostgresFactory()
+    await f.create_schema()
+    return f
 
 
-@pytest.fixture
-def seed_session_turns(pg_factory):
+@pytest_asyncio.fixture
+async def seed_session_turns(pg_factory):
     """Seed a session idle for 30 minutes (comfortably > 15m threshold)."""
-    session = pg_factory.get_session_factory()()
-    try:
+    async with pg_factory.get_session_factory()() as session:
         session.add_all(
             [
                 InteractionRecord(
@@ -113,9 +116,7 @@ def seed_session_turns(pg_factory):
                 ),
             ]
         )
-        session.commit()
-    finally:
-        session.close()
+        await session.commit()
     return pg_factory
 
 
@@ -238,23 +239,21 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 1
 
-        db = seed_session_turns.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
             assert row.summary == "Capitals of France and Germany"
             assert json.loads(row.key_points) == ["Paris", "Berlin"]
             assert row.model == "mistral-7b-summarizer"
             assert row.user_id == "user-1"
             assert row.summarized_at is not None
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_recent_session_not_eligible(self, pg_factory):
         """A session idle only 5 minutes must NOT be summarised — still
         inside the 15-minute idle window."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             db.add(
                 InteractionRecord(
                     project="P",
@@ -266,9 +265,7 @@ class TestRunOnce:
                     user_id="user-1",
                 )
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(),
@@ -278,20 +275,15 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 0
 
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             assert (
-                db.query(SessionRecord).filter_by(id="sess-recent").one_or_none()
-                is None
-            )
-        finally:
-            db.close()
+                await db.execute(select(SessionRecord).filter_by(id="sess-recent"))
+            ).scalar_one_or_none() is None
 
     @pytest.mark.asyncio
     async def test_up_to_date_session_skipped(self, pg_factory):
         """summarized_at >= last_ts → no new work."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             db.add_all(
                 [
                     InteractionRecord(
@@ -316,9 +308,7 @@ class TestRunOnce:
                     ),
                 ]
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(),
@@ -328,19 +318,17 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 0
 
-        db = pg_factory.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-fresh").one()
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-fresh"))
+            ).scalar_one()
             assert row.summary == "Prior summary"  # untouched
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_stale_session_re_summarised(self, pg_factory):
         """summarized_at < last_ts → re-summarise and UPDATE in place."""
         last_ts = _iso_minutes_ago(40)
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             db.add_all(
                 [
                     InteractionRecord(
@@ -374,9 +362,7 @@ class TestRunOnce:
                     ),
                 ]
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(),
@@ -386,22 +372,22 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 1
 
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             # Still exactly one row — updated, not duplicated.
-            rows = db.query(SessionRecord).filter_by(id="sess-stale").all()
+            rows = (
+                (await db.execute(select(SessionRecord).filter_by(id="sess-stale")))
+                .scalars()
+                .all()
+            )
             assert len(rows) == 1
             assert rows[0].summary == "Refreshed summary"
             assert rows[0].summarized_at is not None
             assert rows[0].summarized_at > datetime.now() - timedelta(minutes=1)
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_null_session_id_ignored(self, pg_factory):
         """Interactions with NULL session_id must not reach the LLM."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             db.add(
                 InteractionRecord(
                     project="P",
@@ -413,9 +399,7 @@ class TestRunOnce:
                     user_id="user-1",
                 )
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(),
@@ -428,8 +412,7 @@ class TestRunOnce:
     @pytest.mark.asyncio
     async def test_max_per_cycle_respected(self, pg_factory):
         """max_per_cycle=2 over 5 eligible sessions → process 2 only."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             for idx in range(5):
                 db.add(
                     InteractionRecord(
@@ -442,9 +425,7 @@ class TestRunOnce:
                         user_id="user-1",
                     )
                 )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(summarizer_max_per_cycle=2),
@@ -454,11 +435,10 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 2
 
-        db = pg_factory.get_session_factory()()
-        try:
-            assert db.query(SessionRecord).count() == 2
-        finally:
-            db.close()
+        async with pg_factory.get_session_factory()() as db:
+            assert (
+                await db.execute(select(func.count()).select_from(SessionRecord))
+            ).scalar_one() == 2
 
     @pytest.mark.asyncio
     async def test_malformed_json_leaves_summarized_at_null(self, seed_session_turns):
@@ -472,12 +452,11 @@ class TestRunOnce:
         count = await summariser.run_once()
         assert count == 1  # the cycle attempted — the LLM just failed
 
-        db = seed_session_turns.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-idle").one_or_none()
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one_or_none()
             assert row is None
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_never_summarised_beats_backlog_of_up_to_date(self, pg_factory):
@@ -488,8 +467,7 @@ class TestRunOnce:
         rows were all fresh-enough-already. Fixed by
         ``ORDER BY (summarized_at IS NULL) DESC`` — unsummarised rows
         are prioritised regardless of their relative age."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             # 20 old sessions, all already summarised AFTER their last
             # interaction — up-to-date, should never be picked.
             for idx in range(20):
@@ -530,9 +508,7 @@ class TestRunOnce:
                     user_id="user-1",
                 )
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(summarizer_max_per_cycle=10),
@@ -541,25 +517,20 @@ class TestRunOnce:
         )
         await summariser.run_once()
 
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             # The unsummarised session must have been picked despite
             # being newer than the 20-session backlog.
             assert (
-                db.query(SessionRecord)
-                .filter_by(id="sess-fresh-but-unsummarised")
-                .one_or_none()
-                is not None
-            )
-        finally:
-            db.close()
+                await db.execute(
+                    select(SessionRecord).filter_by(id="sess-fresh-but-unsummarised")
+                )
+            ).scalar_one_or_none() is not None
 
     @pytest.mark.asyncio
     async def test_per_user_attribution(self, pg_factory):
         """Two idle sessions for different users → each SessionRecord
         carries its own user_id (no cross-user leakage)."""
-        db = pg_factory.get_session_factory()()
-        try:
+        async with pg_factory.get_session_factory()() as db:
             db.add_all(
                 [
                     InteractionRecord(
@@ -582,9 +553,7 @@ class TestRunOnce:
                     ),
                 ]
             )
-            db.commit()
-        finally:
-            db.close()
+            await db.commit()
 
         summariser = SessionSummarizer(
             settings=_settings(),
@@ -593,14 +562,15 @@ class TestRunOnce:
         )
         assert await summariser.run_once() == 2
 
-        db = pg_factory.get_session_factory()()
-        try:
-            alice = db.query(SessionRecord).filter_by(id="sess-alice").one()
-            bob = db.query(SessionRecord).filter_by(id="sess-bob").one()
+        async with pg_factory.get_session_factory()() as db:
+            alice = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-alice"))
+            ).scalar_one()
+            bob = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-bob"))
+            ).scalar_one()
             assert alice.user_id == "alice"
             assert bob.user_id == "bob"
-        finally:
-            db.close()
 
 
 class TestMalformedLLMOutputs:
@@ -622,12 +592,11 @@ class TestMalformedLLMOutputs:
         )
         await summariser.run_once()
 
-        db = seed_session_turns.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
             assert json.loads(row.key_points) == []
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_empty_choices_in_llm_response_yields_no_summary(
@@ -646,13 +615,10 @@ class TestMalformedLLMOutputs:
         )
         await summariser.run_once()
 
-        db = seed_session_turns.get_session_factory()()
-        try:
+        async with seed_session_turns.get_session_factory()() as db:
             assert (
-                db.query(SessionRecord).filter_by(id="sess-idle").one_or_none() is None
-            )
-        finally:
-            db.close()
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one_or_none() is None
 
 
 class TestRunLifecycle:
@@ -725,15 +691,14 @@ def _mock_summariser_client_with_tokenize(
 
 
 @pytest.fixture
-def seed_five_turn_session(pg_factory):
+async def seed_five_turn_session(pg_factory):
     """Seed a session with 5 idle turns so the truncate branch has
     something to drop.
 
     Timestamps are spaced 1 minute apart inside the idle window so the
     eligibility query treats this as one session, idle for >15 min.
     """
-    session = pg_factory.get_session_factory()()
-    try:
+    async with pg_factory.get_session_factory()() as session:
         for i in range(5):
             session.add(
                 InteractionRecord(
@@ -746,9 +711,7 @@ def seed_five_turn_session(pg_factory):
                     user_id="user-1",
                 )
             )
-        session.commit()
-    finally:
-        session.close()
+        await session.commit()
     return pg_factory
 
 
@@ -808,17 +771,16 @@ class TestCtxOverflowGuard:
         count = await summariser.run_once()
         assert count == 1
 
-        db = seed_five_turn_session.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-long").one()
+        async with seed_five_turn_session.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-long"))
+            ).scalar_one()
             assert "[truncated:" in row.summary, (
                 f"expected truncation note in summary, got: {row.summary}"
             )
             assert "trunc-ok" in row.summary
             assert row.model == "mistral-7b-summarizer"  # NOT the sentinel model
             assert row.summarized_at is not None
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_sentinel_branch_for_pathological_single_turn(
@@ -841,14 +803,13 @@ class TestCtxOverflowGuard:
         count = await summariser.run_once()
         assert count == 1  # sentinel write counts as a successful skip
 
-        db = seed_session_turns.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
             assert row.model == "sentinel-skip-ctx-overflow-auto"
             assert "sentinel-skip-ctx-overflow-auto" in row.summary
             assert row.summarized_at is not None  # critical: leaves eligibility set
-        finally:
-            db.close()
 
     @pytest.mark.asyncio
     async def test_tokenize_unreachable_falls_back_to_raw_send(
@@ -874,11 +835,10 @@ class TestCtxOverflowGuard:
         count = await summariser.run_once()
         assert count == 1
 
-        db = seed_session_turns.get_session_factory()()
-        try:
-            row = db.query(SessionRecord).filter_by(id="sess-idle").one()
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
             assert row.summary == "happy-path-summary"
             assert "[truncated:" not in row.summary  # no spurious annotation
             assert row.model == "mistral-7b-summarizer"
-        finally:
-            db.close()
