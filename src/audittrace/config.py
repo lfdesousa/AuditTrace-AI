@@ -504,7 +504,12 @@ class Settings(BaseSettings):
         (SQLite has no RLS) and single-tenant dev deployments.
         """
         if self.summarizer_postgres_url:
-            return self.summarizer_postgres_url
+            # The summariser runs on AsyncSession (async_sessionmaker), so its
+            # engine needs the asyncpg driver too. The operator-supplied
+            # owner-role URL is typically psycopg2/driverless — normalise it,
+            # else URLPostgresFactory's create_async_engine raises
+            # "psycopg2 is not async" and crashes startup. ADR-030.
+            return _as_async_url(self.summarizer_postgres_url)
         return self.database_url
 
     @property

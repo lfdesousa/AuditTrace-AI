@@ -96,6 +96,35 @@ def test_database_url_from_full_url():
     assert settings.database_url_sync == custom_url
 
 
+def test_summarizer_database_url_normalised_to_asyncpg():
+    """The summariser owner-role URL must be normalised to the asyncpg driver.
+
+    Regression — live laptop k3s crashloop 2026-05-31. The summariser runs on
+    AsyncSession, and ``URLPostgresFactory`` builds ``create_async_engine``,
+    which raises "The loaded 'psycopg2' is not async" if handed a raw
+    psycopg2/driverless URL. The operator supplies ``summarizer_postgres_url``
+    with owner-role creds (typically driverless) — it must come back as
+    ``+asyncpg``. The unit suite missed this because the live summariser
+    startup block is ``# pragma: no cover`` and the kind integration runs with
+    ``summarizer_enabled=false``.
+    """
+    plain = Settings(
+        summarizer_postgres_url=(
+            "postgresql://owner:pw@audittrace-postgresql:5432/audittrace"
+        )
+    )
+    assert plain.summarizer_database_url == (
+        "postgresql+asyncpg://owner:pw@audittrace-postgresql:5432/audittrace"
+    )
+
+    psyco = Settings(
+        summarizer_postgres_url="postgresql+psycopg2://owner:pw@host:5432/db"
+    )
+    assert psyco.summarizer_database_url == (
+        "postgresql+asyncpg://owner:pw@host:5432/db"
+    )
+
+
 def test_database_url_none():
     """Test database_url returns None when not configured."""
     settings = Settings()

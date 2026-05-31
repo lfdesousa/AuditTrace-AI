@@ -186,9 +186,13 @@ class TestProducer:
 
 
 def _persist_recorder():
-    """Build a dual mock: persist + flush captures, configurable error."""
-    persist = MagicMock(return_value=42)  # interaction_id
-    flush = MagicMock(return_value=None)
+    """Build a dual mock: persist + flush captures, configurable error.
+
+    AsyncMock because the persist/flush callables are async coroutine
+    functions (#263) and the consumer awaits them directly.
+    """
+    persist = AsyncMock(return_value=42)  # interaction_id
+    flush = AsyncMock(return_value=None)
     return persist, flush
 
 
@@ -255,8 +259,8 @@ class TestConsumer:
         await producer.enqueue(kwargs=_kwargs(), pending_tool_calls=None)
 
         # Persist raises — simulates DB blip.
-        persist = MagicMock(side_effect=RuntimeError("postgres unreachable"))
-        flush = MagicMock()
+        persist = AsyncMock(side_effect=RuntimeError("postgres unreachable"))
+        flush = AsyncMock()
         consumer = AsyncPersistConsumer(
             settings=s,
             persist_callable=persist,
@@ -317,8 +321,8 @@ class TestConsumer:
         await producer.enqueue(kwargs=_kwargs(), pending_tool_calls=None)
 
         # Persist always fails — message stays un-acked, retries climb.
-        persist = MagicMock(side_effect=RuntimeError("permanent failure"))
-        flush = MagicMock()
+        persist = AsyncMock(side_effect=RuntimeError("permanent failure"))
+        flush = AsyncMock()
         consumer = AsyncPersistConsumer(
             settings=s,
             persist_callable=persist,
@@ -394,8 +398,8 @@ class TestConsumer:
         # First consumer creates the group.
         c1 = AsyncPersistConsumer(
             settings=s,
-            persist_callable=MagicMock(),
-            flush_tool_calls_callable=MagicMock(),
+            persist_callable=AsyncMock(),
+            flush_tool_calls_callable=AsyncMock(),
             redis=redis,
             consumer_name="c1",
         )
@@ -405,8 +409,8 @@ class TestConsumer:
         # and exercises the BUSYGROUP swallow path.
         c2 = AsyncPersistConsumer(
             settings=s,
-            persist_callable=MagicMock(),
-            flush_tool_calls_callable=MagicMock(),
+            persist_callable=AsyncMock(),
+            flush_tool_calls_callable=AsyncMock(),
             redis=redis,
             consumer_name="c2",
         )
@@ -453,8 +457,8 @@ class TestConsumer:
         monkeypatch.setenv("HOSTNAME", "audittrace-memory-server-abc123")
         c = AsyncPersistConsumer(
             settings=_settings(),
-            persist_callable=MagicMock(),
-            flush_tool_calls_callable=MagicMock(),
+            persist_callable=AsyncMock(),
+            flush_tool_calls_callable=AsyncMock(),
             redis=FakeRedis(decode_responses=True),
         )
         assert c.consumer_name == "consumer-audittrace-memory-server-abc123"
@@ -466,8 +470,8 @@ class TestConsumer:
         monkeypatch.delenv("HOSTNAME", raising=False)
         c = AsyncPersistConsumer(
             settings=_settings(),
-            persist_callable=MagicMock(),
-            flush_tool_calls_callable=MagicMock(),
+            persist_callable=AsyncMock(),
+            flush_tool_calls_callable=AsyncMock(),
             redis=FakeRedis(decode_responses=True),
         )
         # Just assert the prefix; the actual hostname depends on the

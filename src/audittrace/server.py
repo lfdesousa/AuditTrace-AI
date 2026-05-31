@@ -220,8 +220,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # Without a dedicated URL (tests, single-tenant dev), falls back
     # to the main factory — RLS is then the caller's problem.
     summarizer_task: asyncio.Task[None] | None = None
+    # asyncpg-normalised (config.summarizer_database_url) — URLPostgresFactory
+    # builds an async engine, which rejects a raw psycopg2 URL.
+    summarizer_db_url = settings.summarizer_database_url
     if (
-        settings.summarizer_enabled and settings.summarizer_database_url
+        settings.summarizer_enabled and summarizer_db_url
     ):  # pragma: no cover - live-startup path
         if (
             settings.summarizer_postgres_url
@@ -229,9 +232,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         ):
             from audittrace.db.postgres import URLPostgresFactory
 
-            summarizer_factory = URLPostgresFactory(
-                settings.summarizer_postgres_url, pool_size=2
-            )
+            summarizer_factory = URLPostgresFactory(summarizer_db_url, pool_size=2)
             summarizer_session_factory = summarizer_factory.get_session_factory()
             logger.info("Session summariser: using dedicated owner-role connection")
         else:
