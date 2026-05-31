@@ -7,11 +7,11 @@ from audittrace.services.memory import (
 )
 
 
-def test_mock_memory_service_store():
+async def test_mock_memory_service_store():
     """Test mock memory service store method."""
     service = MockMemoryService()
 
-    mem_id = service.store(
+    mem_id = await service.store(
         project="test-project",
         source="test-source",
         content="test content",
@@ -19,53 +19,53 @@ def test_mock_memory_service_store():
     )
 
     assert mem_id is not None
-    assert service.count() == 1
+    assert await service.count() == 1
 
 
-def test_mock_memory_service_retrieve():
+async def test_mock_memory_service_retrieve():
     """Test mock memory service retrieve method."""
     service = MockMemoryService()
 
     # Store some memories
-    service.store("project1", "source1", "content1")
-    service.store("project1", "source1", "content2")
-    service.store("project2", "source1", "content3")
+    await service.store("project1", "source1", "content1")
+    await service.store("project1", "source1", "content2")
+    await service.store("project2", "source1", "content3")
 
     # Retrieve all
-    results = service.retrieve(query="test", limit=10)
+    results = await service.retrieve(query="test", limit=10)
     assert len(results) == 3
 
     # Retrieve with project filter
-    results = service.retrieve(query="test", project="project1", limit=10)
+    results = await service.retrieve(query="test", project="project1", limit=10)
     assert len(results) == 2
 
     # Retrieve with limit
-    results = service.retrieve(query="test", limit=1)
+    results = await service.retrieve(query="test", limit=1)
     assert len(results) == 1
 
 
-def test_mock_memory_service_reset():
+async def test_mock_memory_service_reset():
     """Test mock memory service reset."""
     service = MockMemoryService()
 
-    service.store("p1", "s1", "c1")
-    service.store("p1", "s1", "c2")
+    await service.store("p1", "s1", "c1")
+    await service.store("p1", "s1", "c2")
 
-    assert service.count() == 2
+    assert await service.count() == 2
 
     service.reset()
 
-    assert service.count() == 0
+    assert await service.count() == 0
 
 
-def test_mock_memory_service_call_tracking():
+async def test_mock_memory_service_call_tracking():
     """Test that service call count is tracked."""
     service = MockMemoryService()
 
-    service.store("p1", "s1", "c1")
+    await service.store("p1", "s1", "c1")
     assert service.call_count == 1
 
-    service.store("p1", "s1", "c2")
+    await service.store("p1", "s1", "c2")
     assert service.call_count == 2
 
 
@@ -77,17 +77,17 @@ def test_chroma_memory_service_interface():
     assert hasattr(MemoryService, "count")
 
 
-def test_chroma_memory_service_with_mock_client():
+async def test_chroma_memory_service_with_mock_client():
     """Test ChromaMemoryService with mock ChromaDB client."""
     from audittrace.db.factory import MockChromaDBFactory
 
     factory = MockChromaDBFactory()
-    client = factory.get_client()
+    client = await factory.get_client()
 
     service = ChromaMemoryService(client, collection_name="test")
 
     # Store memory
-    mem_id = service.store(
+    mem_id = await service.store(
         project="test-project",
         source="test-source",
         content="test content",
@@ -97,9 +97,9 @@ def test_chroma_memory_service_with_mock_client():
     assert mem_id is not None
 
     # Count should be 1
-    assert service.count() == 1
+    assert await service.count() == 1
 
     # Retrieve should return the memory
-    results = service.retrieve(query="test content", limit=10)
+    results = await service.retrieve(query="test content", limit=10)
     assert len(results) == 1
     assert "test content" in results[0]["content"]

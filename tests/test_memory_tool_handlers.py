@@ -19,6 +19,7 @@ from dataclasses import replace
 
 import fakeredis
 import pytest
+import pytest_asyncio
 
 # Side-effect import — running the module is what runs the @register_memory_tool
 # decorators. Must happen before any test code dispatches through the registry.
@@ -59,8 +60,8 @@ def _fresh_registry_with_handlers():
     reset_registry_for_tests()
 
 
-@pytest.fixture
-def _populated_container():
+@pytest_asyncio.fixture
+async def _populated_container():
     """A fresh test container with mocks seeded so the handlers have
     something real to query against."""
     c = create_test_container()
@@ -75,14 +76,14 @@ def _populated_container():
         skill="IAM",
         file="SKILL-IAM.md",
     )
-    c._instances["conversational"].save_session(
+    await c._instances["conversational"].save_session(
         sentinel_user_context(),
         "AuditTrace",
         "Session about KV cache compression",
         ["ADR-009 accepted"],
         session_id="seed-kv-1",
     )
-    c._instances["semantic"].add_document(
+    await c._instances["semantic"].add_document(
         "RAG body about cache optimisation",
         source="ADR-009",
         collection="decisions",
@@ -535,7 +536,7 @@ class TestRecallSemanticUncap:
     ):
         big_chunk = "RAG chunk text — " + ("cache theme repeated line.\n" * 200)
         assert len(big_chunk) > 1000
-        _populated_container._instances["semantic"].add_document(
+        await _populated_container._instances["semantic"].add_document(
             big_chunk, source="ADR-025", collection="decisions"
         )
         user = sentinel_user_context()

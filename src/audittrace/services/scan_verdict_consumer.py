@@ -43,7 +43,7 @@ from sqlalchemy import update
 from audittrace.db.models import MemoryItem
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from audittrace.config import Settings
 
@@ -88,7 +88,7 @@ class ScanVerdictConsumer:
         self,
         *,
         settings: Settings,
-        session_factory: sessionmaker[Any],
+        session_factory: async_sessionmaker[AsyncSession],
         queue_name: str = "audittrace.scan.verdicts",
         prefetch_count: int = 16,
         episodic_bucket: str = "memory-shared",
@@ -168,7 +168,7 @@ class ScanVerdictConsumer:
             extra={"queue": self._queue_name},
         )
 
-    def _apply_verdict(self, payload: dict[str, Any]) -> None:
+    async def _apply_verdict(self, payload: dict[str, Any]) -> None:
         """Synchronous DB UPDATE — wrapped in to_thread by the
         caller (Danjou §3 — sync libs off the event loop).
         Raises on parse / DB errors so the AMQP CM nacks."""
@@ -178,8 +178,8 @@ class ScanVerdictConsumer:
         if scan_status is None:
             raise ValueError(f"unknown verdict kind: {kind!r}")
 
-        with self._session_factory() as session:
-            row = session.get(MemoryItem, scan_id)
+        async with self._session_factory() as session:
+            row = await session.get(MemoryItem, scan_id)
             if row is None:
                 # Manifest row missing — likely a duplicate verdict
                 # for a row that was already processed and reaped.
@@ -201,10 +201,10 @@ class ScanVerdictConsumer:
                     scan_id=scan_id,
                     quarantine_key=row.key,
                 )
-            session.execute(
+            await session.execute(
                 update(MemoryItem).where(MemoryItem.id == scan_id).values(**updates)
             )
-            session.commit()
+            await session.commit()
             logger.info(
                 "scan_verdict_consumer.applied",
                 extra={
@@ -220,7 +220,7 @@ class ScanVerdictConsumer:
         DLX kicks in after ``x-delivery-limit=5``."""
         async with message.process(requeue=False):
             payload = json.loads(message.body.decode("utf-8"))
-            await asyncio.to_thread(self._apply_verdict, payload)
+            await self._apply_verdict(payload)
 
     async def run(self) -> None:
         await self._ensure_connected()

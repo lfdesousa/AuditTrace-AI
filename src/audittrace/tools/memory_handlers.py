@@ -88,7 +88,7 @@ async def recall_decisions(
         return {"error": "recall_decisions: 'query' is required and must be a string"}
 
     episodic = get_episodic_service()
-    matches = episodic.search(user_context, query)
+    matches = await episodic.search(user_context, query)
     return {
         "matches": [
             {
@@ -138,7 +138,7 @@ async def recall_skills(
         return {"error": "recall_skills: 'query' is required and must be a string"}
 
     procedural = get_procedural_service()
-    matches = procedural.search(user_context, query)
+    matches = await procedural.search(user_context, query)
     return {
         "matches": [
             {
@@ -208,7 +208,7 @@ async def recall_recent_sessions(
         return {"error": "recall_recent_sessions: 'n' must be an integer"}
 
     conversational = get_conversational_service()
-    sessions = conversational.load_sessions(user_context, project, n)
+    sessions = await conversational.load_sessions(user_context, project, n)
 
     matches: list[dict[str, Any]] = []
     for s in sessions:
@@ -281,7 +281,7 @@ async def recall_semantic(
         return {"error": "recall_semantic: 'k' must be an integer"}
 
     semantic = get_semantic_service()
-    matches = semantic.search(user_context, query, k=k)
+    matches = await semantic.search(user_context, query, k=k)
     return {
         "matches": [
             {
@@ -332,7 +332,7 @@ async def read_decision(
         return {"error": "read_decision: 'file' is required and must be a string"}
 
     episodic = get_episodic_service()
-    doc = episodic.read(user_context, file)
+    doc = await episodic.read(user_context, file)
     if doc is None:
         return {"error": "not_found", "file": file}
     return {
@@ -376,7 +376,7 @@ async def read_skill(user_context: UserContext, args: dict[str, Any]) -> dict[st
         return {"error": "read_skill: 'file' is required and must be a string"}
 
     procedural = get_procedural_service()
-    doc = procedural.read(user_context, file)
+    doc = await procedural.read(user_context, file)
     if doc is None:
         return {"error": "not_found", "file": file}
     return {

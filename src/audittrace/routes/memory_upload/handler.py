@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     import asyncio
 
     from audittrace_object_storage import S3ObjectStorageProvider
-    from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from audittrace.config import Settings
     from audittrace.identity import UserContext
@@ -55,7 +55,7 @@ async def handle_pdf_upload(
     *,
     settings: Settings,
     minio_client: S3ObjectStorageProvider,
-    session_factory: sessionmaker[Session],
+    session_factory: async_sessionmaker[AsyncSession],
     queue: asyncio.Queue[ScanRequestEnvelope],
     user: UserContext,
     filename: str,
@@ -92,8 +92,8 @@ async def handle_pdf_upload(
         content_type=content_type,
     )
 
-    with session_factory() as session:
-        manifest_mod.insert_pending_scan(
+    async with session_factory() as session:
+        await manifest_mod.insert_pending_scan(
             session,
             scan_id=scan_id,
             user_id=user.user_id,

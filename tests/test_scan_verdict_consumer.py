@@ -17,6 +17,12 @@ from audittrace.services.scan_verdict_consumer import (
 )
 
 
+async def _make_factory():
+    _f = InMemoryPostgresFactory()
+    await _f.create_schema()
+    return _f.get_session_factory()
+
+
 def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
     s = MagicMock()
     s.scan_amqp_url = url
@@ -39,9 +45,9 @@ def _aio_pika_mock() -> MagicMock:
     return aio_pika
 
 
-def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
-    with factory() as session:
-        manifest_mod.insert_pending_scan(
+async def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
+    async with factory() as session:
+        await manifest_mod.insert_pending_scan(
             session,
             scan_id=scan_id,
             user_id=user_id,
@@ -79,16 +85,18 @@ class TestEpisodicUri:
 
 
 class TestApplyVerdict:
-    def test_clean_promotes_key_and_sets_scanned_clean(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-1")
+    async def test_clean_promotes_key_and_sets_scanned_clean(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-1")
         consumer = ScanVerdictConsumer(
             settings=_settings(),
             session_factory=factory,
             episodic_bucket="memory-shared",
             episodic_prefix="episodic/papers/",
         )
-        consumer._apply_verdict(
+        await consumer._apply_verdict(
             {
                 "scan_id": "scan-1",
                 "kind": "clean",
@@ -98,24 +106,28 @@ class TestApplyVerdict:
                 "threats": [],
             }
         )
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-1")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-1")
         assert row is not None
         assert row.scan_status == "scanned_clean"
         # Promoted to episodic/papers/<scan_id>/<filename>.
         assert row.key == "s3://memory-shared/episodic/papers/scan-1/paper.pdf"
 
-    def test_rejected_sets_rejected_malware_and_keeps_quarantine_key(self) -> None:
+    async def test_rejected_sets_rejected_malware_and_keeps_quarantine_key(
+        self,
+    ) -> None:
         # Rejected → memory-server stops caring about the byte
         # location (content-control deleted them); we only flip
         # the manifest's scan_status. The original key stays.
-        factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-2")
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-2")
         consumer = ScanVerdictConsumer(
             settings=_settings(),
             session_factory=factory,
         )
-        consumer._apply_verdict(
+        await consumer._apply_verdict(
             {
                 "scan_id": "scan-2",
                 "kind": "rejected",
@@ -123,40 +135,42 @@ class TestApplyVerdict:
                 "threats": [{"name": "EICAR", "family": "test", "confidence": 1.0}],
             }
         )
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-2")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-2")
         assert row is not None
         assert row.scan_status == "rejected_malware"
         assert row.key.startswith("s3://memory-shared/quarantine/")
 
-    def test_scan_failed_sets_scan_failed_status(self) -> None:
-        factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-3")
+    async def test_scan_failed_sets_scan_failed_status(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-3")
         consumer = ScanVerdictConsumer(
             settings=_settings(),
             session_factory=factory,
         )
-        consumer._apply_verdict(
+        await consumer._apply_verdict(
             {
                 "scan_id": "scan-3",
                 "kind": "scan_failed",
                 "scanner": "clamav",
             }
         )
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-3")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-3")
         assert row is not None
         assert row.scan_status == "scan_failed"
 
-    def test_unknown_verdict_kind_raises(self) -> None:
+    async def test_unknown_verdict_kind_raises(self) -> None:
         consumer = ScanVerdictConsumer(
             settings=_settings(),
-            session_factory=InMemoryPostgresFactory().get_session_factory(),
+            session_factory=await _make_factory(),
         )
         with pytest.raises(ValueError, match="unknown verdict kind"):
-            consumer._apply_verdict({"scan_id": "x", "kind": "WHATEVER"})
+            await consumer._apply_verdict({"scan_id": "x", "kind": "WHATEVER"})
 
-    def test_missing_manifest_row_logs_and_returns(self) -> None:
+    async def test_missing_manifest_row_logs_and_returns(self) -> None:
         # Duplicate verdict for an already-reaped row: don't nack
         # because re-delivery would loop forever.
         #
@@ -167,7 +181,9 @@ class TestApplyVerdict:
         # logger is hermetic and survives test ordering.
         from unittest.mock import patch
 
-        factory = InMemoryPostgresFactory().get_session_factory()
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
         consumer = ScanVerdictConsumer(
             settings=_settings(),
             session_factory=factory,
@@ -175,13 +191,13 @@ class TestApplyVerdict:
         with patch(
             "audittrace.services.scan_verdict_consumer.logger.warning"
         ) as mock_warn:
-            consumer._apply_verdict({"scan_id": "ghost", "kind": "clean"})
+            await consumer._apply_verdict({"scan_id": "ghost", "kind": "clean"})
         # Exactly one row_missing warning, no exception raised, and
         # the manifest row is never created.
         warn_messages = [c.args[0] for c in mock_warn.call_args_list]
         assert "scan_verdict_consumer.row_missing" in warn_messages
-        with factory() as session:
-            assert manifest_mod.get_by_scan_id(session, "ghost") is None
+        async with factory() as session:
+            assert await manifest_mod.get_by_scan_id(session, "ghost") is None
 
 
 class TestEnsureConnected:
@@ -203,7 +219,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
             await consumer._ensure_connected()
@@ -214,7 +230,7 @@ class TestEnsureConnected:
     async def test_missing_url_raises(self) -> None:
         consumer = ScanVerdictConsumer(
             settings=_settings(url=""),
-            session_factory=InMemoryPostgresFactory().get_session_factory(),
+            session_factory=await _make_factory(),
         )
         with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
             await consumer._ensure_connected()
@@ -240,7 +256,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
         # Two channel-opens, two get_queue calls — first failed,
@@ -266,7 +282,7 @@ class TestEnsureConnected:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             with pytest.raises(
                 RuntimeError,
@@ -280,8 +296,10 @@ class TestProcessOne:
     async def test_message_process_owns_ack_nack(self) -> None:
         # Verifies the consumer uses ``message.process`` async-CM so
         # ack/nack semantics are owned by aio_pika, not by us.
-        factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-9")
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-9")
         consumer = ScanVerdictConsumer(
             settings=_settings(),
             session_factory=factory,
@@ -297,8 +315,8 @@ class TestProcessOne:
 
         message.process.assert_called_once_with(requeue=False)
         process_cm.__aenter__.assert_awaited_once()
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-9")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-9")
         assert row is not None
         assert row.scan_status == "scanned_clean"
 
@@ -352,8 +370,10 @@ class TestRunLoop:
         queue.iterator = MagicMock(return_value=_FakeIter())
         channel.get_queue = AsyncMock(return_value=queue)
 
-        factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-run")
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-run")
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
@@ -366,8 +386,8 @@ class TestRunLoop:
             with pytest.raises(_asyncio.CancelledError):
                 await task
 
-        with factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-run")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-run")
         assert row is not None
         assert row.scan_status == "scanned_clean"
 
@@ -425,7 +445,7 @@ class TestRunLoop:
             ) as mock_err:
                 consumer = ScanVerdictConsumer(
                     settings=_settings(),
-                    session_factory=InMemoryPostgresFactory().get_session_factory(),
+                    session_factory=await _make_factory(),
                 )
                 task = _asyncio.create_task(consumer.run())
                 await _asyncio.sleep(0.05)
@@ -439,7 +459,7 @@ class TestAclose:
     async def test_aclose_idempotent_when_not_connected(self) -> None:
         consumer = ScanVerdictConsumer(
             settings=_settings(),
-            session_factory=InMemoryPostgresFactory().get_session_factory(),
+            session_factory=await _make_factory(),
         )
         await consumer.aclose()  # never connected → no-op
 
@@ -448,7 +468,7 @@ class TestAclose:
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
-                session_factory=InMemoryPostgresFactory().get_session_factory(),
+                session_factory=await _make_factory(),
             )
             await consumer._ensure_connected()
             await consumer.aclose()

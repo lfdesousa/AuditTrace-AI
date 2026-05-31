@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
 from audittrace.logging_config import log_call
@@ -163,11 +164,11 @@ class MemoryManifestService:
     themselves are global content shared across users).
     """
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
     @log_call(logger=logger)
-    def record_create(
+    async def record_create(
         self,
         layer: str,
         key: str,
@@ -184,10 +185,12 @@ class MemoryManifestService:
         """
         _validate_layer(layer)
         now = _now_ms()
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             existing = (
-                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
-            )
+                await session.execute(
+                    select(MemoryItem).filter_by(layer=layer, key=key)
+                )
+            ).scalar_one_or_none()
             if existing is None:
                 row = MemoryItem(
                     layer=layer,
@@ -213,12 +216,12 @@ class MemoryManifestService:
                 existing.modified_at_ms = now
                 existing.modified_by_user_id = user_id
                 row = existing
-            session.commit()
-            session.refresh(row)
+            await session.commit()
+            await session.refresh(row)
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    def record_update(
+    async def record_update(
         self,
         layer: str,
         key: str,
@@ -235,10 +238,12 @@ class MemoryManifestService:
         rather than update a deleted row).
         """
         _validate_layer(layer)
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             row = (
-                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
-            )
+                await session.execute(
+                    select(MemoryItem).filter_by(layer=layer, key=key)
+                )
+            ).scalar_one_or_none()
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
             if row.deleted_at_ms is not None:
@@ -251,33 +256,35 @@ class MemoryManifestService:
             row.size_bytes = size_bytes
             row.modified_at_ms = _now_ms()
             row.modified_by_user_id = user_id
-            session.commit()
-            session.refresh(row)
+            await session.commit()
+            await session.refresh(row)
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
         """Soft-delete: set ``deleted_at_ms`` + ``deleted_by_user_id``.
         Idempotent — calling on an already-deleted row is a no-op
         that returns the existing entry. Raises ``LookupError`` if
         the row does not exist at all.
         """
         _validate_layer(layer)
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             row = (
-                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
-            )
+                await session.execute(
+                    select(MemoryItem).filter_by(layer=layer, key=key)
+                )
+            ).scalar_one_or_none()
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
             if row.deleted_at_ms is None:
                 row.deleted_at_ms = _now_ms()
                 row.deleted_by_user_id = user_id
-                session.commit()
-                session.refresh(row)
+                await session.commit()
+                await session.refresh(row)
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    def list_for_layer(
+    async def list_for_layer(
         self, layer: str, *, include_deleted: bool = False
     ) -> list[ManifestEntry]:
         """Return manifest entries for ``layer``, ordered by
@@ -288,15 +295,19 @@ class MemoryManifestService:
         callers can request ``include_deleted=True``.
         """
         _validate_layer(layer)
-        with self._session_factory() as session:
-            q = session.query(MemoryItem).filter_by(layer=layer)
+        async with self._session_factory() as session:
+            q = select(MemoryItem).filter_by(layer=layer)
             if not include_deleted:
                 q = q.filter(MemoryItem.deleted_at_ms.is_(None))
-            rows = q.order_by(MemoryItem.modified_at_ms.desc()).all()
+            rows = (
+                (await session.execute(q.order_by(MemoryItem.modified_at_ms.desc())))
+                .scalars()
+                .all()
+            )
             return [ManifestEntry.from_row(r) for r in rows]
 
     @log_call(logger=logger)
-    def upsert_pdf_metadata(
+    async def upsert_pdf_metadata(
         self,
         layer: str,
         key: str,
@@ -332,10 +343,12 @@ class MemoryManifestService:
         """
         _validate_layer(layer)
         now = _now_ms()
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             row = (
-                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
-            )
+                await session.execute(
+                    select(MemoryItem).filter_by(layer=layer, key=key)
+                )
+            ).scalar_one_or_none()
             if row is None:
                 row = MemoryItem(
                     layer=layer,
@@ -367,22 +380,24 @@ class MemoryManifestService:
             row.pdfa_part = pdfa_part
             row.pdfa_conformance = pdfa_conformance
             row.ltv_data = ltv_data
-            session.commit()
-            session.refresh(row)
+            await session.commit()
+            await session.refresh(row)
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    def get(self, layer: str, key: str) -> ManifestEntry | None:
+    async def get(self, layer: str, key: str) -> ManifestEntry | None:
         """Return a single manifest entry, or ``None`` if no row
         exists. Soft-deleted rows ARE returned (the caller decides
         whether to treat them as missing — the per-layer service
         usually treats them as missing for normal reads, while
         admin/audit paths surface them)."""
         _validate_layer(layer)
-        with self._session_factory() as session:
+        async with self._session_factory() as session:
             row = (
-                session.query(MemoryItem).filter_by(layer=layer, key=key).one_or_none()
-            )
+                await session.execute(
+                    select(MemoryItem).filter_by(layer=layer, key=key)
+                )
+            ).scalar_one_or_none()
             return ManifestEntry.from_row(row) if row is not None else None
 
 
@@ -427,7 +442,7 @@ class MockMemoryManifestService(MemoryManifestService):
             ltv_data=row.get("ltv_data"),
         )
 
-    def record_create(
+    async def record_create(
         self,
         layer: str,
         key: str,
@@ -465,7 +480,7 @@ class MockMemoryManifestService(MemoryManifestService):
                 existing["deleted_by_user_id"] = None
         return self._to_entry(existing)
 
-    def record_update(
+    async def record_update(
         self,
         layer: str,
         key: str,
@@ -489,7 +504,7 @@ class MockMemoryManifestService(MemoryManifestService):
         existing["modified_by_user_id"] = user_id
         return self._to_entry(existing)
 
-    def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         if existing is None:
@@ -499,7 +514,7 @@ class MockMemoryManifestService(MemoryManifestService):
             existing["deleted_by_user_id"] = user_id
         return self._to_entry(existing)
 
-    def list_for_layer(
+    async def list_for_layer(
         self, layer: str, *, include_deleted: bool = False
     ) -> list[ManifestEntry]:
         _validate_layer(layer)
@@ -509,12 +524,12 @@ class MockMemoryManifestService(MemoryManifestService):
         rows.sort(key=lambda r: r["modified_at_ms"], reverse=True)
         return [self._to_entry(r) for r in rows]
 
-    def get(self, layer: str, key: str) -> ManifestEntry | None:
+    async def get(self, layer: str, key: str) -> ManifestEntry | None:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         return self._to_entry(existing) if existing is not None else None
 
-    def upsert_pdf_metadata(
+    async def upsert_pdf_metadata(
         self,
         layer: str,
         key: str,

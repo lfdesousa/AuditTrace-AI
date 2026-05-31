@@ -15,9 +15,9 @@ def session_factory() -> object:
 
 
 class TestInsertPendingScan:
-    def test_inserts_with_pending_scan_status(self, session_factory) -> None:
-        with session_factory() as session:
-            row = manifest_mod.insert_pending_scan(
+    async def test_inserts_with_pending_scan_status(self, session_factory) -> None:
+        async with session_factory() as session:
+            row = await manifest_mod.insert_pending_scan(
                 session,
                 scan_id="scan-1",
                 user_id="alice",
@@ -37,12 +37,12 @@ class TestInsertPendingScan:
         assert row.document_sha256 == "0" * 64
         assert row.size_bytes == 12345
 
-    def test_published_at_ms_is_null_outbox_marker(self, session_factory) -> None:
+    async def test_published_at_ms_is_null_outbox_marker(self, session_factory) -> None:
         # The outbox pattern relies on this being NULL until the
         # publisher's UPDATE — janitor's WHERE clause would skip
         # the row otherwise.
-        with session_factory() as session:
-            row = manifest_mod.insert_pending_scan(
+        async with session_factory() as session:
+            row = await manifest_mod.insert_pending_scan(
                 session,
                 scan_id="scan-2",
                 user_id="alice",
@@ -56,9 +56,9 @@ class TestInsertPendingScan:
 
 
 class TestGetByScanId:
-    def test_returns_row_when_found(self, session_factory) -> None:
-        with session_factory() as session:
-            manifest_mod.insert_pending_scan(
+    async def test_returns_row_when_found(self, session_factory) -> None:
+        async with session_factory() as session:
+            await manifest_mod.insert_pending_scan(
                 session,
                 scan_id="scan-3",
                 user_id="alice",
@@ -68,11 +68,11 @@ class TestGetByScanId:
                 title="x",
                 trace_id="t",
             )
-        with session_factory() as session:
-            row = manifest_mod.get_by_scan_id(session, "scan-3")
+        async with session_factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-3")
         assert row is not None
         assert row.id == "scan-3"
 
-    def test_returns_none_when_missing(self, session_factory) -> None:
-        with session_factory() as session:
-            assert manifest_mod.get_by_scan_id(session, "nope") is None
+    async def test_returns_none_when_missing(self, session_factory) -> None:
+        async with session_factory() as session:
+            assert await manifest_mod.get_by_scan_id(session, "nope") is None

@@ -12,6 +12,7 @@ first positional argument. SKILL files are shared (not per-user), so the
 parameter is plumbing here.
 """
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
@@ -29,19 +30,19 @@ class ProceduralService(ABC):
     """Abstract procedural memory service — skill-based knowledge."""
 
     @abstractmethod
-    def load(self, user_context: UserContext) -> list[Document]:
+    async def load(self, user_context: UserContext) -> list[Document]:
         """Load all SKILL documents."""
 
     @abstractmethod
-    def search(self, user_context: UserContext, query: str) -> list[Document]:
+    async def search(self, user_context: UserContext, query: str) -> list[Document]:
         """Search skills by query relevance. No arbitrary caps."""
 
     @abstractmethod
-    def as_context(self, user_context: UserContext, query: str) -> str:
+    async def as_context(self, user_context: UserContext, query: str) -> str:
         """Return matched skills formatted as context string."""
 
     @abstractmethod
-    def read(self, user_context: UserContext, file: str) -> Document | None:
+    async def read(self, user_context: UserContext, file: str) -> Document | None:
         """Fetch a single SKILL by exact filename. Returns ``None`` if not found.
 
         ``file`` must be a leaf filename like ``SKILL-IAM.md``. Path-traversal
@@ -49,13 +50,15 @@ class ProceduralService(ABC):
         """
 
     @abstractmethod
-    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+    async def write(
+        self, user_context: UserContext, file: str, content: str
+    ) -> Document:
         """Create or replace a SKILL document. Returns the persisted
         ``Document``. Same filename validation as ``read``. Caches
         invalidated on success."""
 
     @abstractmethod
-    def delete(self, user_context: UserContext, file: str) -> bool:
+    async def delete(self, user_context: UserContext, file: str) -> bool:
         """Hard-delete the underlying object from storage. Returns
         ``True`` if deleted, ``False`` if it didn't exist. Caches
         invalidated on success."""
@@ -130,13 +133,15 @@ class S3ProceduralService(ProceduralService):
         return docs
 
     @log_call(logger=logger)
-    def load(self, user_context: UserContext) -> list[Document]:
+    async def load(self, user_context: UserContext) -> list[Document]:
         del user_context  # shared content — not per-user scoped
-        return list(self._load_from_s3())
+        # minio SDK is sync-only → offload the blocking S3 listing/get to a
+        # worker thread so the event loop stays free (PYTHON-ENGINEERING §3).
+        return list(await asyncio.to_thread(self._load_from_s3))
 
     @log_call(logger=logger)
-    def search(self, user_context: UserContext, query: str) -> list[Document]:
-        skills = self.load(user_context)
+    async def search(self, user_context: UserContext, query: str) -> list[Document]:
+        skills = await self.load(user_context)
         query_lower = query.lower()
         keywords = [kw for kw in query_lower.split() if len(kw) > 3]
         if not keywords:
@@ -152,8 +157,8 @@ class S3ProceduralService(ProceduralService):
         ]
 
     @log_call(logger=logger)
-    def as_context(self, user_context: UserContext, query: str) -> str:
-        matched = self.search(user_context, query)
+    async def as_context(self, user_context: UserContext, query: str) -> str:
+        matched = await self.search(user_context, query)
         if not matched:
             return ""
         lines = ["## Relevant Skills"]
@@ -162,21 +167,27 @@ class S3ProceduralService(ProceduralService):
         return "\n".join(lines)
 
     @log_call(logger=logger)
-    def read(self, user_context: UserContext, file: str) -> Document | None:
+    async def read(self, user_context: UserContext, file: str) -> Document | None:
         del user_context  # shared content — not per-user scoped
         if not _validate_filename(file):
             return None
-        client: Any = self._client
         key = f"{self._prefix}{file}"
-        try:
-            with client.get_object(self._bucket, key) as response:
-                content = response.read().decode("utf-8")
-        except ObjectNotFoundError:
-            return None
-        except Exception as exc:
-            # Network / auth / transient — preserved dual-arm behaviour
-            # so a backend hiccup does NOT surface as a 500 to the caller.
-            logger.warning("S3ProceduralService.read(%r) failed: %s", file, exc)
+
+        def _fetch() -> str | None:
+            client: Any = self._client
+            try:
+                with client.get_object(self._bucket, key) as response:
+                    return str(response.read().decode("utf-8"))
+            except ObjectNotFoundError:
+                return None
+            except Exception as exc:
+                # Network / auth / transient — preserved dual-arm behaviour
+                # so a backend hiccup does NOT surface as a 500 to the caller.
+                logger.warning("S3ProceduralService.read(%r) failed: %s", file, exc)
+                return None
+
+        content = await asyncio.to_thread(_fetch)
+        if content is None:
             return None
         return Document(
             page_content=content,
@@ -188,21 +199,28 @@ class S3ProceduralService(ProceduralService):
         )
 
     @log_call(logger=logger)
-    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+    async def write(
+        self, user_context: UserContext, file: str, content: str
+    ) -> Document:
         del user_context  # shared content — not per-user scoped
         if not _validate_filename(file):
             raise ValueError(f"invalid filename: {file!r}")
         import io
 
-        client: Any = self._client
         key = f"{self._prefix}{file}"
         body = content.encode("utf-8")
-        try:
-            client.put_object(self._bucket, key, io.BytesIO(body), length=len(body))
-        except Exception as exc:
-            raise RuntimeError(
-                f"S3ProceduralService.write({file!r}) failed: {exc}"
-            ) from exc
+
+        def _put() -> None:
+            client: Any = self._client
+            try:
+                with io.BytesIO(body) as buf:
+                    client.put_object(self._bucket, key, buf, length=len(body))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"S3ProceduralService.write({file!r}) failed: {exc}"
+                ) from exc
+
+        await asyncio.to_thread(_put)
         self.invalidate_cache()
         return Document(
             page_content=content,
@@ -214,31 +232,37 @@ class S3ProceduralService(ProceduralService):
         )
 
     @log_call(logger=logger)
-    def delete(self, user_context: UserContext, file: str) -> bool:
+    async def delete(self, user_context: UserContext, file: str) -> bool:
         del user_context  # shared content — not per-user scoped
         if not _validate_filename(file):
             return False
-        client: Any = self._client
         key = f"{self._prefix}{file}"
-        try:
-            client.stat_object(self._bucket, key)
-        except ObjectNotFoundError:
-            return False
-        except Exception as exc:
-            logger.warning(
-                "S3ProceduralService.delete(%r): stat failed (%s) — "
-                "attempting remove regardless",
-                file,
-                exc,
-            )
-        try:
-            client.remove_object(self._bucket, key)
-        except Exception as exc:
-            raise RuntimeError(
-                f"S3ProceduralService.delete({file!r}) failed: {exc}"
-            ) from exc
-        self.invalidate_cache()
-        return True
+
+        def _delete() -> bool:
+            client: Any = self._client
+            try:
+                client.stat_object(self._bucket, key)
+            except ObjectNotFoundError:
+                return False
+            except Exception as exc:
+                logger.warning(
+                    "S3ProceduralService.delete(%r): stat failed (%s) — "
+                    "attempting remove regardless",
+                    file,
+                    exc,
+                )
+            try:
+                client.remove_object(self._bucket, key)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"S3ProceduralService.delete({file!r}) failed: {exc}"
+                ) from exc
+            return True
+
+        deleted = await asyncio.to_thread(_delete)
+        if deleted:
+            self.invalidate_cache()
+        return deleted
 
     @log_call(logger=logger)
     def invalidate_cache(self) -> None:
@@ -264,12 +288,12 @@ class MockProceduralService(ProceduralService):
         )
 
     @log_call(logger=logger)
-    def load(self, user_context: UserContext) -> list[Document]:
+    async def load(self, user_context: UserContext) -> list[Document]:
         del user_context  # plumbing only
         return list(self._documents)
 
     @log_call(logger=logger)
-    def search(self, user_context: UserContext, query: str) -> list[Document]:
+    async def search(self, user_context: UserContext, query: str) -> list[Document]:
         del user_context  # plumbing only
         query_lower = query.lower()
         keywords = [kw for kw in query_lower.split() if len(kw) > 3]
@@ -286,8 +310,8 @@ class MockProceduralService(ProceduralService):
         ]
 
     @log_call(logger=logger)
-    def as_context(self, user_context: UserContext, query: str) -> str:
-        matched = self.search(user_context, query)
+    async def as_context(self, user_context: UserContext, query: str) -> str:
+        matched = await self.search(user_context, query)
         if not matched:
             return ""
         lines = ["## Relevant Skills"]
@@ -296,7 +320,7 @@ class MockProceduralService(ProceduralService):
         return "\n".join(lines)
 
     @log_call(logger=logger)
-    def read(self, user_context: UserContext, file: str) -> Document | None:
+    async def read(self, user_context: UserContext, file: str) -> Document | None:
         del user_context  # plumbing only
         if not _validate_filename(file):
             return None
@@ -306,7 +330,9 @@ class MockProceduralService(ProceduralService):
         return None
 
     @log_call(logger=logger)
-    def write(self, user_context: UserContext, file: str, content: str) -> Document:
+    async def write(
+        self, user_context: UserContext, file: str, content: str
+    ) -> Document:
         del user_context  # plumbing only
         if not _validate_filename(file):
             raise ValueError(f"invalid filename: {file!r}")
@@ -333,7 +359,7 @@ class MockProceduralService(ProceduralService):
         return new_doc
 
     @log_call(logger=logger)
-    def delete(self, user_context: UserContext, file: str) -> bool:
+    async def delete(self, user_context: UserContext, file: str) -> bool:
         del user_context  # plumbing only
         if not _validate_filename(file):
             return False

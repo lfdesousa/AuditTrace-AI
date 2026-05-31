@@ -6,7 +6,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.routes.memory_upload import manifest as manifest_mod
@@ -27,14 +27,14 @@ class TestGetSessionFactory:
         container._instances["postgres_factory"] = InMemoryPostgresFactory()
         try:
             sf = _get_session_factory()
-            assert isinstance(sf, sessionmaker)
+            assert isinstance(sf, async_sessionmaker)
         finally:
             container._instances.pop("postgres_factory", None)
 
 
-def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
-    with factory() as session:
-        manifest_mod.insert_pending_scan(
+async def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
+    async with factory() as session:
+        await manifest_mod.insert_pending_scan(
             session,
             scan_id=scan_id,
             user_id=user_id,
@@ -58,9 +58,9 @@ def _stub_auth_and_factory(client: TestClient, factory, *, sub: str, scope: str)
 
 
 class TestGetUploadStatus:
-    def test_returns_pending_scan_for_owner(self, client: TestClient) -> None:
+    async def test_returns_pending_scan_for_owner(self, client: TestClient) -> None:
         factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-1")
+        await _seed_pending(factory, "scan-1")
         client.app.dependency_overrides[_get_session_factory] = lambda: factory
         try:
             with (
@@ -122,10 +122,10 @@ class TestGetUploadStatus:
             client.app.dependency_overrides.pop(_get_session_factory, None)
         assert response.status_code == 404
 
-    def test_cross_tenant_lookup_returns_404(self, client: TestClient) -> None:
+    async def test_cross_tenant_lookup_returns_404(self, client: TestClient) -> None:
         # Same 404 shape as "unknown scan_id" — don't leak existence.
         factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-9", user_id="bob")
+        await _seed_pending(factory, "scan-9", user_id="bob")
         client.app.dependency_overrides[_get_session_factory] = lambda: factory
         try:
             with (
@@ -152,9 +152,9 @@ class TestGetUploadStatus:
             client.app.dependency_overrides.pop(_get_session_factory, None)
         assert response.status_code == 404
 
-    def test_admin_can_read_any_scan_id(self, client: TestClient) -> None:
+    async def test_admin_can_read_any_scan_id(self, client: TestClient) -> None:
         factory = InMemoryPostgresFactory().get_session_factory()
-        _seed_pending(factory, "scan-x", user_id="bob")
+        await _seed_pending(factory, "scan-x", user_id="bob")
         client.app.dependency_overrides[_get_session_factory] = lambda: factory
         try:
             with (

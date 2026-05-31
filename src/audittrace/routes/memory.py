@@ -47,6 +47,7 @@ from fastapi import (
     Security,
     UploadFile,
 )
+from sqlalchemy import func, select
 
 # ADR-006 — direct ``minio.Minio`` import removed; routes/memory.py
 # now consumes the ABC-shaped provider from the DI container via
@@ -55,6 +56,7 @@ from audittrace.auth import require_user, validate_jwt
 from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
+from audittrace.db.rls import current_user_id, set_rls_user_id
 from audittrace.dependencies import (
     get_chromadb,
     get_episodic_service,
@@ -774,12 +776,12 @@ async def create_episodic(
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
     try:
-        service.write(user, filename, content)
+        await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = manifest.record_create(
+    entry: ManifestEntry = await manifest.record_create(
         layer="episodic",
         key=filename,
         title=title,
@@ -789,7 +791,7 @@ async def create_episodic(
     return entry.to_dict()
 
 
-def _merge_layer_items_with_s3(
+async def _merge_layer_items_with_s3(
     layer: str,
     visible_entries: list[ManifestEntry],
     user: UserContext,
@@ -816,7 +818,7 @@ def _merge_layer_items_with_s3(
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
-    all_known: list[ManifestEntry] = manifest.list_for_layer(
+    all_known: list[ManifestEntry] = await manifest.list_for_layer(
         layer, include_deleted=True
     )
     known_keys = {e.key for e in all_known}
@@ -830,7 +832,7 @@ def _merge_layer_items_with_s3(
         return items  # other layers don't have S3 backing
 
     try:
-        docs = service.load(user)
+        docs = await service.load(user)
     except Exception as exc:
         logger.warning(
             "S3 backfill load failed for layer %s: %s — listing manifest only",
@@ -878,10 +880,10 @@ async def list_episodic(
     has no effect on discovered entries (they have no soft-delete
     state)."""
     manifest = get_memory_manifest_service()
-    entries: list[ManifestEntry] = manifest.list_for_layer(
+    entries: list[ManifestEntry] = await manifest.list_for_layer(
         "episodic", include_deleted=include_deleted
     )
-    items = _merge_layer_items_with_s3("episodic", entries, user)
+    items = await _merge_layer_items_with_s3("episodic", entries, user)
     return {"items": items, "total": len(items)}
 
 
@@ -895,10 +897,10 @@ async def read_episodic(
     _validate_filename_or_400(filename, "episodic")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
-    doc = service.read(user, filename)
+    doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
-    entry: ManifestEntry | None = manifest.get("episodic", filename)
+    entry: ManifestEntry | None = await manifest.get("episodic", filename)
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -926,13 +928,13 @@ async def update_episodic(
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
     try:
-        service.write(user, filename, content)
+        await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     try:
-        entry: ManifestEntry = manifest.record_update(
+        entry: ManifestEntry = await manifest.record_update(
             layer="episodic",
             key=filename,
             size_bytes=len(content.encode("utf-8")),
@@ -971,14 +973,14 @@ async def delete_episodic(
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
     try:
-        entry: ManifestEntry = manifest.record_delete(
+        entry: ManifestEntry = await manifest.record_delete(
             "episodic", filename, user.user_id
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if hard:
         try:
-            service.delete(user, filename)
+            await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     return entry.to_dict()
@@ -1006,12 +1008,12 @@ async def create_procedural(
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
     try:
-        service.write(user, filename, content)
+        await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = manifest.record_create(
+    entry: ManifestEntry = await manifest.record_create(
         layer="procedural",
         key=filename,
         title=title,
@@ -1030,10 +1032,10 @@ async def list_procedural(
     """List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
     so pre-PR-A items appear alongside operator-created ones."""
     manifest = get_memory_manifest_service()
-    entries: list[ManifestEntry] = manifest.list_for_layer(
+    entries: list[ManifestEntry] = await manifest.list_for_layer(
         "procedural", include_deleted=include_deleted
     )
-    items = _merge_layer_items_with_s3("procedural", entries, user)
+    items = await _merge_layer_items_with_s3("procedural", entries, user)
     return {"items": items, "total": len(items)}
 
 
@@ -1046,10 +1048,10 @@ async def read_procedural(
     _validate_filename_or_400(filename, "procedural")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
-    doc = service.read(user, filename)
+    doc = await service.read(user, filename)
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
-    entry: ManifestEntry | None = manifest.get("procedural", filename)
+    entry: ManifestEntry | None = await manifest.get("procedural", filename)
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1074,13 +1076,13 @@ async def update_procedural(
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
     try:
-        service.write(user, filename, content)
+        await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     try:
-        entry: ManifestEntry = manifest.record_update(
+        entry: ManifestEntry = await manifest.record_update(
             layer="procedural",
             key=filename,
             size_bytes=len(content.encode("utf-8")),
@@ -1112,14 +1114,14 @@ async def delete_procedural(
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
     try:
-        entry: ManifestEntry = manifest.record_delete(
+        entry: ManifestEntry = await manifest.record_delete(
             "procedural", filename, user.user_id
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if hard:
         try:
-            service.delete(user, filename)
+            await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     return entry.to_dict()
@@ -1165,10 +1167,10 @@ async def create_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     try:
-        service.upsert(user, collection, document_id, text, metadata)
+        await service.upsert(user, collection, document_id, text, metadata)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = manifest.record_create(
+    entry: ManifestEntry = await manifest.record_create(
         layer="semantic",
         key=_semantic_key(collection, document_id),
         title=title,
@@ -1178,7 +1180,7 @@ async def create_semantic(
     return entry.to_dict()
 
 
-def _merge_semantic_with_chroma(
+async def _merge_semantic_with_chroma(
     visible_entries: list[ManifestEntry],
     collection: str | None,
 ) -> list[dict[str, Any]]:
@@ -1194,7 +1196,7 @@ def _merge_semantic_with_chroma(
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
-    all_known: list[ManifestEntry] = manifest.list_for_layer(
+    all_known: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=True
     )
     known_keys = {e.key for e in all_known}
@@ -1274,13 +1276,13 @@ async def list_semantic(
     discovery so pre-PR-A vectors (seeded via index-chromadb.py)
     surface alongside operator-created ones."""
     manifest = get_memory_manifest_service()
-    entries: list[ManifestEntry] = manifest.list_for_layer(
+    entries: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=include_deleted
     )
     if collection is not None:
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
-    items = _merge_semantic_with_chroma(entries, collection)
+    items = await _merge_semantic_with_chroma(entries, collection)
     return {"items": items, "total": len(items)}
 
 
@@ -1293,10 +1295,10 @@ async def read_semantic(
 ) -> dict[str, Any]:
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
-    doc = service.get_document(user, collection, document_id)
+    doc = await service.get_document(user, collection, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="semantic doc not found")
-    entry: ManifestEntry | None = manifest.get(
+    entry: ManifestEntry | None = await manifest.get(
         "semantic", _semantic_key(collection, document_id)
     )
     return {
@@ -1322,12 +1324,12 @@ async def update_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     try:
-        service.upsert(user, collection, document_id, text, metadata)
+        await service.upsert(user, collection, document_id, text, metadata)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     key = _semantic_key(collection, document_id)
     try:
-        entry: ManifestEntry = manifest.record_update(
+        entry: ManifestEntry = await manifest.record_update(
             layer="semantic",
             key=key,
             size_bytes=len(text.encode("utf-8")),
@@ -1361,12 +1363,14 @@ async def delete_semantic(
     manifest = get_memory_manifest_service()
     key = _semantic_key(collection, document_id)
     try:
-        entry: ManifestEntry = manifest.record_delete("semantic", key, user.user_id)
+        entry: ManifestEntry = await manifest.record_delete(
+            "semantic", key, user.user_id
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if hard:
         try:
-            service.delete_document(user, collection, document_id)
+            await service.delete_document(user, collection, document_id)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     return entry.to_dict()
@@ -1432,18 +1436,33 @@ async def list_conversational_sessions(
         ) from exc
 
     session_factory = pg.get_session_factory()
-    with session_factory() as db:
-        q = db.query(SessionRow)
+    async with session_factory() as db:
+        # Phase 4 RLS: the sync after_begin listener no-ops on async
+        # engines, so async routes set the per-user GUC explicitly here
+        # (Postgres-only; no-op on SQLite). Reads the request-scoped
+        # ContextVar populated by ``require_user``.
+        await set_rls_user_id(db, current_user_id())
+        stmt = select(SessionRow)
         if project is not None:
-            q = q.filter(SessionRow.project == project)
+            stmt = stmt.where(SessionRow.project == project)
         if since is not None:
-            q = q.filter(SessionRow.date >= since)
+            stmt = stmt.where(SessionRow.date >= since)
         if summarised is True:
-            q = q.filter(SessionRow.summarized_at.is_not(None))
+            stmt = stmt.where(SessionRow.summarized_at.is_not(None))
         elif summarised is False:
-            q = q.filter(SessionRow.summarized_at.is_(None))
-        total = q.count()
-        rows = q.order_by(SessionRow.date.desc()).offset(offset).limit(limit).all()
+            stmt = stmt.where(SessionRow.summarized_at.is_(None))
+        total = (
+            await db.execute(select(func.count()).select_from(stmt.subquery()))
+        ).scalar_one()
+        rows = (
+            (
+                await db.execute(
+                    stmt.order_by(SessionRow.date.desc()).offset(offset).limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     return {
         "items": [
@@ -1490,21 +1509,28 @@ async def read_conversational_session(
         ) from exc
 
     session_factory = pg.get_session_factory()
-    with session_factory() as db:
+    async with session_factory() as db:
+        # Phase 4 RLS GUC for the async path (see list route above).
+        await set_rls_user_id(db, current_user_id())
         session_row = (
-            db.query(SessionRow).filter(SessionRow.id == session_id).one_or_none()
-        )
+            await db.execute(select(SessionRow).where(SessionRow.id == session_id))
+        ).scalar_one_or_none()
         if session_row is None:
             raise HTTPException(status_code=404, detail="session not found")
 
-        q = (
-            db.query(InteractionRow)
-            .filter(InteractionRow.session_id == session_id)
-            .order_by(InteractionRow.timestamp.asc())
-            .offset(offset)
-            .limit(limit)
+        interactions = (
+            (
+                await db.execute(
+                    select(InteractionRow)
+                    .where(InteractionRow.session_id == session_id)
+                    .order_by(InteractionRow.timestamp.asc())
+                    .offset(offset)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
         )
-        interactions = q.all()
 
     return {
         "session": {

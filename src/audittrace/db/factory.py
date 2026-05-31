@@ -5,8 +5,8 @@ factory layer (a critical trust boundary in the audit story) is visible
 in logs, traces, and metrics.
 """
 
+import asyncio
 import logging
-import time
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
@@ -27,38 +27,51 @@ _CHROMADB_CONNECT_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
 
 
 class ChromaDBClient(Protocol):
-    """Protocol for ChromaDB client abstraction."""
+    """Protocol for the async ChromaDB client abstraction."""
 
-    def get_or_create_collection(
-        self, name: str, **kwargs: Any
-    ) -> "chromadb.Collection": ...
+    async def get_or_create_collection(self, name: str, **kwargs: Any) -> Any: ...
 
 
 class ChromaDBFactory(ABC):
-    """Abstract factory for ChromaDB client creation."""
+    """Abstract factory for async ChromaDB client creation."""
 
     @abstractmethod
-    def get_client(self) -> ChromaDBClient:
-        """Create and return a ChromaDB client."""
+    async def get_client(self) -> ChromaDBClient:
+        """Create and return an async ChromaDB client.
+
+        Async because chromadb.AsyncHttpClient is a coroutine constructor
+        (it performs the get_user_identity handshake on connect) — so Chroma
+        I/O never blocks the event loop (PYTHON-ENGINEERING §3: network I/O →
+        async).
+        """
 
 
 class MemoryChromaDBFactory(ChromaDBFactory):
-    """In-memory ChromaDB (for testing)."""
+    """In-memory ChromaDB (for testing).
+
+    chromadb 1.x ships no async in-process client (only AsyncHttpClient for
+    server mode), so this returns the sync EphemeralClient. Production
+    memory-server always uses HTTPChromaDBFactory (async); this factory exists
+    only for lightweight in-process tests that don't exercise the async
+    collection path.
+    """
 
     @log_call(logger=logger)
-    def get_client(self) -> ChromaDBClient:
-        return chromadb.Client()  # type: ignore[return-value]
+    async def get_client(self) -> ChromaDBClient:
+        # Construction is cheap + sync; the async signature keeps the ABC
+        # uniform with HTTPChromaDBFactory.
+        return chromadb.EphemeralClient()  # type: ignore[return-value]
 
 
 class HTTPChromaDBFactory(ChromaDBFactory):
-    """HTTP-based ChromaDB (server mode) with optional token authentication."""
+    """Async HTTP-based ChromaDB (server mode) with optional token auth."""
 
     def __init__(self, url: str = "http://localhost:8000", token: str | None = None):
         self.url = url
         self.token = token
 
     @log_call(logger=logger)
-    def get_client(self) -> ChromaDBClient:
+    async def get_client(self) -> ChromaDBClient:
         # Accept both "http://host:port" and "host:port" forms.
         url = self.url
         if "://" in url:
@@ -73,7 +86,7 @@ class HTTPChromaDBFactory(ChromaDBFactory):
         last_exc: Exception | None = None
         for attempt in range(_CHROMADB_CONNECT_RETRIES + 1):
             try:
-                return chromadb.HttpClient(**kwargs)  # type: ignore[return-value]
+                return await chromadb.AsyncHttpClient(**kwargs)  # type: ignore[return-value]
             except (ValueError, ConnectionError) as exc:
                 last_exc = exc
                 if attempt < _CHROMADB_CONNECT_RETRIES:
@@ -85,7 +98,7 @@ class HTTPChromaDBFactory(ChromaDBFactory):
                         exc,
                         delay,
                     )
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
 
 
@@ -103,7 +116,7 @@ class MockChromaDBFactory(ChromaDBFactory):
         self.call_count: int = 0
 
     @log_call(logger=logger)
-    def get_client(self) -> "_MockChromaDBClient":
+    async def get_client(self) -> "_MockChromaDBClient":
         self.call_count += 1
         return _MockChromaDBClient(self)
 
@@ -124,7 +137,9 @@ class _MockChromaDBClient:
         self._factory = factory
 
     @log_call(logger=logger)
-    def get_or_create_collection(self, name: str, **kwargs: Any) -> "MockCollection":
+    async def get_or_create_collection(
+        self, name: str, **kwargs: Any
+    ) -> "MockCollection":
         return self._factory._get_or_create_collection(name, **kwargs)
 
 
@@ -136,7 +151,7 @@ class MockCollection:
         self.data: list[dict[str, Any]] = []
 
     @log_call(logger=logger)
-    def add(
+    async def add(
         self,
         ids: list[str] | None = None,
         documents: list[str] | None = None,
@@ -157,7 +172,7 @@ class MockCollection:
         return list(ids)
 
     @log_call(logger=logger)
-    def query(
+    async def query(
         self,
         query_texts: list[str] | None = None,
         n_results: int = 5,
@@ -180,7 +195,7 @@ class MockCollection:
         }
 
     @log_call(logger=logger)
-    def get(
+    async def get(
         self,
         ids: list[str] | None = None,
         **kwargs: Any,
@@ -197,7 +212,7 @@ class MockCollection:
         }
 
     @log_call(logger=logger)
-    def upsert(
+    async def upsert(
         self,
         ids: list[str] | None = None,
         documents: list[str] | None = None,
@@ -220,14 +235,14 @@ class MockCollection:
                 self.data.append({"id": doc_id, "document": doc, "metadata": meta})
 
     @log_call(logger=logger)
-    def delete(self, ids: list[str] | None = None, **kwargs: Any) -> None:
+    async def delete(self, ids: list[str] | None = None, **kwargs: Any) -> None:
         if not ids:
             return
         id_set = set(ids)
         self.data = [r for r in self.data if r["id"] not in id_set]
 
     @log_call(logger=logger)
-    def count(self, where: dict[str, Any] | None = None, **kwargs: Any) -> int:
+    async def count(self, where: dict[str, Any] | None = None, **kwargs: Any) -> int:
         if where:
             return sum(
                 1

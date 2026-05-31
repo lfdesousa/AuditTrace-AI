@@ -9,7 +9,8 @@ Three call-sites:
   ``pending_scan`` → terminal state.
 
 All three use the regular ``memory_items`` ORM (no RLS, per
-migration 009 — manifest is operator-global by design)."""
+migration 009 — manifest is operator-global by design). Async-only
+data layer (#263): callers pass an ``AsyncSession``."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from sqlalchemy import select
 from audittrace.db.models import MemoryItem
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import Session
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,8 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def insert_pending_scan(
-    session: Session,
+async def insert_pending_scan(
+    session: AsyncSession,
     *,
     scan_id: str,
     user_id: str,
@@ -73,8 +74,8 @@ def insert_pending_scan(
         document_sha256=object_sha256,
     )
     session.add(row)
-    session.commit()
-    session.refresh(row)
+    await session.commit()
+    await session.refresh(row)
     logger.info(
         "memory_upload.manifest.inserted",
         extra={"scan_id": scan_id, "user_id": user_id},
@@ -82,9 +83,9 @@ def insert_pending_scan(
     return row
 
 
-def get_by_scan_id(session: Session, scan_id: str) -> MemoryItem | None:
+async def get_by_scan_id(session: AsyncSession, scan_id: str) -> MemoryItem | None:
     """Lookup for /memory/upload/status. Returns None on miss
     so the route can surface 404 cleanly."""
-    return session.execute(
-        select(MemoryItem).where(MemoryItem.id == scan_id)
+    return (
+        await session.execute(select(MemoryItem).where(MemoryItem.id == scan_id))
     ).scalar_one_or_none()

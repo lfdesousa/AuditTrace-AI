@@ -73,6 +73,33 @@ def current_user_id() -> str | None:
     return _current_user_id.get()
 
 
+async def set_rls_user_id(db: Any, user_id: str | None) -> None:
+    """Set the Postgres RLS GUC ``app.current_user_id`` on ``db``.
+
+    Async counterpart to the ``after_begin`` listener for code paths that
+    hold an :class:`~sqlalchemy.ext.asyncio.AsyncSession` explicitly and
+    want to scope it to a user without relying on the request-scoped
+    ContextVar (notably the RLS integration tests, which open their own
+    sessions outside the request lifecycle).
+
+    Emits ``set_config('app.current_user_id', :uid, true)`` — the third
+    argument ``true`` makes it transaction-LOCAL, matching
+    ``_apply_rls_guc``. Passing ``user_id=None`` sets the empty-string
+    sentinel so the RLS policy's default denies every row (safe-by-default,
+    mirrors the "no user bound" path).
+
+    No-op on non-PostgreSQL dialects (SQLite has no RLS), so the helper is
+    safe to call from dialect-agnostic code.
+    """
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": user_id if user_id is not None else ""},
+    )
+
+
 # ─────────────────────── SQLAlchemy event listener ─────────────────────────
 # The listener runs inside the ``Session.after_begin`` hook, which fires
 # at the start of every transaction. Since Postgres ``SET LOCAL`` /

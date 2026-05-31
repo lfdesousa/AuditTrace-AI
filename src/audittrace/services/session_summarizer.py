@@ -41,8 +41,8 @@ from typing import Any
 
 import httpx
 from opentelemetry import metrics
-from sqlalchemy import text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
@@ -147,7 +147,7 @@ class SessionSummarizer:
         self,
         *,
         settings: Settings,
-        session_factory: sessionmaker[Session],
+        session_factory: async_sessionmaker[AsyncSession],
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings
@@ -201,7 +201,7 @@ class SessionSummarizer:
         and counted as a skip — the row stays eligible for the next
         cycle because ``summarized_at`` was never advanced.
         """
-        eligible = await asyncio.to_thread(self._find_eligible)
+        eligible = await self._find_eligible()
         if not eligible:
             logger.debug("session summariser cycle — 0 eligible sessions")
             return 0
@@ -224,7 +224,7 @@ class SessionSummarizer:
 
     # ── eligibility ────────────────────────────────────────────────────
 
-    def _find_eligible(self) -> list[EligibleSession]:
+    async def _find_eligible(self) -> list[EligibleSession]:
         """Synchronous eligibility query. Bypasses RLS on Postgres via
         ``SET LOCAL row_security = off`` (table-owner privilege).
 
@@ -236,16 +236,18 @@ class SessionSummarizer:
         threshold = (
             datetime.now() - timedelta(minutes=self._settings.summarizer_idle_minutes)
         ).isoformat()
-        with self._session_factory() as db:
-            self._disable_rls_if_postgres(db)
-            rows = db.execute(
-                _ELIGIBILITY_SQL,
-                {
-                    "threshold": threshold,
-                    # Over-fetch so fresh sessions filtered out in Python
-                    # do not silently cap the cycle's useful work.
-                    "fetch_limit": max_per_cycle * 3,
-                },
+        async with self._session_factory() as db:
+            await self._disable_rls_if_postgres(db)
+            rows = (
+                await db.execute(
+                    _ELIGIBILITY_SQL,
+                    {
+                        "threshold": threshold,
+                        # Over-fetch so fresh sessions filtered out in Python
+                        # do not silently cap the cycle's useful work.
+                        "fetch_limit": max_per_cycle * 3,
+                    },
+                )
             ).all()
             eligible: list[EligibleSession] = []
             for row in rows:
@@ -266,7 +268,7 @@ class SessionSummarizer:
     # ── per-session work ───────────────────────────────────────────────
 
     async def _summarise_one(self, es: EligibleSession) -> None:
-        turns = await asyncio.to_thread(self._fetch_turns, es)
+        turns = await self._fetch_turns(es)
         if not turns:
             logger.warning(
                 "session summariser: 0 turns for session=%s — skipping",
@@ -282,7 +284,7 @@ class SessionSummarizer:
         # looping every cycle on an HTTP 400.
         prompt, dropped = await self._fit_prompt_to_ctx(turns)
         if prompt is None:
-            await asyncio.to_thread(self._persist_sentinel_overflow, es, len(turns))
+            await self._persist_sentinel_overflow(es, len(turns))
             _ctx_overflow_counter.add(1, {"branch": "sentinel"})
             return
 
@@ -311,7 +313,7 @@ class SessionSummarizer:
             }
             _ctx_overflow_counter.add(1, {"branch": "truncate"})
 
-        await asyncio.to_thread(self._persist, es, parsed)
+        await self._persist(es, parsed)
 
     async def _fit_prompt_to_ctx(
         self, turns: Sequence[InteractionRecord]
@@ -385,15 +387,17 @@ class SessionSummarizer:
         tokens = body.get("tokens") or []
         return len(tokens)
 
-    def _persist_sentinel_overflow(self, es: EligibleSession, turn_count: int) -> None:
+    async def _persist_sentinel_overflow(
+        self, es: EligibleSession, turn_count: int
+    ) -> None:
         """Write a sentinel SessionRecord for a session whose latest single
         turn exceeds ctx_size. Marks ``summarized_at`` so the row leaves
         the eligibility set; manual operator follow-up resolves the data
         archive question.
         """
-        with self._session_factory() as db:
+        async with self._session_factory() as db:
             try:
-                self._set_user_id_if_postgres(db, es.user_id)
+                await self._set_user_id_if_postgres(db, es.user_id)
                 now = datetime.now()
                 sentinel_summary = (
                     f"[sentinel-skip-ctx-overflow-auto] session has "
@@ -403,10 +407,10 @@ class SessionSummarizer:
                     "No automated summary produced. Manual review recommended."
                 )
                 existing = (
-                    db.query(SessionRecord)
-                    .filter(SessionRecord.id == es.session_id)
-                    .one_or_none()
-                )
+                    await db.execute(
+                        select(SessionRecord).filter(SessionRecord.id == es.session_id)
+                    )
+                ).scalar_one_or_none()
                 if existing is None:
                     db.add(
                         SessionRecord(
@@ -426,7 +430,7 @@ class SessionSummarizer:
                     existing.date = now.isoformat()
                     existing.model = "sentinel-skip-ctx-overflow-auto"
                     existing.summarized_at = now
-                db.commit()
+                await db.commit()
                 logger.warning(
                     "session summariser: sentinel-skip session=%s user=%s "
                     "(latest turn alone exceeds ctx=%d)",
@@ -435,32 +439,37 @@ class SessionSummarizer:
                     self._settings.summarizer_ctx_tokens,
                 )
             except Exception:
-                db.rollback()
+                await db.rollback()
                 raise
 
-    def _fetch_turns(self, es: EligibleSession) -> list[InteractionRecord]:
-        with self._session_factory() as db:
-            self._disable_rls_if_postgres(db)
-            return (
-                db.query(InteractionRecord)
-                .filter(InteractionRecord.session_id == es.session_id)
-                .filter(InteractionRecord.user_id == es.user_id)
-                .filter(InteractionRecord.project == es.project)
-                .order_by(InteractionRecord.timestamp)
+    async def _fetch_turns(self, es: EligibleSession) -> list[InteractionRecord]:
+        async with self._session_factory() as db:
+            await self._disable_rls_if_postgres(db)
+            return list(
+                (
+                    await db.execute(
+                        select(InteractionRecord)
+                        .filter(InteractionRecord.session_id == es.session_id)
+                        .filter(InteractionRecord.user_id == es.user_id)
+                        .filter(InteractionRecord.project == es.project)
+                        .order_by(InteractionRecord.timestamp)
+                    )
+                )
+                .scalars()
                 .all()
             )
 
-    def _persist(
+    async def _persist(
         self,
         es: EligibleSession,
         parsed: dict[str, Any],
     ) -> None:
         """Upsert SessionRecord under the session's user's GUC."""
-        with self._session_factory() as db:
+        async with self._session_factory() as db:
             try:
                 # SET LOCAL app.current_user_id so the RLS WITH CHECK on
                 # sessions accepts the write.
-                self._set_user_id_if_postgres(db, es.user_id)
+                await self._set_user_id_if_postgres(db, es.user_id)
                 now = datetime.now()
                 summary = str(parsed.get("summary") or "")[:400]
                 key_points = parsed.get("key_points") or []
@@ -472,10 +481,10 @@ class SessionSummarizer:
                 ]
 
                 existing = (
-                    db.query(SessionRecord)
-                    .filter(SessionRecord.id == es.session_id)
-                    .one_or_none()
-                )
+                    await db.execute(
+                        select(SessionRecord).filter(SessionRecord.id == es.session_id)
+                    )
+                ).scalar_one_or_none()
                 if existing is None:
                     db.add(
                         SessionRecord(
@@ -495,7 +504,7 @@ class SessionSummarizer:
                     existing.date = now.isoformat()
                     existing.model = self._settings.summarizer_model
                     existing.summarized_at = now
-                db.commit()
+                await db.commit()
                 logger.info(
                     "session summariser: wrote summary session=%s user=%s kp=%d",
                     es.session_id,
@@ -503,7 +512,7 @@ class SessionSummarizer:
                     len(kp_clean),
                 )
             except Exception:
-                db.rollback()
+                await db.rollback()
                 raise
 
     # ── LLM call ───────────────────────────────────────────────────────
@@ -547,7 +556,7 @@ class SessionSummarizer:
     # ── dialect-aware helpers ──────────────────────────────────────────
 
     @staticmethod
-    def _disable_rls_if_postgres(db: Session) -> None:
+    async def _disable_rls_if_postgres(db: AsyncSession) -> None:
         """Table-owner bypass of RLS for the current txn on Postgres.
 
         See `_find_eligible` / `_fetch_turns` — we need to read rows
@@ -556,15 +565,15 @@ class SessionSummarizer:
         if (
             db.bind is not None and db.bind.dialect.name == "postgresql"
         ):  # pragma: no cover - postgres-only, smoke-tested live
-            db.execute(text("SET LOCAL row_security = off"))
+            await db.execute(text("SET LOCAL row_security = off"))
 
     @staticmethod
-    def _set_user_id_if_postgres(db: Session, user_id: str) -> None:
+    async def _set_user_id_if_postgres(db: AsyncSession, user_id: str) -> None:
         """Scope the write txn to the session's user for RLS WITH CHECK."""
         if (
             db.bind is not None and db.bind.dialect.name == "postgresql"
         ):  # pragma: no cover - postgres-only, smoke-tested live
-            db.execute(
+            await db.execute(
                 text("SET LOCAL app.current_user_id = :uid"),
                 {"uid": user_id},
             )

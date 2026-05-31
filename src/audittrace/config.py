@@ -7,6 +7,31 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
+
+def _as_async_url(url: str) -> str:
+    """Normalise a SQLAlchemy URL to its async driver (asyncpg / aiosqlite)."""
+    if url.startswith("postgresql+psycopg2://"):
+        return url.replace("postgresql+psycopg2://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("sqlite://") and "+aiosqlite" not in url:
+        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+    return url
+
+
+def _as_sync_url(url: str) -> str:
+    """Normalise a SQLAlchemy URL to its sync driver (psycopg2 / sqlite).
+
+    Used for Alembic + the RLS oracle test, which run out-of-band of the
+    request event loop.
+    """
+    if url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
+    if url.startswith("sqlite+aiosqlite://"):
+        return url.replace("sqlite+aiosqlite://", "sqlite://", 1)
+    return url
+
+
 # Skip .env loading entirely when AUDITTRACE_ENV=test so a developer's local
 # .env (with real credentials) cannot leak into the test suite.
 _ENV_FILE: str | None = None if os.environ.get("AUDITTRACE_ENV") == "test" else ".env"
@@ -446,15 +471,27 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str | None:
-        """Construct PostgreSQL URL from components (SQLAlchemy format)."""
+        """Async PostgreSQL URL (asyncpg) — the runtime engine driver.
+
+        memory-server runs its data layer on asyncio (AsyncSession) so the
+        event loop is never blocked on DB I/O under load. Alembic + the
+        sync RLS oracle test use ``database_url_sync`` instead.
+        """
         if self.postgres_url:
-            return self.postgres_url
+            return _as_async_url(self.postgres_url)
         if self.postgres_password:
             return (
-                f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}"
+                f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
                 f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
             )
         return None
+
+    @property
+    def database_url_sync(self) -> str | None:
+        """Sync PostgreSQL URL (psycopg2) — Alembic migrations + the RLS
+        isolation oracle test, which run out-of-band of the request loop."""
+        url = self.database_url
+        return _as_sync_url(url) if url else None
 
     @property
     def summarizer_database_url(self) -> str | None:

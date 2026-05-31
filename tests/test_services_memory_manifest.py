@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 
 import pytest
+import pytest_asyncio
 
 from audittrace.services.memory_manifest import (
     ManifestEntry,
@@ -51,10 +52,10 @@ class TestValidateLayer:
 
 
 class TestRecordCreate:
-    def test_first_create_sets_created_modified_to_same(
+    async def test_first_create_sets_created_modified_to_same(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        entry = manifest.record_create(
+        entry = await manifest.record_create(
             "episodic", "ADR-x.md", "Title X", 100, "user-alice"
         )
         assert entry.layer == "episodic"
@@ -66,24 +67,26 @@ class TestRecordCreate:
         assert entry.modified_by_user_id == "user-alice"
         assert entry.deleted_at_ms is None
 
-    def test_recreate_revives_soft_deleted(
+    async def test_recreate_revives_soft_deleted(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", None, 1, "alice")
-        manifest.record_delete("episodic", "k.md", "alice")
+        await manifest.record_create("episodic", "k.md", None, 1, "alice")
+        await manifest.record_delete("episodic", "k.md", "alice")
         # Recreate
-        revived = manifest.record_create("episodic", "k.md", "new title", 2, "bob")
+        revived = await manifest.record_create(
+            "episodic", "k.md", "new title", 2, "bob"
+        )
         assert revived.deleted_at_ms is None
         assert revived.deleted_by_user_id is None
         assert revived.title == "new title"
         assert revived.size_bytes == 2
         assert revived.modified_by_user_id == "bob"
 
-    def test_recreate_existing_live_row_overwrites(
+    async def test_recreate_existing_live_row_overwrites(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", "v1", 10, "alice")
-        again = manifest.record_create("episodic", "k.md", "v2", 20, "bob")
+        await manifest.record_create("episodic", "k.md", "v1", 10, "alice")
+        again = await manifest.record_create("episodic", "k.md", "v2", 20, "bob")
         assert again.title == "v2"
         assert again.size_bytes == 20
         # Created_at preserved (the row was created by alice originally)
@@ -92,19 +95,21 @@ class TestRecordCreate:
         # That's a divergence from the Postgres path which DOES preserve.
         # Documented for awareness.
 
-    def test_rejects_invalid_layer(self, manifest: MockMemoryManifestService) -> None:
+    async def test_rejects_invalid_layer(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
         with pytest.raises(ValueError):
-            manifest.record_create("conversational", "x", None, 0, "u")
+            await manifest.record_create("conversational", "x", None, 0, "u")
 
 
 class TestRecordUpdate:
-    def test_update_bumps_modified_only(
+    async def test_update_bumps_modified_only(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        e1 = manifest.record_create("episodic", "k.md", "v1", 10, "alice")
+        e1 = await manifest.record_create("episodic", "k.md", "v1", 10, "alice")
         # Sleep just enough to guarantee a different millisecond.
         time.sleep(0.002)
-        e2 = manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
+        e2 = await manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
         assert e2.created_at_ms == e1.created_at_ms
         assert e2.modified_at_ms > e1.modified_at_ms
         assert e2.created_by_user_id == "alice"
@@ -112,96 +117,100 @@ class TestRecordUpdate:
         assert e2.title == "v2"
         assert e2.size_bytes == 20
 
-    def test_update_title_none_preserves_existing(
+    async def test_update_title_none_preserves_existing(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", "stays", 1, "alice")
-        e2 = manifest.record_update("episodic", "k.md", 2, "bob", title=None)
+        await manifest.record_create("episodic", "k.md", "stays", 1, "alice")
+        e2 = await manifest.record_update("episodic", "k.md", 2, "bob", title=None)
         assert e2.title == "stays"
 
-    def test_update_missing_raises(self, manifest: MockMemoryManifestService) -> None:
-        with pytest.raises(LookupError):
-            manifest.record_update("episodic", "missing.md", 1, "u")
-
-    def test_update_soft_deleted_raises(
+    async def test_update_missing_raises(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", None, 1, "alice")
-        manifest.record_delete("episodic", "k.md", "alice")
+        with pytest.raises(LookupError):
+            await manifest.record_update("episodic", "missing.md", 1, "u")
+
+    async def test_update_soft_deleted_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create("episodic", "k.md", None, 1, "alice")
+        await manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
-            manifest.record_update("episodic", "k.md", 2, "bob")
+            await manifest.record_update("episodic", "k.md", 2, "bob")
 
 
 class TestRecordDelete:
-    def test_delete_sets_timestamp_and_user(
+    async def test_delete_sets_timestamp_and_user(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d = manifest.record_delete("episodic", "k.md", "bob")
+        await manifest.record_create("episodic", "k.md", None, 1, "alice")
+        d = await manifest.record_delete("episodic", "k.md", "bob")
         assert d.deleted_at_ms is not None
         assert d.deleted_by_user_id == "bob"
 
-    def test_delete_already_deleted_is_idempotent(
+    async def test_delete_already_deleted_is_idempotent(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d1 = manifest.record_delete("episodic", "k.md", "bob")
-        d2 = manifest.record_delete("episodic", "k.md", "cleo")
+        await manifest.record_create("episodic", "k.md", None, 1, "alice")
+        d1 = await manifest.record_delete("episodic", "k.md", "bob")
+        d2 = await manifest.record_delete("episodic", "k.md", "cleo")
         # Second call returns existing entry, doesn't update deleter.
         assert d2.deleted_at_ms == d1.deleted_at_ms
         assert d2.deleted_by_user_id == "bob"
 
-    def test_delete_missing_raises(self, manifest: MockMemoryManifestService) -> None:
+    async def test_delete_missing_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
         with pytest.raises(LookupError):
-            manifest.record_delete("episodic", "missing.md", "u")
+            await manifest.record_delete("episodic", "missing.md", "u")
 
 
 class TestListForLayer:
-    def test_excludes_deleted_by_default(
+    async def test_excludes_deleted_by_default(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "live.md", None, 1, "u")
-        manifest.record_create("episodic", "deleted.md", None, 1, "u")
-        manifest.record_delete("episodic", "deleted.md", "u")
-        rows = manifest.list_for_layer("episodic")
+        await manifest.record_create("episodic", "live.md", None, 1, "u")
+        await manifest.record_create("episodic", "deleted.md", None, 1, "u")
+        await manifest.record_delete("episodic", "deleted.md", "u")
+        rows = await manifest.list_for_layer("episodic")
         keys = {r.key for r in rows}
         assert keys == {"live.md"}
 
-    def test_include_deleted_returns_all(
+    async def test_include_deleted_returns_all(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "live.md", None, 1, "u")
-        manifest.record_create("episodic", "deleted.md", None, 1, "u")
-        manifest.record_delete("episodic", "deleted.md", "u")
-        rows = manifest.list_for_layer("episodic", include_deleted=True)
+        await manifest.record_create("episodic", "live.md", None, 1, "u")
+        await manifest.record_create("episodic", "deleted.md", None, 1, "u")
+        await manifest.record_delete("episodic", "deleted.md", "u")
+        rows = await manifest.list_for_layer("episodic", include_deleted=True)
         assert {r.key for r in rows} == {"live.md", "deleted.md"}
 
-    def test_layer_isolation(self, manifest: MockMemoryManifestService) -> None:
-        manifest.record_create("episodic", "a.md", None, 1, "u")
-        manifest.record_create("procedural", "b.md", None, 1, "u")
-        manifest.record_create("semantic", "c/d", None, 1, "u")
-        assert {r.key for r in manifest.list_for_layer("episodic")} == {"a.md"}
-        assert {r.key for r in manifest.list_for_layer("procedural")} == {"b.md"}
-        assert {r.key for r in manifest.list_for_layer("semantic")} == {"c/d"}
+    async def test_layer_isolation(self, manifest: MockMemoryManifestService) -> None:
+        await manifest.record_create("episodic", "a.md", None, 1, "u")
+        await manifest.record_create("procedural", "b.md", None, 1, "u")
+        await manifest.record_create("semantic", "c/d", None, 1, "u")
+        assert {r.key for r in await manifest.list_for_layer("episodic")} == {"a.md"}
+        assert {r.key for r in await manifest.list_for_layer("procedural")} == {"b.md"}
+        assert {r.key for r in await manifest.list_for_layer("semantic")} == {"c/d"}
 
-    def test_ordered_by_modified_at_desc(
+    async def test_ordered_by_modified_at_desc(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "first.md", None, 1, "u")
+        await manifest.record_create("episodic", "first.md", None, 1, "u")
         time.sleep(0.002)
-        manifest.record_create("episodic", "second.md", None, 1, "u")
+        await manifest.record_create("episodic", "second.md", None, 1, "u")
         time.sleep(0.002)
-        manifest.record_update("episodic", "first.md", 2, "u")
-        rows = manifest.list_for_layer("episodic")
+        await manifest.record_update("episodic", "first.md", 2, "u")
+        rows = await manifest.list_for_layer("episodic")
         # `first.md` was modified most recently → ordered first.
         assert [r.key for r in rows] == ["first.md", "second.md"]
 
 
 class TestManifestEntryRoundTrip:
-    def test_to_dict_contains_all_fields(
+    async def test_to_dict_contains_all_fields(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        entry = manifest.record_create("episodic", "k.md", "Title", 100, "user-x")
+        entry = await manifest.record_create("episodic", "k.md", "Title", 100, "user-x")
         d = entry.to_dict()
         for k in (
             "id",
@@ -221,39 +230,39 @@ class TestManifestEntryRoundTrip:
         for v in d.values():
             assert v is None or isinstance(v, (str, int))
 
-    def test_frozen_dataclass(self, manifest: MockMemoryManifestService) -> None:
-        entry = manifest.record_create("episodic", "k.md", None, 1, "u")
+    async def test_frozen_dataclass(self, manifest: MockMemoryManifestService) -> None:
+        entry = await manifest.record_create("episodic", "k.md", None, 1, "u")
         with pytest.raises(Exception):  # FrozenInstanceError
             entry.layer = "procedural"  # type: ignore[misc]
 
-    def test_immutable_via_get(self, manifest: MockMemoryManifestService) -> None:
-        manifest.record_create("episodic", "k.md", "t", 1, "u")
-        e1 = manifest.get("episodic", "k.md")
+    async def test_immutable_via_get(self, manifest: MockMemoryManifestService) -> None:
+        await manifest.record_create("episodic", "k.md", "t", 1, "u")
+        e1 = await manifest.get("episodic", "k.md")
         assert e1 is not None
         # Updating doesn't mutate the previously-returned entry.
-        manifest.record_update("episodic", "k.md", 2, "u")
+        await manifest.record_update("episodic", "k.md", 2, "u")
         assert e1.size_bytes == 1
 
 
 class TestGet:
-    def test_returns_none_for_missing(
+    async def test_returns_none_for_missing(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        assert manifest.get("episodic", "never.md") is None
+        assert await manifest.get("episodic", "never.md") is None
 
-    def test_returns_entry_for_existing(
+    async def test_returns_entry_for_existing(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", "t", 1, "u")
-        e = manifest.get("episodic", "k.md")
+        await manifest.record_create("episodic", "k.md", "t", 1, "u")
+        e = await manifest.get("episodic", "k.md")
         assert e is not None and e.key == "k.md"
 
-    def test_returns_soft_deleted_too(
+    async def test_returns_soft_deleted_too(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        manifest.record_create("episodic", "k.md", None, 1, "u")
-        manifest.record_delete("episodic", "k.md", "u")
-        e = manifest.get("episodic", "k.md")
+        await manifest.record_create("episodic", "k.md", None, 1, "u")
+        await manifest.record_delete("episodic", "k.md", "u")
+        e = await manifest.get("episodic", "k.md")
         assert e is not None
         assert e.deleted_at_ms is not None
 
@@ -304,18 +313,16 @@ class TestManifestEntryFromRow:
 # ── Postgres-backed MemoryManifestService (uses InMemoryPostgresFactory) ─────
 
 
-@pytest.fixture
-def pg_manifest():
-    """Real ``MemoryManifestService`` over an in-memory SQLite-via-SQLAlchemy
-    DB. Schema is created via ``Base.metadata.create_all`` (no Alembic
-    needed for unit tests; the actual production run does run migration
-    009)."""
-    from audittrace.db.models import Base
+@pytest_asyncio.fixture
+async def pg_manifest():
+    """Real ``MemoryManifestService`` over an async in-memory SQLite DB.
+    Schema is created via the factory's async ``create_schema()`` (no Alembic
+    needed for unit tests; the production run does run migration 009)."""
     from audittrace.db.postgres import InMemoryPostgresFactory
     from audittrace.services.memory_manifest import MemoryManifestService
 
     factory = InMemoryPostgresFactory()
-    Base.metadata.create_all(factory.get_engine())
+    await factory.create_schema()
     return MemoryManifestService(session_factory=factory.get_session_factory())
 
 
@@ -323,11 +330,11 @@ class TestPostgresMemoryManifestService:
     """End-to-end tests on the real Postgres-backed implementation. Mirrors
     the Mock test suite so the production code path is exercised."""
 
-    def test_create_then_get(self, pg_manifest) -> None:
-        e = pg_manifest.record_create(
+    async def test_create_then_get(self, pg_manifest) -> None:
+        e = await pg_manifest.record_create(
             "episodic", "ADR-001.md", "Title", 100, "user-alice"
         )
-        got = pg_manifest.get("episodic", "ADR-001.md")
+        got = await pg_manifest.get("episodic", "ADR-001.md")
         assert got is not None
         assert got.id == e.id
         assert got.layer == "episodic"
@@ -336,112 +343,120 @@ class TestPostgresMemoryManifestService:
         assert got.created_by_user_id == "user-alice"
         assert got.deleted_at_ms is None
 
-    def test_get_returns_none_for_missing(self, pg_manifest) -> None:
-        assert pg_manifest.get("episodic", "never.md") is None
+    async def test_get_returns_none_for_missing(self, pg_manifest) -> None:
+        assert await pg_manifest.get("episodic", "never.md") is None
 
-    def test_recreate_revives_soft_deleted(self, pg_manifest) -> None:
-        pg_manifest.record_create("procedural", "SKILL-x.md", None, 1, "alice")
-        pg_manifest.record_delete("procedural", "SKILL-x.md", "alice")
+    async def test_recreate_revives_soft_deleted(self, pg_manifest) -> None:
+        await pg_manifest.record_create("procedural", "SKILL-x.md", None, 1, "alice")
+        await pg_manifest.record_delete("procedural", "SKILL-x.md", "alice")
         # Pre-condition: row is soft-deleted
-        deleted = pg_manifest.get("procedural", "SKILL-x.md")
+        deleted = await pg_manifest.get("procedural", "SKILL-x.md")
         assert deleted is not None and deleted.deleted_at_ms is not None
         # Recreate
-        revived = pg_manifest.record_create("procedural", "SKILL-x.md", "new", 2, "bob")
+        revived = await pg_manifest.record_create(
+            "procedural", "SKILL-x.md", "new", 2, "bob"
+        )
         assert revived.deleted_at_ms is None
         assert revived.deleted_by_user_id is None
         assert revived.title == "new"
         assert revived.modified_by_user_id == "bob"
 
-    def test_recreate_overwrites_live_row(self, pg_manifest) -> None:
-        e1 = pg_manifest.record_create("semantic", "decisions/d-1", "v1", 10, "alice")
-        e2 = pg_manifest.record_create("semantic", "decisions/d-1", "v2", 20, "bob")
+    async def test_recreate_overwrites_live_row(self, pg_manifest) -> None:
+        e1 = await pg_manifest.record_create(
+            "semantic", "decisions/d-1", "v1", 10, "alice"
+        )
+        e2 = await pg_manifest.record_create(
+            "semantic", "decisions/d-1", "v2", 20, "bob"
+        )
         # Same row id (UNIQUE on (layer, key))
         assert e2.id == e1.id
         assert e2.title == "v2"
         assert e2.size_bytes == 20
         assert e2.modified_by_user_id == "bob"
 
-    def test_update_bumps_modified_only(self, pg_manifest) -> None:
-        e1 = pg_manifest.record_create("episodic", "k.md", "v1", 10, "alice")
+    async def test_update_bumps_modified_only(self, pg_manifest) -> None:
+        e1 = await pg_manifest.record_create("episodic", "k.md", "v1", 10, "alice")
         time.sleep(0.002)  # guarantee different ms
-        e2 = pg_manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
+        e2 = await pg_manifest.record_update("episodic", "k.md", 20, "bob", title="v2")
         assert e2.id == e1.id
         assert e2.created_at_ms == e1.created_at_ms
         assert e2.modified_at_ms > e1.modified_at_ms
         assert e2.modified_by_user_id == "bob"
         assert e2.title == "v2"
 
-    def test_update_title_none_preserves_existing(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "k.md", "stays", 1, "alice")
-        e2 = pg_manifest.record_update("episodic", "k.md", 2, "bob", title=None)
+    async def test_update_title_none_preserves_existing(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "k.md", "stays", 1, "alice")
+        e2 = await pg_manifest.record_update("episodic", "k.md", 2, "bob", title=None)
         assert e2.title == "stays"
 
-    def test_update_missing_raises(self, pg_manifest) -> None:
+    async def test_update_missing_raises(self, pg_manifest) -> None:
         with pytest.raises(LookupError):
-            pg_manifest.record_update("episodic", "missing.md", 1, "u")
+            await pg_manifest.record_update("episodic", "missing.md", 1, "u")
 
-    def test_update_soft_deleted_raises(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
-        pg_manifest.record_delete("episodic", "k.md", "alice")
+    async def test_update_soft_deleted_raises(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
+        await pg_manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
-            pg_manifest.record_update("episodic", "k.md", 2, "bob")
+            await pg_manifest.record_update("episodic", "k.md", 2, "bob")
 
-    def test_delete_sets_timestamp(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d = pg_manifest.record_delete("episodic", "k.md", "bob")
+    async def test_delete_sets_timestamp(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
+        d = await pg_manifest.record_delete("episodic", "k.md", "bob")
         assert d.deleted_at_ms is not None
         assert d.deleted_by_user_id == "bob"
 
-    def test_delete_idempotent(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
-        d1 = pg_manifest.record_delete("episodic", "k.md", "bob")
-        d2 = pg_manifest.record_delete("episodic", "k.md", "cleo")
+    async def test_delete_idempotent(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")
+        d1 = await pg_manifest.record_delete("episodic", "k.md", "bob")
+        d2 = await pg_manifest.record_delete("episodic", "k.md", "cleo")
         # Returns existing entry; doesn't update deleter (lossy bob-was-here)
         assert d2.deleted_at_ms == d1.deleted_at_ms
         assert d2.deleted_by_user_id == "bob"
 
-    def test_delete_missing_raises(self, pg_manifest) -> None:
+    async def test_delete_missing_raises(self, pg_manifest) -> None:
         with pytest.raises(LookupError):
-            pg_manifest.record_delete("episodic", "missing.md", "u")
+            await pg_manifest.record_delete("episodic", "missing.md", "u")
 
-    def test_list_excludes_deleted_by_default(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "live.md", None, 1, "u")
-        pg_manifest.record_create("episodic", "deleted.md", None, 1, "u")
-        pg_manifest.record_delete("episodic", "deleted.md", "u")
-        rows = pg_manifest.list_for_layer("episodic")
+    async def test_list_excludes_deleted_by_default(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "live.md", None, 1, "u")
+        await pg_manifest.record_create("episodic", "deleted.md", None, 1, "u")
+        await pg_manifest.record_delete("episodic", "deleted.md", "u")
+        rows = await pg_manifest.list_for_layer("episodic")
         assert {r.key for r in rows} == {"live.md"}
 
-    def test_list_include_deleted(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "live.md", None, 1, "u")
-        pg_manifest.record_create("episodic", "deleted.md", None, 1, "u")
-        pg_manifest.record_delete("episodic", "deleted.md", "u")
-        rows = pg_manifest.list_for_layer("episodic", include_deleted=True)
+    async def test_list_include_deleted(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "live.md", None, 1, "u")
+        await pg_manifest.record_create("episodic", "deleted.md", None, 1, "u")
+        await pg_manifest.record_delete("episodic", "deleted.md", "u")
+        rows = await pg_manifest.list_for_layer("episodic", include_deleted=True)
         assert {r.key for r in rows} == {"live.md", "deleted.md"}
 
-    def test_list_layer_isolation(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "a.md", None, 1, "u")
-        pg_manifest.record_create("procedural", "b.md", None, 1, "u")
-        pg_manifest.record_create("semantic", "c/d", None, 1, "u")
-        assert {r.key for r in pg_manifest.list_for_layer("episodic")} == {"a.md"}
-        assert {r.key for r in pg_manifest.list_for_layer("procedural")} == {"b.md"}
-        assert {r.key for r in pg_manifest.list_for_layer("semantic")} == {"c/d"}
+    async def test_list_layer_isolation(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "a.md", None, 1, "u")
+        await pg_manifest.record_create("procedural", "b.md", None, 1, "u")
+        await pg_manifest.record_create("semantic", "c/d", None, 1, "u")
+        assert {r.key for r in await pg_manifest.list_for_layer("episodic")} == {"a.md"}
+        assert {r.key for r in await pg_manifest.list_for_layer("procedural")} == {
+            "b.md"
+        }
+        assert {r.key for r in await pg_manifest.list_for_layer("semantic")} == {"c/d"}
 
-    def test_list_ordered_by_modified_desc(self, pg_manifest) -> None:
-        pg_manifest.record_create("episodic", "first.md", None, 1, "u")
+    async def test_list_ordered_by_modified_desc(self, pg_manifest) -> None:
+        await pg_manifest.record_create("episodic", "first.md", None, 1, "u")
         time.sleep(0.002)
-        pg_manifest.record_create("episodic", "second.md", None, 1, "u")
+        await pg_manifest.record_create("episodic", "second.md", None, 1, "u")
         time.sleep(0.002)
-        pg_manifest.record_update("episodic", "first.md", 2, "u")
-        rows = pg_manifest.list_for_layer("episodic")
+        await pg_manifest.record_update("episodic", "first.md", 2, "u")
+        rows = await pg_manifest.list_for_layer("episodic")
         assert [r.key for r in rows] == ["first.md", "second.md"]
 
-    def test_invalid_layer_raises(self, pg_manifest) -> None:
+    async def test_invalid_layer_raises(self, pg_manifest) -> None:
         with pytest.raises(ValueError):
-            pg_manifest.record_create("conversational", "x.md", None, 0, "u")
+            await pg_manifest.record_create("conversational", "x.md", None, 0, "u")
         with pytest.raises(ValueError):
-            pg_manifest.list_for_layer("not-a-layer")
+            await pg_manifest.list_for_layer("not-a-layer")
         with pytest.raises(ValueError):
-            pg_manifest.get("not-a-layer", "k")
+            await pg_manifest.get("not-a-layer", "k")
 
 
 # ── Telemetry-coverage regression test ──────────────────────────────────────
@@ -528,10 +543,10 @@ class TestMockUpsertPdfMetadata:
     creates rows when none exist + updates fields when one does, on
     both code paths."""
 
-    def test_first_call_creates_row_with_pdf_columns(
+    async def test_first_call_creates_row_with_pdf_columns(
         self, manifest: MockMemoryManifestService
     ) -> None:
-        entry = manifest.upsert_pdf_metadata(
+        entry = await manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="user-1",
@@ -559,11 +574,11 @@ class TestMockUpsertPdfMetadata:
         assert len(entry.extraction_warnings) == 2
         assert entry.extraction_warnings[0]["code"] == "no_text_layer"
 
-    def test_subsequent_call_updates_fields_keeps_authorship(
+    async def test_subsequent_call_updates_fields_keeps_authorship(
         self, manifest: MockMemoryManifestService
     ) -> None:
         # First call as user-1
-        manifest.upsert_pdf_metadata(
+        await manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="user-1",
@@ -577,7 +592,7 @@ class TestMockUpsertPdfMetadata:
             document_sha256="b" * 64,
         )
         # Second call as user-2 — bumps modified_*, keeps created_*.
-        e2 = manifest.upsert_pdf_metadata(
+        e2 = await manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="user-2",
@@ -597,9 +612,11 @@ class TestMockUpsertPdfMetadata:
         assert e2.form_field_count == 3
         assert e2.size_bytes == 200
 
-    def test_rejects_invalid_layer(self, manifest: MockMemoryManifestService) -> None:
+    async def test_rejects_invalid_layer(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
         with pytest.raises(ValueError):
-            manifest.upsert_pdf_metadata(
+            await manifest.upsert_pdf_metadata(
                 "bogus-layer",
                 "x.pdf",
                 user_id="u",
@@ -613,7 +630,7 @@ class TestMockUpsertPdfMetadata:
                 document_sha256=None,
             )
 
-    def test_warnings_round_trip_through_to_dict(
+    async def test_warnings_round_trip_through_to_dict(
         self, manifest: MockMemoryManifestService
     ) -> None:
         warnings = [
@@ -627,7 +644,7 @@ class TestMockUpsertPdfMetadata:
                 "minio_key": "episodic/main.pdf/attachments/invoice.xml",
             },
         ]
-        entry = manifest.upsert_pdf_metadata(
+        entry = await manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="u",
@@ -650,8 +667,8 @@ class TestPostgresUpsertPdfMetadata:
     """End-to-end tier-B #22 against the real Postgres-backed service.
     Mirrors the Mock suite so the production code path is exercised."""
 
-    def test_create_writes_pdf_columns(self, pg_manifest) -> None:
-        entry = pg_manifest.upsert_pdf_metadata(
+    async def test_create_writes_pdf_columns(self, pg_manifest) -> None:
+        entry = await pg_manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="alice",
@@ -668,14 +685,14 @@ class TestPostgresUpsertPdfMetadata:
         )
         assert entry.page_count == 46
         # Round-trip: fetch via get() and verify the same shape.
-        got = pg_manifest.get("episodic", "main.pdf")
+        got = await pg_manifest.get("episodic", "main.pdf")
         assert got is not None
         assert got.signature_status == "signed_invalid"
         assert got.attachment_count == 2
         assert got.extraction_warnings == [{"code": "no_text_layer", "page": 5}]
 
-    def test_update_preserves_created_by(self, pg_manifest) -> None:
-        pg_manifest.upsert_pdf_metadata(
+    async def test_update_preserves_created_by(self, pg_manifest) -> None:
+        await pg_manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="alice",
@@ -688,7 +705,7 @@ class TestPostgresUpsertPdfMetadata:
             extraction_warnings=[],
             document_sha256="b" * 64,
         )
-        e2 = pg_manifest.upsert_pdf_metadata(
+        e2 = await pg_manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="bob",
@@ -705,13 +722,15 @@ class TestPostgresUpsertPdfMetadata:
         assert e2.modified_by_user_id == "bob"
         assert e2.page_count == 20
 
-    def test_update_after_crud_create_carries_over(self, pg_manifest) -> None:
+    async def test_update_after_crud_create_carries_over(self, pg_manifest) -> None:
         """Common flow: operator first POSTs to /memory/episodic
         (record_create), THEN runs /memory/index which writes PDF
         metadata. The second call must update — not duplicate — the
         same row."""
-        pg_manifest.record_create("episodic", "main.pdf", "Main paper", 100, "alice")
-        e = pg_manifest.upsert_pdf_metadata(
+        await pg_manifest.record_create(
+            "episodic", "main.pdf", "Main paper", 100, "alice"
+        )
+        e = await pg_manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
             user_id="indexer",

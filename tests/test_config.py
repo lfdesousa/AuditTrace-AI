@@ -57,7 +57,7 @@ def test_settings_chroma_token_defaults_none():
 
 
 def test_database_url_property():
-    """Test PostgreSQL URL construction with psycopg2 driver."""
+    """database_url uses the async asyncpg driver (the runtime engine)."""
     settings = Settings(
         postgres_user="audittrace",
         postgres_password="secret",
@@ -67,14 +67,33 @@ def test_database_url_property():
     )
 
     url = settings.database_url
-    assert url == "postgresql+psycopg2://audittrace:secret@postgres:5432/audittrace"
+    assert url == "postgresql+asyncpg://audittrace:secret@postgres:5432/audittrace"
+
+
+def test_database_url_sync_property():
+    """database_url_sync exposes the psycopg2 URL for Alembic + the RLS oracle."""
+    settings = Settings(
+        postgres_user="audittrace",
+        postgres_password="secret",
+        postgres_host="postgres",
+        postgres_port=5432,
+        postgres_db="audittrace",
+    )
+
+    assert (
+        settings.database_url_sync
+        == "postgresql+psycopg2://audittrace:secret@postgres:5432/audittrace"
+    )
 
 
 def test_database_url_from_full_url():
-    """Test using full postgres_url when provided."""
+    """A psycopg2 postgres_url is normalised to the async driver for database_url."""
     custom_url = "postgresql+psycopg2://custom:pass@host:5432/custom_db"
     settings = Settings(postgres_url=custom_url)
-    assert settings.database_url == custom_url
+    assert (
+        settings.database_url == "postgresql+asyncpg://custom:pass@host:5432/custom_db"
+    )
+    assert settings.database_url_sync == custom_url
 
 
 def test_database_url_none():

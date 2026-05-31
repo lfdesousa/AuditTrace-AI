@@ -6,6 +6,7 @@ layer methods with Phase-2 signatures (``user_context, query, ...``).
 """
 
 import pytest
+import pytest_asyncio
 
 from audittrace.services.context_builder import (
     PROFILE_SECTION_HEADER,
@@ -21,8 +22,8 @@ from audittrace.services.semantic import MockSemanticService
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def populated_builder(user_context):
+@pytest_asyncio.fixture
+async def populated_builder(user_context):
     """ContextBuilder with all 4 mock layers populated."""
     episodic = MockEpisodicService()
     episodic.add_document(
@@ -41,14 +42,14 @@ def populated_builder(user_context):
     )
 
     conversational = MockConversationalService()
-    conversational.save_session(
+    await conversational.save_session(
         user_context,
         "AuditTrace",
         "KV cache compression enabled",
         ["ADR-009"],
         session_id="cb-kv-1",
     )
-    conversational.save_session(
+    await conversational.save_session(
         user_context,
         "AuditTrace",
         "Phase 0 complete",
@@ -57,10 +58,10 @@ def populated_builder(user_context):
     )
 
     semantic = MockSemanticService()
-    semantic.add_document(
+    await semantic.add_document(
         "RAG doc about cache optimisation", source="ADR-009", collection="decisions"
     )
-    semantic.add_document(
+    await semantic.add_document(
         "RAG doc about OAuth2 flows", source="SKILL-IAM", collection="skills"
     )
 
@@ -87,8 +88,8 @@ def empty_builder():
 
 
 class TestDefaultContextBuilder:
-    def test_no_query_returns_profile_only(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_no_query_returns_profile_only(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project="AuditTrace", query=None
         )
         assert PROFILE_SECTION_HEADER in ctx
@@ -96,8 +97,8 @@ class TestDefaultContextBuilder:
         assert "Relevant Skills" not in ctx
         assert "Recent Sessions" not in ctx
 
-    def test_query_fires_all_four_layers(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_query_fires_all_four_layers(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project="AuditTrace", query="cache compression OAuth2"
         )
         # Layer 1: Episodic
@@ -114,15 +115,15 @@ class TestDefaultContextBuilder:
         # Layer 4: Semantic
         assert "Relevant Context" in ctx
 
-    def test_profile_always_present(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_profile_always_present(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project="AuditTrace", query="anything"
         )
         assert "Solutions Architect" in ctx
         assert "AuditTrace" in ctx
 
-    def test_query_with_no_matches(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_query_with_no_matches(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project="AuditTrace", query="quantum entanglement"
         )
         assert PROFILE_SECTION_HEADER in ctx
@@ -131,15 +132,15 @@ class TestDefaultContextBuilder:
         # Conversational always returns for the project
         assert "Recent Sessions" in ctx
 
-    def test_empty_layers_still_work(self, empty_builder, user_context):
-        ctx = empty_builder.build_system_context(
+    async def test_empty_layers_still_work(self, empty_builder, user_context):
+        ctx = await empty_builder.build_system_context(
             user_context, project="P", query="cache"
         )
         assert PROFILE_SECTION_HEADER in ctx
         assert "Architecture Decisions" not in ctx
         assert "Recent Sessions" not in ctx
 
-    def test_no_arbitrary_caps(self, user_context):
+    async def test_no_arbitrary_caps(self, user_context):
         """No caps — all matching results returned."""
         episodic = MockEpisodicService()
         for i in range(10):
@@ -154,14 +155,14 @@ class TestDefaultContextBuilder:
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
         )
-        ctx = builder.build_system_context(
+        ctx = await builder.build_system_context(
             user_context, project="P", query="server configuration"
         )
         adr_count = ctx.count("### ADR-")
         assert adr_count == 10
 
-    def test_layer_stats_returned(self, populated_builder, user_context):
-        ctx, stats = populated_builder.build_system_context_with_stats(
+    async def test_layer_stats_returned(self, populated_builder, user_context):
+        ctx, stats = await populated_builder.build_system_context_with_stats(
             user_context, project="AuditTrace", query="cache compression"
         )
         assert "episodic" in stats
@@ -170,17 +171,17 @@ class TestDefaultContextBuilder:
         assert "semantic" in stats
         assert isinstance(stats["episodic"], int)
 
-    def test_context_sections_separated(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_context_sections_separated(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project="AuditTrace", query="cache"
         )
         assert "---" in ctx
 
-    def test_exception_in_one_layer_doesnt_break_others(self, user_context):
+    async def test_exception_in_one_layer_doesnt_break_others(self, user_context):
         """If one layer throws, the others should still contribute."""
 
         class BrokenEpisodicService(MockEpisodicService):
-            def search(self, user_context, query):
+            async def search(self, user_context, query):
                 raise RuntimeError("Episodic layer broken")
 
         builder = DefaultContextBuilder(
@@ -190,16 +191,18 @@ class TestDefaultContextBuilder:
             semantic=MockSemanticService(),
         )
         # Should not raise
-        ctx = builder.build_system_context(user_context, project="P", query="cache")
+        ctx = await builder.build_system_context(
+            user_context, project="P", query="cache"
+        )
         assert PROFILE_SECTION_HEADER in ctx
 
-    def test_project_none_still_works(self, populated_builder, user_context):
-        ctx = populated_builder.build_system_context(
+    async def test_project_none_still_works(self, populated_builder, user_context):
+        ctx = await populated_builder.build_system_context(
             user_context, project=None, query="cache"
         )
         assert PROFILE_SECTION_HEADER in ctx
 
-    def test_procedural_layer_exception_is_swallowed(self, user_context):
+    async def test_procedural_layer_exception_is_swallowed(self, user_context):
         """Procedural layer exception must be swallowed; layer_stats=0.
 
         The contract is: one broken layer cannot break the whole context build.
@@ -208,7 +211,7 @@ class TestDefaultContextBuilder:
         """
 
         class BrokenProcedural(MockProceduralService):
-            def search(self, user_context, query):
+            async def search(self, user_context, query):
                 raise RuntimeError("Procedural broken")
 
         builder = DefaultContextBuilder(
@@ -217,17 +220,17 @@ class TestDefaultContextBuilder:
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
         )
-        ctx, stats = builder.build_system_context_with_stats(
+        ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
         )
         assert stats["procedural"] == 0
         assert PROFILE_SECTION_HEADER in ctx  # always-on layer survived broken sibling
 
-    def test_conversational_layer_exception_is_swallowed(self, user_context):
+    async def test_conversational_layer_exception_is_swallowed(self, user_context):
         """Conversational layer exception must be swallowed; layer_stats=0."""
 
         class BrokenConversational(MockConversationalService):
-            def as_context(self, user_context, project):
+            async def as_context(self, user_context, project):
                 raise RuntimeError("Conversational broken")
 
         builder = DefaultContextBuilder(
@@ -236,17 +239,17 @@ class TestDefaultContextBuilder:
             conversational=BrokenConversational(),
             semantic=MockSemanticService(),
         )
-        ctx, stats = builder.build_system_context_with_stats(
+        ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
         )
         assert stats["conversational"] == 0
         assert PROFILE_SECTION_HEADER in ctx
 
-    def test_semantic_layer_exception_is_swallowed(self, user_context):
+    async def test_semantic_layer_exception_is_swallowed(self, user_context):
         """Semantic layer exception must be swallowed; layer_stats=0."""
 
         class BrokenSemantic(MockSemanticService):
-            def search(self, user_context, query, k=4, collections=None):
+            async def search(self, user_context, query, k=4, collections=None):
                 raise RuntimeError("Semantic broken")
 
         builder = DefaultContextBuilder(
@@ -255,16 +258,16 @@ class TestDefaultContextBuilder:
             conversational=MockConversationalService(),
             semantic=BrokenSemantic(),
         )
-        ctx, stats = builder.build_system_context_with_stats(
+        ctx, stats = await builder.build_system_context_with_stats(
             user_context, project="P", query="cache"
         )
         assert stats["semantic"] == 0
         assert PROFILE_SECTION_HEADER in ctx
 
-    def test_semantic_layer_strips_path_prefix_from_source(self, user_context):
+    async def test_semantic_layer_strips_path_prefix_from_source(self, user_context):
         """Sources containing '/' must be displayed as basename only (line 132-133)."""
         semantic = MockSemanticService()
-        semantic.add_document(
+        await semantic.add_document(
             "RAG body about cache compression and KV optimisation",
             source="/abs/path/to/ADR-009.md",
             collection="decisions",
@@ -275,7 +278,9 @@ class TestDefaultContextBuilder:
             conversational=MockConversationalService(),
             semantic=semantic,
         )
-        ctx = builder.build_system_context(user_context, project="P", query="cache")
+        ctx = await builder.build_system_context(
+            user_context, project="P", query="cache"
+        )
         # The basename should appear, the full path should not
         assert "ADR-009.md" in ctx
         assert "/abs/path/to/" not in ctx
@@ -285,14 +290,16 @@ class TestDefaultContextBuilder:
 
 
 class TestMockContextBuilder:
-    def test_mock_returns_static_context(self, user_context):
+    async def test_mock_returns_static_context(self, user_context):
         mock = MockContextBuilder(static_context="Mock memory context")
-        ctx = mock.build_system_context(user_context, project="P", query="anything")
+        ctx = await mock.build_system_context(
+            user_context, project="P", query="anything"
+        )
         assert ctx == "Mock memory context"
 
-    def test_mock_returns_empty_stats(self, user_context):
+    async def test_mock_returns_empty_stats(self, user_context):
         mock = MockContextBuilder()
-        _, stats = mock.build_system_context_with_stats(
+        _, stats = await mock.build_system_context_with_stats(
             user_context, project="P", query="q"
         )
         assert stats == {}
@@ -440,7 +447,7 @@ class TestNamingConventionInjection:
     Pinned in tests so a future edit to context_builder doesn't silently
     drop it."""
 
-    def test_inject_mode_includes_naming_note(self, user_context):
+    async def test_inject_mode_includes_naming_note(self, user_context):
         """build_system_context_with_stats (inject mode) carries the
         naming note even when no query is provided — so a /context
         request without a query still warns the LLM about old names."""
@@ -450,7 +457,7 @@ class TestNamingConventionInjection:
             conversational=MockConversationalService(),
             semantic=MockSemanticService(),
         )
-        ctx, _ = empty.build_system_context_with_stats(
+        ctx, _ = await empty.build_system_context_with_stats(
             user_context, project="P", query=None
         )
         assert "SOVEREIGN_*" in ctx and "AUDITTRACE_*" in ctx
