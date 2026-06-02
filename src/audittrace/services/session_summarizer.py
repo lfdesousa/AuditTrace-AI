@@ -20,13 +20,13 @@ Two transaction boundaries per eligible session:
    ``MAX(timestamp)`` joined against ``sessions.summarized_at`` for
    staleness.
 2. **Summary write** — a fresh transaction per session, scoped to
-   that session's ``user_id`` via ``SET LOCAL app.current_user_id``
-   so the RLS ``WITH CHECK`` on ``sessions`` accepts the INSERT /
-   UPDATE. No cross-user leakage is possible: each row is written
-   under its own user's GUC.
+   that session's ``user_id`` via ``set_config('app.current_user_id',
+   ..., true)`` so the RLS ``WITH CHECK`` on ``sessions`` accepts the
+   INSERT / UPDATE. No cross-user leakage is possible: each row is
+   written under its own user's GUC.
 
-On SQLite (tests), both ``SET LOCAL`` calls are no-ops because SQLite
-has no GUCs and no RLS.
+On SQLite (tests), the ``row_security`` / ``set_config`` calls are
+no-ops because SQLite has no GUCs and no RLS.
 """
 
 from __future__ import annotations
@@ -467,8 +467,8 @@ class SessionSummarizer:
         """Upsert SessionRecord under the session's user's GUC."""
         async with self._session_factory() as db:
             try:
-                # SET LOCAL app.current_user_id so the RLS WITH CHECK on
-                # sessions accepts the write.
+                # set_config('app.current_user_id', ...) so the RLS WITH
+                # CHECK on sessions accepts the write.
                 await self._set_user_id_if_postgres(db, es.user_id)
                 now = datetime.now()
                 summary = str(parsed.get("summary") or "")[:400]
@@ -562,19 +562,24 @@ class SessionSummarizer:
         See `_find_eligible` / `_fetch_turns` — we need to read rows
         across every user. SQLite has no RLS so this is a no-op.
         """
-        if (
-            db.bind is not None and db.bind.dialect.name == "postgresql"
-        ):  # pragma: no cover - postgres-only, smoke-tested live
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
             await db.execute(text("SET LOCAL row_security = off"))
 
     @staticmethod
     async def _set_user_id_if_postgres(db: AsyncSession, user_id: str) -> None:
-        """Scope the write txn to the session's user for RLS WITH CHECK."""
-        if (
-            db.bind is not None and db.bind.dialect.name == "postgresql"
-        ):  # pragma: no cover - postgres-only, smoke-tested live
+        """Scope the write txn to the session's user for RLS WITH CHECK.
+
+        Emits ``set_config('app.current_user_id', :uid, true)`` rather than
+        ``SET LOCAL app.current_user_id = :uid``: Postgres ``SET`` is a
+        utility command that cannot take a bind parameter, so the latter
+        compiles to ``SET LOCAL app.current_user_id = $1`` and raises
+        ``syntax error at or near "$1"``. ``set_config(..., true)`` is the
+        parameterizable, transaction-LOCAL equivalent — same idiom as
+        ``audittrace.db.rls.set_rls_user_id`` / ``_apply_rls_guc``.
+        """
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
             await db.execute(
-                text("SET LOCAL app.current_user_id = :uid"),
+                text("SELECT set_config('app.current_user_id', :uid, true)"),
                 {"uid": user_id},
             )
 

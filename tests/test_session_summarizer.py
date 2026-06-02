@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -842,3 +843,56 @@ class TestCtxOverflowGuard:
             assert row.summary == "happy-path-summary"
             assert "[truncated:" not in row.summary  # no spurious annotation
             assert row.model == "mistral-7b-summarizer"
+
+
+class TestPostgresGUCStatements:
+    """Postgres-only SQL the SQLite test factory never exercises.
+
+    The write-path GUC was once emitted as ``SET LOCAL
+    app.current_user_id = :uid``. Postgres ``SET`` is a utility command
+    that cannot bind a parameter, so it compiled to ``SET LOCAL
+    app.current_user_id = $1`` and raised ``syntax error at or near
+    "$1"`` on every cycle — invisible to the SQLite suite (the branch is
+    ``# pragma: no cover``). These tests fake a ``postgresql`` dialect and
+    assert the *parameterizable* ``set_config(...)`` form is emitted, so
+    the regression cannot recur silently.
+    """
+
+    @staticmethod
+    def _fake_pg_db() -> MagicMock:
+        db = MagicMock()
+        db.bind.dialect.name = "postgresql"
+        db.execute = AsyncMock()
+        return db
+
+    @pytest.mark.asyncio
+    async def test_set_user_id_uses_set_config_not_set_local(self):
+        db = self._fake_pg_db()
+        await SessionSummarizer._set_user_id_if_postgres(db, "user-x")
+
+        db.execute.assert_awaited_once()
+        stmt, params = db.execute.await_args.args
+        sql = str(stmt)
+        # The parameterizable, transaction-LOCAL form.
+        assert "set_config('app.current_user_id'" in sql
+        assert ", true)" in sql
+        # The broken un-parameterizable form must NOT come back.
+        assert "SET LOCAL app.current_user_id =" not in sql
+        # The user id flows through a real bind parameter.
+        assert params == {"uid": "user-x"}
+
+    @pytest.mark.asyncio
+    async def test_set_user_id_noop_on_sqlite(self):
+        db = MagicMock()
+        db.bind.dialect.name = "sqlite"
+        db.execute = AsyncMock()
+        await SessionSummarizer._set_user_id_if_postgres(db, "user-x")
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disable_rls_emits_row_security_off_on_postgres(self):
+        db = self._fake_pg_db()
+        await SessionSummarizer._disable_rls_if_postgres(db)
+        db.execute.assert_awaited_once()
+        (stmt,) = db.execute.await_args.args
+        assert "row_security = off" in str(stmt)
