@@ -331,10 +331,32 @@ async def read_decision(
     if not isinstance(file, str) or not file.strip():
         return {"error": "read_decision: 'file' is required and must be a string"}
 
+    # Self-correcting guard: read_decision serves ADRs (episodic memory). A
+    # SKILL filename here is a wrong-tool category error — return an actionable
+    # redirect instead of a bare not_found, which the model otherwise answers
+    # by guessing another tool/filename and re-prefilling a huge context.
+    if file.strip().upper().startswith("SKILL-"):
+        return {
+            "error": "wrong_tool",
+            "file": file,
+            "detail": (
+                f"'{file}' is a SKILL document (procedural memory), not an ADR. "
+                "Use read_skill for SKILL-*.md; read_decision only serves ADRs."
+            ),
+        }
+
     episodic = get_episodic_service()
     doc = await episodic.read(user_context, file)
     if doc is None:
-        return {"error": "not_found", "file": file}
+        return {
+            "error": "not_found",
+            "file": file,
+            "detail": (
+                f"No ADR matching '{file}' is in episodic memory. Do not retry "
+                "with filename variations — use recall_decisions to discover "
+                "ADRs by topic, or read the file from the workspace directly."
+            ),
+        }
     return {
         "title": doc.metadata.get("title", file),
         "file": doc.metadata.get("file", file),
@@ -375,10 +397,33 @@ async def read_skill(user_context: UserContext, args: dict[str, Any]) -> dict[st
     if not isinstance(file, str) or not file.strip():
         return {"error": "read_skill: 'file' is required and must be a string"}
 
+    # Self-correcting guard: read_skill serves SKILLs (procedural memory). An
+    # ADR filename here is a wrong-tool category error (an ADR is a decision,
+    # not a skill) — redirect to read_decision rather than emit a bare
+    # not_found that invites another expensive guess-and-retry round-trip.
+    if file.strip().upper().startswith("ADR-"):
+        return {
+            "error": "wrong_tool",
+            "file": file,
+            "detail": (
+                f"'{file}' is an Architecture Decision Record (a decision), not a "
+                "skill. Use read_decision for ADRs; read_skill only serves "
+                "SKILL-*.md documents."
+            ),
+        }
+
     procedural = get_procedural_service()
     doc = await procedural.read(user_context, file)
     if doc is None:
-        return {"error": "not_found", "file": file}
+        return {
+            "error": "not_found",
+            "file": file,
+            "detail": (
+                f"No skill matching '{file}' is in procedural memory. Do not "
+                "retry with filename variations — use recall_skills to discover "
+                "skills by topic."
+            ),
+        }
     return {
         "title": doc.metadata.get("skill", file),
         "file": doc.metadata.get("file", file),
