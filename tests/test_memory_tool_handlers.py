@@ -458,6 +458,25 @@ class TestReadDecisionTool:
         )
         assert result["error"] == "not_found"
         assert result["file"] == "ADR-999-nope.md"
+        # Fix B: not_found carries an actionable hint so the model stops
+        # guessing filename variations and pivots to recall_decisions.
+        assert "recall_decisions" in result["detail"]
+        assert "Do not retry" in result["detail"]
+
+    @pytest.mark.asyncio
+    async def test_read_decision_skill_filename_is_wrong_tool(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Fix B: a SKILL-* filename to read_decision is a category error —
+        redirect to read_skill rather than emit a bare not_found."""
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_decision")
+        result, _ = await invoke_tool(
+            user, tool, {"file": "SKILL-IAM.md"}, session_id="sess-1"
+        )
+        assert result["error"] == "wrong_tool"
+        assert result["file"] == "SKILL-IAM.md"
+        assert "read_skill" in result["detail"]
 
     @pytest.mark.asyncio
     async def test_read_decision_path_traversal_blocked(
@@ -514,6 +533,25 @@ class TestReadSkillTool:
             user, tool, {"file": "SKILL-NOPE.md"}, session_id="sess-1"
         )
         assert result["error"] == "not_found"
+        # Fix B: actionable hint pointing at recall_skills.
+        assert "recall_skills" in result["detail"]
+        assert "Do not" in result["detail"]
+
+    @pytest.mark.asyncio
+    async def test_read_skill_adr_filename_is_wrong_tool(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Fix B: an ADR-* filename to read_skill is the exact category error
+        seen in the OpenCode trace (an ADR is a decision, not a skill) —
+        redirect to read_decision."""
+        user = sentinel_user_context()
+        tool = get_tool_by_name("read_skill")
+        result, _ = await invoke_tool(
+            user, tool, {"file": "ADR-026-multi-user-identity.md"}, session_id="sess-1"
+        )
+        assert result["error"] == "wrong_tool"
+        assert result["file"] == "ADR-026-multi-user-identity.md"
+        assert "read_decision" in result["detail"]
 
     @pytest.mark.asyncio
     async def test_read_skill_missing_file_arg_returns_error(
