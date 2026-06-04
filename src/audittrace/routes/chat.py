@@ -1160,7 +1160,14 @@ async def _handle_tools_mode(
             user_id=user.user_id,
             status="failed",
             failure_class=FAILURE_UPSTREAM_ERROR,
-            error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+            # Record the upstream response BODY, not str(exc) — httpx's
+            # HTTPStatusError message omits the body, which is where
+            # llama-server's real reason lives (e.g. "context size
+            # exceeded", KV-cache-full). Fall back to str(exc) if empty.
+            error_detail=(
+                f"status={exc.response.status_code}: "
+                f"{exc.response.text[:400] or str(exc)[:400]}"
+            ),
             duration_ms=int((time.perf_counter() - perf_start) * 1000),
         )
         raise HTTPException(
