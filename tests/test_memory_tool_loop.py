@@ -35,6 +35,7 @@ import audittrace.tools.memory_handlers  # noqa: F401
 from audittrace import dependencies
 from audittrace.dependencies import create_test_container
 from audittrace.identity import sentinel_user_context
+from audittrace.routes import _memory_tool_loop as _loop_mod
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     run_memory_tool_loop,
@@ -943,6 +944,7 @@ class _SeqStatusClient(_FakeAsyncClient):
         self._i = 0
 
     async def post(self, url, json=None, **kwargs):
+        import json as _json  # local: the `json` param shadows the module
         from unittest.mock import MagicMock
 
         self.last_post_url = url
@@ -953,6 +955,7 @@ class _SeqStatusClient(_FakeAsyncClient):
         resp = MagicMock()
         resp.status_code = status
         resp.json.return_value = body
+        resp.text = _json.dumps(body)
 
         def _raise() -> None:
             if status >= 400:
@@ -1124,7 +1127,11 @@ class TestToolParseErrorRetry:
     ):
         """A 500 whose body is NOT a tool-parse error must NOT be retried —
         the upstream is reporting a different failure class (out of memory,
-        crash, etc.) and retrying could amplify the problem."""
+        crash, etc.) and retrying could amplify the problem. The upstream
+        body MUST be logged before raising so the reason is visible without
+        spelunking the llama-server journal."""
+        from unittest.mock import patch
+
         user = sentinel_user_context()
         fake = _SeqStatusClient(
             [
@@ -1134,7 +1141,11 @@ class TestToolParseErrorRetry:
                 ),
             ]
         )
-        with _patch_async_client(fake), pytest.raises(httpx.HTTPStatusError):
+        with (
+            patch.object(_loop_mod.logger, "warning") as mock_warn,
+            _patch_async_client(fake),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
             await run_memory_tool_loop(
                 llama_url="http://llama/chat/completions",
                 payload={
@@ -1147,25 +1158,36 @@ class TestToolParseErrorRetry:
                 max_iterations=5,
             )
         assert len(fake.post_calls) == 1  # no retry on non-parse 500
+        # The upstream reason is surfaced in the logs (HTTP 500 + body).
+        assert any(
+            "upstream error HTTP" in str(c) and "out of memory" in str(c)
+            for c in mock_warn.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_4xx_passes_through_unchanged(
         self, _populated_container, _fakeredis_cache
     ):
-        """A 4xx response (e.g., bad request) goes back unmodified — NOT a
-        server failure, so the loop returns it as if it were the final body
-        for the caller to inspect."""
+        """A 4xx response (e.g., context-size-exceeded) goes back unmodified —
+        NOT a server failure, so the loop returns it as if it were the final
+        body for the caller to inspect. The upstream reason MUST still be
+        logged (the common case is OpenCode overrunning --ctx-size)."""
         # Note: 4xx with no `choices` field will be returned as-is per the
         # existing exit condition (no tool_calls in body → final answer).
+        from unittest.mock import patch
+
         user = sentinel_user_context()
         fake = _SeqStatusClient(
             [
-                (400, {"error": {"message": "bad request payload"}}),
+                (400, {"error": {"message": "the request exceeds the context size"}}),
             ]
         )
         # Should NOT raise — 4xx is a client/upstream concern, not the
         # transient model flake we retry on.
-        with _patch_async_client(fake):
+        with (
+            patch.object(_loop_mod.logger, "warning") as mock_warn,
+            _patch_async_client(fake),
+        ):
             final_body, _ = await run_memory_tool_loop(
                 llama_url="http://llama/chat/completions",
                 payload={
@@ -1177,8 +1199,15 @@ class TestToolParseErrorRetry:
                 session_id="sess-retry-4",
                 max_iterations=5,
             )
-        assert final_body == {"error": {"message": "bad request payload"}}
+        assert final_body == {
+            "error": {"message": "the request exceeds the context size"}
+        }
         assert len(fake.post_calls) == 1
+        # The 4xx reason is surfaced in the logs (HTTP 400 + body).
+        assert any(
+            "client error HTTP" in str(c) and "context size" in str(c)
+            for c in mock_warn.call_args_list
+        )
 
 
 # ───────────────── Phase A.2 — pre-emptive tool_call sanitisation ────────────

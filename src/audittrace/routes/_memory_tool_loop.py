@@ -338,6 +338,16 @@ async def _post_with_tool_parse_retry(
     """
     response = await client.post(url, json=payload)
     if response.status_code < 500:
+        # 4xx is returned (not raised) so the caller can surface a body-shaped
+        # error — but log the upstream reason here, else it's invisible. The
+        # common case is llama-server's 400 "context size exceeded" when an
+        # OpenCode prompt overruns --ctx-size.
+        if response.status_code >= 400:
+            logger.warning(
+                "llama-server client error HTTP %d — upstream body: %s",
+                response.status_code,
+                response.text[:500],
+            )
         return response
 
     if _is_tool_parse_error_500(response):
@@ -377,7 +387,14 @@ async def _post_with_tool_parse_retry(
 
     # Persistent failure even after fallback — genuinely broken upstream.
     # Surface as HTTPStatusError so chat.py's caller produces a clean
-    # 502 + failed audit row.
+    # 502 + failed audit row. Log the upstream body first so the reason
+    # (OOM, KV-cache-full, segfault) is visible without spelunking the
+    # llama-server journal.
+    logger.warning(
+        "llama-server upstream error HTTP %d — body: %s",
+        response.status_code,
+        response.text[:500],
+    )
     response.raise_for_status()
     return response  # unreachable, raise_for_status raised
 
