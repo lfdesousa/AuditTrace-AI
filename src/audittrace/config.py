@@ -244,8 +244,14 @@ class Settings(BaseSettings):
     # transcript would exceed this minus headroom, the summariser truncates
     # oldest turns until it fits, rather than letting llama-server reject the
     # request with HTTP 400 and re-trying every 5 min indefinitely (the
-    # 2026-04-22 incident, see project_summarizer_400.md). Match the value
-    # baked into scripts/start-summarizer-llama.sh; 32768 since 2026-04-24.
+    # 2026-04-22 incident, see project_summarizer_400.md).
+    #
+    # FALLBACK ONLY since 2026-06-09: the worker now auto-detects the real
+    # ``n_ctx`` from the server's ``/props`` at startup and prefers it over
+    # this value (see SessionSummarizer._resolve_ctx_tokens). This default is
+    # used only when ``/props`` is unreachable. The 2026-06-09 incident was a
+    # drift of exactly this kind — config said 32768, the live server ran
+    # 8192, the guard waved oversized prompts through, every cycle 4xx/5xx'd.
     summarizer_ctx_tokens: int = 32768
     # Output-token reservation: max_tokens=600 in the request; pad with a
     # small safety margin against tokenizer drift.

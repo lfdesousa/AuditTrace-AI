@@ -896,3 +896,214 @@ class TestPostgresGUCStatements:
         db.execute.assert_awaited_once()
         (stmt,) = db.execute.await_args.args
         assert "row_security = off" in str(stmt)
+
+
+# ──────────────── ctx auto-detect + poison-pill hardening (2026-06-09) ────────
+
+
+def _mock_client_props_tokenize(
+    *,
+    n_ctx: int | None = None,
+    props_status: int = 200,
+    tokenize_status: int = 200,
+    token_counts=None,
+    tokens_per_call: int = 10,
+    summary: str = "ok",
+    props_calls: list[int] | None = None,
+) -> httpx.AsyncClient:
+    """Mock transport routing ``/props``, ``/tokenize`` and ``/chat/completions``.
+
+    ``n_ctx`` (when set) is returned under ``default_generation_settings`` on
+    ``/props``. ``props_status``/``tokenize_status`` simulate those endpoints
+    being unreachable. ``token_counts`` is an iterator pinning successive
+    ``/tokenize`` counts; otherwise every call returns ``tokens_per_call``.
+    ``props_calls`` (a list) records one entry per ``/props`` hit so a test can
+    assert the result is cached.
+    """
+    chat_content = json.dumps({"summary": summary, "key_points": ["k"]})
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/props"):
+            if props_calls is not None:
+                props_calls.append(1)
+            if props_status != 200:
+                return httpx.Response(props_status, json={})
+            body: dict = {}
+            if n_ctx is not None:
+                body["default_generation_settings"] = {"n_ctx": n_ctx}
+            return httpx.Response(200, json=body)
+        if path.endswith("/tokenize"):
+            if tokenize_status != 200:
+                return httpx.Response(tokenize_status, json={})
+            count = next(token_counts) if token_counts is not None else tokens_per_call
+            return httpx.Response(200, json={"tokens": list(range(count))})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": chat_content},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+
+class TestCtxAutoDetect:
+    """ctx window resolved from the server's /props, not the configured default.
+
+    Regression for the 2026-06-09 incident: config said 32768, the live
+    summariser ran n_ctx=8192, the guard waved oversized prompts through and
+    every cycle 4xx/5xx'd into an infinite retry.
+    """
+
+    @pytest.mark.asyncio
+    async def test_props_n_ctx_overrides_large_configured_default(
+        self, seed_five_turn_session
+    ):
+        """A small server n_ctx must win over a huge configured value, forcing
+        truncation that the configured value alone would never trigger."""
+        # sys=10, full=100, then 90, 80, 50 as oldest turns drop.
+        counts = iter([10, 100, 90, 80, 50])
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=100_000,  # would fit everything
+                summarizer_ctx_reserve_tokens=20,
+            ),
+            session_factory=seed_five_turn_session.get_session_factory(),
+            http_client=_mock_client_props_tokenize(n_ctx=80, token_counts=counts),
+        )
+        assert await summariser.run_once() == 1
+        async with seed_five_turn_session.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-long"))
+            ).scalar_one()
+            # Truncation only happens if budget came from n_ctx(80), not 100000.
+            assert "[truncated:" in row.summary
+            assert row.summarized_at is not None
+
+    @pytest.mark.asyncio
+    async def test_props_unreachable_falls_back_to_configured(
+        self, seed_five_turn_session
+    ):
+        """/props down → use the configured ctx; a transcript that fits it is
+        summarised without truncation."""
+        counts = iter([10, 100, 90, 80, 50])
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=100_000,
+                summarizer_ctx_reserve_tokens=20,
+            ),
+            session_factory=seed_five_turn_session.get_session_factory(),
+            http_client=_mock_client_props_tokenize(
+                props_status=503, token_counts=counts
+            ),
+        )
+        assert await summariser.run_once() == 1
+        async with seed_five_turn_session.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-long"))
+            ).scalar_one()
+            assert "[truncated:" not in row.summary  # configured budget fit it
+
+    @pytest.mark.asyncio
+    async def test_ctx_resolution_is_cached(self):
+        """/props is queried at most once; the result is memoised."""
+        props_calls: list[int] = []
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=MagicMock(),
+            http_client=_mock_client_props_tokenize(
+                n_ctx=8192, props_calls=props_calls
+            ),
+        )
+        first = await summariser._resolve_ctx_tokens()
+        second = await summariser._resolve_ctx_tokens()
+        assert first == second == 8192
+        assert len(props_calls) == 1
+        await summariser._aclose_owned_client()
+
+    @pytest.mark.asyncio
+    async def test_fetch_server_n_ctx_top_level_and_missing(self):
+        """n_ctx may live at the top level; a malformed body yields None."""
+        top = SessionSummarizer(
+            settings=_settings(),
+            session_factory=MagicMock(),
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda r: httpx.Response(200, json={"n_ctx": 4096})
+                )
+            ),
+        )
+        assert await top._fetch_server_n_ctx() == 4096
+        await top._aclose_owned_client()
+
+        bad = SessionSummarizer(
+            settings=_settings(),
+            session_factory=MagicMock(),
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda r: httpx.Response(200, json={"unrelated": 1})
+                )
+            ),
+        )
+        assert await bad._fetch_server_n_ctx() is None
+        await bad._aclose_owned_client()
+
+
+class TestPoisonPillHardening:
+    """A session must never wedge the worker into an infinite-retry loop."""
+
+    @pytest.mark.asyncio
+    async def test_char_fallback_converges_when_tokenize_down(
+        self, seed_five_turn_session
+    ):
+        """/tokenize AND /props down → char-estimate keeps the fit loop
+        converging; the session is still summarised, never re-queued forever."""
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=400,  # generous vs the tiny transcript
+                summarizer_ctx_reserve_tokens=10,
+            ),
+            session_factory=seed_five_turn_session.get_session_factory(),
+            http_client=_mock_client_props_tokenize(
+                props_status=503,
+                tokenize_status=503,
+                summary="converged",
+            ),
+        )
+        assert await summariser.run_once() == 1
+        async with seed_five_turn_session.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-long"))
+            ).scalar_one()
+            assert row.summary == "converged"
+            assert row.summarized_at is not None  # left the eligibility set
+
+    @pytest.mark.asyncio
+    async def test_aclose_only_closes_owned_client(self):
+        """The teardown callback closes a worker-owned client but never a
+        test/DI-injected one."""
+        injected = AsyncMock()
+        injected.aclose = AsyncMock()
+        s_injected = SessionSummarizer(
+            settings=_settings(),
+            session_factory=MagicMock(),
+            http_client=injected,  # injected → not owned
+        )
+        await s_injected._aclose_owned_client()
+        injected.aclose.assert_not_awaited()
+
+        s_owned = SessionSummarizer(
+            settings=_settings(),
+            session_factory=MagicMock(),
+        )
+        owned = AsyncMock()
+        owned.aclose = AsyncMock()
+        s_owned._http_client = owned  # simulate lazy-created, owned client
+        await s_owned._aclose_owned_client()
+        owned.aclose.assert_awaited_once()

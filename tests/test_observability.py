@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -488,6 +489,41 @@ def test_structured_formatter_emits_json():
     data = _json.loads(line)
     assert data["message"] == "hello"
     assert data["operation"] == "op"
+    # No exception → no exception field.
+    assert "exception" not in data
+
+
+def test_structured_formatter_preserves_exception_traceback():
+    """logger.exception()/exc_info=True must survive into the JSON line.
+
+    Regression: the formatter previously dropped record.exc_info, so a
+    background worker's only failure signal carried just the message and the
+    stack was lost — which masked the 2026-06-09 summariser poison-pill root
+    cause. The traceback must now appear under an ``exception`` field.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    try:
+        raise ValueError("boom-detail")
+    except ValueError:
+        record = logging.LogRecord(
+            name="x",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="it failed",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+    data = _json.loads(fmt.format(record))
+    assert data["message"] == "it failed"
+    assert "exception" in data
+    assert "ValueError" in data["exception"]
+    assert "boom-detail" in data["exception"]
+    assert "Traceback" in data["exception"]
 
 
 class TestRecordSpanError:
