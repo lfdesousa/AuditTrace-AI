@@ -81,6 +81,14 @@ class StructuredFormatter(logging.Formatter):
         for attr in ("request_id", "duration", "operation"):
             if hasattr(record, attr):
                 log_data[attr] = getattr(record, attr)
+        # Preserve exception tracebacks. logger.exception()/exc_info=True sets
+        # record.exc_info; without this the JSON line carried only the message
+        # and the stack was lost — which masked the summariser poison-pill root
+        # cause (a background worker whose only signal is its log).
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            log_data["stack_info"] = self.formatStack(record.stack_info)
         return json.dumps(log_data)
 
 

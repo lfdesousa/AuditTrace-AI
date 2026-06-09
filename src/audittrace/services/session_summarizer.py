@@ -32,6 +32,7 @@ no-ops because SQLite has no GUCs and no RLS.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Sequence
@@ -157,6 +158,10 @@ class SessionSummarizer:
         # shutdown.
         self._http_client = http_client
         self._owns_http_client = http_client is None
+        # Effective summariser context window, resolved once from the
+        # server's /props (single source of truth) and cached. None until
+        # the first resolution. See `_resolve_ctx_tokens`.
+        self._ctx_tokens: int | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -175,21 +180,32 @@ class SessionSummarizer:
             self._settings.summarizer_url,
         )
         interval = self._settings.summarizer_interval_minutes * 60
-        try:
-            while True:
-                try:
-                    await self.run_once()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("session summariser cycle failed")
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            logger.info("session summariser cancelled — exiting")
-            raise
-        finally:
-            if self._owns_http_client and self._http_client is not None:
-                await self._http_client.aclose()
+        # AsyncExitStack over a hand-rolled try/finally (PEP 343 / PYTHON-
+        # ENGINEERING §1): register the owned-client teardown declaratively
+        # so it runs on every exit path — normal, exception, or cancellation.
+        # The client is created lazily (`_ensure_client`) and may be injected
+        # by a test (which we must NOT close), so the callback re-checks
+        # ownership at teardown time rather than entering a client we may not
+        # yet have.
+        async with contextlib.AsyncExitStack() as stack:
+            stack.push_async_callback(self._aclose_owned_client)
+            try:
+                while True:
+                    try:
+                        await self.run_once()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("session summariser cycle failed")
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                logger.info("session summariser cancelled — exiting")
+                raise
+
+    async def _aclose_owned_client(self) -> None:
+        """Close the HTTP client iff we own it (not test-injected)."""
+        if self._owns_http_client and self._http_client is not None:
+            await self._http_client.aclose()
 
     # ── one cycle ──────────────────────────────────────────────────────
 
@@ -330,23 +346,18 @@ class SessionSummarizer:
         prompt as-is if ``/tokenize`` is unreachable — the existing
         post-error path is the safety net of last resort.
         """
-        budget = (
-            self._settings.summarizer_ctx_tokens
-            - self._settings.summarizer_ctx_reserve_tokens
-        )
-        # System prompt counts against the budget too.
-        try:
-            sys_tokens = await self._count_tokens(_SYSTEM_PROMPT)
-        except Exception as exc:
-            logger.debug(
-                "session summariser: /tokenize unreachable (%s) — sending as-is",
-                exc,
-            )
-            return _format_transcript(turns), 0
+        ctx_tokens = await self._resolve_ctx_tokens()
+        budget = ctx_tokens - self._settings.summarizer_ctx_reserve_tokens
+
+        # System prompt counts against the budget too. ``_safe_count_tokens``
+        # never raises — a /tokenize failure falls back to a conservative
+        # char estimate so a poison-pill session can never wedge the worker
+        # into an infinite-retry loop (the 2026-06-09 incident).
+        sys_tokens = await self._safe_count_tokens(_SYSTEM_PROMPT)
 
         # Try the full transcript first; if it fits, no truncation needed.
         full = _format_transcript(turns)
-        full_tokens = await self._count_tokens(full)
+        full_tokens = await self._safe_count_tokens(full)
         if sys_tokens + full_tokens <= budget:
             return full, 0
 
@@ -362,12 +373,87 @@ class SessionSummarizer:
             if not kept:
                 break
             candidate = _format_transcript(kept)
-            cand_tokens = await self._count_tokens(candidate)
+            cand_tokens = await self._safe_count_tokens(candidate)
             if sys_tokens + cand_tokens <= budget:
                 return candidate, dropped
 
         # Even the most recent single turn is over ctx. Fall to sentinel.
         return None, len(turns)
+
+    async def _resolve_ctx_tokens(self) -> int:
+        """Return the summariser context window, preferring the server's own
+        ``/props`` over the configured default. Cached after first call.
+
+        ``summarizer_ctx_tokens`` drifts from the deployed llama-server's
+        actual ``--ctx-size`` (the 2026-06-09 incident: config 32768, server
+        8192 → the guard waved oversized prompts through → HTTP 4xx/5xx every
+        cycle). Reading ``n_ctx`` from ``/props`` makes the server the single
+        source of truth. Falls back to the configured value if ``/props`` is
+        unreachable or malformed, so the feature degrades rather than crashes.
+        """
+        if self._ctx_tokens is not None:
+            return self._ctx_tokens
+        configured = self._settings.summarizer_ctx_tokens
+        n_ctx: int | None = None
+        try:
+            n_ctx = await self._fetch_server_n_ctx()
+        except Exception as exc:
+            logger.debug(
+                "session summariser: /props unreachable (%s) — using configured ctx=%d",
+                exc,
+                configured,
+            )
+        resolved = n_ctx if n_ctx and n_ctx > 0 else configured
+        if n_ctx and n_ctx != configured:
+            logger.info(
+                "session summariser: ctx window from /props=%d overrides configured=%d",
+                n_ctx,
+                configured,
+            )
+        self._ctx_tokens = resolved
+        return resolved
+
+    async def _fetch_server_n_ctx(self) -> int | None:
+        """GET the summariser server's ``/props`` and return ``n_ctx``.
+
+        ``summarizer_url`` ends in ``/v1``; ``/props`` lives at the server
+        root, so we strip the suffix first (same idiom as ``_count_tokens``).
+        Returns ``None`` if the field is absent or non-positive.
+        """
+        client = self._ensure_client()
+        base = self._settings.summarizer_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        url = f"{base}/props"
+        response = await client.get(url, timeout=10)
+        response.raise_for_status()
+        body = response.json()
+        gen = body.get("default_generation_settings") or {}
+        n_ctx = gen.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            return n_ctx
+        # Some llama.cpp builds expose it at the top level instead.
+        top = body.get("n_ctx")
+        return top if isinstance(top, int) and top > 0 else None
+
+    async def _safe_count_tokens(self, content: str) -> int:
+        """Token count via ``/tokenize`` with a conservative char fallback.
+
+        A poison-pill session must never wedge the worker. If ``/tokenize``
+        is slow or unreachable we estimate high (1 token per 3 chars) so the
+        truncation loop still converges and we err on the side of dropping
+        more rather than overflowing the server's context window.
+        """
+        try:
+            return await self._count_tokens(content)
+        except Exception as exc:
+            est = len(content) // 3 + 1
+            logger.debug(
+                "session summariser: /tokenize failed (%s) — char estimate %d",
+                exc,
+                est,
+            )
+            return est
 
     async def _count_tokens(self, content: str) -> int:
         """POST to llama-server's ``/tokenize`` and return the token count.
@@ -381,7 +467,10 @@ class SessionSummarizer:
         if base.endswith("/v1"):
             base = base[: -len("/v1")]
         url = f"{base}/tokenize"
-        response = await client.post(url, json={"content": content}, timeout=10)
+        # 30s (was 10s): a very large transcript can take longer than 10s to
+        # tokenise; a timeout here used to propagate and re-queue the session
+        # forever. ``_safe_count_tokens`` is the backstop if this still fails.
+        response = await client.post(url, json={"content": content}, timeout=30)
         response.raise_for_status()
         body = response.json()
         tokens = body.get("tokens") or []
