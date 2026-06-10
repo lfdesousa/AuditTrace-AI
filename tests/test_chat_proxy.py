@@ -9,6 +9,7 @@ regression that triggered ADR-024.
 
 from datetime import date
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 from sqlalchemy import select
@@ -21,6 +22,17 @@ from audittrace.routes.chat import (
     _resolve_thinking,
 )
 from audittrace.services.context_builder import PROFILE_SECTION_HEADER
+
+# Langfuse ingestion endpoint path. Tests filter recorded POSTs by the URL's
+# parsed PATH component (not a substring `in url` test) so the check is exact —
+# clears CodeQL py/incomplete-url-substring-sanitization and is stricter.
+_INGESTION_PATH = "/api/public/ingestion"
+
+
+def _is_ingestion_url(url: str) -> bool:
+    """True iff *url*'s path is exactly the Langfuse ingestion endpoint."""
+    return urlsplit(url).path == _INGESTION_PATH
+
 
 # ──────────────────────────── httpx.AsyncClient fakes ────────────────────────
 #
@@ -1070,9 +1082,7 @@ class TestChatProxy:
         config_mod.get_settings.cache_clear()
 
         assert response.status_code == 200
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls, "Langfuse ingestion endpoint was not called"
         call = ingestion_calls[0]
         assert call["url"].startswith("http://lf.test")
@@ -1123,9 +1133,7 @@ class TestChatProxy:
         config_mod.get_settings.cache_clear()
 
         assert response.status_code == 200
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls
         body = ingestion_calls[0]["json"]["batch"][0]["body"]
         captured = body["input"]
@@ -1830,9 +1838,7 @@ class TestToolsModeIntegration:
 
         # The ingestion POST flows through the same patched client as the
         # llama-server POST (both go via chat.py's httpx.AsyncClient).
-        ingestion_calls = [
-            c for c in fake.post_calls if "/api/public/ingestion" in c["url"]
-        ]
+        ingestion_calls = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
         assert ingestion_calls, (
             "tools-mode did not POST to Langfuse /api/public/ingestion — "
             "prompts and replies will be invisible in the Langfuse UI"
