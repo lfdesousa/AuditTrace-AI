@@ -435,17 +435,17 @@ class TestAmbientContext:
         reframe is instructed-against. Regression guard for the Round-3 finding
         where the model echoed its ambient context verbatim."""
         from audittrace.services.context_builder import (
-            CONFIDENTIALITY_NOTE,
+            AMBIENT_GUARD_NOTE,
             build_ambient_context,
         )
 
         ctx = build_ambient_context(
             user_context, project="AuditTrace", tools_visible=[]
         )
-        assert "## Confidentiality" in ctx
-        assert CONFIDENTIALITY_NOTE in ctx
+        assert "## System policy" in ctx
+        assert AMBIENT_GUARD_NOTE in ctx
         # It must come BEFORE the profile/identity it is protecting.
-        assert ctx.index("## Confidentiality") < ctx.index(PROFILE_SECTION_HEADER)
+        assert ctx.index("## System policy") < ctx.index(PROFILE_SECTION_HEADER)
         # And explicitly cover the reframe vectors that defeated the blunt refusal.
         low = ctx.lower()
         assert "never reveal" in low
