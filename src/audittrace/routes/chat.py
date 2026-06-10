@@ -44,6 +44,14 @@ from audittrace.identity import UserContext
 from audittrace.logging_config import log_call, reset_langgraph_step
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
+    _execute_memory_tool,
+    _extract_assistant_message,
+    _extract_tool_calls,
+    _is_tool_parse_error_500,
+    _post_with_tool_parse_retry,
+    _sanitise_assistant_tool_calls,
+    _split_tool_calls_by_type,
+    _tool_call_signatures,
     run_memory_tool_loop,
 )
 from audittrace.services.context_builder import (
@@ -870,82 +878,6 @@ async def _record_langfuse_output(
         logger.debug("Langfuse ingestion update failed (non-fatal)", exc_info=True)
 
 
-def _synthesize_sse_from_body(
-    body: dict[str, Any], requested_model: str
-) -> AsyncIterator[bytes]:
-    """Produce an OpenAI-spec SSE stream from a non-streamed chat body.
-
-    ADR-025 Phase 4: the tool-call loop is always non-streaming so the
-    proxy can inspect ``tool_calls`` between iterations. When the
-    caller asked for ``stream=true`` we synthesise the SSE bytes from
-    the final body the loop returned — the content lands in one chunk
-    rather than being word-by-word streamed, but the wire format is
-    correct and OpenAI-compatible clients handle it uniformly.
-
-    The emitted frames are:
-
-      1. One data chunk with the full content (and tool_calls if any)
-      2. One data chunk with the finish_reason
-      3. A synthetic usage chunk (so clients that track token counts
-         see the cost the loop incurred in aggregate)
-      4. ``data: [DONE]``
-
-    Returns an async iterator suitable for ``StreamingResponse``.
-    """
-    choices = body.get("choices") or []
-    first = choices[0] if choices else {}
-    message = first.get("message") or {}
-    content = message.get("content") or ""
-    tool_calls = message.get("tool_calls")
-    finish_reason = first.get("finish_reason") or "stop"
-    usage = body.get("usage") or {}
-    model = body.get("model") or requested_model
-    resp_id = body.get("id") or "chatcmpl-sovereign"
-    created = body.get("created") or 0
-
-    async def _iter() -> AsyncIterator[bytes]:
-        # Content chunk
-        delta: dict[str, Any] = {"content": content}
-        if tool_calls:
-            delta["tool_calls"] = tool_calls
-        content_chunk = {
-            "id": resp_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta}],
-        }
-        yield ("data: " + json.dumps(content_chunk) + "\n\n").encode()
-
-        # Finish chunk
-        finish_chunk: dict[str, Any] = {
-            "id": resp_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-        }
-        yield ("data: " + json.dumps(finish_chunk) + "\n\n").encode()
-
-        # Usage chunk (optional but helps clients that track cost)
-        usage_chunk: dict[str, Any] = {
-            "id": resp_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
-        yield ("data: " + json.dumps(usage_chunk) + "\n\n").encode()
-        yield b"data: [DONE]\n\n"
-
-    return _iter()
-
-
 def _render_tool_calls_text(tool_calls_acc: dict[int, dict[str, Any]]) -> str:
     """Render accumulated tool_calls as ``[tool_call] name(args)`` lines."""
     lines: list[str] = []
@@ -957,6 +889,331 @@ def _render_tool_calls_text(tool_calls_acc: dict[int, dict[str, Any]]) -> str:
             args = json.dumps(args, ensure_ascii=False)
         lines.append(f"[tool_call] {fn.get('name', '')}({args[:500]})")
     return "\n".join(lines)
+
+
+# ──────────────── Tools-mode streaming (#299) ──────────────────────────────
+#
+# ``memory_mode=tools`` previously buffered the WHOLE agentic loop and
+# emitted the answer in one SSE chunk at the very end (a now-removed
+# synthesise-from-final-body path) — so OpenCode showed nothing for ~45 s
+# then dumped everything at once. This streams every loop turn token-by-token
+# instead: content deltas (including ``<think>``) are forwarded LIVE; internal
+# memory tool_calls are swallowed + executed and the loop continues; an
+# external tool_call or a no-tool answer terminates the loop. Single
+# generation per turn — no double-generation, real time-to-first-token.
+
+
+def _sse_content_frame(
+    rid: str | None, created: int | None, model: str, content: str
+) -> bytes:
+    """One OpenAI ``chat.completion.chunk`` carrying a content delta."""
+    chunk = {
+        "id": rid or "chatcmpl-sovereign",
+        "object": "chat.completion.chunk",
+        "created": created or 0,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": content}}],
+    }
+    return ("data: " + json.dumps(chunk) + "\n\n").encode()
+
+
+def _sse_tool_calls_frame(
+    rid: str | None, created: int | None, model: str, tool_calls: list[dict[str, Any]]
+) -> bytes:
+    """One chunk carrying the assembled external ``tool_calls`` delta so the
+    agentic client (OpenCode) can execute them. Emitted whole (not fragmented)
+    because the proxy already has the complete tool_calls block by the time it
+    knows they are external."""
+    chunk = {
+        "id": rid or "chatcmpl-sovereign",
+        "object": "chat.completion.chunk",
+        "created": created or 0,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}],
+    }
+    return ("data: " + json.dumps(chunk) + "\n\n").encode()
+
+
+def _sse_finish_frame(
+    rid: str | None, created: int | None, model: str, finish_reason: str
+) -> bytes:
+    """Terminal chunk carrying ``finish_reason`` and an empty delta."""
+    chunk = {
+        "id": rid or "chatcmpl-sovereign",
+        "object": "chat.completion.chunk",
+        "created": created or 0,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    return ("data: " + json.dumps(chunk) + "\n\n").encode()
+
+
+@dataclass
+class _ToolsStreamResult:
+    """Accumulator the tools-mode streaming loop fills so the caller can
+    persist exactly what the user received (ADR-049 reconstructibility:
+    the streamed answer IS the persisted answer — no separate generation)."""
+
+    answer_text: str = ""
+    pending: list[PendingToolCall] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str = ""
+    finish_reason: str = "stop"
+    external_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    resp_id: str | None = None
+    created: int | None = None
+
+
+def _assistant_msg_from_stream_state(state: _StreamState) -> dict[str, Any]:
+    """Reconstruct the assistant message (content + tool_calls) from a
+    streamed turn so it can be appended to the loop's conversation history,
+    exactly as the buffered loop appends ``_extract_assistant_message``."""
+    msg: dict[str, Any] = {"role": "assistant", "content": "".join(state.chunks)}
+    if state.tool_calls_acc:
+        msg["tool_calls"] = [
+            state.tool_calls_acc[i] for i in sorted(state.tool_calls_acc)
+        ]
+    return msg
+
+
+async def _resolve_turn_buffered(
+    client: httpx.AsyncClient,
+    llama_url: str,
+    turn_payload: dict[str, Any],
+    messages: list[dict[str, Any]],
+    user: UserContext,
+    session_id: str,
+    result: _ToolsStreamResult,
+) -> tuple[list[bytes], bool]:
+    """Resolve ONE turn via the buffered retry/no-tools fallback.
+
+    Used only when streaming a turn hit the Qwen tool-args-malformed-JSON 500
+    (``_is_tool_parse_error_500``). Reuses the proven
+    ``_post_with_tool_parse_retry`` so the resilience is identical to the
+    buffered loop. Returns ``(frames, terminal)``: ``frames`` are SSE bytes to
+    forward (the fallback body is already fully generated, so its content is
+    emitted as one frame), ``terminal`` says whether the loop should stop.
+    """
+    buffered_payload = dict(turn_payload)
+    buffered_payload["stream"] = False
+    resp = await _post_with_tool_parse_retry(client, llama_url, buffered_payload)
+    body = resp.json()
+    rid = body.get("id")
+    created = body.get("created")
+    model = body.get("model") or ""
+    if result.resp_id is None:
+        result.resp_id = rid
+    if result.created is None:
+        result.created = created
+    if model:
+        result.model = model
+    usage = body.get("usage") or {}
+    result.prompt_tokens = usage.get("prompt_tokens", 0) or result.prompt_tokens
+    result.completion_tokens += usage.get("completion_tokens", 0) or 0
+
+    msg = (body.get("choices") or [{}])[0].get("message") or {}
+    content = msg.get("content") or ""
+    frames: list[bytes] = []
+    if content:
+        frames.append(_sse_content_frame(rid, created, model, content))
+        result.answer_text += content
+
+    tool_calls = _extract_tool_calls(body)
+    if not tool_calls:
+        result.finish_reason = (body.get("choices") or [{}])[0].get(
+            "finish_reason"
+        ) or "stop"
+        return frames, True
+
+    memory_calls, external_calls = _split_tool_calls_by_type(tool_calls)
+    if external_calls:
+        frames.append(_sse_tool_calls_frame(rid, created, model, tool_calls))
+        result.external_tool_calls = tool_calls
+        result.finish_reason = "tool_calls"
+        tc_text = _render_tool_calls_text({i: tc for i, tc in enumerate(tool_calls)})
+        result.answer_text = (
+            result.answer_text + "\n" + tc_text if result.answer_text else tc_text
+        )
+        return frames, True
+
+    # Memory-only turn: append assistant msg + execute, then keep looping.
+    assistant_msg = _sanitise_assistant_tool_calls(_extract_assistant_message(body))
+    messages.append(assistant_msg)
+    for tc in memory_calls:
+        await _execute_memory_tool(
+            tc=tc,
+            user_context=user,
+            session_id=session_id,
+            messages=messages,
+            pending=result.pending,
+        )
+    return frames, False
+
+
+async def _stream_memory_tool_loop(
+    *,
+    llama_url: str,
+    loop_payload: dict[str, Any],
+    user: UserContext,
+    session_id: str,
+    settings: Settings,
+    result: _ToolsStreamResult,
+) -> AsyncIterator[bytes]:
+    """Stream the memory tool loop turn-by-turn (#299).
+
+    Yields SSE byte frames to forward to the client and fills *result* for
+    post-stream persistence. Each iteration streams one llama turn:
+
+      * content deltas (``<think>`` + answer) → forwarded LIVE
+      * memory tool_calls → swallowed, executed, loop continues
+      * external tool_calls → forwarded so the client executes them, stop
+      * no tool_calls → final answer (already streamed), stop
+
+    httpx exceptions (timeout, connect, non-tool-parse status) propagate to
+    the caller, which emits a structured SSE error frame and persists a
+    failed-interaction audit row — same contract as the inject path.
+    """
+    messages = list(loop_payload.get("messages") or [])
+    max_iterations = settings.memory_tool_loop_max_iterations
+    chunk_timeout = settings.llama_chunk_timeout
+    keepalive = settings.sse_keepalive_interval
+    model_hint = loop_payload.get("model", "") or ""
+    last_sigs: frozenset[tuple[str, str]] | None = None
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    ) as client:
+        for iteration in range(max_iterations):
+            turn_payload = dict(loop_payload)
+            turn_payload["messages"] = messages
+            turn_payload["stream"] = True
+            turn = _StreamState()
+
+            async with client.stream("POST", llama_url, json=turn_payload) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    if _is_tool_parse_error_500(resp):
+                        frames, terminal = await _resolve_turn_buffered(
+                            client,
+                            llama_url,
+                            turn_payload,
+                            messages,
+                            user,
+                            session_id,
+                            result,
+                        )
+                        for f in frames:
+                            yield f
+                        if terminal:
+                            return
+                        continue
+                    # Any other upstream error → let the caller shape the
+                    # SSE error frame + failed audit row.
+                    resp.raise_for_status()
+
+                async for line in _iter_with_idle_timeout(
+                    resp, chunk_timeout, keepalive
+                ):
+                    if line is None:
+                        yield b": keep-alive\n\n"
+                        continue
+                    stripped = line.strip()
+                    if not stripped.startswith("data: "):
+                        continue
+                    payload_str = stripped[6:]
+                    if payload_str == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    _accumulate_chunk(turn, chunk)
+                    if result.resp_id is None and turn.id:
+                        result.resp_id = turn.id
+                    if result.created is None and turn.created:
+                        result.created = turn.created
+                    # Forward content deltas LIVE. tool_call fragments are
+                    # held back — we don't yet know if they're memory
+                    # (swallow) or external (forward at turn end).
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        piece = (choices[0].get("delta") or {}).get("content")
+                        if piece:
+                            yield _sse_content_frame(
+                                turn.id or result.resp_id,
+                                turn.created or result.created,
+                                turn.model or model_hint,
+                                piece,
+                            )
+
+            # ── turn complete: accumulate usage + answer, decide disposition ──
+            if turn.prompt_tokens:
+                result.prompt_tokens = turn.prompt_tokens
+            result.completion_tokens += turn.completion_tokens
+            if turn.model:
+                result.model = turn.model
+            if turn.chunks:
+                result.answer_text += "".join(turn.chunks)
+
+            tool_calls = [turn.tool_calls_acc[i] for i in sorted(turn.tool_calls_acc)]
+            if not tool_calls:
+                # Final answer — content already streamed.
+                result.finish_reason = turn.finish_reason or "stop"
+                return
+
+            memory_calls, external_calls = _split_tool_calls_by_type(tool_calls)
+            if external_calls:
+                result.external_tool_calls = tool_calls
+                result.finish_reason = "tool_calls"
+                yield _sse_tool_calls_frame(
+                    result.resp_id,
+                    result.created,
+                    result.model or model_hint,
+                    tool_calls,
+                )
+                tc_text = _render_tool_calls_text(
+                    {i: tc for i, tc in enumerate(tool_calls)}
+                )
+                result.answer_text = (
+                    result.answer_text + "\n" + tc_text
+                    if result.answer_text
+                    else tc_text
+                )
+                return
+
+            # ADR-030 early exit: model repeating the same memory tool calls.
+            this_sigs = _tool_call_signatures(memory_calls)
+            if last_sigs is not None and this_sigs == last_sigs:
+                logger.info(
+                    "memory tool-call loop (stream) repeated signatures at "
+                    "iteration %d — exiting early",
+                    iteration + 1,
+                )
+                result.finish_reason = "stop"
+                return
+            last_sigs = this_sigs
+
+            # Memory-only turn: append assistant msg + execute, then loop.
+            assistant_msg = _sanitise_assistant_tool_calls(
+                _assistant_msg_from_stream_state(turn)
+            )
+            messages.append(assistant_msg)
+            for tc in memory_calls:
+                await _execute_memory_tool(
+                    tc=tc,
+                    user_context=user,
+                    session_id=session_id,
+                    messages=messages,
+                    pending=result.pending,
+                )
+
+        # Iteration cap — not an error; return whatever streamed so far.
+        logger.warning(
+            "memory tool-call loop (stream) reached max iterations (%d)",
+            max_iterations,
+        )
+        result.finish_reason = "stop"
 
 
 @router.get("/models")
@@ -1108,6 +1365,166 @@ async def _handle_tools_mode(
     loop_payload["stream"] = False  # loop is always non-streaming internally
 
     llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+
+    # ───────────────────── Streaming branch (#299) ──────────────────────
+    # Stream the agentic loop turn-by-turn so content (including <think>)
+    # reaches the client as it is generated, instead of the old
+    # buffer-everything-then-one-chunk behaviour. Persistence + Langfuse
+    # capture happen after the stream drains, recording exactly what the
+    # user received (single generation — no double-gen, ADR-049).
+    if is_stream:
+
+        async def _iter_tools_stream_and_capture() -> AsyncIterator[bytes]:
+            result = _ToolsStreamResult()
+            stream_perf_start = time.perf_counter()
+            try:
+                async for frame in _stream_memory_tool_loop(
+                    llama_url=llama_url,
+                    loop_payload=loop_payload,
+                    user=user,
+                    session_id=session_id,
+                    settings=settings,
+                    result=result,
+                ):
+                    yield frame
+                # Trailing frames: finish + synthetic usage + DONE.
+                yield _sse_finish_frame(
+                    result.resp_id,
+                    result.created,
+                    result.model or requested_model,
+                    result.finish_reason,
+                )
+                usage_state = _StreamState()
+                usage_state.id = result.resp_id
+                usage_state.created = result.created
+                usage_state.model = result.model
+                usage_state.prompt_tokens = result.prompt_tokens
+                usage_state.completion_tokens = result.completion_tokens
+                yield _build_synthetic_usage_chunk(usage_state, requested_model)
+                yield b"data: [DONE]\n\n"
+            except httpx.TimeoutException as exc:
+                yield _emit_sse_error_frame(
+                    FAILURE_PROXY_TIMEOUT,
+                    f"llama-server idle timeout after {settings.llama_chunk_timeout}s",
+                    504,
+                )
+                await _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_PROXY_TIMEOUT,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                )
+                return
+            except httpx.ConnectError as exc:
+                yield _emit_sse_error_frame(
+                    FAILURE_UPSTREAM_UNREACHABLE,
+                    f"llama-server unreachable at {llama_url}",
+                    502,
+                )
+                await _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_UPSTREAM_UNREACHABLE,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                )
+                return
+            except httpx.HTTPStatusError as exc:
+                yield _emit_sse_error_frame(
+                    FAILURE_UPSTREAM_ERROR,
+                    f"llama-server returned status {exc.response.status_code}",
+                    502,
+                )
+                await _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_UPSTREAM_ERROR,
+                    error_detail=f"status={exc.response.status_code}: {str(exc)[:400]}",
+                    duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                )
+                return
+            except Exception as exc:
+                logger.exception("tools-mode streaming generator failed unexpectedly")
+                yield _emit_sse_error_frame(
+                    FAILURE_INTERNAL_ERROR,
+                    "Internal error during streaming.",
+                    500,
+                )
+                await _persist_interaction(
+                    project=project,
+                    source=source,
+                    question=query,
+                    answer="",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    session_id=session_id,
+                    model=requested_model,
+                    user_id=user.user_id,
+                    status="failed",
+                    failure_class=FAILURE_INTERNAL_ERROR,
+                    error_detail=str(exc)[:500],
+                    duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+                )
+                return
+
+            # Success persistence — record exactly the streamed answer.
+            await _persist_or_enqueue(
+                persist_mode=persist_mode,
+                pending_tool_calls=result.pending,
+                project=project,
+                source=source,
+                question=query,
+                answer=result.answer_text,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                session_id=session_id,
+                model=result.model or requested_model,
+                user_id=user.user_id,
+                duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
+            )
+            await _record_langfuse_output(
+                trace_id=trace_id,
+                answer=result.answer_text,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                finish_reason=result.finish_reason,
+                tool_calls=result.external_tool_calls or None,
+                session_id=session_id,
+                model=result.model or requested_model,
+                user_id=user.user_id,
+                input_messages=payload.get("messages"),
+            )
+
+        return StreamingResponse(
+            _iter_tools_stream_and_capture(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # 2 — Run the loop. On TimeoutException or unexpected Exception we
     # persist a failed-interaction audit row BEFORE propagating, so a
@@ -1277,13 +1694,9 @@ async def _handle_tools_mode(
     except Exception:  # pragma: no cover - defensive attribute write
         pass
 
-    # 6 — Return JSON or synthesised SSE
-    if is_stream:
-        return StreamingResponse(
-            _synthesize_sse_from_body(final_body, requested_model),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+    # 6 — Return the final body as JSON. The streaming case returned far
+    # earlier via the per-turn streaming branch (#299); by here the request
+    # is always non-streaming.
     return final_body
 
 
