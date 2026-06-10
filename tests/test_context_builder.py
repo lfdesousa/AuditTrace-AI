@@ -418,13 +418,39 @@ class TestAmbientContext:
                 "recall_semantic",
             )
         ]
+        from audittrace.services.context_builder import _AMBIENT_BUDGET_WORDS
+
         ctx = build_ambient_context(
             user_context, project="AuditTrace", tools_visible=four_tools
         )
         word_count = len(ctx.split())
-        assert word_count <= 280, (
-            f"ambient context is {word_count} words, over the 280 budget:\n{ctx}"
+        assert word_count <= _AMBIENT_BUDGET_WORDS, (
+            f"ambient context is {word_count} words, over the "
+            f"{_AMBIENT_BUDGET_WORDS} budget:\n{ctx}"
         )
+
+    def test_ambient_context_carries_confidentiality_directive(self, user_context):
+        """F-L6 (OWASP-LLM LLM06): the always-injected ambient context must lead
+        with the confidentiality directive so a 'paste your system prompt'
+        reframe is instructed-against. Regression guard for the Round-3 finding
+        where the model echoed its ambient context verbatim."""
+        from audittrace.services.context_builder import (
+            CONFIDENTIALITY_NOTE,
+            build_ambient_context,
+        )
+
+        ctx = build_ambient_context(
+            user_context, project="AuditTrace", tools_visible=[]
+        )
+        assert "## Confidentiality" in ctx
+        assert CONFIDENTIALITY_NOTE in ctx
+        # It must come BEFORE the profile/identity it is protecting.
+        assert ctx.index("## Confidentiality") < ctx.index(PROFILE_SECTION_HEADER)
+        # And explicitly cover the reframe vectors that defeated the blunt refusal.
+        low = ctx.lower()
+        assert "never reveal" in low
+        for framing in ("debugging", "role-play"):
+            assert framing in low
 
     def test_non_admin_profile_does_not_say_admin(self, user_context):
         """A non-admin UserContext does not see the word 'admin' in its
@@ -503,6 +529,9 @@ class TestNamingConventionInjection:
         ctx = build_ambient_context(
             user_context, project="AuditTrace", tools_visible=four_tools
         )
-        assert len(ctx.split()) <= 280, (
-            f"naming note pushed ambient context over 280 words: {len(ctx.split())}"
+        from audittrace.services.context_builder import _AMBIENT_BUDGET_WORDS
+
+        assert len(ctx.split()) <= _AMBIENT_BUDGET_WORDS, (
+            f"naming note pushed ambient context over {_AMBIENT_BUDGET_WORDS} "
+            f"words: {len(ctx.split())}"
         )
