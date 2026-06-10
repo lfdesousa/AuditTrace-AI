@@ -149,6 +149,242 @@ def _patch_tool_loop_client(fake):
     )
 
 
+# ── Streaming fakes for the tools-mode per-turn streaming loop (#299) ────────
+#
+# The tools-mode streaming path (``_stream_memory_tool_loop``) opens one
+# ``client.stream(...)`` per loop turn and forwards content deltas live. These
+# fakes return a DIFFERENT set of SSE lines per ``.stream()`` call (one per
+# turn) and, on the buffered tool-parse-500 fallback, a ``.post()`` body.
+
+
+def _sse_line(obj: dict) -> str:
+    """Encode one OpenAI ``chat.completion.chunk`` dict as an SSE data line."""
+    import json as _j
+
+    return "data: " + _j.dumps(obj)
+
+
+def _sse_content_lines(pieces: list[str], model: str = "qwen3.5-35b") -> list[str]:
+    """SSE data lines streaming *pieces* of content then finish_reason=stop."""
+    lines = [
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": p}}],
+            }
+        )
+        for p in pieces
+    ]
+    lines.append(
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 8,
+                    "total_tokens": 28,
+                },
+            }
+        )
+    )
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _sse_tool_call_lines(
+    tool_name: str, args_json: str, call_id: str = "call_1", model: str = "qwen3.5-35b"
+) -> list[str]:
+    """SSE data lines for a streamed tool_calls turn (think text + tool_call)."""
+    return [
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {"content": "<think>recall</think>"}}
+                ],
+            }
+        ),
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": args_json,
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        ),
+        _sse_line(
+            {
+                "id": "cmpl-s",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            }
+        ),
+        "data: [DONE]",
+    ]
+
+
+class _SeqStreamResponse:
+    def __init__(self, lines, status=200, body=None):
+        self._lines = lines
+        self.status_code = status
+        self._body = body or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import httpx
+
+            raise httpx.HTTPStatusError(
+                "upstream error", request=MagicMock(), response=self
+            )
+        return None
+
+    async def aread(self):
+        return b""
+
+    def json(self):
+        return self._body
+
+    @property
+    def text(self):
+        import json as _j
+
+        return _j.dumps(self._body)
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _SeqStreamCtx:
+    def __init__(self, lines, status=200, body=None):
+        self._lines = lines
+        self._status = status
+        self._body = body
+
+    async def __aenter__(self):
+        return _SeqStreamResponse(self._lines, self._status, self._body)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _SequencedStreamClient(_FakeAsyncClient):
+    """``_FakeAsyncClient`` whose ``.stream()`` returns a different SSE
+    line-set per call (one per loop turn), plus ``.post()`` for the buffered
+    tool-parse-500 fallback. ``stream_status``/``stream_bodies`` (parallel to
+    ``stream_turns``) drive error/fallback turns."""
+
+    def __init__(
+        self,
+        stream_turns: list[list[str]],
+        post_responses: list[dict] | None = None,
+        stream_status: list[int] | None = None,
+        stream_bodies: list[dict] | None = None,
+    ):
+        super().__init__()
+        self._turns = stream_turns
+        self._si = 0
+        self._post_responses = post_responses or []
+        self._pi = 0
+        self._stream_status = stream_status or []
+        self._stream_bodies = stream_bodies or []
+        self.stream_calls: list[dict] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        lines = self._turns[idx]
+        status = self._stream_status[idx] if idx < len(self._stream_status) else 200
+        body = self._stream_bodies[idx] if idx < len(self._stream_bodies) else None
+        self._si += 1
+        return _SeqStreamCtx(lines, status, body)
+
+    async def post(self, url, json=None, **kwargs):
+        self.last_post_url = url
+        self.last_post_json = json
+        self.post_calls.append({"url": url, "json": json, "kwargs": kwargs})
+        body = self._post_responses[min(self._pi, len(self._post_responses) - 1)]
+        self._pi += 1
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = body
+        return resp
+
+
+def _parse_sse_deltas(raw: str) -> list[dict]:
+    """Parse an SSE body into the list of decoded ``data:`` JSON chunks
+    (skipping ``[DONE]`` and keep-alive comment frames)."""
+    import json as _j
+
+    out: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            continue
+        try:
+            out.append(_j.loads(payload))
+        except _j.JSONDecodeError:
+            continue
+    return out
+
+
+class _RaisingStreamCtx:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RaisingStreamClient(_FakeAsyncClient):
+    """``.stream()`` raises *exc* when the streaming context is entered —
+    models llama-server being unreachable / timing out / blowing up mid-open."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def stream(self, method, url, json=None, **kwargs):
+        return _RaisingStreamCtx(self._exc)
+
+
 # ─────────────────────────────── Session id ─────────────────────────────────
 
 
@@ -1157,13 +1393,202 @@ class TestToolsModeIntegration:
         assert tc_row.error is None
         assert tc_row.interaction_id == latest_interaction.id
 
+    def test_tools_mode_streams_content_token_by_token(self, client, _tools_mode):
+        """#299: stream=true must stream the answer as MULTIPLE content
+        deltas (real token-by-token), not one buffered chunk. The pieces
+        concatenate to the full answer and the stream ends with [DONE]."""
+        fake = _SequencedStreamClient([_sse_content_lines(["Hel", "lo ", "world"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "event-stream" in response.headers.get("content-type", "")
+        raw = response.content.decode()
+        assert "[DONE]" in raw
+        chunks = _parse_sse_deltas(raw)
+        # Multiple content deltas — the whole point of #299 (was one chunk).
+        content_pieces = [
+            c["choices"][0]["delta"]["content"]
+            for c in chunks
+            if c.get("choices") and c["choices"][0].get("delta", {}).get("content")
+        ]
+        assert content_pieces == ["Hel", "lo ", "world"]
+        # Exactly one streaming POST (single terminal turn).
+        assert len(fake.stream_calls) == 1
+        # A finish_reason=stop frame is present.
+        assert any(
+            c.get("choices") and c["choices"][0].get("finish_reason") == "stop"
+            for c in chunks
+        )
+
+    async def test_tools_mode_streaming_persists_streamed_answer(
+        self, client, _tools_mode
+    ):
+        """ADR-049 reconstructibility: the persisted answer equals exactly
+        what was streamed to the user (single generation, no double-gen)."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _SequencedStreamClient(
+            [_sse_content_lines(["The ", "answer ", "is 42."])]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert len(interactions) >= 1
+        latest = interactions[-1]
+        assert latest.answer == "The answer is 42."
+        assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_tools_mode_streaming_through_memory_tool_loop(
+        self, client, _tools_mode
+    ):
+        """A memory tool turn streams (think forwarded, tool_call swallowed),
+        the tool executes + audits, then the final answer streams. The
+        internal memory tool_call must NOT leak to the client as tool_calls."""
+        from audittrace.db.models import ToolCall
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines(
+                    "recall_decisions", '{"query": "cache compression"}'
+                ),
+                _sse_content_lines(["Based on ", "ADR-009."]),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "what about KV cache?"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        chunks = _parse_sse_deltas(raw)
+        # TWO streaming turns (tool turn + answer turn).
+        assert len(fake.stream_calls) == 2
+        # The memory tool_call was NOT forwarded to the client.
+        assert not any(
+            c.get("choices") and c["choices"][0].get("delta", {}).get("tool_calls")
+            for c in chunks
+        )
+        # The final answer streamed.
+        joined = "".join(
+            c["choices"][0]["delta"].get("content", "")
+            for c in chunks
+            if c.get("choices") and c["choices"][0].get("delta")
+        )
+        assert "ADR-009." in joined
+        # The memory tool executed and was audited.
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert len(tool_calls_rows) == 1
+        assert tool_calls_rows[0].tool_name == "recall_decisions"
+
+    def test_tools_mode_streaming_forwards_external_tool_call(
+        self, client, _tools_mode
+    ):
+        """An external (non-memory) tool call is forwarded to the client so
+        the agentic loop (OpenCode) can execute it, with finish_reason
+        tool_calls — the proxy does not try to run it itself."""
+        fake = _SequencedStreamClient(
+            [_sse_tool_call_lines("read_file", '{"path": "/etc/hosts"}')]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "read a file"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        chunks = _parse_sse_deltas(response.content.decode())
+        # Exactly one streaming turn — the external call terminates the loop.
+        assert len(fake.stream_calls) == 1
+        # The external tool_call IS forwarded to the client.
+        forwarded = [
+            tc
+            for c in chunks
+            if c.get("choices")
+            for tc in (c["choices"][0].get("delta", {}).get("tool_calls") or [])
+        ]
+        assert len(forwarded) == 1
+        assert forwarded[0]["function"]["name"] == "read_file"
+        assert any(
+            c.get("choices") and c["choices"][0].get("finish_reason") == "tool_calls"
+            for c in chunks
+        )
+
+    def test_tools_mode_streaming_tool_parse_500_falls_back(self, client, _tools_mode):
+        """Resilience port: a tool-parse 500 on the streamed turn falls back
+        to the buffered retry/no-tools path and still streams an answer."""
+        parse_err_body = {
+            "error": {
+                "code": 500,
+                "type": "server_error",
+                "message": (
+                    "Failed to parse tool call arguments as JSON: "
+                    "[json.exception.parse_error.101]"
+                ),
+            }
+        }
+        fake = _SequencedStreamClient(
+            stream_turns=[["data: [DONE]"]],  # unused — status 500 short-circuits
+            stream_status=[500],
+            stream_bodies=[parse_err_body],
+            post_responses=[_tools_mode_response_text("Recovered answer.")],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "trigger parse error"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "Recovered answer." in raw
+        assert "[DONE]" in raw
+        # Fallback used the buffered .post() path at least once.
+        assert len(fake.post_calls) >= 1
+
     def test_tools_mode_streams_synthesized_sse_when_stream_true(
         self, client, _tools_mode
     ):
-        """When the client asks for stream=true, tools-mode synthesises an
-        SSE response from the final non-streamed body (the loop itself is
-        always non-streaming because it has to inspect tool_calls)."""
-        fake = _SequencedClient([_tools_mode_response_text("Streamed text.")])
+        """Smoke: stream=true returns an event-stream that carries the
+        answer text and terminates with [DONE] (back-compat wire shape)."""
+        fake = _SequencedStreamClient([_sse_content_lines(["Streamed text."])])
         with _patch_tool_loop_client(fake), _patch_async_client(fake):
             response = client.post(
                 "/v1/chat/completions",
@@ -1179,6 +1604,187 @@ class TestToolsModeIntegration:
         body = response.content.decode()
         assert "Streamed text." in body
         assert "[DONE]" in body
+
+    async def test_tools_mode_streaming_connect_error_persists_failed(
+        self, client, _tools_mode
+    ):
+        """A connect error mid-stream emits an SSE error frame and persists a
+        failed-interaction audit row (same contract as the inject path)."""
+        import httpx
+
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _RaisingStreamClient(httpx.ConnectError("down"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "unreachable" in raw
+        assert "[DONE]" in raw
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert interactions[-1].status == "failed"
+
+    def test_tools_mode_streaming_timeout_emits_error_frame(self, client, _tools_mode):
+        """A read timeout mid-stream emits the 504 idle-timeout error frame."""
+        import httpx
+
+        fake = _RaisingStreamClient(httpx.ReadTimeout("slow"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "idle timeout" in response.content.decode()
+
+    def test_tools_mode_streaming_generic_exception_emits_error_frame(
+        self, client, _tools_mode
+    ):
+        """An unexpected error mid-stream emits the internal-error frame."""
+        fake = _RaisingStreamClient(ValueError("boom"))
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "Internal error during streaming." in response.content.decode()
+
+    def test_tools_mode_streaming_non_parse_500_emits_502(self, client, _tools_mode):
+        """A non-tool-parse upstream 500 surfaces a 502 error frame (no
+        retry/fallback — only the Qwen tool-args parse error falls back)."""
+        fake = _SequencedStreamClient(
+            stream_turns=[["data: [DONE]"]],
+            stream_status=[500],
+            stream_bodies=[{"error": {"message": "CUDA OOM"}}],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "status 500" in response.content.decode()
+        # No buffered fallback attempted for a non-parse error.
+        assert fake.post_calls == []
+
+    async def test_tools_mode_streaming_fallback_executes_memory_tool(
+        self, client, _tools_mode
+    ):
+        """tool-parse 500 whose buffered fallback returns a MEMORY tool_call:
+        execute it, then keep streaming the next turn to a final answer."""
+        from audittrace.db.models import ToolCall
+        from audittrace.dependencies import get_postgres_factory
+
+        parse_err = {
+            "error": {
+                "message": "Failed to parse tool call arguments as JSON: "
+                "[json.exception.parse_error.101]"
+            }
+        }
+        fake = _SequencedStreamClient(
+            stream_turns=[["unused"], _sse_content_lines(["Final answer."])],
+            stream_status=[500, 200],
+            stream_bodies=[parse_err, None],
+            post_responses=[
+                _tools_mode_tool_call_response("recall_decisions", '{"query": "x"}')
+            ],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "Final answer." in raw
+        # The buffered fallback executed the memory tool and audited it.
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            tool_calls_rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert len(tool_calls_rows) == 1
+        assert tool_calls_rows[0].tool_name == "recall_decisions"
+
+    def test_tools_mode_streaming_repeated_signature_exits_early(
+        self, client, _tools_mode
+    ):
+        """ADR-030: identical memory tool_calls two turns running → the
+        streaming loop exits early instead of spinning to the cap."""
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines("recall_decisions", '{"query": "x"}', "c1"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "x"}', "c2"),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        # Two streamed turns, then early exit — not the 5-iteration cap.
+        assert len(fake.stream_calls) == 2
+
+    def test_tools_mode_streaming_hits_iteration_cap(
+        self, client, _tools_mode, monkeypatch
+    ):
+        """Distinct memory tool_calls every turn → the loop stops at the
+        configured iteration cap and still closes the stream cleanly."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS", "2")
+
+        fake = _SequencedStreamClient(
+            [
+                _sse_tool_call_lines("recall_decisions", '{"query": "a"}', "c1"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "b"}', "c2"),
+                _sse_tool_call_lines("recall_decisions", '{"query": "c"}', "c3"),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        assert "[DONE]" in response.content.decode()
+        # Exactly the cap — 2 streamed turns, not 3.
+        assert len(fake.stream_calls) == 2
 
     def test_tools_mode_records_langfuse_output_when_configured(
         self, client, _tools_mode, monkeypatch
