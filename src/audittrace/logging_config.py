@@ -22,7 +22,28 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from audittrace import telemetry
+
+
+def _is_expected_client_error(exc: BaseException) -> bool:
+    """True for an ``HTTPException`` carrying a 4xx status — an *expected*
+    client error (bad/expired token, missing scope, not found, validation)
+    that ``@log_call`` should log concisely at WARNING, NOT as an ERROR with a
+    full stack trace.
+
+    Reserving ERROR+traceback for 5xx / unexpected exceptions keeps attacker-
+    controllable 4xx (e.g. malformed-token spam) from flooding ERROR logs with
+    tracebacks that disclose internal paths and pollute error-rate alerting
+    (pentest finding F-L1, ADR-049 / OWASP A09). FastAPI's ``HTTPException``
+    subclasses Starlette's, so this isinstance check covers both.
+    """
+    return (
+        isinstance(exc, StarletteHTTPException)
+        and 400 <= getattr(exc, "status_code", 0) < 500
+    )
+
 
 # Per-trace step counter (backlog #02). A process-global counter interleaved
 # step numbers across concurrent requests. The ContextVar scopes the counter
@@ -512,11 +533,16 @@ def log_call(
                         return result
                     except Exception as e:
                         err = type(e).__name__
-                        log.error(
-                            f"ERROR {op}: {e}",
-                            exc_info=True,
-                            extra={"operation": op},
-                        )
+                        if _is_expected_client_error(e):
+                            # Expected 4xx (auth/scope/not-found/validation):
+                            # concise WARNING, no stack trace (F-L1).
+                            log.warning("%s: %s", op, e, extra={"operation": op})
+                        else:
+                            log.error(
+                                f"ERROR {op}: {e}",
+                                exc_info=True,
+                                extra={"operation": op},
+                            )
                         _record_span_error(span, e)
                         raise
                     finally:
@@ -547,11 +573,16 @@ def log_call(
                     return result
                 except Exception as e:
                     err = type(e).__name__
-                    log.error(
-                        f"ERROR {op}: {e}",
-                        exc_info=True,
-                        extra={"operation": op},
-                    )
+                    if _is_expected_client_error(e):
+                        # Expected 4xx (auth/scope/not-found/validation):
+                        # concise WARNING, no stack trace (F-L1).
+                        log.warning("%s: %s", op, e, extra={"operation": op})
+                    else:
+                        log.error(
+                            f"ERROR {op}: {e}",
+                            exc_info=True,
+                            extra={"operation": op},
+                        )
                     _record_span_error(span, e)
                     raise
                 finally:

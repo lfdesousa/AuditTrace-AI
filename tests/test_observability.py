@@ -446,6 +446,54 @@ def test_log_call_logs_and_reraises_errors(caplog):
     assert any("ERROR" in r.message for r in caplog.records if r.name == logger.name)
 
 
+def test_log_call_4xx_httpexception_warns_without_traceback(caplog):
+    """Pentest F-L1: an expected 4xx HTTPException (bad/expired token, missing
+    scope, not found, validation) must be logged concisely at WARNING with NO
+    stack trace — not ERROR+traceback — so attacker-controllable 4xx cannot
+    flood ERROR logs or disclose internal paths."""
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("audittrace.tests.client_err")
+
+    @log_call(logger=logger)
+    async def deny():
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with pytest.raises(HTTPException):
+            asyncio.run(deny())
+
+    recs = [r for r in caplog.records if r.name == logger.name]
+    # No ERROR record from the wrapper, and no traceback attached.
+    assert not any(r.levelno >= logging.ERROR for r in recs), (
+        "4xx must not log at ERROR"
+    )
+    warns = [r for r in recs if r.levelno == logging.WARNING]
+    assert warns, "expected a WARNING for the 4xx"
+    assert all(r.exc_info is None for r in warns), "WARNING must carry no traceback"
+
+
+def test_log_call_5xx_httpexception_still_errors_with_traceback(caplog):
+    """A 5xx HTTPException is a real server fault and must still log at ERROR
+    with the traceback (only 4xx are downgraded)."""
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("audittrace.tests.server_err")
+
+    @log_call(logger=logger)
+    async def fault():
+        raise HTTPException(status_code=502, detail="upstream boom")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with pytest.raises(HTTPException):
+            asyncio.run(fault())
+
+    recs = [r for r in caplog.records if r.name == logger.name]
+    errs = [r for r in recs if r.levelno >= logging.ERROR]
+    assert errs, "5xx must still log at ERROR"
+    assert any(r.exc_info is not None for r in errs), "5xx ERROR must carry traceback"
+
+
 def test_telemetry_init_is_idempotent_and_noop_without_endpoint():
     telemetry._reset_for_tests()
     telemetry.init_telemetry(service_name="test-svc", otlp_endpoint="")
