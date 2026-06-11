@@ -269,6 +269,10 @@ async def upload_memory_file(
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
+    # NOT auth-only: the real gate is the dynamic per-layer
+    # ``_require_layer_write`` below. The static ``scopes=[]`` only keeps
+    # OAuth2 declared in the OpenAPI spec (same pattern as /memory/index);
+    # the scope can't be static because it depends on the ``layer`` param.
     _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
@@ -293,7 +297,12 @@ async def upload_memory_file(
     Authorization (per-layer): the caller's JWT must carry
     ``memory:<layer>:write`` matching the ``layer`` query parameter
     (or ``audittrace:admin``). A token with ``memory:procedural:write``
-    cannot upload to ``layer=episodic`` and vice-versa.
+    cannot upload to ``layer=episodic`` and vice-versa. This is enforced
+    by ``_require_layer_write`` on the first line below — the endpoint is
+    **not** auth-only despite the static ``scopes=[]`` on the OAuth2
+    declaration (which exists only so the spec lists the security scheme;
+    the effective scope is dynamic in the ``layer`` parameter, so it
+    cannot be declared statically — same contract as ``/memory/index``).
     """
     _require_layer_write(user, layer)
     settings = get_settings()

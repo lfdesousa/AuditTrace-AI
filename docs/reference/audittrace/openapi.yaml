@@ -1714,7 +1714,11 @@ paths:
         \ content-control once the verdict is clean.\n\n* **Non-PDF uploads** (markdown skills, ADRs, plain text)\n  keep\
         \ the existing synchronous path: PUT to\n  ``{layer}/{filename}`` and return HTTP 200 with the\n  direct-write summary.\n\
         \nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n\
-        (or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa."
+        (or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa.\
+        \ This is enforced\nby ``_require_layer_write`` on the first line below — the endpoint is\n**not** auth-only despite\
+        \ the static ``scopes=[]`` on the OAuth2\ndeclaration (which exists only so the spec lists the security scheme;\n\
+        the effective scope is dynamic in the ``layer`` parameter, so it\ncannot be declared statically — same contract as\
+        \ ``/memory/index``)."
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query
