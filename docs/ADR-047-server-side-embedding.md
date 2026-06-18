@@ -1,8 +1,15 @@
 # ADR-047 — Move ChromaDB embedding off the request path
 
-**Status:** Proposed
-**Date:** 2026-05-06 (proposed)
+**Status:** Accepted
+**Date:** 2026-05-06 (proposed) · 2026-06-18 (accepted as-is)
 **Deciders:** Luis Filipe de Sousa
+
+> **Accepted 2026-06-18, as-is.** The proposal stands without amendment: cut embedding
+> over to the dedicated nomic-embed-server, accept the 384→768-dim vector-space
+> migration via `_v2` coexistence collections, and retire the in-process stock
+> embedder. Implementation follows the "Sequence after acceptance" below. The
+> rationale is captured for non-engineering audiences in
+> `docs/architecture/model-topology.md`.
 **Related:** ADR-027 (MinIO object storage), ADR-029 (`/interactions`
 route + audit-record schema), ADR-046 (async chat-completion
 persistence — same pattern, different consumer), and the same-day
