@@ -138,6 +138,8 @@ spec:
               value: "audittrace-server"
             - name: AUDITTRACE_LLAMA_URL
               value: "http://{{ .Release.Name }}-llm-chat:{{ .Values.externalLLM.chat.port }}/v1"
+            # ADR-047 — embedding always runs on the dedicated nomic server
+            # (the gateway hosts no in-process model). 768-dim.
             - name: AUDITTRACE_EMBED_URL
               value: "http://{{ .Release.Name }}-llm-embed:{{ .Values.externalLLM.embed.port }}/v1"
             - name: AUDITTRACE_SUMMARIZER_URL
