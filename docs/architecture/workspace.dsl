@@ -16,7 +16,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         llamaServer = softwareSystem "Chat LLM Server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE, ~3B active per token) on :11435 — chat + tool-loop reasoning (GPU, ROCm). MoE prompt-eval is materially faster than dense 27B Q4 on consumer GPU at the 5–15K-token prompts OpenCode produces, which is why we swapped back from 27B on 2026-05-01." {
             tags "External"
         }
-        embedServer = softwareSystem "Embedding Server" "nomic-embed-text v1.5 Q8_0 on :11436 — 768-dim embeddings (CPU)" {
+        embedServer = softwareSystem "Embedding Server (intended — cutover pending)" "nomic-embed-text v1.5 Q8_0 on :11436 (768-dim), CPU-only. DEPLOYED + running as the INTENDED embedder (ADR-030, three-model dev topology). NOT yet on the code path: the shipped code still embeds IN-PROCESS via ONNX all-MiniLM-L6-v2 (384-dim — see Embedder), after an OOM with ChromaDB's stock embedder. Cutover to this server = ADR-047 (Accepted, in progress): move embedding off the request path. Q8 quant because embedding quality is quant-sensitive; CPU-only because ChromaDB queries are off the user-facing critical path." {
             tags "External"
         }
         summarizerServer = softwareSystem "Summariser LLM Server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 — background session summarisation, strict-JSON output (GPU, EU-origin) (ADR-030)" {
@@ -82,6 +82,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                 proceduralSvc = component "ProceduralService" "Layer 2 — SKILL file loading from MinIO (ADR-027)" "ABC + S3ProceduralService (File fallback for tests)"
                 conversationalSvc = component "ConversationalService" "Layer 3 — PostgreSQL sessions (ADR-020)" "ABC + PostgresConversationalService"
                 semanticSvc = component "SemanticService" "Layer 4 — ChromaDB vector search" "ABC + ChromaSemanticService"
+                embedder = component "Embedder (in-process)" "ONNX all-MiniLM-L6-v2, 384-dim, module-level singleton (SINGLETON_EMBEDDER) passed as ChromaDB embedding_function on every collection (semantic search + /memory index). Computes query + index vectors INSIDE memory-server (CPU); ChromaDB only stores/searches the vectors and never calls out. (services/embedder.py)" "ONNX Runtime"
 
                 // Memory-as-tools (ADR-025) — dynamic registry + tool-call loop
                 memoryToolRegistry = component "MemoryToolRegistry" "Decorator-based registry (@register_memory_tool). tools_visible_to(user) scope filter. invoke_tool cache-aware dispatch. Optional TOML overlay (ADR-025)" "tools/__init__.py"
@@ -181,8 +182,13 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         episodicSvc -> minioStore "Lists + downloads ADR-*.md from memory-shared/episodic/" "S3 API"
         proceduralSvc -> minioStore "Lists + downloads SKILL-*.md from memory-shared/procedural/" "S3 API"
         conversationalSvc -> postgresDb "SELECT/INSERT sessions" "SQLAlchemy ORM"
-        semanticSvc -> chromaDb "query()" "HTTP + Bearer token"
-        chromaDb -> embedServer "Embedding vectors" "HTTP/OpenAI-compat"
+        semanticSvc -> chromaDb "query() / upsert() — sends pre-computed vectors" "HTTP + Bearer token"
+        semanticSvc -> embedder "vectorise query + index text IN-PROCESS (ONNX) before calling ChromaDB" "in-proc call"
+        embedder -> embedServer "ADR-047 (ACCEPTED, in progress — not yet wired): move embedding off the request path to the dedicated nomic server" "FUTURE / HTTP"
+        // NOTE: TODAY ChromaDB does NOT call out for embeddings — the embedding_function is a
+        // client-side ONNX model held by memory-server (SINGLETON_EMBEDDER); vectors are computed
+        // in-process and shipped to the store. The nomic embedServer (:11436) is deployed + intended
+        // (ADR-030) but the cutover is pending (ADR-047 Accepted, in progress).
 
         // Session summariser (ADR-030)
         sessionSummarizer -> postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
@@ -291,7 +297,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
 
             deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU (three model processes, separate ports)" "Linux / ROCm" {
                 llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE) on :11435 (GPU)" "llama.cpp / ROCm"
-                embedInstance = infrastructureNode "embed-server" "nomic-embed-text v1.5 Q8_0 on :11436 (CPU)" "llama.cpp / CPU"
+                embedInstance = infrastructureNode "embed-server (intended — cutover pending)" "nomic-embed-text v1.5 Q8_0 on :11436, CPU-only (--n-gpu-layers 0). Runs as the intended embedder (ADR-030); today embeddings actually run IN-PROCESS in memory-server (ONNX all-MiniLM-L6-v2). Cutover to this box = ADR-047 (Accepted, in progress)." "llama.cpp / CPU"
                 summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
                 opencodeProxyInstance = infrastructureNode "audittrace-opencode-proxy" "Caddy 2.6 reverse proxy on 127.0.0.1:11434, systemd-managed, TLS-verified upstream to Istio Gateway. Bun 1.3.x fetch-trust workaround." "Caddy 2.6"
                 vaultUnsealInstance = infrastructureNode "audittrace-vault-auto-unseal" "Boot-time idempotent Vault unseal (systemd oneshot, retry-on-failure). Reads keys from ~/work/audittrace-private/runbooks/vault-init-*.json (mode 600). Production successor: KMS auto-unseal (M3+)." "systemd + bash"
@@ -313,7 +319,9 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             apiInstance -> summarizerInstance "Background summariser loop — non-streaming JSON (ADR-030)" "HTTP/JSON"
             apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
             apiInstance -> otelCollectorInstance "OTLP metrics + logs" "HTTP/OTLP"
-            chromaInstance -> embedInstance "Embedding vectors" "HTTP"
+            // NOTE: no chromaInstance -> embedInstance edge — TODAY embeddings run IN-PROCESS
+            // inside apiInstance (memory-server, ONNX MiniLM). The nomic embed-server runs as the
+            // intended embedder (ADR-030); cutover to it is pending (ADR-047 Accepted, in progress).
         }
     }
 
