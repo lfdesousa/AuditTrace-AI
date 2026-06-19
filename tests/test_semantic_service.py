@@ -9,6 +9,7 @@ keeps all legacy test data visible.
 """
 
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,6 +20,19 @@ from audittrace.services.semantic import (
     SemanticService,
 )
 
+
+@pytest.fixture(autouse=True)
+def _mock_nomic_embed(monkeypatch):
+    """ADR-047 — ChromaSemanticService always vectorises on the nomic server.
+    The mock ChromaDB ignores embeddings (it matches on text/where), so a
+    deterministic stub keeps these unit tests offline while exercising the
+    real query_embeddings/embeddings code path."""
+    monkeypatch.setattr(
+        "audittrace.services.semantic.embed_via_nomic",
+        AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+    )
+
+
 # ── ChromaSemanticService tests ──────────────────────────────────────────────
 
 
@@ -28,7 +42,7 @@ class TestChromaSemanticService:
         factory = MockChromaDBFactory()
         client = await factory.get_client()
         # Seed a collection with documents
-        col = await client.get_or_create_collection(name="decisions")
+        col = await client.get_or_create_collection(name="decisions_v2")
         await col.add(
             ids=["doc1", "doc2", "doc3"],
             documents=[
@@ -61,7 +75,7 @@ class TestChromaSemanticService:
     async def test_search_specific_collection(self, user_context):
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        col = await client.get_or_create_collection(name="skills")
+        col = await client.get_or_create_collection(name="skills_v2")
         await col.add(
             ids=["s1"],
             documents=["Architecture patterns for cloud"],
@@ -76,7 +90,7 @@ class TestChromaSemanticService:
     async def test_search_empty_collection(self, user_context):
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        await client.get_or_create_collection(name="empty")
+        await client.get_or_create_collection(name="empty_v2")
         service = ChromaSemanticService(client=client, default_collections=["empty"])
         results = await service.search(user_context, "anything", k=4)
         assert results == []
@@ -94,11 +108,11 @@ class TestChromaSemanticService:
     async def test_search_across_multiple_collections(self, user_context):
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        col1 = await client.get_or_create_collection(name="decisions")
+        col1 = await client.get_or_create_collection(name="decisions_v2")
         await col1.add(
             ids=["d1"], documents=["ADR content"], metadatas=[{"source": "adr"}]
         )
-        col2 = await client.get_or_create_collection(name="skills")
+        col2 = await client.get_or_create_collection(name="skills_v2")
         await col2.add(
             ids=["s1"], documents=["Skill content"], metadatas=[{"source": "skill"}]
         )
@@ -114,7 +128,7 @@ class TestChromaSemanticService:
         different user_id must be invisible."""
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        col = await client.get_or_create_collection(name="decisions")
+        col = await client.get_or_create_collection(name="decisions_v2")
         await col.add(
             ids=["mine", "theirs", "untagged"],
             documents=[
@@ -144,7 +158,7 @@ class TestChromaSemanticService:
         """Admin sees every row regardless of ``user_id`` metadata."""
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        col = await client.get_or_create_collection(name="decisions")
+        col = await client.get_or_create_collection(name="decisions_v2")
         await col.add(
             ids=["mine", "theirs"],
             documents=[
@@ -219,7 +233,7 @@ class TestUserScopedSemanticService:
         """Chroma client seeded with two users' docs + one untagged row."""
         factory = MockChromaDBFactory()
         client = await factory.get_client()
-        col = await client.get_or_create_collection(name="decisions")
+        col = await client.get_or_create_collection(name="decisions_v2")
         await col.add(
             ids=["alice1", "bob1", "legacy"],
             documents=[

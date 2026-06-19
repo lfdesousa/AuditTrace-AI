@@ -7,7 +7,20 @@ from io import BytesIO
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def _mock_nomic_embed(monkeypatch):
+    """ADR-047 — /memory/index vectorises chunks on the nomic server via
+    ``_upsert_in_batches``. Stub it so these route tests stay offline; the
+    mock ChromaDB ignores the supplied embeddings anyway."""
+    monkeypatch.setattr(
+        "audittrace.routes.memory.embed_via_nomic",
+        AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+    )
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

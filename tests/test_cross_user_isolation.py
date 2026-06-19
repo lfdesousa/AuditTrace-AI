@@ -45,6 +45,8 @@ Phase 5b, which depends on Phase 7 Keycloak operator setup.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 # Import memory-handler module so @register_memory_tool decorators
@@ -68,6 +70,18 @@ from audittrace.tools.cache import (
     reset_tool_result_cache,
     set_tool_result_cache,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_nomic_embed(monkeypatch):
+    """ADR-047 — semantic search/upsert vectorise on the nomic server. Stub
+    it so these isolation tests stay offline; the mock ChromaDB matches on
+    metadata (the user_id `where` filter), not on the embedding vector."""
+    monkeypatch.setattr(
+        "audittrace.services.semantic.embed_via_nomic",
+        AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+    )
+
 
 # ─────────────────────────── Two-user fixtures ──────────────────────────────
 
@@ -237,7 +251,7 @@ class TestCrossUserIsolation:
         Chroma query. Alice's docs are tagged with her user_id, Bob's
         with his; searching as alice returns only alice's rows."""
         client = await container._factories["chromadb"].get_client()
-        col = await client.get_or_create_collection(name="audittrace")
+        col = await client.get_or_create_collection(name="audittrace_v2")
         await col.add(
             ids=["a1", "b1", "legacy"],
             documents=[
@@ -273,7 +287,7 @@ class TestCrossUserIsolation:
         and ignores whatever user_context is passed at call time.
         Proves the Phase 4 'isolation by construction' property."""
         client = await container._factories["chromadb"].get_client()
-        col = await client.get_or_create_collection(name="audittrace")
+        col = await client.get_or_create_collection(name="audittrace_v2")
         await col.add(
             ids=["a1", "b1"],
             documents=[
@@ -425,7 +439,7 @@ class TestCrossUserIsolation:
         # inject mode still works. Seed tagged rows and verify admin
         # sees them all.
         client = await container._factories["chromadb"].get_client()
-        col = await client.get_or_create_collection(name="audittrace")
+        col = await client.get_or_create_collection(name="audittrace_v2")
         await col.add(
             ids=["a1", "b1"],
             documents=["alice cache", "bob cache"],

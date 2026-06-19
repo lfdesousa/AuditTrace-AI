@@ -312,6 +312,9 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
             "ai_research_papers",  # /memory/index?collections=ai_research_papers (PDF corpus, ADR-047 path)
             "scm_coursework",
         ],
+        # ADR-047 — vectors computed on the dedicated nomic embed server.
+        embed_url=settings.embed_url,
+        embed_model=settings.embed_model,
     )
 
     # Memory-layer manifest (CRUD backoffice — migration 009 + the

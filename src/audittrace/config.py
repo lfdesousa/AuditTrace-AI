@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     # LLM servers (external, on host machine)
     llama_url: str = "http://host.docker.internal:11435/v1"
     embed_url: str = "http://host.docker.internal:11436/v1"
+    # ADR-047 — embedding always runs on the dedicated nomic-embed-server;
+    # the request gateway hosts no in-process model. 768-dim.
+    embed_model: str = "nomic-embed-text"
 
     # ChromaDB configuration (server mode — ADR-020)
     chroma_url: str = "http://localhost:8000"
@@ -134,7 +137,10 @@ class Settings(BaseSettings):
     # Memory tiering configuration
     memory_cache_ttl: int = 3600  # seconds
     memory_max_context_turns: int = 117000  # ~131k - system prompt - output buffer
-    memory_embedding_dim: int = 1024  # Nomic-embed-text default
+    # nomic-embed-text v1.5 dimension (server-side embedding, ADR-047).
+    # In-process fallback (all-MiniLM-L6-v2) is 384-dim. Informational —
+    # ChromaDB owns the on-disk vector width per collection.
+    memory_embedding_dim: int = 768
 
     # 4-layer memory: layers 1+2 are S3-only (MinIO) — no filesystem paths.
     # See feedback_storage_always_s3 for the durable rule (2026-05-03 sweep).

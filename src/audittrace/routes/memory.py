@@ -81,7 +81,7 @@ from audittrace.models import (
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
-from audittrace.services.embedder import SINGLETON_EMBEDDER
+from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.memory_manifest import ManifestEntry
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
@@ -388,6 +388,14 @@ async def upload_memory_file(
 # ── POST /memory/index ──────────────────────────────────────────────────────
 
 
+def _physical_collection(name: str) -> str:
+    """Physical ChromaDB collection name for the nomic (768-dim) generation
+    (ADR-047). The ``_v2`` suffix keeps it disjoint from the legacy
+    in-process (384-dim) collection, so re-indexing is non-destructive and
+    incremental — mirrors ChromaSemanticService._physical."""
+    return f"{name}_v2"
+
+
 async def _upsert_in_batches(
     collection: Any,
     ids: list[str],
@@ -401,13 +409,25 @@ async def _upsert_in_batches(
     a client looping per file can re-run the same call without
     duplicate-id errors. Splitting per file into _INDEX_BATCH_SIZE
     chunks bounds the in-flight payload size to ChromaDB.
+
+    ADR-047: chunk vectors are computed on the nomic server per batch and
+    supplied explicitly, so ChromaDB never embeds client-side. Both the
+    markdown and PDF index paths flow through here, so this one choke-point
+    covers both.
     """
+    settings = get_settings()
     for start in range(0, len(ids), _INDEX_BATCH_SIZE):
         end = min(start + _INDEX_BATCH_SIZE, len(ids))
+        batch_docs = documents[start:end]
         await collection.upsert(
             ids=ids[start:end],
-            documents=documents[start:end],
+            documents=batch_docs,
             metadatas=metadatas[start:end],
+            embeddings=await embed_via_nomic(
+                batch_docs,
+                embed_url=settings.embed_url,
+                model=settings.embed_model,
+            ),
         )
 
 
@@ -645,12 +665,16 @@ async def index_memory(
         # doesn't 500 (per ``feedback_use_context_managers``).
         # Tier-C #23 (ADR-056): dry-run preserves the existing
         # collection — no delete-and-recreate side-effect.
+        # ADR-047: write to the physical _v2 (768-dim) collection; ChromaDB
+        # never embeds client-side (embedding_function=None) — chunk vectors
+        # are computed on the nomic server in _upsert_in_batches.
+        physical_col = _physical_collection(col_name)
         if not single_file_mode and not dry_run:
             with contextlib.suppress(Exception):
-                await chroma_client.delete_collection(col_name)
+                await chroma_client.delete_collection(physical_col)
         collection = await chroma_client.get_or_create_collection(
-            name=col_name,
-            embedding_function=SINGLETON_EMBEDDER,
+            name=physical_col,
+            embedding_function=None,
         )
 
         chunk_count = 0
@@ -1221,7 +1245,9 @@ async def _merge_semantic_with_chroma(
     # list call would scale poorly past a few collections.
     target_cols: list[str]
     if collection is not None:
-        target_cols = [collection]
+        # ADR-047: a named (logical) collection resolves to its physical
+        # _v2 form; list_collections already yields physical names.
+        target_cols = [_physical_collection(collection)]
     else:
         try:
             target_cols = [c.name for c in await chroma.list_collections()][:5]
@@ -1231,9 +1257,11 @@ async def _merge_semantic_with_chroma(
 
     for col_name in target_cols:
         try:
+            # ADR-047: open with embedding_function=None (vectors are computed
+            # on the nomic server); this path only reads (col.get).
             col = await chroma.get_or_create_collection(
                 name=col_name,
-                embedding_function=SINGLETON_EMBEDDER,
+                embedding_function=None,
             )
             res = await col.get(
                 limit=_SEMANTIC_DISCOVERY_LIMIT,

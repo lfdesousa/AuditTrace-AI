@@ -19,7 +19,7 @@ from langchain_core.documents import Document
 from audittrace.db.factory import ChromaDBClient
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
-from audittrace.services.embedder import SINGLETON_EMBEDDER
+from audittrace.services.embedder import embed_via_nomic
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +86,32 @@ class ChromaSemanticService(SemanticService):
         self,
         client: ChromaDBClient,
         default_collections: list[str] | None = None,
+        *,
+        embed_url: str = "",
+        embed_model: str = "nomic-embed-text",
     ):
         self._client = client
         self._default_collections = default_collections or ["audittrace"]
+        # ADR-047 — vectors are always computed on the dedicated nomic
+        # server; collections are opened with embedding_function=None so
+        # ChromaDB never embeds client-side.
+        self._embed_url = embed_url
+        self._embed_model = embed_model
+
+    async def _embed_one(self, text: str) -> list[float]:
+        """Vectorise a single string on the nomic server."""
+        vectors = await embed_via_nomic(
+            [text], embed_url=self._embed_url, model=self._embed_model
+        )
+        return vectors[0]
+
+    @staticmethod
+    def _physical(name: str) -> str:
+        """Physical ChromaDB collection name for the nomic (768-dim)
+        generation. The ``_v2`` suffix keeps these disjoint from the legacy
+        in-process (384-dim) collections, so the cutover is non-destructive
+        and re-indexing is incremental (ADR-047)."""
+        return f"{name}_v2"
 
     @log_call(logger=logger)
     async def search(
@@ -116,13 +139,17 @@ class ChromaSemanticService(SemanticService):
         for col_name in target_collections:
             try:
                 collection = await self._client.get_or_create_collection(
-                    name=col_name, embedding_function=SINGLETON_EMBEDDER
+                    name=self._physical(col_name), embedding_function=None
                 )
                 count = await collection.count()
                 if count == 0:
                     continue
+                # Vectorise the query on the nomic server; an embed failure
+                # raises EmbeddingServerError, which the surrounding except
+                # degrades to "no hits for this collection" (same posture as
+                # a Chroma failure).
                 query_kwargs: dict[str, Any] = {
-                    "query_texts": [query],
+                    "query_embeddings": [await self._embed_one(query)],
                     "n_results": min(k, count),
                     "include": ["documents", "metadatas"],
                 }
@@ -170,10 +197,17 @@ class ChromaSemanticService(SemanticService):
         meta = dict(metadata or {})
         meta.setdefault("user_id", user_context.user_id)
         col = await self._client.get_or_create_collection(
-            name=collection, embedding_function=SINGLETON_EMBEDDER
+            name=self._physical(collection), embedding_function=None
         )
         # ChromaDB's `upsert` is exactly what we want — insert or replace.
-        await col.upsert(ids=[document_id], documents=[text], metadatas=[meta])
+        # The vector is computed on the nomic server and supplied explicitly;
+        # an embed failure propagates so a write never silently drops the doc.
+        await col.upsert(
+            ids=[document_id],
+            documents=[text],
+            embeddings=[await self._embed_one(text)],
+            metadatas=[meta],
+        )
 
     @log_call(logger=logger)
     async def delete_document(
@@ -184,7 +218,7 @@ class ChromaSemanticService(SemanticService):
     ) -> bool:
         del user_context  # operator-side write; not user-scoped
         col = await self._client.get_or_create_collection(
-            name=collection, embedding_function=SINGLETON_EMBEDDER
+            name=self._physical(collection), embedding_function=None
         )
         # ChromaDB's `delete` is silently idempotent (deleting a non-
         # existent ID does not raise). To return a faithful boolean we
@@ -204,7 +238,7 @@ class ChromaSemanticService(SemanticService):
     ) -> Document | None:
         del user_context  # operator-side read; admin scope gates the route
         col = await self._client.get_or_create_collection(
-            name=collection, embedding_function=SINGLETON_EMBEDDER
+            name=self._physical(collection), embedding_function=None
         )
         result = await col.get(ids=[document_id], include=["documents", "metadatas"])
         if not result.get("ids"):
