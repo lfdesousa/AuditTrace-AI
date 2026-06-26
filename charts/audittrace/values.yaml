@@ -123,19 +123,29 @@ memoryServer:
   port: 8765
   resources:
     requests:
-      cpu: 500m
-      memory: 512Mi
+      # Re-baselined post-ADR-047 (#334). ADR-047 moved embedding to the
+      # nomic server, so the memory-server no longer loads an in-process
+      # embedding model (onnxruntime + MiniLM retired). Over 7 days of
+      # real operation — spanning the full _v2 re-index (1272 chunks, the
+      # heaviest ingest workload) — the container's cgroup high-water mark
+      # was 241 MiB (idle ~189 MiB). Requests dropped from 500m/512Mi to
+      # reserve closer to the real working set so more replicas pack per
+      # node (feeds #296 g6e sizing); kept comfortably above the 241 MiB
+      # observed peak.
+      cpu: 250m
+      memory: 320Mi
     limits:
-      cpu: 2000m
-      # 4 GiB ceiling. Original 2 GiB OOMKilled (exit 137) the
-      # /memory/index route on live ai-knowledge ingest. After the
-      # streaming refactor + the ?file=<key> single-file API
-      # contract, peak working set during one PDF is bounded by
-      # pymupdf's parse-tree for that one file (≤19 MiB seen in
-      # corpus). Operators loop client-side per file rather than
-      # cramming a whole corpus into one request. Re-evaluate if a
-      # synchronous bulk path is reintroduced.
-      memory: 4Gi
+      cpu: 1000m
+      # 1 GiB ceiling (was 4 GiB). The 4 GiB was provisioned solely for
+      # the in-process MiniLM OOM (2 GiB OOMKilled /memory/index, exit
+      # 137). ADR-047 removed the in-process embedder entirely, so that
+      # OOM class is structurally impossible: chunk vectors are computed
+      # on the nomic server (embed_via_nomic) and supplied explicitly —
+      # ChromaDB never embeds client-side. Post-ADR-047 peak working set
+      # during one PDF is bounded by pymupdf's parse-tree (≤19 MiB seen)
+      # plus orchestration. 1 GiB is 4.2× the observed 7-day peak.
+      # Re-evaluate only if a synchronous in-process embed path returns.
+      memory: 1Gi
   env:
     AUDITTRACE_ENV: "local"
     AUDITTRACE_HOST: "0.0.0.0"

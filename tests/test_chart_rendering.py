@@ -226,14 +226,22 @@ class TestMemoryServerEntrypointSafety:
             f" Got command: {cmd}"
         )
 
-    def test_memory_limit_at_least_4gi(self) -> None:
-        """Regression guard for the 2026-05-06 OOMKilled (exit 137)
-        on /memory/index. The streaming refactor cut peak working
-        set substantially, but the safety floor for this pod is
-        ≥4 GiB so a burst of /memory/upload buffers + a hot embedder
-        + the ai_research_papers PDF rebuild can't drive RSS into
-        the limit again. If a future PR drops below this, the live
-        index path will start dying under realistic loads."""
+    def test_memory_limit_has_post_adr047_floor(self) -> None:
+        """Regression guard for the memory-server memory limit (#334).
+
+        History: the 2026-05-06 OOMKilled (exit 137) on /memory/index
+        forced a 4 GiB ceiling because the *in-process* embedder
+        (onnxruntime + MiniLM) loaded its model into the same RSS as a
+        PDF rebuild. ADR-047 moved embedding to the nomic server, so the
+        in-process embedder is gone entirely — chunk vectors are computed
+        on nomic (embed_via_nomic) and supplied explicitly; ChromaDB
+        never embeds client-side. The 4 GiB OOM class is structurally
+        impossible now. Re-baselined to a 1 GiB floor: over 7 days of
+        real operation (spanning the full _v2 re-index, the heaviest
+        ingest workload) the container's cgroup high-water mark was
+        241 MiB, so 1 GiB is 4.2× the observed peak. If a future PR drops
+        below this floor, the gate exists so the reduction is a
+        deliberate, reviewed decision rather than an accident."""
         import re as _re
 
         out = _render(["--set", "vault.enabled=true"])
@@ -255,12 +263,12 @@ class TestMemoryServerEntrypointSafety:
             "G": value * 1000,  # binary-vs-decimal slop is fine for the floor
             "M": value,
         }[unit]
-        assert mib >= 4 * 1024, (
+        assert mib >= 1 * 1024, (
             f"memory-server limit is {limit} (~{mib} MiB) — must be at "
-            f"least 4Gi to absorb one PDF's pymupdf parse-tree plus the "
-            f"warm embedder. Single-file ?file= mode is the contract; "
-            f"bulk synchronous indexing is intentionally not supported "
-            f"for the ai_research_papers collection (2026-05-06)."
+            f"least 1Gi (#334). Post-ADR-047 the in-process embedder is "
+            f"gone, so the old 4Gi OOM class can't recur; but 1Gi (4.2× "
+            f"the observed 241 MiB 7-day peak) is the reviewed floor so "
+            f"pymupdf parse + orchestration keeps generous headroom."
         )
 
 
