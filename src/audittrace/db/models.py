@@ -74,6 +74,14 @@ class SessionRecord(Base):
     summarized_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, index=True
     )
+    # #344 — OpenTelemetry trace_id (32-char hex) of the background
+    # summariser run that produced this row, so the persisted summary
+    # links back to its Tempo/Langfuse trace. The summariser sweep is a
+    # background task whose model call would otherwise surface as an
+    # unattributed orphan root span; capturing the trace_id closes the
+    # DB→trace correlation. NULL for rows written before this migration
+    # or when no span was active. Mirrors ``InteractionRecord.trace_id``.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
 
 class InteractionRecord(Base):

@@ -47,7 +47,8 @@ class TestSessionRecordSchema:
         inspector = inspect(engine)
         columns = {col["name"] for col in inspector.get_columns("sessions")}
         # user_id (Phase 0 multi-user identity) and summarized_at
-        # (ADR-030 Part 2 background summariser) are later additions.
+        # (ADR-030 Part 2 background summariser) are later additions;
+        # trace_id (#344) links a summary row to the summariser run's trace.
         assert columns == {
             "id",
             "project",
@@ -57,6 +58,7 @@ class TestSessionRecordSchema:
             "model",
             "user_id",
             "summarized_at",
+            "trace_id",
         }
 
     def test_primary_key_is_id(self, engine):

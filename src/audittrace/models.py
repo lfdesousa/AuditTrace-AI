@@ -264,6 +264,9 @@ class SessionListItem(BaseModel):
     model: str | None = None
     user_id: str | None = None
     summarized_at: str | None = None
+    # #344 — trace_id of the background summariser run that produced the row,
+    # so an audit-API reader can pivot to the Tempo/Langfuse trace.
+    trace_id: str | None = None
 
 
 class SessionListResponse(BaseModel):

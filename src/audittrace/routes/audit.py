@@ -204,6 +204,10 @@ def _session_row_to_dict(row: SessionRow) -> dict[str, Any]:
         "summarized_at": (
             row.summarized_at.isoformat() if row.summarized_at is not None else None
         ),
+        # #344 — trace_id of the background summariser run that produced this
+        # row, so a reader of the audit API can pivot straight to the Tempo/
+        # Langfuse trace of the summariser's model call.
+        "trace_id": row.trace_id,
     }
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -22,10 +23,12 @@ from sqlalchemy import func, select
 from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
 from audittrace.db.postgres import InMemoryPostgresFactory
+from audittrace.services import session_summarizer as ss_mod
 from audittrace.services.session_summarizer import (
     SessionSummarizer,
     _format_transcript,
     _parse_llm_response,
+    _span_trace_id_hex,
 )
 
 # ──────────────────────────── Helpers ────────────────────────────────
@@ -1107,3 +1110,151 @@ class TestPoisonPillHardening:
         s_owned._http_client = owned  # simulate lazy-created, owned client
         await s_owned._aclose_owned_client()
         owned.aclose.assert_awaited_once()
+
+
+# ──────────────────────── Trace attribution (#344) ───────────────────────
+
+
+class _RecordingSpan:
+    """Minimal context-manager span that records set_attribute calls and
+    returns a fixed trace_id, so we can assert attribution without standing
+    up a real OTel SDK TracerProvider (which is process-global and fragile
+    across the suite)."""
+
+    def __init__(self, trace_id_int: int, *, valid: bool = True) -> None:
+        self._trace_id_int = trace_id_int
+        self._valid = valid
+        self.attributes: dict[str, object] = {}
+
+    def set_attribute(self, key: str, value: object) -> None:
+        self.attributes[key] = value
+
+    def get_span_context(self):
+        return SimpleNamespace(trace_id=self._trace_id_int, is_valid=self._valid)
+
+    def __enter__(self) -> _RecordingSpan:
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+class _RecordingTracer:
+    def __init__(self, trace_id_int: int, *, valid: bool = True) -> None:
+        self.span = _RecordingSpan(trace_id_int, valid=valid)
+        self.span_names: list[str] = []
+
+    def start_as_current_span(self, name: str) -> _RecordingSpan:
+        self.span_names.append(name)
+        return self.span
+
+
+class TestSpanTraceIdHex:
+    """Unit coverage for the span→trace_id helper."""
+
+    def test_valid_context_returns_32_hex(self):
+        span = _RecordingSpan(0x0123456789ABCDEF0123456789ABCDEF, valid=True)
+        assert _span_trace_id_hex(span) == "0123456789abcdef0123456789abcdef"
+
+    def test_invalid_context_returns_none(self):
+        # Non-recording span (tracing disabled) → invalid ctx → never fabricate.
+        span = _RecordingSpan(0, valid=False)
+        assert _span_trace_id_hex(span) is None
+
+    def test_exception_returns_none(self):
+        class _Boom:
+            def get_span_context(self):
+                raise RuntimeError("no span context")
+
+        assert _span_trace_id_hex(_Boom()) is None
+
+
+class TestTraceAttribution:
+    """#344 — the background summariser must attribute its model call to the
+    user/session it condenses and persist the trace_id onto the SessionRecord,
+    so the row links back to its Tempo/Langfuse trace instead of an
+    unattributed orphan root span."""
+
+    _TID_INT = 0xABCDEF0123456789ABCDEF0123456789
+    _TID_HEX = "abcdef0123456789abcdef0123456789"
+
+    @pytest.mark.asyncio
+    async def test_span_attributed_and_trace_id_persisted(
+        self, seed_session_turns, monkeypatch
+    ):
+        tracer = _RecordingTracer(self._TID_INT)
+        monkeypatch.setattr(ss_mod, "_tracer", tracer)
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client(
+                summary="Capitals", key_points=["Paris", "Berlin"]
+            ),
+        )
+        assert await summariser.run_once() == 1
+
+        # The span was opened and attributed to the user/session/project.
+        assert "session.summarise" in tracer.span_names
+        assert tracer.span.attributes["langfuse.user.id"] == "user-1"
+        assert tracer.span.attributes["user.id"] == "user-1"
+        assert tracer.span.attributes["session.id"] == "sess-idle"
+        assert tracer.span.attributes["audittrace.project"] == "P"
+        assert tracer.span.attributes["langfuse.observation.type"] == "generation"
+
+        # The persisted row links back to that exact trace.
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
+            assert row.trace_id == self._TID_HEX
+            assert row.user_id == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_trace_id_null_when_no_recording_span(
+        self, seed_session_turns, monkeypatch
+    ):
+        """Tracing disabled (non-recording span) → trace_id left NULL rather
+        than fabricated; the summary is still written."""
+        tracer = _RecordingTracer(0, valid=False)
+        monkeypatch.setattr(ss_mod, "_tracer", tracer)
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        assert await summariser.run_once() == 1
+
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
+            assert row.trace_id is None
+            assert row.summarized_at is not None
+
+    @pytest.mark.asyncio
+    async def test_sentinel_overflow_also_persists_trace_id(
+        self, seed_session_turns, monkeypatch
+    ):
+        """The sentinel-overflow path is still part of the attributed span, so
+        the sentinel row must carry the trace_id too."""
+        tracer = _RecordingTracer(self._TID_INT)
+        monkeypatch.setattr(ss_mod, "_tracer", tracer)
+
+        summariser = SessionSummarizer(
+            settings=_settings(
+                summarizer_ctx_tokens=10,
+                summarizer_ctx_reserve_tokens=2,
+            ),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client_with_tokenize(tokens_per_call=999),
+        )
+        assert await summariser.run_once() == 1
+
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one()
+            assert row.model == "sentinel-skip-ctx-overflow-auto"
+            assert row.trace_id == self._TID_HEX
