@@ -41,7 +41,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -49,6 +49,14 @@ from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
 
 logger = logging.getLogger(__name__)
+
+# #344 — the background sweep runs with no inbound request, so without an
+# explicit span its model call surfaces as an unattributed orphan root
+# trace. Open one span per session, attributed to the user/session it
+# condenses (mirrors the request-path LLM spans). ``get_tracer`` returns a
+# proxy that resolves the global TracerProvider lazily, so this works
+# whether or not tracing is configured (no-op span when it is not).
+_tracer = trace.get_tracer(__name__)
 
 # Backlog #10 — counter for ctx-overflow handling.
 # Label `branch` ∈ {"truncate", "sentinel"} so the operator can tell ordinary
@@ -284,52 +292,65 @@ class SessionSummarizer:
     # ── per-session work ───────────────────────────────────────────────
 
     async def _summarise_one(self, es: EligibleSession) -> None:
-        turns = await self._fetch_turns(es)
-        if not turns:
-            logger.warning(
-                "session summariser: 0 turns for session=%s — skipping",
-                es.session_id,
-            )
-            return
+        # #344 — open an attributed span for the whole per-session unit so
+        # the LLM call (and its HTTPX client span) nests under a trace that
+        # carries the user/session it condenses, instead of an anonymous
+        # orphan root. The captured trace_id is persisted onto the
+        # SessionRecord so the row links back to its trace.
+        with _tracer.start_as_current_span("session.summarise") as span:
+            span.set_attribute("langfuse.user.id", es.user_id)
+            span.set_attribute("user.id", es.user_id)
+            span.set_attribute("session.id", es.session_id)
+            span.set_attribute("audittrace.project", es.project)
+            span.set_attribute("langfuse.observation.type", "generation")
+            trace_id = _span_trace_id_hex(span)
 
-        # Backlog #10 — pre-flight ctx guard. Before sending the prompt,
-        # check it fits in the summariser's ctx window. If not, drop oldest
-        # turns until it does ("truncate" branch). If even one turn is
-        # bigger than ctx by itself, write a sentinel SessionRecord so the
-        # row leaves the eligibility set ("sentinel" branch) rather than
-        # looping every cycle on an HTTP 400.
-        prompt, dropped = await self._fit_prompt_to_ctx(turns)
-        if prompt is None:
-            await self._persist_sentinel_overflow(es, len(turns))
-            _ctx_overflow_counter.add(1, {"branch": "sentinel"})
-            return
+            turns = await self._fetch_turns(es)
+            if not turns:
+                logger.warning(
+                    "session summariser: 0 turns for session=%s — skipping",
+                    es.session_id,
+                )
+                return
 
-        raw = await self._call_llm(prompt)
-        parsed = _parse_llm_response(raw)
-        if parsed is None:
-            # JSON parse failed — leave summarized_at NULL so the row
-            # is retried next cycle. No partial write.
-            logger.warning(
-                "session summariser: malformed JSON response for session=%s",
-                es.session_id,
-            )
-            return
+            # Backlog #10 — pre-flight ctx guard. Before sending the prompt,
+            # check it fits in the summariser's ctx window. If not, drop oldest
+            # turns until it does ("truncate" branch). If even one turn is
+            # bigger than ctx by itself, write a sentinel SessionRecord so the
+            # row leaves the eligibility set ("sentinel" branch) rather than
+            # looping every cycle on an HTTP 400.
+            prompt, dropped = await self._fit_prompt_to_ctx(turns)
+            if prompt is None:
+                await self._persist_sentinel_overflow(es, len(turns), trace_id)
+                _ctx_overflow_counter.add(1, {"branch": "sentinel"})
+                return
 
-        if dropped > 0:
-            # Surface the truncation to the operator via the persisted
-            # summary so audit consumers see what was elided.
-            note = (
-                f"[truncated: oldest {dropped} of {len(turns)} turns omitted, "
-                f"summariser ctx={self._settings.summarizer_ctx_tokens}]"
-            )
-            existing = parsed.get("summary") or ""
-            parsed = {
-                **parsed,
-                "summary": f"{note} {existing}".strip(),
-            }
-            _ctx_overflow_counter.add(1, {"branch": "truncate"})
+            raw = await self._call_llm(prompt)
+            parsed = _parse_llm_response(raw)
+            if parsed is None:
+                # JSON parse failed — leave summarized_at NULL so the row
+                # is retried next cycle. No partial write.
+                logger.warning(
+                    "session summariser: malformed JSON response for session=%s",
+                    es.session_id,
+                )
+                return
 
-        await self._persist(es, parsed)
+            if dropped > 0:
+                # Surface the truncation to the operator via the persisted
+                # summary so audit consumers see what was elided.
+                note = (
+                    f"[truncated: oldest {dropped} of {len(turns)} turns omitted, "
+                    f"summariser ctx={self._settings.summarizer_ctx_tokens}]"
+                )
+                existing = parsed.get("summary") or ""
+                parsed = {
+                    **parsed,
+                    "summary": f"{note} {existing}".strip(),
+                }
+                _ctx_overflow_counter.add(1, {"branch": "truncate"})
+
+            await self._persist(es, parsed, trace_id)
 
     async def _fit_prompt_to_ctx(
         self, turns: Sequence[InteractionRecord]
@@ -477,7 +498,7 @@ class SessionSummarizer:
         return len(tokens)
 
     async def _persist_sentinel_overflow(
-        self, es: EligibleSession, turn_count: int
+        self, es: EligibleSession, turn_count: int, trace_id: str | None = None
     ) -> None:
         """Write a sentinel SessionRecord for a session whose latest single
         turn exceeds ctx_size. Marks ``summarized_at`` so the row leaves
@@ -511,6 +532,7 @@ class SessionSummarizer:
                             model="sentinel-skip-ctx-overflow-auto",
                             user_id=es.user_id,
                             summarized_at=now,
+                            trace_id=trace_id,
                         )
                     )
                 else:
@@ -519,6 +541,7 @@ class SessionSummarizer:
                     existing.date = now.isoformat()
                     existing.model = "sentinel-skip-ctx-overflow-auto"
                     existing.summarized_at = now
+                    existing.trace_id = trace_id
                 await db.commit()
                 logger.warning(
                     "session summariser: sentinel-skip session=%s user=%s "
@@ -552,6 +575,7 @@ class SessionSummarizer:
         self,
         es: EligibleSession,
         parsed: dict[str, Any],
+        trace_id: str | None = None,
     ) -> None:
         """Upsert SessionRecord under the session's user's GUC."""
         async with self._session_factory() as db:
@@ -585,6 +609,7 @@ class SessionSummarizer:
                             model=self._settings.summarizer_model,
                             user_id=es.user_id,
                             summarized_at=now,
+                            trace_id=trace_id,
                         )
                     )
                 else:
@@ -593,6 +618,7 @@ class SessionSummarizer:
                     existing.date = now.isoformat()
                     existing.model = self._settings.summarizer_model
                     existing.summarized_at = now
+                    existing.trace_id = trace_id
                 await db.commit()
                 logger.info(
                     "session summariser: wrote summary session=%s user=%s kp=%d",
@@ -674,6 +700,24 @@ class SessionSummarizer:
 
 
 # ──────────────────────────── Pure helpers ───────────────────────────────
+
+
+def _span_trace_id_hex(span: Any) -> str | None:
+    """Return ``span``'s trace_id as a 32-char hex string, or ``None``.
+
+    #344 — reads the trace_id straight off the span object (not the ambient
+    context) so the caller can persist it onto the SessionRecord. Returns
+    ``None`` when the span context is invalid — i.e. tracing is disabled and
+    the tracer handed back a non-recording span — so we never fabricate an
+    id. Mirrors ``chat.py::_current_trace_id_hex`` but span-scoped.
+    """
+    try:
+        ctx = span.get_span_context()
+        if ctx is not None and getattr(ctx, "is_valid", False):
+            return format(ctx.trace_id, "032x")
+    except Exception:  # pragma: no cover - defensive instrumentation read
+        return None
+    return None
 
 
 def _coerce_datetime(value: Any) -> datetime | None:

@@ -494,6 +494,11 @@ components:
           - type: string
           - type: 'null'
           title: Summary
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
         user_id:
           anyOf:
           - type: string
