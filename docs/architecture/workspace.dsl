@@ -5,245 +5,203 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
     model {
 
         // Actors
-        agent = person "Coding Agent" "OpenCode, Roo Code, Continue — any OpenAI-compatible client"
-        architect = person "Luis Filipe" "Solutions Architect — configures memory layers and ADRs"
-        humanUser = person "Human User" "Browser-capable human authenticating via OAuth2 Device Flow (RFC 8628, ADR-032) so every agent request carries a real Keycloak sub on the audit trail instead of the flat dev-client identity"
+        agent = person "Coding Agent" "OpenCode / Roo Code / Continue (OpenAI-compatible)"
+        architect = person "Luis Filipe" "Solutions Architect"
+        humanUser = person "Human User" "OAuth2 Device Flow login (ADR-032)"
 
         // External systems
-        vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (KV v2 + K8s auth) — replaces env-var/Secret-rendered passwords for production deploys (ADR-043). Sub-chart bundled by deliberate ADR-045 §Rule 1 exception." {
+        vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (ADR-043)" {
             tags "External"
         }
-        llamaServer = softwareSystem "Chat LLM Server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE, ~3B active per token) on :11435 — chat + tool-loop reasoning (GPU, ROCm). MoE prompt-eval is materially faster than dense 27B Q4 on consumer GPU at the 5–15K-token prompts OpenCode produces, which is why we swapped back from 27B on 2026-05-01." {
+        llamaServer = softwareSystem "Chat LLM Server" "Reasoning — Qwen 3.6-35B-A3B MoE, :11435 (GPU)" {
             tags "External"
         }
-        embedServer = softwareSystem "Embedding Server (intended — cutover pending)" "nomic-embed-text v1.5 Q8_0 on :11436 (768-dim), CPU-only. DEPLOYED + running as the INTENDED embedder (ADR-030, three-model dev topology). NOT yet on the code path: the shipped code still embeds IN-PROCESS via ONNX all-MiniLM-L6-v2 (384-dim — see Embedder), after an OOM with ChromaDB's stock embedder. Cutover to this server = ADR-047 (Accepted, in progress): move embedding off the request path. Q8 quant because embedding quality is quant-sensitive; CPU-only because ChromaDB queries are off the user-facing critical path." {
+        embedServer = softwareSystem "Embedding Server (nomic)" "Embeddings — nomic-embed-text v1.5, :11436 (live, ADR-047)" {
             tags "External"
         }
-        summarizerServer = softwareSystem "Summariser LLM Server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 — background session summarisation, strict-JSON output (GPU, EU-origin) (ADR-030)" {
+        summarizerServer = softwareSystem "Summariser LLM Server" "Background summaries — Mistral 7B, :11437 (ADR-030)" {
             tags "External"
         }
-        langfuse = softwareSystem "Langfuse" "Observability — traces, spans, metrics (sibling stack)" {
+        langfuse = softwareSystem "Langfuse" "Observability — traces + spans" {
             tags "External"
         }
-        keycloak = softwareSystem "Keycloak" "Identity provider — owns users/roles/scopes; issues OIDC JWTs via both client_credentials (service accounts, ADR-022) AND OAuth2 Device Authorization Grant (human users, RFC 8628, ADR-032). Public client audittrace-opencode serves the Device Flow path; audittrace-dev serves the CI / smoke-test path. In M2+ deployments brokers to an Organisational IdP (ADR-044) via OIDC; the broker shadow user is the realm's identity, the realm key is the JWT signer." {
+        keycloak = softwareSystem "Keycloak" "Identity provider — OIDC JWTs (ADR-022/032)" {
             tags "External"
         }
-        organisationalIdP = softwareSystem "Organisational IdP" "Customer-side OIDC issuer (Microsoft Entra ID, Okta, Google Workspace, Ping Identity, Auth0, ...). Source-of-truth for employee identity, group membership, MFA, and deprovisioning. Brokered through Keycloak per ADR-044; never directly contacted by memory-server. Optional dependency — laptop-first / POC deployments run with Keycloak as the only IdP." {
+        organisationalIdP = softwareSystem "Organisational IdP" "Customer OIDC issuer, brokered (ADR-044)" {
             tags "External"
         }
-        euLotl = softwareSystem "EU List of Trusted Lists" "EU Commission's eu-lotl.xml + member-state national TSLs — XAdES-signed registry of qualified-signature trust service providers. Hit transiently by EuLotlTrustStoreBuilder during admin-endpoint refresh; not a standing runtime dependency (ADR-052). pyhanko's [etsi] extra ships the LOTL bootstrap signing keys, so no out-of-band cert vendoring is required." {
+        euLotl = softwareSystem "EU List of Trusted Lists" "EU trust-list registry for PAdES (ADR-052)" {
             tags "External"
         }
-
-        observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki + OTel Collector — metrics aggregation, log search, dashboards (ADR-028)" {
+        observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki (ADR-028)" {
             tags "External"
         }
-        opencodeProxy = softwareSystem "OpenCode TLS Proxy" "Caddy 2.6 reverse proxy on 127.0.0.1:11434 — listens plain HTTP on loopback, forwards over verified TLS to Istio Gateway (cert pinned to ~/.config/audittrace/ca.crt). Workaround for Bun 1.3.x: OpenCode's compiled-binary fetch() does not honour NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / OS trust store, so the loopback hop is the minimum-scope way to keep TLS verification on without disabling it globally. Loopback hop is plain but JWT still authenticates, so identity guarantees are preserved. Removed once Bun fixes upstream." {
+        opencodeProxy = softwareSystem "OpenCode TLS Proxy" "Caddy loopback → TLS (Bun fetch workaround)" {
             tags "External"
         }
-
-        // ADR-048 ingestion content-control (PR-B1 lands as peer; full
-        // L2/L3 view lives in the audittrace-content-control repo's
-        // workspace.dsl). Ninth named dependency per ADR-041 — separate
-        // pod, separate ServiceAccount, separate Vault path, separate
-        // MinIO IAM role. Memory-server PUTs to a quarantine prefix
-        // that content-control reads; verdicts ride RabbitMQ (ADR-057).
-        contentControl = softwareSystem "audittrace-content-control" "Reads quarantined uploads from MinIO, scans for malware (ClamAV default; ICAP / cloud / sandbox alternatives), publishes verdicts via RabbitMQ. Promotes clean objects to episodic/papers/. Refuses-by-default when scanner unavailable. Lives in a separate private repo (lfdesousa/audittrace-content-control) and ships as a sibling Helm chart." {
+        contentControl = softwareSystem "audittrace-content-control" "Scans uploads, publishes verdicts (ADR-048)" {
             tags "External"
         }
-
-        // ADR-057 — AMQP broker for ADR-048 scan-control. Tenth named
-        // dependency per ADR-041. Topic exchanges + quorum queues +
-        // DLX. Topology bootstrapped post-install by
-        // templates/rabbitmq/job-amqp-topology-bootstrap.yaml. ADR-046
-        // chat persistence does NOT use this broker — it stays on
-        // Redis Streams (different domain, separate brokers fine).
-        rabbitmq = softwareSystem "RabbitMQ Broker" "Bitnami subchart, single-node dev / 3-replica quorum-queue cluster prod (ADR-057). Carries scan-control messages between memory-server and audittrace-content-control. Topic exchanges: audittrace.scan / audittrace.scan.verdicts / audittrace.scan.audit / audittrace.scan.dlx. Quorum queues with x-delivery-limit=5 + DLX. mTLS via Istio on port 5672." {
+        rabbitmq = softwareSystem "RabbitMQ Broker" "Scan-control messaging (ADR-057)" {
             tags "External"
         }
 
         // The system
-        memoryServer = softwareSystem "audittrace-server" "Transparent augmentation proxy with 4-layer memory + Keycloak-delegated identity" {
+        memoryServer = softwareSystem "audittrace-server" "Augmentation proxy — 4-layer memory + delegated identity" {
 
-            api = container "FastAPI Application" "OpenAI-compatible API + /context endpoint" "Python / FastAPI / uvicorn" {
+            api = container "FastAPI Application" "OpenAI-compatible API + /context" "Python / FastAPI" {
 
-                chatRoute = component "Chat Route" "/v1/chat/completions — async raw-dict pass-through; branches on memory_mode={inject|tools} (ADR-024, ADR-025)" "FastAPI Router"
-                contextRoute = component "Context Route" "/context — retrieve assembled context" "FastAPI Router"
+                chatRoute = component "Chat Route" "/v1/chat/completions (inject|tools)" "FastAPI Router"
+                contextRoute = component "Context Route" "/context" "FastAPI Router"
                 healthRoute = component "Health Route" "/health, /metrics" "FastAPI Router"
 
-                // Identity layer (DESIGN §15) — replaces the Phase 0/1 PAT model
-                requireUser = component "require_user" "FastAPI dependency: validates Keycloak JWT via JWKS, accepts iss from the union of keycloak_issuer + keycloak_issuer_extras (ADR-032 §2 — lets Device-Flow tokens on the Istio-exposed issuer coexist with service-account tokens on the internal issuer), returns typed UserContext (DESIGN §15)" "auth.py"
-                tokenCache = component "TokenCache" "sha256(token) → UserContext, TTL eviction, Redis-backed (DESIGN §15.4)" "identity.py"
-                requireScope = component "require_scope (legacy)" "JWT scope check returning raw payload dict (ADR-022, ADR-023)" "auth.py"
+                requireUser = component "require_user" "Validates Keycloak JWT → UserContext" "auth.py"
+                tokenCache = component "TokenCache" "sha256(token) → UserContext, Redis-backed" "identity.py"
+                requireScope = component "require_scope (legacy)" "JWT scope check (ADR-022)" "auth.py"
 
-                // Memory layers (inject mode + shared by tools mode handlers)
-                contextBuilder = component "ContextBuilderService" "Aggregates all 4 memory layers (inject mode). In tools mode: build_ambient_context with intent-based selection rules guiding the LLM to pick ONE tool per question (ADR-025 Accepted)" "ABC + DefaultContextBuilder"
-                episodicSvc = component "EpisodicService" "Layer 1 — ADR markdown loading from MinIO (ADR-027)" "ABC + S3EpisodicService (File fallback for tests)"
-                proceduralSvc = component "ProceduralService" "Layer 2 — SKILL file loading from MinIO (ADR-027)" "ABC + S3ProceduralService (File fallback for tests)"
-                conversationalSvc = component "ConversationalService" "Layer 3 — PostgreSQL sessions (ADR-020)" "ABC + PostgresConversationalService"
-                semanticSvc = component "SemanticService" "Layer 4 — ChromaDB vector search" "ABC + ChromaSemanticService"
-                embedder = component "Embedder (in-process)" "ONNX all-MiniLM-L6-v2, 384-dim, module-level singleton (SINGLETON_EMBEDDER) passed as ChromaDB embedding_function on every collection (semantic search + /memory index). Computes query + index vectors INSIDE memory-server (CPU); ChromaDB only stores/searches the vectors and never calls out. (services/embedder.py)" "ONNX Runtime"
+                contextBuilder = component "ContextBuilderService" "Aggregates the 4 memory layers (ADR-025)" "DefaultContextBuilder"
+                episodicSvc = component "EpisodicService" "Layer 1 — ADRs from MinIO (ADR-027)" "S3EpisodicService"
+                proceduralSvc = component "ProceduralService" "Layer 2 — SKILLs from MinIO (ADR-027)" "S3ProceduralService"
+                conversationalSvc = component "ConversationalService" "Layer 3 — PostgreSQL sessions (ADR-020)" "PostgresConversationalService"
+                semanticSvc = component "SemanticService" "Layer 4 — ChromaDB vector search" "ChromaSemanticService"
+                embedder = component "Nomic Embed Client" "httpx → nomic /v1/embeddings (ADR-047); peer.service=nomic-embed-server" "httpx / OTel-instrumented"
 
-                // Memory-as-tools (ADR-025) — dynamic registry + tool-call loop
-                memoryToolRegistry = component "MemoryToolRegistry" "Decorator-based registry (@register_memory_tool). tools_visible_to(user) scope filter. invoke_tool cache-aware dispatch. Optional TOML overlay (ADR-025)" "tools/__init__.py"
-                memoryHandlers = component "Memory Tool Handlers" "recall_decisions, recall_skills, recall_recent_sessions, recall_semantic — thin adapters to the 4 services, canonical {matches, total, truncated} result schema" "tools/memory_handlers.py"
-                toolResultCache = component "ToolResultCache" "sha256(session|tool|args) → result dict, TTL eviction, Redis-backed, namespace audittrace:tool-result:, disjoint from TokenCache (ADR-025 §Decision.8)" "tools/cache.py"
-                memoryToolLoop = component "Memory Tool-Call Loop" "Proxy-internal non-streaming round-trip: dispatch → llama → tool_calls → execute selected memory tool → repeat. LLM selects ONE tool per question via ambient context selection rules. Bounded by AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS. Produces PendingToolCall audit records (ADR-025 Accepted)" "routes/_memory_tool_loop.py"
+                memoryToolRegistry = component "MemoryToolRegistry" "Scope-filtered tool registry (ADR-025)" "tools/__init__.py"
+                memoryHandlers = component "Memory Tool Handlers" "recall_decisions / skills / sessions / semantic" "tools/memory_handlers.py"
+                toolResultCache = component "ToolResultCache" "Tool-result cache, Redis-backed (ADR-025)" "tools/cache.py"
+                memoryToolLoop = component "Memory Tool-Call Loop" "dispatch → llama → tool → repeat (ADR-025)" "routes/_memory_tool_loop.py"
 
-                // Background summarisation (ADR-030)
-                sessionSummarizer = component "SessionSummarizer" "Background asyncio task — every AUDITTRACE_SUMMARIZER_INTERVAL_MINUTES picks idle sessions (last interaction > AUDITTRACE_SUMMARIZER_IDLE_MINUTES) via FOR UPDATE SKIP LOCKED, calls the summariser LLM with strict-JSON response_format, writes SessionRecord rows. Sets app.current_user_id GUC per-session for RLS attribution (ADR-030)" "services/session_summarizer.py"
+                sessionSummarizer = component "SessionSummarizer" "Scheduled sweep: every 5 min, idle > 15 min → summariser LLM (ADR-030)" "services/session_summarizer.py"
 
-                // Async chat-completion persistence (ADR-046)
-                asyncPersistConsumer = component "AsyncPersistConsumer" "Background asyncio task — XREADGROUP from audittrace:persist:stream under consumer-${HOSTNAME} in the audittrace-persisters group. Per iteration: XPENDING+XCLAIM idle entries (steals from dead consumers, bumps delivery_count), XREADGROUP > for new entries, deserialise → _persist_interaction → XACK. Poison messages (parse fail or delivery_count > max_deliveries) move to audittrace:persist:dlq + XACK. Multi-pod safe via Redis consumer-group routing — each entry goes to exactly one consumer (ADR-046 §3, §4)" "services/async_persist.py"
-                asyncPersistProducer = component "AsyncPersistProducer" "Per-request opt-in path. Triggered when X-Persist-Mode: async + async_persist_enabled. XADDs the InteractionRecord kwargs + pending tool_calls to audittrace:persist:stream and returns immediately. On any Redis failure falls back to sync _persist_interaction so the audit invariant is preserved (ADR-046 §3)" "services/async_persist.py + routes/chat.py"
+                asyncPersistConsumer = component "AsyncPersistConsumer" "Redis-stream consumer → persist (ADR-046)" "services/async_persist.py"
+                asyncPersistProducer = component "AsyncPersistProducer" "Opt-in async persist via Redis stream (ADR-046)" "services/async_persist.py"
 
-                // Plumbing
-                diContainer = component "DependencyContainer" "DI — registers factories and services" "Python"
-                pgFactory = component "PostgresFactory" "Connection pooling + session management (ADR-020)" "ABC + URLPostgresFactory"
-                telemetry = component "Telemetry" "OTel spans + Langfuse SDK routing (ADR-024 §15.x)" "telemetry.py + logging_config.py"
+                diContainer = component "DependencyContainer" "DI — factories + services" "Python"
+                pgFactory = component "PostgresFactory" "Connection pooling (ADR-020)" "URLPostgresFactory"
+                telemetry = component "Telemetry" "OTel spans + Langfuse SDK (ADR-024)" "telemetry.py"
 
-                // PAdES trust store (ADR-052 — pluggable Provider + Builder)
-                adminRoute = component "Admin Route" "/admin/trust-store/refresh — operator-explicit trust-store refresh (scope: audittrace:admin). Synchronously invokes Builder.build() then Provider.store() and invalidates the in-process ValidationContext singleton. Also called once by the Helm post-install hook Job (ADR-052 §5)." "FastAPI Router (routes/admin.py)"
-                trustStoreProvider = component "TrustStoreProvider" "Where the PEM bundle lives. Pluggable storage layer — default S3TrustStoreProvider (MinIO at memory-shared/trust-store/eu-lotl-bundle.pem). MockTrustStoreProvider for tests. VaultTrustStoreProvider in ABC contract (future). ADR-052 §2." "ABC + S3TrustStoreProvider (Mock fallback for tests)"
-                trustStoreBuilder = component "TrustStoreBuilder" "Where the PEM bundle comes from. Pluggable sourcing layer — default EuLotlTrustStoreBuilder (pyhanko[etsi] lotl_to_registry, filters QC for ESig/ESeal). StaticTrustStoreBuilder (concat operator-supplied PEMs) for air-gapped deploys + tests. AdobeAATLTrustStoreBuilder + CefDssSidecarBuilder in ABC contract (future). ADR-052 §3." "ABC + EuLotlTrustStoreBuilder (+ StaticTrustStoreBuilder)"
+                adminRoute = component "Admin Route" "/admin/trust-store/refresh (ADR-052)" "routes/admin.py"
+                trustStoreProvider = component "TrustStoreProvider" "Where the PEM lives — S3 default (ADR-052)" "S3TrustStoreProvider"
+                trustStoreBuilder = component "TrustStoreBuilder" "Where the PEM comes from — EU LOTL (ADR-052)" "EuLotlTrustStoreBuilder"
             }
 
-            postgresDb = container "PostgreSQL 16" "Audit trail (interactions, sessions, tool_calls) — user_id is Keycloak sub, no local users table" "PostgreSQL" {
+            postgresDb = container "PostgreSQL 16" "Audit trail — interactions, sessions, tool_calls" "PostgreSQL" {
                 tags "Database"
             }
-            chromaDb = container "ChromaDB Server" "Vector store — decisions, skills collections — token auth" "ChromaDB HTTP Server" {
+            chromaDb = container "ChromaDB Server" "Vector store — token auth" "ChromaDB" {
                 tags "Database"
             }
-            redisCache = container "Redis 7" "Shared cache + streams. Cache namespaces: audittrace:token:* (TokenCache, DESIGN §15.4), audittrace:tool-result:* (ToolResultCache, ADR-025 §Decision.8). Streams: audittrace:persist:stream + audittrace:persist:dlq (ADR-046 — async chat persistence + DLQ)." "Redis" {
+            redisCache = container "Redis 7" "Cache + streams — tokens, tool-results, persist" "Redis" {
                 tags "Database"
             }
-            minioStore = container "MinIO" "S3-compatible object storage — memory-shared (ADRs, skills) + memory-private (per-user knowledge). SSE-S3 encryption at rest (ADR-027)" "MinIO" {
+            minioStore = container "MinIO" "S3 object storage — shared + per-user (ADR-027)" "MinIO" {
                 tags "Database"
             }
         }
 
         // Relationships — system level
-        humanUser -> keycloak "Interactive Device Flow login via browser (client_id=audittrace-opencode) — ADR-032" "HTTPS/OIDC"
-        humanUser -> organisationalIdP "Interactive login via the customer's existing IdP — only when M2 brokering is configured (ADR-044). Sees the upstream IdP's login UI; lands as a Keycloak shadow user via JIT provisioning." "HTTPS/OIDC"
-        keycloak -> organisationalIdP "OIDC broker handshake — discovery, signature validation against upstream JWKS, attribute mapping per ADR-044 §4. Keycloak signs the downstream JWT with its own realm key; storeToken=false." "HTTPS/OIDC"
-        humanUser -> agent "Launches via scripts/opencode-wrapper.sh (Bearer merged into ~/.config/opencode/config.json)" "CLI"
-        agent -> keycloak "Token refresh + service-account client_credentials (audittrace-dev)" "HTTPS/OIDC"
-        agent -> opencodeProxy "OpenCode-only path: POST /v1/chat/completions (Bearer JWT) — plain HTTP on 127.0.0.1:11434" "HTTP/JSON"
-        opencodeProxy -> api "Forwards over verified TLS, Host=audittrace.local, cert pinned to local CA bundle" "HTTPS/JSON"
-        agent -> api "Direct path for non-OpenCode clients (Continue, Roo Code, curl) — full TLS at the client" "HTTPS/JSON"
-        architect -> minioStore "Uploads ADRs + skills via seed-memory.py (ADR-027)"
-        api -> llamaServer "Proxies augmented request (async, streaming)" "HTTP/SSE"
-        api -> keycloak "Fetch JWKS public keys (cached 5 min)" "HTTP/JSON"
-        api -> langfuse "Exports traces via Langfuse SDK (ADR-024)" "HTTP/OTLP"
-        api -> observability "Exports metrics + logs via OTLP to OTel Collector (ADR-028)" "HTTP/OTLP"
-        api -> vault "Reads dependency creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
-        keycloak -> vault "Reads admin password + DB creds at pod start via Vault Agent Injector (ADR-043)" "HTTP/file-mount"
+        humanUser -> keycloak "Device Flow login (ADR-032)" "HTTPS/OIDC"
+        humanUser -> organisationalIdP "Login via customer IdP (ADR-044)" "HTTPS/OIDC"
+        keycloak -> organisationalIdP "OIDC broker handshake (ADR-044)" "HTTPS/OIDC"
+        humanUser -> agent "Launches via opencode-wrapper" "CLI"
+        agent -> keycloak "Token refresh / client_credentials" "HTTPS/OIDC"
+        agent -> opencodeProxy "POST /v1/chat/completions (Bearer)" "HTTP/JSON"
+        opencodeProxy -> api "Forwards over verified TLS" "HTTPS/JSON"
+        agent -> api "Direct path (Continue / Roo / curl)" "HTTPS/JSON"
+        architect -> minioStore "Uploads ADRs + skills (ADR-027)"
+        api -> llamaServer "Proxies augmented request — peer.service=qwen-chat-llm" "HTTP/SSE"
+        api -> keycloak "Fetch JWKS (cached)" "HTTP/JSON"
+        api -> langfuse "Exports traces (ADR-024)" "HTTP/OTLP"
+        api -> observability "Exports metrics + logs (ADR-028)" "HTTP/OTLP"
+        api -> vault "Reads creds via Vault Agent (ADR-043)" "file-mount"
+        keycloak -> vault "Reads admin + DB creds (ADR-043)" "file-mount"
 
-        // Relationships — identity layer (DESIGN §15)
-        chatRoute -> requireUser "depends on (Phase 5 cutover)"
-        contextRoute -> requireUser "depends on (Phase 5 cutover)"
-        requireUser -> tokenCache "hot path: get(sha256(token))"
-        requireUser -> keycloak "cold path: validate JWT against JWKS" "HTTP/JSON"
-        requireUser -> tokenCache "cold path: put(sha256(token), UserContext, TTL)"
-        tokenCache -> redisCache "GET/SETEX/SCAN under audittrace:token:*" "Redis protocol"
+        // Identity layer
+        chatRoute -> requireUser "depends on"
+        contextRoute -> requireUser "depends on"
+        requireUser -> tokenCache "get(sha256(token))"
+        requireUser -> keycloak "cold path: validate JWT vs JWKS" "HTTP/JSON"
+        tokenCache -> redisCache "GET/SETEX audittrace:token:*" "Redis"
+        contextRoute -> requireScope "legacy path"
+        requireScope -> keycloak "Fetch JWKS" "HTTP/JSON"
 
-        // Legacy JWT path (kept for backwards compat until Phase 7)
-        contextRoute -> requireScope "legacy: returns raw payload dict"
-        requireScope -> keycloak "Fetch JWKS (shared cache)" "HTTP/JSON"
-
-        // Relationships — chat completion flow (inject mode — memory_mode=inject)
-        chatRoute -> contextBuilder "inject mode: build_system_context(UserContext, project, query)"
+        // Chat flow — inject mode
+        chatRoute -> contextBuilder "inject: build_system_context()"
         contextRoute -> contextBuilder "build_system_context_with_stats()"
-        chatRoute -> llamaServer "async httpx.AsyncClient.stream() (ADR-024)"
-        chatRoute -> telemetry "@observe span + post-stream Langfuse update"
+        chatRoute -> llamaServer "async stream() — peer.service=qwen-chat-llm" "HTTP/SSE"
+        chatRoute -> telemetry "@observe span + Langfuse update"
 
-        // Relationships — chat completion flow (tools mode — memory_mode=tools, ADR-025)
-        chatRoute -> memoryToolRegistry "tools mode: tools_visible_to(user) — scope-filtered tool list"
-        chatRoute -> contextBuilder "tools mode: build_ambient_context(user, project, tools)"
-        chatRoute -> memoryToolLoop "tools mode: run_memory_tool_loop(...)"
-        memoryToolLoop -> llamaServer "non-streaming POST per iteration (bounded by max_iterations)"
-        memoryToolLoop -> memoryToolRegistry "get_tool_by_name + invoke_tool dispatch"
-        memoryToolRegistry -> toolResultCache "cache.get / cache.put (skip on exception)"
-        memoryToolRegistry -> memoryHandlers "await tool.handler(user_context, args)"
-        toolResultCache -> redisCache "GET/SETEX/SCAN under audittrace:tool-result:*" "Redis protocol"
+        // Chat flow — tools mode (ADR-025)
+        chatRoute -> memoryToolRegistry "tools_visible_to(user)"
+        chatRoute -> contextBuilder "build_ambient_context()"
+        chatRoute -> memoryToolLoop "run_memory_tool_loop()"
+        memoryToolLoop -> llamaServer "non-streaming POST/iteration — peer.service=qwen-chat-llm" "HTTP/JSON"
+        memoryToolLoop -> memoryToolRegistry "get_tool + invoke_tool"
+        memoryToolRegistry -> toolResultCache "cache get/put"
+        memoryToolRegistry -> memoryHandlers "tool.handler(user, args)"
+        toolResultCache -> redisCache "GET/SETEX audittrace:tool-result:*" "Redis"
 
-        // Memory tool handlers wrap the existing 4-layer services
-        memoryHandlers -> episodicSvc "recall_decisions → search(user, query)"
-        memoryHandlers -> proceduralSvc "recall_skills → search(user, query)"
-        memoryHandlers -> conversationalSvc "recall_recent_sessions → load_sessions(user, project, n)"
-        memoryHandlers -> semanticSvc "recall_semantic → search(user, query, k)"
+        // Memory tool handlers → services
+        memoryHandlers -> episodicSvc "recall_decisions"
+        memoryHandlers -> proceduralSvc "recall_skills"
+        memoryHandlers -> conversationalSvc "recall_recent_sessions"
+        memoryHandlers -> semanticSvc "recall_semantic"
 
-        // 4-layer memory retrieval (inject mode path)
-        contextBuilder -> episodicSvc "search(user_context, query)"
-        contextBuilder -> proceduralSvc "search(user_context, query)"
-        contextBuilder -> conversationalSvc "as_context(user_context, project)"
-        contextBuilder -> semanticSvc "search(user_context, query, k)"
+        // 4-layer retrieval (inject path)
+        contextBuilder -> episodicSvc "search()"
+        contextBuilder -> proceduralSvc "search()"
+        contextBuilder -> conversationalSvc "as_context()"
+        contextBuilder -> semanticSvc "search()"
 
-        episodicSvc -> minioStore "Lists + downloads ADR-*.md from memory-shared/episodic/" "S3 API"
-        proceduralSvc -> minioStore "Lists + downloads SKILL-*.md from memory-shared/procedural/" "S3 API"
-        conversationalSvc -> postgresDb "SELECT/INSERT sessions" "SQLAlchemy ORM"
-        semanticSvc -> chromaDb "query() / upsert() — sends pre-computed vectors" "HTTP + Bearer token"
-        semanticSvc -> embedder "vectorise query + index text IN-PROCESS (ONNX) before calling ChromaDB" "in-proc call"
-        embedder -> embedServer "ADR-047 (ACCEPTED, in progress — not yet wired): move embedding off the request path to the dedicated nomic server" "FUTURE / HTTP"
-        // NOTE: TODAY ChromaDB does NOT call out for embeddings — the embedding_function is a
-        // client-side ONNX model held by memory-server (SINGLETON_EMBEDDER); vectors are computed
-        // in-process and shipped to the store. The nomic embedServer (:11436) is deployed + intended
-        // (ADR-030) but the cutover is pending (ADR-047 Accepted, in progress).
+        episodicSvc -> minioStore "GET ADR-*.md (memory-shared/episodic/)" "S3 API"
+        proceduralSvc -> minioStore "GET SKILL-*.md (memory-shared/procedural/)" "S3 API"
+        conversationalSvc -> postgresDb "SELECT/INSERT sessions" "SQLAlchemy"
+        semanticSvc -> chromaDb "query()/upsert() — pre-computed vectors" "HTTP + token"
+        semanticSvc -> embedder "vectorise query/index (embed_via_nomic)" "in-proc call"
+        embedder -> embedServer "POST /v1/embeddings (768-dim) — peer.service=nomic-embed-server (ADR-047)" "HTTP/JSON"
 
         // Session summariser (ADR-030)
-        sessionSummarizer -> postgresDb "Eligibility query + INSERT sessions (SET LOCAL app.current_user_id per row)" "SQLAlchemy ORM"
-        sessionSummarizer -> conversationalSvc "save_session(user_context, project, summary, key_points, session_id=…)"
-        sessionSummarizer -> summarizerServer "POST /v1/chat/completions (non-streaming, response_format=json_object)" "HTTP/JSON"
+        sessionSummarizer -> postgresDb "Eligibility query + INSERT sessions" "SQLAlchemy"
+        sessionSummarizer -> conversationalSvc "save_session(summary, key_points)"
+        sessionSummarizer -> summarizerServer "Scheduled sweep (5 min / idle >15 min) — peer.service=mistral-summariser-llm" "HTTP/JSON"
 
-        // PAdES trust store (ADR-052, Accepted)
-        adminRoute -> requireUser "Auth: scope audittrace:admin"
-        adminRoute -> trustStoreBuilder "build() — synchronous; returns TrustStoreBundle(pem_bytes, metadata)"
-        adminRoute -> trustStoreProvider "store(bundle) — persist + invalidate ValidationContext singleton"
-        trustStoreBuilder -> euLotl "lotl_to_registry(lotl_xml=None) — fetch + verify XAdES + walk member-state TSLs (transient, only during refresh)" "HTTPS/XML"
-        trustStoreProvider -> minioStore "GET/PUT memory-shared/trust-store/eu-lotl-bundle.pem" "S3 API"
-        diContainer -> trustStoreProvider "Injects (default S3TrustStoreProvider; settings select impl)"
-        diContainer -> trustStoreBuilder "Injects (default EuLotlTrustStoreBuilder; settings select impl)"
+        // PAdES trust store (ADR-052)
+        adminRoute -> requireUser "scope audittrace:admin"
+        adminRoute -> trustStoreBuilder "build()"
+        adminRoute -> trustStoreProvider "store() + invalidate"
+        trustStoreBuilder -> euLotl "fetch + verify XAdES (transient)" "HTTPS/XML"
+        trustStoreProvider -> minioStore "GET/PUT trust-store bundle" "S3 API"
+        diContainer -> trustStoreProvider "injects"
+        diContainer -> trustStoreBuilder "injects"
 
-        // Async chat-completion persistence (ADR-046, Accepted)
-        chatRoute -> asyncPersistProducer "On X-Persist-Mode: async — serialise InteractionRecord kwargs + tool_calls"
-        asyncPersistProducer -> redisCache "XADD audittrace:persist:stream" "Redis Streams"
-        redisCache -> asyncPersistConsumer "XREADGROUP > / XCLAIM idle pending — multi-pod safe via consumer group" "Redis Streams"
-        asyncPersistConsumer -> postgresDb "_persist_interaction + _flush_pending_tool_calls (reused from sync path) → XACK on success" "SQLAlchemy ORM"
-        asyncPersistConsumer -> redisCache "XADD audittrace:persist:dlq + XACK on poison (parse fail or delivery_count > max_deliveries)" "Redis Streams"
+        // Async chat persistence (ADR-046)
+        chatRoute -> asyncPersistProducer "on X-Persist-Mode: async"
+        asyncPersistProducer -> redisCache "XADD persist:stream" "Redis Streams"
+        redisCache -> asyncPersistConsumer "XREADGROUP / XCLAIM" "Redis Streams"
+        asyncPersistConsumer -> postgresDb "_persist_interaction → XACK" "SQLAlchemy"
+        asyncPersistConsumer -> redisCache "XADD persist:dlq on poison" "Redis Streams"
 
-        // ADR-048 + ADR-057 ingestion content-control (broker = RabbitMQ).
-        // Producer pattern (memory-server, PR-B3): /memory/upload PUTs
-        // to quarantine/, INSERTs memory_items, puts ScanRequest on an
-        // in-process asyncio.Queue, returns 202. A separate
-        // ScanRequestPublisher asyncio task drains the queue and
-        // basic_publish to the audittrace.scan exchange. The
-        // memory_items.published_at column is the Hohpe Outbox marker;
-        // a periodic janitor backstops crash recovery.
-        // Consumer pattern: content-control (PR-A3) basic_consume
-        // from audittrace.scan.requests quorum queue; publishes verdicts
-        // to audittrace.scan.verdicts and SECURITY audit rows to
-        // audittrace.scan.audit. Memory-server's verdict consumer +
-        // audit consumer (PR-B4) update memory_items.scan_status +
-        // INSERT interactions(event_class='security').
-        api -> minioStore "PUT s3://shared/quarantine/<user_id>/<uuid>/<file> (audittrace_app role; bucket-policy denies GET on this prefix in PR-B7)" "S3 API"
-        api -> rabbitmq "basic_publish to audittrace.scan exchange (routing key scan.request.*) — Hohpe Outbox + Danjou asyncio.Queue (PR-B3)" "AMQP 0-9-1 (mTLS)"
-        rabbitmq -> contentControl "Delivers from audittrace.scan.requests quorum queue (basic_consume + manual ack)" "AMQP 0-9-1 (mTLS)"
-        contentControl -> minioStore "GET quarantine/, PUT episodic/papers/, DELETE quarantine/ (content_control role)" "S3 API"
-        contentControl -> rabbitmq "basic_publish to audittrace.scan.verdicts (verdict) + audittrace.scan.audit (SECURITY row)" "AMQP 0-9-1 (mTLS)"
-        rabbitmq -> api "Delivers from audittrace.scan.verdicts + audittrace.scan.audit quorum queues — updates memory_items.scan_status, INSERT interactions(event_class='security')" "AMQP 0-9-1 (mTLS)"
+        // Ingestion content-control (ADR-048 / ADR-057)
+        api -> minioStore "PUT quarantine/<user>/<uuid>/<file>" "S3 API"
+        api -> rabbitmq "publish scan.request.* (ADR-057)" "AMQP (mTLS)"
+        rabbitmq -> contentControl "deliver scan requests" "AMQP (mTLS)"
+        contentControl -> minioStore "GET quarantine, PUT episodic/papers/" "S3 API"
+        contentControl -> rabbitmq "publish verdicts + audit rows" "AMQP (mTLS)"
+        rabbitmq -> api "deliver verdicts → scan_status + security rows" "AMQP (mTLS)"
 
         // DI wiring
-        diContainer -> contextBuilder "Injects"
-        diContainer -> episodicSvc "Injects"
-        diContainer -> proceduralSvc "Injects"
-        diContainer -> conversationalSvc "Injects"
-        diContainer -> semanticSvc "Injects"
-        diContainer -> pgFactory "Injects"
-        pgFactory -> postgresDb "create_engine() + sessionmaker" "SQLAlchemy"
+        diContainer -> contextBuilder "injects"
+        diContainer -> episodicSvc "injects"
+        diContainer -> proceduralSvc "injects"
+        diContainer -> conversationalSvc "injects"
+        diContainer -> semanticSvc "injects"
+        diContainer -> pgFactory "injects"
+        pgFactory -> postgresDb "create_engine + sessionmaker" "SQLAlchemy"
 
-        // Audit writes (post-stream / post-loop, synchronous — async persistence deferred to a separate ADR, see §12 brainstorm)
+        // Audit writes
         chatRoute -> postgresDb "INSERT interactions (user_id = Keycloak sub)"
-        chatRoute -> postgresDb "INSERT tool_calls (ADR-025: one row per memory tool invocation; cache hits skip)"
+        chatRoute -> postgresDb "INSERT tool_calls (ADR-025)"
 
         // Deployment — Kubernetes + Istio
         deploymentEnvironment "Kubernetes" {
@@ -251,77 +209,75 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             deploymentNode "k3s Cluster" "pcluislinux" "k3s v1.34 + Istio 1.29" {
 
                 deploymentNode "Namespace: istio-system" "Istio control plane" "Kubernetes" {
-                    istiodInstance = infrastructureNode "istiod" "Service mesh control plane — xDS, cert rotation, policy" "Istio 1.29"
+                    istiodInstance = infrastructureNode "istiod" "Service mesh control plane" "Istio 1.29"
                 }
 
-                deploymentNode "Namespace: audittrace" "Istio sidecar injection enabled" "Kubernetes" {
+                deploymentNode "Namespace: audittrace" "Istio sidecar injection" "Kubernetes" {
 
                     deploymentNode "Istio IngressGateway" "TLS termination + routing" "Envoy" {
-                        ingressInstance = infrastructureNode "Istio IngressGateway" "HTTPS :443 → audittrace-server :8765, /realms/* → keycloak" "Envoy"
+                        ingressInstance = infrastructureNode "Istio IngressGateway" "HTTPS :443 → :8765" "Envoy"
                     }
 
-                    deploymentNode "audittrace-server Deployment" "FastAPI application pod" "Python 3.12 / uvicorn" {
+                    deploymentNode "audittrace-server Deployment" "FastAPI pod" "Python 3.12 / uvicorn" {
                         apiInstance = containerInstance api
                     }
 
-                    deploymentNode "postgresql StatefulSet" "Audit + sessions — interactions, sessions, tool_calls (DESIGN §15)" "PostgreSQL 16 Alpine" {
+                    deploymentNode "postgresql StatefulSet" "Audit + sessions" "PostgreSQL 16" {
                         pgInstance = containerInstance postgresDb
                     }
 
-                    deploymentNode "redis StatefulSet" "Shared cache: audittrace:token:* (DESIGN §15.4) + audittrace:tool-result:* (ADR-025 §Decision.8). Dedicated — NOT shared with Langfuse Redis." "Redis 7 Alpine" {
+                    deploymentNode "redis StatefulSet" "Cache + streams (dedicated)" "Redis 7" {
                         redisInstance = containerInstance redisCache
                     }
 
-                    deploymentNode "chromadb StatefulSet" "Vector store — token auth" "ChromaDB HTTP Server" {
+                    deploymentNode "chromadb StatefulSet" "Vector store — token auth" "ChromaDB" {
                         chromaInstance = containerInstance chromaDb
                     }
 
-                    deploymentNode "minio StatefulSet" "S3 object storage — SSE-S3 encryption at rest, per-user isolation via path prefix (ADR-027)" "MinIO" {
+                    deploymentNode "minio StatefulSet" "S3 object storage (ADR-027)" "MinIO" {
                         minioInstance = containerInstance minioStore
                     }
 
-                    deploymentNode "keycloak Deployment" "Identity provider — owns users/roles/JWT issuance" "Keycloak 24" {
-                        keycloakInstance = infrastructureNode "Keycloak" "Realm: audittrace, OIDC + private_key_jwt" "Keycloak 24"
+                    deploymentNode "keycloak Deployment" "Identity provider" "Keycloak 24" {
+                        keycloakInstance = infrastructureNode "Keycloak" "Realm: audittrace, OIDC" "Keycloak 24"
                     }
 
-                    deploymentNode "otel-collector DaemonSet" "OTLP receiver → Prometheus + Loki fan-out" "otel-contrib" {
-                        otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver → Prometheus + Loki fan-out (mesh-local)" "otel-contrib"
+                    deploymentNode "otel-collector DaemonSet" "OTLP → Prometheus + Loki" "otel-contrib" {
+                        otelCollectorInstance = infrastructureNode "OTel Collector" "OTLP receiver + fan-out" "otel-contrib"
                     }
 
-                    deploymentNode "vault StatefulSet" "Single-node, file-backend, manual-unseal POC posture (ADR-043). Bundled in-cluster by deliberate ADR-045 §Rule 1 exception." "HashiCorp Vault 1.x" {
-                        vaultServerInstance = infrastructureNode "vault-server" "KV v2 at kv/audittrace/* + Kubernetes auth method" "Vault server"
-                        vaultInjectorInstance = infrastructureNode "vault-agent-injector" "Mutating webhook — injects Agent sidecars on workloads carrying vault.hashicorp.com/* annotations" "vault-k8s"
+                    deploymentNode "vault StatefulSet" "Single-node, file backend (ADR-043)" "Vault 1.x" {
+                        vaultServerInstance = infrastructureNode "vault-server" "KV v2 + K8s auth" "Vault server"
+                        vaultInjectorInstance = infrastructureNode "vault-agent-injector" "Mutating webhook — Agent sidecars" "vault-k8s"
                     }
                 }
             }
 
-            deploymentNode "Host Machine" "Unified memory workstation — bare metal GPU (three model processes, separate ports)" "Linux / ROCm" {
-                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-35B-A3B-Q4_K_M (MoE) on :11435 (GPU)" "llama.cpp / ROCm"
-                embedInstance = infrastructureNode "embed-server (intended — cutover pending)" "nomic-embed-text v1.5 Q8_0 on :11436, CPU-only (--n-gpu-layers 0). Runs as the intended embedder (ADR-030); today embeddings actually run IN-PROCESS in memory-server (ONNX all-MiniLM-L6-v2). Cutover to this box = ADR-047 (Accepted, in progress)." "llama.cpp / CPU"
-                summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B Instruct v0.3 Q4_K_M on :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
-                opencodeProxyInstance = infrastructureNode "audittrace-opencode-proxy" "Caddy 2.6 reverse proxy on 127.0.0.1:11434, systemd-managed, TLS-verified upstream to Istio Gateway. Bun 1.3.x fetch-trust workaround." "Caddy 2.6"
-                vaultUnsealInstance = infrastructureNode "audittrace-vault-auto-unseal" "Boot-time idempotent Vault unseal (systemd oneshot, retry-on-failure). Reads keys from ~/work/audittrace-private/runbooks/vault-init-*.json (mode 600). Production successor: KMS auto-unseal (M3+)." "systemd + bash"
+            deploymentNode "Host Machine" "Bare-metal GPU — three model processes" "Linux / ROCm" {
+                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-35B-A3B MoE, :11435 (GPU)" "llama.cpp / ROCm"
+                embedInstance = infrastructureNode "embed-server (nomic)" "nomic-embed-text v1.5, :11436 (CPU) — live embedder (ADR-047)" "llama.cpp / CPU"
+                summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B, :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
+                opencodeProxyInstance = infrastructureNode "audittrace-opencode-proxy" "Caddy loopback → TLS (systemd)" "Caddy 2.6"
+                vaultUnsealInstance = infrastructureNode "audittrace-vault-auto-unseal" "Boot-time Vault unseal (systemd)" "systemd + bash"
             }
 
-            deploymentNode "Langfuse Stack" "Sibling compose — shared network (ADR-021.2)" "Docker Compose" {
-                langfuseInstance = infrastructureNode "Langfuse Web" "Observability traces + OTLP ingest" "Langfuse v3"
+            deploymentNode "Langfuse Stack" "Sibling compose" "Docker Compose" {
+                langfuseInstance = infrastructureNode "Langfuse Web" "Traces + OTLP ingest" "Langfuse v3"
             }
 
             // Deployment relationships
-            opencodeProxyInstance -> ingressInstance "Forwards OpenCode requests with Host=audittrace.local, cert-pinned" "HTTPS/JSON"
-            vaultUnsealInstance -> vaultServerInstance "Posts unseal keys at boot via kubectl exec" "HTTP/Vault API"
-            ingressInstance -> apiInstance "HTTPS → HTTP proxy (mTLS via Istio sidecar)"
-            ingressInstance -> keycloakInstance "HTTPS → /realms/*, /admin/*"
-            apiInstance -> vaultServerInstance "Reads dependency creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
-            keycloakInstance -> vaultServerInstance "Reads admin pw + DB creds via injected Vault Agent (ADR-043 §4)" "HTTP + file-mount"
+            opencodeProxyInstance -> ingressInstance "Forwards (Host=audittrace.local, cert-pinned)" "HTTPS/JSON"
+            vaultUnsealInstance -> vaultServerInstance "Posts unseal keys at boot" "Vault API"
+            ingressInstance -> apiInstance "HTTPS → HTTP (mTLS via sidecar)"
+            ingressInstance -> keycloakInstance "HTTPS → /realms/*"
+            apiInstance -> vaultServerInstance "Reads creds via Vault Agent (ADR-043)" "file-mount"
+            keycloakInstance -> vaultServerInstance "Reads admin pw + DB creds (ADR-043)" "file-mount"
             apiInstance -> keycloakInstance "JWKS fetch (cached)" "HTTP/JSON"
-            apiInstance -> llamaInstance "Proxies augmented requests (streaming)" "HTTP/SSE"
-            apiInstance -> summarizerInstance "Background summariser loop — non-streaming JSON (ADR-030)" "HTTP/JSON"
-            apiInstance -> langfuseInstance "Exports traces via SDK" "HTTP/OTLP"
+            apiInstance -> llamaInstance "Reasoning — peer.service=qwen-chat-llm" "HTTP/SSE"
+            apiInstance -> embedInstance "Embeddings — peer.service=nomic-embed-server (ADR-047)" "HTTP/JSON"
+            apiInstance -> summarizerInstance "Scheduled summaries (5 min) — peer.service=mistral-summariser-llm" "HTTP/JSON"
+            apiInstance -> langfuseInstance "Exports traces" "HTTP/OTLP"
             apiInstance -> otelCollectorInstance "OTLP metrics + logs" "HTTP/OTLP"
-            // NOTE: no chromaInstance -> embedInstance edge — TODAY embeddings run IN-PROCESS
-            // inside apiInstance (memory-server, ONNX MiniLM). The nomic embed-server runs as the
-            // intended embedder (ADR-030); cutover to it is pending (ADR-047 Accepted, in progress).
         }
     }
 
@@ -332,17 +288,17 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             autolayout lr
         }
 
-        container memoryServer "Containers" "audittrace-server — deployable units (incl. Redis token cache)" {
+        container memoryServer "Containers" "audittrace-server — deployable units" {
             include *
             autolayout lr
         }
 
-        component api "Components" "FastAPI application — 4-layer memory + Keycloak-delegated identity" {
+        component api "Components" "FastAPI application — 4-layer memory + identity" {
             include *
             autolayout tb
         }
 
-        deployment memoryServer "Kubernetes" "K8sIstio" "k3s + Istio topology — Namespace audittrace with Envoy sidecars" {
+        deployment memoryServer "Kubernetes" "K8sIstio" "k3s + Istio topology" {
             include *
             autolayout lr
         }
