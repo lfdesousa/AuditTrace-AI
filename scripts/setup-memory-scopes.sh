@@ -120,6 +120,7 @@ SCOPES=(
   "memory:decisions:write"
   "memory:skills:write"
   "audittrace:admin"
+  "audittrace:assessment:ingest"
 )
 
 # ----- Ensure each scope exists -----
