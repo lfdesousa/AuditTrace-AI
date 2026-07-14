@@ -3240,9 +3240,9 @@ class TestEventClassValues:
 
         # ``interaction`` is the legacy implicit value (chat completions,
         # tool calls); ``security`` is added by ADR-048's verdict
-        # consumer. Migration 012 backfills existing rows with
-        # ``interaction`` so the closed set is non-null going forward.
-        expected = {"interaction", "security"}
+        # consumer; ``assessment`` is added by ADR-058's recursive
+        # self-audit (the recorder recording its own security review).
+        expected = {"interaction", "security", "assessment"}
         assert _EVENT_CLASS_VALUES == expected
 
 

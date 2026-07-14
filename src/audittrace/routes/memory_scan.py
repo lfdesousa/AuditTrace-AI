@@ -54,6 +54,12 @@ _SCAN_STATUS_CODES: frozenset[str] = frozenset(
 # calls). Backfilled as the default for migration 012.
 # "security"    — content-control verdict propagation (clean and
 # rejected outcomes both produce rows; SOC alerting filters on this).
-_EVENT_CLASS_VALUES: frozenset[str] = frozenset({"interaction", "security"})
+# "assessment"  — ADR-058 recursive self-audit: the recorder's own
+# security-assessment recorded as first-class events, distinct from
+# runtime "security" verdicts so SOC alerting does not page on the
+# recorder's self-review rows.
+_EVENT_CLASS_VALUES: frozenset[str] = frozenset(
+    {"interaction", "security", "assessment"}
+)
 
 __all__ = ["_SCAN_STATUS_CODES", "_EVENT_CLASS_VALUES"]
