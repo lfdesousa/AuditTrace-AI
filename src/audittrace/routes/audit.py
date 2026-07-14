@@ -72,6 +72,11 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         # ``"interaction"`` and writes ``"security"`` for content-control
         # verdict rows.
         "event_class": row.event_class,
+        # Migration 015 (ADR-058 WS-A1): DB-server-assigned insert clock,
+        # independent of the application writer. Serialised to ISO-8601;
+        # NULL only on the duck-typed schema-drift stand-in, never on a
+        # real row (the column is NOT NULL with a server default).
+        "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
 
