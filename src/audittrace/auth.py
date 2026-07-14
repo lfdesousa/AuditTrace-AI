@@ -67,6 +67,10 @@ ALL_SCOPES: dict[str, str] = {
     "audittrace:query": "Issue chat completions and inference queries",
     "audittrace:context": "Read context-builder output for a query",
     "audittrace:audit": "Read interactions, sessions, and tool-call audit rows",
+    "audittrace:assessment:ingest": (
+        "Record a security self-assessment as audit events (ADR-058 recursive "
+        "self-audit); a write grant distinct from the broad :audit read scope"
+    ),
     "audittrace:admin": (
         "Operator-grade administration: /memory/upload, /memory/index, "
         "hard-delete, configuration introspection. Optional scope on "

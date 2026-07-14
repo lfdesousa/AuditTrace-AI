@@ -301,6 +301,13 @@ class InteractionListItem(BaseModel):
     error_detail: str | None = None
     duration_ms: int | None = None
     trace_id: str | None = None
+    # Migration 012 (ADR-048): interaction | security | assessment.
+    event_class: str | None = None
+    # Migration 015 (ADR-058 WS-A1): DB-server-assigned insert clock,
+    # serialised to ISO-8601. Surfaced here so the audit API actually
+    # returns the writer-independent timestamp (response_model filters
+    # any field not declared).
+    created_at: str | None = None
 
 
 class InteractionListResponse(BaseModel):
