@@ -365,11 +365,30 @@ async def create_assessment(
     # hiccup must never lose the audit rows themselves.
     # Fetch the live container at call time (the DI container is rebound per
     # request/test, so a module-level import would go stale — mirrors memory.py).
-    from audittrace.dependencies import container as _container
+    from audittrace.dependencies import (
+        _create_object_storage_provider,
+    )
+    from audittrace.dependencies import (
+        container as _container,
+    )
 
     artefact_key: str | None = None
     artefact_sha: str | None = None
+    # The object-storage provider is registered LAZILY (mirrors memory.py's
+    # ``_get_minio_client``): the container caches it on first use, so a bare
+    # cache read misses when an assessment is the first storage consumer since
+    # pod start. Fall back to constructing it. Best-effort throughout — a
+    # store hiccup must never drop the audit rows themselves.
     store = _container._instances.get("object_storage")
+    if store is None:
+        try:
+            store = _create_object_storage_provider(get_settings())
+        except Exception as exc:  # noqa: BLE001 — best-effort artefact capture
+            logger.warning(
+                "assessment artefact store unavailable (rows recorded anyway): %s",
+                exc,
+            )
+            store = None
     if store is not None:
         settings = get_settings()
         bucket = (

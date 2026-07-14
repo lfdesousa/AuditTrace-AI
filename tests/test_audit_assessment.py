@@ -190,3 +190,26 @@ class TestAssessmentArtefact:
             assert detail["artefact_sha256"]
         finally:
             deps.container._instances.pop("object_storage", None)
+
+    def test_endpoint_constructs_store_on_cache_miss(self, client, monkeypatch) -> None:
+        """WS-A4 regression (found in the 2026-07-14 live run): the
+        object-storage provider is registered LAZILY, so an assessment that is
+        the first storage consumer since pod start hits an empty cache. The
+        endpoint must CONSTRUCT the provider (mirroring memory.py's
+        ``_get_minio_client`` fallback), not silently skip the artefact."""
+        import audittrace.dependencies as deps
+
+        fake = _FakeStore()
+        # Ensure a genuine cache miss, then make construction return the fake.
+        deps.container._instances.pop("object_storage", None)
+        monkeypatch.setattr(
+            deps, "_create_object_storage_provider", lambda settings: fake
+        )
+        r = client.post(
+            "/assessments",
+            json={"assessment_id": "a-lazy", "questions": [], "findings": []},
+        )
+        out = r.json()
+        assert r.status_code == 200
+        assert out["artefact_key"], "cache-miss path must still capture the artefact"
+        assert fake.calls  # the constructed provider received the put_object
