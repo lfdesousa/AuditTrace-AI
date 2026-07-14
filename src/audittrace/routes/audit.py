@@ -13,6 +13,8 @@ layer ``WHERE user_id = ...`` is needed (and wouldn't be load-bearing
 against a buggy caller anyway — RLS is the enforcement boundary).
 """
 
+import hashlib
+import io
 import json
 import logging
 from datetime import datetime
@@ -22,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Security
 from sqlalchemy import func, select
 
 from audittrace.auth import require_user, validate_jwt
+from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
@@ -208,8 +211,34 @@ async def create_interaction(
 # ``scan_audit_consumer``), so NO schema migration is needed.
 
 
+def _store_assessment_artefact(
+    store: Any, bucket: str, request: AssessmentIngestRequest
+) -> tuple[str, str]:
+    """Store the raw assessment payload in object storage (ADR-058 WS-A4).
+
+    "Record what, not only that": the full request lands in the object store
+    under a hash-derived key so the recorded verdict is re-derivable, while
+    the audit row keeps only the reference + digest. Returns
+    ``(object_key, sha256)``. The BytesIO buffer is context-managed.
+    """
+    payload = json.dumps(
+        request.model_dump(), sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    sha = hashlib.sha256(payload).hexdigest()
+    key = f"assessments/{request.assessment_id}/{sha}.json"
+    with io.BytesIO(payload) as buf:
+        store.put_object(
+            bucket, key, buf, length=len(payload), content_type="application/json"
+        )
+    return key, sha
+
+
 def _build_assessment_rows(
-    request: AssessmentIngestRequest, user_id: str, trace_id: str | None
+    request: AssessmentIngestRequest,
+    user_id: str,
+    trace_id: str | None,
+    artefact_key: str | None = None,
+    artefact_sha: str | None = None,
 ) -> list[InteractionRow]:
     """Fan one assessment into a header row plus one child per item.
 
@@ -258,6 +287,8 @@ def _build_assessment_rows(
                 "frameworks": request.frameworks,
                 "rules_of_engagement": request.rules_of_engagement,
                 "teardown": request.teardown,
+                "artefact_key": artefact_key,
+                "artefact_sha256": artefact_sha,
             },
         )
     ]
@@ -329,7 +360,35 @@ async def create_assessment(
         logger.error("Assessment ingest unavailable — PostgresFactory not registered")
         raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
 
-    rows = _build_assessment_rows(request, user.user_id, _current_trace_id_hex())
+    # WS-A4: store the raw payload in object storage, referenced by hash from
+    # the header row so the verdict is re-derivable. Best-effort — a store
+    # hiccup must never lose the audit rows themselves.
+    # Fetch the live container at call time (the DI container is rebound per
+    # request/test, so a module-level import would go stale — mirrors memory.py).
+    from audittrace.dependencies import container as _container
+
+    artefact_key: str | None = None
+    artefact_sha: str | None = None
+    store = _container._instances.get("object_storage")
+    if store is not None:
+        settings = get_settings()
+        bucket = (
+            settings.aws_bucket
+            if settings.object_storage_backend == "aws"
+            else settings.minio_shared_bucket
+        )
+        try:
+            artefact_key, artefact_sha = _store_assessment_artefact(
+                store, bucket, request
+            )
+        except Exception as exc:  # best-effort — never drop the audit rows
+            logger.warning(
+                "assessment artefact store failed (rows recorded anyway): %s", exc
+            )
+
+    rows = _build_assessment_rows(
+        request, user.user_id, _current_trace_id_hex(), artefact_key, artefact_sha
+    )
     session_factory = pg.get_session_factory()
     async with session_factory() as db:
         db.add_all(rows)
@@ -339,6 +398,7 @@ async def create_assessment(
         "assessment_id": request.assessment_id,
         "rows_written": len(rows),
         "event_class": "assessment",
+        "artefact_key": artefact_key,
     }
 
 

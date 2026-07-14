@@ -130,3 +130,63 @@ class TestAssessmentEndpoint:
         rows = r.json()["interactions"]
         assert len(rows) >= 1
         assert all(row["event_class"] == "assessment" for row in rows)
+
+
+class _FakeStore:
+    """Records put_object calls without touching a real object-store backend."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int, str | None]] = []
+
+    def put_object(
+        self,
+        bucket: str,
+        key: str,
+        data: object,
+        length: int,
+        content_type: str | None = None,
+    ) -> None:
+        self.calls.append((bucket, key, length, content_type))
+
+
+class TestAssessmentArtefact:
+    """ADR-058 WS-A4 — the raw payload is stored in object storage and
+    referenced by hash from the header row. Best-effort: rows land even with
+    no store configured (the other endpoint tests cover that path)."""
+
+    def test_store_helper_puts_and_returns_key_and_sha(self) -> None:
+        from audittrace.routes.audit import _store_assessment_artefact
+
+        fake = _FakeStore()
+        req = _sample_request()
+        key, sha = _store_assessment_artefact(fake, "bucket-x", req)
+        assert len(sha) == 64
+        assert key == f"assessments/{req.assessment_id}/{sha}.json"
+        assert fake.calls[0][0] == "bucket-x"
+        assert fake.calls[0][1] == key
+
+    def test_endpoint_stores_artefact_when_store_present(self, client) -> None:
+        import audittrace.dependencies as deps
+
+        fake = _FakeStore()
+        deps.container._instances["object_storage"] = fake
+        try:
+            r = client.post(
+                "/assessments",
+                json={"assessment_id": "a-art", "questions": [], "findings": []},
+            )
+            out = r.json()
+            assert r.status_code == 200
+            assert out["artefact_key"]
+            assert fake.calls  # put_object was invoked
+            assert fake.calls[0][1].startswith("assessments/a-art/")
+
+            rows = client.get(
+                "/interactions?event_class=assessment&session_id=a-art"
+            ).json()["interactions"]
+            header = next(row for row in rows if row["question"] == "assessment_header")
+            detail = json.loads(header["error_detail"])
+            assert detail["artefact_key"] == out["artefact_key"]
+            assert detail["artefact_sha256"]
+        finally:
+            deps.container._instances.pop("object_storage", None)
