@@ -26,6 +26,7 @@ from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
+from audittrace.integrity import content_hash as _content_hash
 from audittrace.logging_config import log_call
 from audittrace.models import (
     AssessmentIngestRequest,
@@ -80,6 +81,9 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         # NULL only on the duck-typed schema-drift stand-in, never on a
         # real row (the column is NOT NULL with a server default).
         "created_at": row.created_at.isoformat() if row.created_at else None,
+        # Migration 017 (ADR-058 WS-A3): content-integrity hash; a
+        # mismatch on recomputation means the row was tampered with.
+        "content_hash": row.content_hash,
     }
 
 
@@ -216,7 +220,10 @@ def _build_assessment_rows(
     """
     now = datetime.now().isoformat()
     aid = request.assessment_id
-    common: dict[str, Any] = {
+    # The model-default columns are set explicitly so the WS-A3 content hash
+    # matches what is persisted (SQLAlchemy applies column defaults at flush,
+    # not at construction time).
+    base: dict[str, Any] = {
         "project": request.project,
         "source": request.source,
         "user_id": user_id,
@@ -224,69 +231,73 @@ def _build_assessment_rows(
         "event_class": "assessment",
         "trace_id": trace_id,
         "timestamp": now,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "status": "success",
+        "failure_class": None,
+        "model": None,
+        "duration_ms": None,
     }
+
+    def _row(question: str, answer: str, detail: dict[str, Any]) -> InteractionRow:
+        fields = {
+            **base,
+            "question": question,
+            "answer": answer,
+            "error_detail": json.dumps(detail),
+        }
+        return InteractionRow(**fields, content_hash=_content_hash(fields))
+
     rows: list[InteractionRow] = [
-        InteractionRow(
-            question="assessment_header",
-            answer=aid,
-            error_detail=json.dumps(
-                {
-                    "row_type": "assessment_header",
-                    "assessment_id": aid,
-                    "frameworks": request.frameworks,
-                    "rules_of_engagement": request.rules_of_engagement,
-                    "teardown": request.teardown,
-                }
-            ),
-            **common,
+        _row(
+            "assessment_header",
+            aid,
+            {
+                "row_type": "assessment_header",
+                "assessment_id": aid,
+                "frameworks": request.frameworks,
+                "rules_of_engagement": request.rules_of_engagement,
+                "teardown": request.teardown,
+            },
         )
     ]
     for q in request.questions:
         rows.append(
-            InteractionRow(
-                question=q.question,
-                answer=q.verdict,
-                error_detail=json.dumps(
-                    {
-                        "row_type": "assessment_question",
-                        "assessment_id": aid,
-                        "method": q.method,
-                        "verdict": q.verdict,
-                    }
-                ),
-                **common,
+            _row(
+                q.question,
+                q.verdict,
+                {
+                    "row_type": "assessment_question",
+                    "assessment_id": aid,
+                    "method": q.method,
+                    "verdict": q.verdict,
+                },
             )
         )
     for f in request.findings:
         rows.append(
-            InteractionRow(
-                question=f.title,
-                answer=f.severity,
-                error_detail=json.dumps(
-                    {
-                        "row_type": "assessment_finding",
-                        "assessment_id": aid,
-                        "finding_id": f.finding_id,
-                        "severity": f.severity,
-                        "detail": f.detail,
-                    }
-                ),
-                **common,
+            _row(
+                f.title,
+                f.severity,
+                {
+                    "row_type": "assessment_finding",
+                    "assessment_id": aid,
+                    "finding_id": f.finding_id,
+                    "severity": f.severity,
+                    "detail": f.detail,
+                },
             )
         )
     for d in request.deferrals:
         rows.append(
-            InteractionRow(
-                question=d.item,
-                answer=d.reason or "",
-                error_detail=json.dumps(
-                    {
-                        "row_type": "assessment_deferral",
-                        "assessment_id": aid,
-                        "reason": d.reason,
-                    }
-                ),
-                **common,
+            _row(
+                d.item,
+                d.reason or "",
+                {
+                    "row_type": "assessment_deferral",
+                    "assessment_id": aid,
+                    "reason": d.reason,
+                },
             )
         )
     return rows

@@ -110,6 +110,14 @@ class TestAssessmentEndpoint:
         assert all(row["session_id"] == "assess-x" for row in rows)
         # WS-A1: the DB-server-assigned created_at surfaces through the API.
         assert all(row["created_at"] for row in rows)
+        # WS-A3: each row carries a content hash that verifies end-to-end.
+        from types import SimpleNamespace
+
+        from audittrace.integrity import verify_content_hash
+
+        for row in rows:
+            assert row["content_hash"]
+            assert verify_content_hash(SimpleNamespace(**row))
 
     def test_event_class_filter_excludes_non_assessment_rows(self, client) -> None:
         # A plain interaction (default event_class) and an assessment.

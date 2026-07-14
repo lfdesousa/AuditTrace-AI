@@ -421,6 +421,11 @@ components:
           default: 0
           title: Completion Tokens
           type: integer
+        content_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Hash
         created_at:
           anyOf:
           - type: string

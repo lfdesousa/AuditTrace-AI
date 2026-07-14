@@ -308,6 +308,8 @@ class InteractionListItem(BaseModel):
     # returns the writer-independent timestamp (response_model filters
     # any field not declared).
     created_at: str | None = None
+    # Migration 017 (ADR-058 WS-A3): content-integrity hash.
+    content_hash: str | None = None
 
 
 class InteractionListResponse(BaseModel):

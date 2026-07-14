@@ -140,6 +140,11 @@ class InteractionRecord(Base):
         nullable=False,
         index=True,
     )
+    # Migration 017 (2026-07-14, ADR-058 WS-A3): SHA-256 over the row's
+    # immutable content (``integrity.content_hash``). Paired with the
+    # append-only trigger (WS-A2), a post-hoc mutation is detectable by
+    # recomputation. Nullable for rows predating the column.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ToolCall(Base):
