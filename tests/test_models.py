@@ -5,6 +5,10 @@ from datetime import datetime
 import pytest
 
 from audittrace.models import (
+    AssessmentDeferral,
+    AssessmentFinding,
+    AssessmentIngestRequest,
+    AssessmentQuestion,
     ChatChoice,
     ChatCompletionResponse,
     ChatMessage,
@@ -355,3 +359,43 @@ class TestProjectPiiGuardrail:
             is None
         )
         assert ContextRequest(query="x", project=None).project is None
+
+
+class TestAssessmentIngestRequest:
+    """ADR-058 recursive self-audit — the recorded-self-assessment request
+    model (header + question / finding / deferral children)."""
+
+    def test_full_assessment_round_trips(self) -> None:
+        req = AssessmentIngestRequest(
+            assessment_id="assess-2026-07-14",
+            frameworks=["OWASP", "ASVS"],
+            rules_of_engagement="own infra; front-door scoped token; no DoS",
+            teardown="destroyed to zero",
+            questions=[
+                AssessmentQuestion(
+                    question="Can SSRF steal cloud keys?",
+                    verdict="pass",
+                    method="verify IMDSv2 + hop-limit",
+                )
+            ],
+            findings=[
+                AssessmentFinding(
+                    finding_id="F-LOW-1",
+                    severity="low",
+                    title="one node IMDS hop-limit 2",
+                    detail="not exploitable; normalise to 1",
+                )
+            ],
+            deferrals=[
+                AssessmentDeferral(item="model-in-the-loop", reason="needs real model")
+            ],
+        )
+        assert req.project == "self-audit"
+        assert req.source == "security-assessment"
+        assert req.questions[0].verdict == "pass"
+        assert req.findings[0].finding_id == "F-LOW-1"
+        assert req.deferrals[0].item == "model-in-the-loop"
+
+    def test_project_pii_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            AssessmentIngestRequest(assessment_id="a1", project="ops@example.com")

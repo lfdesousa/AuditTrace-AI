@@ -1,5 +1,137 @@
 components:
   schemas:
+    AssessmentDeferral:
+      description: One deferred / out-of-scope item in a recorded self-assessment (ADR-058).
+      properties:
+        item:
+          description: What was deferred or left out of scope
+          title: Item
+          type: string
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Why it was deferred
+          title: Reason
+      required:
+      - item
+      title: AssessmentDeferral
+      type: object
+    AssessmentFinding:
+      description: One finding in a recorded self-assessment (ADR-058).
+      properties:
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Fuller description
+          title: Detail
+        finding_id:
+          description: Stable id for this finding
+          title: Finding Id
+          type: string
+        severity:
+          description: critical | high | medium | low | info
+          title: Severity
+          type: string
+        title:
+          description: One-line finding title
+          title: Title
+          type: string
+      required:
+      - finding_id
+      - severity
+      - title
+      title: AssessmentFinding
+      type: object
+    AssessmentIngestRequest:
+      description: 'Request body for ``POST /audit/assessments`` (ADR-058 recursive self-audit).
+
+
+        One assessment fans out to a single ``assessment_header`` row plus N
+
+        child rows (question / finding / deferral), all correlated by
+
+        ``assessment_id`` and owner-scoped to the authenticated assessor.'
+      properties:
+        assessment_id:
+          description: Stable id correlating the header and its child rows
+          title: Assessment Id
+          type: string
+        deferrals:
+          items:
+            $ref: '#/components/schemas/AssessmentDeferral'
+          title: Deferrals
+          type: array
+        findings:
+          items:
+            $ref: '#/components/schemas/AssessmentFinding'
+          title: Findings
+          type: array
+        frameworks:
+          description: Frameworks the assessment ran against (OWASP, ASVS, ...)
+          items:
+            type: string
+          title: Frameworks
+          type: array
+        project:
+          default: self-audit
+          description: Audit project namespace
+          title: Project
+          type: string
+        questions:
+          items:
+            $ref: '#/components/schemas/AssessmentQuestion'
+          title: Questions
+          type: array
+        rules_of_engagement:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: The fixed RoE the assessment ran under
+          title: Rules Of Engagement
+        source:
+          default: security-assessment
+          description: Audit source tag
+          title: Source
+          type: string
+        teardown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Teardown / environment-destroyed evidence
+          title: Teardown
+      required:
+      - assessment_id
+      title: AssessmentIngestRequest
+      type: object
+    AssessmentQuestion:
+      description: 'One adversary question in a recorded self-assessment (ADR-058).
+
+
+        Maps to an ``assessment_question`` child row when the assessment is
+
+        recorded through ``POST /audit/assessments``.'
+      properties:
+        method:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: How the question was tested (method / RoE)
+          title: Method
+        question:
+          description: The adversary question that was asked
+          title: Question
+          type: string
+        verdict:
+          description: The result, e.g. 'pass' or 'low'
+          title: Verdict
+          type: string
+      required:
+      - question
+      - verdict
+      title: AssessmentQuestion
+      type: object
     Body_upload_memory_file_memory_upload_post:
       properties:
         file:
@@ -281,6 +413,16 @@ components:
           default: 0
           title: Completion Tokens
           type: integer
+        content_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Hash
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
         duration_ms:
           anyOf:
           - type: integer
@@ -291,6 +433,11 @@ components:
           - type: string
           - type: 'null'
           title: Error Detail
+        event_class:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Event Class
         failure_class:
           anyOf:
           - type: string
@@ -658,6 +805,8 @@ components:
           scopes:
             audittrace:admin: 'Operator-grade administration: /memory/upload, /memory/index, hard-delete, configuration introspection.
               Optional scope on user-facing clients; never granted by default.'
+            audittrace:assessment:ingest: Record a security self-assessment as audit events (ADR-058 recursive self-audit);
+              a write grant distinct from the broad :audit read scope
             audittrace:audit: Read interactions, sessions, and tool-call audit rows
             audittrace:context: Read context-builder output for a query
             audittrace:index: Trigger semantic-store reindex (legacy dev client)
@@ -690,6 +839,50 @@ info:
   title: AuditTrace-AI
 openapi: 3.1.0
 paths:
+  /assessments:
+    post:
+      description: 'Record a security self-assessment as first-class audit events (ADR-058).
+
+
+        The recorder becomes a witness to its own governability: the assessment
+
+        is written through the recorder''s own front door, under a dedicated
+
+        least-privilege scope (``audittrace:assessment:ingest``, distinct from
+
+        the broad ``audittrace:audit`` read scope), as owner-scoped,
+
+        trace-linked ``assessment`` rows. Recording it this way IS the
+
+        assessment''s rules-of-engagement evidence.'
+      operationId: create_assessment_assessments_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssessmentIngestRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Create Assessment Assessments Post
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:assessment:ingest
+      summary: Create Assessment
+      tags:
+      - audit
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.
@@ -809,6 +1002,18 @@ paths:
           description: 'Filter by status: ''success'' or ''failed'' (migration 007 / ADR-033). Use ''failed'' to enumerate
             rows where the chat path errored out.'
           title: Status
+      - description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' (ADR-048 / ADR-058). Pull a whole
+          recorded self-assessment with event_class=assessment & session_id=<assessment_id>.'
+        in: query
+        name: event_class
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' (ADR-048 / ADR-058). Pull a
+            whole recorded self-assessment with event_class=assessment & session_id=<assessment_id>.'
+          title: Event Class
       - description: Max rows (1-1000).
         in: query
         name: limit

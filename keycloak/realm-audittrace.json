@@ -115,6 +115,13 @@
       "attributes": {
         "include.in.token.scope": "true"
       }
+    },
+    {
+      "name": "audittrace:assessment:ingest",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
     }
   ],
   "clients": [
@@ -246,6 +253,7 @@
       ],
       "optionalClientScopes": [
         "audittrace:admin",
+        "audittrace:assessment:ingest",
         "memory:episodic:write",
         "memory:procedural:write",
         "memory:semantic:write",
@@ -355,6 +363,7 @@
       ],
       "optionalClientScopes": [
         "audittrace:admin",
+        "audittrace:assessment:ingest",
         "memory:episodic:write",
         "memory:procedural:write",
         "memory:semantic:write",

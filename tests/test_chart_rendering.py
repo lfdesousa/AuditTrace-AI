@@ -706,3 +706,48 @@ class TestMemoryScopesProvisioningJob:
             admin_pw["valueFrom"]["secretKeyRef"]["name"]
             == "audittrace-keycloak-secret"
         )
+
+
+class TestRealmAssessmentIngestScope:
+    """ADR-058 WS-B3: the recursive-self-audit ingest scope
+    ``audittrace:assessment:ingest`` gates ``POST /assessments``. Like
+    ``audittrace:admin`` it must be OPTIONAL on user-facing clients (never
+    a default — an assessment write is a privileged, deliberate act) and
+    reconciled onto existing realms by the provisioner Job."""
+
+    _SCOPE = "audittrace:assessment:ingest"
+
+    def test_scope_declared_in_realm(self) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        scope_names = {s["name"] for s in realm.get("clientScopes", [])}
+        assert self._SCOPE in scope_names, (
+            f"{self._SCOPE} not declared in realm.json::clientScopes"
+        )
+
+    def test_user_facing_clients_offer_scope_optionally_never_by_default(
+        self,
+    ) -> None:
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-keycloak-realm")
+        realm = _json.loads(cm["data"]["realm.json"])
+        for client_id in ("audittrace-webui", "audittrace-opencode"):
+            client = next(c for c in realm["clients"] if c["clientId"] == client_id)
+            defaults = set(client.get("defaultClientScopes") or [])
+            optional = set(client.get("optionalClientScopes") or [])
+            assert self._SCOPE not in defaults, (
+                f"{client_id} carries {self._SCOPE} in defaults — every token "
+                "would be able to write assessments"
+            )
+            assert self._SCOPE in optional, (
+                f"{client_id} missing optional {self._SCOPE}"
+            )
+
+    def test_provisioner_script_lists_scope(self) -> None:
+        """The Job reconciles the scope onto existing realms — realm.json
+        alone only affects fresh installs."""
+        out = _render(["--set", "vault.enabled=true"])
+        cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
+        script = cm["data"]["ensure-memory-scopes.sh"]
+        assert self._SCOPE in script, f"provisioner script missing {self._SCOPE}"

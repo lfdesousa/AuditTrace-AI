@@ -13,19 +13,26 @@ layer ``WHERE user_id = ...`` is needed (and wouldn't be load-bearing
 against a buggy caller anyway — RLS is the enforcement boundary).
 """
 
+import hashlib
+import io
+import json
 import logging
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Security
 from sqlalchemy import func, select
 
 from audittrace.auth import require_user, validate_jwt
+from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
+from audittrace.integrity import content_hash as _content_hash
 from audittrace.logging_config import log_call
 from audittrace.models import (
+    AssessmentIngestRequest,
     InteractionListResponse,
     InteractionRecord,
     SessionListResponse,
@@ -72,6 +79,14 @@ def _row_to_dict(row: InteractionRow) -> dict[str, Any]:
         # ``"interaction"`` and writes ``"security"`` for content-control
         # verdict rows.
         "event_class": row.event_class,
+        # Migration 015 (ADR-058 WS-A1): DB-server-assigned insert clock,
+        # independent of the application writer. Serialised to ISO-8601;
+        # NULL only on the duck-typed schema-drift stand-in, never on a
+        # real row (the column is NOT NULL with a server default).
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        # Migration 017 (ADR-058 WS-A3): content-integrity hash; a
+        # mismatch on recomputation means the row was tampered with.
+        "content_hash": row.content_hash,
     }
 
 
@@ -101,6 +116,14 @@ async def list_interactions(
         description=(
             "Filter by status: 'success' or 'failed' (migration 007 / ADR-033). "
             "Use 'failed' to enumerate rows where the chat path errored out."
+        ),
+    ),
+    event_class: str | None = Query(
+        None,
+        description=(
+            "Filter by event_class: 'interaction' | 'security' | 'assessment' "
+            "(ADR-048 / ADR-058). Pull a whole recorded self-assessment with "
+            "event_class=assessment & session_id=<assessment_id>."
         ),
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),
@@ -135,6 +158,8 @@ async def list_interactions(
             stmt = stmt.where(InteractionRow.timestamp >= since)
         if status is not None:
             stmt = stmt.where(InteractionRow.status == status)
+        if event_class is not None:
+            stmt = stmt.where(InteractionRow.event_class == event_class)
 
         total = (
             await db.execute(select(func.count()).select_from(stmt.subquery()))
@@ -173,6 +198,227 @@ async def create_interaction(
     """
     # TODO: external audit-row ingestion (non-chat sources)
     return record.model_dump()
+
+
+# ───────────────────── Recursive self-audit (ADR-058) ─────────────────────
+# The recorder records the evidence of its OWN security review — the rules
+# of engagement, the questions + verdicts, the findings, the deferrals — as
+# first-class ``event_class="assessment"`` rows, through its own front door
+# under a dedicated least-privilege scope. Owner-scoped by the same RLS as
+# everything else; correlated by ``assessment_id`` (stored in ``session_id``
+# so the existing session filter groups a whole assessment for free). The
+# structured detail rides in ``error_detail`` JSON (mirrors
+# ``scan_audit_consumer``), so NO schema migration is needed.
+
+
+def _store_assessment_artefact(
+    store: Any, bucket: str, request: AssessmentIngestRequest
+) -> tuple[str, str]:
+    """Store the raw assessment payload in object storage (ADR-058 WS-A4).
+
+    "Record what, not only that": the full request lands in the object store
+    under a hash-derived key so the recorded verdict is re-derivable, while
+    the audit row keeps only the reference + digest. Returns
+    ``(object_key, sha256)``. The BytesIO buffer is context-managed.
+    """
+    payload = json.dumps(
+        request.model_dump(), sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    sha = hashlib.sha256(payload).hexdigest()
+    key = f"assessments/{request.assessment_id}/{sha}.json"
+    with io.BytesIO(payload) as buf:
+        store.put_object(
+            bucket, key, buf, length=len(payload), content_type="application/json"
+        )
+    return key, sha
+
+
+def _build_assessment_rows(
+    request: AssessmentIngestRequest,
+    user_id: str,
+    trace_id: str | None,
+    artefact_key: str | None = None,
+    artefact_sha: str | None = None,
+) -> list[InteractionRow]:
+    """Fan one assessment into a header row plus one child per item.
+
+    ``question``/``answer`` carry the human-legible line so ``_row_to_dict``
+    renders without JSON parsing; the machine-readable structure rides in
+    ``error_detail`` as JSON. Every row shares ``event_class="assessment"``,
+    the owner ``user_id``, and ``assessment_id`` in ``session_id``.
+    """
+    now = datetime.now().isoformat()
+    aid = request.assessment_id
+    # The model-default columns are set explicitly so the WS-A3 content hash
+    # matches what is persisted (SQLAlchemy applies column defaults at flush,
+    # not at construction time).
+    base: dict[str, Any] = {
+        "project": request.project,
+        "source": request.source,
+        "user_id": user_id,
+        "session_id": aid,
+        "event_class": "assessment",
+        "trace_id": trace_id,
+        "timestamp": now,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "status": "success",
+        "failure_class": None,
+        "model": None,
+        "duration_ms": None,
+    }
+
+    def _row(question: str, answer: str, detail: dict[str, Any]) -> InteractionRow:
+        fields = {
+            **base,
+            "question": question,
+            "answer": answer,
+            "error_detail": json.dumps(detail),
+        }
+        return InteractionRow(**fields, content_hash=_content_hash(fields))
+
+    rows: list[InteractionRow] = [
+        _row(
+            "assessment_header",
+            aid,
+            {
+                "row_type": "assessment_header",
+                "assessment_id": aid,
+                "frameworks": request.frameworks,
+                "rules_of_engagement": request.rules_of_engagement,
+                "teardown": request.teardown,
+                "artefact_key": artefact_key,
+                "artefact_sha256": artefact_sha,
+            },
+        )
+    ]
+    for q in request.questions:
+        rows.append(
+            _row(
+                q.question,
+                q.verdict,
+                {
+                    "row_type": "assessment_question",
+                    "assessment_id": aid,
+                    "method": q.method,
+                    "verdict": q.verdict,
+                },
+            )
+        )
+    for f in request.findings:
+        rows.append(
+            _row(
+                f.title,
+                f.severity,
+                {
+                    "row_type": "assessment_finding",
+                    "assessment_id": aid,
+                    "finding_id": f.finding_id,
+                    "severity": f.severity,
+                    "detail": f.detail,
+                },
+            )
+        )
+    for d in request.deferrals:
+        rows.append(
+            _row(
+                d.item,
+                d.reason or "",
+                {
+                    "row_type": "assessment_deferral",
+                    "assessment_id": aid,
+                    "reason": d.reason,
+                },
+            )
+        )
+    return rows
+
+
+@router.post("/assessments")
+@log_call(logger=logger)
+async def create_assessment(
+    request: AssessmentIngestRequest,
+    _auth: dict[str, Any] = Security(
+        validate_jwt, scopes=["audittrace:assessment:ingest"]
+    ),
+    user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """Record a security self-assessment as first-class audit events (ADR-058).
+
+    The recorder becomes a witness to its own governability: the assessment
+    is written through the recorder's own front door, under a dedicated
+    least-privilege scope (``audittrace:assessment:ingest``, distinct from
+    the broad ``audittrace:audit`` read scope), as owner-scoped,
+    trace-linked ``assessment`` rows. Recording it this way IS the
+    assessment's rules-of-engagement evidence.
+    """
+    from audittrace.routes.chat import _current_trace_id_hex
+
+    try:
+        pg = get_postgres_factory()
+    except Exception as exc:
+        logger.error("Assessment ingest unavailable — PostgresFactory not registered")
+        raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
+
+    # WS-A4: store the raw payload in object storage, referenced by hash from
+    # the header row so the verdict is re-derivable. Best-effort — a store
+    # hiccup must never lose the audit rows themselves.
+    # Fetch the live container at call time (the DI container is rebound per
+    # request/test, so a module-level import would go stale — mirrors memory.py).
+    from audittrace.dependencies import (
+        _create_object_storage_provider,
+    )
+    from audittrace.dependencies import (
+        container as _container,
+    )
+
+    artefact_key: str | None = None
+    artefact_sha: str | None = None
+    # The object-storage provider is registered LAZILY (mirrors memory.py's
+    # ``_get_minio_client``): the container caches it on first use, so a bare
+    # cache read misses when an assessment is the first storage consumer since
+    # pod start. Fall back to constructing it. Best-effort throughout — a
+    # store hiccup must never drop the audit rows themselves.
+    store = _container._instances.get("object_storage")
+    if store is None:
+        try:
+            store = _create_object_storage_provider(get_settings())
+        except Exception as exc:  # noqa: BLE001 — best-effort artefact capture
+            logger.warning(
+                "assessment artefact store unavailable (rows recorded anyway): %s",
+                exc,
+            )
+            store = None
+    if store is not None:
+        settings = get_settings()
+        bucket = (
+            settings.aws_bucket
+            if settings.object_storage_backend == "aws"
+            else settings.minio_shared_bucket
+        )
+        try:
+            artefact_key, artefact_sha = _store_assessment_artefact(
+                store, bucket, request
+            )
+        except Exception as exc:  # best-effort — never drop the audit rows
+            logger.warning(
+                "assessment artefact store failed (rows recorded anyway): %s", exc
+            )
+
+    rows = _build_assessment_rows(
+        request, user.user_id, _current_trace_id_hex(), artefact_key, artefact_sha
+    )
+    session_factory = pg.get_session_factory()
+    async with session_factory() as db:
+        db.add_all(rows)
+        await db.commit()
+
+    return {
+        "assessment_id": request.assessment_id,
+        "rows_written": len(rows),
+        "event_class": "assessment",
+        "artefact_key": artefact_key,
+    }
 
 
 # ─────────────────────────────── Sessions ─────────────────────────────────

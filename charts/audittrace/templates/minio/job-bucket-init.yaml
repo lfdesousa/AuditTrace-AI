@@ -208,7 +208,8 @@ spec:
               echo "▶ Materialising MinIO IAM policies (ADR-048 PR-B7)..."
 
               # audittrace_app: PUT to quarantine/, full access to
-              # episodic/ + procedural/. EXPLICIT DENY on
+              # episodic/ + procedural/ + trust-store/ + assessments/
+              # (ADR-058 WS-A4 raw self-audit artefacts). EXPLICIT DENY on
               # GET/quarantine/* so a memory-server bug or compromised
               # adapter cannot read pre-scanned bytes.
               cat >/tmp/audittrace_app.json <<JSON
@@ -235,7 +236,8 @@ spec:
                       "arn:aws:s3:::${SHARED_BUCKET}",
                       "arn:aws:s3:::${SHARED_BUCKET}/episodic/*",
                       "arn:aws:s3:::${SHARED_BUCKET}/procedural/*",
-                      "arn:aws:s3:::${SHARED_BUCKET}/trust-store/*"
+                      "arn:aws:s3:::${SHARED_BUCKET}/trust-store/*",
+                      "arn:aws:s3:::${SHARED_BUCKET}/assessments/*"
                     ]
                   }
                 ]

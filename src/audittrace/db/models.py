@@ -30,6 +30,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -127,6 +128,23 @@ class InteractionRecord(Base):
     event_class: Mapped[str | None] = mapped_column(
         String(16), nullable=True, index=True
     )
+    # Migration 015 (2026-07-14, ADR-058 WS-A1): server-set
+    # contemporaneity anchor. Unlike ``timestamp`` (a String the
+    # application sets via ``datetime.now()``), ``created_at`` is
+    # assigned by Postgres at INSERT via ``server_default=now()`` — a
+    # writer-independent clock, so the record's time cannot be backdated
+    # by the caller. Indexed for "rows created since T" audit queries.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+    # Migration 017 (2026-07-14, ADR-058 WS-A3): SHA-256 over the row's
+    # immutable content (``integrity.content_hash``). Paired with the
+    # append-only trigger (WS-A2), a post-hoc mutation is detectable by
+    # recomputation. Nullable for rows predating the column.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ToolCall(Base):

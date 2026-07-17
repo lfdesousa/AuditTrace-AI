@@ -488,23 +488,29 @@ async def _persist_interaction(
         pg_factory = get_postgres_factory()
         session_factory = pg_factory.get_session_factory()
         async with session_factory() as db:
-            record = InteractionRecord(
-                project=project,
-                source=source,
-                question=question,
-                answer=answer,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                timestamp=datetime.now().isoformat(),
-                session_id=session_id,
-                model=model,
-                user_id=user_id,
-                status=status,
-                failure_class=failure_class,
-                error_detail=error_detail,
-                duration_ms=duration_ms,
-                trace_id=trace_id,
-            )
+            from audittrace.integrity import content_hash as _content_hash
+
+            # ADR-058 WS-A3: hash the exact persisted fields for tamper-
+            # evidence. Hot-path-safe: pure function of this row's content,
+            # no predecessor read and no lock (would serialise 500u writes).
+            _fields = {
+                "project": project,
+                "source": source,
+                "question": question,
+                "answer": answer,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "timestamp": datetime.now().isoformat(),
+                "session_id": session_id,
+                "model": model,
+                "user_id": user_id,
+                "status": status,
+                "failure_class": failure_class,
+                "error_detail": error_detail,
+                "duration_ms": duration_ms,
+                "trace_id": trace_id,
+            }
+            record = InteractionRecord(**_fields, content_hash=_content_hash(_fields))
             db.add(record)
             await db.commit()
             await db.refresh(record)

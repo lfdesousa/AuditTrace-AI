@@ -221,6 +221,32 @@ class TestToolCallCRUD:
         assert loaded.user_id == _TEST_SUB
 
 
+class TestInteractionRecordCreatedAt:
+    """ADR-058 WS-A1 — ``created_at`` is assigned by the database at INSERT
+    (``server_default=now()``), independent of the application writer, so the
+    record's clock cannot be set or backdated by the caller. Contrast with
+    ``timestamp``, which the application supplies as a String."""
+
+    def test_created_at_is_db_assigned_when_not_supplied(
+        self, db_session: Session
+    ) -> None:
+        interaction = InteractionRecord(
+            project="AuditTrace",
+            source="opencode",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            timestamp="2026-07-14T10:00:00",
+            user_id=_TEST_SUB,
+        )
+        # The application deliberately never sets created_at.
+        db_session.add(interaction)
+        db_session.flush()
+        db_session.refresh(interaction)
+        assert interaction.created_at is not None
+
+
 class TestInteractionRecordUserId:
     """``interactions.user_id`` holds a Keycloak sub string (no FK)."""
 

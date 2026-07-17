@@ -127,6 +127,66 @@ class InteractionRecord(BaseModel):
     has_agent_system: bool = False
 
 
+class AssessmentQuestion(BaseModel):
+    """One adversary question in a recorded self-assessment (ADR-058).
+
+    Maps to an ``assessment_question`` child row when the assessment is
+    recorded through ``POST /audit/assessments``.
+    """
+
+    question: str = Field(..., description="The adversary question that was asked")
+    verdict: str = Field(..., description="The result, e.g. 'pass' or 'low'")
+    method: str | None = Field(
+        default=None, description="How the question was tested (method / RoE)"
+    )
+
+
+class AssessmentFinding(BaseModel):
+    """One finding in a recorded self-assessment (ADR-058)."""
+
+    finding_id: str = Field(..., description="Stable id for this finding")
+    severity: str = Field(..., description="critical | high | medium | low | info")
+    title: str = Field(..., description="One-line finding title")
+    detail: str | None = Field(default=None, description="Fuller description")
+
+
+class AssessmentDeferral(BaseModel):
+    """One deferred / out-of-scope item in a recorded self-assessment (ADR-058)."""
+
+    item: str = Field(..., description="What was deferred or left out of scope")
+    reason: str | None = Field(default=None, description="Why it was deferred")
+
+
+class AssessmentIngestRequest(BaseModel):
+    """Request body for ``POST /audit/assessments`` (ADR-058 recursive self-audit).
+
+    One assessment fans out to a single ``assessment_header`` row plus N
+    child rows (question / finding / deferral), all correlated by
+    ``assessment_id`` and owner-scoped to the authenticated assessor.
+    """
+
+    project: str = Field(default="self-audit", description="Audit project namespace")
+    source: str = Field(default="security-assessment", description="Audit source tag")
+    assessment_id: str = Field(
+        ..., description="Stable id correlating the header and its child rows"
+    )
+    frameworks: list[str] = Field(
+        default_factory=list,
+        description="Frameworks the assessment ran against (OWASP, ASVS, ...)",
+    )
+    rules_of_engagement: str | None = Field(
+        default=None, description="The fixed RoE the assessment ran under"
+    )
+    teardown: str | None = Field(
+        default=None, description="Teardown / environment-destroyed evidence"
+    )
+    questions: list[AssessmentQuestion] = Field(default_factory=list)
+    findings: list[AssessmentFinding] = Field(default_factory=list)
+    deferrals: list[AssessmentDeferral] = Field(default_factory=list)
+
+    _validate_project = field_validator("project")(_reject_project_pii)
+
+
 class SessionSaveRequest(BaseModel):
     """Request schema for /session/save endpoint."""
 
@@ -241,6 +301,15 @@ class InteractionListItem(BaseModel):
     error_detail: str | None = None
     duration_ms: int | None = None
     trace_id: str | None = None
+    # Migration 012 (ADR-048): interaction | security | assessment.
+    event_class: str | None = None
+    # Migration 015 (ADR-058 WS-A1): DB-server-assigned insert clock,
+    # serialised to ISO-8601. Surfaced here so the audit API actually
+    # returns the writer-independent timestamp (response_model filters
+    # any field not declared).
+    created_at: str | None = None
+    # Migration 017 (ADR-058 WS-A3): content-integrity hash.
+    content_hash: str | None = None
 
 
 class InteractionListResponse(BaseModel):
