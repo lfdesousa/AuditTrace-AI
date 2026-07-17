@@ -135,6 +135,52 @@ class TestPersistAudit:
         assert row.failure_class == "scan_failed"
 
 
+class TestRlsContextAndOwnerGuard:
+    """#357 — the consumer runs outside FastAPI's auth middleware, so it must
+    set the ``app.current_user_id`` RLS GUC itself before the INSERT into the
+    RLS'd ``interactions`` table, and must refuse to persist an
+    unattributable (NULL-owner) audit row (ADR-058 invariant).
+
+    RLS enforcement is a Postgres property (SQLite ignores it — see
+    ``feedback_unit_tests_miss_rls`` and ``test_rls_isolation.py``); these
+    unit tests pin the *code contract* (the GUC is set, the guard fires).
+    The enforcement itself is proven by the live redeploy in the PR body.
+    """
+
+    async def test_sets_rls_user_context_from_audit_row(self) -> None:
+        factory = await _make_factory()
+        consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
+        with patch(
+            "audittrace.services.scan_audit_consumer.set_current_user_id"
+        ) as mock_set:
+            await consumer._persist_audit(_audit_payload(verdict="clean"))
+        # The uploading user owns their scan-audit row → GUC set to their sub
+        # so Postgres RLS WITH CHECK accepts the INSERT.
+        mock_set.assert_called_once_with("alice")
+
+    async def test_missing_user_id_refuses_unattributable_row(self) -> None:
+        factory = await _make_factory()
+        consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
+        payload = _audit_payload(verdict="clean")
+        del payload["user_id"]
+        with pytest.raises(ValueError, match="no user_id"):
+            await consumer._persist_audit(payload)
+        # Nothing persisted — a NULL-owner row would be permanently unreadable.
+        async with factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(InteractionRecord).where(
+                            InteractionRecord.event_class == "security"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert rows == []
+
+
 def _aio_pika_mock() -> MagicMock:
     """See ``tests/test_scan_verdict_consumer.py::_aio_pika_mock``;
     same purpose — bind the REAL ``aio_pika.exceptions`` submodule to

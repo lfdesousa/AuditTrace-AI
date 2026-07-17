@@ -45,6 +45,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from audittrace.db.models import InteractionRecord
+from audittrace.db.rls import set_current_user_id
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -160,19 +161,40 @@ class ScanAuditConsumer:
             }
         )
 
+        # The consumer task does NOT pass through FastAPI's auth middleware,
+        # so the ``app.current_user_id`` RLS ContextVar is unset. Migration
+        # 005 put ``WITH CHECK (user_id = current_setting('app.current_user_id',
+        # true))`` on ``interactions``; with the GUC unset the check becomes
+        # ``user_id = ''`` and every INSERT is rejected — which silently
+        # dropped every scan-audit row. Set the GUC from the audit row's
+        # user_id (the uploading user owns their scan-audit row, owner-scoped
+        # and readable back under their own JWT). Mirrors async_persist +
+        # session_summarizer. (#357)
+        user_id = payload.get("user_id")
+        if not user_id:
+            # ADR-058 invariant: never persist an audit row with a NULL owner
+            # (permanently unreadable under RLS). A scan-audit with no user_id
+            # is a producer-side traceability defect — fail loud so it is not
+            # lost silently.
+            raise ValueError(
+                f"scan-audit row for scan_id={scan_id} has no user_id; "
+                "refusing to persist an unattributable audit row"
+            )
+
         row = InteractionRecord(
             project="content-control",
             source="scan-audit",
             question=f"scan_id={scan_id} sha256={sha256}",
             answer="",
             timestamp=_now_iso(),
-            user_id=payload.get("user_id"),
+            user_id=user_id,
             trace_id=payload.get("trace_id"),
             status=status,
             failure_class=verdict,
             error_detail=detail,
             event_class="security",
         )
+        set_current_user_id(user_id)
         async with self._session_factory() as session:
             session.add(row)
             await session.commit()
@@ -199,11 +221,13 @@ class ScanAuditConsumer:
                 async for message in it:
                     try:
                         await self._process_one(message)
-                    except Exception as exc:
-                        logger.error(
-                            "scan_audit_consumer.process_failed",
-                            extra={"reason": str(exc)},
-                        )
+                    except Exception:
+                        # exc_info via logger.exception so the DB error (e.g.
+                        # an RLS WITH CHECK rejection) renders in the JSON log.
+                        # StructuredFormatter drops extra{} fields but keeps
+                        # exception tracebacks, so extra={"reason": ...}
+                        # previously masked this failure entirely. (#357)
+                        logger.exception("scan_audit_consumer.process_failed")
         except asyncio.CancelledError:
             logger.info("scan_audit_consumer.run.cancelled")
             raise
