@@ -858,6 +858,16 @@ vault:
     # Vault Agent Injector sidecar — required for the file-mount secret
     # delivery pattern (ADR-043 §4).
     enabled: true
+    # #358 — disable the upstream chart's default injector pod-anti-affinity.
+    # The default is a requiredDuringScheduling podAntiAffinity on
+    # topologyKey kubernetes.io/hostname (forbid two injector webhook pods on
+    # one node). On the single-node k3s laptop a rolling update's surge pod can
+    # never schedule alongside the running one → the Deployment deadlocks
+    # mid-rollout (a Pending pod lingers for weeks, and helm --wait times out
+    # → the release is marked "failed" even though the app is healthy). Empty
+    # string overrides the upstream default so the injector schedules anywhere.
+    # Multi-node prod can restore a soft (preferredDuringScheduling) rule.
+    affinity: ""
     # Pod-level annotations. The mutating webhook listens on :8080 and
     # is invoked by the K8s API server, which is OUT of the Istio mesh
     # and does not speak Istio mTLS. We keep the Istio sidecar on the
