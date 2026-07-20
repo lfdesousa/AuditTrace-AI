@@ -1,0 +1,126 @@
+meta {
+  name: Tempo — fetch the trace and corroborate against Langfuse
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{tempoUrl}}/api/traces/{{traceId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    const names = [];
+    for (const b of (body.batches || [])) {
+      for (const ss of (b.scopeSpans || [])) {
+        for (const s of (ss.spans || [])) names.push(s.name);
+      }
+    }
+    names.sort();
+    bru.setEnvVar("tempoSpanCount", String(names.length));
+    bru.setEnvVar("tempoSpanNames", JSON.stringify(names));
+    console.log("tempo spans:", names.length, names);
+  }
+}
+
+tests {
+  test("returns 200 — the trace reached Tempo", function() {
+    // Tempo's API takes no auth (verified 2026-07-20). A 404 here with a
+    // 200 from Langfuse is itself a finding: the OTel pipeline dropped a
+    // trace the Langfuse SDK kept.
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("trace has at least one span", function() {
+    expect(Number(bru.getEnvVar("tempoSpanCount"))).to.be.above(0);
+  });
+
+  test("CORROBORATION — every Langfuse observation is present in Tempo", function() {
+    // The invariant is CONTAINMENT, not equality — corrected 2026-07-20
+    // after a live run showed langfuse=5 tempo=17 on the same trace.
+    // The two stores have different instrumentation scopes: Tempo receives
+    // every OTel span (ASGI, DB, Redis, HTTP client — SELECT, SETEX,
+    // connect, http send), while Langfuse receives only what the Langfuse
+    // SDK observes. Tempo is therefore a superset by construction.
+    //
+    // A Langfuse observation with NO matching Tempo span is the real
+    // anomaly: it means the OTel pipeline dropped a span the Langfuse SDK
+    // kept. That is what this asserts.
+    const lf = JSON.parse(bru.getEnvVar("langfuseObsNames") || "[]");
+    const tp = JSON.parse(bru.getEnvVar("tempoSpanNames") || "[]");
+    console.log(`langfuse=${lf.length} tempo=${tp.length}`);
+    const missing = lf.filter(n => !tp.includes(n));
+    if (missing.length) console.log("MISSING from Tempo:", missing);
+    expect(missing).to.deep.equal([]);
+  });
+  test("Tempo's surplus spans are infrastructure, not lost application spans", function() {
+    // Report the delta rather than hide it. This is descriptive, not a
+    // pass/fail gate on an exact list — the auto-instrumented span set
+    // changes with library versions and must not become a brittle pin.
+    const lf = JSON.parse(bru.getEnvVar("langfuseObsNames") || "[]");
+    const tp = JSON.parse(bru.getEnvVar("tempoSpanNames") || "[]");
+    const surplus = tp.filter(n => !lf.includes(n));
+    console.log(`tempo-only spans (${surplus.length}):`, [...new Set(surplus)].sort());
+    expect(tp.length).to.be.at.least(lf.length);
+  });
+}
+
+docs {
+  **Step 3 of the evidence chain — the Tempo leg, and the comparison.**
+
+  Fetches the same `{{traceId}}` from Tempo, counts spans across
+  `batches[].scopeSpans[].spans[]`, and corroborates against the Langfuse
+  figures captured in `01`. The comparison lives here because this
+  request runs last and therefore holds both sides.
+
+  **The invariant is containment, not equality** — corrected 2026-07-20
+  by a live run. On a real request trace the two stores disagreed 5 vs
+  17, and that disagreement was correct: Tempo receives every OTel span
+  (ASGI `http send`/`http receive`, DB `SELECT`/`INSERT`, Redis `SETEX`,
+  HTTP-client `GET`/`PUT`, `connect`), while Langfuse receives only what
+  the Langfuse SDK observes. Tempo is a superset by construction.
+
+  An earlier check passed 2 == 2 on a bootstrap trace whose only spans
+  were DI/DB ones both stores happened to capture. That was a degenerate
+  case masquerading as agreement — a direct instance of the noise hazard
+  in this collection's other docs: validating a mechanism against
+  infrastructure traces will teach you the wrong invariant.
+
+  **What this proves, and what it does not.**
+
+  Containment defeats one direction of *persistence-loss*: a Langfuse
+  observation with no matching Tempo span means the OTel pipeline dropped
+  something the SDK kept, and this fails. It does NOT defeat
+  *emission-loss* — the same process feeds both stores, so a span never
+  emitted is absent from both and they agree on a number that is wrong.
+  Nor does it detect a Tempo-only span going missing, since surplus is
+  expected. Say all of this plainly; it is the honest boundary of the
+  technique.
+
+  **The missing third leg — a real gap, recorded here.** The intended
+  design corroborates THREE stores: Postgres `tool_calls`, Langfuse
+  observations, Tempo spans. But as of 2026-07-20 the `tool_calls` table
+  is exposed through no API endpoint — `_row_to_dict` in
+  `routes/audit.py` returns no tool-call data, and there is no
+  `/tool-calls` route in the OpenAPI document. So the Postgres leg
+  cannot be reached through the front door, and this request corroborates
+  two stores, not three.
+
+  That gap bears directly on the "zero versus missing" question: an
+  auditor holding a scoped JWT cannot today ask the system of record how
+  many tool calls a given interaction made. Closing it means an additive,
+  scope-gated read surface over `tool_calls`. Until then, this pair of
+  requests is the strongest corroboration available through the API, and
+  the shortfall belongs in any write-up rather than in a footnote.
+
+  **Retention caveat:** Tempo's retention window bounds how long
+  corroboration stays possible. A trace that has aged out returns 404
+  here while Langfuse may still hold it — expected divergence, not a
+  fault, but distinguish it from a genuine drop before reporting.
+}

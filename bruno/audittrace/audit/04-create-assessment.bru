@@ -1,0 +1,128 @@
+meta {
+  name: POST /assessments — record a self-assessment (ADR-058)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/assessments
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{assessmentToken}}
+}
+
+script:pre-request {
+  // A fresh assessment_id per run keeps each execution's fan-out
+  // isolatable — the read-back request filters on it via session_id.
+  const aid = "bruno-assessment-" + Date.now();
+  bru.setEnvVar("assessmentId", aid);
+  console.log("assessment_id:", aid);
+}
+
+body:json {
+  {
+    "project": "self-audit",
+    "source": "security-assessment",
+    "assessment_id": "{{assessmentId}}",
+    "frameworks": ["OWASP Top 10", "ASVS", "OWASP CRS (defensive lens)"],
+    "rules_of_engagement": "Own application, own infrastructure, authorised. Front door only — public API with properly scoped tokens. kubectl observes impact, never creates it. No denial of service.",
+    "teardown": "Bruno smoke run — no environment provisioned, nothing to tear down.",
+    "questions": [
+      {
+        "question": "Can a forged server-side request steal the cloud's keys?",
+        "verdict": "pass",
+        "method": "Verify the metadata service configuration on every instance (IMDSv2 handshake + hop-limit)."
+      },
+      {
+        "question": "If one component is compromised, what can it touch?",
+        "verdict": "pass",
+        "method": "Enumerate every component's cloud identity and the exact resources its permissions grant."
+      }
+    ],
+    "findings": [
+      {
+        "finding_id": "BRUNO-SMOKE-L1",
+        "severity": "low",
+        "title": "Bruno smoke finding — not a real assessment result",
+        "detail": "Fixture row proving the finding fan-out path. Real assessments are ingested by the operator, not by the collection."
+      }
+    ],
+    "deferrals": [
+      {
+        "item": "Model-in-the-loop attack surface",
+        "reason": "Requires a real model in the loop; belongs to a separate run."
+      }
+    ]
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    bru.setEnvVar("assessmentRowsWritten", String(body.rows_written));
+    console.log("rows_written:", body.rows_written, "artefact_key:", body.artefact_key);
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("echoes the assessment_id we sent", function() {
+    expect(res.getBody().assessment_id).to.equal(bru.getEnvVar("assessmentId"));
+  });
+  test("event_class is 'assessment' (ADR-048 taxonomy)", function() {
+    expect(res.getBody().event_class).to.equal("assessment");
+  });
+  test("fan-out wrote 1 header + N children (here: 1+2+1+1 = 5)", function() {
+    // The builder emits one assessment_header row plus one child per
+    // question / finding / deferral. This body carries 2 questions,
+    // 1 finding, 1 deferral — so 5 rows. If this number changes, the
+    // body above changed and the assertion must move with it.
+    expect(res.getBody().rows_written).to.equal(5);
+  });
+  test("raw payload captured to object storage (WS-A4)", function() {
+    // artefact_key is best-effort by design — a store hiccup must never
+    // drop the audit rows. So a null is a WARNING, not a failure: the
+    // rows are the audit record, the artefact is the re-derivation aid.
+    const key = res.getBody().artefact_key;
+    if (key === null) {
+      console.log("WARN: artefact_key is null — object storage was unreachable. Rows still recorded.");
+      return;
+    }
+    expect(key).to.contain("assessments/" + bru.getEnvVar("assessmentId"));
+  });
+}
+
+docs {
+  ADR-058 recursive self-audit — the recorder records the evidence of
+  its OWN security review as first-class, queryable audit events. Dr
+  Ivan Roche's framing: "the recorder needs to be a witness to its own
+  governability."
+
+  **Path is `/assessments`, NOT `/audit/assessments`.** The route
+  docstring in `routes/audit.py` says the latter, but `audit.router` is
+  mounted with no prefix (`server.py:547`), so the live path — confirmed
+  against `/openapi.json` on 2026-07-20 — is `/assessments`. Trust the
+  OpenAPI document, not the docstring.
+
+  **Scope: `audittrace:assessment:ingest`** — deliberately distinct from
+  the broad `audittrace:audit` read scope. Write and read are separate
+  grants, so this request uses `{{assessmentToken}}` rather than the
+  collection-wide `{{accessToken}}`. Mint it with the ingest scope:
+
+      bru run ... --env-var assessmentToken=$TOKEN_INGEST
+
+  If you point `assessmentToken` at a token WITHOUT the ingest scope,
+  the expected result is 403 — that negative path is worth running
+  deliberately, it is the proof the least-privilege split is real.
+
+  Recording the assessment through the front door under a scoped JWT
+  IS the assessment's own rules-of-engagement evidence — the method and
+  the artefact are the same act.
+
+  Read the rows back with `05-read-assessment-rows`.
+}

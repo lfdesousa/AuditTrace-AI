@@ -1,0 +1,81 @@
+meta {
+  name: Langfuse — count observations for the trace
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{langfuseUrl}}/api/public/observations?traceId={{traceId}}&limit=100
+  body: none
+  auth: basic
+}
+
+auth:basic {
+  username: {{langfusePublicKey}}
+  password: {{langfuseSecretKey}}
+}
+
+query {
+  traceId: {{traceId}}
+  limit: 100
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    const body = res.getBody();
+    const names = (body.data || []).map(o => o.name).sort();
+    bru.setEnvVar("langfuseObsCount", String(body.meta.totalItems));
+    bru.setEnvVar("langfuseObsNames", JSON.stringify(names));
+    console.log("langfuse observations:", body.meta.totalItems, names);
+  }
+}
+
+tests {
+  test("returns 200 — credentials accepted", function() {
+    // A 401 here means the Basic-auth key pair is wrong or absent.
+    // Inject them at runtime; they must never be committed (public repo).
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("the trace is present in Langfuse", function() {
+    expect(res.getBody().meta.totalItems).to.be.above(0);
+  });
+  test("every observation belongs to the trace we asked for", function() {
+    for (const o of res.getBody().data) {
+      expect(o.traceId).to.equal(bru.getEnvVar("traceId"));
+    }
+  });
+  test("pagination did not silently truncate the count", function() {
+    // If totalItems exceeds the page limit, the name list captured above
+    // is partial and the cross-store name comparison in `03` would be
+    // comparing a truncated set. Fail loudly rather than corroborate a
+    // subset and call it agreement.
+    const meta = res.getBody().meta;
+    expect(meta.totalItems).to.be.at.most(meta.limit);
+  });
+}
+
+docs {
+  **Step 2 of the evidence chain — the Langfuse leg.**
+
+  Counts the observations Langfuse holds for `{{traceId}}` and stashes
+  both the count and the sorted span names for the three-way comparison
+  in `03-tempo-trace`.
+
+  **Auth: HTTP Basic**, public key as username, secret key as password.
+  `/api/public/*` returns 401 unauthenticated (verified 2026-07-20).
+  Inject at runtime — this collection lives in a PUBLIC repo:
+
+      bru run ... --env-var langfusePublicKey=$LF_PK \
+                  --env-var langfuseSecretKey=$LF_SK
+
+  **Trust-basis caveat, stated rather than glossed:** this leg runs
+  under observability-store credentials, not the caller's JWT. That is
+  not a front-door violation — Langfuse is a separate store and reading
+  it is the auditor's job, not the user's — but it IS a different trust
+  basis from the AuditTrace legs, and any write-up should say so.
+
+  **Known noise (2026-07-20):** the store holds ~64k traces dominated by
+  bootstrap/DI spans (`db-postgres-session-factory`, `di-bootstrap`,
+  `db-chromadb-client`). Always filter by `traceId` — never reason from
+  "recent traces".
+}
