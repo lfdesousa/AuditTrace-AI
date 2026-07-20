@@ -1000,3 +1000,97 @@ class TestPostDeployVerifyKeycloakScopeGuard:
         assert numbering == list(range(1, total + 1)), (
             f"check numbers are not sequential 1..{total}: {numbering}"
         )
+
+
+class TestRestrictedClientStaysRestricted:
+    """`audittrace-restricted` must never gain an audit or admin scope (SC-09).
+
+    This client exists for exactly one purpose: to hold a token that CANNOT be
+    widened by asking. Keycloak silently DROPS a requested scope a client does
+    not offer rather than erroring, so "the client does not offer it" is the
+    entire mechanism. Adding `audittrace:audit` to either scope set - even as
+    optional, even "just for a test" - does not weaken the evidence, it VOIDS
+    it: every SC-09 403 would then prove only that the caller did not ask.
+
+    The failure mode this guards against is quiet. Nothing breaks, no test
+    goes red, and the adversarial result silently becomes worthless while
+    still being cited. Hence a test rather than a comment.
+    """
+
+    FORBIDDEN = (
+        "audittrace:audit",
+        "audittrace:admin",
+        "audittrace:assessment:ingest",
+        "audittrace:index",
+    )
+
+    @staticmethod
+    def _restricted(realm: dict) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == "audittrace-restricted":
+                return c
+        raise AssertionError(
+            "audittrace-restricted is missing from the realm. SC-09 "
+            "(adversarial cross-tenant read) cannot be run without it - a "
+            "second identity on the SHARED client proves politeness, not a "
+            "boundary. See audittrace-private doc 14."
+        )
+
+    def test_top_level_realm_grants_no_audit_scope(self) -> None:
+        realm = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        c = self._restricted(realm)
+        both = list(c.get("defaultClientScopes", [])) + list(
+            c.get("optionalClientScopes", [])
+        )
+        offenders = [s for s in both if s in self.FORBIDDEN]
+        assert not offenders, (
+            "audittrace-restricted was granted "
+            f"{offenders} - this VOIDS every SC-09 result. The client's only "
+            "purpose is that these scopes are unobtainable, not merely "
+            "unrequested. Remove them, or stop citing SC-09."
+        )
+
+    def test_description_fits_keycloak_column(self) -> None:
+        """Keycloak stores client.description in a varchar(255).
+
+        Overflowing it makes the admin API return a bare HTTP 500 with
+        `{"error":"unknown_error"}` and no hint; the real cause
+        (`value too long for type character varying(255)`) appears only in the
+        Keycloak pod log. Cost a debugging cycle on 2026-07-20.
+        """
+        for rel in (
+            "keycloak/realm-audittrace.json",
+            "charts/audittrace/files/realm-audittrace.json",
+        ):
+            raw = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            i = raw.index('"clientId": "audittrace-restricted"')
+            start = raw.rindex('"description": "', 0, i) + len('"description": ')
+            desc = json.loads(raw[start : raw.index('",\n', start) + 1])
+            assert len(desc) <= 255, (
+                f"{rel}: audittrace-restricted description is {len(desc)} "
+                "chars; Keycloak's column is varchar(255) and the admin API "
+                'fails with an unhelpful bare 500 ("unknown_error").'
+            )
+
+    def test_chart_and_top_level_realms_agree(self) -> None:
+        """Both realm files must define the client identically.
+
+        The chart file is the one actually imported; the top-level file is the
+        dev/standalone import. A client present in only one of them produces a
+        realm that behaves differently depending on how it was created - the
+        exact drift class as #370.
+        """
+        chart_raw = (
+            REPO_ROOT / "charts" / "audittrace" / "files" / "realm-audittrace.json"
+        ).read_text(encoding="utf-8")
+        assert '"audittrace-restricted"' in chart_raw, (
+            "audittrace-restricted is in keycloak/realm-audittrace.json but "
+            "NOT in the chart's realm file - the chart file is the one that "
+            "actually gets imported, so a fresh cluster would not have it."
+        )
+        for scope in ("audittrace:query", "audittrace:context"):
+            assert scope in chart_raw
