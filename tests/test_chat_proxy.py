@@ -1984,3 +1984,815 @@ class TestApplyThinkingMode:
         _apply_thinking_mode(payload, "deep")
         assert payload["chat_template_kwargs"]["some_other_flag"] == 42
         assert payload["chat_template_kwargs"]["enable_thinking"] is True
+
+
+# ───────────────────────── Stream chunk accumulation ────────────────────────
+
+
+class TestAccumulateChunk:
+    """``_accumulate_chunk`` is the only place a streamed answer is
+    reconstructed. Whatever it accumulates becomes the persisted
+    ``interactions.answer`` and the token counts on the audit row, so a
+    mis-parse here silently corrupts the audit trail rather than raising.
+    """
+
+    def test_usage_only_chunk_without_choices_records_tokens(self):
+        """llama-server ends a stream with a usage-only chunk that carries
+        ``choices: []``. Indexing ``choices[0]`` unguarded would raise inside
+        the streaming generator — the response has already started, so the
+        client would see a truncated stream and the audit row would carry
+        zero tokens. Usage must be read from a choice-less chunk."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "id": "cmpl-usage",
+                "model": "qwen3.5-35b",
+                "choices": [],
+                "usage": {"prompt_tokens": 31, "completion_tokens": 7},
+            },
+        )
+        assert state.prompt_tokens == 31
+        assert state.completion_tokens == 7
+        assert state.chunks == []
+        assert state.finish_reason is None
+
+    def test_tool_call_fragment_without_arguments_keeps_accumulated_args(self):
+        """Streamed ``function.arguments`` arrive as fragments across chunks,
+        and llama-server interleaves fragments that carry only ``name``. If a
+        name-only fragment reset or appended to the buffer, the tool-call
+        audit row would record malformed JSON — the tool_calls table is the
+        record of what the model actually asked for (ADR-025)."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        for delta in (
+            {"index": 0, "id": "call_1", "function": {"name": "recall_decisions"}},
+            {"index": 0, "function": {"arguments": '{"query":'}},
+            # Name repeated, no arguments — must not disturb the buffer.
+            {"index": 0, "function": {"name": "recall_decisions"}},
+            {"index": 0, "function": {"arguments": '"rls"}'}},
+        ):
+            _accumulate_chunk(state, {"choices": [{"delta": {"tool_calls": [delta]}}]})
+
+        acc = state.tool_calls_acc[0]
+        assert acc["id"] == "call_1"
+        assert acc["function"]["name"] == "recall_decisions"
+        assert acc["function"]["arguments"] == '{"query":"rls"}'
+
+    def test_timings_do_not_override_authoritative_usage(self):
+        """llama-server sends BOTH an OpenAI ``usage`` block and a
+        llama-specific ``timings`` block. ``timings.cache_n`` counts cached
+        prompt tokens and would double-count against ``usage.prompt_tokens``.
+        The usage block wins; timings are only a fallback for backends that
+        omit it. Getting this wrong inflates every billed/audited token
+        count on a cache-hit request."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                "timings": {"cache_n": 900, "prompt_n": 100, "predicted_n": 20},
+            },
+        )
+        assert state.prompt_tokens == 100
+        assert state.completion_tokens == 20
+
+    def test_timings_fill_in_when_usage_absent(self):
+        """The complementary case: no ``usage`` block at all, so the audit
+        row would record 0/0 tokens unless timings are used."""
+        from audittrace.routes.chat import _accumulate_chunk, _StreamState
+
+        state = _StreamState()
+        _accumulate_chunk(
+            state,
+            {
+                "choices": [],
+                "timings": {"cache_n": 90, "prompt_n": 10, "predicted_n": 4},
+            },
+        )
+        assert state.prompt_tokens == 100  # cache_n + prompt_n
+        assert state.completion_tokens == 4
+
+
+class TestAssistantMsgFromStreamState:
+    """The streamed turn is replayed into the tool-loop conversation
+    history. The reconstructed message must be a legal OpenAI assistant
+    message or the NEXT llama call 400s mid-loop."""
+
+    def test_no_tool_calls_key_when_none_were_streamed(self):
+        """OpenAI rejects ``tool_calls: []`` — the key must be absent, not
+        empty, on a plain-text turn. A stray empty array breaks the second
+        iteration of the memory tool loop."""
+        from audittrace.routes.chat import (
+            _assistant_msg_from_stream_state,
+            _StreamState,
+        )
+
+        state = _StreamState(chunks=["Hello ", "world"])
+        msg = _assistant_msg_from_stream_state(state)
+        assert msg == {"role": "assistant", "content": "Hello world"}
+        assert "tool_calls" not in msg
+
+
+class TestRenderToolCallsText:
+    """``_render_tool_calls_text`` produces the ``answer`` text persisted for
+    a turn that ended in tool_calls — the only human-readable record of what
+    the model asked for when the client (not us) executes the tool."""
+
+    def test_non_string_arguments_are_json_encoded(self):
+        """Some clients hand back already-parsed ``arguments`` as a dict.
+        Slicing a dict with ``[:500]`` raises ``TypeError``, which inside the
+        streaming tail would lose the audit row entirely (ADR-033)."""
+        from audittrace.routes.chat import _render_tool_calls_text
+
+        text = _render_tool_calls_text(
+            {
+                0: {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "/etc/hosts"},
+                    }
+                }
+            }
+        )
+        assert text == '[tool_call] read_file({"path": "/etc/hosts"})'
+
+
+class TestDetectSource:
+    """``_detect_source`` decides the ``source`` column on every audit row
+    and the prefix of every ``session_id``. If it mis-classifies, traces
+    for the same client scatter across different session ids and the
+    grouping the reconstructibility walkthrough relies on is lost."""
+
+    def test_valid_x_source_header_is_honoured(self):
+        """Browser clients all send ``Mozilla/5.0 ...`` and would otherwise
+        collapse to ``"unknown"``. The explicit header is what lets the SPA
+        self-identify and keep a stable, readable session_id prefix."""
+        from audittrace.routes.chat import _compute_session_id, _detect_source
+
+        req = _FakeRequest(
+            {"x-source": "audittrace-webui", "user-agent": "Mozilla/5.0"}
+        )
+        source = _detect_source(req)
+        assert source == "audittrace-webui"
+        assert _compute_session_id(source, "hi", "user-1").startswith(
+            "audittrace-webui-"
+        )
+
+    def test_invalid_x_source_header_is_rejected_and_falls_through_to_ua(self):
+        """``source`` is concatenated into ``session_id`` and stored, so an
+        unvalidated header is a caller-controlled value flowing into an
+        identifier. Anything failing ``[a-z0-9][a-z0-9_-]{0,31}`` must be
+        discarded, not sanitised-and-kept."""
+        from audittrace.routes.chat import _detect_source
+
+        req = _FakeRequest(
+            {"x-source": "evil source/../../etc", "user-agent": "curl/8.5.0"}
+        )
+        assert _detect_source(req) == "curl"
+
+    def test_over_long_x_source_header_is_rejected(self):
+        """32-char cap: an unbounded source would produce unbounded
+        session_id values on an indexed column."""
+        from audittrace.routes.chat import _detect_source
+
+        req = _FakeRequest({"x-source": "a" * 33, "user-agent": "unmatched-agent"})
+        assert _detect_source(req) == "unknown"
+
+    def test_user_agent_marker_identifies_terminal_clients(self):
+        """OpenCode and friends cannot set headers; UA substring matching is
+        the only way their traffic is attributable in the audit trail."""
+        from audittrace.routes.chat import _detect_source
+
+        assert (
+            _detect_source(_FakeRequest({"user-agent": "opencode/1.2"})) == "opencode"
+        )
+        assert (
+            _detect_source(_FakeRequest({"user-agent": "python-httpx/0.27"})) == "httpx"
+        )
+
+    def test_unrecognised_client_falls_back_to_unknown(self):
+        """The fallback must be a constant, never a reflected UA string."""
+        from audittrace.routes.chat import _detect_source
+
+        assert _detect_source(_FakeRequest({"user-agent": "Mozilla/5.0"})) == "unknown"
+
+
+class TestExtractQueryEdgeCases:
+    """The extracted query is what gets embedded for memory retrieval AND
+    what lands in ``interactions.question``. A wrong extraction retrieves
+    the wrong context and files the interaction under the wrong question."""
+
+    def test_returns_empty_string_when_no_user_message_present(self):
+        """A tool-result-only continuation turn (system + assistant + tool)
+        has no user message. Returning "" keeps the request on the normal
+        path; anything raising here would 500 a legal OpenAI request."""
+        from audittrace.routes.chat import _extract_query
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "assistant", "content": "calling tool"},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            ]
+        }
+        assert _extract_query(payload) == ""
+
+    def test_skips_user_message_whose_content_is_neither_str_nor_list(self):
+        """OpenAI permits ``content: null`` on a message. The scan must keep
+        walking backwards to the last usable user turn instead of returning
+        an unusable value — otherwise memory retrieval runs on an empty
+        query and the answer silently loses its context."""
+        from audittrace.routes.chat import _extract_query
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": "what changed in RLS?"},
+                {"role": "assistant", "content": "..."},
+                {"role": "user", "content": None},
+            ]
+        }
+        assert _extract_query(payload) == "what changed in RLS?"
+
+
+class TestRecordLangfuseOutputBody:
+    """``_record_langfuse_output`` is the ONLY writer of trace-level
+    input/output/user/session in Langfuse. Langfuse ``trace-create`` is an
+    upsert, so a key present-but-null overwrites; a key absent leaves the
+    existing value alone. These tests pin which keys the helper emits."""
+
+    @pytest.fixture
+    def _langfuse_env(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_HOST", "http://lf.test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("AUDITTRACE_LANGFUSE_SECRET_KEY", "sk-test")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_absent_trace_id_makes_no_ingestion_call(self, _langfuse_env):
+        """Langfuse is unreachable or the SDK is not installed on some
+        deployments, so ``trace_id`` is legitimately ``None``. Posting
+        anyway would create an orphan trace keyed on ``output-None`` and
+        every request would collide onto that one row."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id=None,
+                answer="hello",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+                tool_calls=None,
+                session_id="sess-1",
+                model="qwen3.5-35b",
+                user_id="user-1",
+                input_messages=[{"role": "user", "content": "hi"}],
+            )
+        assert fake.post_calls == []
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_are_summarised_into_trace_metadata(self, _langfuse_env):
+        """A turn that ends in ``tool_calls`` has no answer text, so without
+        the metadata summary the Langfuse trace shows an empty output and an
+        auditor cannot see which tools the model reached for. Name + id are
+        the join keys back to the ``tool_calls`` Postgres rows."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id="trace-tc-1",
+                answer="",
+                prompt_tokens=10,
+                completion_tokens=2,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {"id": "call_a", "function": {"name": "read_file"}},
+                    {"id": "call_b", "function": {"name": "recall_decisions"}},
+                ],
+                session_id="sess-1",
+                model="qwen3.5-35b",
+                user_id="user-1",
+                input_messages=[{"role": "user", "content": "hi"}],
+            )
+
+        ingestion = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
+        assert len(ingestion) == 1
+        metadata = ingestion[0]["json"]["batch"][0]["body"]["metadata"]
+        assert metadata["has_tool_calls"] is True
+        assert metadata["tool_calls"] == [
+            {"name": "read_file", "id": "call_a"},
+            {"name": "recall_decisions", "id": "call_b"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_optional_identity_fields_are_omitted_not_nulled(self, _langfuse_env):
+        """``user_id``, ``session_id`` and ``input_messages`` are optional on
+        this helper. When a caller has none of them the body must OMIT the
+        corresponding keys: ``trace-create`` is an upsert, so emitting
+        ``userId: null`` would erase the attribution an earlier write already
+        put on the trace (EU AI Act Art. 12 — the trace must stay tied to a
+        user). Absent keys leave the stored value intact."""
+        from audittrace.routes.chat import _record_langfuse_output
+
+        fake = _FakeAsyncClient()
+        with _patch_async_client(fake):
+            await _record_langfuse_output(
+                trace_id="trace-min-1",
+                answer="hello",
+                prompt_tokens=5,
+                completion_tokens=1,
+                finish_reason=None,
+                tool_calls=None,
+                session_id=None,
+                model=None,
+            )
+
+        ingestion = [c for c in fake.post_calls if _is_ingestion_url(c["url"])]
+        assert len(ingestion) == 1
+        body = ingestion[0]["json"]["batch"][0]["body"]
+        assert body["output"] == "hello"
+        assert "input" not in body
+        assert "userId" not in body
+        assert "sessionId" not in body
+        # Unknown-but-present is how the dashboards read a missing backend /
+        # finish_reason — never a null that breaks the metadata filters.
+        assert body["metadata"]["finish_reason"] == "unknown"
+        assert body["metadata"]["model_backend"] == "unknown"
+        assert body["metadata"]["has_tool_calls"] is False
+        assert "tool_calls" not in body["metadata"]
+
+
+class TestLangfuseUnavailableDegradesGracefully:
+    """Langfuse is a sibling Docker-Compose stack, not part of the k8s
+    deployment. When it is down or the SDK is not installed the chat hot
+    path must still answer — observability degrades, the service does not.
+    """
+
+    class _StubContextBuilder:
+        async def build_system_context(self, user_context, project=None, query=None):
+            return "## Memory\ncontext"
+
+    @pytest.mark.asyncio
+    async def test_inject_mode_returns_context_and_null_trace_id_when_sdk_absent(self):
+        """``_LANGFUSE_AVAILABLE`` is False on any install without the
+        langfuse package. The memory context must still be built and
+        returned; only ``trace_id`` goes ``None`` (the caller then skips
+        the ingestion update)."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _build_memory_context_with_trace
+
+        with patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", False):
+            context, trace_id = await _build_memory_context_with_trace(
+                self._StubContextBuilder(),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert context == "## Memory\ncontext"
+        assert trace_id is None
+
+    @pytest.mark.asyncio
+    async def test_inject_mode_survives_langfuse_client_being_none(self):
+        """``_lf_get_client()`` returns ``None`` when the SDK is importable
+        but unconfigured (no keys). Neither the trace-id read nor the span
+        update may be attempted on ``None`` — an AttributeError here would
+        abort the request before the LLM is ever called."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _build_memory_context_with_trace
+
+        with (
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._lf_get_client", return_value=None),
+        ):
+            context, trace_id = await _build_memory_context_with_trace(
+                self._StubContextBuilder(),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert context == "## Memory\ncontext"
+        assert trace_id is None
+
+    def test_tools_mode_still_advertises_tools_when_sdk_absent(self):
+        """Tools mode must not lose its tool list because observability is
+        down — a silently empty ``tools`` array would make the model answer
+        without ever calling memory, and the degradation would be invisible."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _prepare_tools_mode_trace
+
+        with patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", False):
+            tools, trace_id = _prepare_tools_mode_trace(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert trace_id is None
+        assert tools, "tools must still be advertised with Langfuse unavailable"
+
+    def test_tools_mode_survives_langfuse_client_being_none(self):
+        """Same guard on the tools-mode branch: an unconfigured Langfuse
+        client must not be dereferenced."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _prepare_tools_mode_trace
+
+        with (
+            patch("audittrace.routes.chat._LANGFUSE_AVAILABLE", True),
+            patch("audittrace.routes.chat._lf_get_client", return_value=None),
+        ):
+            tools, trace_id = _prepare_tools_mode_trace(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                "hi",
+                "sess-1",
+                "curl",
+                sentinel_user_context(),
+            )
+        assert trace_id is None
+        assert tools
+
+
+def _j_loads(frame: bytes) -> dict:
+    """Decode one ``data: {...}`` SSE frame emitted by the chat route."""
+    import json as _j
+
+    text = frame.decode().strip()
+    assert text.startswith("data: "), text
+    return _j.loads(text[6:])
+
+
+class TestResolveTurnBufferedIdentity:
+    """``_resolve_turn_buffered`` is the recovery path taken when a streamed
+    turn hits the Qwen tool-args-malformed-JSON 500. It emits frames into a
+    stream that has ALREADY started, so it inherits the stream's identity
+    instead of introducing its own."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_keeps_the_identity_already_recorded_for_the_turn(self):
+        """``_ToolsStreamResult`` carries the ``id``/``created``/``model``
+        that the post-stream code persists to ``interactions`` and pushes to
+        Langfuse. When the fallback fires on turn 2+, those fields are
+        already populated from turn 1 and MUST NOT be re-stamped with the
+        recovery call's own values — the audit row and the trace would then
+        point at a completion the client never saw as turn 1. An absent
+        ``model`` on the fallback body likewise must not blank the model
+        already recorded."""
+        from audittrace.identity import sentinel_user_context
+        from audittrace.routes.chat import _resolve_turn_buffered, _ToolsStreamResult
+
+        result = _ToolsStreamResult()
+        result.resp_id = "cmpl-turn-1"
+        result.created = 1111
+        result.model = "qwen3.5-35b"
+        result.answer_text = "Thinking. "
+
+        fallback_body = {
+            "id": "cmpl-fallback-9",
+            "created": 9999,
+            # No "model" key — llama-server omits it on the no-tools retry.
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "I need the file.",
+                        "tool_calls": [
+                            {
+                                "id": "call_x",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "/tmp/x"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+        }
+        fake = _FakeAsyncClient(post_json=fallback_body)
+
+        frames, terminal = await _resolve_turn_buffered(
+            fake,
+            "http://llama.test/v1/chat/completions",
+            {"model": "qwen3.5-35b", "messages": []},
+            [],
+            sentinel_user_context(),
+            "sess-1",
+            result,
+        )
+
+        # Identity of the in-flight stream is preserved, not overwritten.
+        assert result.resp_id == "cmpl-turn-1"
+        assert result.created == 1111
+        assert result.model == "qwen3.5-35b"
+
+        # An external tool call terminates the loop and is forwarded to the
+        # client, which is the party that executes it.
+        assert terminal is True
+        assert result.finish_reason == "tool_calls"
+        assert [tc["function"]["name"] for tc in result.external_tool_calls] == [
+            "read_file"
+        ]
+
+        chunks = [_j_loads(f) for f in frames]
+        forwarded = [
+            tc
+            for c in chunks
+            for tc in (c["choices"][0].get("delta") or {}).get("tool_calls") or []
+        ]
+        assert [tc["function"]["name"] for tc in forwarded] == ["read_file"]
+        # The recovered content reaches the client too, not just the audit row.
+        assert any(
+            (c["choices"][0].get("delta") or {}).get("content") == "I need the file."
+            for c in chunks
+        ), chunks
+
+        # The tool request is rendered into the answer text so the audit row
+        # records WHAT was asked for, not just that the turn ended.
+        assert "[tool_call] read_file(" in result.answer_text
+        assert result.answer_text.startswith("Thinking. ")
+
+
+# ─────────────── Streaming: keep-alive, metadata-only turns, [DONE] ──────────
+
+
+class _DelayedStreamResponse(_FakeStreamResponse):
+    """``_FakeStreamResponse`` that stalls *delay* seconds before the first
+    line — long enough for ``_iter_with_idle_timeout`` to emit keep-alives."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def aiter_lines(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        for line in self._lines:
+            yield line
+
+
+class _DelayedStreamCtx:
+    def __init__(self, lines: list[str], delay: float) -> None:
+        self._lines = lines
+        self._delay = delay
+
+    async def __aenter__(self):
+        return _DelayedStreamResponse(self._lines, self._delay)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _DelayedStreamClient(_FakeAsyncClient):
+    """Client whose stream stalls before producing any SSE line."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__()
+        self._lines = lines
+        self._delay = delay
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        return _DelayedStreamCtx(self._lines, self._delay)
+
+
+class _DelayedSeqStreamResponse(_SeqStreamResponse):
+    """``_SeqStreamResponse`` (which carries ``status_code``, needed by the
+    tools loop) that stalls before yielding its first line."""
+
+    def __init__(self, lines, delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def aiter_lines(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        for line in self._lines:
+            yield line
+
+
+class _DelayedSeqStreamCtx(_SeqStreamCtx):
+    def __init__(self, lines, delay: float) -> None:
+        super().__init__(lines)
+        self._delay = delay
+
+    async def __aenter__(self):
+        return _DelayedSeqStreamResponse(self._lines, self._delay)
+
+
+class _DelayedSeqStreamClient(_SequencedStreamClient):
+    """Tools-mode variant: each turn's stream stalls before its first line."""
+
+    def __init__(self, stream_turns, delay: float) -> None:
+        super().__init__(stream_turns)
+        self._delay = delay
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        self._si += 1
+        return _DelayedSeqStreamCtx(self._turns[idx], self._delay)
+
+
+class TestStreamingQuietPeriodsAndTermination:
+    """ADR-034: a reasoning model can go quiet for minutes inside
+    ``<think>``. Intermediate proxies (Istio, Caddy, corporate egress) drop
+    an idle connection, so the route must emit SSE comment frames during the
+    silence — and those frames must be comments, invisible to a JSON parser,
+    or every OpenAI client would choke on them."""
+
+    @pytest.fixture
+    def _fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _tools_mode_fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_inject_mode_emits_comment_frames_during_a_quiet_period(
+        self, client, _fast_keepalive
+    ):
+        """The keep-alive must be an SSE *comment* (``: ...``), never a
+        ``data:`` line — a data line would be parsed as a malformed chunk by
+        every OpenAI SDK. The real answer must still arrive afterwards."""
+        fake = _DelayedStreamClient(
+            [
+                'data: {"id":"cmpl-k","created":5,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"answer"}}]}',
+                "data: [DONE]",
+            ],
+            delay=1.4,
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" in raw
+        # Comment frames carry no payload a JSON parser would see.
+        assert "data: : keep-alive" not in raw
+        assert "answer" in raw
+        assert raw.rstrip().endswith("[DONE]")
+
+    def test_tools_mode_emits_comment_frames_during_a_quiet_period(
+        self, client, _tools_mode_fast_keepalive
+    ):
+        """Same guarantee on the tools-mode loop, which opens a fresh
+        upstream stream per turn and so has its own idle window."""
+        fake = _DelayedSeqStreamClient(
+            [_sse_content_lines(["done"])],
+            delay=1.4,
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" in raw
+        assert "data: : keep-alive" not in raw
+        assert "done" in raw
+
+    def test_done_is_echoed_not_synthesised(self, client):
+        """``[DONE]`` is upstream's end-of-stream marker and the proxy only
+        re-emits it AFTER the synthetic usage chunk. When llama-server dies
+        mid-generation the socket closes without ``[DONE]``, and the proxy
+        must not manufacture one: a fabricated terminator makes a truncated
+        answer look like a clean completion to the client. This is the same
+        failure shape as the ``finish_reason="length"`` truncation bug."""
+        fake = _FakeAsyncClient(
+            stream_lines=[
+                'data: {"id":"cmpl-t","created":5,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"half an ans"}}],'
+                '"usage":{"prompt_tokens":9,"completion_tokens":3}}',
+                # Upstream vanishes here — no [DONE].
+            ]
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert "half an ans" in raw
+        assert "[DONE]" not in raw
+        # The usage chunk is still emitted so the token accounting the audit
+        # row and the client both rely on is not lost with the connection.
+        chunks = _parse_sse_deltas(raw)
+        usage_chunks = [c for c in chunks if c.get("usage")]
+        assert usage_chunks, chunks
+        assert usage_chunks[-1]["usage"]["prompt_tokens"] == 9
+
+
+class TestToolsModeMetadataOnlyTurn:
+    """ADR-033: every request gets an audit row. The degenerate upstream
+    turn — SSE frames that carry only metadata, no content, no usage, no
+    model, no tool calls — is exactly the shape that used to escape without
+    a row, because nothing in the turn looked like a result."""
+
+    @pytest.fixture
+    def _tools_mode(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    async def test_content_free_turn_still_persists_an_auditable_row(
+        self, client, _tools_mode
+    ):
+        """The turn yields a non-``data:`` SSE line and one choice-less
+        chunk, then ends. The request must complete, and the audit row must
+        record the empty answer honestly plus the model the CALLER asked
+        for — upstream never sent one, and a null model on the row would
+        make the interaction unattributable to a model version."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        turn = [
+            "event: ping",  # SSE comment/event line — must be skipped, not parsed
+            'data: {"id":"cmpl-empty","created":42,"choices":[]}',
+            "data: [DONE]",
+        ]
+        fake = _SequencedStreamClient([turn])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        chunks = _parse_sse_deltas(response.content.decode())
+        assert not [
+            c
+            for c in chunks
+            if (c.get("choices") or [{}])[0].get("delta", {}).get("content")
+        ], "no content was streamed upstream, none may be invented"
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.answer == ""
+        assert row.model == "qwen3.5-35b"
+        assert row.user_id == SENTINEL_SUBJECT
+        assert row.prompt_tokens == 0

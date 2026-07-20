@@ -201,3 +201,280 @@ class TestPerRequestContextBuilder:
         assert builder_a is not builder_b
         assert builder_a._semantic._bound_user.user_id == "user-alice"
         assert builder_b._semantic._bound_user.user_id == "user-bob"
+
+
+# ── Trust-store DI selection paths (#366 branch coverage) ──────────────────
+# These branches are pure operator-configuration handling: which storage
+# Provider and which sourcing Builder get wired at startup (ADR-052 §2/§3,
+# ADR-053). Every untested outcome here was an error path — the ones that
+# turn a typo in an env var into a clear message instead of a confusing
+# failure three layers down. `_build_inner_builder`'s 'static' arm and the
+# 'file' Provider arm had NO coverage at all before this.
+
+
+def _bootable_settings(**overrides):
+    """Settings valid enough for register_default_dependencies to reach the
+    trust-store wiring at the end of the function.
+
+    Object-storage credentials are validated FIRST and fail fast when empty
+    (feedback_storage_always_s3 — the filesystem fallback was removed), so a
+    bare Settings() never gets as far as the Provider/Builder selection.
+    """
+    from audittrace.config import Settings
+
+    base = dict(env="test", minio_secret_key="test-secret")
+    base.update(overrides)
+    return Settings(**base)
+
+
+class TestTrustStoreProviderSelection:
+    """AUDITTRACE_PDF_TRUST_STORE_PROVIDER — the storage layer."""
+
+    def test_file_provider_registers_mock_so_di_shape_stays_uniform(self) -> None:
+        """`provider=file` is the pre-ADR-052 backwards-compat path.
+
+        The operator points the validator at a Vault-Agent-mounted PEM, so
+        the Provider is bypassed — but DI still needs *something* bound or
+        every downstream lookup has to special-case a missing key. It
+        registers a Mock whose load() raises, and the validator falls back
+        to certifi. Had zero coverage before.
+        """
+        from audittrace.dependencies import _build_trust_store_provider
+        from audittrace.services.trust_store import MockTrustStoreProvider
+
+        provider = _build_trust_store_provider(
+            _bootable_settings(pdf_trust_store_provider="file"),
+            object_store=None,
+            bucket="irrelevant",
+        )
+        assert isinstance(provider, MockTrustStoreProvider)
+
+    def test_unknown_provider_fails_fast_with_the_allowed_values(self) -> None:
+        """A typo must fail at startup naming the valid options.
+
+        The alternative is a server that boots and then fails on the first
+        signed-PDF upload, which is a far worse place to discover a typo.
+        """
+
+        from audittrace.dependencies import _build_trust_store_provider
+
+        with pytest.raises(RuntimeError) as exc:
+            _build_trust_store_provider(
+                _bootable_settings(pdf_trust_store_provider="gcs"),
+                object_store=None,
+                bucket="irrelevant",
+            )
+        msg = str(exc.value)
+        assert "gcs" in msg, "error must echo the offending value"
+        assert "'s3'" in msg and "'file'" in msg, "error must list valid options"
+
+
+class TestTrustStoreBuilderSelection:
+    """AUDITTRACE_PDF_TRUST_STORE_BUILDER — the sourcing layer (ADR-053)."""
+
+    def test_composite_with_blank_list_fails_fast(self) -> None:
+        """composite + empty list would build a bundle with zero roots.
+
+        That silently trusts nothing, so every signature validates as
+        `signed_untrusted` — a taxonomy-wide false negative. Fail at boot.
+        """
+
+        from audittrace.dependencies import _build_trust_store_builder
+
+        with pytest.raises(RuntimeError) as exc:
+            _build_trust_store_builder(
+                _bootable_settings(
+                    pdf_trust_store_builder="composite",
+                    pdf_trust_store_composite_builders="  ,  ,",
+                )
+            )
+        assert "non-empty" in str(exc.value)
+
+    def test_static_builder_requires_its_directory(self) -> None:
+        """'static' without a directory has nothing to read.
+
+        Same failure class as the blank composite list: it would produce an
+        empty bundle rather than an error.
+        """
+        from audittrace.config import Settings
+        from audittrace.dependencies import _build_inner_builder
+
+        settings = Settings(pdf_trust_store_static_dir="")
+        with pytest.raises(RuntimeError) as exc:
+            _build_inner_builder("static", settings)
+        assert "STATIC_DIR" in str(exc.value)
+
+    def test_static_builder_is_constructed_when_directory_is_set(self) -> None:
+        """The happy arm of the same branch — operator-supplied roots."""
+        from audittrace.config import Settings
+        from audittrace.dependencies import _build_inner_builder
+        from audittrace.services.trust_store import StaticTrustStoreBuilder
+
+        settings = Settings(pdf_trust_store_static_dir="/etc/roots")
+        builder = _build_inner_builder("static", settings)
+        assert isinstance(builder, StaticTrustStoreBuilder)
+
+    def test_unknown_builder_name_lists_the_valid_set(self) -> None:
+        from audittrace.config import Settings
+        from audittrace.dependencies import _build_inner_builder
+
+        with pytest.raises(RuntimeError) as exc:
+            _build_inner_builder("uk_tsl", Settings())
+        msg = str(exc.value)
+        assert "uk_tsl" in msg
+        assert "eu_lotl" in msg and "swiss_tsl" in msg and "static" in msg
+
+
+# ── Remaining bootstrap branches (#366) ────────────────────────────────────
+# Startup-path decisions: which Postgres factory, which object-storage
+# backend, which trust-store builder. Every one of these is a place where a
+# misconfigured deployment should fail loudly at boot rather than degrade
+# silently once traffic arrives.
+
+
+class TestContainerCoroutineResolution:
+    """``create_instance`` must handle BOTH sync and async factories.
+
+    ChromaDB factories are ``async def get_client`` (#263) while others are
+    plain sync. The container API is synchronous, so it resolves coroutines
+    itself — but it must not try to "resolve" a value that is already
+    concrete, or every sync factory would break.
+    """
+
+    def test_sync_factory_result_is_stored_as_is(self) -> None:
+        class _SyncFactory:
+            def get_client(self):
+                return {"kind": "sync-client"}
+
+        container = DependencyContainer()
+        container.register_factory("thing", _SyncFactory())
+        assert container.create_instance("thing") == {"kind": "sync-client"}
+
+    def test_async_factory_result_is_awaited_before_storing(self) -> None:
+        class _AsyncFactory:
+            async def get_client(self):
+                return {"kind": "async-client"}
+
+        container = DependencyContainer()
+        container.register_factory("thing", _AsyncFactory())
+        got = container.create_instance("thing")
+        # A coroutine leaking through here would be stored and later awaited
+        # by an unsuspecting sync caller -> "coroutine was never awaited".
+        assert got == {"kind": "async-client"}
+        assert container._instances["thing"] == {"kind": "async-client"}
+
+
+class TestPostgresFactorySelection:
+    """AUDITTRACE_POSTGRES_URL vs env=test vs neither."""
+
+    @staticmethod
+    def _register(monkeypatch, settings):
+        """Register up to the PG selection, stubbing the networked tail.
+
+        ``_register_memory_services`` builds ChromaDB/embedder clients and
+        talks to them; the factory choice under test happens before it.
+        """
+        from audittrace import dependencies as deps
+
+        monkeypatch.setattr(deps, "_register_memory_services", lambda *a, **k: None)
+        deps.container = DependencyContainer()
+        deps.register_default_dependencies(settings)
+        return deps.container
+
+    def test_explicit_database_url_wins(self, monkeypatch) -> None:
+        from audittrace.db.postgres import URLPostgresFactory
+
+        c = self._register(
+            monkeypatch,
+            # database_url is DERIVED from postgres_url (config.py:485),
+            # so the URL has to be supplied through the real field.
+            _bootable_settings(postgres_url="postgresql://u:p@h/db"),
+        )
+        assert isinstance(c._instances["postgres_factory"], URLPostgresFactory)
+
+    def test_test_env_without_url_falls_back_to_in_memory(self, monkeypatch) -> None:
+        from audittrace.db.postgres import InMemoryPostgresFactory
+
+        c = self._register(monkeypatch, _bootable_settings(env="test", postgres_url=""))
+        assert isinstance(c._instances["postgres_factory"], InMemoryPostgresFactory)
+
+    def test_non_test_env_without_url_refuses_to_boot(self, monkeypatch) -> None:
+        """No silent SQLite fallback (ADR-020).
+
+        Booting a production pod against an in-memory DB would accept writes
+        and lose every audit row on restart — the worst possible failure for
+        a recorder. It must refuse instead.
+        """
+        with pytest.raises(RuntimeError) as exc:
+            self._register(
+                monkeypatch, _bootable_settings(env="production", postgres_url="")
+            )
+        assert "requires a database" in str(exc.value)
+
+
+class TestObjectStorageBackendSelection:
+    """AUDITTRACE_OBJECT_STORAGE_BACKEND — minio | aws, nothing else."""
+
+    def test_aws_backend_requires_region_and_bucket(self) -> None:
+        """IRSA supplies credentials, but never the region/bucket.
+
+        Missing either yields a provider that cannot address anything; the
+        failure would surface as a confusing 500 on the first upload.
+        """
+        from audittrace.config import Settings
+        from audittrace.dependencies import _create_object_storage_provider
+
+        with pytest.raises(RuntimeError) as exc:
+            _create_object_storage_provider(
+                Settings(object_storage_backend="aws", aws_region="", aws_bucket="")
+            )
+        assert "AWS_REGION" in str(exc.value) or "AWS_BUCKET" in str(exc.value)
+
+    def test_unknown_backend_names_the_valid_set(self) -> None:
+        from audittrace.config import Settings
+        from audittrace.dependencies import _create_object_storage_provider
+
+        with pytest.raises(RuntimeError) as exc:
+            _create_object_storage_provider(
+                Settings(object_storage_backend="azure-blob")
+            )
+        msg = str(exc.value)
+        assert "azure-blob" in msg
+        assert "minio" in msg and "aws" in msg
+
+
+class TestCompositeBuilderHappyPath:
+    def test_composite_wraps_each_named_inner_builder(self) -> None:
+        """ADR-053: one refresh must cover EU + CH together.
+
+        If the composite silently collapsed to a single builder, the bundle
+        would cover one jurisdiction and every signature from the other would
+        validate as `signed_untrusted`.
+        """
+        from audittrace.dependencies import _build_trust_store_builder
+        from audittrace.services.trust_store import (
+            CompositeTrustStoreBuilder,
+            EuLotlTrustStoreBuilder,
+            SwissTslTrustStoreBuilder,
+        )
+
+        builder = _build_trust_store_builder(
+            _bootable_settings(
+                pdf_trust_store_builder="composite",
+                pdf_trust_store_composite_builders="eu_lotl,swiss_tsl",
+            )
+        )
+        assert isinstance(builder, CompositeTrustStoreBuilder)
+        assert [type(b) for b in builder._inner] == [
+            EuLotlTrustStoreBuilder,
+            SwissTslTrustStoreBuilder,
+        ]
+
+    def test_single_named_builder_skips_the_composite_wrapper(self) -> None:
+        from audittrace.dependencies import _build_trust_store_builder
+        from audittrace.services.trust_store import EuLotlTrustStoreBuilder
+
+        builder = _build_trust_store_builder(
+            _bootable_settings(pdf_trust_store_builder="eu_lotl")
+        )
+        assert isinstance(builder, EuLotlTrustStoreBuilder)

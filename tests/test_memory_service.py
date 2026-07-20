@@ -44,6 +44,29 @@ async def test_mock_memory_service_retrieve():
     assert len(results) == 1
 
 
+async def test_mock_memory_service_count_scoped_to_project():
+    """A project-scoped count must exclude other projects' memories.
+
+    The mock backs every unit test that asserts on memory volume. If its
+    project filter were ignored it would return the global total, so a
+    test asserting "project A holds 2 memories" would pass even against a
+    service that leaked project B's rows — hiding exactly the cross-project
+    bleed the real filter exists to prevent.
+    """
+    service = MockMemoryService()
+
+    await service.store("project1", "s1", "c1")
+    await service.store("project1", "s1", "c2")
+    await service.store("project2", "s1", "c3")
+
+    assert await service.count(project="project1") == 2
+    assert await service.count(project="project2") == 1
+    # Unknown project is 0, not the global total — proves the filter runs.
+    assert await service.count(project="project3") == 0
+    # And the unfiltered count still sees everything.
+    assert await service.count() == 3
+
+
 async def test_mock_memory_service_reset():
     """Test mock memory service reset."""
     service = MockMemoryService()
@@ -103,3 +126,28 @@ async def test_chroma_memory_service_with_mock_client():
     results = await service.retrieve(query="test content", limit=10)
     assert len(results) == 1
     assert "test content" in results[0]["content"]
+
+
+async def test_chroma_count_passes_project_filter_to_collection():
+    """``count(project=...)`` must push a ``where`` clause down to ChromaDB.
+
+    The collection is shared across every project, so counting without the
+    ``where={"project": ...}`` predicate returns the whole collection. That
+    number surfaces on the memory-stats path — an operator reading it would
+    see another tenant's document volume, and any capacity or retention
+    decision keyed off it would be wrong.
+    """
+    from audittrace.db.factory import MockChromaDBFactory
+
+    factory = MockChromaDBFactory()
+    client = await factory.get_client()
+    service = ChromaMemoryService(client, collection_name="test")
+
+    await service.store(project="alpha", source="s", content="a1")
+    await service.store(project="alpha", source="s", content="a2")
+    await service.store(project="beta", source="s", content="b1")
+
+    assert await service.count(project="alpha") == 2
+    assert await service.count(project="beta") == 1
+    # Distinct from the global total — the filter is not being dropped.
+    assert await service.count() == 3

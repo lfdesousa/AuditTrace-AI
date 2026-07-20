@@ -342,14 +342,30 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     # selected. The Provider is the storage layer (where the PEM
     # lives — default S3/MinIO); the Builder is the sourcing layer
     # (where the PEM comes from — default EU LOTL via pyhanko[etsi]).
-    trust_store_provider: TrustStoreProvider
+    container._instances["trust_store_provider"] = _build_trust_store_provider(
+        settings, object_store, effective_bucket
+    )
+    container._instances["trust_store_builder"] = _build_trust_store_builder(settings)
+
+
+def _build_trust_store_provider(
+    settings: Settings, object_store: Any, bucket: str
+) -> TrustStoreProvider:
+    """Resolve ``AUDITTRACE_PDF_TRUST_STORE_PROVIDER`` to a Provider.
+
+    Extracted from ``register_default_dependencies`` so the selection can be
+    tested without booting the whole container — that function performs real
+    network I/O (ChromaDB, embedder) before it reaches this point, which made
+    these config branches unreachable from a unit test. Mirrors the shape of
+    ``_build_inner_builder`` below.
+    """
     if settings.pdf_trust_store_provider == "s3":
-        trust_store_provider = S3TrustStoreProvider(
+        return S3TrustStoreProvider(
             minio_client=object_store,
-            bucket=effective_bucket,
+            bucket=bucket,
             pem_key=settings.pdf_trust_store_s3_key,
         )
-    elif settings.pdf_trust_store_provider == "file":
+    if settings.pdf_trust_store_provider == "file":
         # Pre-ADR-052 backwards-compat: when the operator points
         # AUDITTRACE_PDF_SIGNATURE_TRUST_STORE at a Vault-Agent-mounted
         # PEM file, the validator picks that up directly — the
@@ -357,40 +373,39 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         # so DI shape is uniform; load() raises FileNotFoundError
         # when called, which the validator handles by falling back
         # to certifi.
-        trust_store_provider = MockTrustStoreProvider()
-    else:
-        raise RuntimeError(
-            f"Unknown AUDITTRACE_PDF_TRUST_STORE_PROVIDER="
-            f"{settings.pdf_trust_store_provider!r}; expected one of "
-            f"'s3', 'file' (per ADR-052 §2)."
-        )
+        return MockTrustStoreProvider()
+    raise RuntimeError(
+        f"Unknown AUDITTRACE_PDF_TRUST_STORE_PROVIDER="
+        f"{settings.pdf_trust_store_provider!r}; expected one of "
+        f"'s3', 'file' (per ADR-052 §2)."
+    )
 
-    trust_store_builder: TrustStoreBuilder
+
+def _build_trust_store_builder(settings: Settings) -> TrustStoreBuilder:
+    """Resolve ``AUDITTRACE_PDF_TRUST_STORE_BUILDER`` to a Builder.
+
+    Extracted alongside ``_build_trust_store_provider`` for the same reason.
+    """
     builder_kind = settings.pdf_trust_store_builder
-    if builder_kind == "composite":
-        # ADR-053 — compose multiple jurisdictional builders so the
-        # bundle covers EU + CH (and any future programs) in one
-        # refresh cycle.
-        names = [
-            n.strip()
-            for n in settings.pdf_trust_store_composite_builders.split(",")
-            if n.strip()
-        ]
-        if not names:
-            raise RuntimeError(
-                "AUDITTRACE_PDF_TRUST_STORE_BUILDER=composite requires "
-                "AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS to be a "
-                "non-empty comma-separated list (e.g. 'eu_lotl,swiss_tsl')."
-            )
-        inner_builders: list[TrustStoreBuilder] = [
-            _build_inner_builder(n, settings) for n in names
-        ]
-        trust_store_builder = CompositeTrustStoreBuilder(inner_builders)
-    else:
-        trust_store_builder = _build_inner_builder(builder_kind, settings)
+    if builder_kind != "composite":
+        return _build_inner_builder(builder_kind, settings)
 
-    container._instances["trust_store_provider"] = trust_store_provider
-    container._instances["trust_store_builder"] = trust_store_builder
+    # ADR-053 — compose multiple jurisdictional builders so the bundle
+    # covers EU + CH (and any future programs) in one refresh cycle.
+    names = [
+        n.strip()
+        for n in settings.pdf_trust_store_composite_builders.split(",")
+        if n.strip()
+    ]
+    if not names:
+        raise RuntimeError(
+            "AUDITTRACE_PDF_TRUST_STORE_BUILDER=composite requires "
+            "AUDITTRACE_PDF_TRUST_STORE_COMPOSITE_BUILDERS to be a "
+            "non-empty comma-separated list (e.g. 'eu_lotl,swiss_tsl')."
+        )
+    return CompositeTrustStoreBuilder(
+        [_build_inner_builder(n, settings) for n in names]
+    )
 
 
 def _build_inner_builder(name: str, settings: Settings) -> TrustStoreBuilder:

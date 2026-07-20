@@ -35,6 +35,7 @@ from audittrace.services.trust_store import (
     TrustStoreMetadata,
     _bundle_from_pem,
     _count_pem_certs,
+    _extract_qc_certs_from_swiss_tsl,
     _registry_to_pem_bundle,
 )
 
@@ -898,3 +899,253 @@ class TestQcServiceTypesClosedSet:
             "http://uri.etsi.org/TrstSvc/Svctype/CA/QC",
         }
         assert _QC_SERVICE_TYPES == expected
+
+
+# ───────────── TSLO cert PEM-vs-DER vendoring (ADR-053 §bootstrap) ──────
+
+
+class TestSwissTslTsloCertEncoding:
+    """The TSLO cert is the out-of-band trust anchor for the Swiss TSL.
+    The chart vendors it as DER, but an operator re-exporting it from a
+    browser or from ``openssl x509`` gets PEM. Both encodings must
+    bootstrap, because a builder that rejects the vendored cert raises
+    ``TrustStoreBuilderUnavailableError`` — no Swiss bundle is ever
+    published, and every Swiss qualified signature then validates as
+    ``signed_untrusted`` instead of ``signed_valid``."""
+
+    def test_pem_armoured_tslo_cert_is_accepted(self, tmp_path: Any) -> None:
+        """A PEM-armoured TSLO cert must be unarmoured and parsed, not
+        rejected. Proof that parsing succeeded: the build gets far
+        enough to attempt the network fetch and fails THERE ("failed to
+        fetch"), never at "failed to parse TSLO cert"."""
+        import base64
+
+        der = _VENDORED_TSLO_CERT_PATH.read_bytes()
+        b64 = base64.b64encode(der).decode("ascii")
+        pem = (
+            "-----BEGIN CERTIFICATE-----\n"
+            + "\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
+            + "\n-----END CERTIFICATE-----\n"
+        )
+        pem_path = tmp_path / "ch-tl.pem"
+        pem_path.write_text(pem)
+
+        builder = SwissTslTrustStoreBuilder(tslo_cert_path=pem_path)
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                raise ConnectionError("OFCOM down")
+
+        with patch("aiohttp.ClientSession", return_value=_FakeSession()):
+            with pytest.raises(TrustStoreBuilderUnavailableError) as excinfo:
+                asyncio.run(builder.build())
+
+        # The failure is the (mocked) network step, which is only
+        # reachable once the PEM branch produced a parseable cert.
+        assert "failed to fetch Swiss TSL" in str(excinfo.value)
+        assert "failed to parse TSLO cert" not in str(excinfo.value)
+
+
+# ───────── Swiss TSL walker — malformed-entry tolerance (ADR-053) ───────
+
+
+def _swiss_tsl_xml(services_xml: str) -> str:
+    """Wrap raw ``<TSPService>`` fragments in an ETSI TS 119 612 shell."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<TrustServiceStatusList xmlns="http://uri.etsi.org/02231/v2#">\n'
+        f"{services_xml}\n"
+        "</TrustServiceStatusList>"
+    )
+
+
+def _qc_service(cert_b64: str) -> str:
+    return (
+        "<TSPService><ServiceInformation>"
+        "<ServiceTypeIdentifier>"
+        "https://uri.tsl-switzerland.ch/TrstSvc/Svctype/CA/QC"
+        "</ServiceTypeIdentifier>"
+        "<ServiceDigitalIdentity><DigitalId>"
+        f"<X509Certificate>{cert_b64}</X509Certificate>"
+        "</DigitalId></ServiceDigitalIdentity>"
+        "</ServiceInformation></TSPService>"
+    )
+
+
+class TestSwissTslWalkerMalformedEntries:
+    """The Swiss TSL is fetched live from OFCOM and can carry service
+    entries this walker does not understand (missing service-type,
+    placeholder cert elements, the same root listed under several
+    services). A walker that raised or bailed out on the first odd
+    entry would drop every LATER qualified CA from the bundle — a
+    silent downgrade of otherwise-valid Swiss signatures to
+    ``signed_untrusted``. Each malformed entry must be skipped
+    individually while the good ones still land."""
+
+    def test_service_without_service_type_is_skipped_not_fatal(self) -> None:
+        """A TSPService with no ServiceTypeIdentifier element, and one
+        with an empty one, are both skipped — and the qualified CA
+        listed AFTER them still reaches the bundle."""
+        import base64
+
+        good_b64 = base64.b64encode(b"\x30\x82good-qc-ca").decode("ascii")
+        no_type = (
+            "<TSPService><ServiceInformation>"
+            "<ServiceDigitalIdentity><DigitalId>"
+            "<X509Certificate>QUFB</X509Certificate>"
+            "</DigitalId></ServiceDigitalIdentity>"
+            "</ServiceInformation></TSPService>"
+        )
+        empty_type = (
+            "<TSPService><ServiceInformation>"
+            "<ServiceTypeIdentifier></ServiceTypeIdentifier>"
+            "<ServiceDigitalIdentity><DigitalId>"
+            "<X509Certificate>QkJC</X509Certificate>"
+            "</DigitalId></ServiceDigitalIdentity>"
+            "</ServiceInformation></TSPService>"
+        )
+        xml = _swiss_tsl_xml(no_type + empty_type + _qc_service(good_b64))
+
+        ders = _extract_qc_certs_from_swiss_tsl(xml)
+
+        # Only the qualified CA — the untyped services contributed
+        # nothing, and crucially did not abort the walk before it.
+        assert ders == [b"\x30\x82good-qc-ca"]
+
+    def test_empty_x509_element_is_skipped_not_fatal(self) -> None:
+        """An ``<X509Certificate/>`` placeholder inside an otherwise
+        qualified service must not decode to an empty DER (which would
+        emit a zero-length PEM block and corrupt the whole bundle for
+        pyhanko), and must not stop the sibling cert from landing."""
+        import base64
+
+        good_b64 = base64.b64encode(b"\x30\x82second-cert").decode("ascii")
+        service = (
+            "<TSPService><ServiceInformation>"
+            "<ServiceTypeIdentifier>"
+            "https://uri.tsl-switzerland.ch/TrstSvc/Svctype/CA/QC"
+            "</ServiceTypeIdentifier>"
+            "<ServiceDigitalIdentity><DigitalId>"
+            "<X509Certificate></X509Certificate>"
+            f"<X509Certificate>{good_b64}</X509Certificate>"
+            "</DigitalId></ServiceDigitalIdentity>"
+            "</ServiceInformation></TSPService>"
+        )
+
+        ders = _extract_qc_certs_from_swiss_tsl(_swiss_tsl_xml(service))
+
+        assert ders == [b"\x30\x82second-cert"]
+        assert b"" not in ders
+
+    def test_same_root_listed_twice_is_emitted_once(self) -> None:
+        """Swiss TSPs list one root under several services (sign,
+        seal, …). Without dedup the same anchor would be counted
+        twice, and ``metadata.cert_count`` — the number an auditor
+        reads off the trust-store manifest — would overstate how many
+        distinct roots the store actually trusts."""
+        import base64
+
+        dup_b64 = base64.b64encode(b"\x30\x82shared-root").decode("ascii")
+        other_b64 = base64.b64encode(b"\x30\x82other-root").decode("ascii")
+        xml = _swiss_tsl_xml(
+            _qc_service(dup_b64) + _qc_service(dup_b64) + _qc_service(other_b64)
+        )
+
+        ders = _extract_qc_certs_from_swiss_tsl(xml)
+
+        assert ders == [b"\x30\x82shared-root", b"\x30\x82other-root"]
+
+
+# ──────── _registry_to_pem_bundle — malformed authority tolerance ───────
+
+
+class TestRegistryToPemBundleMalformedEntries:
+    """``_registry_to_pem_bundle`` serialises pyhanko's registry into
+    the PEM bundle that becomes the trust store. Entries whose
+    certificate is absent or not asn1crypto-shaped must be skipped
+    silently, because the alternative — raising — means NO bundle is
+    published at all and every signature downgrades to
+    ``signed_untrusted``. Equally important: a skipped entry must not
+    be counted, or ``cert_count`` misreports the store's real reach."""
+
+    def test_primary_path_skips_authorities_without_usable_certificates(
+        self,
+    ) -> None:
+        """Authority with ``certificate=None``, one whose certificate
+        has no callable ``dump``, and one whose ``dump()`` returns a
+        non-bytes value are all dropped; only the well-formed CA is
+        serialised and counted."""
+
+        class _FakeCert:
+            def __init__(self, der: Any) -> None:
+                self._der = der
+
+            def dump(self) -> Any:
+                return self._der
+
+        registry = SimpleNamespace(
+            known_certificate_authorities=[
+                SimpleNamespace(certificate=None),  # L830: no cert
+                SimpleNamespace(certificate=SimpleNamespace(dump="not-callable")),
+                SimpleNamespace(certificate=_FakeCert("der-as-str")),  # non-bytes
+                SimpleNamespace(certificate=_FakeCert(b"\x30\x82good-der")),
+            ]
+        )
+
+        pem_bytes = _registry_to_pem_bundle(registry)
+
+        # Exactly one PEM block — the three malformed authorities
+        # contributed nothing to the count.
+        assert _count_pem_certs(pem_bytes) == 1
+        import base64
+
+        assert base64.b64encode(b"\x30\x82good-der").decode(
+            "ascii"
+        ) in pem_bytes.decode("ascii")
+
+    def test_fallback_path_normalises_digital_identity_cert_shapes(self) -> None:
+        """The duck-typed fallback sees several DER carriers depending
+        on the parser: raw ``bytes``, a ``memoryview`` over the XML
+        buffer, or an asn1crypto object exposing ``dump()``. All three
+        must normalise to the same PEM block; an identity with no cert
+        at all, or one carrying an object with no ``dump``, is skipped
+        rather than crashing the bundle build."""
+
+        class _Asn1Like:
+            def dump(self) -> bytes:
+                return b"\x30\x82from-dump"
+
+        qc = "http://uri.etsi.org/TrstSvc/Svctype/CA/QC"
+        registry = SimpleNamespace(
+            services=[
+                SimpleNamespace(
+                    service_type_identifier=qc,
+                    service_digital_identities=[
+                        # No cert attribute at all → skipped (L862).
+                        SimpleNamespace(other="irrelevant"),
+                        # memoryview over the DER → coerced to bytes.
+                        SimpleNamespace(x509_certificate=memoryview(b"\x30\x82mview")),
+                        # asn1crypto-shaped object → dump() called.
+                        SimpleNamespace(x509_certificate=_Asn1Like()),
+                        # A str: not bytes, no dump() → skipped, not
+                        # UTF-8-guessed into a corrupt PEM block.
+                        SimpleNamespace(x509_certificate="a-string-not-a-cert"),
+                    ],
+                )
+            ]
+        )
+
+        pem_bytes = _registry_to_pem_bundle(registry)
+
+        assert _count_pem_certs(pem_bytes) == 2
+        import base64
+
+        text = pem_bytes.decode("ascii")
+        assert base64.b64encode(b"\x30\x82mview").decode("ascii") in text
+        assert base64.b64encode(b"\x30\x82from-dump").decode("ascii") in text

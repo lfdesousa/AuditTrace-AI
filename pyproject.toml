@@ -146,6 +146,16 @@ filterwarnings = ["ignore::DeprecationWarning"]
 source = ["audittrace"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
+# SQLAlchemy's asyncio layer bridges sync<->async with greenlet
+# (``sqlalchemy.util.concurrency.greenlet_spawn``), so EVERY line inside an
+# ``async with session_factory()`` block executes in a greenlet context.
+# Without this setting coverage.py silently records none of it — measured
+# 2026-07-20 (#367): routes/memory.py:1564 executed on every request and was
+# reported hits=0, and the DB-touching route modules looked like the worst in
+# the tree (memory.py 80.33% branch, chat.py 80.81%) purely because they were
+# UNMEASURED rather than untested. `thread` is kept alongside because the
+# TestClient portal and the background workers are real threads.
+concurrency = ["thread", "greenlet"]
 
 [tool.coverage.report]
 exclude_lines = [

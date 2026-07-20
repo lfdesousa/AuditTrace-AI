@@ -3126,6 +3126,116 @@ class TestConversationalLayer:
         assert r.status_code == 404
         assert "not found" in r.json()["detail"].lower()
 
+    # ── Populated paths ────────────────────────────────────────────────
+    # The two tests above only ever exercised the empty-list and 404
+    # branches, so the response-building code — every field mapping in both
+    # handlers — was never executed by the suite. #364 surfaced that while
+    # moving serialisation inside the session scope. These seed real rows
+    # and assert the documented shape.
+
+    @staticmethod
+    async def _seed_session_with_interaction() -> None:
+        from datetime import datetime
+
+        from audittrace.db.models import InteractionRecord as InteractionRow
+        from audittrace.db.models import SessionRecord as SessionRow
+        from audittrace.dependencies import get_postgres_factory
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            db.add(
+                SessionRow(
+                    id="sess-conv-1",
+                    project="AuditTrace-AI",
+                    date="2026-07-20",
+                    summary="a summary",
+                    key_points='["one","two"]',
+                    model="qwen3.6",
+                    user_id="sentinel-user",
+                    summarized_at=datetime(2026, 7, 20, 12, 0, 0),
+                )
+            )
+            db.add(
+                InteractionRow(
+                    project="AuditTrace-AI",
+                    source="opencode",
+                    question="q1",
+                    answer="a1",
+                    model="qwen3.6",
+                    user_id="sentinel-user",
+                    session_id="sess-conv-1",
+                    timestamp="2026-07-20T12:00:00",
+                    trace_id="a" * 32,
+                )
+            )
+            await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_list_returns_full_session_shape(self, client: TestClient) -> None:
+        await self._seed_session_with_interaction()
+        body = client.get("/memory/conversational").json()
+        assert body["total"] >= 1
+        item = next(i for i in body["items"] if i["id"] == "sess-conv-1")
+        assert item["project"] == "AuditTrace-AI"
+        assert item["summary"] == "a summary"
+        assert item["key_points"] == '["one","two"]'
+        assert item["model"] == "qwen3.6"
+        assert item["user_id"] == "sentinel-user"
+        # summarized_at is a DateTime column serialised to ISO-8601.
+        assert item["summarized_at"] == "2026-07-20T12:00:00"
+
+    @pytest.mark.asyncio
+    async def test_read_returns_session_plus_interactions(
+        self, client: TestClient
+    ) -> None:
+        await self._seed_session_with_interaction()
+        body = client.get("/memory/conversational/sess-conv-1").json()
+
+        assert body["session"]["id"] == "sess-conv-1"
+        assert body["session"]["summary"] == "a summary"
+        assert body["session"]["summarized_at"] == "2026-07-20T12:00:00"
+
+        assert body["total"] == 1
+        row = body["interactions"][0]
+        # `timestamp` is a String column (migration 005) — passed through
+        # verbatim rather than reformatted.
+        assert row["timestamp"] == "2026-07-20T12:00:00"
+        assert row["question"] == "q1"
+        assert row["answer"] == "a1"
+        assert row["session_id"] == "sess-conv-1"
+        assert row["source"] == "opencode"
+        assert row["trace_id"] == "a" * 32
+        assert row["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_read_summarised_null_serialises_as_none(
+        self, client: TestClient
+    ) -> None:
+        """`summarized_at` is nullable — NULL must not blow up the isoformat."""
+        from audittrace.db.models import SessionRecord as SessionRow
+        from audittrace.dependencies import get_postgres_factory
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            db.add(
+                SessionRow(
+                    id="sess-conv-2",
+                    project="P",
+                    date="2026-07-20",
+                    summary="s",
+                    key_points="[]",
+                    model="m",
+                    user_id="sentinel-user",
+                    summarized_at=None,
+                )
+            )
+            await db.commit()
+
+        body = client.get("/memory/conversational/sess-conv-2").json()
+        assert body["session"]["summarized_at"] is None
+        assert body["interactions"] == []
+        assert body["total"] == 0
+
 
 # ── Tier-B: PDF robustness (ADR-050) ─────────────────────────────────────────
 
@@ -4213,6 +4323,58 @@ class TestPdfaConformanceExtraction:
         assert part is None
         assert conf is None
 
+    def test_non_pdfa_xmp_records_no_conformance(self) -> None:
+        """A valid XMP packet with no ``pdfaid`` namespace must yield
+        ``(None, None)``, not a partial or invented value.
+
+        Most uploaded PDFs are ordinary (non-PDF/A) documents that still
+        carry XMP — Dublin Core, XMP Basic, PDF producer info. If either
+        regex mis-fired on that metadata the audit row would claim PDF/A
+        conformance the file does not have, and an archival-compliance
+        query (``WHERE pdfa_part = '3'``) would return documents that are
+        not archivable.
+        """
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        xmp = (
+            '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+            '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:pdf="http://ns.adobe.com/pdf/1.3/" '
+            'pdf:Producer="LibreOffice 7.4">'
+            "<dc:title>Quarterly report</dc:title>"
+            "</rdf:Description>"
+        )
+        doc = SimpleNamespace(get_xml_metadata=lambda: xmp)
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part is None
+        assert conf is None
+
+    def test_part_without_conformance_records_part_only(self) -> None:
+        """A packet declaring ``pdfaid:part`` but no ``pdfaid:conformance``
+        must record the part and leave conformance NULL.
+
+        The two values are independent columns precisely so a half-declared
+        packet degrades to partial truth. Coupling them (e.g. dropping both
+        when one is absent, or defaulting conformance to 'A') would either
+        lose the part evidence we do have or fabricate a conformance level
+        the document never claimed.
+        """
+        from types import SimpleNamespace
+
+        from audittrace.routes.memory import _extract_pdfa_conformance
+
+        xmp = (
+            "<rdf:Description xmlns:pdfaid='http://www.aiim.org/pdfa/ns/id/'>"
+            "<pdfaid:part>4</pdfaid:part>"
+            "</rdf:Description>"
+        )
+        doc = SimpleNamespace(get_xml_metadata=lambda: xmp)
+        part, conf = _extract_pdfa_conformance(doc)
+        assert part == "4"
+        assert conf is None
+
     def test_xmp_raise_swallowed(self) -> None:
         from types import SimpleNamespace
 
@@ -4448,6 +4610,226 @@ class TestPdfIndexCorruptionExceptionPath:
         assert details_log[0]["chunks"] == 0
 
 
+def _fake_pdf_page(text: str = "Body text."):
+    """A pymupdf page stub with the surface the orchestrator touches."""
+    from unittest.mock import MagicMock
+
+    page = MagicMock()
+    page.get_text.return_value = text
+    page.rect = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+    page.widgets.return_value = []
+    page.get_images.return_value = []
+    page.annots = MagicMock(return_value=[])
+    return page
+
+
+def _fake_pdf_doc(pages: list, *, metadata: dict, toc: list, page_count: int):
+    """A pymupdf Document stub, opened as a context manager by the pipeline."""
+    from unittest.mock import MagicMock
+
+    doc = MagicMock()
+    doc.__iter__.return_value = iter(pages)
+    doc.__enter__.return_value = doc
+    doc.__exit__.return_value = None
+    doc.page_count = page_count
+    doc.xref_length.return_value = 10
+    doc.is_encrypted = False
+    doc.needs_pass = False
+    doc.embfile_count.return_value = 0
+    doc.metadata = metadata
+    doc.get_xml_metadata = MagicMock(return_value="")
+    doc.get_toc = MagicMock(return_value=toc)
+    return doc
+
+
+class TestPdfIndexOrchestratorEdgePaths:
+    """Per-document paths of ``_index_pdf_objects`` that the route-level
+    happy-path tests never reach."""
+
+    async def test_unreadable_object_is_skipped_without_a_manifest_row(self) -> None:
+        """A MinIO read failure must skip the file with no manifest row and no
+        ChromaDB write.
+
+        The manifest is the audit record of what was ingested. Writing a row
+        for bytes we never obtained would assert an ingestion that did not
+        happen — the manifest would claim a document is indexed while ChromaDB
+        holds nothing, and a reconstruction attempt from the manifest would
+        dead-end with no trace of why.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+
+        mock_minio = MagicMock()
+        # _read_minio_object swallows the raise and returns None.
+        mock_minio.get_object.side_effect = OSError("connection reset by peer")
+
+        fake_pymupdf = MagicMock()
+        mock_collection = AsyncMock()
+        mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
+        details_log: list[dict] = []
+
+        with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
+            chunks = await _index_pdf_objects(
+                collection=mock_collection,
+                minio_client=mock_minio,
+                bucket="memory-shared",
+                objects=[
+                    {"key": "episodic/unreadable.pdf", "filename": "unreadable.pdf"}
+                ],
+                col_name="ai_research_papers",
+                category="episodic",
+                layer_prefix="episodic/",
+                user_id="u1",
+                ingestion_ts_ms=0,
+                manifest_service=mock_manifest,
+                details_log=details_log,
+                dry_run=False,
+            )
+
+        assert chunks == 0
+        mock_collection.upsert.assert_not_called()
+        mock_manifest.upsert_pdf_metadata.assert_not_called()
+        assert details_log == []
+        # The document was never even opened — the skip happens before parsing.
+        fake_pymupdf.open.assert_not_called()
+
+    async def test_toc_section_and_metadata_warning_reach_chunks_and_manifest(
+        self,
+    ) -> None:
+        """A page covered by a TOC entry must keep ``toc_section`` on every
+        chunk, and an unparseable ``creationDate`` must surface as a
+        document-level extraction warning.
+
+        ``toc_section`` is the field auditors filter chunks by when tracing a
+        claim back to a section of a source document; it is stripped from
+        metadata only when genuinely unknown, so a bug that dropped it
+        unconditionally would silently remove that pivot. The metadata warning
+        is the complementary signal: it records "we read a creation date and it
+        was malformed", distinct from "the document had none" — which is what
+        an auditor needs to distinguish a producer bug from an absent field.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        fake_doc = _fake_pdf_doc(
+            [_fake_pdf_page("Introduction body text.")],
+            # creationDate is a non-empty string that refuses to parse.
+            metadata={"title": "Signed Report", "creationDate": "D:not-a-real-date"},
+            # TOC entry starting at page 1 ⇒ page 1 maps to "Introduction".
+            toc=[[1, "Introduction", 1]],
+            page_count=1,
+        )
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_collection = AsyncMock()
+        mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
+        upsert_spy = AsyncMock()
+        details_log: list[dict] = []
+
+        with (
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            patch("audittrace.routes.memory._upsert_in_batches", upsert_spy),
+        ):
+            chunks = await _index_pdf_objects(
+                collection=mock_collection,
+                minio_client=mock_minio,
+                bucket="memory-shared",
+                objects=[{"key": "episodic/report.pdf", "filename": "report.pdf"}],
+                col_name="ai_research_papers",
+                category="episodic",
+                layer_prefix="episodic/",
+                user_id="u1",
+                ingestion_ts_ms=1234,
+                manifest_service=mock_manifest,
+                details_log=details_log,
+                dry_run=False,
+            )
+
+        assert chunks >= 1
+        # Every chunk of a TOC-covered page carries the section title.
+        assert upsert_spy.await_count == 1
+        metadatas = upsert_spy.await_args.args[3]
+        assert metadatas, "the page must have produced at least one chunk"
+        assert all(md["toc_section"] == "Introduction" for md in metadatas)
+
+        # The malformed date is recorded as a document-level (page=None)
+        # warning, and the title that DID parse still reaches the manifest.
+        kwargs = mock_manifest.upsert_pdf_metadata.call_args.kwargs
+        warnings = kwargs["extraction_warnings"]
+        assert {"code": "pdf_metadata_parse_error", "page": None} in warnings
+        assert kwargs["pdf_title"] == "Signed Report"
+        # Malformed input degrades that one field, it does not fail the doc.
+        assert kwargs["pdf_creation_date"] is None
+        assert details_log[0]["ok"] is True
+
+    async def test_zero_page_document_reports_no_ocr_coverage(self) -> None:
+        """A document reporting ``page_count == 0`` must flush a manifest row
+        with ``ocr_coverage_pct=None`` rather than divide by zero.
+
+        Zero-page PDFs are real (structurally valid files whose page tree is
+        empty, and a common shape from truncated/generated output). The OCR
+        coverage percentage is ``ocr_pages / page_count``; an unguarded
+        division would raise inside the per-file loop, abort the whole batch,
+        and take down ingestion for every remaining document in the layer.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+
+        raw_bytes = b"%PDF-1.4 empty-page-tree"
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        fake_doc = _fake_pdf_doc([], metadata={"title": "Empty"}, toc=[], page_count=0)
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_collection = AsyncMock()
+        mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
+        details_log: list[dict] = []
+
+        with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
+            chunks = await _index_pdf_objects(
+                collection=mock_collection,
+                minio_client=mock_minio,
+                bucket="memory-shared",
+                objects=[{"key": "episodic/empty.pdf", "filename": "empty.pdf"}],
+                col_name="ai_research_papers",
+                category="episodic",
+                layer_prefix="episodic/",
+                user_id="u1",
+                ingestion_ts_ms=0,
+                manifest_service=mock_manifest,
+                details_log=details_log,
+                dry_run=False,
+            )
+
+        assert chunks == 0
+        mock_collection.upsert.assert_not_called()
+        # The document is still recorded — "we processed it and it held
+        # nothing" is an auditable outcome, not a silent skip.
+        kwargs = mock_manifest.upsert_pdf_metadata.call_args.kwargs
+        assert kwargs["page_count"] == 0
+        assert kwargs["ocr_coverage_pct"] is None
+        assert details_log[0]["ok"] is True
+
+
 class TestPdfIndexDetailsResponseShape:
     """ADR-056 #24 — ``?details=true`` adds a ``documents`` array to the
     /memory/index response; legacy ``?details=false`` (default) keeps
@@ -4599,3 +4981,289 @@ class TestPdfIndexDetailsResponseShape:
         # Date is serialised as ISO-8601 string.
         assert isinstance(d["pdf_creation_date"], str)
         assert d["pdf_creation_date"].startswith("2026-04-03")
+
+
+# ── ?hard=true privilege guard (#366 branch coverage) ──────────────────────
+# `?hard=true` permanently destroys a memory item rather than soft-deleting
+# it, so it is gated on audittrace:admin. Only the ALLOWED side of that guard
+# was exercised; the 403 refusal path had no test at all. A regression here
+# would let any caller holding the ordinary per-layer write scope irreversibly
+# destroy audit-relevant records — the one deletion the manifest cannot undo.
+
+
+class TestHardDeleteRequiresAdmin:
+    @staticmethod
+    def _as_non_admin(client: TestClient):
+        """Swap the bypass-mode sentinel (which is admin) for a plain writer."""
+        from dataclasses import replace
+
+        from audittrace.auth import require_user
+        from audittrace.identity import sentinel_user_context
+
+        plain = replace(
+            sentinel_user_context(),
+            is_admin=False,
+            scopes=("memory:procedural:write", "memory:semantic:write"),
+        )
+        client.app.dependency_overrides[require_user] = lambda: plain
+
+    def test_procedural_hard_delete_denied_without_admin(
+        self, client: TestClient
+    ) -> None:
+        self._as_non_admin(client)
+        try:
+            r = client.delete("/memory/procedural/SKILL-x.md?hard=true")
+            assert r.status_code == 403
+            assert "audittrace:admin" in r.json()["detail"]
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_semantic_hard_delete_denied_without_admin(
+        self, client: TestClient
+    ) -> None:
+        self._as_non_admin(client)
+        try:
+            r = client.delete("/memory/semantic/audittrace/doc-1?hard=true")
+            assert r.status_code == 403
+            assert "audittrace:admin" in r.json()["detail"]
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_soft_delete_is_allowed_without_admin(self, client: TestClient) -> None:
+        """The guard must gate ONLY the destructive variant.
+
+        If it also blocked soft delete, ordinary writers could never retract
+        an item — the guard would have turned a safety rail into an outage.
+        """
+        self._as_non_admin(client)
+        try:
+            r = client.delete("/memory/procedural/SKILL-x.md")
+            assert r.status_code != 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestConversationalListFilters:
+    """Query filters on GET /memory/conversational.
+
+    Each filter is a separate `if` that narrows the SELECT. An inverted or
+    dropped filter silently returns the wrong slice of the audit record —
+    the failure mode is a WRONG ANSWER to an auditor, not an error, so it
+    needs a test that would notice.
+    """
+
+    @staticmethod
+    async def _seed_two_projects() -> None:
+        from datetime import datetime
+
+        from audittrace.db.models import SessionRecord as SessionRow
+        from audittrace.dependencies import get_postgres_factory
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            db.add(
+                SessionRow(
+                    id="f-alpha",
+                    project="Alpha",
+                    date="2026-07-01",
+                    summary="s",
+                    key_points="[]",
+                    model="m",
+                    user_id="sentinel-user",
+                    summarized_at=datetime(2026, 7, 1, 9, 0, 0),
+                )
+            )
+            db.add(
+                SessionRow(
+                    id="f-beta",
+                    project="Beta",
+                    date="2026-07-20",
+                    summary="s",
+                    key_points="[]",
+                    model="m",
+                    user_id="sentinel-user",
+                    summarized_at=None,
+                )
+            )
+            await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_project_filter_narrows_results(self, client: TestClient) -> None:
+        await self._seed_two_projects()
+        ids = {
+            i["id"]
+            for i in client.get("/memory/conversational?project=Alpha").json()["items"]
+        }
+        assert "f-alpha" in ids
+        assert "f-beta" not in ids, "project filter did not exclude the other project"
+
+    @pytest.mark.asyncio
+    async def test_since_filter_excludes_older_sessions(
+        self, client: TestClient
+    ) -> None:
+        await self._seed_two_projects()
+        ids = {
+            i["id"]
+            for i in client.get("/memory/conversational?since=2026-07-10").json()[
+                "items"
+            ]
+        }
+        assert "f-beta" in ids
+        assert "f-alpha" not in ids, "since filter did not exclude the older row"
+
+    @pytest.mark.asyncio
+    async def test_summarised_true_and_false_are_complementary(
+        self, client: TestClient
+    ) -> None:
+        """summarised=true/false are separate branches — assert BOTH, and that
+        they partition the set rather than both returning everything."""
+        await self._seed_two_projects()
+        yes = {
+            i["id"]
+            for i in client.get("/memory/conversational?summarised=true").json()[
+                "items"
+            ]
+        }
+        no = {
+            i["id"]
+            for i in client.get("/memory/conversational?summarised=false").json()[
+                "items"
+            ]
+        }
+        assert "f-alpha" in yes and "f-alpha" not in no
+        assert "f-beta" in no and "f-beta" not in yes
+
+
+# ── Indexing-pipeline helper branches (#366) ───────────────────────────────
+# These helpers sit upstream of ChromaDB. A wrong branch here does not raise —
+# it quietly puts the wrong thing in the semantic index, and every later
+# `recall_semantic` inherits the error. That is a WRONG ANSWER failure mode,
+# which is exactly what the branch gate exists to catch.
+
+
+class TestChunkTextBranches:
+    def test_whitespace_only_chunk_is_dropped(self) -> None:
+        """A chunk of pure whitespace must never reach the embedder.
+
+        It would be embedded into a meaningless vector and then returned as a
+        recall hit — polluting the context the model reasons over. The
+        `if chunk.strip()` guard is the only thing preventing that, and only
+        its true side was exercised.
+        """
+        from audittrace.routes.memory import _chunk_text
+
+        # Long enough to force chunking; the tail slice is pure whitespace.
+        text = "A" * 1500 + " " * 400
+        chunks = _chunk_text(text, chunk_size=1500, overlap=200)
+        assert all(c.strip() for c in chunks), "an all-whitespace chunk survived"
+
+    def test_short_text_is_returned_as_a_single_chunk(self) -> None:
+        """Below the threshold the splitter must not fragment the document."""
+        from audittrace.routes.memory import _chunk_text
+
+        assert _chunk_text("short doc") == ["short doc"]
+
+
+class TestListObjectsFromMinioBranches:
+    class _Obj:
+        def __init__(self, name):
+            self.object_name = name
+
+    def test_directory_marker_keys_are_skipped(self) -> None:
+        """Keys ending in '/' are prefix markers, not documents.
+
+        S3-compatible stores surface them as zero-byte objects. Indexing one
+        would create a manifest row with an empty filename that no later
+        lookup can match — a phantom entry in the audit record.
+        """
+        from audittrace.routes.memory import _list_objects_from_minio
+
+        class _Client:
+            def list_objects(self, bucket, prefix=None):
+                return [
+                    TestListObjectsFromMinioBranches._Obj("episodic/ADR-1.md"),
+                    TestListObjectsFromMinioBranches._Obj("episodic/"),  # marker
+                    TestListObjectsFromMinioBranches._Obj(None),  # defensive
+                ]
+
+        got = _list_objects_from_minio(_Client(), "bucket", "episodic/")
+        assert [o["filename"] for o in got] == ["ADR-1.md"]
+
+    def test_unprefixed_key_keeps_its_whole_name(self) -> None:
+        """A key with no '/' is its own filename — the rsplit must not eat it."""
+        from audittrace.routes.memory import _list_objects_from_minio
+
+        class _Client:
+            def list_objects(self, bucket, prefix=None):
+                return [TestListObjectsFromMinioBranches._Obj("top-level.md")]
+
+        got = _list_objects_from_minio(_Client(), "bucket", "")
+        assert got == [{"key": "top-level.md", "filename": "top-level.md"}]
+
+
+class TestPdfUploadRequiresScanPipeline:
+    """A PDF must never be stored while the malware scanner is unavailable.
+
+    ADR-003: uploads are quarantined and scanned before they land. If
+    `scan_queue` is absent (pipeline disabled or not yet started) the route
+    must refuse with 503 rather than fall through to the plain-text path —
+    a fall-through would write an UNSCANNED PDF into the memory layer, which
+    is the exact bypass the quarantine design exists to prevent.
+
+    Only the pipeline-present side of this guard had coverage.
+    """
+
+    @staticmethod
+    def _minimal_pdf() -> bytes:
+        # %PDF- magic is what is_pdf_upload sniffs; content beyond it is
+        # irrelevant because the request must be refused before any parsing.
+        return b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n"
+
+    @staticmethod
+    def _register_fake_object_storage():
+        """Bind a fake provider into the DI container.
+
+        `_get_minio_client` resolves `container._instances["object_storage"]`
+        and only constructs a provider when that key is missing. Registering
+        here exercises the REAL factory lookup the production path uses,
+        instead of monkeypatching the private helper out of the picture —
+        and it covers the cache-hit arm of that lookup as a side effect.
+        """
+        from audittrace import dependencies as deps
+
+        fake = MagicMock()
+        deps.container._instances["object_storage"] = fake
+        return fake
+
+    def test_pdf_upload_refused_when_scan_queue_absent(
+        self, client: TestClient
+    ) -> None:
+        # The test app starts with the scan pipeline disabled, so
+        # app.state.scan_queue is unset — the condition under test.
+        assert getattr(client.app.state, "scan_queue", None) is None
+
+        store = self._register_fake_object_storage()
+        r = client.post(
+            "/memory/upload?layer=episodic&filename=doc.pdf",
+            files={"file": ("doc.pdf", self._minimal_pdf(), "application/pdf")},
+        )
+        assert r.status_code == 503, "an unscanned PDF must not be accepted"
+        assert "scan pipeline" in r.json()["detail"]
+        # Refusal must happen BEFORE anything is written — otherwise the
+        # unscanned bytes are already in the bucket when we say "no".
+        store.put_object.assert_not_called()
+
+    def test_non_pdf_upload_is_unaffected_by_the_guard(
+        self, client: TestClient
+    ) -> None:
+        """The guard must gate PDFs only.
+
+        If it fired on every upload, disabling the scan pipeline would take
+        the whole memory layer offline rather than just the PDF path.
+        """
+        self._register_fake_object_storage()
+        r = client.post(
+            "/memory/upload?layer=episodic&filename=note.md",
+            files={"file": ("note.md", b"# plain markdown\n", "text/markdown")},
+        )
+        assert r.status_code != 503

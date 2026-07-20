@@ -25,8 +25,10 @@ from audittrace.db.models import InteractionRecord, SessionRecord
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.services import session_summarizer as ss_mod
 from audittrace.services.session_summarizer import (
+    EligibleSession,
     SessionSummarizer,
     _format_transcript,
+    _is_stale,
     _parse_llm_response,
     _span_trace_id_hex,
 )
@@ -1258,3 +1260,233 @@ class TestTraceAttribution:
             ).scalar_one()
             assert row.model == "sentinel-skip-ctx-overflow-auto"
             assert row.trace_id == self._TID_HEX
+
+
+# ── Branch-level hardening (#364) ────────────────────────────────────
+#
+# Each path below is the less-travelled half of a decision the summariser
+# makes every cycle. Getting one wrong either fabricates a SessionRecord
+# with no evidence behind it, drops a session out of the eligibility set
+# without a summary, or points the LLM calls at a URL that does not exist.
+
+
+class TestEmptyTurnSet:
+    """A session that vanishes between eligibility and fetch must be skipped."""
+
+    @pytest.mark.asyncio
+    async def test_zero_turns_writes_no_session_record_and_calls_no_llm(
+        self, pg_factory
+    ):
+        """Eligibility and turn-fetch are two separate transactions.
+
+        A retention purge or a GDPR erasure can delete the interactions in
+        between, leaving an ``EligibleSession`` whose turns are gone. Without
+        the guard the summariser would send an empty transcript to the LLM
+        and persist whatever came back — a SessionRecord with no interactions
+        behind it, which is exactly the kind of unsupported row the audit
+        trail must never contain (ADR-033). The correct behaviour is to write
+        nothing and leave the session out of the sessions table entirely.
+        """
+        llm_calls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(str(request.url))
+            return httpx.Response(500, json={})
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+
+        await summariser._summarise_one(
+            EligibleSession(
+                session_id="sess-purged",
+                user_id="user-1",
+                project="P",
+                last_ts=_iso_minutes_ago(30),
+            )
+        )
+
+        # No LLM round trip was even attempted.
+        assert llm_calls == []
+        async with pg_factory.get_session_factory()() as db:
+            count = (
+                await db.execute(select(func.count()).select_from(SessionRecord))
+            ).scalar_one()
+        assert count == 0
+
+
+class TestSummariserUrlWithoutV1Suffix:
+    """``/props`` and ``/tokenize`` live at the server root, /v1 or not."""
+
+    @pytest.mark.asyncio
+    async def test_props_url_built_from_root_when_url_has_no_v1(self):
+        """``summarizer_url`` is operator-configured and need not end in /v1.
+
+        A llama-server pointed at ``http://llama:8080`` is a legitimate
+        configuration. The suffix-strip is conditional, so the code must not
+        mangle a URL that never had ``/v1``. Getting this wrong turns ctx
+        auto-detection into a permanent 404, silently reverting to the
+        configured ctx value — the exact condition behind the 2026-06-09
+        infinite-retry incident.
+        """
+        seen: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"n_ctx": 4096})
+
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_url="http://llama:8080"),
+            session_factory=MagicMock(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+
+        assert await summariser._fetch_server_n_ctx() == 4096
+        # No spurious "/v1" and no doubled slash.
+        assert seen == ["http://llama:8080/props"]
+        await summariser._aclose_owned_client()
+
+    @pytest.mark.asyncio
+    async def test_tokenize_url_built_from_root_when_url_has_no_v1(self):
+        """Same suffix-strip, on the path the ctx guard depends on.
+
+        If ``/tokenize`` 404s, ``_safe_count_tokens`` swallows it and falls
+        back to the coarse char estimate — the guard keeps working but every
+        prompt is sized by guesswork. Pinning the URL keeps the real
+        tokeniser in the loop for non-/v1 deployments.
+        """
+        seen: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"tokens": [1, 2, 3, 4, 5]})
+
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_url="http://llama:8080/"),
+            session_factory=MagicMock(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+
+        assert await summariser._count_tokens("some transcript") == 5
+        assert seen == ["http://llama:8080/tokenize"]
+        await summariser._aclose_owned_client()
+
+
+class TestSentinelOverflowUpsert:
+    """A re-summarised overflow session must update its row, not duplicate it."""
+
+    @pytest.mark.asyncio
+    async def test_existing_session_record_is_updated_in_place(self, pg_factory):
+        """``sessions.id`` is the primary key — a blind INSERT would raise.
+
+        A session already carrying a summary can grow one oversized turn and
+        become an overflow case on a later cycle. The sentinel write then has
+        to UPDATE. If it inserted instead, the IntegrityError would propagate,
+        the transaction would roll back, ``summarized_at`` would stay at its
+        old value, and the session would be re-picked every cycle forever
+        while never getting a correct row. This pins the update branch,
+        including the trace_id refresh that links the row to the cycle that
+        produced it.
+        """
+        async with pg_factory.get_session_factory()() as db:
+            db.add(
+                SessionRecord(
+                    id="sess-grew",
+                    project="P",
+                    date="2026-07-01T00:00:00",
+                    summary="an earlier, normal summary",
+                    key_points=json.dumps(["old-point"]),
+                    model="mistral-7b-summarizer",
+                    user_id="user-1",
+                    summarized_at=datetime(2026, 7, 1),
+                    trace_id="0000000000000000000000000000aaaa",
+                )
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_ctx_tokens=8192),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        es = EligibleSession(
+            session_id="sess-grew",
+            user_id="user-1",
+            project="P",
+            last_ts=_iso_minutes_ago(30),
+        )
+
+        await summariser._persist_sentinel_overflow(
+            es, turn_count=7, trace_id="ffffffffffffffffffffffffffffbbbb"
+        )
+
+        async with pg_factory.get_session_factory()() as db:
+            count = (
+                await db.execute(select(func.count()).select_from(SessionRecord))
+            ).scalar_one()
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-grew"))
+            ).scalar_one()
+
+        # Still exactly one row — updated, not duplicated.
+        assert count == 1
+        assert row.model == "sentinel-skip-ctx-overflow-auto"
+        assert "sentinel-skip-ctx-overflow-auto" in row.summary
+        assert "7 turns" in row.summary
+        # The stale summary and its key points were replaced, not appended to.
+        assert "an earlier, normal summary" not in row.summary
+        assert json.loads(row.key_points) == []
+        # Traceability: the row now points at the cycle that wrote it.
+        assert row.trace_id == "ffffffffffffffffffffffffffffbbbb"
+        # summarized_at moved forward, so the row leaves the eligibility set.
+        assert row.summarized_at > datetime(2026, 7, 1)
+
+
+class TestStalenessWithUnparseableTimestamp:
+    """A malformed ``last_ts`` must surface the session, not hide it."""
+
+    def test_unparseable_last_ts_is_treated_as_stale(self):
+        """``last_ts`` comes back as a raw string from the eligibility SQL.
+
+        Dialect differences and hand-edited rows can produce something
+        ``_coerce_datetime`` cannot parse. Defaulting to "not stale" would
+        drop the session out of every future cycle — it would never be
+        summarised and nobody would be told. Defaulting to stale means the
+        row is picked up and any real problem surfaces loudly.
+        """
+        already_summarised = datetime(2026, 7, 1, 12, 0, 0)
+
+        assert _is_stale("not-a-timestamp", already_summarised) is True
+        assert _is_stale(None, already_summarised) is True
+
+        # Contrast: a parseable last_ts older than summarized_at is NOT stale,
+        # which is what makes the malformed case a deliberate default rather
+        # than an accident of the same code path.
+        assert _is_stale("2026-06-30T12:00:00", already_summarised) is False
+
+
+class TestUnlabelledCodeFence:
+    """A ``` fence without a language tag must still parse."""
+
+    def test_bare_fenced_json_is_parsed(self):
+        """Small instruct models fence their output with or without "json".
+
+        The prompt asks for bare JSON; both fenced forms are observed
+        violations. If only the ```json form were stripped, a bare-fenced
+        response would fail ``json.loads``, ``_parse_llm_response`` would
+        return None, ``summarized_at`` would stay NULL, and the session would
+        be retried every cycle — burning a full LLM call each time for a
+        response that was actually correct.
+        """
+        raw = '```\n{"summary": "bare fence", "key_points": ["a", "b"]}\n```'
+
+        parsed = _parse_llm_response(raw)
+
+        assert parsed == {"summary": "bare fence", "key_points": ["a", "b"]}
+        # The literal "json" language tag is not treated as part of the body
+        # in the labelled form either.
+        assert _parse_llm_response(
+            '```JSON\n{"summary": "upper", "key_points": []}\n```'
+        ) == {"summary": "upper", "key_points": []}
