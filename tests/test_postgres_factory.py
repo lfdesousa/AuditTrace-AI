@@ -65,6 +65,45 @@ class TestURLPostgresFactory:
         engine = factory.get_engine()
         assert engine.pool._pre_ping is True
 
+    def test_postgres_url_gets_configured_pool_size(self):
+        """Production (non-sqlite) URLs must build a real queue-pooled engine
+        sized from ``pool_size``.
+
+        Why this matters: the sqlite branch swaps in StaticPool (one shared
+        connection) because StaticPool rejects ``pool_size``. If the sqlite
+        branch ever leaked into the Postgres path, production would run the
+        whole FastAPI event loop through a SINGLE serialised connection —
+        every concurrent request queued behind the previous one — and the
+        ``pool_size`` setting would be silently ignored.
+
+        No connection is opened here: create_async_engine is lazy, so this
+        asserts engine configuration without needing a live Postgres.
+        """
+        factory = URLPostgresFactory(
+            "postgresql+asyncpg://user:pw@localhost:5432/audittrace", pool_size=7
+        )
+        engine = factory.get_engine()
+        # size() reports the configured pool_size on a QueuePool — StaticPool
+        # has no such notion, so this fails loudly if the branch is inverted.
+        assert engine.pool.size() == 7
+        assert engine.pool._pre_ping is True
+
+    def test_session_factory_is_cached_across_calls(self):
+        """``get_session_factory`` must memoise, not rebuild per call.
+
+        Every request handler resolves the session factory through this
+        method. Rebuilding an async_sessionmaker on each call would defeat
+        the ``self._session_factory is None`` guard and hand out sessionmakers
+        that are no longer identity-comparable — which breaks test overrides
+        and any code that caches the factory by identity.
+        """
+        factory = URLPostgresFactory("sqlite+aiosqlite://")
+        first = factory.get_session_factory()
+        second = factory.get_session_factory()
+        assert first is second
+        # And it stays bound to the one singleton engine.
+        assert first.kw["bind"] is factory.get_engine()
+
 
 # ── InMemoryPostgresFactory tests ─────────────────────────────────────────────
 

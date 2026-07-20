@@ -204,6 +204,87 @@ class TestTokenCacheBasic:
         assert cache.size() == 0
 
 
+class _PagingRedis:
+    """Redis stub whose ``SCAN`` returns one page at a time, including an
+    empty page mid-scan.
+
+    ``fakeredis`` holds so few keys in these tests that SCAN always
+    completes in a single call with ``count=100``, so the multi-page loop in
+    ``TokenCache.clear``/``size`` never runs against it. A real Redis with a
+    populated keyspace behaves as modelled here: SCAN returns a *partial*
+    batch plus a non-zero continuation cursor, and a batch may legitimately
+    be empty when the slots visited in that COUNT window hold no matching
+    keys. Everything other than ``scan`` delegates to the real fake.
+    """
+
+    def __init__(self, inner, pages: list[list[str]]):
+        self._inner = inner
+        self._pages = pages
+        self.delete_calls: list[tuple[str, ...]] = []
+
+    def scan(self, cursor=0, match=None, count=None):
+        page = self._pages[cursor]
+        # Cursor 0 is the "scan complete" sentinel, so it can only be
+        # returned from the final page.
+        next_cursor = cursor + 1 if cursor + 1 < len(self._pages) else 0
+        return next_cursor, list(page)
+
+    def delete(self, *keys):
+        self.delete_calls.append(keys)
+        return self._inner.delete(*keys)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class TestTokenCacheScanPaging:
+    """The SCAN loops must drain *every* page, not just the first.
+
+    A revocation that only clears page one leaves valid-looking cached
+    ``UserContext`` entries behind, so a revoked token keeps authenticating
+    until its TTL expires — the exact failure mode SCAN-based clear() exists
+    to avoid.
+    """
+
+    def test_clear_drains_every_scan_page(self, fake_redis):
+        pages = [
+            ["audittrace:token:hash-1"],
+            [],  # empty mid-scan page — must not terminate the loop
+            ["audittrace:token:hash-2", "audittrace:token:hash-3"],
+        ]
+        paging = _PagingRedis(fake_redis, pages)
+        cache = TokenCache(paging, default_ttl_seconds=300)
+        for h in ("hash-1", "hash-2", "hash-3"):
+            cache.put(h, _user_ctx(user_id=h))
+        fake_redis.set("not-our-key", "should-survive")
+
+        cache.clear()
+
+        # Every page's keys are gone, including the two behind the empty page.
+        assert cache.get("hash-1") is None
+        assert cache.get("hash-2") is None
+        assert cache.get("hash-3") is None
+        assert fake_redis.get("not-our-key") == "should-survive"
+        # The empty page must not have issued DELETE with zero arguments —
+        # real Redis rejects that with "wrong number of arguments".
+        assert paging.delete_calls == [
+            ("audittrace:token:hash-1",),
+            ("audittrace:token:hash-2", "audittrace:token:hash-3"),
+        ]
+
+    def test_size_counts_across_scan_pages(self, fake_redis):
+        """size() must sum every page, else the /metrics gauge under-reports
+        cache occupancy by however much SCAN left on later pages."""
+        pages = [
+            ["audittrace:token:hash-1"],
+            [],
+            ["audittrace:token:hash-2", "audittrace:token:hash-3"],
+        ]
+        cache = TokenCache(_PagingRedis(fake_redis, pages), default_ttl_seconds=300)
+
+        assert cache.size() == 3
+
+
 class TestTokenCacheTTL:
     def test_explicit_ttl_overrides_default(self, cache, fake_redis):
         cache.put("hash-1", _user_ctx(), ttl_seconds=60)

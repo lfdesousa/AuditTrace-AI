@@ -1505,8 +1505,10 @@ async def list_conversational_sessions(
             .all()
         )
 
-    return {
-        "items": [
+        # Serialise inside the session scope (#364) — ORM instances are
+        # detached once the block exits, so building the payload here keeps
+        # the handler independent of ``expire_on_commit``.
+        items = [
             {
                 "id": r.id,
                 "project": r.project,
@@ -1520,7 +1522,10 @@ async def list_conversational_sessions(
                 "user_id": r.user_id,
             }
             for r in rows
-        ],
+        ]
+
+    return {
+        "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -1573,8 +1578,10 @@ async def read_conversational_session(
             .all()
         )
 
-    return {
-        "session": {
+        # Serialise inside the session scope (#364) — both `session_row`
+        # and `interactions` are ORM instances that detach when the block
+        # exits.
+        session_payload = {
             "id": session_row.id,
             "project": session_row.project,
             "date": session_row.date,
@@ -1587,8 +1594,8 @@ async def read_conversational_session(
                 else None
             ),
             "user_id": session_row.user_id,
-        },
-        "interactions": [
+        }
+        interaction_payload = [
             {
                 "id": r.id,
                 # `timestamp` is stored as a String column in the
@@ -1614,6 +1621,10 @@ async def read_conversational_session(
                 "trace_id": r.trace_id,
             }
             for r in interactions
-        ],
-        "total": len(interactions),
+        ]
+
+    return {
+        "session": session_payload,
+        "interactions": interaction_payload,
+        "total": len(interaction_payload),
     }

@@ -57,24 +57,40 @@ async def get_upload_status(
     tenant boundaries even pre-PR-B7 IAM split."""
     async with session_factory() as session:
         row = await get_by_scan_id(session, scan_id)
-    if row is None:
+        # Snapshot inside the session scope (#364). ``get_by_scan_id``
+        # returns a session-bound ORM row, so every attribute read below —
+        # including the ``created_by_user_id`` the authorization check
+        # depends on — must happen before the block exits. Reading a
+        # detached row raises rather than returning a wrong value, so this
+        # was fail-closed rather than a leak, but a 500 in an authz path is
+        # still the wrong failure.
+        snapshot = (
+            None
+            if row is None
+            else {
+                "created_by_user_id": row.created_by_user_id,
+                "scan_id": row.id,
+                "status": row.scan_status,
+                "object_uri": row.key,
+                "object_sha256": row.document_sha256,
+                "size_bytes": row.size_bytes,
+                "created_at_ms": row.created_at_ms,
+                "modified_at_ms": row.modified_at_ms,
+                "trace_id": row.trace_id,
+            }
+        )
+
+    if snapshot is None:
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
     if not (
         user.is_admin
         or "audittrace:admin" in user.scopes
-        or row.created_by_user_id == user.user_id
+        or snapshot["created_by_user_id"] == user.user_id
     ):
         # Don't reveal whether the scan_id exists for some other
         # tenant — return the same 404 shape.
         raise HTTPException(status_code=404, detail=f"scan_id not found: {scan_id}")
 
-    return {
-        "scan_id": row.id,
-        "status": row.scan_status,
-        "object_uri": row.key,
-        "object_sha256": row.document_sha256,
-        "size_bytes": row.size_bytes,
-        "created_at_ms": row.created_at_ms,
-        "modified_at_ms": row.modified_at_ms,
-        "trace_id": row.trace_id,
-    }
+    # created_by_user_id is an authorization input, not part of the
+    # response contract — drop it rather than widen the payload.
+    return {k: v for k, v in snapshot.items() if k != "created_by_user_id"}

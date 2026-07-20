@@ -9,7 +9,7 @@ keeps all legacy test data visible.
 """
 
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -415,6 +415,78 @@ class TestMockSemanticServiceCrud:
         assert await s.delete_document(user_context, "col", "id-1") is True
         assert await s.get_document(user_context, "col", "id-1") is None
         assert await s.delete_document(user_context, "col", "id-1") is False
+
+    async def test_upsert_replaces_only_the_matching_document(self, user_context):
+        """The replace scan must skip non-matching documents, not overwrite
+        the first row it walks past.
+
+        Every route test that runs against ``MockSemanticService`` trusts it to
+        behave like ChromaDB's id-keyed upsert. If the scan replaced on the
+        wrong index, re-uploading one document would silently destroy an
+        unrelated one and the route tests would still pass — the corruption
+        only shows up against real ChromaDB in production.
+        """
+        s = MockSemanticService()
+        await s.upsert(user_context, "col", "id-a", "alpha")
+        await s.upsert(user_context, "col", "id-b", "beta")
+        # id-a is scanned first and must NOT match, so the loop moves on.
+        await s.upsert(user_context, "col", "id-b", "beta-v2")
+
+        doc_a = await s.get_document(user_context, "col", "id-a")
+        doc_b = await s.get_document(user_context, "col", "id-b")
+        assert doc_a is not None and doc_a.page_content == "alpha"
+        assert doc_b is not None and doc_b.page_content == "beta-v2"
+        # Replace, not append: the collection still holds exactly two rows.
+        assert len(s._docs["col"]) == 2
+
+    async def test_delete_removes_only_the_matching_document(self, user_context):
+        """Deleting the second document must leave the first intact.
+
+        ``delete_document`` pops by list index while scanning; an off-by-one
+        would delete a bystander document. The admin backoffice DELETE route
+        is wired to this method, so the blast radius is operator-visible data
+        loss on the wrong record.
+        """
+        s = MockSemanticService()
+        await s.upsert(user_context, "col", "id-a", "alpha")
+        await s.upsert(user_context, "col", "id-b", "beta")
+
+        assert await s.delete_document(user_context, "col", "id-b") is True
+        survivor = await s.get_document(user_context, "col", "id-a")
+        assert survivor is not None and survivor.page_content == "alpha"
+        assert await s.get_document(user_context, "col", "id-b") is None
+
+
+class TestChromaSemanticServiceDegradedPayloads:
+    """ChromaDB responses that are well-formed but incomplete."""
+
+    async def test_get_document_returns_none_when_documents_payload_empty(
+        self, user_context
+    ):
+        """A collection row can exist with an id but no stored text (an
+        embedding-only record, or a row written by a client that omitted
+        ``documents``). ``get_document`` must degrade to ``None``.
+
+        Without the guard the ``documents[0]`` access raises ``IndexError``,
+        which surfaces on the admin backoffice GET as a 500 instead of a clean
+        404 — an operator investigating an audit trail would read that as
+        "the service is broken" rather than "that document has no text".
+        """
+        col = AsyncMock()
+        col.get = AsyncMock(
+            return_value={
+                "ids": ["doc-1"],
+                "documents": [],
+                "metadatas": [{"source": "ADR-007"}],
+            }
+        )
+        client = MagicMock()
+        client.get_or_create_collection = AsyncMock(return_value=col)
+        service = ChromaSemanticService(
+            client=client, default_collections=["decisions"]
+        )
+
+        assert await service.get_document(user_context, "decisions", "doc-1") is None
 
 
 class TestUserScopedSemanticServiceCrud:

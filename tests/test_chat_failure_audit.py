@@ -604,3 +604,112 @@ class TestSuccessCaseDurationPersisted:
             assert row.duration_ms is not None
         finally:
             config_mod.get_settings.cache_clear()
+
+
+class TestPersistTraceIdBinding:
+    """Migration 008 / #344: ``interactions.trace_id`` is the single join key
+    from an audit row to the Langfuse trace and the Tempo spans. Without it
+    an auditor holding a row cannot reach the evidence that reconstructs it
+    (EU AI Act Art. 12, ``feedback_traceability_requirement``)."""
+
+    async def test_explicit_trace_id_wins_over_the_auto_captured_one(
+        self, client, monkeypatch
+    ):
+        """Deferred persists — the post-stream tail and the async-persist
+        worker — run *after* the request span has closed or under a
+        different span entirely. Auto-capture there would file the row under
+        the wrong trace, which is worse than no trace at all: it points an
+        auditor at someone else's request. An explicitly supplied trace_id
+        must therefore never be overwritten by the ambient one."""
+        from audittrace.routes import chat as chat_mod
+
+        explicit = "a" * 32
+        ambient = "b" * 32
+        monkeypatch.setattr(chat_mod, "_current_trace_id_hex", lambda: ambient)
+
+        interaction_id = await chat_mod._persist_interaction(
+            project="AuditTrace",
+            source="curl",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            session_id="sess-1",
+            model="qwen3.5-35b",
+            user_id=SENTINEL_SUBJECT,
+            trace_id=explicit,
+        )
+
+        assert interaction_id is not None
+        row = await _latest_interaction()
+        assert row is not None
+        assert row.trace_id == explicit
+        assert row.trace_id != ambient
+
+    async def test_trace_id_is_auto_captured_when_the_caller_omits_it(
+        self, client, monkeypatch
+    ):
+        """The hot-path callers omit ``trace_id`` and rely on auto-capture
+        from the live FastAPI server span. If that silently produced NULL,
+        every in-request audit row would lose its only link to the trace and
+        the reconstructibility walkthrough would dead-end at Postgres."""
+        from audittrace.routes import chat as chat_mod
+
+        ambient = "c" * 32
+        monkeypatch.setattr(chat_mod, "_current_trace_id_hex", lambda: ambient)
+
+        await chat_mod._persist_interaction(
+            project="AuditTrace",
+            source="curl",
+            question="q",
+            answer="a",
+            prompt_tokens=1,
+            completion_tokens=1,
+            session_id="sess-1",
+            model="qwen3.5-35b",
+            user_id=SENTINEL_SUBJECT,
+        )
+
+        row = await _latest_interaction()
+        assert row is not None
+        assert row.trace_id == ambient
+
+
+class TestFlushPendingToolCallsGuard:
+    """ADR-025 §Decision.5: ``tool_calls`` rows hang off ``interactions`` via
+    a NOT NULL FK. The flush runs in the response tail, where raising would
+    break a chat response that already succeeded."""
+
+    async def test_no_rows_written_when_the_parent_interaction_failed(self, client):
+        """``_persist_interaction`` returns ``None`` when the DB write fails,
+        and the flush is called with that ``None``. Attempting the insert
+        anyway would either raise inside the response tail or leave orphan
+        rows that ``GET /interactions/{id}/tool-calls`` can never surface —
+        breaking the "zero versus missing" distinction that endpoint exists
+        to guarantee. The guard must drop the children silently."""
+        from datetime import datetime
+
+        from audittrace.db.models import ToolCall
+        from audittrace.routes._memory_tool_loop import PendingToolCall
+        from audittrace.routes.chat import _flush_pending_tool_calls
+
+        pending = [
+            PendingToolCall(
+                tool_name="recall_decisions",
+                user_id=SENTINEL_SUBJECT,
+                agent_type="chat",
+                args='{"query": "rls"}',
+                result_summary="1 hit",
+                error=None,
+                started_at=datetime.now(),
+                duration_ms=3,
+                granted_scope="memory:episodic:read",
+            )
+        ]
+
+        await _flush_pending_tool_calls(pending, None)  # must not raise
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(ToolCall))).scalars().all()
+        assert rows == []

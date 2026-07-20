@@ -175,9 +175,15 @@ async def list_interactions(
             .scalars()
             .all()
         )
+        # Serialise while the session is still open (#364). ORM instances
+        # are detached once the block exits; reading their attributes then
+        # only works while nothing has expired them, which is a coupling to
+        # ``expire_on_commit=False`` that nothing here declares. Extracting
+        # plain dicts inside the block removes the dependency entirely.
+        interactions = [_row_to_dict(r) for r in rows]
 
     return {
-        "interactions": [_row_to_dict(r) for r in rows],
+        "interactions": interactions,
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -623,9 +629,11 @@ async def list_sessions(
             .scalars()
             .all()
         )
+        # Serialise inside the session scope — see list_interactions (#364).
+        sessions = [_session_row_to_dict(r) for r in rows]
 
     return {
-        "sessions": [_session_row_to_dict(r) for r in rows],
+        "sessions": sessions,
         "total": total,
         "limit": limit,
         "offset": offset,

@@ -96,6 +96,42 @@ def test_database_url_from_full_url():
     assert settings.database_url_sync == custom_url
 
 
+def test_database_url_already_async_sqlite_is_idempotent():
+    """An already-async SQLite URL must survive normalisation unchanged, and
+    ``database_url_sync`` must strip ``+aiosqlite`` back off for Alembic.
+
+    Both directions matter in production. ``_as_async_url`` must not double
+    up the driver (``sqlite+aiosqlite+aiosqlite://``) when an operator has
+    already written the async form, and Alembic — which runs sync — is
+    handed ``database_url_sync``; if the ``+aiosqlite`` prefix leaked through
+    there, migrations would fail at engine construction with "the loaded
+    'aiosqlite' dialect is async" before a single revision ran.
+    """
+    settings = Settings(postgres_url="sqlite+aiosqlite:///./audittrace.db")
+
+    # Idempotent: the async normaliser leaves an already-async URL alone.
+    assert settings.database_url == "sqlite+aiosqlite:///./audittrace.db"
+    # And the sync form drops the async driver so Alembic can use it.
+    assert settings.database_url_sync == "sqlite:///./audittrace.db"
+
+
+def test_database_url_unrecognised_driver_passes_through_unchanged():
+    """A driver the normalisers don't know about must pass through verbatim
+    in *both* directions rather than being partially rewritten.
+
+    The normalisers are prefix-rewrites over a small allow-list. If an
+    unknown scheme fell into any rewrite branch the operator's URL would be
+    silently corrupted and the connection failure would point at the wrong
+    thing (a mangled DSN, not an unsupported driver). Passing it through
+    unchanged means SQLAlchemy raises the accurate "can't load plugin" error.
+    """
+    exotic = "mysql+aiomysql://user:pw@db:3306/audittrace"
+    settings = Settings(postgres_url=exotic)
+
+    assert settings.database_url == exotic
+    assert settings.database_url_sync == exotic
+
+
 def test_summarizer_database_url_normalised_to_asyncpg():
     """The summariser owner-role URL must be normalised to the asyncpg driver.
 

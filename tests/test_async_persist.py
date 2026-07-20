@@ -24,6 +24,7 @@ from fastapi import Request
 
 from audittrace.config import Settings
 from audittrace.db.postgres import InMemoryPostgresFactory
+from audittrace.identity import SENTINEL_SUBJECT
 from audittrace.routes._memory_tool_loop import PendingToolCall
 from audittrace.routes.chat import _resolve_persist_mode
 from audittrace.services.async_persist import (
@@ -777,3 +778,369 @@ class TestConsumerExtras:
         assert persist_b.call_count >= 1
         # Total processed == 6 (assuming all entries pulled by now).
         assert persist_a.call_count + persist_b.call_count == 6
+
+
+# ──────────────── Branch-level hardening (#364) ────────────────
+#
+# The paths below are the "second half" of decisions the consumer makes
+# on every message. Each one is a place where a wrong answer silently
+# costs an audit row (ADR-033: every interaction gets a row) or corrupts
+# the per-user RLS context that makes those rows insertable at all.
+
+
+class TestReconstructAlreadyHydratedToolCalls:
+    """``reconstruct_pending_tool_calls`` must be type-tolerant on ``started_at``."""
+
+    def test_datetime_started_at_is_left_intact(self):
+        """Tool-call dicts do not always arrive with an ISO *string* timestamp.
+
+        ``deserialise_record`` yields strings, but the DLQ replay tool and
+        the XCLAIM reclaim path can hand back dicts built with
+        ``dataclasses.asdict`` — where ``started_at`` is still a real
+        ``datetime``. Calling ``datetime.fromisoformat`` on that raises
+        ``TypeError``, which would abort ``_flush`` and lose every tool-call
+        audit row for that interaction. The isinstance guard is what keeps
+        the function idempotent; this pins the non-string side of it.
+        """
+        from dataclasses import asdict
+
+        hydrated = asdict(_pending_tool_call())
+        assert isinstance(hydrated["started_at"], datetime)  # pre-condition
+
+        recs = reconstruct_pending_tool_calls([hydrated])
+
+        assert len(recs) == 1
+        # The datetime survived untouched — not re-parsed, not stringified.
+        assert recs[0].started_at == datetime(2026, 5, 4, 12, 0, 0)
+        assert recs[0].tool_name == "recall_decisions"
+        # The traceability fields the audit row is keyed on came through too.
+        assert recs[0].user_id == "user-luis"
+        assert recs[0].granted_scope == "audittrace:query"
+
+
+class TestReclaimRaceLoses:
+    """Multi-pod safety: losing the XCLAIM race must be a no-op, not a re-persist."""
+
+    @pytest.mark.asyncio
+    async def test_lost_xclaim_race_does_not_double_persist(self):
+        """Two pods can see the same idle pending entry in the same instant.
+
+        Both call ``XPENDING`` and see the entry; only one ``XCLAIM``
+        succeeds — the loser gets an empty reply. If the loser fell through
+        to ``_process_batch`` anyway it would write a *second*
+        InteractionRecord for one chat completion, which is a duplicated
+        audit row (worse than a missing one: it inflates the evidence
+        trail). This pins the early return.
+        """
+        redis = FakeRedis(decode_responses=True)
+        s = _settings(async_persist_pending_idle_ms=0)
+        producer = AsyncPersistProducer(settings=s, redis=redis)
+        await producer.enqueue(kwargs=_kwargs(), pending_tool_calls=None)
+
+        # Leave the entry pending: first pass fails to persist, so no XACK.
+        failing_persist = AsyncMock(side_effect=RuntimeError("pod died mid-write"))
+        consumer = AsyncPersistConsumer(
+            settings=s,
+            persist_callable=failing_persist,
+            flush_tool_calls_callable=AsyncMock(),
+            redis=redis,
+            consumer_name="c-loser",
+        )
+        await consumer._ensure_group()
+        await consumer.run_once()
+        pending = await redis.xpending_range(
+            s.async_persist_stream, s.async_persist_group, min="-", max="+", count=10
+        )
+        assert len(pending) == 1  # pre-condition: entry is idle + pending
+
+        # Now the reclaim attempt loses the race — XCLAIM returns nothing.
+        persist, flush = _persist_recorder()
+        consumer._persist = persist
+        consumer._flush = flush
+        redis.xclaim = AsyncMock(return_value=[])
+
+        reclaimed = await consumer._reclaim_and_process_idle_pending()
+
+        assert reclaimed == 0
+        # The decisive assertion: no duplicate audit row was written.
+        persist.assert_not_called()
+        flush.assert_not_called()
+
+
+class TestRlsContextGuard:
+    """The RLS ContextVar must only ever be set from a real user id."""
+
+    @pytest.mark.asyncio
+    async def test_blank_user_id_does_not_overwrite_rls_context(self, monkeypatch):
+        """A blank ``user_id`` must not clobber the per-user RLS GUC.
+
+        The consumer task is one long-lived asyncio task processing every
+        pod's messages back to back. ``set_current_user_id("")`` would leave
+        an empty GUC behind, and the *next* message's INSERT would be
+        evaluated by Postgres RLS against the wrong (empty) principal —
+        rejected with InsufficientPrivilege, silently costing that
+        interaction its audit row. The truthiness guard is the protection;
+        this pins the falsy side.
+        """
+        import audittrace.db.rls as rls_module
+
+        seen: list[str] = []
+        monkeypatch.setattr(rls_module, "set_current_user_id", seen.append)
+
+        redis = FakeRedis(decode_responses=True)
+        s = _settings()
+        producer = AsyncPersistProducer(settings=s, redis=redis)
+        # Message 1: no user id at all. Message 2: a real one.
+        await producer.enqueue(
+            kwargs=_kwargs() | {"user_id": ""}, pending_tool_calls=None
+        )
+        await producer.enqueue(
+            kwargs=_kwargs() | {"user_id": "user-frank"}, pending_tool_calls=None
+        )
+
+        persist, flush = _persist_recorder()
+        consumer = AsyncPersistConsumer(
+            settings=s,
+            persist_callable=persist,
+            flush_tool_calls_callable=flush,
+            redis=redis,
+            consumer_name="c-rls",
+        )
+        await consumer._ensure_group()
+        assert await consumer.run_once() == 2
+
+        # Only the real principal reached the ContextVar — never "".
+        assert seen == ["user-frank"]
+        # Both messages still got persisted: the guard skips the GUC, it
+        # does not skip the audit row.
+        assert persist.call_count == 2
+
+
+class TestMissingEnqueuedTimestamp:
+    """An entry without ``enqueued_ts`` must still complete and XACK."""
+
+    @pytest.mark.asyncio
+    async def test_entry_without_enqueued_ts_still_persists_and_acks(self):
+        """Stream entries are not guaranteed to carry ``enqueued_ts``.
+
+        A DLQ replay, a hand-injected triage entry, or an entry written by
+        an older producer build has no timestamp, so ``deserialise_record``
+        returns ``0.0``. Recording a queue-lag sample from that would report
+        a ~56-year lag and poison the histogram; more importantly the entry
+        must still be persisted and XACKed rather than stalling the stream
+        forever. This pins the skip-the-histogram side.
+        """
+        redis = FakeRedis(decode_responses=True)
+        s = _settings()
+        # Hand-built entry — deliberately no "enqueued_ts" field.
+        await redis.xadd(
+            s.async_persist_stream,
+            {"record_json": json.dumps(_kwargs()), "tool_calls_json": "[]"},
+        )
+
+        persist, flush = _persist_recorder()
+        consumer = AsyncPersistConsumer(
+            settings=s,
+            persist_callable=persist,
+            flush_tool_calls_callable=flush,
+            redis=redis,
+            consumer_name="c-nots",
+        )
+        await consumer._ensure_group()
+        assert await consumer.run_once() == 1
+
+        persist.assert_called_once()
+        # XACKed — nothing left pending, so the entry cannot be re-delivered.
+        pending = await redis.xpending_range(
+            s.async_persist_stream, s.async_persist_group, min="-", max="+", count=10
+        )
+        assert pending == []
+        # And it did not get treated as poison.
+        assert await redis.xrange(s.async_persist_dlq, "-", "+") == []
+
+
+class TestDeliveryCountWithoutPendingEntry:
+    """No XPENDING metadata → assume first delivery, never DLQ."""
+
+    @pytest.mark.asyncio
+    async def test_absent_pending_entry_is_treated_as_first_delivery(self):
+        """``XPENDING`` for a message id can legitimately come back empty.
+
+        It happens when the entry was ACKed by a racing consumer between the
+        read and the count, or when the group's PEL was trimmed. If the
+        empty reply fell through to a large default the message would be
+        classed as exceeding ``max_deliveries`` and dumped in the DLQ —
+        discarding a perfectly good interaction instead of persisting it.
+        The fallback of 1 is what keeps first-attempt messages on the happy
+        path; this pins it.
+        """
+        redis = MagicMock()
+        redis.xgroup_create = AsyncMock(return_value=None)
+        redis.xack = AsyncMock(return_value=1)
+        redis.xadd = AsyncMock(return_value="9-9")
+        # Every XPENDING lookup comes back empty — both the reclaim sweep
+        # and the per-message delivery-count probe.
+        redis.xpending_range = AsyncMock(return_value=[])
+        entry_fields = serialise_record(kwargs=_kwargs(), pending_tool_calls=None)
+        redis.xreadgroup = AsyncMock(
+            return_value=[("test:persist:stream", [("5-1", entry_fields)])]
+        )
+
+        s = _settings(async_persist_max_deliveries=3)
+        persist, flush = _persist_recorder()
+        consumer = AsyncPersistConsumer(
+            settings=s,
+            persist_callable=persist,
+            flush_tool_calls_callable=flush,
+            redis=redis,
+            consumer_name="c-nopel",
+        )
+        await consumer._ensure_group()
+
+        assert await consumer._delivery_count("5-1") == 1
+
+        assert await consumer.run_once() == 1
+        # Persisted and ACKed rather than DLQ'd.
+        persist.assert_called_once()
+        redis.xack.assert_awaited_once()
+        # Nothing was written to the DLQ stream.
+        dlq_writes = [
+            c for c in redis.xadd.await_args_list if c.args[0] == s.async_persist_dlq
+        ]
+        assert dlq_writes == []
+
+
+class TestPersistOrEnqueueBranch:
+    """ADR-046 — ``_persist_or_enqueue`` is the fork between the Redis
+    Streams path and the direct Postgres write. ADR-033's invariant ("every
+    interaction gets an audit row") has to hold on BOTH sides of it,
+    including when Redis is the thing that broke."""
+
+    @pytest.fixture
+    def _async_persist_on(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_ASYNC_PERSIST_ENABLED", "true")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @staticmethod
+    def _persist_kwargs() -> dict:
+        return {
+            "project": "AuditTrace",
+            "source": "curl",
+            "question": "who changed the RLS policy?",
+            "answer": "migration 005",
+            "prompt_tokens": 11,
+            "completion_tokens": 3,
+            "session_id": "curl-2026-07-20-abc",
+            "model": "qwen3.5-35b",
+            "user_id": SENTINEL_SUBJECT,
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_mode_enqueues_and_skips_the_inline_db_write(
+        self, client, _async_persist_on
+    ):
+        """The whole point of async mode is to take the Postgres write off
+        the chat hot path. If the sync write also ran, the row would be
+        written twice (once here, once by the consumer) and the latency win
+        would be zero. The handler must return ``None`` so no caller tries
+        to hang tool_calls off an id that does not exist yet."""
+        from sqlalchemy import select as _select
+
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+        from audittrace.routes.chat import _persist_or_enqueue
+        from audittrace.services import async_persist as ap
+
+        redis = FakeRedis(decode_responses=True)
+        ap.install_test_producer(
+            AsyncPersistProducer(settings=_settings(), redis=redis)
+        )
+        try:
+            result = await _persist_or_enqueue(
+                persist_mode="async",
+                pending_tool_calls=None,
+                **self._persist_kwargs(),
+            )
+        finally:
+            ap.reset_for_tests()
+
+        assert result is None
+
+        entries = await redis.xrange("test:persist:stream", "-", "+")
+        assert len(entries) == 1
+        enqueued_kwargs, enqueued_tcs, _ = deserialise_record(entries[0][1])
+        # The enqueued payload must carry the full traceability triple —
+        # the consumer writes the row minutes later with no request context
+        # of its own (EU AI Act Art. 12).
+        assert enqueued_kwargs["user_id"] == SENTINEL_SUBJECT
+        assert enqueued_kwargs["session_id"] == "curl-2026-07-20-abc"
+        assert enqueued_kwargs["question"] == "who changed the RLS policy?"
+        assert enqueued_tcs == []
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(_select(InteractionRecord))).scalars().all()
+        assert rows == [], "async mode must not also write inline"
+
+    @pytest.mark.asyncio
+    async def test_producer_failure_falls_back_to_a_synchronous_audit_row(
+        self, client, _async_persist_on
+    ):
+        """A Redis blip must degrade latency, never auditability. If the
+        XADD fails and we simply returned, the interaction would exist in
+        the user's terminal and nowhere else — the exact silent-loss shape
+        migration 007 was written to close."""
+        from sqlalchemy import select as _select
+
+        from audittrace.db.models import InteractionRecord, ToolCall
+        from audittrace.dependencies import get_postgres_factory
+        from audittrace.routes.chat import _persist_or_enqueue
+        from audittrace.services import async_persist as ap
+
+        broken = MagicMock()
+        broken.xadd = AsyncMock(side_effect=ConnectionError("redis is down"))
+        ap.install_test_producer(
+            AsyncPersistProducer(settings=_settings(), redis=broken)
+        )
+        pending = [
+            PendingToolCall(
+                tool_name="recall_decisions",
+                user_id=SENTINEL_SUBJECT,
+                agent_type="chat",
+                args='{"query": "rls"}',
+                result_summary="1 hit",
+                error=None,
+                started_at=datetime.now(),
+                duration_ms=4,
+                granted_scope="memory:episodic:read",
+            )
+        ]
+        try:
+            interaction_id = await _persist_or_enqueue(
+                persist_mode="async",
+                pending_tool_calls=pending,
+                **self._persist_kwargs(),
+            )
+        finally:
+            ap.reset_for_tests()
+
+        assert interaction_id is not None
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(_select(InteractionRecord))).scalars().all()
+            tool_rows = (await db.execute(_select(ToolCall))).scalars().all()
+
+        assert len(rows) == 1
+        assert rows[0].id == interaction_id
+        assert rows[0].user_id == SENTINEL_SUBJECT
+        assert rows[0].question == "who changed the RLS policy?"
+        # The tool-call children land too, linked to the parent that just
+        # landed — the fallback is a full sync persist, not a partial one.
+        assert len(tool_rows) == 1
+        assert tool_rows[0].interaction_id == interaction_id
+        assert tool_rows[0].tool_name == "recall_decisions"

@@ -424,3 +424,179 @@ class TestMockProceduralServiceWriteDelete:
     def test_invalidate_cache_no_op(self, user_context) -> None:
         service = MockProceduralService()
         service.invalidate_cache()  # no exception
+
+
+# ── Filename-validation branch hardening (#364) ─────────────────────────────
+#
+# ``_validate_filename`` is the only thing standing between a CRUD-backoffice
+# caller and arbitrary object keys in the shared ``memory-shared`` bucket. The
+# tests below pin the guard on the write/delete surface (read was already
+# covered) and pin the "keep scanning" side of the per-document match loops,
+# where an off-by-one would clobber or delete the wrong skill.
+
+
+class TestFilenameValidationOnWriteDelete:
+    """Empty / non-string / traversal filenames must never reach storage."""
+
+    async def test_empty_filename_is_rejected_everywhere(self, user_context) -> None:
+        """An empty ``file`` must not resolve to the prefix directory itself.
+
+        ``key = f"{self._prefix}{file}"`` with an empty ``file`` produces
+        ``"procedural/"`` — a valid object key. Without the emptiness check a
+        delete of ``""`` would target that key, and a read of ``""`` would
+        return whatever sits there. The guard has to fire before the key is
+        built.
+        """
+        service = MockProceduralService()
+        service.add_document("body", skill="IAM", file="SKILL-IAM.md")
+
+        assert await service.read(user_context, "") is None
+        assert await service.delete(user_context, "") is False
+        with pytest.raises(ValueError):
+            await service.write(user_context, "", "payload")
+        # The pre-existing skill is untouched by any of the three attempts.
+        assert len(await service.load(user_context)) == 1
+
+    async def test_non_string_filename_is_rejected(self, user_context) -> None:
+        """A JSON body with ``"file": null`` arrives as ``None``, not a string.
+
+        ``None.endswith(".md")`` raises ``AttributeError``, which would surface
+        as a 500 from the CRUD route instead of a clean rejection. The
+        isinstance half of the guard is what turns that into a normal
+        "invalid filename" answer.
+        """
+        service = MockProceduralService()
+
+        assert await service.read(user_context, None) is None  # type: ignore[arg-type]
+        assert await service.delete(user_context, None) is False  # type: ignore[arg-type]
+
+    async def test_mock_write_rejects_traversal_filename(self, user_context) -> None:
+        """The mock must reject exactly what the S3 implementation rejects.
+
+        ``MockProceduralService`` is what most unit tests run against. If it
+        accepted ``../`` filenames the CRUD tests would pass while the real
+        S3 path rejected them, and the traversal defence would only ever be
+        exercised in production.
+        """
+        service = MockProceduralService()
+
+        with pytest.raises(ValueError, match="invalid filename"):
+            await service.write(user_context, "../../etc/passwd.md", "pwned")
+        with pytest.raises(ValueError, match="invalid filename"):
+            await service.write(user_context, "SKILL-notes.txt", "wrong suffix")
+
+        # Nothing was appended by the rejected writes.
+        assert await service.load(user_context) == []
+
+    async def test_s3_delete_rejects_traversal_before_touching_storage(
+        self, user_context
+    ) -> None:
+        """The S3 delete guard must short-circuit *before* the MinIO call.
+
+        ``key = f"{self._prefix}{file}"`` normalises nothing, so
+        ``"../secrets.md"`` would resolve to ``procedural/../secrets.md`` —
+        an object outside the procedural prefix in the shared bucket. Asserting
+        the client was never called (rather than only that the return value is
+        ``False``) is what pins the short-circuit.
+        """
+        calls: list[str] = []
+
+        class _RecordingMinio(_FakeMinio):
+            def stat_object(self, bucket: str, key: str) -> object:
+                calls.append(f"stat:{key}")
+                return super().stat_object(bucket, key)
+
+            def remove_object(self, bucket: str, key: str) -> None:
+                calls.append(f"remove:{key}")
+                super().remove_object(bucket, key)
+
+        client = _RecordingMinio({"procedural/SKILL-IAM.md": b"# IAM\n"})
+        service = S3ProceduralService(
+            client, bucket="memory-shared", prefix="procedural/"
+        )
+
+        assert await service.delete(user_context, "../secrets.md") is False
+        assert await service.delete(user_context, "SKILL-IAM") is False
+
+        # Decisive: the object store was never asked to do anything.
+        assert calls == []
+
+
+class TestMockMatchLoops:
+    """The per-document scans must act on the named skill and nothing else."""
+
+    async def test_write_updates_only_the_named_skill(self, user_context) -> None:
+        """Overwriting one skill must leave its siblings byte-identical.
+
+        The write path scans ``self._documents`` for a filename match and
+        replaces in place. If the scan stopped at the first entry rather than
+        continuing past non-matches, writing to the second or third skill
+        would silently overwrite the first — a shared-content corruption that
+        every user of the procedural layer would then read back.
+        """
+        service = MockProceduralService()
+        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
+        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
+        service.add_document("cli body", skill="CLI", file="SKILL-CLI.md")
+
+        updated = await service.write(user_context, "SKILL-CLI.md", "cli body v2")
+
+        assert updated.page_content == "cli body v2"
+        assert updated.metadata["skill"] == "CLI"
+        # No new document was appended — this was an in-place replace.
+        docs = await service.load(user_context)
+        assert len(docs) == 3
+        by_file = {d.metadata["file"]: d.page_content for d in docs}
+        assert by_file["SKILL-IAM.md"] == "iam body"
+        assert by_file["SKILL-ARCH.md"] == "arch body"
+        assert by_file["SKILL-CLI.md"] == "cli body v2"
+
+    async def test_read_scans_past_non_matching_documents(self, user_context) -> None:
+        """``read`` must find a skill that is not the first one stored.
+
+        Recall and the CRUD backoffice both read by exact filename against a
+        multi-skill store; a scan that only ever inspected the head of the
+        list would return the wrong skill's content to the LLM.
+        """
+        service = MockProceduralService()
+        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
+        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
+
+        doc = await service.read(user_context, "SKILL-ARCH.md")
+
+        assert doc is not None
+        assert doc.page_content == "arch body"
+        assert doc.metadata["file"] == "SKILL-ARCH.md"
+
+    async def test_delete_missing_skill_is_a_no_op(self, user_context) -> None:
+        """Deleting an absent skill must report False and remove nothing.
+
+        The route maps the boolean onto 404-vs-200. If the scan fell off the
+        end and removed the last-inspected entry (or returned True), a delete
+        of a typo'd filename would destroy an unrelated skill and report
+        success.
+        """
+        service = MockProceduralService()
+        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
+        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
+
+        assert await service.delete(user_context, "SKILL-NOPE.md") is False
+
+        remaining = {d.metadata["file"] for d in await service.load(user_context)}
+        assert remaining == {"SKILL-IAM.md", "SKILL-ARCH.md"}
+
+    async def test_delete_removes_only_the_named_skill(self, user_context) -> None:
+        """Deleting the second of three skills must leave the other two.
+
+        Same off-by-one risk as the write scan, but destructive: the index
+        used for ``pop`` has to be the index of the *matching* document.
+        """
+        service = MockProceduralService()
+        service.add_document("iam body", skill="IAM", file="SKILL-IAM.md")
+        service.add_document("arch body", skill="ARCH", file="SKILL-ARCH.md")
+        service.add_document("cli body", skill="CLI", file="SKILL-CLI.md")
+
+        assert await service.delete(user_context, "SKILL-ARCH.md") is True
+
+        remaining = {d.metadata["file"] for d in await service.load(user_context)}
+        assert remaining == {"SKILL-IAM.md", "SKILL-CLI.md"}

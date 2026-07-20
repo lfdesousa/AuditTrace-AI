@@ -1387,3 +1387,315 @@ def test_append_tool_result_wraps_recalled_content_as_untrusted_data():
     # ...and the actual recalled JSON payload is still present for the model to use.
     assert "PWNED" in msg["content"]
     assert '"matches"' in msg["content"]
+
+
+# ─────────── Malformed-response tolerance in the extraction helpers ─────────
+
+
+class TestExtractionHelpersOnDegenerateBodies:
+    """llama-server occasionally returns a body with no ``choices`` (load
+    shedding, an aborted slot, a proxy-injected error envelope). The
+    extraction helpers must degrade to a well-formed empty result instead
+    of raising, because an IndexError here escapes as a 500 with no audit
+    row at all — the worst outcome for reconstructibility, since the
+    interaction then leaves no trace of having happened."""
+
+    def test_assistant_message_from_choiceless_body_is_still_well_formed(self):
+        """A body with no ``choices`` must yield a syntactically valid
+        assistant turn. That message is appended to history verbatim; a
+        ``None`` or a bare ``{}`` would corrupt the next round-trip's
+        chat-template rendering."""
+        from audittrace.routes._memory_tool_loop import _extract_assistant_message
+
+        msg = _extract_assistant_message({"id": "cmpl-x", "object": "chat.completion"})
+
+        assert msg == {"role": "assistant", "content": ""}
+        # No tool_calls key at all — nothing for the next turn to correlate
+        # against, which is correct: the model never emitted a tool call.
+        assert "tool_calls" not in msg
+
+    def test_non_dict_tool_call_entries_are_preserved_not_dropped(self):
+        """``_sanitise_assistant_tool_calls`` must pass a non-dict
+        tool_calls entry through untouched rather than dropping it.
+        Dropping would silently shorten the ``tool_calls`` array the
+        model produced, and the audit trail would then disagree with
+        what the model actually asked for."""
+        from audittrace.routes._memory_tool_loop import _sanitise_assistant_tool_calls
+
+        msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                "not-a-dict",  # garbage entry from a malformed stream
+                {
+                    "id": "call_ok",
+                    "type": "function",
+                    "function": {
+                        "name": "recall_decisions",
+                        "arguments": '{"query": "ADR-025"}',
+                    },
+                },
+            ],
+        }
+
+        cleaned = _sanitise_assistant_tool_calls(msg)
+
+        assert len(cleaned["tool_calls"]) == 2
+        assert cleaned["tool_calls"][0] == "not-a-dict"
+        # The well-formed neighbour is untouched (already valid JSON).
+        assert (
+            cleaned["tool_calls"][1]["function"]["arguments"] == '{"query": "ADR-025"}'
+        )
+
+
+class TestParseArgumentsCoercion:
+    """``_parse_arguments`` produces the dict handed to the tool handler
+    AND (via ``json.dumps``) the ``args`` column of the ``tool_calls``
+    audit row. Both consumers need a dict; a wrong coercion either loses
+    the model's parameters or writes an unreadable audit row."""
+
+    def test_dict_arguments_are_passed_through_unchanged(self):
+        """Some clients forward ``function.arguments`` as an object
+        rather than the JSON string the OpenAI spec mandates. Those
+        arguments must survive intact — re-parsing or discarding them
+        would execute the tool with an empty query and record an audit
+        row that misrepresents what was asked."""
+        from audittrace.routes._memory_tool_loop import _parse_arguments
+
+        raw = {"query": "ADR-025 memory modes", "limit": 3}
+        parsed = _parse_arguments(raw)
+
+        assert parsed == {"query": "ADR-025 memory modes", "limit": 3}
+
+    def test_empty_arguments_become_empty_dict_not_error(self):
+        """A no-argument tool call arrives as ``""`` (or None). It must
+        coerce to ``{}`` so the handler applies its defaults; raising
+        here would turn a legitimate zero-arg call into a failed
+        interaction."""
+        from audittrace.routes._memory_tool_loop import _parse_arguments
+
+        assert _parse_arguments("") == {}
+        assert _parse_arguments(None) == {}
+
+
+class TestToolParseErrorClassification:
+    """``_is_tool_parse_error_500`` is the gate on the retry + strip-tools
+    fallback. A false positive re-sends a payload to an upstream that is
+    failing for a different reason (amplification); a false negative
+    turns a recoverable model flake into a user-visible 502."""
+
+    def test_4xx_is_never_classified_as_a_parse_error(self):
+        """Even when a 4xx body carries the marker text, it must not be
+        classified as the retryable Qwen 500 — 4xx means the request was
+        rejected, and re-sending it cannot succeed."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes._memory_tool_loop import _is_tool_parse_error_500
+
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.json.return_value = {
+            "error": {"message": "json.exception.parse_error.101 in your request"}
+        }
+
+        assert _is_tool_parse_error_500(resp) is False
+
+    def test_string_shaped_error_field_is_still_classified(self):
+        """llama-server builds vary: some emit ``error`` as an object,
+        others as a bare string. The string shape must still be matched,
+        otherwise the tools-stripping fallback never fires on those
+        builds and every malformed tool_call becomes a 502."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes._memory_tool_loop import _is_tool_parse_error_500
+
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.json.return_value = {
+            "error": "Failed to parse tool call arguments as JSON: bad quote"
+        }
+
+        assert _is_tool_parse_error_500(resp) is True
+
+    def test_error_field_of_unusable_shape_is_not_classified(self):
+        """A 500 whose ``error`` field is neither an object nor a string
+        (a list, a number, absent) yields no message to match. It must
+        fall through to "not a parse error" so the loop raises instead of
+        spending retries and a fallback round-trip on an upstream that is
+        failing for an unknown reason."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes._memory_tool_loop import _is_tool_parse_error_500
+
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.json.return_value = {"error": ["json.exception.parse_error.101"]}
+
+        assert _is_tool_parse_error_500(resp) is False
+
+    def test_non_dict_body_is_not_classified(self):
+        """A 500 whose body is a JSON array (or any non-object) carries
+        no error message to match on. Treat it as a genuine upstream
+        failure and let it raise, rather than burning retries."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes._memory_tool_loop import _is_tool_parse_error_500
+
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.json.return_value = ["unexpected", "array"]
+
+        assert _is_tool_parse_error_500(resp) is False
+
+
+class TestStripToolsForFallbackMessageScrubbing:
+    """The fallback payload is the last chance to get the user a real
+    answer instead of a 502. Every message it forwards must be something
+    llama-server's chat template can render — one unrenderable entry and
+    the fallback fails too."""
+
+    def test_non_dict_messages_are_dropped_from_the_fallback_payload(self):
+        """A non-dict entry in ``messages`` (corrupted history) cannot be
+        role-inspected or rendered; it is dropped so the fallback request
+        stays valid and the surviving user turn still reaches the model."""
+        from audittrace.routes._memory_tool_loop import _strip_tools_for_fallback
+
+        payload = {
+            "model": "qwen3.5-35b",
+            "messages": [
+                "corrupted-entry",
+                {"role": "user", "content": "What does ADR-025 say?"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+        }
+
+        fallback = _strip_tools_for_fallback(payload)
+
+        assert fallback["messages"] == [
+            {"role": "user", "content": "What does ADR-025 say?"}
+        ]
+        assert "tools" not in fallback
+
+    def test_assistant_text_survives_when_its_tool_calls_are_stripped(self):
+        """When an assistant turn carried BOTH text and a broken
+        tool_calls block, only the tool_calls are removed. Preserving the
+        text keeps the model's reasoning in context so the degraded
+        (no-tools) answer is still coherent — the whole point of the
+        fallback."""
+        from audittrace.routes._memory_tool_loop import _strip_tools_for_fallback
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": "ADR-025?"},
+                {
+                    "role": "assistant",
+                    "content": "Let me look that up.",
+                    "tool_calls": [
+                        {
+                            "id": "call_broken",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_decisions",
+                                "arguments": '{"query": "ADR-025',
+                            },
+                        }
+                    ],
+                },
+            ],
+            "tools": [],
+        }
+
+        fallback = _strip_tools_for_fallback(payload)
+
+        assistant = fallback["messages"][1]
+        assert assistant["content"] == "Let me look that up."
+        # The poisoned block is gone — that string was the 500 trigger.
+        assert "tool_calls" not in assistant
+
+
+class TestRetryStopsOnDifferentFailureClass:
+    @pytest.mark.asyncio
+    async def test_retry_returning_non_parse_500_skips_the_fallback(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """First POST is a tool-parse 500 (retryable); the retry comes
+        back 500 for a DIFFERENT reason (OOM). The upstream has moved to
+        a real failure, so the strip-tools fallback must NOT be
+        attempted — exactly 2 POSTs — and the error surfaces as
+        HTTPStatusError so chat.py writes a failed audit row instead of
+        silently degrading the answer."""
+        user = sentinel_user_context()
+        fake = _SeqStatusClient(
+            [
+                (500, _TOOL_PARSE_500_BODY),
+                (500, {"error": {"message": "CUDA out of memory; slot aborted"}}),
+            ]
+        )
+        with _patch_async_client(fake), pytest.raises(httpx.HTTPStatusError):
+            await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "ADR-025?"}],
+                    "tools": [{"type": "function", "function": {"name": "x"}}],
+                },
+                user_context=user,
+                session_id="sess-retry-class-change",
+                max_iterations=5,
+            )
+        # 1 initial + 1 retry, and NO third (fallback) attempt.
+        assert len(fake.post_calls) == 2
+        # Both attempts still carried `tools` — the fallback never ran.
+        assert all("tools" in call["json"] for call in fake.post_calls)
+
+
+class TestUnknownToolAuditRow:
+    @pytest.mark.asyncio
+    async def test_unknown_tool_records_a_denied_shaped_audit_row(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """A tool_call naming a tool that is not in the registry (a
+        registry reload, a renamed tool, a replayed old conversation)
+        must still produce a ``tool_calls`` audit row. ADR-025: refusals
+        are recorded so an auditor can distinguish "the model asked and
+        was refused" from "the model never asked". ``granted_scope=""``
+        is the marker that NOTHING was authorised for this call."""
+        from audittrace.routes._memory_tool_loop import _execute_memory_tool
+
+        user = sentinel_user_context()
+        messages: list[dict] = []
+        pending: list = []
+
+        await _execute_memory_tool(
+            tc={
+                "id": "call_ghost",
+                "type": "function",
+                "function": {
+                    "name": "recall_from_the_void",
+                    "arguments": '{"query": "anything"}',
+                },
+            },
+            user_context=user,
+            session_id="sess-unknown-tool",
+            messages=messages,
+            pending=pending,
+        )
+
+        assert len(pending) == 1
+        row = pending[0]
+        # The tool the model NAMED is recorded, not a placeholder — the
+        # auditor needs to see what was requested.
+        assert row.tool_name == "recall_from_the_void"
+        assert row.error is not None and "unknown memory tool" in row.error
+        assert row.result_summary is None
+        # Nothing was authorised: no scope was granted for this call.
+        assert row.granted_scope == ""
+        # The model's arguments are preserved in the row.
+        assert "anything" in row.args
+
+        # The model also gets an error-shaped tool_result so it can
+        # recover in the next turn instead of hanging on the call id.
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
+        assert messages[0]["tool_call_id"] == "call_ghost"
+        assert "unknown memory tool" in messages[0]["content"]

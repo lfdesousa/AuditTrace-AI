@@ -176,6 +176,83 @@ async def test_mock_collection_count_with_where_filter():
     assert await collection.count(where={"k": "no-match"}) == 0
 
 
+# ── MockCollection upsert / delete semantics ─────────────────────────────────
+#
+# MockCollection is the ChromaDB stand-in for the whole memory-service suite.
+# If its write semantics drift from real ChromaDB, every test that exercises
+# a memory layer through it validates against the wrong contract, and the
+# divergence only shows up against a live Chroma.
+
+
+async def test_mock_collection_upsert_replaces_only_the_matching_id():
+    """Upsert must replace the row whose id matches and leave its neighbours
+    untouched — including rows scanned *before* the match is found.
+
+    Real ChromaDB upsert is per-id. A stub that replaced the first row it
+    looked at (or appended a duplicate instead of replacing) would let a
+    memory-layer regression that overwrites a different user's document pass
+    the unit suite, since the collection state the assertions read back is
+    entirely the stub's.
+    """
+    collection = MockCollection("test")
+    await collection.add(
+        ids=["a", "b", "c"],
+        documents=["doc-a", "doc-b", "doc-c"],
+        metadatas=[{"owner": "u1"}, {"owner": "u2"}, {"owner": "u3"}],
+    )
+
+    # "b" is not the first row, so the scan walks past a non-matching row.
+    await collection.upsert(
+        ids=["b"], documents=["doc-b-v2"], metadatas=[{"owner": "u2"}]
+    )
+
+    # Replaced in place: still three rows, not four.
+    assert await collection.count() == 3
+    rows = await collection.get()
+    by_id = dict(zip(rows["ids"], rows["documents"], strict=True))
+    assert by_id["b"] == "doc-b-v2"
+    # Neighbours on both sides of the match survive unchanged.
+    assert by_id["a"] == "doc-a"
+    assert by_id["c"] == "doc-c"
+    # Order is preserved — the replacement is positional, not a delete+append.
+    assert rows["ids"] == ["a", "b", "c"]
+
+
+async def test_mock_collection_upsert_appends_when_id_is_new():
+    """An id not already present must be appended, not silently dropped."""
+    collection = MockCollection("test")
+    await collection.add(ids=["a"], documents=["doc-a"])
+
+    await collection.upsert(ids=["b"], documents=["doc-b"])
+
+    rows = await collection.get()
+    assert rows["ids"] == ["a", "b"]
+    assert rows["documents"] == ["doc-a", "doc-b"]
+
+
+async def test_mock_collection_delete_without_ids_is_a_noop():
+    """``delete()`` with no ids must delete nothing.
+
+    Real ChromaDB treats an empty id list as "nothing to do". The dangerous
+    misreading is "no filter → delete everything": a service that computes an
+    empty deletion set (nothing expired, nothing to evict) would then wipe the
+    whole collection, and against this stub the test suite would happily
+    confirm it.
+    """
+    collection = MockCollection("test")
+    await collection.add(ids=["a", "b"], documents=["doc-a", "doc-b"])
+
+    await collection.delete()
+    assert await collection.count() == 2
+
+    await collection.delete(ids=[])
+    assert await collection.count() == 2
+
+    # Contrast: a populated id list does delete, and only the named row.
+    await collection.delete(ids=["a"])
+    assert (await collection.get())["ids"] == ["b"]
+
+
 # ── HTTPChromaDBFactory startup-race retry ───────────────────────────────────
 #
 # Mirrors the Istio-sidecar startup race: chromadb's SDK wraps Envoy 503
