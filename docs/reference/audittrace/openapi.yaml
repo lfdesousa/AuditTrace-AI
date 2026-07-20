@@ -779,6 +779,103 @@ components:
       - project
       title: SessionSummaryResponse
       type: object
+    ToolCallListItem:
+      description: 'One row in ``GET /interactions/{id}/tool-calls`` (#363 / RF-10).
+
+
+        Mirrors the ``tool_calls`` columns. ``granted_scope`` is the field
+
+        that answers "who was allowed to call what" under audit: a REFUSED
+
+        call is recorded with ``granted_scope=""`` and an ``error``, which is
+
+        what makes a genuine zero-tool interaction distinguishable from one
+
+        where the calls went missing.'
+      properties:
+        agent_type:
+          title: Agent Type
+          type: string
+        args:
+          title: Args
+          type: string
+        duration_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Duration Ms
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        granted_scope:
+          title: Granted Scope
+          type: string
+        id:
+          title: Id
+          type: string
+        interaction_id:
+          title: Interaction Id
+          type: integer
+        result_summary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Result Summary
+        started_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Started At
+        tool_name:
+          title: Tool Name
+          type: string
+        user_id:
+          title: User Id
+          type: string
+      required:
+      - id
+      - interaction_id
+      - user_id
+      - agent_type
+      - tool_name
+      - args
+      - granted_scope
+      title: ToolCallListItem
+      type: object
+    ToolCallListResponse:
+      description: 'Response from ``GET /interactions/{id}/tool-calls``.
+
+
+        ``total`` is deliberately the count of rows returned for THIS
+
+        interaction rather than a paginated grand total: the per-interaction
+
+        fan-out is bounded (one row per tool the model invoked in a single
+
+        completion), so a caller counting tool calls for cross-store
+
+        corroboration gets the whole set in one response and never has to
+
+        reason about whether a zero means "none" or "next page".'
+      properties:
+        interaction_id:
+          title: Interaction Id
+          type: integer
+        tool_calls:
+          items:
+            $ref: '#/components/schemas/ToolCallListItem'
+          title: Tool Calls
+          type: array
+        total:
+          default: 0
+          title: Total
+          type: integer
+      required:
+      - interaction_id
+      title: ToolCallListResponse
+      type: object
     ValidationError:
       properties:
         ctx:
@@ -1101,6 +1198,84 @@ paths:
       - audittrace-oauth2:
         - audittrace:audit
       summary: Create Interaction
+      tags:
+      - audit
+  /interactions/{interaction_id}/tool-calls:
+    get:
+      description: 'List the tool calls recorded for one interaction (RLS-scoped).
+
+
+        Closes RF-10: ``tool_calls`` was written on every model tool
+
+        invocation but reachable through no API surface, so an auditor
+
+        holding a scoped JWT could not ask the system of record how many
+
+        tools a given decision invoked. Cross-store corroboration was
+
+        therefore limited to the two observability stores (Langfuse, Tempo),
+
+        both fed by the same process — they could agree with each other but
+
+        neither could be checked against Postgres.
+
+
+        **Zero versus missing.** A tool the model was refused is recorded at
+
+        dispatch with ``granted_scope=""`` and an ``error``, so an empty list
+
+        here means the model invoked nothing — not that the record was lost.
+
+        That distinction is the whole point of the endpoint.
+
+
+        **Isolation.** ``tool_calls`` carries the same migration-005 RLS
+
+        policy as ``interactions`` (``ENABLE`` + ``FORCE ROW LEVEL SECURITY``,
+
+        ``tenant_isolation_tool_calls`` comparing ``user_id`` to the
+
+        ``app.current_user_id`` GUC). So no service-layer ``WHERE user_id``
+
+        is needed or wanted: RLS is the enforcement boundary, and a caller
+
+        asking for another user''s ``interaction_id`` gets an empty list
+
+        rather than a leak.
+
+
+        A 404 is deliberately NOT raised for an unknown or unreadable
+
+        ``interaction_id``: distinguishing "does not exist" from "exists but
+
+        is not yours" would turn this endpoint into an existence oracle for
+
+        other users'' rows. Both cases return an empty list.'
+      operationId: list_tool_calls_interactions__interaction_id__tool_calls_get
+      parameters:
+      - in: path
+        name: interaction_id
+        required: true
+        schema:
+          title: Interaction Id
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolCallListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - audittrace:audit
+      summary: List Tool Calls
       tags:
       - audit
   /memory/conversational:

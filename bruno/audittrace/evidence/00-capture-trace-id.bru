@@ -26,6 +26,8 @@ script:post-response {
     const rows = res.getBody().interactions;
     if (rows.length && rows[0].trace_id) {
       bru.setEnvVar("traceId", rows[0].trace_id);
+      // interactionId feeds 03-postgres-tool-calls — the system-of-record
+      // leg of the corroboration (#363 / RF-10).
       bru.setEnvVar("interactionId", String(rows[0].id));
       console.log("traceId:", rows[0].trace_id, "interaction id:", rows[0].id);
     } else {

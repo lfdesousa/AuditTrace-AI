@@ -27,6 +27,7 @@ from audittrace.auth import require_user, validate_jwt
 from audittrace.config import get_settings
 from audittrace.db.models import InteractionRecord as InteractionRow
 from audittrace.db.models import SessionRecord as SessionRow
+from audittrace.db.models import ToolCall as ToolCallRow
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.integrity import content_hash as _content_hash
@@ -36,6 +37,7 @@ from audittrace.models import (
     InteractionListResponse,
     InteractionRecord,
     SessionListResponse,
+    ToolCallListResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,102 @@ async def list_interactions(
         "total": total,
         "limit": limit,
         "offset": offset,
+    }
+
+
+def _tool_call_to_dict(row: ToolCallRow) -> dict[str, Any]:
+    """Serialise a ``ToolCall`` row for the audit response.
+
+    ``started_at`` is a real ``DateTime`` here (unlike ``interactions``
+    where ``timestamp`` is stored as text), so it is normalised to
+    ISO-8601 rather than handed over as a bare object.
+    """
+    return {
+        "id": row.id,
+        "interaction_id": row.interaction_id,
+        "user_id": row.user_id,
+        "agent_type": row.agent_type,
+        "tool_name": row.tool_name,
+        "args": row.args,
+        "result_summary": row.result_summary,
+        "error": row.error,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "duration_ms": row.duration_ms,
+        # The audit-relevant field: "" on a refusal, so a reader can tell
+        # a denied call from one that never happened.
+        "granted_scope": row.granted_scope,
+    }
+
+
+@router.get(
+    "/interactions/{interaction_id}/tool-calls",
+    response_model=ToolCallListResponse,
+)
+@log_call(logger=logger)
+async def list_tool_calls(
+    interaction_id: int,
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:audit"]),
+    _user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """List the tool calls recorded for one interaction (RLS-scoped).
+
+    Closes RF-10: ``tool_calls`` was written on every model tool
+    invocation but reachable through no API surface, so an auditor
+    holding a scoped JWT could not ask the system of record how many
+    tools a given decision invoked. Cross-store corroboration was
+    therefore limited to the two observability stores (Langfuse, Tempo),
+    both fed by the same process — they could agree with each other but
+    neither could be checked against Postgres.
+
+    **Zero versus missing.** A tool the model was refused is recorded at
+    dispatch with ``granted_scope=""`` and an ``error``, so an empty list
+    here means the model invoked nothing — not that the record was lost.
+    That distinction is the whole point of the endpoint.
+
+    **Isolation.** ``tool_calls`` carries the same migration-005 RLS
+    policy as ``interactions`` (``ENABLE`` + ``FORCE ROW LEVEL SECURITY``,
+    ``tenant_isolation_tool_calls`` comparing ``user_id`` to the
+    ``app.current_user_id`` GUC). So no service-layer ``WHERE user_id``
+    is needed or wanted: RLS is the enforcement boundary, and a caller
+    asking for another user's ``interaction_id`` gets an empty list
+    rather than a leak.
+
+    A 404 is deliberately NOT raised for an unknown or unreadable
+    ``interaction_id``: distinguishing "does not exist" from "exists but
+    is not yours" would turn this endpoint into an existence oracle for
+    other users' rows. Both cases return an empty list.
+    """
+    try:
+        pg = get_postgres_factory()
+    except Exception as exc:
+        logger.error("Audit endpoint unavailable — PostgresFactory not registered")
+        raise HTTPException(status_code=503, detail="Audit store unavailable") from exc
+
+    session_factory = pg.get_session_factory()
+    async with session_factory() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(ToolCallRow)
+                    .where(ToolCallRow.interaction_id == interaction_id)
+                    .order_by(ToolCallRow.started_at.asc(), ToolCallRow.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Serialise INSIDE the session's context manager. Reading ORM
+        # attributes after the session closes works only while the values
+        # happen to still sit in the instance ``__dict__`` — detached
+        # instances raise as soon as anything expires them. Extracting the
+        # data here makes the session's lifetime cover every use of it
+        # instead of relying on that accident.
+        payload = [_tool_call_to_dict(r) for r in rows]
+
+    return {
+        "interaction_id": interaction_id,
+        "tool_calls": payload,
+        "total": len(payload),
     }
 
 

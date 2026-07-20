@@ -321,6 +321,45 @@ class InteractionListResponse(BaseModel):
     offset: int = 0
 
 
+class ToolCallListItem(BaseModel):
+    """One row in ``GET /interactions/{id}/tool-calls`` (#363 / RF-10).
+
+    Mirrors the ``tool_calls`` columns. ``granted_scope`` is the field
+    that answers "who was allowed to call what" under audit: a REFUSED
+    call is recorded with ``granted_scope=""`` and an ``error``, which is
+    what makes a genuine zero-tool interaction distinguishable from one
+    where the calls went missing.
+    """
+
+    id: str
+    interaction_id: int
+    user_id: str
+    agent_type: str
+    tool_name: str
+    args: str
+    result_summary: str | None = None
+    error: str | None = None
+    started_at: str | None = None
+    duration_ms: int | None = None
+    granted_scope: str
+
+
+class ToolCallListResponse(BaseModel):
+    """Response from ``GET /interactions/{id}/tool-calls``.
+
+    ``total`` is deliberately the count of rows returned for THIS
+    interaction rather than a paginated grand total: the per-interaction
+    fan-out is bounded (one row per tool the model invoked in a single
+    completion), so a caller counting tool calls for cross-store
+    corroboration gets the whole set in one response and never has to
+    reason about whether a zero means "none" or "next page".
+    """
+
+    interaction_id: int
+    tool_calls: list[ToolCallListItem] = Field(default_factory=list)
+    total: int = 0
+
+
 class SessionListItem(BaseModel):
     """One row in GET /sessions. Mirrors the SessionRecord columns
     serialised by ``audit._session_row_to_dict``."""
