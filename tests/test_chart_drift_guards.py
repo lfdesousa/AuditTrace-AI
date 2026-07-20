@@ -882,3 +882,121 @@ class TestKeycloakOpencodeMemoryWriteScopes:
             "Add to both scripts/setup-memory-scopes.sh and the ConfigMap "
             "mirror, so existing-cluster re-runs pick up the new scopes."
         )
+
+
+class TestPostDeployVerifyKeycloakScopeGuard:
+    """Check 11 of ``scripts/post-deploy-verify.sh`` (#370).
+
+    The live Keycloak realm granted ``memory:episodic:write`` as a DEFAULT
+    scope on ``audittrace-opencode`` while every declared source said
+    OPTIONAL. Nothing noticed for months, because ``--import-realm`` runs on
+    FIRST BOOT ONLY: after the realm exists the ConfigMap is inert, so the
+    file-vs-file guards in this module structurally cannot see the drift.
+
+    These tests pin the *properties* of that check, not its output. They
+    cannot prove it detects drift (that needs a cluster — see the PR's
+    Validation section for the live fire-and-clear evidence); they prove it
+    keeps the shape that makes it trustworthy.
+    """
+
+    @staticmethod
+    def _script() -> str:
+        return (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_check_exists(self) -> None:
+        assert "Keycloak client-scope drift" in self._script(), (
+            "post-deploy-verify.sh lost its Keycloak scope-drift check. This "
+            "is the ONLY place declared realm config is compared against the "
+            "live realm; without it #370 recurs silently."
+        )
+
+    def test_admin_password_never_reaches_argv(self) -> None:
+        """The credential goes in on stdin, never as a process argument.
+
+        ``kubectl exec -- env VAR=secret`` publishes the value to the pod's
+        process table, readable from /proc by anything else in that
+        container. Checks 9/10 predate this rule and still use the env form
+        for VAULT_TOKEN; new code must not, and this test stops the pattern
+        being copied forward into the Keycloak check.
+        """
+        script = self._script()
+        offenders = [
+            line.strip()
+            for line in script.splitlines()
+            if "env " in line and "KEYCLOAK_ADMIN_PASSWORD" in line
+        ]
+        assert not offenders, (
+            "Keycloak admin password passed via `env VAR=` — it lands in the "
+            "pod's process table. Pipe it on stdin instead. Sites: "
+            + " | ".join(offenders)
+        )
+
+    def test_skips_rather_than_fails_without_credential(self) -> None:
+        """A missing credential must not turn the gate red.
+
+        Unprivileged post-deploy runs are a supported mode (mirrors checks
+        9/10). If a missing password FAILED, operators would start passing
+        ``|| true`` around the whole gate and lose all eleven checks.
+        """
+        script = self._script()
+        assert 'skip "no Keycloak admin credential' in script, (
+            "The Keycloak check must SKIP (not FAIL) when no admin "
+            "credential is available."
+        )
+
+    def test_expected_state_reads_both_declared_sources(self) -> None:
+        """Expected = realm ConfigMap UNION the ensure-memory-scopes Job.
+
+        The realm JSON is not the whole story: the Job binds its own SCOPES
+        list to clients precisely BECAUSE --import-realm is inert after
+        first boot. Those bindings are intentional and legitimately live
+        while absent from the realm JSON.
+
+        Dropping the Job would make the check fail permanently on a CORRECT
+        cluster (admin-client alone reports three phantom over-privileges),
+        and a guard that cries wolf gets muted. A muted guard is worse than
+        none — #370 got through while a green gate was already running.
+        """
+        script = self._script()
+        assert "-keycloak-realm" in script, "must read the declared realm ConfigMap"
+        assert "-memory-scopes-script" in script, (
+            "must also read the ensure-memory-scopes Job ConfigMap, or the "
+            "check reports phantom over-privileges on admin-client forever"
+        )
+
+    def test_reports_over_privilege_distinctly(self) -> None:
+        """The two drift directions fail differently and must read differently.
+
+        over-privileged  = a scope nobody asked for lands in every token
+                           (the security bug — this is what #370 was)
+        under-privileged = callers that never had to ask now get 403
+                           (the availability bug)
+
+        An operator triaging a red gate needs to know which one they have.
+        """
+        assert "OVER-PRIVILEGED" in self._script(), (
+            "Over-privilege (live default not declared) must be labelled "
+            "distinctly from under-privilege — they are different incidents."
+        )
+
+    def test_header_numbering_is_self_consistent(self) -> None:
+        """Every ``(N/TOTAL)`` header agrees with the real number of checks.
+
+        Adding check 11 meant renumbering ten existing headers. A missed one
+        is invisible in review and quietly tells operators a check is absent.
+        """
+        script = self._script()
+        headers = re.findall(r'header "\((\d+)/(\d+)\)', script)
+        assert headers, "no numbered headers found in post-deploy-verify.sh"
+        total = len(headers)
+        wrong_total = [f"({n}/{d})" for n, d in headers if int(d) != total]
+        assert not wrong_total, (
+            f"{total} numbered checks exist but these headers disagree on the "
+            f"total: {', '.join(wrong_total)}. Renumber all of them."
+        )
+        numbering = [int(n) for n, _ in headers]
+        assert numbering == list(range(1, total + 1)), (
+            f"check numbers are not sequential 1..{total}: {numbering}"
+        )

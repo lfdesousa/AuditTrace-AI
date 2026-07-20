@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/10) Pod readiness"
+header "(1/11) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/10) No crashing pods"
+header "(2/11) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/10) Helm release status"
+header "(3/11) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/10) Memory-server /health"
+header "(4/11) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/10) Memory-server /metrics"
+header "(5/11) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/10) Postgres reachability"
+header "(6/11) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/10) Tempo: recent traces for audittrace-server"
+header "(7/11) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/10) Loki: audittrace ERROR rate"
+header "(8/11) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
-header "(9/10) Vault drift guard (ConfigMap ⊆ Vault)"
+header "(9/11) Vault drift guard (ConfigMap ⊆ Vault)"
 # Catches the 2026-05-03 drift class: chart adds a policy/role to
 # templates/vault/configmap-policies.yaml, operator forgets to re-run
 # `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
@@ -247,7 +247,7 @@ else
 fi
 
 # ── 10. Vault ↔ k8s Redis password alignment (closes 2026-05-04 drift) ─────
-header "(10/10) Vault Redis-password sync"
+header "(10/11) Vault Redis-password sync"
 # v1.0.9 ADR-046 live test surfaced this drift class: Bitnami Redis
 # subchart auto-generates the password into the k8s secret
 # '${RELEASE}-redis' on first install; setup-vault.sh independently
@@ -281,6 +281,161 @@ else
         fail "Redis password drift — k8s '${RELEASE}-redis' != Vault kv/audittrace/redis/main. Run 'make k8s-bootstrap-secrets'"
     fi
 fi
+
+# ── 11. Keycloak realm scope drift (ConfigMap declared == live realm) ──────
+header "(11/11) Keycloak client-scope drift (declared == live)"
+# Catches the 2026-07-20 drift class (#370): the live realm granted
+# `memory:episodic:write` as a DEFAULT scope on audittrace-opencode, while
+# every declared source (both realm JSON files, both provisioning scripts,
+# and their whole git history) said OPTIONAL. Every human identity on the
+# Device Flow client was therefore receiving a WRITE scope in every token
+# without asking for it.
+#
+# Why nothing caught it: Keycloak's `--import-realm` runs on FIRST BOOT
+# ONLY. After the realm exists, the ConfigMap is inert — an edit to
+# realm-audittrace.json changes what a FRESH cluster would get and has no
+# effect on this one. tests/test_chart_drift_guards.py compares file to
+# file and structurally cannot see the live realm. This check is the only
+# place the two can be compared.
+#
+# Expected comes from the DEPLOYED ConfigMap rather than the working
+# tree, so the gate answers "does the cluster match what was shipped to
+# it" and stays correct when run from outside a git checkout.
+#
+# BOTH directions are reported, because they fail differently:
+#   over-privileged  (live default ⊅ declared)  — the security bug. A scope
+#                    nobody asked for lands in every token.
+#   under-privileged (declared default ⊄ live)  — the availability bug.
+#                    Callers that never had to ask now get 403.
+#
+# SKIPped when: the realm ConfigMap is absent (keycloak.enabled=false), no
+# admin credential is available, or the token request fails. A missing
+# credential must not fail the gate — unprivileged post-deploy runs are a
+# supported mode (mirrors checks 9/10).
+REALM_CM="${RELEASE}-keycloak-realm"
+KC_SVC="${KC_SVC:-http://${RELEASE}-keycloak:8080}"
+KC_REALM="${KC_REALM:-audittrace}"
+
+# Credential resolution order: explicit env, then the chart's secret (which
+# only exists when keycloak.auth is not Vault-backed), then give up.
+kc_admin_pw="${KEYCLOAK_ADMIN_PASSWORD:-}"
+if [ -z "$kc_admin_pw" ]; then
+    kc_admin_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get secret \
+        "${RELEASE}-keycloak-secret" -o jsonpath='{.data.admin-password}' \
+        2>/dev/null | base64 -d 2>/dev/null || echo "")
+fi
+
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap "$REALM_CM" \
+        >/dev/null 2>&1; then
+    skip "ConfigMap $REALM_CM not present (keycloak.enabled=false?)"
+elif [ -z "$ms_pod" ]; then
+    skip "no memory-server pod to reach Keycloak from"
+elif [ -z "$kc_admin_pw" ]; then
+    skip "no Keycloak admin credential (set KEYCLOAK_ADMIN_PASSWORD)"
+else
+    # The password goes in on STDIN, never in argv: `kubectl exec -- env
+    # VAR=secret` publishes the value to the pod's process table, where any
+    # other process in that container can read it from /proc. Checks 9/10
+    # predate this and still use the env form; new code should not.
+    kc_curl() {  # kc_curl <curl-args...> — runs inside the memory-server pod
+        kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+            -c memory-server -- curl -s --max-time 15 "$@" 2>/dev/null || true
+    }
+    kc_token=$(printf '%s' "$kc_admin_pw" \
+        | kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec -i "$ms_pod" \
+            -c memory-server -- sh -c "read -r PW; curl -s --max-time 15 \
+              -X POST '${KC_SVC}/realms/master/protocol/openid-connect/token' \
+              -d grant_type=password -d client_id=admin-cli -d username=admin \
+              --data-urlencode \"password=\$PW\"" 2>/dev/null \
+        | jq -r '.access_token // empty' 2>/dev/null || echo "")
+
+    if [ -z "$kc_token" ]; then
+        skip "Keycloak admin auth failed (bad credential, or Keycloak not ready)"
+    else
+        realm_json=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+            "$REALM_CM" -o jsonpath='{.data.realm\.json}' 2>/dev/null || echo "")
+
+        # SECOND declared source. The realm JSON is not the whole story: the
+        # ensure-memory-scopes Job binds its own SCOPES list to specific
+        # clients (CLIENT_KIND decides default vs optional) precisely BECAUSE
+        # --import-realm is inert after first boot. Those bindings are
+        # intentional and are legitimately present live while absent from the
+        # realm JSON.
+        #
+        # Ignoring the Job would make this check fail permanently on a
+        # CORRECT cluster — admin-client alone would report three phantom
+        # over-privileges forever. A guard that cries wolf gets muted, and a
+        # muted guard is worse than none: #370 got through while a green gate
+        # was running. So expected = realm JSON UNION the Job's intent.
+        scopes_cm="${RELEASE}-memory-scopes-script"
+        job_script=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+            "$scopes_cm" -o jsonpath='{.data.*}' 2>/dev/null || echo "")
+        job_scopes=$(echo "$job_script" | sed -n '/SCOPES=(/,/^ *)/p' \
+            | grep -oE '"[^"]+"' | tr -d '"' | sort || echo "")
+        # Only clients the ConfigMap actually declares scope sets for. No
+        # hardcoded client list — a new client in the chart is covered the
+        # day it ships, with no edit here.
+        clients=$(echo "$realm_json" \
+            | jq -r '.clients[]? | select(.defaultClientScopes != null) | .clientId' \
+            2>/dev/null | sort || echo "")
+        scope_drift=""
+        checked=0
+
+        for cid in $clients; do
+            live_uuid=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients?clientId=${cid}" \
+                | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+            [ -z "$live_uuid" ] && continue   # declared but not deployed
+            checked=$((checked + 1))
+
+            for kind in default optional; do
+                declared=$(echo "$realm_json" | jq -r \
+                    --arg c "$cid" --arg k "${kind}ClientScopes" \
+                    '.clients[]|select(.clientId==$c)|.[$k][]?' 2>/dev/null \
+                    | sort || echo "")
+                # Fold in the Job's intent when it targets THIS client with
+                # THIS kind. grep -F -x so a scope name is never treated as
+                # a regex (they contain ':' but a future one may not).
+                if echo "$job_script" \
+                     | grep -qF "CLIENT_KIND[\"${cid}\"]=\"${kind}\"" 2>/dev/null; then
+                    declared=$(printf '%s\n%s\n' "$declared" "$job_scopes" \
+                        | grep -v '^$' | sort -u || echo "")
+                fi
+                live=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                    "${KC_SVC}/admin/realms/${KC_REALM}/clients/${live_uuid}/${kind}-client-scopes" \
+                    | jq -r '.[].name' 2>/dev/null | sort || echo "")
+
+                # comm -13 = in live only (extra); -23 = declared only (missing).
+                extra=$(comm -13 <(echo "$declared") <(echo "$live") | grep -v '^$' || true)
+                missing=$(comm -23 <(echo "$declared") <(echo "$live") | grep -v '^$' || true)
+
+                for s in $extra; do
+                    if [ "$kind" = "default" ]; then
+                        scope_drift="${scope_drift}${cid}: OVER-PRIVILEGED — '$s' is live-default but not declared-default"$'\n'
+                    else
+                        scope_drift="${scope_drift}${cid}: '$s' is live-optional but not declared-optional"$'\n'
+                    fi
+                done
+                for s in $missing; do
+                    scope_drift="${scope_drift}${cid}: '$s' is declared-${kind} but MISSING from live ${kind}"$'\n'
+                done
+            done
+        done
+
+        if [ "$checked" -eq 0 ]; then
+            skip "no declared clients found in $REALM_CM"
+        elif [ -z "$scope_drift" ]; then
+            pass "Keycloak client scopes match $REALM_CM for all $checked client(s)"
+        else
+            fail "Keycloak realm scope drift — live realm != $REALM_CM:"
+            echo "$scope_drift" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            echo "[verify]      NOTE: --import-realm runs on FIRST BOOT ONLY, so" >&2
+            echo "[verify]      editing realm-audittrace.json will NOT fix a running" >&2
+            echo "[verify]      cluster. Correct the live realm via the admin API." >&2
+        fi
+    fi
+fi
+unset kc_admin_pw
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo "[verify]"
