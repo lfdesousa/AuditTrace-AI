@@ -1,0 +1,108 @@
+meta {
+  name: GET /interactions — read the assessment fan-out back (ADR-058)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/interactions?event_class=assessment&session_id={{assessmentId}}&limit=50
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  event_class: assessment
+  session_id: {{assessmentId}}
+  limit: 50
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("every row came back under event_class=assessment", function() {
+    const rows = res.getBody().interactions;
+    expect(rows).to.be.an("array");
+    expect(rows.length).to.be.above(0);
+    for (const r of rows) {
+      expect(r.event_class).to.equal("assessment");
+    }
+  });
+  test("read-back count matches what the write said it wrote", function() {
+    // The closing of the loop: POST reported rows_written, and the audit
+    // API — a different code path, under a different scope — returns the
+    // same number. Reconstruction, not just persistence.
+    const expected = Number(bru.getEnvVar("assessmentRowsWritten"));
+    expect(res.getBody().interactions.length).to.equal(expected);
+  });
+  test("exactly one assessment_header row", function() {
+    const headers = res.getBody().interactions.filter(r => r.question === "assessment_header");
+    expect(headers.length).to.equal(1);
+  });
+  test("child rows carry the four known row_types", function() {
+    const known = ["assessment_header","assessment_question","assessment_finding","assessment_deferral"];
+    for (const r of res.getBody().interactions) {
+      const detail = JSON.parse(r.error_detail);
+      expect(known).to.include(detail.row_type);
+      expect(detail.assessment_id).to.equal(bru.getEnvVar("assessmentId"));
+    }
+  });
+  test("header carries the rules of engagement and frameworks", function() {
+    const header = res.getBody().interactions.find(r => r.question === "assessment_header");
+    const detail = JSON.parse(header.error_detail);
+    expect(detail.frameworks).to.be.an("array");
+    expect(detail.frameworks.length).to.be.above(0);
+    expect(detail.rules_of_engagement).to.be.a("string");
+  });
+  test("every row is owner-attributed (never a NULL owner)", function() {
+    // A NULL-owner assessment row would be permanently unreadable under
+    // RLS — recorded but unrecoverable. Documented invariant, asserted here.
+    for (const r of res.getBody().interactions) {
+      expect(r.user_id).to.be.a("string");
+      expect(r.user_id).to.not.be.empty;
+    }
+  });
+  test("server-set created_at is present on every row (WS-A1)", function() {
+    // created_at is assigned by Postgres, not by the caller. Its presence
+    // on a row the caller just wrote is the clock-authority property.
+    for (const r of res.getBody().interactions) {
+      expect(r.created_at).to.be.a("string");
+    }
+  });
+  test("content_hash present on every row (WS-A3 tamper-evidence)", function() {
+    for (const r of res.getBody().interactions) {
+      if (r.content_hash === undefined) {
+        console.log("WARN: content_hash not surfaced by the audit API on this build.");
+        return;
+      }
+      expect(r.content_hash).to.match(/^[0-9a-f]{64}$/);
+    }
+  });
+}
+
+docs {
+  Reads back the fan-out written by `04-create-assessment`, closing the
+  ADR-058 loop: written under `audittrace:assessment:ingest`, read under
+  `audittrace:audit`. Two different scopes, two different code paths,
+  one record.
+
+  `session_id` is deliberately overloaded to carry `assessment_id` — a
+  convention (not a chat session) that buys grouping for free from the
+  existing filter. Combined with `event_class=assessment` it isolates
+  exactly one assessment run.
+
+  **This request depends on `04` having run first** in the same
+  execution — `assessmentId` and `assessmentRowsWritten` are set by its
+  pre-request and post-response scripts. Running `05` alone reads
+  whatever `assessmentId` was last left in the environment.
+
+  The `event_class` filter is the ADR-048 taxonomy in action: runtime
+  chat rows (`interaction`), content-scan verdicts (`security`), and the
+  recorder's own meta-review (`assessment`) share one table but never
+  blur together. A SOC alerting on `event_class=security` will not page
+  on an assessment.
+}

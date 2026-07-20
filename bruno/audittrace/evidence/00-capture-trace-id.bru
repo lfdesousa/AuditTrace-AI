@@ -1,0 +1,69 @@
+meta {
+  name: Capture trace_id from the audit record (the join key)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/interactions?limit=1
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+query {
+  limit: 1
+}
+
+script:post-response {
+  // The whole three-store corroboration hangs off this one value.
+  // Migration 008 added `trace_id` to the interactions row precisely so
+  // a reader of the audit API can pivot to Tempo/Langfuse in one query.
+  if (res.getStatus() === 200) {
+    const rows = res.getBody().interactions;
+    if (rows.length && rows[0].trace_id) {
+      bru.setEnvVar("traceId", rows[0].trace_id);
+      bru.setEnvVar("interactionId", String(rows[0].id));
+      console.log("traceId:", rows[0].trace_id, "interaction id:", rows[0].id);
+    } else {
+      console.log("WARN: newest interaction has no trace_id — the probes downstream will not run.");
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("at least one interaction exists to corroborate", function() {
+    expect(res.getBody().interactions.length).to.be.above(0);
+  });
+  test("the row carries a 32-char hex trace_id", function() {
+    // Not cosmetic: this is the OTel trace-id format, and the fact that
+    // Langfuse and Tempo both key on this SAME value is what makes
+    // cross-store corroboration possible at all (verified 2026-07-20).
+    const t = res.getBody().interactions[0].trace_id;
+    expect(t).to.be.a("string");
+    expect(t).to.match(/^[0-9a-f]{32}$/);
+  });
+}
+
+docs {
+  **Step 1 of the evidence chain.** Takes the newest audit row and
+  extracts its `trace_id` into the environment so the Langfuse and Tempo
+  probes downstream can query the SAME trace.
+
+  Run `chat/02-chat-completions` first if you want the corroboration to
+  cover a real model call with tool invocations. Run this straight away
+  and you corroborate whatever the newest row happens to be — still a
+  valid mechanism check, but a thinner one.
+
+  **Why the front door for this leg.** The trace_id comes back through
+  the authenticated audit API under a scoped JWT, not from a database
+  query. That matters: it means an auditor holding only an
+  `audittrace:audit` token can start the reconstruction, with no
+  privileged access to any store.
+}
