@@ -103,21 +103,16 @@ docs {
   expected. Say all of this plainly; it is the honest boundary of the
   technique.
 
-  **The missing third leg — a real gap, recorded here.** The intended
-  design corroborates THREE stores: Postgres `tool_calls`, Langfuse
-  observations, Tempo spans. But as of 2026-07-20 the `tool_calls` table
-  is exposed through no API endpoint — `_row_to_dict` in
-  `routes/audit.py` returns no tool-call data, and there is no
-  `/tool-calls` route in the OpenAPI document. So the Postgres leg
-  cannot be reached through the front door, and this request corroborates
-  two stores, not three.
+  **The third leg — closed 2026-07-20 (#363 / RF-10).** The Postgres leg
+  now exists: `GET /interactions/{id}/tool-calls` serves the system of
+  record under `audittrace:audit`. See `03-postgres-tool-calls`, which
+  runs after this request and compares the tool calls Postgres holds
+  against what the observability stores saw.
 
-  That gap bears directly on the "zero versus missing" question: an
-  auditor holding a scoped JWT cannot today ask the system of record how
-  many tool calls a given interaction made. Closing it means an additive,
-  scope-gated read surface over `tool_calls`. Until then, this pair of
-  requests is the strongest corroboration available through the API, and
-  the shortfall belongs in any write-up rather than in a footnote.
+  This request remains the Langfuse↔Tempo half of that picture: it
+  corroborates the two stores fed by the same emission path, while `03`
+  supplies the independent leg that neither of them can provide about
+  itself.
 
   **Retention caveat:** Tempo's retention window bounds how long
   corroboration stays possible. A trace that has aged out returns 404
