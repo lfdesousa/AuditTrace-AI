@@ -5267,3 +5267,133 @@ class TestPdfUploadRequiresScanPipeline:
             files={"file": ("note.md", b"# plain markdown\n", "text/markdown")},
         )
         assert r.status_code != 503
+
+
+# ── Semantic manifest/ChromaDB merge (#366) ────────────────────────────────
+# `_merge_semantic_with_chroma` reconciles two sources of truth: the manifest
+# (tracked rows) and ChromaDB (what is actually indexed). Its dedup decides
+# whether an auditor listing the semantic layer sees each document once, or
+# sees phantom duplicates. Neither the dedup hit nor the collection-filter
+# arm was covered.
+
+
+class TestMergeSemanticWithChroma:
+    class _Col:
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def get(self, **_kw):
+            return self._payload
+
+    class _Chroma:
+        def __init__(self, payload, names=("audittrace_v2",)):
+            self._payload = payload
+            self._names = names
+            self.opened: list[str] = []
+
+        async def list_collections(self):
+            return [type("C", (), {"name": n})() for n in self._names]
+
+        async def get_or_create_collection(self, name, embedding_function=None):
+            self.opened.append(name)
+            return TestMergeSemanticWithChroma._Col(self._payload)
+
+    @staticmethod
+    def _entry(key: str):
+        """A tracked manifest row for `key`."""
+        from audittrace.services.memory_manifest import ManifestEntry
+
+        return ManifestEntry(
+            id="mi-1",
+            layer="semantic",
+            key=key,
+            title=key,
+            size_bytes=1,
+            created_at_ms=1,
+            modified_at_ms=1,
+            created_by_user_id="u",
+            modified_by_user_id="u",
+            deleted_at_ms=None,
+            deleted_by_user_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_document_already_tracked_is_not_listed_twice(
+        self, monkeypatch
+    ) -> None:
+        """A doc present in BOTH manifest and ChromaDB must appear once.
+
+        Without the `key in known_keys` guard the same document is emitted
+        twice — once as a tracked row and once as a discovered one — and an
+        auditor counting the semantic layer gets an inflated number that no
+        query can reconcile.
+        """
+        from audittrace.routes import memory as m
+
+        tracked = self._entry("audittrace_v2/doc-1")
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return [tracked]
+
+        chroma = self._Chroma(
+            {"ids": ["doc-1"], "documents": ["body"], "metadatas": [{}]}
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        items = await m._merge_semantic_with_chroma([tracked], collection=None)
+        keys = [i["key"] for i in items]
+        assert keys.count("audittrace_v2/doc-1") == 1, f"duplicated: {keys}"
+
+    @pytest.mark.asyncio
+    async def test_untracked_document_is_discovered(self, monkeypatch) -> None:
+        """The complementary arm: indexed-but-untracked must still surface.
+
+        These are documents in ChromaDB with no manifest row. Dropping them
+        would hide real indexed content from the audit listing.
+        """
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return []
+
+        chroma = self._Chroma(
+            {"ids": ["ghost"], "documents": ["body"], "metadatas": [{"title": "T"}]}
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        items = await m._merge_semantic_with_chroma([], collection=None)
+        assert [i["key"] for i in items] == ["audittrace_v2/ghost"]
+        assert items[0]["title"] == "T"
+        assert items[0]["id"] is None, "discovered rows carry no manifest id"
+
+    @pytest.mark.asyncio
+    async def test_named_collection_skips_discovery_listing(self, monkeypatch) -> None:
+        """?collection= must target ONE physical collection, not scan all.
+
+        The unfiltered path caps at 5 collections; if the filter fell through
+        to it, asking for a specific collection could silently return results
+        from others — or miss it entirely past the cap. Also pins the ADR-047
+        logical -> physical `_v2` resolution.
+        """
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return []
+
+        chroma = self._Chroma(
+            {"ids": [], "documents": [], "metadatas": []},
+            names=("should_not_be_listed_v2",),
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        await m._merge_semantic_with_chroma([], collection="audittrace")
+        assert chroma.opened == ["audittrace_v2"], (
+            "named collection must resolve to its _v2 form and be the only "
+            f"one opened; opened={chroma.opened}"
+        )
