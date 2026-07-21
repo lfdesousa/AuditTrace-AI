@@ -1094,3 +1094,89 @@ class TestRestrictedClientStaysRestricted:
         )
         for scope in ("audittrace:query", "audittrace:context"):
             assert scope in chart_raw
+
+
+class TestPostDeployVerifyShadowClientCheck:
+    """Check 11 must also walk LIVE -> DECLARED, not only DECLARED -> LIVE (#371).
+
+    The original check enumerated the clients in the realm ConfigMap and
+    compared each against the live realm. A client existing live but declared
+    nowhere was therefore never enumerated, never compared, and never
+    reported. Demonstrated on 2026-07-20: ``audittrace-restricted`` was created
+    via the admin API and the gate passed it in silence — not "checked and
+    clean", *not checked*.
+
+    That gap matters more than the comparison it complements. The drift the
+    check was built for (#370) was someone CHANGING a scope on an existing
+    client; the strictly worse move is CREATING a client with
+    ``audittrace:admin`` as a default scope, which a declared-only walk cannot
+    see — and which disturbs nothing already being watched.
+
+    These tests pin the shape. Live fire-and-clear evidence (two planted
+    clients, one privileged) is in the PR body; a cluster is needed for that
+    and pytest has none.
+    """
+
+    @staticmethod
+    def _script() -> str:
+        return (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_enumerates_live_clients(self) -> None:
+        script = self._script()
+        assert "live_clients=" in script, (
+            "check 11 no longer enumerates LIVE clients — it is back to "
+            "declared->live only, and a shadow client is invisible again (#371)."
+        )
+        assert (
+            '/clients"' in script
+            or "/clients'" in script
+            or "${KC_REALM}/clients" in script
+        ), "expected an unfiltered GET on /clients to list every live client"
+
+    def test_builtin_allowlist_is_exact_names_not_a_prefix(self) -> None:
+        """A prefix rule would exempt exactly the clients worth watching.
+
+        ``audittrace-*`` as an allowlist pattern would silently whitelist a
+        hostile ``audittrace-backdoor``. The allowlist must therefore be exact
+        names, and must not contain our own prefix.
+        """
+        script = self._script()
+        assert "KC_BUILTIN_CLIENTS" in script, "built-in allowlist missing"
+        start = script.index("KC_BUILTIN_CLIENTS")
+        block = script[start : start + 400]
+        for builtin in (
+            "account",
+            "admin-cli",
+            "broker",
+            "realm-management",
+            "security-admin-console",
+        ):
+            assert builtin in block, f"{builtin} missing from the allowlist"
+        assert "audittrace-*" not in block and "audittrace*" not in block, (
+            "the allowlist uses a wildcard over our own client prefix — that "
+            "exempts precisely the clients most worth watching. Exact names only."
+        )
+
+    def test_privileged_shadow_client_is_ranked_distinctly(self) -> None:
+        """An undeclared client holding admin/audit is a different incident.
+
+        An operator triaging a red gate needs to see which shadow client is
+        dangerous, not scan a flat list.
+        """
+        script = self._script()
+        assert "UNDECLARED and holds a privileged default scope" in script, (
+            "undeclared clients holding audittrace:admin or audittrace:audit "
+            "must be reported distinctly from harmless ones."
+        )
+
+    def test_shadow_clients_fail_the_gate_rather_than_warn(self) -> None:
+        """Silence and warnings both get ignored; only FAIL changes behaviour."""
+        script = self._script()
+        idx = script.index("UNDECLARED client(s)")
+        window = script[max(0, idx - 200) : idx + 100]
+        assert "fail " in window, (
+            "undeclared clients must call fail(), not pass() or skip() — a "
+            "warning that does not redden the gate is a warning nobody reads."
+        )

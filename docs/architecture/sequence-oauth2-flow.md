@@ -373,10 +373,28 @@ truth: `keycloak/realm-audittrace.json`):
 | Client | Flow | Default scopes |
 |---|---|---|
 | `audittrace-opencode` (ADR-032, humans) | Device Flow | `audittrace:query`, `:context`, `:audit`, all four `memory:*` |
-| `audittrace-dev` (CI / smoke) | client_credentials | identical to `audittrace-opencode` — so the dev path exercises the full scope surface |
+| `audittrace-dev` (dev tooling, `mint-dev-jwt.sh`) | client_credentials | READ-ONLY: `audittrace:query`, `:context`, `:audit`, `:index`, plus `memory:{episodic,procedural,semantic}:read` and `memory:conversational:read-own`. **No write scope and no `audittrace:admin`.** |
+| `audittrace-restricted` (adversarial verification, SC-09) | Device Flow | `audittrace:query`, `:context`, `memory:conversational:read-own`. Holds **no audit or admin scope in either scope set** — deliberately, so its token cannot be widened by asking. |
 | `opencode-agent`, `continue-agent`, `roocode-agent` | client-JWT client_credentials | `audittrace:query` only (legacy, pre-ADR-032) |
 | `inject-memory` | client-JWT | `audittrace:context`, `:index` |
-| `admin-client` | client-JWT | `audittrace:admin`, `:audit` |
+
+> **Corrected 2026-07-21.** This table previously said `audittrace-dev` was
+> *"identical to `audittrace-opencode`"*. It was not, in the direction that
+> mattered: `audittrace-dev` held `audittrace:admin` as a **default** scope
+> while `audittrace-opencode` holds it as *optional*. Because
+> `scripts/mint-dev-jwt.sh` sends no `scope` parameter, every dev token
+> silently carried admin. Corrected on the live realm (#370) and the claim
+> rewritten here.
+>
+> Two lessons this table should carry rather than repeat:
+> **(1)** Keycloak's `--import-realm` runs on **first boot only**, so
+> `realm-audittrace.json` describes what a *fresh* realm receives, never what a
+> running one has. Check the live realm, or check `post-deploy-verify.sh`
+> check 11, which now compares the two.
+> **(2)** A client is defined by its scope sets, not by a prose comparison to
+> another client. "Identical to X" ages badly and cannot be verified; list the
+> scopes.
+| `admin-client` | client-JWT | `audittrace:admin`, `:audit`, plus `memory:{episodic,procedural,semantic}:{read,write}`. The `ensure-memory-scopes` Job additionally binds `audittrace:assessment:ingest`, `memory:decisions:write` and `memory:skills:write` as defaults. |
 
 `is_admin` in the resolved `UserContext` is derived programmatically
 via `is_admin_scope()` — true when the `audittrace:admin` scope is
