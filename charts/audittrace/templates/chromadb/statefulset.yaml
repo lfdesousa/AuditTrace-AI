@@ -73,7 +73,28 @@ spec:
             {{- toYaml .Values.chromadb.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /chroma/chroma
+              # MUST match the `persist_path` in the image's /config.yaml.
+              #
+              # ChromaDB 0.x persisted to /chroma/chroma; 1.x persists to
+              # /data. The mount was written for 0.x and never updated when
+              # the image moved to 1.x, so from that upgrade until 2026-07-21
+              # ChromaDB wrote its entire database to the container's
+              # EPHEMERAL overlay filesystem while a 10Gi PVC sat empty at
+              # /chroma/chroma. Every pod restart silently wiped the semantic
+              # memory layer — 160 restarts by the time it was found.
+              #
+              # Nothing surfaced it: the pod was Ready, both probes hit
+              # /api/v2/heartbeat which does not touch persistence, and an
+              # empty store answers queries perfectly well with zero results.
+              # Recall simply returned nothing, forever, and the model read
+              # that as "the document does not exist" (#374).
+              #
+              # Do NOT change this path without changing persist_path too.
+              # tests/test_chart_drift_guards.py pins the pair, and
+              # post-deploy-verify.sh check 12 asserts at RUNTIME that the
+              # persist path is on the PVC rather than the overlay — the
+              # only check that would have caught this.
+              mountPath: {{ .Values.chromadb.persistPath | default "/data" | quote }}
   volumeClaimTemplates:
     - metadata:
         name: data

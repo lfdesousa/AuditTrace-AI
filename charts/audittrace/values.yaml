@@ -659,6 +659,16 @@ keycloak:
 
 chromadb:
   enabled: true
+  # Where ChromaDB persists its database INSIDE the container. This must
+  # equal the `persist_path` in the image's /config.yaml, and it is the path
+  # the PVC is mounted at.
+  #
+  # ChromaDB 0.x used /chroma/chroma; 1.x uses /data. A mismatch does not
+  # fail loudly — Chroma happily writes to the container's ephemeral layer
+  # and loses everything on restart (found 2026-07-21 after 160 silent
+  # wipes). Verify against the image before bumping the tag:
+  #     kubectl exec <chromadb-pod> -- cat /config.yaml
+  persistPath: /data
   image:
     repository: chromadb/chroma
     tag: "1.5.7"

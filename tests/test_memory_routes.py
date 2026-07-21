@@ -987,7 +987,7 @@ class TestPdfProvenance:
     Asserts that every PDF chunk carries the full provenance set:
     bbox_x0/y0/x1/y1, text_source, extraction_confidence,
     document_hash (sha256 of raw bytes), signature_status (placeholder
-    until #12 lands), ingested_by_user_id, ingestion_ts_ms.
+    until #12 lands), user_id, ingestion_ts_ms.
 
     Static defaults for text_source / confidence / signature_status
     are pinned here so future commits in the tier-A series surface
@@ -1106,8 +1106,14 @@ class TestPdfProvenance:
         # Item #21 — ingestion identity. user_id comes from
         # require_user (sentinel "audittrace-admin" in bypass mode);
         # ingestion_ts_ms is the wall clock at request entry.
-        assert isinstance(meta["ingested_by_user_id"], str)
-        assert meta["ingested_by_user_id"]  # non-empty
+        # `user_id` is the ONE ownership key across every Chroma writer.
+        # It was `ingested_by_user_id` until 2026-07-21, which no reader ever
+        # filtered on — ChromaSemanticService.search filters non-admin callers
+        # on `user_id`, so these chunks were invisible to everyone but admins
+        # (#372 / #374). If a distinct "who ingested this" field is ever
+        # needed, ADD one; do not rename this back.
+        assert isinstance(meta["user_id"], str)
+        assert meta["user_id"]  # non-empty
         assert isinstance(meta["ingestion_ts_ms"], int)
         assert meta["ingestion_ts_ms"] > 1_700_000_000_000  # post-2023
 

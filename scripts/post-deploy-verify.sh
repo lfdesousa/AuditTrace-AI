@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/11) Pod readiness"
+header "(1/13) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/11) No crashing pods"
+header "(2/13) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/11) Helm release status"
+header "(3/13) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/11) Memory-server /health"
+header "(4/13) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/11) Memory-server /metrics"
+header "(5/13) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/11) Postgres reachability"
+header "(6/13) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/11) Tempo: recent traces for audittrace-server"
+header "(7/13) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/11) Loki: audittrace ERROR rate"
+header "(8/13) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
-header "(9/11) Vault drift guard (ConfigMap ⊆ Vault)"
+header "(9/13) Vault drift guard (ConfigMap ⊆ Vault)"
 # Catches the 2026-05-03 drift class: chart adds a policy/role to
 # templates/vault/configmap-policies.yaml, operator forgets to re-run
 # `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
@@ -247,7 +247,7 @@ else
 fi
 
 # ── 10. Vault ↔ k8s Redis password alignment (closes 2026-05-04 drift) ─────
-header "(10/11) Vault Redis-password sync"
+header "(10/13) Vault Redis-password sync"
 # v1.0.9 ADR-046 live test surfaced this drift class: Bitnami Redis
 # subchart auto-generates the password into the k8s secret
 # '${RELEASE}-redis' on first install; setup-vault.sh independently
@@ -283,7 +283,7 @@ else
 fi
 
 # ── 11. Keycloak realm scope drift (ConfigMap declared == live realm) ──────
-header "(11/11) Keycloak client-scope drift (declared == live)"
+header "(11/13) Keycloak client-scope drift (declared == live)"
 # Catches the 2026-07-20 drift class (#370): the live realm granted
 # `memory:episodic:write` as a DEFAULT scope on audittrace-opencode, while
 # every declared source (both realm JSON files, both provisioning scripts,
@@ -495,6 +495,146 @@ security-admin-console"
     fi
 fi
 unset kc_admin_pw
+
+# ── 12. ChromaDB persists to the PVC, not to the container overlay ─────────
+header "(12/13) ChromaDB persistence is durable"
+# Catches the 2026-07-21 class (#372), which nothing else could see:
+# ChromaDB's /config.yaml said `persist_path: /data` while the chart mounted
+# the PVC at /chroma/chroma (the 0.x convention, never updated when the image
+# moved to 1.x). Chroma wrote its whole database to the container's EPHEMERAL
+# overlay and lost it on every restart — 160 restarts before anyone noticed.
+#
+# Why every other signal stayed green:
+#   - the pod was Ready; both probes hit /api/v2/heartbeat, which does not
+#     touch persistence
+#   - an EMPTY store answers queries correctly, with zero results
+#   - so recall silently returned nothing forever, and the model read that as
+#     "the document does not exist" (#374)
+#
+# This check compares the DEVICE ID of the persist path against the device ID
+# of `/`. Same device means the persist path is on the overlay and every
+# restart is a data loss. It reads persist_path from the image's own
+# /config.yaml rather than assuming, so an image that moves the path again is
+# caught rather than trusted.
+CHROMA_POD="${CHROMA_POD:-${RELEASE}-chromadb-0}"
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod "$CHROMA_POD" \
+        >/dev/null 2>&1; then
+    skip "$CHROMA_POD not present (chromadb.enabled=false?)"
+else
+    chroma_persist=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+        -c chromadb -- sh -c \
+        "sed -n 's/^persist_path:[[:space:]]*//p' /config.yaml | tr -d '\"'" \
+        2>/dev/null | tr -d '\r' | head -1 || echo "")
+    if [ -z "$chroma_persist" ]; then
+        skip "could not read persist_path from /config.yaml in $CHROMA_POD"
+    else
+        dev_persist=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+            -c chromadb -- stat -c '%d' "$chroma_persist" 2>/dev/null | tr -d '\r' || echo "")
+        dev_root=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$CHROMA_POD" \
+            -c chromadb -- stat -c '%d' / 2>/dev/null | tr -d '\r' || echo "")
+        if [ -z "$dev_persist" ] || [ -z "$dev_root" ]; then
+            skip "could not stat '$chroma_persist' inside $CHROMA_POD"
+        elif [ "$dev_persist" = "$dev_root" ]; then
+            fail "ChromaDB persist_path '$chroma_persist' is on the CONTAINER OVERLAY — every restart wipes the semantic layer"
+            echo "[verify]      persist_path device = / device = $dev_root" >&2
+            echo "[verify]      The PVC is mounted somewhere else. Set" >&2
+            echo "[verify]      chromadb.persistPath to match the image's" >&2
+            echo "[verify]      /config.yaml persist_path (0.x used" >&2
+            echo "[verify]      /chroma/chroma, 1.x uses /data)." >&2
+        else
+            pass "ChromaDB persists to a real volume ('$chroma_persist', device $dev_persist != / device $dev_root)"
+        fi
+    fi
+fi
+
+# ── 13. Memory layers hold REAL DATA (not merely reachable) ────────────────
+header "(13/13) Memory layers hold real data"
+# Added 2026-07-21 after #372. Every E2E assertion we had was satisfiable by
+# an EMPTY semantic layer, so ChromaDB ran empty through 160 pod restarts and
+# nothing went red:
+#   - chat returned 200 with finish_reason=stop        -> passes when empty
+#   - prompt_tokens was large, read as "augmentation"  -> that was EPISODIC,
+#                                                         not the vector layer
+#   - tool_calls recorded recall_semantic              -> recorded even when
+#                                                         it returns nothing
+#   - Bruno evidence 17/17 corroborated tool-call COUNTS, never CONTENT
+# An empty store answers every query correctly, with zero results. So recall
+# silently returned nothing forever and the model read that as "the document
+# does not exist" (#374).
+#
+# The rule this encodes: a layer is not "working" because it responds. It is
+# working when it returns REAL DATA. Assert non-zero, per layer, and fail
+# loudly on zero rather than skipping the empty ones the way
+# ChromaSemanticService.search does (`if count == 0: continue`).
+#
+# Front door only, scoped JWT — same discipline as the rest of the evidence
+# work. SKIPs when no token is supplied so unprivileged runs still work; a
+# SKIP is NOT a pass and is reported as its own state.
+if [ -z "${AUDITTRACE_TOKEN:-}" ]; then
+    skip "AUDITTRACE_TOKEN unset — layer-content check needs a scoped JWT"
+else
+    BASE_URL="${AUDITTRACE_BASE_URL:-https://audittrace.local:30952}"
+    layer_report=""
+    layers_ok=0
+    for layer in episodic procedural; do
+        # Capture the HTTP STATUS separately from the body. Parsing alone is
+        # not enough: a 401 returns a JSON error object with no `.items`, so
+        # `jq '(.items // []) | length'` yields 0 and an AUTH FAILURE reads as
+        # an EMPTY LAYER. That is the same "absence of evidence" trap this
+        # check exists to catch, and the first version of this check fell into
+        # it — caught 2026-07-21 by running it with a deliberately invalid
+        # token instead of assuming.
+        body_file="$(mktemp)"
+        code=$(curl -sk --max-time 20 -o "$body_file" -w '%{http_code}' \
+                 "${BASE_URL}/memory/${layer}?limit=500" \
+                 -H "Authorization: Bearer ${AUDITTRACE_TOKEN}" 2>/dev/null || echo "000")
+        n=$(jq -r '(.items // []) | length' < "$body_file" 2>/dev/null || echo "")
+        rm -f "$body_file"
+        if [ "$code" != "200" ]; then
+            layer_report="${layer_report}${layer}: UNREADABLE (HTTP ${code} — auth or transport failure, NOT the same as empty)"$'\n'
+        elif [ -z "$n" ]; then
+            layer_report="${layer_report}${layer}: UNPARSEABLE response (HTTP 200 but no items field)"$'\n'
+        elif [ "$n" -eq 0 ]; then
+            layer_report="${layer_report}${layer}: EMPTY — 0 items"$'\n'
+        else
+            layers_ok=$((layers_ok + 1))
+        fi
+    done
+
+    # The vector layer is checked separately: it has its own store, and it is
+    # the one that silently emptied. Count documents across every collection.
+    chroma_docs=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+        -c memory-server -- sh -c '
+          . /vault/secrets/env 2>/dev/null
+          python - <<PY 2>/dev/null
+import os, chromadb
+tok=os.environ.get("AUDITTRACE_CHROMA_TOKEN")
+u=os.environ.get("AUDITTRACE_CHROMA_URL","http://audittrace-chromadb:8000").split("://",1)[-1]
+h,_,p=u.partition(":")
+kw={"host":h,"port":int(p or 8000)}
+if tok: kw["headers"]={"X-Chroma-Token":tok}
+c=chromadb.HttpClient(**kw)
+print(sum(c.get_collection(getattr(x,"name",x)).count() for x in c.list_collections()))
+PY' 2>/dev/null | tr -d '\r' | tail -1 || echo "")
+
+    if [ -z "$chroma_docs" ]; then
+        layer_report="${layer_report}semantic/chroma: UNREADABLE (could not query — NOT the same as empty)"$'\n'
+    elif [ "$chroma_docs" -eq 0 ]; then
+        layer_report="${layer_report}semantic/chroma: EMPTY — 0 documents across all collections"$'\n'
+    else
+        layers_ok=$((layers_ok + 1))
+    fi
+
+    if [ -z "$layer_report" ]; then
+        pass "all $layers_ok memory layer(s) hold real data (episodic, procedural, semantic)"
+    else
+        fail "memory layer(s) not holding real data — recall will silently return nothing:"
+        echo "$layer_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+        echo "[verify]      An empty layer answers queries correctly with zero" >&2
+        echo "[verify]      results, so nothing else goes red. Re-index the" >&2
+        echo "[verify]      corpus; see #372 / #374." >&2
+    fi
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo "[verify]"
