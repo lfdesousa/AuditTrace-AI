@@ -1180,3 +1180,121 @@ class TestPostDeployVerifyShadowClientCheck:
             "undeclared clients must call fail(), not pass() or skip() — a "
             "warning that does not redden the gate is a warning nobody reads."
         )
+
+
+class TestChromaDBPersistPathMatchesMount:
+    """The PVC must be mounted where ChromaDB actually persists (#372).
+
+    ChromaDB 0.x persisted to ``/chroma/chroma``; 1.x persists to ``/data``.
+    The chart's mountPath was written for 0.x and never updated when the image
+    moved to 1.x, so ChromaDB wrote its entire database to the container's
+    EPHEMERAL overlay while a 10Gi PVC sat empty. Every pod restart wiped the
+    semantic memory layer — 160 restarts before it was found on 2026-07-21.
+
+    Nothing surfaced it. The pod was Ready, both probes hit
+    ``/api/v2/heartbeat`` which does not touch persistence, and an empty store
+    answers every query correctly with zero results. Recall silently returned
+    nothing forever, and the model read that as "the document does not exist"
+    (#374).
+
+    These tests pin the chart side. The runtime side — that the persist path
+    is on a real volume rather than the overlay — is
+    ``post-deploy-verify.sh`` check 12, which is the only check that would
+    have caught this.
+    """
+
+    @staticmethod
+    def _sts() -> str:
+        return (
+            REPO_ROOT
+            / "charts"
+            / "audittrace"
+            / "templates"
+            / "chromadb"
+            / "statefulset.yaml"
+        ).read_text(encoding="utf-8")
+
+    def test_mount_path_is_driven_by_persist_path_value(self) -> None:
+        """The mount must not be a hardcoded literal that can drift again."""
+        sts = self._sts()
+        assert "chromadb.persistPath" in sts, (
+            "chromadb statefulset no longer derives mountPath from "
+            ".Values.chromadb.persistPath — a hardcoded mountPath is exactly "
+            "how #372 happened (0.x path left behind after a 1.x image bump)."
+        )
+        assert "/chroma/chroma" not in sts.split("persistPath")[-1][:200], (
+            "the ChromaDB 0.x path /chroma/chroma reappeared as the mount; "
+            "1.x persists to /data"
+        )
+
+    def test_default_persist_path_matches_chromadb_1x(self) -> None:
+        values = (REPO_ROOT / "charts" / "audittrace" / "values.yaml").read_text(
+            encoding="utf-8"
+        )
+        assert re.search(r"^\s*persistPath:\s*/data\s*$", values, re.M), (
+            "chromadb.persistPath must default to /data for ChromaDB 1.x. "
+            "If the image is downgraded to 0.x this becomes /chroma/chroma — "
+            "and the value must be changed deliberately, never left to drift."
+        )
+
+    def test_runtime_guard_exists(self) -> None:
+        """A chart-side test cannot see a container's real filesystem.
+
+        Only the runtime check can prove the persist path is on the PVC, so it
+        must not be dropped in favour of these cheaper tests.
+        """
+        script = (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+        assert "ChromaDB persistence is durable" in script, (
+            "the runtime persistence check is gone — chart tests alone cannot "
+            "detect a mount landing on the container overlay."
+        )
+        assert "CONTAINER OVERLAY" in script, (
+            "the runtime check must compare the persist path's device against "
+            "/ and fail when they match"
+        )
+
+
+class TestMemoryLayerContentCheck:
+    """E2E must prove layers hold REAL DATA, not merely that they respond (#372).
+
+    Every assertion we had was satisfiable by an empty semantic layer: chat
+    returned 200, prompt_tokens looked large (that was the EPISODIC layer),
+    tool_calls recorded ``recall_semantic`` even when it returned nothing, and
+    the Bruno evidence chain corroborated tool-call COUNTS rather than content.
+    So an empty store passed every gate for months.
+    """
+
+    @staticmethod
+    def _script() -> str:
+        return (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_layer_content_check_exists(self) -> None:
+        assert "Memory layers hold real data" in self._script(), (
+            "the layer-content check is gone — without it an empty memory "
+            "layer passes every other assertion in the gate."
+        )
+
+    def test_distinguishes_unreadable_from_empty(self) -> None:
+        """A 401 must not read as "empty".
+
+        The first version of this check parsed ``.items`` length without
+        looking at the HTTP status. A 401 returns a JSON error body with no
+        ``items``, so jq yielded 0 and an AUTH FAILURE was reported as an
+        EMPTY LAYER — the same absence-of-evidence trap the check exists to
+        catch. Caught 2026-07-21 by running it against a failing auth path.
+        """
+        script = self._script()
+        assert "UNREADABLE (HTTP" in script, (
+            "the layer check must report a non-200 as UNREADABLE with its "
+            "status code, never as EMPTY — an auth failure and an empty layer "
+            "are different incidents with different fixes."
+        )
+        assert "%{http_code}" in script, (
+            "the check must capture the HTTP status separately from the body; "
+            "parsing alone cannot distinguish 401-with-error-body from an "
+            "empty result set."
+        )
