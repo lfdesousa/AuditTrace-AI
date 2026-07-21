@@ -1298,3 +1298,65 @@ class TestMemoryLayerContentCheck:
             "parsing alone cannot distinguish 401-with-error-body from an "
             "empty result set."
         )
+
+
+class TestSingleOwnershipKeyInVectorMetadata:
+    """Every Chroma writer must tag chunks with ``user_id`` (#372 / #374).
+
+    ``ChromaSemanticService.search`` filters non-admin callers on
+    ``where={"user_id": ...}``. Until 2026-07-21 no writer set that key:
+    the markdown path set no ownership key at all, and the PDF pipeline set
+    ``ingested_by_user_id``. So the filter matched nothing and EVERY
+    non-admin recall returned zero results for EVERY collection.
+
+    It failed silently by construction. An empty result set is
+    indistinguishable from "no relevant documents", so recall simply returned
+    nothing and the model reported that documents did not exist (#374).
+    Nothing in the stack could tell the difference.
+
+    One key. If a writer needs to record who ingested something as distinct
+    from who owns it, add a SEPARATE field — do not rename this one.
+    """
+
+    WRITERS = (
+        "src/audittrace/routes/memory.py",
+        "src/audittrace/routes/memory_pdf/pipeline.py",
+    )
+
+    def test_no_writer_uses_a_second_ownership_key(self) -> None:
+        offenders: list[str] = []
+        for rel in self.WRITERS:
+            for i, line in enumerate(
+                (REPO_ROOT / rel).read_text(encoding="utf-8").splitlines(), 1
+            ):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue  # historical notes may name the old key
+                if '"ingested_by_user_id"' in stripped:
+                    offenders.append(f"{rel}:{i}")
+        assert not offenders, (
+            "a second ownership key is back in Chroma metadata: "
+            f"{offenders}. ChromaSemanticService.search filters on `user_id` "
+            "and nothing else, so chunks tagged with another key are "
+            "invisible to every non-admin caller — silently, because an empty "
+            "result set looks like 'nothing found'."
+        )
+
+    def test_both_writers_set_user_id(self) -> None:
+        for rel in self.WRITERS:
+            body = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            assert '"user_id": user_id' in body or '"user_id": user.user_id' in body, (
+                f"{rel} builds Chroma metadata without a `user_id` key. "
+                "Non-admin recall will return nothing from anything it writes."
+            )
+
+    def test_search_filter_key_matches_the_writers(self) -> None:
+        """Pin reader and writer together so they cannot drift apart again."""
+        svc = (REPO_ROOT / "src" / "audittrace" / "services" / "semantic.py").read_text(
+            encoding="utf-8"
+        )
+        assert 'where = {"user_id": user_context.user_id}' in svc, (
+            "the search filter key changed. It must stay `user_id`, or every "
+            "writer must change with it in the same commit — a reader/writer "
+            "mismatch here produces zero results with no error anywhere."
+        )

@@ -90,7 +90,8 @@ async def _index_pdf_objects(
     (e.g. two ``main.pdf`` in different paper subdirs).
 
     *user_id* + *ingestion_ts_ms* propagate into every chunk's
-    metadata as ``ingested_by_user_id`` and ``ingestion_ts_ms`` —
+    metadata as ``user_id`` (the single system-wide ownership key,
+    which ChromaSemanticService.search filters on) and ``ingestion_ts_ms`` —
     per-chunk reconstructibility per gap-inventory item #21.
 
     *manifest_service* (tier-B item #22) — when supplied, every PDF
@@ -562,7 +563,18 @@ async def _index_pdf_objects(
                             "document_hash": document_hash,
                             "signature_status": signature_status,
                             "redaction_status": redaction_status,
-                            "ingested_by_user_id": user_id,
+                            # ONE ownership key across every writer. Was
+                            # ``ingested_by_user_id`` until 2026-07-21, which
+                            # no reader ever filtered on:
+                            # ChromaSemanticService.search filters non-admin
+                            # callers on ``user_id``, so these chunks were
+                            # unreachable to everyone except admins. Combined
+                            # with the markdown path setting no ownership key
+                            # at all, EVERY non-admin recall returned zero
+                            # results for EVERY collection — silently, because
+                            # an empty result set looks exactly like "nothing
+                            # relevant found" (#372 / #374).
+                            "user_id": user_id,
                             "ingestion_ts_ms": ingestion_ts_ms,
                             "chunk_type": ("form_field" if i == form_idx else "text"),
                         }

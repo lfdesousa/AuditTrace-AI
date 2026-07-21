@@ -455,6 +455,7 @@ async def _index_md_objects(
     objects: list[dict[str, str]],
     col_name: str,
     category: str,
+    user_id: str,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
@@ -481,6 +482,19 @@ async def _index_md_objects(
                 "category": category,
                 "file_type": "md",
                 "chunk": i,
+                # ``user_id`` is the ONE ownership key across every writer
+                # (this path and routes/memory_pdf/pipeline.py). It is the
+                # key ``ChromaSemanticService.search`` filters on for
+                # non-admin callers.
+                #
+                # Before 2026-07-21 this path set NO ownership key at all and
+                # the PDF path set ``ingested_by_user_id``, so the filter
+                # matched nothing and EVERY non-admin recall returned zero
+                # results for EVERY collection. Nothing failed loudly: an
+                # empty result set is indistinguishable from "no relevant
+                # documents", so the model read it as "this does not exist"
+                # (#374). Do not introduce a second ownership key.
+                "user_id": user_id,
             }
             for i in range(len(chunks))
         ]
@@ -686,6 +700,7 @@ async def index_memory(
                 episodic_objects,
                 col_name,
                 category="episodic",
+                user_id=user.user_id,
             )
         if col_name in ("skills", "semantic"):
             chunk_count += await _index_md_objects(
@@ -695,6 +710,7 @@ async def index_memory(
                 procedural_objects,
                 col_name,
                 category="procedural",
+                user_id=user.user_id,
             )
         if col_name == "ai_research_papers":
             # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
