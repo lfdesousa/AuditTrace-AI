@@ -422,13 +422,72 @@ else
             done
         done
 
+        # ── UNDECLARED ("shadow") clients ───────────────────────────────
+        # The loop above walks DECLARED -> LIVE, so a client that exists live
+        # but is declared nowhere was never enumerated and never reported.
+        # Found 2026-07-20 (#371): audittrace-restricted was created via the
+        # admin API and this check passed it in SILENCE. Not "checked and
+        # clean" — not checked.
+        #
+        # It matters more than the scope comparison it complements. The drift
+        # this check was built for (#370) was someone CHANGING a scope on an
+        # existing client. The strictly worse move is CREATING a client with
+        # audittrace:admin as a default scope — and that is exactly the shape
+        # a declared->live walk cannot see. It is also the more attractive
+        # move, because it disturbs nothing already being watched.
+        #
+        # The allowlist is EXACT NAMES ONLY. A prefix rule such as
+        # "audittrace-*" would exempt precisely the clients most worth
+        # watching, which is the opposite of the point. Keycloak creates these
+        # six in every realm; everything else must be declared.
+        KC_BUILTIN_CLIENTS="account
+account-console
+admin-cli
+broker
+realm-management
+security-admin-console"
+        live_clients=$(kc_curl -H "Authorization: Bearer $kc_token" \
+            "${KC_SVC}/admin/realms/${KC_REALM}/clients" \
+            | jq -r '.[].clientId' 2>/dev/null | sort || echo "")
+        undeclared=$(comm -23 <(echo "$live_clients" | grep -v '^$') \
+                              <(printf '%s\n%s\n' "$clients" "$KC_BUILTIN_CLIENTS" \
+                                | grep -v '^$' | sort -u) || true)
+
+        # Rank by blast radius: a shadow client holding admin or audit as a
+        # DEFAULT scope is a different incident from one holding neither, and
+        # an operator triaging a red gate needs that distinction up front.
+        shadow_report=""
+        for cid in $undeclared; do
+            u=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients?clientId=${cid}" \
+                | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+            sc=$(kc_curl -H "Authorization: Bearer $kc_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/clients/${u}/default-client-scopes" \
+                | jq -r '[.[].name]|join(",")' 2>/dev/null || echo "")
+            case ",$sc," in
+                *,audittrace:admin,*|*,audittrace:audit,*)
+                    shadow_report="${shadow_report}!! ${cid}: UNDECLARED and holds a privileged default scope [${sc}]"$'\n' ;;
+                *)
+                    shadow_report="${shadow_report}${cid}: UNDECLARED (default scopes: ${sc:-none})"$'\n' ;;
+            esac
+        done
+
         if [ "$checked" -eq 0 ]; then
             skip "no declared clients found in $REALM_CM"
+        elif [ -z "$scope_drift" ] && [ -z "$shadow_report" ]; then
+            pass "Keycloak client scopes match $REALM_CM for all $checked client(s); no undeclared clients"
         elif [ -z "$scope_drift" ]; then
-            pass "Keycloak client scopes match $REALM_CM for all $checked client(s)"
+            fail "Keycloak realm has UNDECLARED client(s) — present live, declared nowhere:"
+            echo "$shadow_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            echo "[verify]      A client declared nowhere is unreviewed. Either add it" >&2
+            echo "[verify]      to the realm ConfigMap or delete it from the realm." >&2
         else
             fail "Keycloak realm scope drift — live realm != $REALM_CM:"
             echo "$scope_drift" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            if [ -n "$shadow_report" ]; then
+                echo "[verify]      PLUS undeclared client(s):" >&2
+                echo "$shadow_report" | grep -v '^$' | sed 's/^/[verify]      - /' >&2
+            fi
             echo "[verify]      NOTE: --import-realm runs on FIRST BOOT ONLY, so" >&2
             echo "[verify]      editing realm-audittrace.json will NOT fix a running" >&2
             echo "[verify]      cluster. Correct the live realm via the admin API." >&2
