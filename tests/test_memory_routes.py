@@ -3109,6 +3109,189 @@ class TestS3DiscoveryMerge:
         )
 
 
+class TestListBlindSpotAndErgonomics:
+    """Backlog #15 regression guards + list ergonomics (R5/R6).
+
+    (a) a non-``ADR-`` named doc must appear in the list — the exact case
+    that regressed (Defect A); (c) sort/order/limit/offset paging over a
+    mixed manifest + discovered set; (R4) discovered entries carry real
+    timestamps from the S3 object's last_modified.
+    """
+
+    def test_non_adr_named_doc_appears_in_episodic_list(
+        self, client: TestClient
+    ) -> None:
+        """R6a: the blind spot — a ``decision-*.md`` (non-ADR) uploaded with
+        no manifest row MUST surface in GET /memory/episodic."""
+        from audittrace.dependencies import get_episodic_service
+
+        get_episodic_service().add_document(
+            content="# Decision 375\n\nbody",
+            title="Decision 375",
+            file="decision-2026-07-25-375.md",
+        )
+        r = client.get("/memory/episodic")
+        assert r.status_code == 200
+        keys = {i["key"] for i in r.json()["items"]}
+        assert "decision-2026-07-25-375.md" in keys
+
+    def test_discovered_entry_carries_real_timestamps(self, client: TestClient) -> None:
+        """R4: a discovered entry with an S3 last_modified surfaces it as
+        created_at_ms / modified_at_ms (so the set is uniformly sortable)."""
+        from audittrace.dependencies import get_episodic_service
+
+        get_episodic_service().add_document(
+            content="# Decision\n\nbody",
+            title="Decision",
+            file="decision-ts.md",
+            last_modified_ms=1_700_000_000_000,
+        )
+        r = client.get("/memory/episodic")
+        row = next(i for i in r.json()["items"] if i["key"] == "decision-ts.md")
+        assert row["created_at_ms"] == 1_700_000_000_000
+        assert row["modified_at_ms"] == 1_700_000_000_000
+
+    def test_response_echoes_limit_and_offset(self, client: TestClient) -> None:
+        r = client.get("/memory/episodic?limit=5&offset=0")
+        body = r.json()
+        assert body["limit"] == 5
+        assert body["offset"] == 0
+        assert "total" in body
+
+    def test_order_desc_returns_newest_first_and_paging(
+        self, client: TestClient
+    ) -> None:
+        """R6c: order=desc newest-first + limit/offset paging over a mixed
+        manifest + discovered set, no error on the sort."""
+        from audittrace.dependencies import get_episodic_service
+
+        ep = get_episodic_service()
+        # Discovered entries with ascending timestamps.
+        for i in range(1, 5):
+            ep.add_document(
+                content=f"# d{i}\n\nbody",
+                title=f"d{i}",
+                file=f"discovered-{i}.md",
+                last_modified_ms=1_000 * i,
+            )
+        # A manifest row too (mixed set) — created via the POST endpoint.
+        client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-manifest.md", "content": "# manifest"},
+        )
+
+        r = client.get("/memory/episodic?sort=created_at&order=desc&limit=2&offset=0")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] >= 5  # 4 discovered + >=1 manifest
+        first_page = [i["key"] for i in body["items"]]
+        assert len(first_page) == 2
+        # The manifest row (created "now") is newest → first under desc.
+        assert first_page[0] == "ADR-manifest.md"
+
+        # Second page continues without overlap.
+        r2 = client.get("/memory/episodic?sort=created_at&order=desc&limit=2&offset=2")
+        second_page = [i["key"] for i in r2.json()["items"]]
+        assert set(first_page).isdisjoint(second_page)
+
+    def test_sort_by_key_ascending(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_episodic_service
+
+        ep = get_episodic_service()
+        for name in ("b.md", "a.md", "c.md"):
+            ep.add_document(content="# x", title=name, file=name)
+        r = client.get("/memory/episodic?sort=key&order=asc&limit=100")
+        keys = [i["key"] for i in r.json()["items"]]
+        assert keys == sorted(keys)
+
+    def test_invalid_sort_value_is_422(self, client: TestClient) -> None:
+        r = client.get("/memory/episodic?sort=bogus")
+        assert r.status_code == 422
+
+    def test_limit_over_max_is_422(self, client: TestClient) -> None:
+        r = client.get("/memory/episodic?limit=999")
+        assert r.status_code == 422
+
+    def test_procedural_list_supports_sort_params(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_procedural_service
+
+        get_procedural_service().add_document(
+            content="# runbook", skill="runbook", file="runbook-notes.md"
+        )
+        r = client.get("/memory/procedural?sort=modified_at&order=asc&limit=10")
+        assert r.status_code == 200
+        keys = {i["key"] for i in r.json()["items"]}
+        assert "runbook-notes.md" in keys
+
+
+class TestSortAndPaginateHelper:
+    """Unit coverage for _sort_and_paginate: total-order safety over a set
+    that mixes real timestamps with None (defensive), every sort field, and
+    the pagination slice."""
+
+    @staticmethod
+    def _items():
+        return [
+            {
+                "key": "b.md",
+                "created_at_ms": 200,
+                "modified_at_ms": 5,
+                "size_bytes": 30,
+            },
+            {
+                "key": "a.md",
+                "created_at_ms": 100,
+                "modified_at_ms": 9,
+                "size_bytes": 10,
+            },
+            # None timestamps must not blow up the sort (coalesced to 0).
+            {
+                "key": "c.md",
+                "created_at_ms": None,
+                "modified_at_ms": None,
+                "size_bytes": None,
+            },
+        ]
+
+    def test_created_at_desc_is_newest_first(self) -> None:
+        from audittrace.routes.memory import _sort_and_paginate
+
+        page, total = _sort_and_paginate(
+            self._items(), sort="created_at", order="desc", limit=100, offset=0
+        )
+        assert total == 3
+        assert [i["key"] for i in page] == ["b.md", "a.md", "c.md"]
+
+    def test_none_timestamps_do_not_raise_and_sort_last_on_desc(self) -> None:
+        from audittrace.routes.memory import _sort_and_paginate
+
+        page, _ = _sort_and_paginate(
+            self._items(), sort="modified_at", order="desc", limit=100, offset=0
+        )
+        assert page[-1]["key"] == "c.md"  # None → 0 → last under desc
+
+    def test_key_and_size_sorts(self) -> None:
+        from audittrace.routes.memory import _sort_and_paginate
+
+        by_key, _ = _sort_and_paginate(
+            self._items(), sort="key", order="asc", limit=100, offset=0
+        )
+        assert [i["key"] for i in by_key] == ["a.md", "b.md", "c.md"]
+        by_size, _ = _sort_and_paginate(
+            self._items(), sort="size", order="desc", limit=100, offset=0
+        )
+        assert [i["key"] for i in by_size][0] == "b.md"  # 30 is largest
+
+    def test_pagination_slice_and_total(self) -> None:
+        from audittrace.routes.memory import _sort_and_paginate
+
+        page, total = _sort_and_paginate(
+            self._items(), sort="key", order="asc", limit=1, offset=1
+        )
+        assert total == 3
+        assert [i["key"] for i in page] == ["b.md"]
+
+
 class TestConversationalLayer:
     """Layer 3 — chat sessions + interactions. Read-only RLS-scoped
     surface separate from the audit routes. Backed by the same

@@ -281,15 +281,27 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     )
     container._instances["object_storage"] = object_store
 
+    # Backlog #15 — shared cross-replica listing cache. Redis-backed in
+    # production so a write's ``invalidate_cache()`` is coherent across all
+    # replicas (replicaCount: 3); a missed invalidation self-heals after the
+    # TTL. Fail-open to a fresh S3 read on any Redis error.
+    from audittrace.services.layer_cache import get_layer_cache
+
+    layer_cache = get_layer_cache()
+
     episodic: EpisodicService = S3EpisodicService(
         minio_client=object_store,
         bucket=effective_bucket,
         prefix="episodic/",
+        cache=layer_cache,
+        cache_ttl_seconds=settings.memory_cache_ttl,
     )
     procedural: ProceduralService = S3ProceduralService(
         minio_client=object_store,
         bucket=effective_bucket,
         prefix="procedural/",
+        cache=layer_cache,
+        cache_ttl_seconds=settings.memory_cache_ttl,
     )
     logger.info(
         "Memory layers 1+2: %s-backed (bucket=%s)",

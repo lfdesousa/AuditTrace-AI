@@ -1407,18 +1407,20 @@ paths:
       - memory
   /memory/episodic:
     get:
-      description: 'List ADRs. Merges manifest rows with S3 objects so pre-PR-A
+      description: 'List ADRs / decision records. Merges manifest rows with S3 objects so
 
-        content (uploaded via /memory/upload or seeded via index-chromadb)
+        content uploaded via /memory/upload or seeded via index-chromadb surfaces
 
-        surfaces alongside operator-created items.
+        alongside operator-created items.
 
 
-        ``include_deleted=true`` returns soft-deleted manifest rows; it
+        ``include_deleted=true`` returns soft-deleted manifest rows; it has no
 
-        has no effect on discovered entries (they have no soft-delete
+        effect on discovered entries (they have no soft-delete state).
 
-        state).'
+        ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
+
+        R5); ``total`` is the full pre-limit count.'
       operationId: list_episodic_memory_episodic_get
       parameters:
       - in: query
@@ -1428,6 +1430,53 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
       responses:
         '200':
           content:
@@ -1701,9 +1750,11 @@ paths:
       - memory
   /memory/procedural:
     get:
-      description: 'List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
+      description: 'List SKILLs. Same merge-with-S3 + sort/paginate semantics as
 
-        so pre-PR-A items appear alongside operator-created ones.'
+        `/memory/episodic` so all ``.md`` items appear alongside
+
+        operator-created ones (backlog #15).'
       operationId: list_procedural_memory_procedural_get
       parameters:
       - in: query
@@ -1713,6 +1764,53 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
       responses:
         '200':
           content:
@@ -1878,9 +1976,11 @@ paths:
     get:
       description: 'List semantic-layer items. Merges the manifest with ChromaDB
 
-        discovery so pre-PR-A vectors (seeded via index-chromadb.py)
+        discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
 
-        surface alongside operator-created ones.'
+        alongside operator-created ones. Sort/paginate mirror the other layer
+
+        lists for consistency (backlog #15, R5).'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.
@@ -1900,6 +2000,53 @@ paths:
           default: false
           title: Include Deleted
           type: boolean
+      - description: 'Sort field: created_at | modified_at | key | size.'
+        in: query
+        name: sort
+        required: false
+        schema:
+          default: created_at
+          description: 'Sort field: created_at | modified_at | key | size.'
+          enum:
+          - created_at
+          - modified_at
+          - key
+          - size
+          title: Sort
+          type: string
+      - description: Sort direction. Default desc (most-recent-first).
+        in: query
+        name: order
+        required: false
+        schema:
+          default: desc
+          description: Sort direction. Default desc (most-recent-first).
+          enum:
+          - asc
+          - desc
+          title: Order
+          type: string
+      - description: Page size (max 500).
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Page size (max 500).
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+      - description: Zero-based pagination offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based pagination offset.
+          minimum: 0
+          title: Offset
+          type: integer
       responses:
         '200':
           content:

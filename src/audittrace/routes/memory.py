@@ -33,8 +33,9 @@ import hashlib
 import io
 import logging
 import time
+from collections.abc import Callable
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -82,6 +83,7 @@ from audittrace.models import (
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.services.embedder import embed_via_nomic
+from audittrace.services.layer_listing import list_layer_objects
 from audittrace.services.memory_manifest import ManifestEntry
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
@@ -206,19 +208,40 @@ def _list_objects_from_minio(
 
     Returns a list of ``{"key": ..., "filename": ...}`` dicts.
 
+    Delegates to the shared
+    :func:`~audittrace.services.layer_listing.list_layer_objects` helper so
+    the ``/memory/index`` prefix walk and the list/``load()`` path enumerate
+    through one code path and cannot diverge again (backlog #15, Defect A).
+    The shared helper also drops directory-marker / ``None`` keys.
+
     The ABC's ``list_objects`` paginates AND recurses transparently
     (MinIO backend uses ``recursive=True``; boto3 paginator walks every
     page). Before ADR-006 this helper also passed ``recursive=True``
     explicitly to the minio-py client; that kwarg no longer exists on
     the ABC because the contract guarantees full-subtree walking.
     """
-    objects: list[dict[str, str]] = []
-    for obj in client.list_objects(bucket, prefix=prefix):
-        key = obj.object_name or ""
-        filename = key.rsplit("/", 1)[-1] if "/" in key else key
-        if filename:
-            objects.append({"key": key, "filename": filename})
-    return objects
+    return [
+        {"key": obj["key"], "filename": obj["filename"]}
+        for obj in list_layer_objects(client, bucket, prefix)
+    ]
+
+
+def _invalidate_layer_list_cache(layer: str) -> None:
+    """Invalidate the shared listing cache for *layer* after a mutation.
+
+    Backlog #15, R3: because the cache is shared (Redis) one invalidation is
+    seen by all replicas, so this is the PRIMARY correctness mechanism that
+    makes a just-written object appear in the list fleet-wide. Best-effort —
+    the service's ``invalidate_cache`` already fails open, and the TTL is the
+    safety net.
+    """
+    try:
+        if layer == MemoryLayer.episodic.value:
+            get_episodic_service().invalidate_cache()
+        elif layer == MemoryLayer.procedural.value:
+            get_procedural_service().invalidate_cache()
+    except Exception as exc:  # never fail the request on a cache-invalidate miss
+        logger.warning("layer-cache invalidate failed for %s (ignored): %s", layer, exc)
 
 
 # ── POST /memory/upload ─────────────────────────────────────────────────────
@@ -376,6 +399,11 @@ async def upload_memory_file(
         bucket,
         key,
     )
+
+    # Backlog #15, R3: /memory/upload writes S3 directly, so it must invalidate
+    # the shared listing cache or the new object stays invisible to the list
+    # (fleet-wide, since the cache is shared) until the TTL expires.
+    _invalidate_layer_list_cache(layer.value)
 
     return {
         "status": "uploaded",
@@ -753,6 +781,15 @@ async def index_memory(
         total_chunks += chunk_count
         logger.info("Indexed %s: %d chunks", col_name, chunk_count)
 
+    # Backlog #15, R3: after a real (non-dry-run) index seed, invalidate the
+    # shared listing caches so any objects the seed run touched are re-read
+    # fresh on the next list. Skipped for dry-run (no side effects).
+    if not dry_run:
+        if file is None or file.startswith("episodic/"):
+            _invalidate_layer_list_cache(MemoryLayer.episodic.value)
+        if file is None or file.startswith("procedural/"):
+            _invalidate_layer_list_cache(MemoryLayer.procedural.value)
+
     duration = time.time() - start
     response: dict[str, Any] = {
         "status": "dry_run" if dry_run else "indexed",
@@ -844,6 +881,67 @@ async def create_episodic(
     return entry.to_dict()
 
 
+# ── List ergonomics — sort / order / limit / offset (backlog #15, R5) ────────
+
+# Sensible page-size default + hard cap so a single list request can never
+# ask the server to serialise an unbounded set.
+_LIST_DEFAULT_LIMIT = 100
+_LIST_MAX_LIMIT = 500
+
+# Query-param literals — FastAPI validates these (422 on anything else), so
+# the sort/order values are a closed set and the sort key functions below
+# never see an unexpected field.
+ListSort = Literal["created_at", "modified_at", "key", "size"]
+ListOrder = Literal["asc", "desc"]
+
+_SORT_FIELD_MS = {"created_at": "created_at_ms", "modified_at": "modified_at_ms"}
+
+
+def _sort_and_paginate(
+    items: list[dict[str, Any]],
+    *,
+    sort: str,
+    order: str,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return ``(page, total)`` — a total-order-safe sorted, paginated slice.
+
+    ``total`` is the full pre-limit count so a client can page. Sorting is
+    total-order safe: timestamp/size keys coalesce ``None`` → ``0`` and the
+    ``key`` sort coalesces to ``""``, so no comparison ever touches ``None``
+    (backlog #15, R5). Ties break on the object ``key`` ascending regardless
+    of ``order`` (stable secondary sort) so paging is deterministic.
+    """
+
+    def _int_key(field: str) -> Callable[[dict[str, Any]], Any]:
+        def key(item: dict[str, Any]) -> Any:
+            value = item.get(field)
+            return value if isinstance(value, int) else 0
+
+        return key
+
+    def _str_key(item: dict[str, Any]) -> Any:
+        return str(item.get("key") or "")
+
+    primary: Callable[[dict[str, Any]], Any]
+    if sort == "key":
+        primary = _str_key
+    elif sort == "size":
+        primary = _int_key("size_bytes")
+    else:
+        primary = _int_key(_SORT_FIELD_MS.get(sort, "created_at_ms"))
+
+    # Stable secondary sort (key ascending) first, then the primary sort —
+    # Python's sort is stable, so equal-primary items keep the key-asc order.
+    ordered = sorted(items, key=lambda item: str(item.get("key") or ""))
+    ordered = sorted(ordered, key=primary, reverse=(order != "asc"))
+
+    total = len(ordered)
+    page = ordered[offset : offset + limit]
+    return page, total
+
+
 async def _merge_layer_items_with_s3(
     layer: str,
     visible_entries: list[ManifestEntry],
@@ -898,6 +996,11 @@ async def _merge_layer_items_with_s3(
         filename = doc.metadata.get("file")
         if not filename or filename in known_keys:
             continue
+        # R4 (backlog #15): discovered entries carry the S3 object's real
+        # ``last_modified`` (epoch-ms) for both created/modified so the merged
+        # set is uniformly sortable and never yields ``None`` timestamps.
+        # Manifest rows still take precedence (authorship, sub-second times).
+        last_modified_ms = doc.metadata.get("last_modified_ms")
         items.append(
             {
                 "id": None,
@@ -907,8 +1010,8 @@ async def _merge_layer_items_with_s3(
                 or doc.metadata.get("skill")
                 or filename,
                 "size_bytes": len(doc.page_content.encode("utf-8")),
-                "created_at_ms": None,
-                "modified_at_ms": None,
+                "created_at_ms": last_modified_ms,
+                "modified_at_ms": last_modified_ms,
                 "created_by_user_id": None,
                 "modified_by_user_id": None,
                 "deleted_at_ms": None,
@@ -922,22 +1025,40 @@ async def _merge_layer_items_with_s3(
 @router.get("/episodic")
 async def list_episodic(
     include_deleted: bool = Query(False),
+    sort: ListSort = Query(
+        "created_at",
+        description="Sort field: created_at | modified_at | key | size.",
+    ),
+    order: ListOrder = Query(
+        "desc", description="Sort direction. Default desc (most-recent-first)."
+    ),
+    limit: int = Query(
+        _LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=_LIST_MAX_LIMIT,
+        description="Page size (max 500).",
+    ),
+    offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """List ADRs. Merges manifest rows with S3 objects so pre-PR-A
-    content (uploaded via /memory/upload or seeded via index-chromadb)
-    surfaces alongside operator-created items.
+    """List ADRs / decision records. Merges manifest rows with S3 objects so
+    content uploaded via /memory/upload or seeded via index-chromadb surfaces
+    alongside operator-created items.
 
-    ``include_deleted=true`` returns soft-deleted manifest rows; it
-    has no effect on discovered entries (they have no soft-delete
-    state)."""
+    ``include_deleted=true`` returns soft-deleted manifest rows; it has no
+    effect on discovered entries (they have no soft-delete state).
+    ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
+    R5); ``total`` is the full pre-limit count."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "episodic", include_deleted=include_deleted
     )
     items = await _merge_layer_items_with_s3("episodic", entries, user)
-    return {"items": items, "total": len(items)}
+    page, total = _sort_and_paginate(
+        items, sort=sort, order=order, limit=limit, offset=offset
+    )
+    return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/episodic/{filename}")
@@ -1079,17 +1200,35 @@ async def create_procedural(
 @router.get("/procedural")
 async def list_procedural(
     include_deleted: bool = Query(False),
+    sort: ListSort = Query(
+        "created_at",
+        description="Sort field: created_at | modified_at | key | size.",
+    ),
+    order: ListOrder = Query(
+        "desc", description="Sort direction. Default desc (most-recent-first)."
+    ),
+    limit: int = Query(
+        _LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=_LIST_MAX_LIMIT,
+        description="Page size (max 500).",
+    ),
+    offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """List SKILLs. Same merge-with-S3 semantics as `/memory/episodic`
-    so pre-PR-A items appear alongside operator-created ones."""
+    """List SKILLs. Same merge-with-S3 + sort/paginate semantics as
+    `/memory/episodic` so all ``.md`` items appear alongside
+    operator-created ones (backlog #15)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "procedural", include_deleted=include_deleted
     )
     items = await _merge_layer_items_with_s3("procedural", entries, user)
-    return {"items": items, "total": len(items)}
+    page, total = _sort_and_paginate(
+        items, sort=sort, order=order, limit=limit, offset=offset
+    )
+    return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/procedural/{filename}")
@@ -1327,11 +1466,26 @@ async def list_semantic(
         None, description="Filter to a single collection if set."
     ),
     include_deleted: bool = Query(False),
+    sort: ListSort = Query(
+        "created_at",
+        description="Sort field: created_at | modified_at | key | size.",
+    ),
+    order: ListOrder = Query(
+        "desc", description="Sort direction. Default desc (most-recent-first)."
+    ),
+    limit: int = Query(
+        _LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=_LIST_MAX_LIMIT,
+        description="Page size (max 500).",
+    ),
+    offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
-    discovery so pre-PR-A vectors (seeded via index-chromadb.py)
-    surface alongside operator-created ones."""
+    discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
+    alongside operator-created ones. Sort/paginate mirror the other layer
+    lists for consistency (backlog #15, R5)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=include_deleted
@@ -1340,7 +1494,10 @@ async def list_semantic(
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
     items = await _merge_semantic_with_chroma(entries, collection)
-    return {"items": items, "total": len(items)}
+    page, total = _sort_and_paginate(
+        items, sort=sort, order=order, limit=limit, offset=offset
+    )
+    return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/semantic/{collection}/{document_id}")

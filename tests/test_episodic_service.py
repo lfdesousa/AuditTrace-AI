@@ -163,18 +163,34 @@ class TestS3EpisodicService:
             assert d.metadata["file"].startswith("ADR-")
             assert d.metadata["file"].endswith(".md")
 
-    async def test_load_skips_non_adr_keys(self, user_context):
-        """Objects that don't match ADR-*.md must be ignored."""
+    async def test_load_includes_all_md_objects(self, user_context):
+        """Backlog #15 (R1): every ``.md`` object is enumerated, not just
+        ADR-*.md. A non-ADR ``decision-*.md`` / ``README.md`` uploaded via
+        /memory/upload MUST surface — that was the blind spot."""
         client = _FakeMinio(
             {
                 "episodic/README.md": b"# Just a readme\n",
+                "episodic/decision-2026-07-24-x.md": b"# Decision\n\nbody\n",
                 "episodic/ADR-001-x.md": b"# ADR-001\n\nbody\n",
             }
         )
         service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         docs = await service.load(user_context)
-        files = [d.metadata["file"] for d in docs]
-        assert files == ["ADR-001-x.md"]
+        files = {d.metadata["file"] for d in docs}
+        assert files == {"README.md", "decision-2026-07-24-x.md", "ADR-001-x.md"}
+
+    async def test_load_still_skips_non_md_objects(self, user_context):
+        """Non-``.md`` objects (e.g. papers/*.pdf) are NOT loaded as docs —
+        the unified rule is '.md under the prefix'."""
+        client = _FakeMinio(
+            {
+                "episodic/ADR-001-x.md": b"# ADR-001\n\nbody\n",
+                "episodic/papers/foo.pdf": b"%PDF-1.7\n",
+            }
+        )
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        files = {d.metadata["file"] for d in await service.load(user_context)}
+        assert files == {"ADR-001-x.md"}
 
     async def test_load_handles_empty_bucket(self, user_context):
         service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
@@ -464,6 +480,101 @@ class TestS3EpisodicServiceWriteDelete:
         service.invalidate_cache()
         files_after = {d.metadata["file"] for d in await service.load(user_context)}
         assert "ADR-side.md" in files_after
+
+
+class _FakeObjectWithMeta:
+    """List-object double carrying size + last_modified (backlog #15, R4)."""
+
+    def __init__(self, object_name: str, size: int, last_modified: Any) -> None:
+        self.object_name = object_name
+        self.size = size
+        self.last_modified = last_modified
+
+
+class _FakeMinioWithMeta(_FakeMinio):
+    """As :class:`_FakeMinio` but ``list_objects`` yields last_modified."""
+
+    def __init__(self, objects: dict[str, tuple[bytes, Any]]) -> None:
+        self._rich = dict(objects)
+        super().__init__({k: v[0] for k, v in objects.items()})
+
+    def list_objects(self, bucket: str, prefix: str = "", **kwargs: Any):
+        del bucket, kwargs
+        return [
+            _FakeObjectWithMeta(k, len(v[0]), v[1])
+            for k, v in self._rich.items()
+            if k.startswith(prefix)
+        ]
+
+
+class TestS3EpisodicServiceCacheAndTimestamps:
+    """Backlog #15 — shared cache (R2), real timestamps (R4), three-view (R6b)."""
+
+    async def test_last_modified_flows_into_document_metadata(self, user_context):
+        from datetime import UTC, datetime
+
+        lm = datetime(2026, 7, 24, 9, 30, 0, tzinfo=UTC)
+        client = _FakeMinioWithMeta(
+            {"episodic/decision-2026-07-24.md": (b"# Decision\n\nbody\n", lm)}
+        )
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        docs = await service.load(user_context)
+        assert len(docs) == 1
+        assert docs[0].metadata["last_modified_ms"] == int(lm.timestamp() * 1000)
+
+    async def test_injected_shared_store_is_used_and_invalidation_surfaces_object(
+        self, user_context
+    ):
+        """The list path (load) consults the SHARED store; an invalidation
+        makes a newly-written object appear (R6d). Two services over one
+        store simulate two replicas (R2/Defect B)."""
+        from audittrace.services.layer_cache import InMemoryLayerCacheStore
+
+        shared = InMemoryLayerCacheStore()
+        client = _FakeMinio({"episodic/ADR-c.md": b"# c\n"})
+        pod_a = S3EpisodicService(client, bucket="b", prefix="episodic/", cache=shared)
+        pod_b = S3EpisodicService(client, bucket="b", prefix="episodic/", cache=shared)
+
+        # pod A warms the shared cache
+        assert {d.metadata["file"] for d in await pod_a.load(user_context)} == {
+            "ADR-c.md"
+        }
+        # A non-ADR object lands in S3 directly (as /memory/upload would do)
+        client._objects["episodic/decision-new.md"] = b"# decision\n"
+        # pod B still serves the shared cached listing (no re-read yet)
+        assert "decision-new.md" not in {
+            d.metadata["file"] for d in await pod_b.load(user_context)
+        }
+        # The write path invalidates the shared cache → fleet-wide
+        pod_a.invalidate_cache()
+        assert "decision-new.md" in {
+            d.metadata["file"] for d in await pod_b.load(user_context)
+        }
+
+    async def test_three_view_consistency_for_non_adr_md(self, user_context):
+        """R6b: an object present in S3 is enumerable by the list (load),
+        fetchable by read(), AND seen by the /memory/index prefix walk — the
+        three views agree on the SAME set, including non-ADR ``.md``."""
+        from audittrace.routes.memory import _list_objects_from_minio
+
+        client = _FakeMinio(
+            {
+                "episodic/ADR-1.md": b"# ADR-1\n\nbody\n",
+                "episodic/decision-2026-07-24.md": b"# Decision\n\nbody\n",
+            }
+        )
+        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+
+        load_files = {d.metadata["file"] for d in await service.load(user_context)}
+        index_files = {
+            o["filename"]
+            for o in _list_objects_from_minio(client, "b", "episodic/")
+            if o["filename"].endswith(".md")
+        }
+        read_doc = await service.read(user_context, "decision-2026-07-24.md")
+
+        assert load_files == index_files == {"ADR-1.md", "decision-2026-07-24.md"}
+        assert read_doc is not None  # read-by-key sees the same non-ADR object
 
 
 class TestMockEpisodicServiceWriteDelete:

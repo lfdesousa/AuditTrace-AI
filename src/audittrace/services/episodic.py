@@ -1,16 +1,25 @@
 """Episodic memory service — Layer 1 of the 4-layer memory architecture (ADR-018).
 
-Loads Architecture Decision Records (ADR-*.md) from object storage and provides
-query-driven retrieval based on keyword matching against content.
+Loads markdown decision records (``.md`` — ADRs, decisions, session docs)
+from object storage and provides query-driven retrieval based on keyword
+matching against content.
 
 Storage is **always S3-backed** (MinIO) — there is no filesystem implementation.
 Tests use ``MockEpisodicService``. See ``feedback_storage_always_s3`` for the
 durable rule and ``dependencies.py`` for the startup-time enforcement.
 
+Backlog #15: enumeration flows through the shared
+:func:`audittrace.services.layer_listing.list_layer_objects` helper and
+includes **every** ``.md`` object under the layer prefix (not just
+``ADR-*.md``), so ``read()`` by key, the ``/memory/index`` walk, and the
+list all see the same set. The per-process listing cache was replaced by a
+shared :class:`~audittrace.services.layer_cache.LayerCacheStore` so a write
+invalidation is coherent across all replicas.
+
 DESIGN §15 Phase 2: every method takes ``user_context: UserContext`` as the
-first positional argument. ADRs are shared content (not per-user), so the
-parameter is plumbing here — it exists for uniform service shape and future
-audit/scope checks in Phase 3.
+first positional argument. Decision records are shared content (not
+per-user), so the parameter is plumbing here — it exists for uniform service
+shape and future audit/scope checks in Phase 3.
 """
 
 import asyncio
@@ -23,8 +32,22 @@ from langchain_core.documents import Document
 
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.layer_cache import (
+    InMemoryLayerCacheStore,
+    LayerCacheStore,
+    layer_list_cache_key,
+)
+from audittrace.services.layer_listing import (
+    is_listable_md_object,
+    list_layer_objects,
+)
 
 logger = logging.getLogger(__name__)
+
+# Default TTL for the shared listing cache when a service is constructed
+# without an explicit value (direct construction in tests). Production wires
+# ``settings.memory_cache_ttl`` through ``dependencies.py``.
+_DEFAULT_CACHE_TTL_SECONDS = 3600
 
 
 class EpisodicService(ABC):
@@ -103,60 +126,106 @@ def _title_from_content(content: str, fallback: str) -> str:
 
 
 class S3EpisodicService(EpisodicService):
-    """S3/MinIO-backed episodic service reading ADR-*.md from object storage.
+    """S3/MinIO-backed episodic service reading ``.md`` records from object storage.
 
     Reads from the ``memory-shared`` bucket under the ``episodic/`` prefix.
-    ADRs are shared content — ``user_context`` is required (authenticated)
-    but not used for path scoping (ADR-027 §2).
+    Decision records are shared content — ``user_context`` is required
+    (authenticated) but not used for path scoping (ADR-027 §2).
 
-    Documents are cached in memory on first ``load()`` since ADRs are static,
-    small (~24 files), and read-heavy. Cache is per-process lifetime. The
-    ``read()`` path bypasses the cache and does a direct ``get_object`` to
-    keep point-fetch latency O(1) regardless of corpus size.
+    Enumeration includes **every** ``.md`` object under the prefix (ADRs,
+    decisions, session docs) via the shared
+    :func:`~audittrace.services.layer_listing.list_layer_objects` helper —
+    the same set ``read()`` can fetch by key and ``/memory/index`` embeds
+    (backlog #15, Defect A).
+
+    The listing is cached through a shared
+    :class:`~audittrace.services.layer_cache.LayerCacheStore`. In production
+    a Redis-backed store is injected so a single ``invalidate_cache()`` is
+    coherent across all replicas (backlog #15, Defect B); the default
+    in-memory store keeps per-process caching for direct construction. A TTL
+    self-heals any missed invalidation. The ``read()`` path bypasses the
+    cache and does a direct ``get_object`` to keep point-fetch latency O(1)
+    regardless of corpus size.
     """
 
-    def __init__(self, minio_client: object, bucket: str, prefix: str = "episodic/"):
+    _LAYER = "episodic"
+
+    def __init__(
+        self,
+        minio_client: object,
+        bucket: str,
+        prefix: str = "episodic/",
+        *,
+        cache: LayerCacheStore | None = None,
+        cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS,
+    ):
         self._client = minio_client  # minio.Minio instance
         self._bucket = bucket
         self._prefix = prefix
-        self._cache: list[Document] | None = None
+        # None → per-instance in-memory store (preserves the old per-process
+        # caching for direct construction). Production injects the shared
+        # Redis-backed store so invalidations are fleet-wide (backlog #15).
+        self._cache_store: LayerCacheStore = (
+            cache if cache is not None else InMemoryLayerCacheStore()
+        )
+        self._cache_ttl = cache_ttl_seconds
+        self._cache_key = layer_list_cache_key(self._LAYER)
 
-    def _load_from_s3(self) -> list[Document]:
-        """Download all ADR-*.md objects from MinIO and parse as Documents."""
-        if self._cache is not None:
-            return self._cache
-        docs: list[Document] = []
+    def _read_layer_rows(self) -> list[dict[str, Any]]:
+        """Enumerate + read every ``.md`` object as serialisable, cacheable rows.
+
+        Never raises — a backend failure logs and yields what was read so far
+        (fail-open), matching the historical ``load()`` contract.
+        """
+        rows: list[dict[str, Any]] = []
         try:
             client: Any = self._client
-            objects = client.list_objects(self._bucket, prefix=self._prefix)
-            for obj in objects:
-                name = obj.object_name or ""
-                filename = name.rsplit("/", 1)[-1] if "/" in name else name
-                if not filename.startswith("ADR-") or not filename.endswith(".md"):
+            for obj in list_layer_objects(client, self._bucket, self._prefix):
+                filename = obj["filename"]
+                if not is_listable_md_object(filename):
                     continue
-                with client.get_object(self._bucket, name) as response:
+                with client.get_object(self._bucket, obj["key"]) as response:
                     content = response.read().decode("utf-8")
-                docs.append(
-                    Document(
-                        page_content=content,
-                        metadata={
-                            "source": "episodic",
-                            "file": filename,
-                            "title": _title_from_content(content, filename[:-3]),
-                        },
-                    )
+                rows.append(
+                    {
+                        "file": filename,
+                        "content": content,
+                        "title": _title_from_content(content, filename[:-3]),
+                        "last_modified_ms": obj["last_modified_ms"],
+                    }
                 )
         except Exception as exc:
             logger.warning("S3EpisodicService load failed: %s", exc)
-        self._cache = docs
-        return docs
+        return rows
+
+    def _layer_rows(self) -> list[dict[str, Any]]:
+        """Shared-cache read-through. Fail-open: any cache miss/error → fresh S3."""
+        cached = self._cache_store.get(self._cache_key)
+        if cached is not None:
+            return cached
+        rows = self._read_layer_rows()
+        self._cache_store.set(self._cache_key, rows, self._cache_ttl)
+        return rows
+
+    @staticmethod
+    def _row_to_document(row: dict[str, Any]) -> Document:
+        return Document(
+            page_content=row["content"],
+            metadata={
+                "source": "episodic",
+                "file": row["file"],
+                "title": row["title"],
+                "last_modified_ms": row.get("last_modified_ms"),
+            },
+        )
 
     @log_call(logger=logger)
     async def load(self, user_context: UserContext) -> list[Document]:
         del user_context  # shared content — not per-user scoped
         # minio SDK is sync-only → offload the blocking S3 listing/get to a
         # worker thread so the event loop stays free (PYTHON-ENGINEERING §3).
-        return list(await asyncio.to_thread(self._load_from_s3))
+        rows = await asyncio.to_thread(self._layer_rows)
+        return [self._row_to_document(row) for row in rows]
 
     @log_call(logger=logger)
     async def search(self, user_context: UserContext, query: str) -> list[Document]:
@@ -286,7 +355,9 @@ class S3EpisodicService(EpisodicService):
 
     @log_call(logger=logger)
     def invalidate_cache(self) -> None:
-        self._cache = None
+        # Shared store → one invalidation is seen by every replica
+        # (backlog #15, Defect B). TTL is the safety net for a missed call.
+        self._cache_store.invalidate(self._cache_key)
 
 
 class MockEpisodicService(EpisodicService):
@@ -297,13 +368,27 @@ class MockEpisodicService(EpisodicService):
 
     @log_call(logger=logger)
     def add_document(
-        self, content: str, title: str = "Mock ADR", file: str = "ADR-mock.md"
+        self,
+        content: str,
+        title: str = "Mock ADR",
+        file: str = "ADR-mock.md",
+        last_modified_ms: int | None = None,
     ) -> None:
-        """Add a document for testing."""
+        """Add a document for testing.
+
+        ``last_modified_ms`` mirrors the real S3 ``last_modified`` timestamp
+        the discovered-entry merge reads (backlog #15, R4); ``None`` keeps the
+        pre-R4 "no timestamp" shape.
+        """
         self._documents.append(
             Document(
                 page_content=content,
-                metadata={"source": "episodic", "file": file, "title": title},
+                metadata={
+                    "source": "episodic",
+                    "file": file,
+                    "title": title,
+                    "last_modified_ms": last_modified_ms,
+                },
             )
         )
 
