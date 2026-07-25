@@ -145,16 +145,30 @@ class TestS3ProceduralService:
             assert d.metadata["source"] == "procedural"
             assert d.metadata["file"].startswith("SKILL-")
 
-    async def test_load_skips_non_skill_keys(self, user_context):
+    async def test_load_includes_all_md_objects(self, user_context):
+        """Backlog #15 (R1): every ``.md`` object is enumerated, not just
+        SKILL-*.md — parity with the episodic fix."""
         client = _FakeMinio(
             {
                 "procedural/README.md": b"# readme\n",
+                "procedural/runbook-notes.md": b"# notes\n\nbody\n",
                 "procedural/SKILL-X.md": b"# X\n\nbody\n",
             }
         )
         service = S3ProceduralService(client, bucket="b", prefix="procedural/")
-        files = [d.metadata["file"] for d in await service.load(user_context)]
-        assert files == ["SKILL-X.md"]
+        files = {d.metadata["file"] for d in await service.load(user_context)}
+        assert files == {"README.md", "runbook-notes.md", "SKILL-X.md"}
+
+    async def test_load_still_skips_non_md_objects(self, user_context):
+        client = _FakeMinio(
+            {
+                "procedural/SKILL-X.md": b"# X\n\nbody\n",
+                "procedural/asset.bin": b"\x00\x01",
+            }
+        )
+        service = S3ProceduralService(client, bucket="b", prefix="procedural/")
+        files = {d.metadata["file"] for d in await service.load(user_context)}
+        assert files == {"SKILL-X.md"}
 
     async def test_load_handles_empty_bucket(self, user_context):
         service = S3ProceduralService(_FakeMinio({}), bucket="b", prefix="procedural/")

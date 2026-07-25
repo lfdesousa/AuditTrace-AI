@@ -74,17 +74,19 @@ class TestS3EpisodicService:
         assert docs[0].metadata["file"] == "ADR-018-four-layer-memory-port.md"
         assert docs[0].metadata["title"] == "Four-Layer Memory"
 
-    async def test_load_ignores_non_adr_files(self):
+    async def test_load_includes_all_md_files(self):
+        """Backlog #15 (R1): the bulk loader enumerates every ``.md`` object,
+        not just ADR-*.md — the exact blind spot that hid decision-*.md."""
         svc = self._make_service(
             {
                 "episodic/ADR-018.md": "# ADR\n\nContent.",
-                "episodic/agent-configuration.md": "Not an ADR.",
-                "episodic/README.md": "Not an ADR.",
+                "episodic/agent-configuration.md": "# Agent config\n\nNot an ADR.",
+                "episodic/README.md": "# Readme\n\nNot an ADR.",
             }
         )
         docs = await svc.load(_make_user())
-        assert len(docs) == 1
-        assert docs[0].metadata["file"] == "ADR-018.md"
+        files = {d.metadata["file"] for d in docs}
+        assert files == {"ADR-018.md", "agent-configuration.md", "README.md"}
 
     async def test_search_filters_by_keyword(self):
         svc = self._make_service(
@@ -155,7 +157,9 @@ class TestS3ProceduralService:
         assert docs[0].metadata["skill"] == "ARCHITECTURE"
         assert docs[1].metadata["skill"] == "GENAI"
 
-    async def test_load_ignores_non_skill_files(self):
+    async def test_load_includes_all_md_files(self):
+        """Backlog #15 (R1): every ``.md`` object is enumerated — parity
+        with the episodic fix."""
         svc = self._make_service(
             {
                 "procedural/SKILL-IAM.md": "IAM content.",
@@ -163,7 +167,7 @@ class TestS3ProceduralService:
             }
         )
         docs = await svc.load(_make_user())
-        assert len(docs) == 1
+        assert {d.metadata["file"] for d in docs} == {"SKILL-IAM.md", "README.md"}
 
     async def test_search_matches_skill_name_and_content(self):
         svc = self._make_service(
