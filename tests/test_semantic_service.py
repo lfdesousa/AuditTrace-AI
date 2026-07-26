@@ -178,6 +178,104 @@ class TestChromaSemanticService:
         assert len(results) == 2
 
 
+# ── #372 / ADR-060 — record recall by id + score ────────────────────────────
+
+
+class TestChromaSemanticServiceRecordsIdentity:
+    """``search`` must thread the ChromaDB ``chunk_id`` (== the ``document_id``
+    supplied at upsert) and a relevance ``score`` (the distance) into each
+    returned ``Document.metadata`` so the audit trail can name the exact
+    passage that shaped an answer, not just its text (#372)."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        col = await client.get_or_create_collection(name="decisions_v2")
+        await col.add(
+            ids=["chunk-abc", "chunk-def"],
+            documents=[
+                "KV cache compression reduces memory by 75%",
+                "another cache note",
+            ],
+            metadatas=[
+                {"source": "ADR-009.md", "document_sha256": "deadbeef" * 8},
+                {"source": "ADR-001.md"},
+            ],
+        )
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_search_threads_chunk_id(self, service, user_context):
+        results = await service.search(user_context, "cache", k=10)
+        assert results, "expected at least one hit"
+        ids = {d.metadata.get("chunk_id") for d in results}
+        assert "chunk-abc" in ids
+        # Every returned doc carries a non-empty chunk_id (the durable id).
+        assert all(d.metadata.get("chunk_id") for d in results)
+
+    async def test_search_threads_distance_from_distances(self, service, user_context):
+        results = await service.search(user_context, "cache", k=10)
+        # MockCollection.query returns distances of 0.1 for every row. The RAW
+        # distance is recorded (lower = closer), honestly named ``distance``.
+        assert all(d.metadata.get("distance") == pytest.approx(0.1) for d in results)
+
+    async def test_search_preserves_source_and_sha_metadata(
+        self, service, user_context
+    ):
+        results = await service.search(user_context, "cache", k=10)
+        by_id = {d.metadata["chunk_id"]: d for d in results}
+        assert by_id["chunk-abc"].metadata["source"] == "ADR-009.md"
+        assert by_id["chunk-abc"].metadata["document_sha256"] == "deadbeef" * 8
+
+    async def test_search_distance_is_none_when_distances_absent(self, user_context):
+        """Guard: a ChromaDB response without ``distances`` must not raise;
+        ``distance`` degrades to ``None`` and ``chunk_id`` is still threaded."""
+        col = AsyncMock()
+        col.count = AsyncMock(return_value=1)
+        col.query = AsyncMock(
+            return_value={
+                "ids": [["only-chunk"]],
+                "documents": [["some cache text"]],
+                "metadatas": [[{"source": "ADR-009.md"}]],
+                # NO "distances" key on purpose.
+            }
+        )
+        client = MagicMock()
+        client.get_or_create_collection = AsyncMock(return_value=col)
+        service = ChromaSemanticService(
+            client=client, default_collections=["decisions"]
+        )
+        results = await service.search(user_context, "cache", k=4)
+        assert len(results) == 1
+        assert results[0].metadata["chunk_id"] == "only-chunk"
+        assert results[0].metadata["distance"] is None
+
+    async def test_search_still_passes_user_id_where_filter(self, user_context):
+        """The per-user isolation filter is UNTOUCHED by the id/score change:
+        a non-admin caller still only sees rows tagged with their user_id,
+        and those rows now also carry a chunk_id."""
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        col = await client.get_or_create_collection(name="decisions_v2")
+        await col.add(
+            ids=["mine", "theirs"],
+            documents=["mine: cache note", "theirs: cache note"],
+            metadatas=[
+                {"source": "n1.md", "user_id": "user-alice"},
+                {"source": "n2.md", "user_id": "user-bob"},
+            ],
+        )
+        service = ChromaSemanticService(
+            client=client, default_collections=["decisions"]
+        )
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        results = await service.search(alice, "cache", k=10)
+        contents = [d.page_content for d in results]
+        assert any("mine" in c for c in contents)
+        assert not any("theirs" in c for c in contents)
+        assert all(d.metadata.get("chunk_id") for d in results)
+
+
 # ── MockSemanticService tests ────────────────────────────────────────────────
 
 

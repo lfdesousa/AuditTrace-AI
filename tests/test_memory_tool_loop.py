@@ -21,7 +21,9 @@ Pending ``ToolCall`` audit records are accumulated during the loop and
 returned to the caller so the chat handler can flush them to Postgres
 after the parent ``InteractionRecord`` lands (FK constraint).
 
-Cache hits skip the pending audit row entirely — ADR-025 §Decision.8.
+Cache hits record a lightweight read-audit row flagged ``cache_hit`` in
+``result_summary`` (ADR-060 / #372 D3) so the memory that shaped the
+interaction stays identifiable from its own record.
 """
 
 from __future__ import annotations
@@ -538,15 +540,19 @@ class TestPendingAuditRows:
         assert "query" in rec.args
 
     @pytest.mark.asyncio
-    async def test_cache_hit_skips_pending_record(
+    async def test_cache_hit_records_read_audit_row(
         self, _populated_container, _fakeredis_cache
     ):
-        """ADR-025 §Decision.8: cache hits skip the audit row because they
-        represent the same execution we already audited when the cache was
-        populated."""
+        """ADR-060 / #372 D3: a cache-served recall still SHAPED the answer,
+        so it records a lightweight read-audit row — flagged ``cache_hit`` in
+        ``result_summary`` and carrying the served match id — instead of
+        being dropped. Before D3 the warm interaction persisted zero rows and
+        the shaping memory could not be identified from its own record."""
+        import json
+
         user = sentinel_user_context()
 
-        # First loop — cold cache, one pending row
+        # First loop — cold cache, one fresh (non-cache) pending row
         fake1 = _SequencedClient(
             [
                 _tool_call_response(
@@ -568,8 +574,10 @@ class TestPendingAuditRows:
                 max_iterations=5,
             )
         assert len(pending1) == 1
+        # Cold row is a fresh read — no cache_hit flag in its summary.
+        assert "cache_hit" not in (pending1[0].result_summary or "")
 
-        # Second loop, same session + same args — cache hit, NO pending row
+        # Second loop, same session + same args — cache hit, STILL one row
         fake2 = _SequencedClient(
             [
                 _tool_call_response(
@@ -590,7 +598,57 @@ class TestPendingAuditRows:
                 session_id="sess-1",
                 max_iterations=5,
             )
-        assert pending2 == []  # cache hit → no audit row
+        assert len(pending2) == 1  # D3: cache hit → read-audit row, not dropped
+        rec = pending2[0]
+        assert rec.tool_name == "recall_decisions"
+        assert rec.error is None
+        assert rec.granted_scope == "memory:episodic:read"
+        summary = json.loads(rec.result_summary)
+        assert summary["cache_hit"] is True
+        # The served memory is identifiable: the seeded ADR-009.md id rides
+        # in the recorded matches so the row names what shaped the answer.
+        assert summary["matches"][0]["id"] == "ADR-009.md"
+        assert summary["matches"][0]["source_ref"] == "ADR-009.md"
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_error_records_error_not_summary(
+        self, _populated_container, _fakeredis_cache, monkeypatch
+    ):
+        """If a cache-served result is error-shaped, the read-audit row
+        records ``error`` and leaves ``result_summary`` None — the same
+        error handling as the fresh path, just cache-served. (Errors are not
+        normally cached, so this is forced via a stubbed ``invoke_tool``.)"""
+
+        async def _fake_invoke(user_context, tool, args, session_id):
+            return {"error": "boom-from-cache"}, True  # was_cache_hit=True
+
+        monkeypatch.setattr(_loop_mod, "invoke_tool", _fake_invoke)
+
+        user = sentinel_user_context()
+        fake = _SequencedClient(
+            [
+                _tool_call_response(
+                    "recall_decisions", '{"query": "cache"}', call_id="call_e"
+                ),
+                _text_response("answer"),
+            ]
+        )
+        with _patch_async_client(fake):
+            _, pending = await run_memory_tool_loop(
+                llama_url="http://llama/chat/completions",
+                payload={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-1",
+                max_iterations=5,
+            )
+        assert len(pending) == 1
+        rec = pending[0]
+        assert rec.error == "boom-from-cache"
+        assert rec.result_summary is None
 
     @pytest.mark.asyncio
     async def test_handler_error_produces_pending_record_with_error(

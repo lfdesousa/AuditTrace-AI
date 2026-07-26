@@ -564,6 +564,174 @@ class TestReadSkillTool:
         assert "file" in result["error"]
 
 
+class TestRecallRecordsIdentity:
+    """#372 / ADR-060 — every recall_* match records a durable ``id`` and a
+    stable ``source_ref`` (plus ``sha256``/``distance`` when available) so a
+    ``tool_calls.result_summary`` row names the exact memory that shaped the
+    answer, and a reconstruction query can fetch it back."""
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_match_has_id_and_source_ref(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache compression"}, session_id="s"
+        )
+        m = result["matches"][0]
+        # Keyword layer: no chunk_id, so id falls back to the durable file.
+        assert m["id"] == "ADR-009.md"
+        assert m["source_ref"] == "ADR-009.md"
+        assert m["id"] and m["source_ref"]  # never blank
+        assert m["sha256"] is None
+        assert m["distance"] is None
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_match_has_id_and_source_ref(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(user, tool, {"query": "OAuth2"}, session_id="s")
+        m = result["matches"][0]
+        assert m["id"] == "SKILL-IAM.md"
+        assert m["source_ref"] == "SKILL-IAM.md"
+        assert m["id"] and m["source_ref"]
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_surfaces_chunk_id_sha_and_distance(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """When the ChromaDB-backed metadata carries chunk_id + distance +
+        document_sha256, the match surfaces all of them."""
+        from langchain_core.documents import Document
+
+        _populated_container._instances["semantic"]._docs.setdefault(
+            "decisions", []
+        ).append(
+            Document(
+                page_content="cache-rich chunk about optimisation",
+                metadata={
+                    "chunk_id": "decisions:ADR-050.md:3",
+                    "distance": 0.2,
+                    "document_sha256": "ab" * 32,
+                    "source": "ADR-050.md",
+                    "collection": "decisions",
+                },
+            )
+        )
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "k": 10}, session_id="s"
+        )
+        rich = [m for m in result["matches"] if m["id"] == "decisions:ADR-050.md:3"]
+        assert rich, "expected the chunk_id-tagged match to surface"
+        m = rich[0]
+        assert m["source_ref"] == "ADR-050.md"
+        assert m["sha256"] == "ab" * 32
+        # Raw ChromaDB distance, honestly named (lower = closer).
+        assert m["distance"] == 0.2
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_every_match_has_nonblank_id_and_source_ref(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "k": 4}, session_id="s"
+        )
+        assert result["matches"]
+        for m in result["matches"]:
+            assert m["id"], "id must never be blank"
+            assert m["source_ref"], "source_ref must never be blank"
+
+
+class TestRecallIdentityHelper:
+    """Unit coverage for ``_recall_identity_fields`` — the D1 stable-pointer
+    fallback chain and the D1 re-index guarantee."""
+
+    def test_source_ref_prefers_file_then_source_then_title(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        assert (
+            _recall_identity_fields({"file": "f.md", "source": "s", "title": "t"})[
+                "source_ref"
+            ]
+            == "f.md"
+        )
+        assert (
+            _recall_identity_fields({"source": "s", "title": "t"})["source_ref"] == "s"
+        )
+        assert _recall_identity_fields({"title": "t"})["source_ref"] == "t"
+
+    def test_source_ref_falls_back_to_chunk_id_then_collection(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        # No file/source/title → fall back to chunk_id …
+        assert (
+            _recall_identity_fields({"chunk_id": "c9", "collection": "decisions"})[
+                "source_ref"
+            ]
+            == "c9"
+        )
+        # … then to collection when there's no chunk_id either.
+        assert (
+            _recall_identity_fields({"collection": "decisions"})["source_ref"]
+            == "decisions"
+        )
+
+    def test_source_ref_is_never_blank_for_a_real_match(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        # MINOR-2: a metadata dict with NONE of file/source/title must still
+        # yield a non-empty source_ref (via chunk_id / collection). Every real
+        # ChromaDB match carries a chunk_id and a collection, so this is the
+        # never-blank guarantee in practice.
+        fields = _recall_identity_fields(
+            {"chunk_id": "decisions:x:0", "collection": "decisions"}
+        )
+        assert fields["source_ref"]  # non-empty
+
+    def test_source_ref_empty_only_when_metadata_totally_bare(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        # The helper is total: an entirely empty dict never raises, and only
+        # then is source_ref "" (no real recall path produces this).
+        assert _recall_identity_fields({})["source_ref"] == ""
+
+    def test_id_uses_chunk_id_when_present_else_source_ref(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        assert _recall_identity_fields({"chunk_id": "c1", "file": "f.md"})["id"] == "c1"
+        assert _recall_identity_fields({"file": "f.md"})["id"] == "f.md"
+
+    def test_sha256_reads_document_sha256_then_document_hash(self):
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        assert _recall_identity_fields({"document_sha256": "aa"})["sha256"] == "aa"
+        # PDF pipeline writes the hash under ``document_hash``.
+        assert _recall_identity_fields({"document_hash": "bb"})["sha256"] == "bb"
+        assert _recall_identity_fields({})["sha256"] is None
+
+    def test_reindex_changes_chunk_id_but_source_ref_is_stable(self):
+        """The D1 guarantee: a re-index that re-mints ``chunk_id`` leaves
+        ``source_ref`` (and thus the durable pointer to the artefact)
+        untouched — the audit row still resolves after re-indexing."""
+        from audittrace.tools.memory_handlers import _recall_identity_fields
+
+        before = _recall_identity_fields(
+            {"chunk_id": "decisions:ADR-050.md:3", "source": "ADR-050.md"}
+        )
+        after = _recall_identity_fields(
+            {"chunk_id": "decisions:ADR-050.md:0", "source": "ADR-050.md"}
+        )
+        assert before["id"] != after["id"]  # chunk id churned
+        assert before["source_ref"] == after["source_ref"] == "ADR-050.md"
+
+
 class TestRecallSemanticUncap:
     """``recall_semantic`` previously truncated chunks at 400 chars. Chunks
     are bounded by the chunker so the second cap was hiding useful context."""

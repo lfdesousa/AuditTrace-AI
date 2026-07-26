@@ -54,6 +54,51 @@ logger = logging.getLogger(__name__)
 _SNIPPET_LIMIT = 400
 
 
+def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Durable-identity fields for a recall match (#372 / ADR-060).
+
+    Records BOTH a durable identifier and a stable source pointer so a
+    ``tool_calls.result_summary`` row names the exact memory that shaped an
+    answer — not just its text — and a reconstruction query can fetch that
+    passage back:
+
+    - ``id`` — the ChromaDB ``chunk_id`` (== the ``document_id`` supplied at
+      upsert) when the match came from the vector store (``recall_semantic``).
+      The keyword layers (``recall_decisions`` / ``recall_skills``) are
+      S3-backed and not indexed, so they carry no chunk id; ``id`` then falls
+      back to the stable source pointer, which is itself the durable
+      identifier ``read_decision`` / ``read_skill`` resolve by. Never blank.
+    - ``source_ref`` — stable pointer that survives a re-index (D1):
+      ``file`` → ``source`` → ``title`` → ``chunk_id`` → ``collection``. Never
+      blank. This is the audit-grade answer to "does that identifier still
+      resolve after you re-index?" — a re-mint of ``chunk_id`` leaves the
+      earlier (file/source/title) pointer untouched.
+    - ``sha256`` — ``document_sha256`` (markdown / manifest key) or
+      ``document_hash`` (the key the PDF pipeline writes), else ``None``.
+    - ``distance`` — the RAW ChromaDB distance (D2), lower = closer. Recorded
+      honestly named, not converted to a similarity score. ``None`` for the
+      keyword layers (no vector store) or a distance-less response.
+    """
+    source_ref = (
+        metadata.get("file")
+        or metadata.get("source")
+        or metadata.get("title")
+        or metadata.get("chunk_id")
+        or metadata.get("collection")
+        or ""
+    )
+    chunk_id = metadata.get("chunk_id")
+    match_id = chunk_id if chunk_id else source_ref
+    sha256 = metadata.get("document_sha256") or metadata.get("document_hash")
+    distance = metadata.get("distance")
+    return {
+        "id": match_id,
+        "source_ref": source_ref,
+        "sha256": sha256,
+        "distance": distance,
+    }
+
+
 # ───────────────────────────── recall_decisions ─────────────────────────────
 
 
@@ -92,6 +137,7 @@ async def recall_decisions(
     return {
         "matches": [
             {
+                **_recall_identity_fields(d.metadata),
                 "title": d.metadata.get("title", d.metadata.get("file", "ADR")),
                 "snippet": d.page_content[:_SNIPPET_LIMIT],
                 "source": d.metadata.get("file", ""),
@@ -142,6 +188,7 @@ async def recall_skills(
     return {
         "matches": [
             {
+                **_recall_identity_fields(d.metadata),
                 "title": d.metadata.get("skill", d.metadata.get("file", "Skill")),
                 "snippet": d.page_content[:_SNIPPET_LIMIT],
                 "source": d.metadata.get("file", ""),
@@ -285,6 +332,7 @@ async def recall_semantic(
     return {
         "matches": [
             {
+                **_recall_identity_fields(d.metadata),
                 "title": d.metadata.get("source", d.metadata.get("file", "?")),
                 "snippet": d.page_content,
                 "source": d.metadata.get("collection", ""),

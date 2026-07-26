@@ -23,9 +23,14 @@ returned to the caller (the ``chat.py`` handler). The handler writes
 them to the ``tool_calls`` table **after** the parent ``InteractionRecord``
 lands so the FK constraint is satisfied.
 
-Cache hits skip the pending audit row entirely (ADR-025 §Decision.8) —
-a cache hit represents zero side effects on the memory layers and we
-already audited the real execution when the cache was populated.
+Cache hits STILL record a lightweight read-audit ``PendingToolCall``
+(ADR-060 / #372 D3): a cache-served recall shaped this interaction's
+answer, so the memory that shaped it must be identifiable from this
+interaction's own record. The row is flagged ``cache_hit`` inside
+``result_summary`` so it reads as a cache read, not a fresh execution.
+The original ADR-025 §Decision.8 optimisation still holds for the WRITE
+side — a cache hit mutates nothing on the memory layers; it is only the
+per-interaction reconstructability that now requires the row.
 """
 
 from __future__ import annotations
@@ -579,7 +584,11 @@ async def _execute_memory_tool(
     pending: list[PendingToolCall],
 ) -> None:
     """Dispatch one memory tool_call, append the tool_result message, and
-    record a pending audit row unless the call was a cache hit.
+    record a pending audit row. Cache hits are recorded too (ADR-060 /
+    #372 D3), flagged ``cache_hit`` inside ``result_summary`` so the memory
+    that shaped this interaction stays identifiable from the interaction's
+    own record; only the flag and the ~1ms duration distinguish a cache-
+    served row from a fresh read.
 
     This function owns the scope-defensive check: even though
     ``tools_visible_to`` already filtered at advertisement time, we
@@ -676,6 +685,34 @@ async def _execute_memory_tool(
                 user_context.user_id,
                 session_id,
                 duration_ms,
+            )
+            # ADR-060 / #372 D3 — a cache-served recall still SHAPED this
+            # interaction's answer, so it must be identifiable from this
+            # interaction's own record. Record a lightweight read-audit row
+            # carrying the served match ids (``result`` is already in hand),
+            # flagged ``cache_hit`` so the row is honestly contemporaneous —
+            # a cache read, not a fresh execution. No schema migration: the
+            # flag rides inside ``result_summary`` (the tool_calls table has
+            # no cache_hit column) and the ~1ms duration corroborates.
+            cache_error: str | None = None
+            cache_summary: str | None = None
+            if "error" in result:
+                cache_error = str(result.get("error"))
+                span.set_status(trace.StatusCode.ERROR, cache_error)
+            else:
+                cache_summary = json.dumps({"cache_hit": True, **result})[:1000]
+            pending.append(
+                PendingToolCall(
+                    tool_name=tool_name,
+                    user_id=user_context.user_id,
+                    agent_type=user_context.agent_type,
+                    args=json.dumps(args),
+                    result_summary=cache_summary,
+                    error=cache_error,
+                    started_at=started,
+                    duration_ms=duration_ms,
+                    granted_scope=tool.required_scope,
+                )
             )
             return
 
