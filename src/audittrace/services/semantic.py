@@ -151,20 +151,48 @@ class ChromaSemanticService(SemanticService):
                 query_kwargs: dict[str, Any] = {
                     "query_embeddings": [await self._embed_one(query)],
                     "n_results": min(k, count),
-                    "include": ["documents", "metadatas"],
+                    # ``distances`` rides along so each match records HOW
+                    # strongly it matched (#372 D2). ``ids`` is always returned
+                    # by ChromaDB and IS the stable ``document_id`` supplied at
+                    # upsert — we now thread it through instead of using it only
+                    # as a loop counter, so a ``tool_calls`` row names the exact
+                    # passage that shaped an answer, not just its text (#372 D1).
+                    "include": ["documents", "metadatas", "distances"],
                 }
                 if where is not None:
                     query_kwargs["where"] = where
                 results = await collection.query(**query_kwargs)
-                for i in range(len(results["ids"][0])):
+                ids_row = results["ids"][0]
+                # ``distances`` may be absent (older client / include dropped)
+                # or None — guard so a distance-less response never raises and
+                # ``distance`` degrades to ``None`` for that match.
+                distances = results.get("distances")
+                dist_row = distances[0] if distances else None
+                for i in range(len(ids_row)):
                     doc_content = results["documents"][0][i]
                     doc_metadata = (
                         results["metadatas"][0][i] if results.get("metadatas") else {}
                     )
+                    distance = (
+                        dist_row[i]
+                        if dist_row is not None and i < len(dist_row)
+                        else None
+                    )
                     all_docs.append(
                         Document(
                             page_content=doc_content,
-                            metadata={**doc_metadata, "collection": col_name},
+                            metadata={
+                                **doc_metadata,
+                                "collection": col_name,
+                                # #372 D1 — the ChromaDB id is the durable
+                                # document_id from upsert; recording it lets a
+                                # reconstruction query fetch this exact passage.
+                                "chunk_id": ids_row[i],
+                                # #372 D2 — the RAW ChromaDB distance (lower =
+                                # closer). Recorded honestly named, not converted
+                                # to a similarity score.
+                                "distance": distance,
+                            },
                         )
                     )
             except Exception as e:
