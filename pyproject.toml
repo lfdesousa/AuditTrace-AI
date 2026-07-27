@@ -143,7 +143,13 @@ addopts = "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["audittrace"]
+# `scripts/deploy` (the WS2 deterministic deploy runner) is measured alongside
+# the app package so the per-file ≥90% gate applies to it too. It is added to
+# `source` AND to the `--cov=scripts/deploy` flag in `make test` / CI: config
+# `source` alone is filtered out by the CLI `--cov=src`, and `--cov` alone is
+# filtered out by config `source` — coverage.py measures a file only when it is
+# reachable via BOTH. No other `scripts/*` module is dragged into the gate.
+source = ["audittrace", "scripts/deploy"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet
