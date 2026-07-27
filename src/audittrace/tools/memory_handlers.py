@@ -45,13 +45,20 @@ from audittrace.tools import register_memory_tool
 logger = logging.getLogger(__name__)
 
 
-# Snippet length for keyword-discovery tools (recall_decisions / recall_skills).
+# Snippet length for the discovery tools (recall_decisions / recall_skills).
 # Discovery results return short previews so the LLM can pick a candidate, then
-# fetch the full document via read_decision / read_skill on a follow-up call.
-# recall_semantic does NOT use this — its results are vector-store chunks that
-# are already bounded by the chunker, so truncating them again was hiding
-# useful context with no benefit.
+# fetch the full document via read_decision / read_skill on a follow-up call —
+# those reads still resolve the full ``.md`` from S3 by filename, so the preview
+# stays deliberately short even though the underlying store is now the ChromaDB
+# vector collection (#383). recall_semantic does NOT use this — its results are
+# vector-store chunks that are already bounded by the chunker, so truncating
+# them again was hiding useful context with no benefit.
 _SNIPPET_LIMIT = 400
+
+# Top-k for the discovery tools. The keyword layer they replaced returned every
+# substring hit; a vector store needs a bounded top-k. Kept small because these
+# are discovery previews (pick a candidate → read the full .md), not answers.
+_DISCOVERY_K = 5
 
 
 def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -63,11 +70,13 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     passage back:
 
     - ``id`` — the ChromaDB ``chunk_id`` (== the ``document_id`` supplied at
-      upsert) when the match came from the vector store (``recall_semantic``).
-      The keyword layers (``recall_decisions`` / ``recall_skills``) are
-      S3-backed and not indexed, so they carry no chunk id; ``id`` then falls
-      back to the stable source pointer, which is itself the durable
-      identifier ``read_decision`` / ``read_skill`` resolve by. Never blank.
+      upsert) when the match came from the vector store. All three vector
+      recall tools carry a chunk id: ``recall_semantic`` and — since #383 —
+      ``recall_decisions`` / ``recall_skills``, which now query the ChromaDB
+      ``decisions`` / ``skills`` collections too. When a match carries no chunk
+      id (a distance-less / degraded response), ``id`` falls back to the stable
+      source pointer — itself the durable ``.md`` filename ``read_decision`` /
+      ``read_skill`` resolve by. Never blank.
     - ``source_ref`` — stable pointer that survives a re-index (D1):
       ``file`` → ``source`` → ``title`` → ``chunk_id`` → ``collection``. Never
       blank. This is the audit-grade answer to "does that identifier still
@@ -76,8 +85,9 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     - ``sha256`` — ``document_sha256`` (markdown / manifest key) or
       ``document_hash`` (the key the PDF pipeline writes), else ``None``.
     - ``distance`` — the RAW ChromaDB distance (D2), lower = closer. Recorded
-      honestly named, not converted to a similarity score. ``None`` for the
-      keyword layers (no vector store) or a distance-less response.
+      honestly named, not converted to a similarity score. Non-null for every
+      vector-store match (all three recall tools post-#383); ``None`` only for a
+      distance-less / degraded response.
     """
     source_ref = (
         metadata.get("file")
@@ -122,25 +132,55 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         },
         "required": ["query"],
     },
+    # Scope UNCHANGED (#383). The DATA DOMAIN is still "decisions" (ADRs /
+    # episodic memory): recall_decisions discovers them and read_decision reads
+    # the full ``.md`` from S3 — both under ``memory:episodic:read``. Only the
+    # discovery STORE moved (S3 keyword → ChromaDB ``decisions`` vector
+    # collection). The semantic service enforces the per-user ``where`` from the
+    # threaded ``user_context``; it needs no scope of its own (the handler does
+    # not gate scope — ``tools_visible_to`` does). Retargeting this to
+    # ``memory:semantic:read`` would decouple recall from read and conflate the
+    # decisions domain with the general RAG corpus, so it stays as-is.
     required_scope="memory:episodic:read",
 )
 async def recall_decisions(
     user_context: UserContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Wrap ``EpisodicService.search`` in the canonical tool-result shape."""
+    """Discover decisions (ADRs) via the ChromaDB ``decisions`` vector
+    collection (#383), shaped into the canonical tool-result schema.
+
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    with ``collections=["decisions"]`` and the per-user ``where`` filter (the
+    service derives it from ``user_context``). The match's ``source`` field
+    stays the ``.md`` filename the indexer stamps (``metadata["source"]``), so
+    the model can chain recall → ``read_decision`` unchanged.
+    """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_decisions: 'query' is required and must be a string"}
 
-    episodic = get_episodic_service()
-    matches = await episodic.search(user_context, query)
+    semantic = get_semantic_service()
+    matches = await semantic.search(
+        user_context, query, k=_DISCOVERY_K, collections=["decisions"]
+    )
     return {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
-                "title": d.metadata.get("title", d.metadata.get("file", "ADR")),
+                # No ``title`` is stamped for .md vector docs; fall back to the
+                # filename so the preview still names its artefact.
+                "title": (
+                    d.metadata.get("title")
+                    or d.metadata.get("source")
+                    or d.metadata.get("file")
+                    or "ADR"
+                ),
                 "snippet": d.page_content[:_SNIPPET_LIMIT],
-                "source": d.metadata.get("file", ""),
+                # READ-FOLLOW-UP CONTRACT: the indexer stamps
+                # ``metadata["source"] = filename`` (routes/memory.py), so
+                # ``source`` carries the ``.md`` filename read_decision resolves
+                # by — never the chunk id. ``file`` is a legacy fallback.
+                "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
             for d in matches
         ],
@@ -173,25 +213,50 @@ async def recall_decisions(
         },
         "required": ["query"],
     },
+    # Scope UNCHANGED (#383). Same reasoning as recall_decisions: the domain is
+    # still "skills" (procedural memory) — recall_skills discovers, read_skill
+    # reads the full ``.md`` from S3, both under ``memory:procedural:read``.
+    # Only the discovery store moved to the ChromaDB ``skills`` vector
+    # collection; the semantic service applies the per-user ``where`` from the
+    # threaded ``user_context`` and needs no scope of its own.
     required_scope="memory:procedural:read",
 )
 async def recall_skills(
     user_context: UserContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Wrap ``ProceduralService.search`` in the canonical tool-result shape."""
+    """Discover skills via the ChromaDB ``skills`` vector collection (#383),
+    shaped into the canonical tool-result schema.
+
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    with ``collections=["skills"]`` and the per-user ``where`` filter. The
+    match's ``source`` field stays the ``.md`` filename (``metadata["source"]``)
+    so the model can chain recall → ``read_skill`` unchanged.
+    """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_skills: 'query' is required and must be a string"}
 
-    procedural = get_procedural_service()
-    matches = await procedural.search(user_context, query)
+    semantic = get_semantic_service()
+    matches = await semantic.search(
+        user_context, query, k=_DISCOVERY_K, collections=["skills"]
+    )
     return {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
-                "title": d.metadata.get("skill", d.metadata.get("file", "Skill")),
+                # The skills indexer stamps ``metadata["skill"] = <name>``
+                # (routes/memory.py); prefer it, then the filename.
+                "title": (
+                    d.metadata.get("skill")
+                    or d.metadata.get("source")
+                    or d.metadata.get("file")
+                    or "Skill"
+                ),
                 "snippet": d.page_content[:_SNIPPET_LIMIT],
-                "source": d.metadata.get("file", ""),
+                # READ-FOLLOW-UP CONTRACT: ``source`` is the ``.md`` filename
+                # read_skill resolves by (stamped ``metadata["source"]``), never
+                # the chunk id.
+                "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
             for d in matches
         ],

@@ -81,10 +81,20 @@ def _populated_container():
         skill="IAM",
         file="SKILL-IAM.md",
     )
-    c._instances["semantic"].add_document(
-        "RAG body about cache compression",
-        source="ADR-009",
-        collection="decisions",
+    # #383 — recall_decisions / recall_skills now discover via the ChromaDB
+    # VECTOR store (semantic service), not the S3 keyword layer. Seed the
+    # semantic "decisions" collection with the doc these loop tests recall,
+    # stamped ``source`` = the ``.md`` filename exactly as the real indexer
+    # does — so the served-match id is the durable ``ADR-009.md`` the audit
+    # row names (D3 / #372). Direct append (this fixture is sync;
+    # MockSemanticService.add_document is a coroutine).
+    from langchain_core.documents import Document
+
+    c._instances["semantic"]._docs.setdefault("decisions", []).append(
+        Document(
+            page_content="RAG body about cache compression",
+            metadata={"source": "ADR-009.md", "collection": "decisions"},
+        )
     )
     prior = dependencies.container
     dependencies.container = c
