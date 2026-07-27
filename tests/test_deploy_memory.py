@@ -397,3 +397,56 @@ def test_no_url_substring_in_source():
     src = Path(memory.__file__).read_text()
     assert " in url" not in src
     assert "in front_door" not in src
+
+
+# ── WS5: transport-timeout hardening at the REAL egress seam ─────────────────
+#
+# A READ timeout raises a bare ``TimeoutError`` (== ``socket.timeout``, an
+# ``OSError`` that is NOT a ``URLError``). The seam must map the WHOLE transport
+# class to the status-0 sentinel so each caller honours its OWN contract:
+# best-effort recall → ``[]``; reliable log → a CLEAN ``DeployLogError``. These
+# drive the REAL ``_http_request`` (patching ``urllib.request.urlopen``) and are
+# falsifiable: revert to ``except URLError`` and they raise a bare TimeoutError.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError("read timed out"),  # == socket.timeout on a read timeout
+        ConnectionResetError("peer reset"),
+        OSError("network unreachable"),
+    ],
+)
+def test_http_request_maps_transport_errors_to_status_zero(monkeypatch, exc):
+    def _raise(*a, **k):
+        raise exc
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise)
+    status, headers, body = memory._http_request("GET", "https://audittrace.test/x")
+    assert status == 0 and headers == {} and body == b""
+
+
+def test_recall_read_timeout_returns_empty_via_real_seam(monkeypatch):
+    """recall is BEST-EFFORT: a real read timeout must yield ``[]``, never raise."""
+    _clear_env_token(monkeypatch)
+
+    def _timeout(*a, **k):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+    assert recall_deploy_lessons("q", front_door=FRONT, token=TOKEN) == []
+
+
+def test_log_read_timeout_raises_clean_deploy_log_error(monkeypatch):
+    """log is RELIABLE: a real read timeout on the upload becomes a CLEAN
+    ``DeployLogError`` (status 0), NOT a bare ``TimeoutError`` escaping the API."""
+    _clear_env_token(monkeypatch)
+
+    def _timeout(*a, **k):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+    with pytest.raises(DeployLogError) as exc:
+        log_deploy_record("t", front_door=FRONT, token=TOKEN, filename="z.md")
+    assert exc.value.step == "upload"
+    assert exc.value.status == 0

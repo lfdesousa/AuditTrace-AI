@@ -43,7 +43,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
 logger = logging.getLogger("audittrace.deploy.memory")
@@ -92,6 +92,15 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
     socket is opened. A transport failure returns status ``0`` so callers read it
     as a hard failure rather than an exception. ``context`` (when set) is the
     unverified SSL context selected by ``insecure=True``.
+
+    Real ``urlopen`` RAISES the whole transport-error class here, not just
+    ``URLError``: a READ timeout surfaces as a bare ``TimeoutError`` (==
+    ``socket.timeout``, an ``OSError``) that is NOT a ``URLError`` (the WS5
+    finding). Catching ``OSError`` after ``HTTPError`` collapses the ENTIRE class
+    — ``URLError``, ``TimeoutError``/``socket.timeout``, ``ConnectionError`` — to
+    the status-``0`` sentinel in ONE place, so every caller maps a timeout to its
+    own clean contract: ``recall_deploy_lessons`` → ``[]``, and
+    ``log_deploy_record`` → a clean ``DeployLogError`` via its non-200 guard.
     """
     request = urllib.request.Request(
         url, data=body, headers=headers or {}, method=method
@@ -106,7 +115,9 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
         return status, resp_headers, payload
     except HTTPError as exc:
         return exc.code, {}, exc.read()
-    except URLError:
+    except OSError:
+        # URLError (an OSError), a bare TimeoutError/socket.timeout on a read
+        # timeout, or any ConnectionError — one sentinel for the whole class.
         return 0, {}, b""
 
 

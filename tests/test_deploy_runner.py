@@ -256,6 +256,27 @@ def test_run_still_emits_report_on_resolve_failure(tmp_path, monkeypatch):
     assert report["certified"] is None
 
 
+def test_run_still_emits_report_on_registry_read_timeout(tmp_path, monkeypatch):
+    """WS5 E2E: a registry READ timeout at P1 now surfaces as a clean
+    ``DigestResolutionError`` upstream (registry seam hardening), so the runner
+    aborts the mutation sequence but STILL emits a report — no bare TimeoutError
+    escapes ``run()``. Falsifiable: revert the registry caller catches and this
+    raises TimeoutError instead of producing an aborted report."""
+    # preflight ok (subprocess), but the registry egress seam TIMES OUT.
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+
+    def _timeout(url, headers=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(registry, "_http_get", _timeout)
+    report = DeployRunner(_cfg(tmp_path)).run()  # must NOT raise
+    assert report["aborted"] is True
+    assert report["phases"][1]["name"] == runner.PHASES[1]
+    assert report["phases"][1]["status"] == "failed"
+    assert "read timed out" in report["phases"][1]["detail"]
+    assert report["certified"] is None
+
+
 # ── version normalization ─────────────────────────────────────────────────────
 
 
