@@ -86,6 +86,7 @@ jobs:
         run: |
           pytest tests/ -v \
             --cov=src \
+            --cov=scripts/deploy \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html:htmlcov \

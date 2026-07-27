@@ -45,7 +45,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -83,7 +83,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "✅ Tests passed"
