@@ -16,17 +16,22 @@ helper → handler → underlying service, using the mock services from
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
+from unittest.mock import AsyncMock
 
 import fakeredis
 import pytest
 import pytest_asyncio
+from langchain_core.documents import Document
 
 # Side-effect import — running the module is what runs the @register_memory_tool
 # decorators. Must happen before any test code dispatches through the registry.
 import audittrace.tools.memory_handlers  # noqa: F401
 from audittrace import dependencies
+from audittrace.db.factory import MockChromaDBFactory
 from audittrace.dependencies import create_test_container
-from audittrace.identity import sentinel_user_context
+from audittrace.identity import UserContext, sentinel_user_context
+from audittrace.services.semantic import ChromaSemanticService, SemanticService
 from audittrace.tools import (
     MEMORY_TOOL_REGISTRY,
     get_tool_by_name,
@@ -38,6 +43,49 @@ from audittrace.tools.cache import (
     reset_tool_result_cache,
     set_tool_result_cache,
 )
+
+
+class _SpySemanticService(SemanticService):
+    """Records every ``search`` call and returns a canned document list.
+
+    Lets a test assert exactly HOW ``recall_decisions`` / ``recall_skills``
+    now call the semantic service (which collections, which user_context, which
+    k) — the #383 contract — without standing up a real ChromaDB.
+    """
+
+    def __init__(self, docs: list[Document]):
+        self.calls: list[dict[str, Any]] = []
+        self._docs = docs
+
+    async def search(
+        self,
+        user_context: UserContext,
+        query: str,
+        k: int = 4,
+        collections: list[str] | None = None,
+    ) -> list[Document]:
+        self.calls.append(
+            {
+                "user_context": user_context,
+                "query": query,
+                "k": k,
+                "collections": collections,
+            }
+        )
+        return self._docs
+
+    async def available_collections(self) -> list[str]:
+        return []
+
+    async def upsert(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        raise AssertionError("recall_* must not upsert")
+
+    async def delete_document(self, *args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("recall_* must not delete")  # pragma: no cover
+
+    async def get_document(self, *args: Any, **kwargs: Any) -> Document | None:
+        raise AssertionError("recall_* must not get_document")  # pragma: no cover
+
 
 # ────────────────────────────── Fixtures ────────────────────────────────────
 
@@ -83,10 +131,36 @@ async def _populated_container():
         ["ADR-009 accepted"],
         session_id="seed-kv-1",
     )
-    await c._instances["semantic"].add_document(
-        "RAG body about cache optimisation",
-        source="ADR-009",
-        collection="decisions",
+    # #383 — recall_decisions / recall_skills now read the ChromaDB VECTOR
+    # store via the semantic service, not the S3 keyword layers. Seed the
+    # semantic mock with a decisions doc and a skills doc, each stamped the way
+    # the real indexer stamps them (``source`` = the ``.md`` filename;
+    # ``skill`` = the skill name), so the recall→read chaining contract is
+    # exercised end to end. Direct-append (not add_document) so the metadata is
+    # under our control — the mock's add_document takes only source/collection.
+    from langchain_core.documents import Document as _Doc
+
+    _sem = c._instances["semantic"]
+    _sem._docs.setdefault("decisions", []).append(
+        _Doc(
+            page_content="KV cache compression reduces memory by 75%",
+            metadata={
+                "source": "ADR-009.md",
+                "collection": "decisions",
+                "user_id": sentinel_user_context().user_id,
+            },
+        )
+    )
+    _sem._docs.setdefault("skills", []).append(
+        _Doc(
+            page_content="OAuth2 OIDC JWT validation patterns",
+            metadata={
+                "source": "SKILL-IAM.md",
+                "skill": "IAM",
+                "collection": "skills",
+                "user_id": sentinel_user_context().user_id,
+            },
+        )
     )
     # Swap global container so the get_*_service helpers see our seeded one.
     prior = dependencies.container
@@ -137,7 +211,10 @@ class TestCanonicalShape:
         assert was_cache_hit is False
         assert set(result.keys()) >= {"matches", "total", "truncated"}
         assert result["total"] == 1
-        assert result["matches"][0]["title"] == "ADR-009"
+        # #383 — no ``title`` is stamped on .md vector docs, so the preview
+        # title falls back to the ``.md`` filename (the indexer's ``source``).
+        assert result["matches"][0]["title"] == "ADR-009.md"
+        assert result["matches"][0]["source"] == "ADR-009.md"
         assert "cache" in result["matches"][0]["snippet"].lower()
 
     @pytest.mark.asyncio
@@ -754,3 +831,186 @@ class TestRecallSemanticUncap:
             m["snippet"] for m in result["matches"] if len(m["snippet"]) > 400
         ]
         assert long_snippets, "expected at least one untruncated semantic chunk"
+
+
+class TestRecallReadsVectorStore383:
+    """#383 — recall_decisions / recall_skills read the ChromaDB VECTOR store
+    via the semantic service (with the per-user ``where``), NOT the S3 keyword
+    layer. These tests are falsifiable: reverting either handler to the S3
+    episodic/procedural service fails at least one of them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_queries_semantic_decisions_collection(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """recall_decisions calls the semantic service with
+        ``collections=["decisions"]``, the caller's own ``user_context`` (the
+        input the per-user ``where`` is derived from) and the discovery ``k`` —
+        and shapes the match with the ``.md`` filename + a non-null distance."""
+        spy = _SpySemanticService(
+            [
+                Document(
+                    page_content="KV cache compression decision body",
+                    metadata={
+                        "source": "ADR-050.md",
+                        "chunk_id": "decisions:ADR-050.md:3",
+                        "distance": 0.2,
+                        "collection": "decisions",
+                        "user_id": "alice",
+                    },
+                )
+            ]
+        )
+        _populated_container._instances["semantic"] = spy
+        alice = replace(
+            sentinel_user_context(),
+            user_id="alice",
+            is_admin=False,
+            scopes=("memory:episodic:read",),
+        )
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(alice, tool, {"query": "kv cache"}, "sess-1")
+
+        assert len(spy.calls) == 1
+        assert spy.calls[0]["collections"] == ["decisions"]
+        assert spy.calls[0]["user_context"] is alice  # threaded → per-user where
+        assert spy.calls[0]["k"] == 5
+
+        m = result["matches"][0]
+        assert m["source"] == "ADR-050.md"  # read-follow-up filename …
+        assert m["id"] == "decisions:ADR-050.md:3"  # … not the chunk id
+        assert m["source_ref"] == "ADR-050.md"
+        assert m["distance"] == 0.2  # vector store → non-null distance
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_queries_semantic_skills_collection(
+        self, _populated_container, _fakeredis_cache
+    ):
+        spy = _SpySemanticService(
+            [
+                Document(
+                    page_content="OAuth2 BFF pattern skill body",
+                    metadata={
+                        "source": "SKILL-IAM.md",
+                        "skill": "IAM",
+                        "chunk_id": "skills:SKILL-IAM.md:0",
+                        "distance": 0.11,
+                        "collection": "skills",
+                        "user_id": "alice",
+                    },
+                )
+            ]
+        )
+        _populated_container._instances["semantic"] = spy
+        alice = replace(
+            sentinel_user_context(),
+            user_id="alice",
+            is_admin=False,
+            scopes=("memory:procedural:read",),
+        )
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(alice, tool, {"query": "oauth2"}, "sess-1")
+
+        assert len(spy.calls) == 1
+        assert spy.calls[0]["collections"] == ["skills"]
+        assert spy.calls[0]["user_context"] is alice
+        assert spy.calls[0]["k"] == 5
+
+        m = result["matches"][0]
+        assert m["title"] == "IAM"  # skill name preferred for the preview title
+        assert m["source"] == "SKILL-IAM.md"  # read-follow-up filename
+        assert m["id"] == "skills:SKILL-IAM.md:0"
+        assert m["distance"] == 0.11
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_does_not_touch_s3_episodic_layer(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Falsifiability: if recall_decisions still queried the S3 episodic
+        keyword layer, this exploding stand-in would surface as an error. It
+        must serve the request purely from the semantic decisions seed."""
+
+        class _Boom:
+            async def search(self, *args: Any, **kwargs: Any):
+                raise AssertionError("recall_decisions must NOT call S3 episodic")
+
+        _populated_container._instances["episodic"] = _Boom()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            sentinel_user_context(), tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert "error" not in result
+        assert result["total"] == 1  # from the semantic "decisions" seed
+        assert result["matches"][0]["source"] == "ADR-009.md"
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_does_not_touch_s3_procedural_layer(
+        self, _populated_container, _fakeredis_cache
+    ):
+        class _Boom:
+            async def search(self, *args: Any, **kwargs: Any):
+                raise AssertionError("recall_skills must NOT call S3 procedural")
+
+        _populated_container._instances["procedural"] = _Boom()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            sentinel_user_context(), tool, {"query": "oauth2"}, "sess-1"
+        )
+        assert "error" not in result
+        assert result["total"] == 1  # from the semantic "skills" seed
+        assert result["matches"][0]["source"] == "SKILL-IAM.md"
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_per_user_where_isolation_and_distance(
+        self, _fakeredis_cache, monkeypatch
+    ):
+        """End-to-end through the REAL ``ChromaSemanticService`` over a mock
+        ChromaDB whose ``query`` honours the ``where`` filter: a non-admin
+        caller sees ONLY their own indexed decision (the per-user ``where`` is
+        exercised), the surfaced ``source`` is the ``.md`` filename (read-
+        follow-up), the ``id`` is the durable chunk id, and ``distance`` is
+        non-null — the #383 signal that the fix landed."""
+        monkeypatch.setattr(
+            "audittrace.services.semantic.embed_via_nomic",
+            AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+        )
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        col = await client.get_or_create_collection(name="decisions_v2")
+        await col.add(
+            ids=["decisions:ADR-060.md:0", "decisions:ADR-061.md:0"],
+            documents=["alice cache decision", "bob cache decision"],
+            metadatas=[
+                {"source": "ADR-060.md", "user_id": "alice"},
+                {"source": "ADR-061.md", "user_id": "bob"},
+            ],
+        )
+        service = ChromaSemanticService(
+            client=client,
+            default_collections=["decisions"],
+            embed_url="",
+            embed_model="nomic-embed-text",
+        )
+        c = create_test_container()
+        c._instances["semantic"] = service
+        prior = dependencies.container
+        dependencies.container = c
+        try:
+            alice = replace(
+                sentinel_user_context(),
+                user_id="alice",
+                is_admin=False,
+                scopes=("memory:episodic:read",),
+            )
+            tool = get_tool_by_name("recall_decisions")
+            result, _ = await invoke_tool(alice, tool, {"query": "cache"}, "sess-1")
+        finally:
+            dependencies.container = prior
+
+        sources = {m["source"] for m in result["matches"]}
+        assert sources == {"ADR-060.md"}  # bob's row hidden by the per-user where
+        m = result["matches"][0]
+        assert m["source"] == "ADR-060.md"  # read-follow-up filename …
+        assert m["id"] == "decisions:ADR-060.md:0"  # … durable chunk id for audit
+        assert m["distance"] is not None  # vector store → non-null distance
