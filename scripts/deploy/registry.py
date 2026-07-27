@@ -21,7 +21,6 @@ import json
 import logging
 import urllib.request
 from dataclasses import dataclass
-from urllib.error import HTTPError, URLError
 
 logger = logging.getLogger(__name__)
 
@@ -114,10 +113,15 @@ def _get_hub_token(repo_path: str) -> str:
     # Real ``urlopen`` RAISES HTTPError on a non-2xx (401/429/5xx); the mocked
     # egress in tests returns a status instead. Normalise BOTH shapes to a clean
     # DigestResolutionError so a resolution failure never escapes as a raw
-    # urllib error (the runner must always still emit a report).
+    # urllib error (the runner must always still emit a report). ``OSError`` is
+    # the superclass of HTTPError/URLError AND of a bare ``TimeoutError`` (==
+    # ``socket.timeout``) raised on a READ timeout — which is NOT a ``URLError``,
+    # so catching only ``(HTTPError, URLError)`` would let a timeout escape and
+    # crash the deploy runner with no report (the WS5 finding). Catch the whole
+    # transport class.
     try:
         status, _headers, body = _http_get(url)
-    except (HTTPError, URLError) as exc:
+    except OSError as exc:
         raise DigestResolutionError(f"Docker Hub auth failed: {exc}") from exc
     if status != 200:
         raise DigestResolutionError(f"Docker Hub auth returned HTTP {status}")
@@ -131,8 +135,11 @@ def _manifest_digest(base: str, repo_path: str, tag: str, token: str | None) -> 
     """Return the ``Docker-Content-Digest`` for ``base/repo_path:tag``.
 
     Any transport failure (real ``urlopen`` raises HTTPError on 404 for a bad
-    tag) or a non-200 status becomes a :class:`DigestResolutionError` so callers
-    have a single, catchable failure type.
+    tag, or a bare ``TimeoutError``/``socket.timeout`` — an ``OSError``, NOT a
+    ``URLError`` — on a READ timeout) or a non-200 status becomes a
+    :class:`DigestResolutionError` so callers have a single, catchable failure
+    type and the runner always still emits a report. ``OSError`` covers the whole
+    class (HTTPError/URLError/TimeoutError/ConnectionError).
     """
     url = f"{base}/v2/{repo_path}/manifests/{tag}"
     headers = {"Accept": _MANIFEST_ACCEPT}
@@ -140,7 +147,7 @@ def _manifest_digest(base: str, repo_path: str, tag: str, token: str | None) -> 
         headers["Authorization"] = f"Bearer {token}"
     try:
         status, resp_headers, _body = _http_get(url, headers)
-    except (HTTPError, URLError) as exc:
+    except OSError as exc:
         raise DigestResolutionError(
             f"manifest fetch for {repo_path}:{tag} failed: {exc}"
         ) from exc
@@ -176,7 +183,10 @@ def resolve(version: str, registry: str = "hub") -> ImageRef:
     # local
     try:
         digest = _manifest_digest(base, repo_path, version, token=None)
-    except (DigestResolutionError, HTTPError, URLError, OSError) as exc:
+    except (DigestResolutionError, OSError) as exc:
+        # OSError subsumes HTTPError/URLError/TimeoutError/ConnectionError; a local
+        # registry that is unreachable OR times out is a SOFT failure here (the
+        # k3s mirror may not be reachable from the runner host) — unpinned ref.
         logger.warning("local registry digest unresolved for %s: %s", version, exc)
         digest = None
     return ImageRef(repository, version, digest, registry)

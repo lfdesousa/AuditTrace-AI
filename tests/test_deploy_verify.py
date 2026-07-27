@@ -857,3 +857,75 @@ def test_run_executes_real_subprocess():
 
 def test_now_iso_has_t():
     assert "T" in verify._now_iso()
+
+
+# ── WS5: transport-timeout hardening at the REAL egress seam ─────────────────
+#
+# The live fault-injection finding: a front-door READ timeout raises a bare
+# ``TimeoutError`` (== ``socket.timeout``, an ``OSError`` that is NOT a
+# ``URLError``), so the former ``except (HTTPError, URLError)`` let it escape and
+# CRASHED the verify runner with no verdict. These tests drive the REAL
+# ``_http_request`` (patching ``urllib.request.urlopen`` to raise) and are
+# FALSIFIABLE: revert the seam to ``except URLError`` and they raise instead of
+# producing the clean sentinel / FAIL verdict.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError("read timed out"),  # == socket.timeout on a read timeout
+        ConnectionResetError("peer reset"),
+        OSError("network unreachable"),
+    ],
+)
+def test_http_request_maps_transport_errors_to_status_zero(monkeypatch, exc):
+    def _raise(*a, **k):
+        raise exc
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise)
+    status, headers, body = verify._http_request(
+        "GET", "https://audittrace.example/health"
+    )
+    assert status == 0 and headers == {} and body == b""
+
+
+def test_read_timeout_fails_probe_and_still_produces_verdict_and_report(
+    tmp_path, monkeypatch
+):
+    """A front-door READ timeout at the REAL seam → the HTTP probes FAIL, the
+    runner STILL emits a verdict (FAIL) and writes a report bundle, and NO
+    exception escapes ``run()``. This is the WS5 crash, now a clean failure."""
+
+    def _timeout(*a, **k):
+        raise TimeoutError("read timed out")
+
+    # urlopen times out for every front-door call; cluster reads fail; a token
+    # exists so recall-e2e actually reaches the (timing-out) front door.
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+
+    report = VerifyRunner(_cfg(tmp_path)).run()  # must NOT raise
+
+    assert report["verdict"] == FAIL
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    # both front-door probes fail cleanly on the transport timeout
+    assert statuses["health-version"] == FAIL
+    assert statuses["recall-e2e"] == FAIL
+    # the verdict is complete (all five probes ran) and a bundle was written
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+    assert list((tmp_path / "runs").glob("verify-v9.9.9-*.json"))
+
+
+def test_health_probe_read_timeout_fails_via_real_seam(tmp_path, monkeypatch):
+    """Narrow proof: a single probe whose HTTP call times out records FAIL (status
+    sentinel 0), never an uncaught exception."""
+
+    def _timeout(*a, **k):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+    res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == FAIL
+    assert res.evidence["http_status"] == 0

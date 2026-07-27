@@ -154,3 +154,43 @@ def test_resolve_hub_manifest_urlerror_becomes_clean(monkeypatch):
     monkeypatch.setattr(registry, "_http_get", fake_get)
     with pytest.raises(DigestResolutionError, match="manifest fetch"):
         registry.resolve("1.13.0", "hub")
+
+
+# ── WS5: transport-timeout hardening ─────────────────────────────────────────
+#
+# A READ timeout raises a bare ``TimeoutError`` (== ``socket.timeout``, an
+# ``OSError`` that is NOT a ``URLError``). The callers must map the WHOLE
+# transport class to a CLEAN ``DigestResolutionError`` (hub) or a soft unpinned
+# ref (local) so the runner always still emits a report. Falsifiable: revert the
+# caller catches to ``(HTTPError, URLError)`` and these raise a bare TimeoutError.
+
+
+def test_resolve_hub_auth_timeout_becomes_clean(monkeypatch):
+    def _timeout(url, headers=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(registry, "_http_get", _timeout)
+    with pytest.raises(DigestResolutionError, match="auth failed"):
+        registry.resolve("1.13.0", "hub")
+
+
+def test_resolve_hub_manifest_timeout_becomes_clean(monkeypatch):
+    def fake_get(url, headers=None):
+        if urlparse(url).hostname == "auth.docker.io":
+            return 200, {}, json.dumps({"token": "t"}).encode()
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(registry, "_http_get", fake_get)
+    with pytest.raises(DigestResolutionError, match="manifest fetch"):
+        registry.resolve("1.13.0", "hub")
+
+
+def test_resolve_local_timeout_is_soft(monkeypatch):
+    def _timeout(url, headers=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(registry, "_http_get", _timeout)
+    ref = registry.resolve("v2", "local")
+    # a local-registry timeout is soft: unpinned ref, no exception
+    assert ref.digest is None
+    assert ref.pinned is False

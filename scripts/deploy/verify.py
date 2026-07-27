@@ -52,7 +52,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from scripts.deploy import registry
@@ -168,6 +168,16 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
     real socket is opened. A transport failure returns status ``0`` so a probe
     reads it as a hard failure rather than an exception. ``context`` (when set)
     is the unverified SSL context selected by ``--insecure``.
+
+    Real ``urlopen`` RAISES the WHOLE transport-error class here, not just
+    ``URLError``: a READ timeout surfaces as a bare ``TimeoutError`` (==
+    ``socket.timeout``, an ``OSError``) that is NOT a ``URLError``, so an
+    ``except (HTTPError, URLError)`` would let it escape and crash the probe with
+    no verdict (the WS5 fault-injection finding; same class as the WS2 CodeQL
+    urllib lesson). Catching ``OSError`` after ``HTTPError`` maps the ENTIRE class
+    — ``URLError``, ``TimeoutError``/``socket.timeout``, ``ConnectionError`` — to
+    the same clean status-``0`` sentinel in ONE place, so no probe can ever see an
+    uncaught transport exception.
     """
     request = urllib.request.Request(
         url, data=body, headers=headers or {}, method=method
@@ -182,7 +192,9 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
         return status, resp_headers, payload
     except HTTPError as exc:
         return exc.code, {}, exc.read()
-    except URLError:
+    except OSError:
+        # URLError (an OSError), a bare TimeoutError/socket.timeout on a read
+        # timeout, or any ConnectionError — one sentinel for the whole class.
         return 0, {}, b""
 
 
