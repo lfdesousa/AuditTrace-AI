@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 import pytest
 
@@ -37,7 +38,7 @@ def test_resolve_hub_happy_path(monkeypatch):
 
     def fake_get(url, headers=None):
         calls.append(url)
-        if "auth.docker.io" in url:
+        if urlparse(url).hostname == "auth.docker.io":
             return 200, {}, json.dumps({"token": "tok123"}).encode()
         assert headers["Authorization"] == "Bearer tok123"
         return 200, _digest_headers("sha256:cafe"), b""
@@ -47,7 +48,7 @@ def test_resolve_hub_happy_path(monkeypatch):
     assert ref.repository == "docker.io/lfds/audittrace-memory-server"
     assert ref.digest == "sha256:cafe"
     assert ref.pinned is True
-    assert any("auth.docker.io" in u for u in calls)
+    assert any(urlparse(u).hostname == "auth.docker.io" for u in calls)
 
 
 def test_resolve_hub_auth_non_200(monkeypatch):
@@ -66,7 +67,7 @@ def test_resolve_hub_auth_no_token(monkeypatch):
 
 def test_resolve_hub_manifest_non_200(monkeypatch):
     def fake_get(url, headers=None):
-        if "auth.docker.io" in url:
+        if urlparse(url).hostname == "auth.docker.io":
             return 200, {}, json.dumps({"token": "t"}).encode()
         return 404, {}, b""
 
@@ -77,7 +78,7 @@ def test_resolve_hub_manifest_non_200(monkeypatch):
 
 def test_resolve_hub_manifest_missing_digest(monkeypatch):
     def fake_get(url, headers=None):
-        if "auth.docker.io" in url:
+        if urlparse(url).hostname == "auth.docker.io":
             return 200, {}, json.dumps({"token": "t"}).encode()
         return 200, {}, b""  # no docker-content-digest header
 
@@ -135,7 +136,7 @@ def test_resolve_hub_auth_httperror_becomes_clean(monkeypatch):
 def test_resolve_hub_manifest_httperror_becomes_clean(monkeypatch):
     # token OK, then the manifest fetch raises HTTPError (e.g. 404 bad tag).
     def fake_get(url, headers=None):
-        if "auth.docker.io" in url:
+        if urlparse(url).hostname == "auth.docker.io":
             return 200, {}, json.dumps({"token": "t"}).encode()
         raise HTTPError(url, 404, "Not Found", {}, None)
 
@@ -146,7 +147,7 @@ def test_resolve_hub_manifest_httperror_becomes_clean(monkeypatch):
 
 def test_resolve_hub_manifest_urlerror_becomes_clean(monkeypatch):
     def fake_get(url, headers=None):
-        if "auth.docker.io" in url:
+        if urlparse(url).hostname == "auth.docker.io":
             return 200, {}, json.dumps({"token": "t"}).encode()
         raise URLError("connection reset")
 
