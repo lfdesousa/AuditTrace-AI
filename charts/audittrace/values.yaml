@@ -55,6 +55,23 @@ memoryServer:
   # deployment template). Single-node dev / laptop k3s + CI override with
   # `--set memoryServer.replicaCount=1` (ScheduleAnyway makes 3-on-1-node safe).
   replicaCount: 3
+  # Rollout strategy. Default is surge-safe: maxSurge=0 means the old pod is
+  # terminated BEFORE the new one starts, so a single-node cluster
+  # (replicaCount=1) never runs two memory-server pods at once — that surge
+  # onto the one node was the 2026-07-26 cascade root cause (a 2nd pod's
+  # app+istio+vault sidecars contended for CPU, starved the vault injector,
+  # and the fail-closed exit 79 → CrashLoop chained into a full outage). On a
+  # multi-replica cluster (replicaCount=3) maxSurge=0/maxUnavailable=1 rolls
+  # one pod at a time, always keeping 2/3 Ready → zero downtime and no added
+  # node pressure. Operators wanting a faster surging roll on a large cluster
+  # can override maxSurge here (or set `strategy: null` to fall back to the
+  # k8s default, documented as unsafe on a single node — `{}` will NOT do it,
+  # Helm merges maps so only an explicit null deletes the block).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   image:
     # Published by .github/workflows/publish.yml on every v*.*.* tag —
     # multi-arch (linux/amd64,linux/arm64). Operators with an internal

@@ -7,6 +7,13 @@ metadata:
     app.kubernetes.io/component: memory-server
 spec:
   replicas: {{ .Values.memoryServer.replicaCount }}
+  # Surge-safe rollout (default maxSurge=0/maxUnavailable=1). Guarded `with`
+  # so an operator can set `memoryServer.strategy: null` to fall back to the
+  # k8s default (maxSurge=25%) — unsafe on a single node, see values.yaml.
+  {{- with .Values.memoryServer.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "audittrace.selectorLabels" . | nindent 6 }}

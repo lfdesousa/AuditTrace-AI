@@ -272,6 +272,110 @@ class TestMemoryServerEntrypointSafety:
         )
 
 
+class TestMemoryServerSurgeSafeStrategy:
+    """WS1 (ADR — CD-agent Component 1): the memory-server Deployment must
+    render a surge-safe RollingUpdate strategy BY DEFAULT.
+
+    History: on 2026-07-26 a routine image roll on the single-node laptop
+    k3s cascaded into a full outage. Root cause: this Deployment had NO
+    ``strategy:`` block, so it inherited the k8s default ``maxSurge=25%``.
+    On ``replicaCount=1`` that rounds up to 1 and surges a SECOND
+    memory-server pod (app + istio + vault sidecars) onto the one node —
+    CPU contention starved the vault injector, its admitted-sidecarless pod
+    hit the fail-closed exit 79, and the chain locked up the mesh.
+
+    The durable fix is a values-driven ``memoryServer.strategy`` defaulting
+    to ``maxSurge=0, maxUnavailable=1`` — correct for BOTH single node
+    (never two pods) and cloud HA 3-replica (one-at-a-time, zero downtime,
+    no surge). These tests pin the default AND prove an operator override is
+    honoured; they are designed to FAIL loudly if the strategy block is ever
+    dropped or its surge default regresses to the unsafe k8s inheritance.
+    """
+
+    def _strategy(self, extra_args: list[str]) -> dict:
+        out = _render(["--set", "vault.enabled=true", *extra_args])
+        doc = _find_workload(out, "Deployment", "audittrace-memory-server")
+        return doc["spec"].get("strategy") or {}
+
+    def test_default_strategy_is_surge_safe(self) -> None:
+        """By DEFAULT the rendered Deployment must be surge-safe:
+        maxSurge=0 (never a second pod on a single node) and
+        maxUnavailable=1 (one pod at a time on an HA cluster)."""
+        strategy = self._strategy([])
+        assert strategy.get("type") == "RollingUpdate", (
+            "memory-server must use a RollingUpdate strategy; got "
+            f"{strategy.get('type')!r}. Without an explicit surge-safe "
+            "strategy the Deployment inherits the k8s default maxSurge=25% "
+            "which surges a 2nd pod onto a single node (2026-07-26 cascade)."
+        )
+        rolling = strategy.get("rollingUpdate") or {}
+        assert rolling.get("maxSurge") == 0, (
+            "memory-server rollout must have maxSurge=0 so a single-node "
+            "cluster never runs two pods at once (the 2026-07-26 cascade "
+            f"root cause). Got maxSurge={rolling.get('maxSurge')!r}."
+        )
+        assert rolling.get("maxUnavailable") == 1, (
+            "memory-server rollout must have maxUnavailable=1 so an HA "
+            "cluster rolls one pod at a time with zero downtime. Got "
+            f"maxUnavailable={rolling.get('maxUnavailable')!r}."
+        )
+
+    def test_default_strategy_holds_on_single_node_replica_count(self) -> None:
+        """The surge-safe default must not depend on replicaCount — the
+        laptop path (replicaCount=1) is exactly where the cascade fired."""
+        rolling = (
+            self._strategy(["--set", "memoryServer.replicaCount=1"]).get(
+                "rollingUpdate"
+            )
+            or {}
+        )
+        assert rolling.get("maxSurge") == 0
+        assert rolling.get("maxUnavailable") == 1
+
+    def test_operator_can_override_max_surge(self) -> None:
+        """An operator on a large cluster may opt into a surging roll.
+        Overriding maxSurge via values must be honoured verbatim."""
+        rolling = (
+            self._strategy(
+                ["--set", "memoryServer.strategy.rollingUpdate.maxSurge=1"]
+            ).get("rollingUpdate")
+            or {}
+        )
+        assert rolling.get("maxSurge") == 1, (
+            "operator override memoryServer.strategy.rollingUpdate.maxSurge=1 "
+            f"was not honoured; got {rolling.get('maxSurge')!r}"
+        )
+        # maxUnavailable default is untouched by the surge override.
+        assert rolling.get("maxUnavailable") == 1
+
+    def test_operator_can_disable_strategy_block(self) -> None:
+        """The guarded ``with`` lets an operator fall back to the k8s
+        default by nulling ``memoryServer.strategy`` — the rendered
+        Deployment then emits NO strategy block at all.
+
+        Note: ``null`` (not ``{}``) is the correct clearing override. Helm
+        MERGES maps, so ``strategy: {}`` coalesces the empty map over the
+        default and the default keys survive; only ``null`` deletes the key
+        (Helm's coalesce treats null as delete). The guarded ``with`` is
+        falsy for both nil and empty-map, so either value that actually
+        reaches the template as empty renders no block — but the operator
+        path that produces that value is ``null``."""
+        out = _render(
+            [
+                "--set",
+                "vault.enabled=true",
+                "--set-json",
+                "memoryServer.strategy=null",
+            ]
+        )
+        doc = _find_workload(out, "Deployment", "audittrace-memory-server")
+        assert "strategy" not in doc["spec"], (
+            "memoryServer.strategy=null must render NO strategy block (fall "
+            "back to k8s default); the guarded `with` was lost so a nulled "
+            "override still emitted a strategy key."
+        )
+
+
 class TestEntrypointScriptSafety:
     """Direct unit tests on scripts/entrypoint.sh — exercise the guard
     branch without needing a real container."""
