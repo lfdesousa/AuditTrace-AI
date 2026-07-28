@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from scripts.deploy import registry, verify
+from scripts.deploy import mesh, registry, verify
 from scripts.deploy.verify import (
     COMPONENT_SELECTORS,
     FAIL,
@@ -30,12 +30,21 @@ from scripts.deploy.verify import (
     VerifyConfig,
     VerifyRunner,
     component_readiness,
+    container_is_ready,
+    containers_with_exit_code,
+    count_unhealthy_upstream,
+    crashlooping_containers,
     is_recall_tool,
     load_token,
+    pod_annotations,
+    pod_has_container,
+    pod_name,
     pod_ready,
+    sidecar_cert_findings,
     ssl_context,
     strategy_matches_intent,
     unready_components,
+    vault_render_findings,
 )
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -567,18 +576,70 @@ def test_recall_e2e_fail_recall_not_recorded(tmp_path, monkeypatch):
 # ── verdict aggregation + independence ───────────────────────────────────────
 
 
+def _healthy_injected_memory_server():
+    """A memory-server pod with a Ready istio-proxy + vault-agent, secret rendered.
+
+    Carries the mesh decorations the four WS2 probes assert on (sidecar Ready,
+    vault-annotated + Ready vault-agent, Running phase) on top of the label +
+    Ready condition the core pods-ready probe needs.
+    """
+    key, value = COMPONENT_SELECTORS["memory-server"]
+    return {
+        "metadata": {
+            "name": "audittrace-memory-server-0",
+            "labels": {key: value},
+            "annotations": {"vault.hashicorp.com/agent-inject": "true"},
+        },
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [
+                {"name": "memory-server", "ready": True, "state": {"running": {}}},
+                {"name": "istio-proxy", "ready": True, "state": {"running": {}}},
+                {"name": "vault-agent", "ready": True, "state": {"running": {}}},
+            ],
+        },
+    }
+
+
+def _mesh_healthy_pods():
+    """All components Ready, with the memory-server pod fully mesh-healthy."""
+    key, value = COMPONENT_SELECTORS["memory-server"]
+    pods = [
+        p for p in _all_components_ready() if p["metadata"]["labels"].get(key) != value
+    ]
+    pods.append(_healthy_injected_memory_server())
+    return pods
+
+
+def _istiod_ready_deployment():
+    return _proc(
+        0, json.dumps({"spec": {"replicas": 1}, "status": {"readyReplicas": 1}})
+    )
+
+
+def _healthy_kube_rules():
+    """The full read-only cluster read set for an all-green deploy (all nine probes).
+
+    The istiod-specific ``get deployment istiod`` rule MUST precede the generic
+    ``get deployment`` rule (first-match-wins), and ``imageID`` MUST precede
+    ``get pods`` (the digest read is also a ``get pods`` command).
+    """
+    return [
+        ("imageID", _proc(0, "repo@sha256:pub")),
+        ("get deployment istiod", _istiod_ready_deployment()),
+        ("get endpoints", _proc(0, "10.42.0.9")),
+        ("get pods", _pods_json(_mesh_healthy_pods())),
+        ("helm status", _proc(0, json.dumps({"info": {"status": "deployed"}}))),
+        ("get deployment", _surge_safe_deployment()),
+        ("logs", _proc(0, "all quiet\nnothing to see here")),
+    ]
+
+
 def _all_pass_runner(tmp_path, monkeypatch, interaction_id=42):
     monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
     monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
-    kube = _KubeDispatcher(
-        rules=[
-            ("imageID", _proc(0, "repo@sha256:pub")),
-            ("get pods", _pods_json(_all_components_ready())),
-            ("helm status", _proc(0, json.dumps({"info": {"status": "deployed"}}))),
-            ("get deployment", _surge_safe_deployment()),
-        ]
-    )
-    monkeypatch.setattr(verify, "_run", kube)
+    monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=_healthy_kube_rules()))
     monkeypatch.setattr(
         verify,
         "_http_request",
@@ -600,22 +661,21 @@ def test_verdict_pass_when_all_probes_pass(tmp_path, monkeypatch):
 
 def test_verdict_fail_when_single_probe_fails(tmp_path, monkeypatch):
     r = _all_pass_runner(tmp_path, monkeypatch)
-    # Break exactly one probe: live digest no longer matches published.
-    kube = _KubeDispatcher(
-        rules=[
-            ("imageID", _proc(0, "repo@sha256:DIFFERENT")),
-            ("get pods", _pods_json(_all_components_ready())),
-            ("helm status", _proc(0, json.dumps({"info": {"status": "deployed"}}))),
-            ("get deployment", _surge_safe_deployment()),
-        ]
-    )
-    monkeypatch.setattr(verify, "_run", kube)
+    # Break exactly one probe: live digest no longer matches published. Every other
+    # read stays mesh-healthy so ONLY the digest probe fails.
+    rules = _healthy_kube_rules()
+    rules[0] = ("imageID", _proc(0, "repo@sha256:DIFFERENT"))
+    monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
     report = r.run()
     assert report["verdict"] == FAIL
     statuses = {p["name"]: p["status"] for p in report["probes"]}
     assert statuses["digest-matches-published"] == FAIL
-    # the other four still PASS — one FAIL is enough to fail the verdict
+    # every other probe (core AND mesh) still PASS — one FAIL fails the verdict
     assert statuses["pods-ready"] == PASS
+    assert statuses["istiod-api-reachable"] == PASS
+    assert statuses["sidecars-have-certs"] == PASS
+    assert statuses["vault-secret-rendered"] == PASS
+    assert statuses["no-unhealthy-upstream"] == PASS
 
 
 def test_verdict_is_fail_with_no_results(tmp_path):
@@ -929,3 +989,711 @@ def test_health_probe_read_timeout_fails_via_real_seam(tmp_path, monkeypatch):
     res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
     assert res.status == FAIL
     assert res.evidence["http_status"] == 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #384 WS2 — mesh-health probes. Four independent, fail-closed post-deploy
+# certification signals. Each is exercised in BOTH directions (healthy PASS /
+# degraded FAIL) and fail-closed on an unreadable/timing-out read, and each is
+# proven to flip the overall VERDICT to FAIL. Every cluster read is mocked; the
+# signal is re-derived from cluster state, NEVER from a deploy report.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _injected_pod(
+    name="audittrace-memory-server-0",
+    *,
+    proxy_ready=True,
+    phase="Running",
+    vault=True,
+    vault_ready=True,
+    exit_code=None,
+    crashloop=False,
+    has_proxy=True,
+):
+    """A configurable istio-injected / vault-annotated pod for the WS2 probes."""
+    statuses = [{"name": "memory-server", "ready": True, "state": {"running": {}}}]
+    if has_proxy:
+        statuses.append(
+            {"name": "istio-proxy", "ready": proxy_ready, "state": {"running": {}}}
+        )
+    if vault and vault_ready:
+        statuses.append(
+            {"name": "vault-agent", "ready": True, "state": {"running": {}}}
+        )
+    if exit_code is not None:
+        statuses[0] = {
+            "name": "memory-server",
+            "ready": False,
+            "state": {"waiting": {"reason": "CrashLoopBackOff"}}
+            if crashloop
+            else {"running": {}},
+            "lastState": {"terminated": {"exitCode": exit_code}},
+        }
+    elif crashloop:
+        statuses[0]["ready"] = False
+        statuses[0]["state"] = {"waiting": {"reason": "CrashLoopBackOff"}}
+    annotations = {"vault.hashicorp.com/agent-inject": "true"} if vault else {}
+    return {
+        "metadata": {"name": name, "annotations": annotations},
+        "status": {"phase": phase, "containerStatuses": statuses},
+    }
+
+
+# ── pure helpers: container / pod introspection ──────────────────────────────
+
+
+def test_pod_name_and_annotations_defaults():
+    assert pod_name({}) == "<unknown>"
+    assert pod_name({"metadata": {"name": "p"}}) == "p"
+    assert pod_annotations({}) == {}
+    assert pod_annotations({"metadata": {"annotations": {"a": "b"}}}) == {"a": "b"}
+    # a non-dict annotations block degrades to {}
+    assert pod_annotations({"metadata": {"annotations": "x"}}) == {}
+
+
+def test_pod_has_container_spec_and_status_and_init():
+    # present in status containerStatuses
+    assert pod_has_container(_injected_pod(), "istio-proxy") is True
+    # absent
+    assert pod_has_container(_injected_pod(has_proxy=False), "istio-proxy") is False
+    # present in spec.initContainers only (native-sidecar shape)
+    native = {
+        "spec": {"initContainers": [{"name": "istio-proxy"}]},
+        "status": {},
+    }
+    assert pod_has_container(native, "istio-proxy") is True
+    # a non-dict status must not crash the introspection
+    assert pod_has_container({"status": "broken"}, "istio-proxy") is False
+    # a non-dict spec, and a non-dict entry inside a container list, are both
+    # skipped without crashing (fail-closed introspection).
+    assert pod_has_container({"spec": "broken", "status": {}}, "istio-proxy") is False
+    weird = {
+        "spec": {"containers": ["not-a-dict", {"name": "istio-proxy"}]},
+        "status": {},
+    }
+    assert pod_has_container(weird, "istio-proxy") is True
+
+
+def test_container_is_ready_found_notfound_and_init():
+    assert container_is_ready(_injected_pod(proxy_ready=True), "istio-proxy") is True
+    assert container_is_ready(_injected_pod(proxy_ready=False), "istio-proxy") is False
+    # absent container → False (fail-closed), never a crash
+    assert container_is_ready(_injected_pod(has_proxy=False), "istio-proxy") is False
+    # readiness reported in initContainerStatuses (native sidecar)
+    native = {
+        "status": {"initContainerStatuses": [{"name": "istio-proxy", "ready": True}]}
+    }
+    assert container_is_ready(native, "istio-proxy") is True
+
+
+def test_containers_with_exit_code_and_crashloop():
+    exited = _injected_pod(exit_code=79)
+    assert containers_with_exit_code(exited, 79) == ["memory-server"]
+    assert containers_with_exit_code(_injected_pod(), 79) == []
+    # missing lastState must not crash
+    assert containers_with_exit_code(_injected_pod(), 1) == []
+    assert crashlooping_containers(_injected_pod(crashloop=True)) == ["memory-server"]
+    assert crashlooping_containers(_injected_pod()) == []
+
+
+# ── pure helpers: findings ───────────────────────────────────────────────────
+
+
+def test_sidecar_cert_findings_clean_and_degraded():
+    assert sidecar_cert_findings([_injected_pod()]) == []
+    # pods with no sidecar are skipped (not part of the data plane)
+    assert sidecar_cert_findings([_injected_pod(has_proxy=False)]) == []
+    # proxy not ready → finding
+    f = sidecar_cert_findings([_injected_pod(proxy_ready=False)])
+    assert len(f) == 1 and "not Ready" in f[0]["reasons"][0]
+    # wedged in Init (phase Pending) → finding
+    f2 = sidecar_cert_findings([_injected_pod(phase="Pending")])
+    assert len(f2) == 1 and any("wedged Init" in r for r in f2[0]["reasons"])
+    # both problems at once → both reasons captured
+    f3 = sidecar_cert_findings([_injected_pod(proxy_ready=False, phase="Pending")])
+    assert len(f3[0]["reasons"]) == 2
+
+
+def test_sidecar_cert_findings_exempts_completed_pods():
+    """NIT 2: a finished (Succeeded/Completed) injected pod whose istio-proxy has
+    terminated (ready=false) is NOT a cert failure — e.g. a Helm-hook Job — so it
+    must be exempt and produce NO finding (no false-FAIL)."""
+    for phase in ("Succeeded", "Completed"):
+        pod = _injected_pod(proxy_ready=False, phase=phase, vault=False)
+        assert sidecar_cert_findings([pod]) == []
+
+
+def test_sidecar_cert_findings_non_dict_status_does_not_crash():
+    """NIT 3: a non-dict ``status`` must be guarded (fail-closed), not crash."""
+    pod = {"spec": {"containers": [{"name": "istio-proxy"}]}, "status": "broken"}
+    findings = sidecar_cert_findings([pod])  # must not raise
+    assert len(findings) == 1  # unreadable status → fail-closed finding
+
+
+def test_vault_render_findings_clean_and_all_failure_modes():
+    assert vault_render_findings([_injected_pod()]) == []
+    # non-annotated pods are skipped
+    assert vault_render_findings([_injected_pod(vault=False)]) == []
+    # annotated but vault-agent not injected (mode 4a) → finding
+    f = vault_render_findings([_injected_pod(vault=True, vault_ready=False)])
+    assert len(f) == 1 and any("vault-agent" in r for r in f[0]["reasons"])
+    # exit-79 (secret file absent) → finding
+    f2 = vault_render_findings([_injected_pod(exit_code=79)])
+    assert any("exited 79" in r for r in f2[0]["reasons"])
+    # crashloop → finding
+    f3 = vault_render_findings([_injected_pod(crashloop=True)])
+    assert any("CrashLoopBackOff" in r for r in f3[0]["reasons"])
+
+
+def test_count_unhealthy_upstream():
+    logs = (
+        "ok\nupstream connect error: no healthy upstream\nfine\nno healthy upstream\n"
+    )
+    assert count_unhealthy_upstream(logs) == 2
+    assert count_unhealthy_upstream("all fine\nnothing here") == 0
+
+
+# ── probe 6: istiod-api-reachable (PASS + FAIL + fail-closed) ─────────────────
+
+
+def _istiod_router(logs="all quiet", dep_ready=True, endpoints="10.42.0.9"):
+    dep = json.dumps(
+        {"spec": {"replicas": 1}, "status": {"readyReplicas": 1 if dep_ready else 0}}
+    )
+    return _KubeDispatcher(
+        rules=[
+            ("get deployment istiod", _proc(0, dep)),
+            ("get endpoints", _proc(0, endpoints)),
+            ("logs", _proc(0, logs)),
+        ]
+    )
+
+
+def test_istiod_api_reachable_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", _istiod_router())
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == PASS
+
+
+def test_istiod_api_reachable_fail_smoking_gun(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_run",
+        _istiod_router(logs="x\ndial tcp 10.43.0.1:443: no route to host"),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-api-unreachable" in res.detail
+
+
+def test_istiod_api_reachable_fail_not_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", _istiod_router(dep_ready=False))
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-not-ready" in res.detail
+
+
+def test_istiod_api_reachable_fail_no_endpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", _istiod_router(endpoints=""))
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-no-endpoints" in res.detail
+
+
+def test_istiod_api_reachable_fail_closed_logs_unreadable(tmp_path, monkeypatch):
+    disp = _KubeDispatcher(
+        rules=[
+            (
+                "get deployment istiod",
+                _proc(
+                    0,
+                    json.dumps(
+                        {"spec": {"replicas": 1}, "status": {"readyReplicas": 1}}
+                    ),
+                ),
+            ),
+            ("get endpoints", _proc(0, "10.42.0.9")),
+            ("logs", _proc(returncode=1, stderr="no such pod")),
+        ]
+    )
+    monkeypatch.setattr(verify, "_run", disp)
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-logs" in res.detail
+
+
+def test_istiod_api_reachable_fail_closed_endpoints_unreadable(tmp_path, monkeypatch):
+    disp = _KubeDispatcher(
+        rules=[
+            (
+                "get deployment istiod",
+                _proc(
+                    0,
+                    json.dumps(
+                        {"spec": {"replicas": 1}, "status": {"readyReplicas": 1}}
+                    ),
+                ),
+            ),
+            ("get endpoints", _proc(returncode=1)),
+            ("logs", _proc(0, "all quiet")),
+        ]
+    )
+    monkeypatch.setattr(verify, "_run", disp)
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-endpoints" in res.detail
+
+
+def test_istiod_api_reachable_fail_deployment_unreadable(tmp_path, monkeypatch):
+    # deployment read fails → dep is None → evaluate_istiod_readiness yields a
+    # fail-closed finding (logs + endpoints still readable, so not caught above).
+    disp = _KubeDispatcher(
+        rules=[
+            ("get deployment istiod", _proc(returncode=1)),
+            ("get endpoints", _proc(0, "10.42.0.9")),
+            ("logs", _proc(0, "all quiet")),
+        ]
+    )
+    monkeypatch.setattr(verify, "_run", disp)
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL and "istiod-unreadable" in res.detail
+
+
+def test_istiod_deployment_read_non_dict_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "[]"))
+    assert VerifyRunner(_cfg(tmp_path))._istiod_deployment() is None
+
+
+# ── probe 7: sidecars-have-certs (PASS + FAIL + fail-closed) ──────────────────
+
+
+def test_sidecars_have_certs_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _pods_json([_injected_pod()]))
+    res = VerifyRunner(_cfg(tmp_path)).probe_sidecars_have_certs()
+    assert res.status == PASS
+
+
+def test_sidecars_have_certs_pass_with_completed_hook_pod(tmp_path, monkeypatch):
+    """NIT 2 at probe level: a live Ready pod PLUS a finished Helm-hook Job pod
+    (Succeeded, terminated not-ready istio-proxy) → the completed pod is exempt →
+    PASS, not a false-FAIL."""
+    live = _injected_pod()
+    completed = _injected_pod(
+        name="audittrace-migrate-hook",
+        proxy_ready=False,
+        phase="Succeeded",
+        vault=False,
+    )
+    monkeypatch.setattr(verify, "_run", lambda cmd: _pods_json([live, completed]))
+    res = VerifyRunner(_cfg(tmp_path)).probe_sidecars_have_certs()
+    assert res.status == PASS
+
+
+def test_sidecars_have_certs_fail_proxy_not_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _pods_json([_injected_pod(proxy_ready=False)])
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_sidecars_have_certs()
+    assert res.status == FAIL and "cert-starved" in res.detail
+
+
+def test_sidecars_have_certs_fail_closed_no_pods(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    res = VerifyRunner(_cfg(tmp_path)).probe_sidecars_have_certs()
+    assert res.status == FAIL and "no pods" in res.detail
+
+
+def test_sidecars_have_certs_fail_no_injected_pods(tmp_path, monkeypatch):
+    # pods exist but none carries an istio-proxy → data plane not certifiable.
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _pods_json([_injected_pod(has_proxy=False)])
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_sidecars_have_certs()
+    assert res.status == FAIL and "no istio-injected pods" in res.detail
+
+
+# ── probe 8: vault-secret-rendered (PASS + FAIL + fail-closed) ────────────────
+
+
+def test_vault_secret_rendered_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _pods_json([_injected_pod()]))
+    res = VerifyRunner(_cfg(tmp_path)).probe_vault_secret_rendered()
+    assert res.status == PASS
+
+
+def test_vault_secret_rendered_fail_exit_79(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _pods_json([_injected_pod(exit_code=79)])
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_vault_secret_rendered()
+    assert res.status == FAIL and "not rendered" in res.detail
+
+
+def test_vault_secret_rendered_fail_closed_no_pods(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    res = VerifyRunner(_cfg(tmp_path)).probe_vault_secret_rendered()
+    assert res.status == FAIL and "no pods" in res.detail
+
+
+def test_vault_secret_rendered_fail_no_annotated_pods(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _pods_json([_injected_pod(vault=False)])
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_vault_secret_rendered()
+    assert res.status == FAIL and "no vault-annotated pods" in res.detail
+
+
+# ── probe 9: no-unhealthy-upstream (PASS + FAIL + fail-closed) ────────────────
+
+
+def test_no_unhealthy_upstream_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok"})}),
+    )
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "all quiet\nserving"))
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == PASS
+
+
+def test_no_unhealthy_upstream_fail_health_down(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_http_request", _FakeHttp({("GET", "/health"): (503, {})})
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL and "503" in res.detail
+
+
+def test_no_unhealthy_upstream_fail_health_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "degraded"})}),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL and "degraded" in res.detail
+
+
+def test_no_unhealthy_upstream_fail_503_in_logs(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok"})}),
+    )
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "x\nupstream: no healthy upstream\n")
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL and "no healthy upstream" in res.detail
+
+
+def test_no_unhealthy_upstream_fail_closed_logs_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok"})}),
+    )
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL and "could not read memory-server logs" in res.detail
+
+
+# ── CodeQL fix: no raw log content leaks into the verify report ───────────────
+#
+# py/clear-text-logging-of-sensitive-data. memory-server / istiod logs can carry
+# tokens / request content / PII; a FAIL must emit DERIVED signals only (counts,
+# window, signature name), never the raw log tail. FALSIFIABLE: re-adding a
+# ``log_tail`` (or any raw-content evidence value) turns these RED.
+
+# A distinctive "secret" planted in the raw logs. If it ever appears in ANY probe
+# evidence value or detail string, a raw-content leak has been reintroduced.
+_PLANTED_SECRET = "Bearer eyJhbGciOiJIUZ.SUPERSECRET.TOKEN-should-never-surface"
+
+
+def _evidence_as_text(evidence):
+    return json.dumps(evidence, default=str)
+
+
+def test_no_unhealthy_upstream_fail_emits_no_raw_log_content(tmp_path, monkeypatch):
+    """The no-unhealthy-upstream FAIL evidence is EXACTLY {match_count, log_window}
+    and carries none of the raw log tail (which here embeds a planted secret)."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok"})}),
+    )
+    noisy = f"req {_PLANTED_SECRET}\nupstream connect error: no healthy upstream\n"
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, noisy))
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL
+    # evidence keys are EXACTLY the derived pair — no log_tail / raw content
+    assert set(res.evidence) == {"match_count", "log_window"}
+    assert res.evidence["match_count"] == 1
+    # the planted secret appears in NO evidence value and NO detail string
+    assert _PLANTED_SECRET not in _evidence_as_text(res.evidence)
+    assert _PLANTED_SECRET not in res.detail
+
+
+def test_istiod_api_reachable_fail_emits_no_raw_log_content(tmp_path, monkeypatch):
+    """The istiod probe reuses mesh diagnosers whose finding carries a raw log_tail;
+    the probe MUST strip it — no finding evidence value contains the planted
+    secret, and no 'log_tail' key survives."""
+    smoking = f"{_PLANTED_SECRET}\ndial tcp 10.43.0.1:443: no route to host\n"
+    monkeypatch.setattr(verify, "_run", _istiod_router(logs=smoking))
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL
+    findings = res.evidence["findings"]
+    assert findings[0]["signal"] == "istiod-api-unreachable"
+    # derived evidence survives, raw log content does not
+    assert findings[0]["evidence"]["match_count"] == 1
+    for finding in findings:
+        assert "log_tail" not in finding["evidence"]
+    assert _PLANTED_SECRET not in _evidence_as_text(res.evidence)
+    assert _PLANTED_SECRET not in res.detail
+
+
+def test_sanitized_finding_keeps_allowlisted_derived_keys():
+    """The sanitizer keeps allowlisted derived evidence (and signal/detail)."""
+    f = mesh.Finding(
+        "istiod-api-unreachable",
+        "1 smoking-gun line",
+        {"match_count": 1, "window": "3m", "log_tail": _PLANTED_SECRET},
+    )
+    out = verify.sanitized_finding(f)
+    assert out["signal"] == "istiod-api-unreachable"
+    assert out["detail"] == "1 smoking-gun line"
+    assert out["evidence"] == {"match_count": 1, "window": "3m"}
+    assert "log_tail" not in out["evidence"]
+    assert _PLANTED_SECRET not in json.dumps(out, default=str)
+    # a finding with no evidence must not crash
+    empty = verify.sanitized_finding(mesh.Finding("s", "d"))
+    assert empty["evidence"] == {}
+
+
+def test_sanitized_finding_allowlist_drops_unknown_and_raw_keys():
+    """FAIL-CLOSED allowlist: known-raw keys (error / deployment_error /
+    endpoints_error / log_tail) AND any UNKNOWN future key are DROPPED; only
+    allowlisted derived keys survive. Falsifiable: switching back to a denylist,
+    or widening the allowlist to include a raw key, turns this RED."""
+    f = mesh.Finding(
+        "istiod-unreadable",
+        "could not read istiod readiness (fail-closed)",
+        {
+            "error": "raw stderr " + _PLANTED_SECRET,
+            "deployment_error": "raw " + _PLANTED_SECRET,
+            "endpoints_error": _PLANTED_SECRET,
+            "log_tail": _PLANTED_SECRET,
+            "future_unknown_key": _PLANTED_SECRET,
+            "match_count": 1,
+        },
+    )
+    out = verify.sanitized_finding(f)
+    # only the allowlisted derived key survives; every raw/unknown key is dropped
+    assert out["evidence"] == {"match_count": 1}
+    for dropped in (
+        "error",
+        "deployment_error",
+        "endpoints_error",
+        "log_tail",
+        "future_unknown_key",
+    ):
+        assert dropped not in out["evidence"]
+    assert _PLANTED_SECRET not in json.dumps(out, default=str)
+
+
+def test_allowed_evidence_keys_are_all_emitted_by_a_mesh_diagnoser():
+    """Every allowlisted key is actually produced by a mesh diagnoser (no dead
+    entries) — and no raw key sneaked into the allowlist."""
+    emitted: set[str] = set()
+    for finding in (
+        *mesh.evaluate_nodes(""),
+        *mesh.evaluate_nodes("True False"),
+        *mesh.evaluate_istiod_logs("no route to host", "3m"),
+        *mesh.evaluate_istiod_readiness(None, "10.0.0.1"),
+        *mesh.evaluate_istiod_readiness({"spec": {"replicas": 1}, "status": {}}, ""),
+        *mesh.evaluate_istiod_readiness(
+            {"spec": {"replicas": 2}, "status": {"readyReplicas": 1}}, "10.0.0.1"
+        ),
+        *mesh.evaluate_istiod_readiness({"spec": {}, "status": {}}, "10.0.0.1"),
+    ):
+        emitted.update(finding.evidence)
+    # allowlist contains no raw key, and every allowlisted key is genuinely emitted
+    for raw in ("log_tail", "error", "deployment_error", "endpoints_error"):
+        assert raw not in verify.ALLOWED_EVIDENCE_KEYS
+    assert verify.ALLOWED_EVIDENCE_KEYS <= emitted
+
+
+# ── verdict integration: each mesh probe flips the VERDICT to FAIL ────────────
+
+
+@pytest.mark.parametrize(
+    "broken_probe,detail_needle",
+    [
+        ("istiod-api-reachable", "istiod"),
+        ("sidecars-have-certs", "cert-starved"),
+        ("vault-secret-rendered", "not rendered"),
+        ("no-unhealthy-upstream", "no healthy upstream"),
+    ],
+)
+def test_degraded_mesh_flips_verdict_to_fail(
+    tmp_path, monkeypatch, broken_probe, detail_needle
+):
+    """FALSIFIABLE: a single degraded mesh signal makes the WHOLE verdict FAIL,
+    while every OTHER probe (core + mesh) still PASSes — proving each new probe
+    genuinely gates the verdict."""
+    r = _all_pass_runner(tmp_path, monkeypatch)
+    rules = _healthy_kube_rules()
+    if broken_probe == "istiod-api-reachable":
+        rules[2] = ("get endpoints", _proc(0, ""))  # istiod has no endpoints
+    elif broken_probe == "sidecars-have-certs":
+        # memory-server proxy not ready → cert-starved data plane
+        bad = _mesh_healthy_pods()
+        bad[-1]["status"]["containerStatuses"][1]["ready"] = False
+        rules[3] = ("get pods", _pods_json(bad))
+    elif broken_probe == "vault-secret-rendered":
+        bad = _mesh_healthy_pods()
+        bad[-1]["status"]["containerStatuses"][0]["lastState"] = {
+            "terminated": {"exitCode": 79}
+        }
+        # drop the ready vault-agent so the annotated pod also fails cleanly
+        bad[-1]["status"]["containerStatuses"] = [
+            c
+            for c in bad[-1]["status"]["containerStatuses"]
+            if c["name"] != "vault-agent"
+        ]
+        rules[3] = ("get pods", _pods_json(bad))
+    monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
+    if broken_probe == "no-unhealthy-upstream":
+        monkeypatch.setattr(
+            verify,
+            "_http_request",
+            _FakeHttp(
+                {
+                    ("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"}),
+                    **_recall_routes(),
+                }
+            ),
+        )
+        # override the memory-server log read to carry the 503 signature
+        rules[6] = ("logs", _proc(0, "no healthy upstream"))
+        monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
+
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert report["verdict"] == FAIL
+    assert statuses[broken_probe] == FAIL
+    broken_detail = next(
+        p["detail"] for p in report["probes"] if p["name"] == broken_probe
+    )
+    assert detail_needle in broken_detail
+    # the OTHER mesh probes are unaffected — the failure is isolated
+    others = {
+        "istiod-api-reachable",
+        "sidecars-have-certs",
+        "vault-secret-rendered",
+        "no-unhealthy-upstream",
+    } - {broken_probe}
+    assert all(statuses[o] == PASS for o in others)
+
+
+def test_mesh_probes_reuse_pure_mesh_diagnosers_independently(tmp_path, monkeypatch):
+    """The istiod probe REUSES mesh's pure diagnosers over reads THIS runner made:
+    the same log window is single-sourced from the WS1 module, and the smoking-gun
+    verdict matches mesh.evaluate_istiod_logs on the same input (no duplicated
+    #307 signature)."""
+    assert verify.MESH_LOG_WINDOW == mesh.DEFAULT_LOG_WINDOW
+    monkeypatch.setattr(
+        verify, "_run", _istiod_router(logs="tokenreviews Unauthenticated")
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL
+    assert res.evidence["findings"][0]["signal"] == "istiod-api-unreachable"
+
+
+def test_evidence_sources_include_mesh_reads_and_stay_independent(tmp_path):
+    """The four mesh reads are enumerated in evidence_sources (so the derived
+    reads_deploy_report stays honest) and NONE is a deploy-report source."""
+    r = VerifyRunner(_cfg(tmp_path))
+    sources = r.evidence_sources()
+    assert "cluster-api:kubectl:istiod-logs" in sources
+    assert "cluster-api:kubectl:istiod-deployment" in sources
+    assert "cluster-api:kubectl:istiod-endpoints" in sources
+    assert "cluster-api:kubectl:memory-server-logs" in sources
+    assert r.reads_deploy_report is False
+    assert not any(s.startswith(verify.DEPLOY_REPORT_SOURCE_PREFIX) for s in sources)
+
+
+# ── NIT 1: fail-closed hardening of the shared read-only _run seam ────────────
+#
+# A HUNG or MISSING kubectl — the exact #307 case (a wedged ClusterIP makes a
+# kube-API read HANG) — must NOT hang or crash run(). These tests drive the REAL
+# ``verify._run`` (patching ``subprocess.run`` to raise) and are FALSIFIABLE:
+# remove the bounded timeout + the ``except (OSError, SubprocessError)`` and they
+# raise instead of producing the clean non-zero-exit sentinel / FAIL verdict.
+
+
+def test_run_passes_a_bounded_timeout(monkeypatch):
+    # The bound is applied (single-sourced from the WS1 gate); a wedged read can
+    # never hang unboundedly.
+    assert verify.PROBE_TIMEOUT == mesh.DEFAULT_PROBE_TIMEOUT
+
+    captured = {}
+
+    def _spy(cmd, **kw):
+        captured.update(kw)
+        return _proc(0, "")
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+    verify._run(["kubectl", "get", "pods"])
+    assert captured["timeout"] == verify.PROBE_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        FileNotFoundError("kubectl: command not found"),  # missing binary → OSError
+        subprocess.TimeoutExpired(cmd=["kubectl"], timeout=30),  # hung read
+        OSError("permission denied"),
+    ],
+)
+def test_run_maps_subprocess_errors_to_failclosed_sentinel(monkeypatch, exc):
+    def _raise(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    proc = verify._run(["kubectl", "get", "pods"])
+    # SAME sentinel a genuine non-zero exit produces: returncode!=0, empty stdout.
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        FileNotFoundError("kubectl: command not found"),
+        subprocess.TimeoutExpired(cmd=["kubectl"], timeout=30),
+    ],
+)
+def test_kubectl_hang_or_missing_fails_closed_and_still_emits_report(
+    tmp_path, monkeypatch, exc
+):
+    """A hung/missing kubectl at the REAL _run seam → every kubectl probe FAILs,
+    run() STILL emits a full verdict + report bundle, NO hang, NO uncaught crash."""
+
+    def _raise(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    monkeypatch.setattr(verify, "_http_request", lambda *a, **k: (0, {}, b""))
+
+    report = VerifyRunner(_cfg(tmp_path)).run()  # must NOT hang or raise
+
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert report["verdict"] == FAIL
+    # every kubectl-backed probe degraded to a clean FAIL
+    assert statuses["pods-ready"] == FAIL
+    assert statuses["istiod-api-reachable"] == FAIL
+    assert statuses["sidecars-have-certs"] == FAIL
+    assert statuses["vault-secret-rendered"] == FAIL
+    # the verdict is complete (all nine probes ran) and a bundle was written
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+    assert list((tmp_path / "runs").glob("verify-v9.9.9-*.json"))
