@@ -559,7 +559,7 @@ def sidecar_cert_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return findings
 
 
-def vault_secret_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def vault_render_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Vault-annotated pods whose secret was not rendered fail-closed.
 
     For each pod carrying the vault inject annotation: the ``vault-agent`` sidecar
@@ -567,6 +567,12 @@ def vault_secret_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
     silent-non-injection signature), no container may have exited 79
     (``/vault/secrets/env`` absent), and no container may be in CrashLoopBackOff.
     Evidence is container status only — secret VALUES are never read or emitted.
+
+    Named ``vault_render_findings`` (not ``*_secret_*``): it returns render/readiness
+    findings (pod names + status reasons), holding NO secret values. The former
+    ``vault_secret_findings`` name was a misnomer that also tripped CodeQL's
+    name-based clear-text-logging classifier when its output reached a log line
+    (#384 WS2) — a false positive the accurate name removes.
     """
     findings: list[dict[str, Any]] = []
     for pod in pods:
@@ -1177,7 +1183,7 @@ class VerifyRunner:
                 "no vault-annotated pods found — cannot certify secret render (fail-closed)",
                 {"pod_count": len(pods)},
             )
-        findings = vault_secret_findings(pods)
+        findings = vault_render_findings(pods)
         if findings:
             return self._record(
                 PROBES[7],

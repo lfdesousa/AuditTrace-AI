@@ -44,7 +44,7 @@ from scripts.deploy.verify import (
     ssl_context,
     strategy_matches_intent,
     unready_components,
-    vault_secret_findings,
+    vault_render_findings,
 )
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -1131,18 +1131,18 @@ def test_sidecar_cert_findings_non_dict_status_does_not_crash():
     assert len(findings) == 1  # unreadable status → fail-closed finding
 
 
-def test_vault_secret_findings_clean_and_all_failure_modes():
-    assert vault_secret_findings([_injected_pod()]) == []
+def test_vault_render_findings_clean_and_all_failure_modes():
+    assert vault_render_findings([_injected_pod()]) == []
     # non-annotated pods are skipped
-    assert vault_secret_findings([_injected_pod(vault=False)]) == []
+    assert vault_render_findings([_injected_pod(vault=False)]) == []
     # annotated but vault-agent not injected (mode 4a) → finding
-    f = vault_secret_findings([_injected_pod(vault=True, vault_ready=False)])
+    f = vault_render_findings([_injected_pod(vault=True, vault_ready=False)])
     assert len(f) == 1 and any("vault-agent" in r for r in f[0]["reasons"])
     # exit-79 (secret file absent) → finding
-    f2 = vault_secret_findings([_injected_pod(exit_code=79)])
+    f2 = vault_render_findings([_injected_pod(exit_code=79)])
     assert any("exited 79" in r for r in f2[0]["reasons"])
     # crashloop → finding
-    f3 = vault_secret_findings([_injected_pod(crashloop=True)])
+    f3 = vault_render_findings([_injected_pod(crashloop=True)])
     assert any("CrashLoopBackOff" in r for r in f3[0]["reasons"])
 
 
