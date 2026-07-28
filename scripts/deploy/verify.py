@@ -13,8 +13,9 @@ the verdict. The deployer decides "it deployed"; this
 runner decides, separately and on evidence it gathered itself, "it works". FAIL
 blocks "done": *up* means complete AND working, not "helm exited 0".
 
-Five deploy-health probes, each PASS/FAIL with captured evidence
-(failures-are-findings, every check declares the evidence it stands on):
+Nine deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) — each
+PASS/FAIL with captured evidence (failures-are-findings, every check declares the
+evidence it stands on):
 
 * **pods-ready**             — every expected app component has ≥1 Ready pod.
 * **digest-matches-published** — the LIVE memory-server pod digest == the intended
@@ -30,6 +31,27 @@ Five deploy-health probes, each PASS/FAIL with captured evidence
   ``POST /v1/chat/completions`` (scoped JWT, real model) that triggers a
   ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
   was recorded. Memory + auth alone is not E2E.
+
+The four MESH-HEALTH probes (#384 WS2, spec §4) certify that the deploy did not
+leave the Istio mesh unable to cert, secret, or route — "up" means the mesh
+survived, not "helm exited 0". Each RE-DERIVES its signal from an INDEPENDENT
+read-only cluster read (never the deploy runner's report, never the WS1 mesh
+gate's result — the same independence contract the core probes hold):
+
+* **istiod-api-reachable**   — istiod Deployment fully Ready, Service has ≥1
+  endpoint, and ZERO #307 smoking-gun lines (``no route to host`` /
+  ``Unauthenticated`` / ``tokenreviews``) in the istiod log window — a new sidecar
+  can get a cert. Reuses the *pure* diagnosers in :mod:`scripts.deploy.mesh`
+  (:func:`mesh.evaluate_istiod_logs` / :func:`mesh.evaluate_istiod_readiness`) over
+  reads THIS runner gathered itself — shared logic, independent evidence.
+* **sidecars-have-certs**    — every istio-injected pod's ``istio-proxy`` container
+  is Ready and the pod reached ``Running`` (no cert-starved data plane, no pod
+  wedged in Init).
+* **vault-secret-rendered**  — every vault-annotated pod has a Ready ``vault-agent``
+  sidecar, no container exited ``79`` (``/vault/secrets/env`` absent), and no
+  CrashLoop — captures container statuses, NEVER secret values.
+* **no-unhealthy-upstream**  — front-door ``/health`` == 200 ``status=ok`` AND no
+  "no healthy upstream" 503 signature in the memory-server log window.
 
 **Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
 ``kubectl exec``, NO root creds, NO scope-skip. Deterministic: no wall-clock
@@ -55,7 +77,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 
-from scripts.deploy import registry
+from scripts.deploy import mesh, registry
 from scripts.deploy.runner import extract_digest, normalize_version
 
 logger = logging.getLogger("audittrace.deploy.verify")
@@ -116,13 +138,45 @@ EXPECTED_MAX_UNAVAILABLE = "1"
 PASS = "PASS"
 FAIL = "FAIL"
 
-# The five probe identifiers — fixed order (determinism contract).
+# ── #384 WS2 mesh-health probe constants ─────────────────────────────────────
+# The mesh probes RE-DERIVE their signal from INDEPENDENT read-only cluster reads
+# gathered by THIS runner. Where the fault SIGNATURE (the #307 log patterns,
+# istiod readiness semantics, the log window) is already encoded as PURE, tested
+# logic in ``scripts.deploy.mesh`` (WS1), we REUSE that logic rather than
+# duplicate it — but never its deploy-side STATE / result. That keeps the
+# #307 signature single-sourced while the evidence stays independent.
+ISTIO_PROXY_CONTAINER = "istio-proxy"
+VAULT_AGENT_CONTAINER = "vault-agent"
+VAULT_INJECT_ANNOTATION = "vault.hashicorp.com/agent-inject"
+# entrypoint.sh trips VAULT_AGENT_REQUIRED and exits 79 when /vault/secrets/env is
+# absent (mode 4, fail-closed BY DESIGN). A 79 in lastState is the smoking gun.
+VAULT_FAILCLOSED_EXIT_CODE = 79
+# The cert-dead-mesh data-plane signature (mode 3): Envoy has no upstream cert/route.
+UNHEALTHY_UPSTREAM_SIGNATURES = ("no healthy upstream",)
+# Pods that have RUN TO COMPLETION — their istio-proxy sidecar terminates normally,
+# so a not-Ready proxy on them is NOT a cert failure (e.g. a finished Helm-hook
+# Job). They are exempt from the live-data-plane sidecar-readiness check.
+COMPLETED_PHASES = ("Succeeded", "Completed")
+# Single-source the istiod-log window from the WS1 gate (Q6: tied to the 150 s
+# startupProbe budget so a normal cold start is never mis-read as the fault).
+MESH_LOG_WINDOW = mesh.DEFAULT_LOG_WINDOW
+# Fail-closed bound (seconds) on every read-only kubectl/helm read: a wedged
+# ClusterIP (the #307 case) makes a read HANG, so it must time out into a
+# non-zero-exit sentinel rather than block run(). Single-sourced from the WS1 gate.
+PROBE_TIMEOUT = mesh.DEFAULT_PROBE_TIMEOUT
+
+# The nine probe identifiers — fixed order (determinism contract). The four
+# mesh-health probes are APPENDED so the core five keep their indices.
 PROBES = (
     "pods-ready",
     "digest-matches-published",
     "no-drift",
     "health-version",
     "recall-e2e",
+    "istiod-api-reachable",
+    "sidecars-have-certs",
+    "vault-secret-rendered",
+    "no-unhealthy-upstream",
 )
 
 
@@ -130,11 +184,27 @@ PROBES = (
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    """Run a read-only kubectl/helm command. Sole subprocess entry point."""
+    """Run a read-only kubectl/helm command. Sole subprocess entry point.
+
+    Fail-closed like :meth:`scripts.deploy.mesh.MeshGate._probe`: a HUNG or MISSING
+    ``kubectl`` must never hang or crash :meth:`VerifyRunner.run`. A wedged
+    ClusterIP — the exact #307 case the mesh probes target — is precisely when a
+    kube-API read HANGS, so every read is bounded by ``PROBE_TIMEOUT``; an
+    ``OSError`` (binary not on PATH) or a ``subprocess.SubprocessError``
+    (``TimeoutExpired``) is mapped to the SAME non-zero-exit ``CompletedProcess``
+    sentinel a genuine non-zero exit already produces — so every probe that reads
+    through this seam degrades to a clean FAIL, never a hang or an uncaught crash.
+    """
     logger.info("exec: %s", " ".join(cmd))
-    return subprocess.run(  # noqa: S603 - fixed argv lists, no shell
-        cmd, capture_output=True, text=True, check=False
-    )
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv lists, no shell
+            cmd, capture_output=True, text=True, check=False, timeout=PROBE_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("read-only command failed (fail-closed): %s (%s)", cmd, exc)
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="", stderr=str(exc)
+        )
 
 
 def ssl_context(insecure: bool) -> ssl.SSLContext | None:
@@ -349,6 +419,158 @@ def _parse_json(body: bytes) -> Any:
         return None
 
 
+# ── #384 WS2 mesh-health pure helpers (unit-tested directly, no I/O) ──────────
+
+
+def pod_name(pod: dict[str, Any]) -> str:
+    name = pod.get("metadata", {}).get("name")
+    return name if isinstance(name, str) and name else "<unknown>"
+
+
+def pod_annotations(pod: dict[str, Any]) -> dict[str, str]:
+    ann = pod.get("metadata", {}).get("annotations", {})
+    return ann if isinstance(ann, dict) else {}
+
+
+def _all_container_statuses(pod: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every reported container status — regular AND init/native-sidecar.
+
+    Istio's ``istio-proxy`` may be a native sidecar (an initContainer with
+    ``restartPolicy: Always``), so its readiness surfaces in
+    ``initContainerStatuses``; the app's exit-79 surfaces in ``containerStatuses``.
+    Scanning both makes the readiness / exit-code helpers robust to either shape.
+    """
+    status = pod.get("status", {})
+    if not isinstance(status, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for key in ("containerStatuses", "initContainerStatuses"):
+        value = status.get(key)
+        if isinstance(value, list):
+            out.extend(c for c in value if isinstance(c, dict))
+    return out
+
+
+def pod_container_names(pod: dict[str, Any]) -> set[str]:
+    """All container names known for the pod (spec + status, regular + init)."""
+    names = {c.get("name") for c in _all_container_statuses(pod)}
+    spec = pod.get("spec", {})
+    if isinstance(spec, dict):
+        for key in ("containers", "initContainers"):
+            for container in spec.get(key, []) or []:
+                if isinstance(container, dict):
+                    names.add(container.get("name"))
+    return {n for n in names if isinstance(n, str)}
+
+
+def pod_has_container(pod: dict[str, Any], name: str) -> bool:
+    return name in pod_container_names(pod)
+
+
+def container_is_ready(pod: dict[str, Any], name: str) -> bool:
+    """True iff a container status named ``name`` reports ``ready: true``.
+
+    A container that is ABSENT (never injected) or present-but-not-ready both
+    return False — the fail-closed reading a certifier needs.
+    """
+    for cs in _all_container_statuses(pod):
+        if cs.get("name") == name:
+            return cs.get("ready") is True
+    return False
+
+
+def containers_with_exit_code(pod: dict[str, Any], code: int) -> list[str]:
+    """Names of containers whose ``lastState.terminated.exitCode`` == ``code``."""
+    out: list[str] = []
+    for cs in _all_container_statuses(pod):
+        terminated = (cs.get("lastState", {}) or {}).get("terminated", {}) or {}
+        if terminated.get("exitCode") == code:
+            out.append(str(cs.get("name")))
+    return out
+
+
+def crashlooping_containers(pod: dict[str, Any]) -> list[str]:
+    """Names of containers currently in ``CrashLoopBackOff``."""
+    out: list[str] = []
+    for cs in _all_container_statuses(pod):
+        waiting = (cs.get("state", {}) or {}).get("waiting", {}) or {}
+        if waiting.get("reason") == "CrashLoopBackOff":
+            out.append(str(cs.get("name")))
+    return out
+
+
+def sidecar_cert_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Istio-injected pods whose data plane is not certified.
+
+    A pod is checked only if it carries an ``istio-proxy`` container. A pod that has
+    RUN TO COMPLETION (``Succeeded``/``Completed`` — e.g. a finished Helm-hook Job)
+    is exempt: its sidecar terminates normally, which is not a cert failure. Any
+    remaining injected pod fails when its sidecar is not Ready (no workload cert) OR
+    it has not reached ``Running`` (wedged in Init — the #307 cert-starved
+    signature). Pods with no sidecar are not part of the data plane and are skipped.
+    """
+    findings: list[dict[str, Any]] = []
+    for pod in pods:
+        if not pod_has_container(pod, ISTIO_PROXY_CONTAINER):
+            continue
+        status = pod.get("status")
+        status = status if isinstance(status, dict) else {}
+        phase = status.get("phase")
+        if phase in COMPLETED_PHASES:
+            # A completed pod's terminated sidecar is not a cert failure.
+            continue
+        reasons: list[str] = []
+        if not container_is_ready(pod, ISTIO_PROXY_CONTAINER):
+            reasons.append("istio-proxy sidecar not Ready (no workload cert)")
+        if phase != "Running":
+            reasons.append(f"pod phase={phase!r} (wedged Init / not Running)")
+        if reasons:
+            findings.append({"pod": pod_name(pod), "phase": phase, "reasons": reasons})
+    return findings
+
+
+def vault_secret_findings(pods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Vault-annotated pods whose secret was not rendered fail-closed.
+
+    For each pod carrying the vault inject annotation: the ``vault-agent`` sidecar
+    must be Ready (an annotated pod with NO ready vault-agent is the mode-4a
+    silent-non-injection signature), no container may have exited 79
+    (``/vault/secrets/env`` absent), and no container may be in CrashLoopBackOff.
+    Evidence is container status only — secret VALUES are never read or emitted.
+    """
+    findings: list[dict[str, Any]] = []
+    for pod in pods:
+        if pod_annotations(pod).get(VAULT_INJECT_ANNOTATION) != "true":
+            continue
+        reasons: list[str] = []
+        if not container_is_ready(pod, VAULT_AGENT_CONTAINER):
+            reasons.append(
+                "vault-agent sidecar missing or not Ready "
+                "(secret not rendered / silent non-injection)"
+            )
+        exited = containers_with_exit_code(pod, VAULT_FAILCLOSED_EXIT_CODE)
+        if exited:
+            reasons.append(
+                f"container(s) {exited} exited {VAULT_FAILCLOSED_EXIT_CODE} "
+                "(/vault/secrets/env absent)"
+            )
+        crashing = crashlooping_containers(pod)
+        if crashing:
+            reasons.append(f"container(s) {crashing} in CrashLoopBackOff")
+        if reasons:
+            findings.append({"pod": pod_name(pod), "reasons": reasons})
+    return findings
+
+
+def count_unhealthy_upstream(logs: str) -> int:
+    """Count log LINES carrying a cert-dead-mesh "no healthy upstream" signature."""
+    return sum(
+        1
+        for line in logs.splitlines()
+        if any(sig in line for sig in UNHEALTHY_UPSTREAM_SIGNATURES)
+    )
+
+
 # ── the runner ────────────────────────────────────────────────────────────────
 
 
@@ -378,6 +600,11 @@ class VerifyRunner:
             "cluster-api:helm:status",
             f"registry:{self.cfg.registry}:published-digest",
             f"front-door:{self.cfg.front_door}",
+            # ── #384 WS2 mesh-health evidence (independent cluster reads) ──
+            "cluster-api:kubectl:istiod-logs",
+            "cluster-api:kubectl:istiod-deployment",
+            "cluster-api:kubectl:istiod-endpoints",
+            "cluster-api:kubectl:memory-server-logs",
         ]
 
     @property
@@ -475,6 +702,73 @@ class VerifyRunner:
             return None
         strategy = parsed.get("spec", {}).get("strategy")
         return strategy if isinstance(strategy, dict) else None
+
+    # -- #384 WS2 mesh-health cluster reads (independent, read-only) --
+
+    def _istiod_logs(self) -> str | None:
+        """istiod log window. ``None`` on a non-zero exit → fail-closed FAIL."""
+        proc = _run(
+            [
+                "kubectl",
+                "logs",
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-l",
+                mesh.ISTIOD_LABEL,
+                f"--since={MESH_LOG_WINDOW}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+    def _istiod_deployment(self) -> dict[str, Any] | None:
+        """Parsed istiod Deployment JSON. ``None`` when unreadable (fail-closed)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                mesh.ISTIOD_DEPLOYMENT,
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        parsed = _parse_json(proc.stdout.encode())
+        return parsed if isinstance(parsed, dict) else None
+
+    def _istiod_endpoint_ips(self) -> str | None:
+        """Space-joined istiod Service endpoint IPs. ``None`` on error (fail-closed)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "endpoints",
+                mesh.ISTIOD_DEPLOYMENT,
+                "-n",
+                mesh.ISTIO_NAMESPACE,
+                "-o",
+                "jsonpath={.subsets[*].addresses[*].ip}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+    def _memory_server_logs(self) -> str | None:
+        """memory-server log window. ``None`` on a non-zero exit → fail-closed FAIL."""
+        proc = _run(
+            [
+                "kubectl",
+                "logs",
+                "-n",
+                self.cfg.namespace,
+                "-l",
+                _COMPONENT_SELECTOR,
+                f"--since={MESH_LOG_WINDOW}",
+            ]
+        )
+        return proc.stdout if proc.returncode == 0 else None
 
     # -- front-door reads (single egress seam: _http_request) --
 
@@ -730,6 +1024,170 @@ class VerifyRunner:
             },
         )
 
+    # -- probe 6: istiod-api-reachable (#384 WS2, the #307 signal) --
+
+    def probe_istiod_api_reachable(self) -> ProbeResult:
+        """istiod can reach the kube-API to cert a NEW sidecar (#307).
+
+        Independent evidence: this runner reads the istiod logs, Deployment and
+        endpoints ITSELF, then feeds them to the PURE ``mesh`` diagnosers. It never
+        reads the WS1 gate's result. Any unreadable transport read → fail-closed.
+        """
+        logs = self._istiod_logs()
+        deployment = self._istiod_deployment()
+        endpoint_ips = self._istiod_endpoint_ips()
+        unreadable = [
+            label
+            for label, value in (
+                ("istiod-logs", logs),
+                ("istiod-endpoints", endpoint_ips),
+            )
+            if value is None
+        ]
+        if unreadable:
+            return self._record(
+                PROBES[5],
+                FAIL,
+                f"could not read {', '.join(unreadable)} (fail-closed)",
+                {"unreadable": unreadable},
+            )
+        findings = mesh.evaluate_istiod_logs(
+            logs, MESH_LOG_WINDOW
+        ) + mesh.evaluate_istiod_readiness(deployment, endpoint_ips)
+        if findings:
+            return self._record(
+                PROBES[5],
+                FAIL,
+                "istiod<->kube-API path degraded: "
+                + ", ".join(f.signal for f in findings),
+                {"findings": [f.as_dict() for f in findings]},
+            )
+        return self._record(
+            PROBES[5],
+            PASS,
+            "istiod fully Ready with endpoints and no #307 smoking-gun in the log window",
+            {"log_window": MESH_LOG_WINDOW},
+        )
+
+    # -- probe 7: sidecars-have-certs (#384 WS2) --
+
+    def probe_sidecars_have_certs(self) -> ProbeResult:
+        """Every istio-injected pod has a Ready istio-proxy and is Running."""
+        pods = self._pods_json()
+        if not pods:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "no pods returned from the cluster API (unreachable or namespace empty)",
+                {"namespace": self.cfg.namespace, "pod_count": 0},
+            )
+        injected = [p for p in pods if pod_has_container(p, ISTIO_PROXY_CONTAINER)]
+        if not injected:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "no istio-injected pods found — the data plane cannot be certified",
+                {"pod_count": len(pods)},
+            )
+        findings = sidecar_cert_findings(pods)
+        if findings:
+            return self._record(
+                PROBES[6],
+                FAIL,
+                "cert-starved data plane: " + ", ".join(f["pod"] for f in findings),
+                {"findings": findings},
+            )
+        return self._record(
+            PROBES[6],
+            PASS,
+            f"all {len(injected)} istio-injected pod(s) have a Ready istio-proxy sidecar",
+            {"injected_pods": [pod_name(p) for p in injected]},
+        )
+
+    # -- probe 8: vault-secret-rendered (#384 WS2) --
+
+    def probe_vault_secret_rendered(self) -> ProbeResult:
+        """Every vault-annotated pod rendered its secret (no exit-79 / non-injection)."""
+        pods = self._pods_json()
+        if not pods:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "no pods returned from the cluster API (unreachable or namespace empty)",
+                {"namespace": self.cfg.namespace, "pod_count": 0},
+            )
+        annotated = [
+            p for p in pods if pod_annotations(p).get(VAULT_INJECT_ANNOTATION) == "true"
+        ]
+        if not annotated:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "no vault-annotated pods found — cannot certify secret render (fail-closed)",
+                {"pod_count": len(pods)},
+            )
+        findings = vault_secret_findings(pods)
+        if findings:
+            return self._record(
+                PROBES[7],
+                FAIL,
+                "vault secret not rendered: " + ", ".join(f["pod"] for f in findings),
+                {"findings": findings},
+            )
+        return self._record(
+            PROBES[7],
+            PASS,
+            f"all {len(annotated)} vault-annotated pod(s) rendered their secret "
+            "(Ready vault-agent, no exit-79)",
+            {"vault_pods": [pod_name(p) for p in annotated]},
+        )
+
+    # -- probe 9: no-unhealthy-upstream (#384 WS2) --
+
+    def probe_no_unhealthy_upstream(self) -> ProbeResult:
+        """Front door serves AND no cert-dead-mesh 503 in the memory-server logs."""
+        status_code, body = self._front_get("/health", token=None)
+        if (
+            status_code != 200
+            or not isinstance(body, dict)
+            or body.get("status") != "ok"
+        ):
+            reported = body.get("status") if isinstance(body, dict) else None
+            return self._record(
+                PROBES[8],
+                FAIL,
+                f"front-door /health HTTP {status_code} status={reported!r} "
+                "(expected 200 + status=ok)",
+                {"http_status": status_code, "health_status": reported},
+            )
+        logs = self._memory_server_logs()
+        if logs is None:
+            return self._record(
+                PROBES[8],
+                FAIL,
+                "could not read memory-server logs (fail-closed)",
+                {"http_status": status_code},
+            )
+        hits = count_unhealthy_upstream(logs)
+        if hits:
+            return self._record(
+                PROBES[8],
+                FAIL,
+                f"{hits} 'no healthy upstream' 503 signature(s) in the last {MESH_LOG_WINDOW} "
+                "(cert-dead mesh data plane)",
+                {
+                    "match_count": hits,
+                    "log_window": MESH_LOG_WINDOW,
+                    "log_tail": logs[-2000:],
+                },
+            )
+        return self._record(
+            PROBES[8],
+            PASS,
+            "front door serving and no 'no healthy upstream' 503 in the log window",
+            {"log_window": MESH_LOG_WINDOW},
+        )
+
     # -- orchestration + verdict --
 
     @property
@@ -745,6 +1203,11 @@ class VerifyRunner:
         self.probe_no_drift()
         self.probe_health_version()
         self.probe_recall_e2e()
+        # ── #384 WS2 mesh-health probes (independent, fail-closed) ──
+        self.probe_istiod_api_reachable()
+        self.probe_sidecars_have_certs()
+        self.probe_vault_secret_rendered()
+        self.probe_no_unhealthy_upstream()
         return self.write_report()
 
     def build_report(self) -> dict[str, Any]:
