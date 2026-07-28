@@ -121,6 +121,26 @@ dev = [
     "pyyaml>=6.0",
 ]
 
+# CI-Agent gate tooling — GATEKEEPER, NOT a runtime dependency; NEVER
+# installed into the image. This group holds the offline semgrep
+# security-lint gate (#382, ADR-059 WS1 — the first component of the local
+# deterministic CI-Agent). It is DELIBERATELY kept out of both `dependencies`
+# and the `dev` extra so that:
+#   * `make sync-requirements` (which renders only runtime + dev) never puts
+#     semgrep into requirements.txt, and
+#   * the Docker image build (`pip install -r requirements.txt`) never pulls
+#     semgrep — so the app's `opentelemetry-instrumentation-*` keep resolving
+#     at their intended (0.65b0) line instead of being dragged to 0.58b0 by
+#     semgrep's `opentelemetry-instrumentation-requests~=0.58b0` hard-pin.
+# Install ONLY to run the local gate:  pip install -e '.[gate]'
+# (CI installs this group in the gate step; the image never does.)
+# semgrep is PINNED for determinism: same code + same rules + same engine →
+# same findings, no wall-clock, no network. See ci/semgrep/rules.yml and the
+# `security-lint` Makefile target.
+gate = [
+    "semgrep==1.171.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/lfdesousa/AuditTrace-AI"
 Documentation = "https://github.com/lfdesousa/AuditTrace-AI#readme"

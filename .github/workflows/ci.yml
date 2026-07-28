@@ -66,11 +66,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Install CI-Agent gate tooling (semgrep — gatekeeper, NOT a runtime dep)
+        # The `gate` extra holds semgrep for the local deterministic CI-Agent
+        # (#382, ADR-059 WS1). It is deliberately kept OUT of `dependencies`
+        # and the `dev` extra (and therefore out of requirements.txt / the
+        # image) so the app's opentelemetry-instrumentation-* keep their
+        # intended (0.65b0) resolution in the shipped image. It is installed
+        # HERE only so `make security-lint` can run and the falsifiable
+        # tests/test_semgrep_url_rule.py does not skip (zero-skip policy).
+        run: pip install -e ".[gate]"
+
       - name: Lint
         run: ruff check src/ tests/
 
       - name: Format check
         run: ruff format --check src/ tests/
+
+      - name: Security-lint (offline semgrep gate — same make target as local + pre-commit; #382)
+        # WS1 of the local deterministic CI-Agent (ADR-059). Runs the SAME
+        # make target, vendored rules, and flags as the local
+        # `make security-lint` and the `semgrep-security-lint` pre-commit
+        # hook (ci/semgrep/rules.yml), so local, pre-commit, and CI are in
+        # lockstep. Offline + deterministic: local --config only (never
+        # `--config auto`), --metrics=off, --disable-version-check, and
+        # semgrep is PINNED in the `gate` extra. This is an ADDITIONAL fast
+        # gate; the repo's default-setup CodeQL stays the deeper backstop and
+        # is NOT touched here.
+        run: make security-lint
 
       - name: Assert RLS integration tests are actually runnable
         # Belt + braces: prove the Postgres service is reachable before

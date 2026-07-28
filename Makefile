@@ -1,4 +1,4 @@
-.PHONY: help venv install lint test test-cov test-coverage clean \
+.PHONY: help venv install lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync
 
@@ -24,13 +24,30 @@ install: venv ## Install all dependencies (including dev)
 	@echo ""
 	@echo "Run tests: make test"
 
-lint: ## Run linting and formatting
+lint: security-lint ## Run linting and formatting (includes the offline security-lint gate)
 	@echo "🔍 Running linter..."
 	@.venv/bin/ruff check src/ tests/
 	@echo "✅ Linting passed"
 	@echo "📝 Running formatter check..."
 	@.venv/bin/ruff format --check src/ tests/
 	@echo "✅ Formatting passed"
+
+security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling — install first with `pip install -e '.[gate]'` (kept OUT of the image on purpose). Vendored rules only — no network, no `--config auto`. Composable: slots into the unified local CI-Agent gate.
+	@SEMGREP="$$( [ -x .venv/bin/semgrep ] && echo .venv/bin/semgrep || command -v semgrep || true )"; \
+	if [ -z "$$SEMGREP" ]; then \
+	  echo "❌ semgrep not found. It is the CI-Agent gate (gatekeeper) tooling —"; \
+	  echo "   deliberately NOT a runtime/image dependency. Install the gate group:"; \
+	  echo "       pip install -e '.[gate]'"; \
+	  exit 1; \
+	fi; \
+	echo "🛡️  Running semgrep security-lint (offline, vendored rules) via $$SEMGREP ..."; \
+	"$$SEMGREP" \
+	  --error \
+	  --disable-version-check \
+	  --metrics=off \
+	  --config ci/semgrep/rules.yml \
+	  src/ tests/ scripts/; \
+	echo "✅ Security-lint passed"
 
 format: ## Run code formatting
 	@echo "📝 Running code formatter..."
