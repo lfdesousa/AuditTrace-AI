@@ -153,6 +153,36 @@ VAULT_INJECT_ANNOTATION = "vault.hashicorp.com/agent-inject"
 VAULT_FAILCLOSED_EXIT_CODE = 79
 # The cert-dead-mesh data-plane signature (mode 3): Envoy has no upstream cert/route.
 UNHEALTHY_UPSTREAM_SIGNATURES = ("no healthy upstream",)
+# Fail-closed ALLOWLIST of mesh-Finding evidence keys this runner may surface.
+# A denylist would be fail-OPEN: mesh diagnosers already attach RAW command/log
+# output under SEVERAL keys (``log_tail`` in evaluate_istiod_logs; ``error`` /
+# ``deployment_error`` / ``endpoints_error`` in MeshGate.diagnose_mesh), and a
+# future diagnoser could add another. So we keep ONLY these known-safe derived
+# keys and DROP every other key — the raw ones today AND any unknown future key —
+# by default, so a newly-added raw key can never leak
+# (CodeQL py/clear-text-logging-of-sensitive-data). Each allowed key is a derived
+# scalar or short status label, verified against every mesh diagnoser's evidence,
+# never raw log/command output:
+#   match_count       int   — count of smoking-gun log lines
+#   window            str   — the log-window label (e.g. "3m")
+#   ready_replicas    int   — istiod ready replica count
+#   desired_replicas  int   — istiod desired replica count
+#   endpoint_count    int   — istiod Service ready-endpoint count
+#   spec_replicas     scalar— istiod spec.replicas value (or None)
+#   ready_statuses    list  — node Ready booleans ("True"/"False"), no node names
+#   deployment        None  — the null sentinel (only ever None in a finding)
+ALLOWED_EVIDENCE_KEYS = frozenset(
+    {
+        "match_count",
+        "window",
+        "ready_replicas",
+        "desired_replicas",
+        "endpoint_count",
+        "spec_replicas",
+        "ready_statuses",
+        "deployment",
+    }
+)
 # Pods that have RUN TO COMPLETION — their istio-proxy sidecar terminates normally,
 # so a not-Ready proxy on them is NOT a cert failure (e.g. a finished Helm-hook
 # Job). They are exempt from the live-data-plane sidecar-readiness check.
@@ -569,6 +599,26 @@ def count_unhealthy_upstream(logs: str) -> int:
         for line in logs.splitlines()
         if any(sig in line for sig in UNHEALTHY_UPSTREAM_SIGNATURES)
     )
+
+
+def sanitized_finding(finding: mesh.Finding) -> dict[str, Any]:
+    """A mesh :class:`~scripts.deploy.mesh.Finding` as a dict, safe to put in the report.
+
+    FAIL-CLOSED: keeps ``signal`` + ``detail`` (the diagnoser's own derived status
+    strings) and, for evidence, ONLY keys in :data:`ALLOWED_EVIDENCE_KEYS` — every
+    other key is DROPPED. mesh diagnosers attach RAW command/log output under keys
+    like ``log_tail`` / ``error`` / ``deployment_error`` / ``endpoints_error``;
+    allowlisting (rather than denylisting those) means a NEW raw key added to any
+    diagnoser is dropped by default, never leaked by default
+    (CodeQL py/clear-text-logging-of-sensitive-data).
+    """
+    raw = finding.as_dict()
+    evidence = {
+        key: value
+        for key, value in (raw.get("evidence") or {}).items()
+        if key in ALLOWED_EVIDENCE_KEYS
+    }
+    return {"signal": raw["signal"], "detail": raw["detail"], "evidence": evidence}
 
 
 # ── the runner ────────────────────────────────────────────────────────────────
@@ -1060,7 +1110,8 @@ class VerifyRunner:
                 FAIL,
                 "istiod<->kube-API path degraded: "
                 + ", ".join(f.signal for f in findings),
-                {"findings": [f.as_dict() for f in findings]},
+                # sanitized: raw istiod log_tail stripped (see sanitized_finding).
+                {"findings": [sanitized_finding(f) for f in findings]},
             )
         return self._record(
             PROBES[5],
@@ -1175,11 +1226,11 @@ class VerifyRunner:
                 FAIL,
                 f"{hits} 'no healthy upstream' 503 signature(s) in the last {MESH_LOG_WINDOW} "
                 "(cert-dead mesh data plane)",
-                {
-                    "match_count": hits,
-                    "log_window": MESH_LOG_WINDOW,
-                    "log_tail": logs[-2000:],
-                },
+                # SECURITY: emit only the DERIVED count + window + the named signature,
+                # never raw log content — memory-server logs can carry tokens / request
+                # content / PII (CodeQL py/clear-text-logging-of-sensitive-data). The
+                # count + window + signature name is sufficient reconstruction evidence.
+                {"match_count": hits, "log_window": MESH_LOG_WINDOW},
             )
         return self._record(
             PROBES[8],

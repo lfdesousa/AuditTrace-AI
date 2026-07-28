@@ -1395,6 +1395,131 @@ def test_no_unhealthy_upstream_fail_closed_logs_unreadable(tmp_path, monkeypatch
     assert res.status == FAIL and "could not read memory-server logs" in res.detail
 
 
+# ── CodeQL fix: no raw log content leaks into the verify report ───────────────
+#
+# py/clear-text-logging-of-sensitive-data. memory-server / istiod logs can carry
+# tokens / request content / PII; a FAIL must emit DERIVED signals only (counts,
+# window, signature name), never the raw log tail. FALSIFIABLE: re-adding a
+# ``log_tail`` (or any raw-content evidence value) turns these RED.
+
+# A distinctive "secret" planted in the raw logs. If it ever appears in ANY probe
+# evidence value or detail string, a raw-content leak has been reintroduced.
+_PLANTED_SECRET = "Bearer eyJhbGciOiJIUZ.SUPERSECRET.TOKEN-should-never-surface"
+
+
+def _evidence_as_text(evidence):
+    return json.dumps(evidence, default=str)
+
+
+def test_no_unhealthy_upstream_fail_emits_no_raw_log_content(tmp_path, monkeypatch):
+    """The no-unhealthy-upstream FAIL evidence is EXACTLY {match_count, log_window}
+    and carries none of the raw log tail (which here embeds a planted secret)."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok"})}),
+    )
+    noisy = f"req {_PLANTED_SECRET}\nupstream connect error: no healthy upstream\n"
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, noisy))
+    res = VerifyRunner(_cfg(tmp_path)).probe_no_unhealthy_upstream()
+    assert res.status == FAIL
+    # evidence keys are EXACTLY the derived pair — no log_tail / raw content
+    assert set(res.evidence) == {"match_count", "log_window"}
+    assert res.evidence["match_count"] == 1
+    # the planted secret appears in NO evidence value and NO detail string
+    assert _PLANTED_SECRET not in _evidence_as_text(res.evidence)
+    assert _PLANTED_SECRET not in res.detail
+
+
+def test_istiod_api_reachable_fail_emits_no_raw_log_content(tmp_path, monkeypatch):
+    """The istiod probe reuses mesh diagnosers whose finding carries a raw log_tail;
+    the probe MUST strip it — no finding evidence value contains the planted
+    secret, and no 'log_tail' key survives."""
+    smoking = f"{_PLANTED_SECRET}\ndial tcp 10.43.0.1:443: no route to host\n"
+    monkeypatch.setattr(verify, "_run", _istiod_router(logs=smoking))
+    res = VerifyRunner(_cfg(tmp_path)).probe_istiod_api_reachable()
+    assert res.status == FAIL
+    findings = res.evidence["findings"]
+    assert findings[0]["signal"] == "istiod-api-unreachable"
+    # derived evidence survives, raw log content does not
+    assert findings[0]["evidence"]["match_count"] == 1
+    for finding in findings:
+        assert "log_tail" not in finding["evidence"]
+    assert _PLANTED_SECRET not in _evidence_as_text(res.evidence)
+    assert _PLANTED_SECRET not in res.detail
+
+
+def test_sanitized_finding_keeps_allowlisted_derived_keys():
+    """The sanitizer keeps allowlisted derived evidence (and signal/detail)."""
+    f = mesh.Finding(
+        "istiod-api-unreachable",
+        "1 smoking-gun line",
+        {"match_count": 1, "window": "3m", "log_tail": _PLANTED_SECRET},
+    )
+    out = verify.sanitized_finding(f)
+    assert out["signal"] == "istiod-api-unreachable"
+    assert out["detail"] == "1 smoking-gun line"
+    assert out["evidence"] == {"match_count": 1, "window": "3m"}
+    assert "log_tail" not in out["evidence"]
+    assert _PLANTED_SECRET not in json.dumps(out, default=str)
+    # a finding with no evidence must not crash
+    empty = verify.sanitized_finding(mesh.Finding("s", "d"))
+    assert empty["evidence"] == {}
+
+
+def test_sanitized_finding_allowlist_drops_unknown_and_raw_keys():
+    """FAIL-CLOSED allowlist: known-raw keys (error / deployment_error /
+    endpoints_error / log_tail) AND any UNKNOWN future key are DROPPED; only
+    allowlisted derived keys survive. Falsifiable: switching back to a denylist,
+    or widening the allowlist to include a raw key, turns this RED."""
+    f = mesh.Finding(
+        "istiod-unreadable",
+        "could not read istiod readiness (fail-closed)",
+        {
+            "error": "raw stderr " + _PLANTED_SECRET,
+            "deployment_error": "raw " + _PLANTED_SECRET,
+            "endpoints_error": _PLANTED_SECRET,
+            "log_tail": _PLANTED_SECRET,
+            "future_unknown_key": _PLANTED_SECRET,
+            "match_count": 1,
+        },
+    )
+    out = verify.sanitized_finding(f)
+    # only the allowlisted derived key survives; every raw/unknown key is dropped
+    assert out["evidence"] == {"match_count": 1}
+    for dropped in (
+        "error",
+        "deployment_error",
+        "endpoints_error",
+        "log_tail",
+        "future_unknown_key",
+    ):
+        assert dropped not in out["evidence"]
+    assert _PLANTED_SECRET not in json.dumps(out, default=str)
+
+
+def test_allowed_evidence_keys_are_all_emitted_by_a_mesh_diagnoser():
+    """Every allowlisted key is actually produced by a mesh diagnoser (no dead
+    entries) — and no raw key sneaked into the allowlist."""
+    emitted: set[str] = set()
+    for finding in (
+        *mesh.evaluate_nodes(""),
+        *mesh.evaluate_nodes("True False"),
+        *mesh.evaluate_istiod_logs("no route to host", "3m"),
+        *mesh.evaluate_istiod_readiness(None, "10.0.0.1"),
+        *mesh.evaluate_istiod_readiness({"spec": {"replicas": 1}, "status": {}}, ""),
+        *mesh.evaluate_istiod_readiness(
+            {"spec": {"replicas": 2}, "status": {"readyReplicas": 1}}, "10.0.0.1"
+        ),
+        *mesh.evaluate_istiod_readiness({"spec": {}, "status": {}}, "10.0.0.1"),
+    ):
+        emitted.update(finding.evidence)
+    # allowlist contains no raw key, and every allowlisted key is genuinely emitted
+    for raw in ("log_tail", "error", "deployment_error", "endpoints_error"):
+        assert raw not in verify.ALLOWED_EVIDENCE_KEYS
+    assert verify.ALLOWED_EVIDENCE_KEYS <= emitted
+
+
 # ── verdict integration: each mesh probe flips the VERDICT to FAIL ────────────
 
 
