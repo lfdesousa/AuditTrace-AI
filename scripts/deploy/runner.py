@@ -42,7 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts.deploy import registry
+from scripts.deploy import mesh, registry
 
 logger = logging.getLogger("audittrace.deploy.runner")
 
@@ -80,6 +80,24 @@ class PreflightAbortError(RuntimeError):
         super().__init__(f"preflight aborted (exit {exit_code}): {meaning}")
         self.exit_code = exit_code
         self.meaning = meaning
+
+
+# Exit code for a P0 abort caused by the mesh-health gate (#384 WS1) — distinct
+# from the preflight-script codes 1–5 so a mesh abort is legible in the report.
+MESH_UNSAFE_EXIT = 6
+
+
+class MeshGateAbortError(PreflightAbortError):
+    """Raised when the P0 mesh gate is UNSAFE; aborts BEFORE any mutation (#384).
+
+    A subclass of :class:`PreflightAbortError` so :meth:`DeployRunner.run` catches
+    it through the existing abort path and still emits a report — the only pod is
+    never terminated into a cert-dead mesh (invariant I1).
+    """
+
+    def __init__(self, result: mesh.MeshGateResult) -> None:
+        super().__init__(MESH_UNSAFE_EXIT, f"mesh unsafe — {result.reason}")
+        self.result = result
 
 
 # ── external-effect indirections (monkeypatched in tests) ────────────────────
@@ -233,7 +251,9 @@ def extract_digest(image_id: str | None) -> str | None:
 class DeployRunner:
     """Executes the ordered phases and emits the non-self-certifying report."""
 
-    def __init__(self, cfg: DeployConfig) -> None:
+    def __init__(
+        self, cfg: DeployConfig, mesh_gate: mesh.MeshGate | None = None
+    ) -> None:
         self.cfg = cfg
         self.records: list[PhaseRecord] = []
         self.image_ref: registry.ImageRef | None = None
@@ -241,6 +261,11 @@ class DeployRunner:
         self.converged: bool = False
         self.surge: dict[str, Any] = {}
         self.aborted: bool = False
+        # Injected so tests drive it without a cluster; the default WS1 gate ships
+        # the UnconfiguredHealer (fail-closed) until the WS5 privileged healer lands.
+        self.mesh_gate = mesh_gate or mesh.MeshGate(
+            mesh.MeshGateConfig(namespace=cfg.namespace)
+        )
 
     # -- phase plumbing --
 
@@ -298,7 +323,40 @@ class DeployRunner:
             PHASES[0],
             "ok",
             command=" ".join(cmd),
-            detail="mesh + injector healthy; safe to proceed",
+            detail="preflight gates passed",
+            started_at=started,
+            ended_at=_now_iso(),
+        )
+        # #384 WS1 — the fail-closed mesh-health gate. Runs AFTER the static
+        # preflight gates but BEFORE any P1+ mutation, so with the WS1 surge-safe
+        # strategy (maxSurge=0) the only memory-server pod is never terminated
+        # into a mesh that cannot re-issue its workload cert (invariant I1). A
+        # degraded mesh is auto-healed (bounded) or the deploy aborts fail-closed.
+        self._mesh_gate()
+
+    def _mesh_gate(self) -> None:
+        """Run the P0 mesh-health gate; ABORT before mutation when UNSAFE (#384)."""
+        started = _now_iso()
+        result = self.mesh_gate.evaluate()
+        if not result.safe:
+            self._record(
+                PHASES[0],
+                "aborted",
+                detail=f"MESH UNSAFE — {result.reason}",
+                evidence=result.as_dict(),
+                started_at=started,
+                ended_at=_now_iso(),
+            )
+            raise MeshGateAbortError(result)
+        self._record(
+            PHASES[0],
+            "ok",
+            detail=(
+                "mesh healthy; safe to proceed"
+                if result.healthy
+                else f"mesh auto-healed; safe to proceed ({result.reason})"
+            ),
+            evidence=result.as_dict(),
             started_at=started,
             ended_at=_now_iso(),
         )
