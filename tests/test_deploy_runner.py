@@ -13,10 +13,11 @@ import subprocess
 
 import pytest
 
-from scripts.deploy import registry, runner
+from scripts.deploy import mesh, registry, runner
 from scripts.deploy.runner import (
     DeployConfig,
     DeployRunner,
+    MeshGateAbortError,
     PreflightAbortError,
     max_concurrent_running,
     within_surge_bound,
@@ -36,6 +37,36 @@ def _cfg(tmp_path, **kw):
     kw.setdefault("settle_interval", 0.0)
     kw.setdefault("target_version", "v9.9.9")
     return DeployConfig(**kw)
+
+
+class _StubGate:
+    """A MeshGate stand-in returning a canned result — lets the runner tests
+    exercise the P0 mesh wiring without touching a cluster."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def evaluate(self):
+        self.calls += 1
+        return self.result
+
+
+def _healthy_gate():
+    diag = mesh.Diagnosis(findings=[])
+    return _StubGate(mesh.MeshGateResult(mesh.HEALTHY, diag, [], diag))
+
+
+def _healed_gate():
+    initial = mesh.Diagnosis(findings=[mesh.Finding("istiod-api-unreachable", "x")])
+    final = mesh.Diagnosis(findings=[])
+    attempt = mesh.HealAttempt(True, "restart-istiod", "healed")
+    return _StubGate(mesh.MeshGateResult(mesh.HEALED, initial, [attempt], final))
+
+
+def _unsafe_gate():
+    initial = mesh.Diagnosis(findings=[mesh.Finding("istiod-api-unreachable", "x")])
+    return _StubGate(mesh.MeshGateResult(mesh.UNSAFE, initial, [], initial))
 
 
 class _Dispatcher:
@@ -161,9 +192,73 @@ def test_preflight_aborts_on_nonzero(tmp_path, monkeypatch, code, needle):
 
 def test_preflight_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
-    r = DeployRunner(_cfg(tmp_path))
+    r = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
     r.phase_preflight()
+    # P0 now emits two records: the preflight-script gate AND the mesh gate.
     assert r.records[0].status == "ok"
+    assert r.records[1].status == "ok"
+    assert "mesh healthy" in r.records[1].detail
+
+
+# ── P0 mesh-health gate wiring (#384 WS1) ────────────────────────────────────
+
+
+def test_preflight_records_mesh_gate_when_healthy(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    gate = _healthy_gate()
+    r = DeployRunner(_cfg(tmp_path), mesh_gate=gate)
+    r.phase_preflight()
+    assert gate.calls == 1
+    assert [rec.status for rec in r.records] == ["ok", "ok"]
+    assert r.records[1].evidence["outcome"] == mesh.HEALTHY
+
+
+def test_preflight_proceeds_when_mesh_auto_healed(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    r = DeployRunner(_cfg(tmp_path), mesh_gate=_healed_gate())
+    r.phase_preflight()  # HEALED is safe → no abort
+    assert r.records[1].status == "ok"
+    assert "auto-healed" in r.records[1].detail
+    assert r.records[1].evidence["outcome"] == mesh.HEALED
+
+
+def test_preflight_aborts_when_mesh_unsafe(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    r = DeployRunner(_cfg(tmp_path), mesh_gate=_unsafe_gate())
+    with pytest.raises(MeshGateAbortError) as exc:
+        r.phase_preflight()
+    assert exc.value.exit_code == runner.MESH_UNSAFE_EXIT
+    # The preflight-script record is "ok"; the mesh gate record is "aborted".
+    assert r.records[0].status == "ok"
+    assert r.records[1].status == "aborted"
+    assert "MESH UNSAFE" in r.records[1].detail
+    assert r.records[1].evidence["outcome"] == mesh.UNSAFE
+
+
+def test_run_aborts_before_mutation_when_mesh_unsafe(tmp_path, monkeypatch):
+    # Preflight SCRIPT passes; only the mesh gate blocks. No helm/kubectl mutation
+    # command must run after the gate aborts — the only pod is never terminated.
+    disp = _Dispatcher(rules=[("deploy-preflight", _proc(0))])
+    monkeypatch.setattr(runner, "_run", disp)
+    report = DeployRunner(_cfg(tmp_path), mesh_gate=_unsafe_gate()).run()
+    assert report["aborted"] is True
+    # exactly one external command attempted: the preflight probe (mesh gate is
+    # a stub here; a real gate's reads are read-only, never a mutation).
+    assert len(disp.calls) == 1 and "deploy-preflight" in " ".join(disp.calls[0])
+    # phases: P0 script ok, P0 mesh aborted, P5 report.
+    names = [p["name"] for p in report["phases"]]
+    assert names == [runner.PHASES[0], runner.PHASES[0], runner.PHASES[5]]
+    mesh_rec = report["phases"][1]
+    assert mesh_rec["status"] == "aborted"
+    assert mesh_rec["evidence"]["outcome"] == mesh.UNSAFE
+
+
+def test_dry_run_skips_mesh_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _pinned_ref())
+    gate = _unsafe_gate()  # would abort IF called
+    report = DeployRunner(_cfg(tmp_path, dry_run=True), mesh_gate=gate).run()
+    assert gate.calls == 0  # dry-run mutates nothing and never runs the gate
+    assert report["aborted"] is False
 
 
 def test_run_aborts_before_mutation_on_preflight_fail(tmp_path, monkeypatch):
@@ -244,15 +339,17 @@ def test_run_still_emits_report_on_resolve_failure(tmp_path, monkeypatch):
         raise registry.DigestResolutionError("429 rate limited")
 
     monkeypatch.setattr(registry, "resolve", boom)
-    report = DeployRunner(_cfg(tmp_path)).run()  # no exception escapes
+    report = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate()).run()
     assert report["aborted"] is True
     names = [p["name"] for p in report["phases"]]
+    # P0 twice (preflight-script + mesh gate), P1 failed, then P5 report.
     assert names == [
+        runner.PHASES[0],
         runner.PHASES[0],
         runner.PHASES[1],
         runner.PHASES[5],
     ]  # P2..P4 not run
-    assert report["phases"][1]["status"] == "failed"
+    assert report["phases"][2]["status"] == "failed"  # P1 resolve failed
     assert report["certified"] is None
 
 
@@ -269,11 +366,12 @@ def test_run_still_emits_report_on_registry_read_timeout(tmp_path, monkeypatch):
         raise TimeoutError("read timed out")
 
     monkeypatch.setattr(registry, "_http_get", _timeout)
-    report = DeployRunner(_cfg(tmp_path)).run()  # must NOT raise
+    report = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate()).run()  # no raise
     assert report["aborted"] is True
-    assert report["phases"][1]["name"] == runner.PHASES[1]
-    assert report["phases"][1]["status"] == "failed"
-    assert "read timed out" in report["phases"][1]["detail"]
+    # phases[2] is P1 resolve (phases[0]/[1] are the two P0 records).
+    assert report["phases"][2]["name"] == runner.PHASES[1]
+    assert report["phases"][2]["status"] == "failed"
+    assert "read timed out" in report["phases"][2]["detail"]
     assert report["certified"] is None
 
 
