@@ -66,15 +66,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Install CI-Agent gate tooling (semgrep — gatekeeper, NOT a runtime dep)
-        # The `gate` extra holds semgrep for the local deterministic CI-Agent
-        # (#382, ADR-059 WS1). It is deliberately kept OUT of `dependencies`
-        # and the `dev` extra (and therefore out of requirements.txt / the
-        # image) so the app's opentelemetry-instrumentation-* keep their
-        # intended (0.65b0) resolution in the shipped image. It is installed
-        # HERE only so `make security-lint` can run and the falsifiable
-        # tests/test_semgrep_url_rule.py does not skip (zero-skip policy).
-        run: pip install -e ".[gate]"
+      - name: Install CI-Agent gate tooling (semgrep — ISOLATED gatekeeper, never in the app/test venv)
+        # semgrep is the local deterministic CI-Agent's security-lint gate
+        # (#382, ADR-059 WS1). It is a standalone CLI GATEKEEPER, not a runtime
+        # OR test dependency, so it must NEVER be pip-installed into the app/test
+        # venv: semgrep hard-pins `opentelemetry-instrumentation-requests~=0.58b0`,
+        # which drags the WHOLE opentelemetry-instrumentation line down from the
+        # app's 0.65b0 to 0.58b0. Against fastapi 0.140.x (which now puts
+        # `_IncludedRouter` objects in `app.routes`), otel-instrumentation-fastapi
+        # 0.58b0's route detection raises AttributeError on a CORS/OPTIONS
+        # preflight (tests/test_server.py::TestCorsOriginsToggle) — a regression
+        # the shipped image never sees, because it installs from requirements.txt
+        # with no semgrep and keeps 0.65b0. `pip check` calls the downgrade
+        # "consistent" (the pin IS satisfied); the break is runtime, not metadata,
+        # so only a live request surfaces it. pipx installs semgrep in its OWN
+        # isolated venv and exposes it on PATH, leaving the app/test venv at
+        # 0.65b0 while `make security-lint` and the falsifiable
+        # tests/test_semgrep_url_rule.py still find the binary (no skip).
+        # Keep the pin in lockstep with pyproject.toml
+        # [project.optional-dependencies].gate.
+        run: |
+          pipx install "semgrep==1.171.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Lint
         run: ruff check src/ tests/

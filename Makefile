@@ -36,8 +36,12 @@ security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#38
 	@SEMGREP="$$( [ -x .venv/bin/semgrep ] && echo .venv/bin/semgrep || command -v semgrep || true )"; \
 	if [ -z "$$SEMGREP" ]; then \
 	  echo "❌ semgrep not found. It is the CI-Agent gate (gatekeeper) tooling —"; \
-	  echo "   deliberately NOT a runtime/image dependency. Install the gate group:"; \
-	  echo "       pip install -e '.[gate]'"; \
+	  echo "   deliberately NOT a runtime/image/test dependency. Install it ISOLATED"; \
+	  echo "   (pipx gives it its own venv so it can't downgrade the app's otel):"; \
+	  echo "       pipx install 'semgrep==1.171.0'   # pin == pyproject [gate]"; \
+	  echo "   Do NOT 'pip install -e .[gate]' into the app/.venv — semgrep pins"; \
+	  echo "   opentelemetry-instrumentation-requests~=0.58b0 and drags the app's"; \
+	  echo "   otel line down from 0.65b0, breaking FastAPI route detection."; \
 	  exit 1; \
 	fi; \
 	echo "🛡️  Running semgrep security-lint (offline, vendored rules) via $$SEMGREP ..."; \
