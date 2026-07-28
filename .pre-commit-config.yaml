@@ -77,6 +77,23 @@ repos:
         pass_filenames: false
         files: ^(pyproject\.toml|requirements\.txt)$
 
+      # Offline, deterministic semgrep security-lint gate (#382, ADR-059
+      # WS1). Mirrors CodeQL's py/incomplete-url-substring-sanitization
+      # LOCALLY so the WS2 class of finding is caught before the PR, not
+      # after push. Invokes `make security-lint` so the rules, flags, and
+      # targets are byte-identical to the local `make lint` and the CI
+      # step (single source of truth = ci/semgrep/rules.yml + the Makefile
+      # target). Vendored rules only — no network, no `--config auto`.
+      # Fires whenever a tracked .py file changes; scans the full
+      # src/ tests/ scripts/ set (pass_filenames: false).
+      - id: semgrep-security-lint
+        name: semgrep security-lint (offline vendored rules — #382)
+        entry: make security-lint
+        language: system
+        files: \.py$
+        pass_filenames: false
+        require_serial: true
+
       # ADR-049 — Test, Evidence, and Reconstructibility Gate.
       # Refuses commits to src/audittrace/routes/** or
       # src/audittrace/services/** that lack an evidence reference

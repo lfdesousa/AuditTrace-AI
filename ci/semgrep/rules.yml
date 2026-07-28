@@ -1,0 +1,62 @@
+# Vendored, OFFLINE semgrep rules — AuditTrace-AI local security-lint gate.
+#
+# WS1 of the local deterministic CI-Agent (#382, ADR-059). These rules are
+# run ONLY via `--config ci/semgrep/rules.yml` — NEVER `--config auto` and
+# never against semgrep's registry — so the gate needs no network and is
+# fully deterministic (same code + same rules + same pinned engine → same
+# findings). See `make security-lint`.
+#
+# Origin: the WS2 CodeQL surprise. `"host" in url` tripped CodeQL's
+# py/incomplete-url-substring-sanitization only AFTER push, past the builder,
+# the reviewer, and the local `make lint`. This rule set catches that class
+# LOCALLY, before the PR. CI's default-setup CodeQL stays the backstop.
+
+rules:
+  - id: audittrace-url-substring-sanitization
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Incomplete URL substring sanitization: a substring membership test
+      ($HOST in $URL) against a URL-like variable is not a safe host check.
+      A hostile URL such as https://evil.example.com/?x=trusted.host satisfies
+      the substring test. Parse the URL and compare the host EXACTLY, e.g.
+      `urlparse(url).hostname == "trusted.host"`. This mirrors CodeQL
+      py/incomplete-url-substring-sanitization (the WS2 finding, #382).
+    metadata:
+      category: security
+      cwe: "CWE-20: Improper Input Validation"
+      confidence: HIGH
+      references:
+        - https://codeql.github.com/codeql-query-help/python/py-incomplete-url-substring-sanitization/
+      origin: "AuditTrace-AI #382 / ADR-059 WS1 (WS2 CodeQL surprise)"
+    patterns:
+      # The right-hand operand must be a URL-like variable name. This keeps
+      # the rule scoped to URL host checks and avoids flagging membership
+      # tests against unrelated containers (lists, dicts, arbitrary vars).
+      - metavariable-regex:
+          metavariable: $URL
+          regex: (?i)^([a-z0-9_]*_)?(url|uri|href|endpoint|front_door|base_url)$
+      # Never flag the negated form (`X not in url`) — that is not a
+      # positive host-trust decision. Belt-and-braces alongside the
+      # domain-shape / host-name gating in the branches below.
+      - pattern-not: $HOST not in $URL
+      - pattern-either:
+          # Branch 1 — a host/domain-SHAPED string literal is substring-tested
+          # against a URL. `"evil.example.com" in url`. The regex requires a
+          # `label.tld`-shaped dotted literal so scheme/driver/path fragments
+          # that legitimately use `in` (e.g. `"://" in url`,
+          # `"+aiosqlite" not in url`) do NOT match — no false positive on the
+          # current tree.
+          - patterns:
+              - pattern: $HOST in $URL
+              - metavariable-regex:
+                  metavariable: $HOST
+                  regex: (?s)^['"].*[A-Za-z0-9]\.[A-Za-z]{2,}.*['"]$
+          # Branch 2 — a host-named variable is substring-tested against a URL.
+          # `host in url`, `hostname in url`, `domain in url` — the exact
+          # shape of the WS2 finding.
+          - patterns:
+              - pattern: $HOST in $URL
+              - metavariable-regex:
+                  metavariable: $HOST
+                  regex: (?i)^(host|hostname|domain|expected_host|allowed_host|trusted_host)$
