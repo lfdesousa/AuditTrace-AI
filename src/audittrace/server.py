@@ -139,6 +139,136 @@ def make_httpx_async_peer_service_hook(
     return _hook
 
 
+async def _connect_scan_amqp_or_degrade(client: Any) -> bool:
+    """Eagerly open the scan-pipeline AMQP connection, failing OPEN.
+
+    The memory-server's core value (recall + memory) needs neither the
+    broker nor the scan pipeline, so an unreachable RabbitMQ at startup
+    MUST NOT crash the lifespan (#384 WS3, invariant I2). On a cold
+    reboot the broker is often not AMQP-ready inside
+    ``ScanAmqpClient``'s connect budget; the client then raises
+    ``RuntimeError("scan_amqp.connect failed after N attempts …")``.
+
+    Returns ``True`` when the eager connect succeeded, ``False`` when the
+    budget was exhausted and we degrade to lazy — the publisher and both
+    consumers self-connect in their own ``run()`` loops once RabbitMQ is
+    up, with zero operator touch. Only the "connect failed after N
+    attempts" RuntimeError is swallowed; any other error (e.g. a genuine
+    misconfiguration) propagates so it still fails loudly.
+    """
+    try:
+        await client.ensure_connected()
+    except RuntimeError as exc:
+        if "connect failed after" not in str(exc):
+            raise
+        logger.warning(
+            "scan_amqp.eager_connect_degraded_to_lazy",
+            extra={"reason": str(exc)},
+        )
+        return False
+    return True
+
+
+async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
+    """Start the ADR-048 scan-request pipeline, failing OPEN on a broker
+    that is not reachable at startup (#384 WS3).
+
+    Construction of ``ScanAmqpClient`` is cheap/sync (no broker I/O); it
+    is registered for cleanup and only THEN eagerly connected via
+    ``_connect_scan_amqp_or_degrade`` (which degrades to lazy instead of
+    raising). The publisher, janitor, and both consumers are created
+    regardless of the eager-connect outcome — each self-connects in its
+    own ``run()`` loop, so the pipeline attaches with zero operator touch
+    once the broker is up. ``app.state.scan_queue`` is always set so the
+    ``/memory/upload`` route handler can enqueue immediately.
+
+    Returns the ``AsyncExitStack`` owning broker-close + task-cancel, to
+    be unwound on shutdown.
+    """
+    import contextlib  # noqa: PLC0415 — local to keep import surface tight
+
+    from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
+    from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
+        ScanAuditConsumer,
+    )
+    from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
+        ScanRequestJanitor,
+    )
+    from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
+        ScanRequestEnvelope,
+        ScanRequestPublisher,
+    )
+    from audittrace.services.scan_verdict_consumer import (  # noqa: PLC0415
+        ScanVerdictConsumer,
+    )
+
+    stack = contextlib.AsyncExitStack()
+    # Construct (cheap, no I/O) → register cleanup → THEN eager-connect.
+    # Separating construction from ``ensure_connected`` is what lets the
+    # connect fail OPEN while the client is still registered for aclose
+    # and still available to the publisher for lazy self-connect.
+    scan_amqp_client = ScanAmqpClient(settings)
+    stack.push_async_callback(scan_amqp_client.aclose)
+    await _connect_scan_amqp_or_degrade(scan_amqp_client)
+
+    scan_queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue(maxsize=10000)
+    scan_session_factory = get_postgres_factory().get_session_factory()
+    scan_publisher_task = asyncio.create_task(
+        ScanRequestPublisher(
+            amqp_client=scan_amqp_client,
+            queue=scan_queue,
+            session_factory=scan_session_factory,
+        ).run(),
+        name="scan-request-publisher",
+    )
+    scan_janitor_task = asyncio.create_task(
+        ScanRequestJanitor(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=scan_queue,
+        ).run(),
+        name="scan-request-janitor",
+    )
+    verdict_consumer = ScanVerdictConsumer(
+        settings=settings, session_factory=scan_session_factory
+    )
+    stack.push_async_callback(verdict_consumer.aclose)
+    audit_consumer = ScanAuditConsumer(
+        settings=settings, session_factory=scan_session_factory
+    )
+    stack.push_async_callback(audit_consumer.aclose)
+    scan_verdict_task = asyncio.create_task(
+        verdict_consumer.run(), name="scan-verdict-consumer"
+    )
+    scan_audit_task = asyncio.create_task(
+        audit_consumer.run(), name="scan-audit-consumer"
+    )
+
+    async def _cancel_scan_tasks() -> None:
+        tasks = (
+            scan_publisher_task,
+            scan_janitor_task,
+            scan_verdict_task,
+            scan_audit_task,
+        )
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(t, timeout=5.0)
+
+    stack.push_async_callback(_cancel_scan_tasks)
+    # Stash on app.state so the route handler reaches the queue.
+    app.state.scan_queue = scan_queue
+    logger.info(
+        "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
+        "(publisher + janitor + verdict-consumer + audit-consumer)",
+        settings.scan_request_exchange,
+        settings.scan_request_routing_key,
+    )
+    return stack
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
@@ -304,94 +434,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
     scan_pipeline_stack: contextlib.AsyncExitStack | None = None
     if settings.scan_pipeline_enabled:  # pragma: no cover — live-startup path
-        # ``get_postgres_factory`` is already imported at module scope
-        # (line 17 — used by the summariser block above).
-        from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
-        from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
-            ScanAuditConsumer,
-        )
-        from audittrace.services.scan_request_janitor import (  # noqa: PLC0415
-            ScanRequestJanitor,
-        )
-        from audittrace.services.scan_request_publisher import (  # noqa: PLC0415
-            ScanRequestEnvelope,
-            ScanRequestPublisher,
-        )
-        from audittrace.services.scan_verdict_consumer import (  # noqa: PLC0415
-            ScanVerdictConsumer,
-        )
-
-        scan_pipeline_stack = contextlib.AsyncExitStack()
-        # Compose the broker first — its aclose runs LAST on unwind,
-        # after both background tasks have been cancelled.
-        scan_amqp_client = await scan_pipeline_stack.enter_async_context(
-            ScanAmqpClient(settings)
-        )
-        scan_queue: asyncio.Queue[ScanRequestEnvelope] = asyncio.Queue(maxsize=10000)
-        scan_session_factory = get_postgres_factory().get_session_factory()
-        scan_publisher_task = asyncio.create_task(
-            ScanRequestPublisher(
-                amqp_client=scan_amqp_client,
-                queue=scan_queue,
-                session_factory=scan_session_factory,
-            ).run(),
-            name="scan-request-publisher",
-        )
-        scan_janitor_task = asyncio.create_task(
-            ScanRequestJanitor(
-                settings=settings,
-                session_factory=scan_session_factory,
-                queue=scan_queue,
-            ).run(),
-            name="scan-request-janitor",
-        )
-        # PR-B4 — verdict + audit consumers live in the same
-        # AsyncExitStack so their aclose hooks run after the cancel
-        # callback. ``enter_async_context`` registers the
-        # close-on-exit; the consumer instances are then turned into
-        # asyncio Tasks, with the cancel callback below covering
-        # all four (publisher, janitor, verdict, audit).
-        verdict_consumer = ScanVerdictConsumer(
-            settings=settings, session_factory=scan_session_factory
-        )
-        scan_pipeline_stack.push_async_callback(verdict_consumer.aclose)
-        audit_consumer = ScanAuditConsumer(
-            settings=settings, session_factory=scan_session_factory
-        )
-        scan_pipeline_stack.push_async_callback(audit_consumer.aclose)
-        scan_verdict_task = asyncio.create_task(
-            verdict_consumer.run(), name="scan-verdict-consumer"
-        )
-        scan_audit_task = asyncio.create_task(
-            audit_consumer.run(), name="scan-audit-consumer"
-        )
-
-        async def _cancel_scan_tasks() -> None:
-            for t in (
-                scan_publisher_task,
-                scan_janitor_task,
-                scan_verdict_task,
-                scan_audit_task,
-            ):
-                t.cancel()
-            for t in (
-                scan_publisher_task,
-                scan_janitor_task,
-                scan_verdict_task,
-                scan_audit_task,
-            ):
-                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                    await asyncio.wait_for(t, timeout=5.0)
-
-        scan_pipeline_stack.push_async_callback(_cancel_scan_tasks)
-        # Stash on app.state so the route handler reaches the queue.
-        app.state.scan_queue = scan_queue
-        logger.info(
-            "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
-            "(publisher + janitor + verdict-consumer + audit-consumer)",
-            settings.scan_request_exchange,
-            settings.scan_request_routing_key,
-        )
+        # ``_bootstrap_scan_pipeline`` fails OPEN on an unreachable broker
+        # (#384 WS3): it degrades the eager AMQP connect to lazy instead
+        # of raising, so the audit plane still starts and serves recall
+        # while RabbitMQ is down. The tasks self-connect once it is up.
+        scan_pipeline_stack = await _bootstrap_scan_pipeline(app, settings)
     else:
         app.state.scan_queue = None
         logger.info("Scan-request pipeline NOT started (scan_pipeline_enabled=False)")

@@ -9,11 +9,16 @@ back-fills ``server.address`` per ADR-029.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from audittrace.server import (
+    _bootstrap_scan_pipeline,
     _build_httpx_peer_service_map,
+    _connect_scan_amqp_or_degrade,
     make_httpx_async_peer_service_hook,
     make_httpx_peer_service_hook,
     urllib3_set_server_address,
@@ -359,3 +364,114 @@ class TestPerLayerOrScopesOpenAPI:
             ["memory:procedural:write"],
             ["audittrace:admin"],
         ]
+
+
+class TestConnectScanAmqpOrDegrade:
+    """#384 WS3 — the eager scan-pipeline AMQP connect FAILS OPEN. A
+    RabbitMQ that isn't AMQP-ready at startup (cold reboot) must not
+    crash the lifespan; the audit plane keeps serving recall while the
+    publisher/consumers self-connect lazily once the broker is up."""
+
+    async def test_success_returns_true(self) -> None:
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        assert await _connect_scan_amqp_or_degrade(client) is True
+        client.ensure_connected.assert_awaited_once()
+
+    async def test_connect_budget_exhausted_degrades_to_lazy(self) -> None:
+        # The exact RuntimeError ScanAmqpClient raises on budget
+        # exhaustion — swallowed + logged, returns False (fail-open).
+        client = MagicMock()
+        client.ensure_connected = AsyncMock(
+            side_effect=RuntimeError(
+                "scan_amqp.connect failed after 9 attempts "
+                "(last error: ConnectionResetError(104, 'reset'))"
+            )
+        )
+        assert await _connect_scan_amqp_or_degrade(client) is False
+
+    async def test_unrelated_runtime_error_propagates(self) -> None:
+        # Only the connect-exhaustion RuntimeError is swallowed; a
+        # genuine misconfiguration must still fail loudly.
+        client = MagicMock()
+        client.ensure_connected = AsyncMock(
+            side_effect=RuntimeError("scan_amqp_url is required")
+        )
+        with pytest.raises(RuntimeError, match="scan_amqp_url is required"):
+            await _connect_scan_amqp_or_degrade(client)
+
+
+class TestBootstrapScanPipeline:
+    """#384 WS3 — even when the eager AMQP connect is exhausted, the
+    lifespan bootstrap does NOT raise, still sets ``app.state.scan_queue``,
+    and still creates the four background tasks (they self-connect once
+    RabbitMQ is up — invariant I2)."""
+
+    async def test_fails_open_sets_queue_and_creates_tasks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started: list[str] = []
+
+        class _FakeAmqp:
+            def __init__(self, settings: object) -> None:
+                self.aclose = AsyncMock()
+
+            async def ensure_connected(self) -> None:
+                # Cold RabbitMQ: budget exhausted.
+                raise RuntimeError(
+                    "scan_amqp.connect failed after 9 attempts "
+                    "(last error: ConnectionResetError(104, 'reset'))"
+                )
+
+        def _make_task_cls(label: str) -> type:
+            class _FakeTask:
+                def __init__(self, **_kwargs: object) -> None:
+                    started.append(label)
+
+                async def run(self) -> None:
+                    await asyncio.Event().wait()  # park until cancelled
+
+                async def aclose(self) -> None:
+                    return None
+
+            return _FakeTask
+
+        monkeypatch.setattr(
+            "audittrace.services.scan_amqp_client.ScanAmqpClient", _FakeAmqp
+        )
+        monkeypatch.setattr(
+            "audittrace.services.scan_request_publisher.ScanRequestPublisher",
+            _make_task_cls("publisher"),
+        )
+        monkeypatch.setattr(
+            "audittrace.services.scan_request_janitor.ScanRequestJanitor",
+            _make_task_cls("janitor"),
+        )
+        monkeypatch.setattr(
+            "audittrace.services.scan_verdict_consumer.ScanVerdictConsumer",
+            _make_task_cls("verdict"),
+        )
+        monkeypatch.setattr(
+            "audittrace.services.scan_audit_consumer.ScanAuditConsumer",
+            _make_task_cls("audit"),
+        )
+        fake_factory = MagicMock()
+        fake_factory.get_session_factory.return_value = MagicMock()
+        monkeypatch.setattr(
+            "audittrace.server.get_postgres_factory", lambda: fake_factory
+        )
+
+        app = SimpleNamespace(state=SimpleNamespace())
+        settings = SimpleNamespace(
+            scan_request_exchange="audittrace.scan",
+            scan_request_routing_key="scan.requested",
+        )
+
+        stack = await _bootstrap_scan_pipeline(app, settings)  # must NOT raise
+        try:
+            # Fail-open: queue is live so /memory/upload can enqueue.
+            assert isinstance(app.state.scan_queue, asyncio.Queue)
+            # All four background tasks were created despite the dead broker.
+            assert sorted(started) == ["audit", "janitor", "publisher", "verdict"]
+        finally:
+            await stack.aclose()  # cancels tasks + runs aclose callbacks
