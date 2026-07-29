@@ -39,6 +39,7 @@ Discipline mirrors ``ScanVerdictConsumer``:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -80,7 +81,52 @@ class ScanAuditConsumer:
 
     # 2026-05-14 B4b — see scan_verdict_consumer for the symmetric
     # rationale. Same fresh-install race; same retry budget.
+    #
+    # RESIDUAL GAP (#393): as in ScanVerdictConsumer, a cold-boot
+    # queue-declaration race outlasting this budget still raises
+    # RuntimeError and kills the consumer (queue-not-found is not
+    # supervised in run()). Tracked as a follow-up.
     _QUEUE_MAX_ATTEMPTS: int = 6
+
+    # #384 WS3 — INITIAL-connect resilience; see ScanVerdictConsumer for
+    # the full rationale. ``connect_robust`` was previously outside the
+    # retry loop, so a cold-reboot RabbitMQ killed the consumer task
+    # permanently once the lifespan fail-open removed the crash-loop
+    # crutch. Wrapped in capped-backoff retry + supervised in ``run()``.
+    _CONNECT_MAX_ATTEMPTS: int = 6
+    _CONNECT_BACKOFF_CAP_SECONDS: float = 30.0
+
+    async def _connect_with_retry(
+        self, aio_pika: Any, amqp_error_cls: type[BaseException]
+    ) -> Any:
+        """Open ``connect_robust`` with capped-backoff retry over
+        connection-level errors (#384 WS3).
+
+        Mirrors ``ScanVerdictConsumer._connect_with_retry``: the FIRST
+        connect against a cold-reboot broker raises, so retry it here; on
+        exhaustion re-raise the last connection error so ``run()`` can
+        supervise it and keep retrying until RabbitMQ is up (I2)."""
+        last_exc: BaseException | None = None
+        for attempt in range(self._CONNECT_MAX_ATTEMPTS):
+            try:
+                return await aio_pika.connect_robust(self._settings.scan_amqp_url)
+            except (ConnectionError, OSError, TimeoutError, amqp_error_cls) as exc:
+                last_exc = exc
+                if attempt == self._CONNECT_MAX_ATTEMPTS - 1:
+                    break
+                delay = min(2**attempt, self._CONNECT_BACKOFF_CAP_SECONDS)
+                logger.warning(
+                    "scan_audit_consumer.connect_retry",
+                    extra={
+                        "attempt": attempt + 1,
+                        "max_attempts": self._CONNECT_MAX_ATTEMPTS,
+                        "delay_seconds": delay,
+                        "reason": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     async def _ensure_connected(self) -> None:
         if self._queue is not None:
@@ -93,10 +139,13 @@ class ScanAuditConsumer:
 
         import aio_pika  # noqa: PLC0415
         from aio_pika.exceptions import (  # noqa: PLC0415
+            AMQPError,
             ChannelNotFoundEntity,
         )
 
-        self._connection = await aio_pika.connect_robust(self._settings.scan_amqp_url)
+        # (C) connection-level retry — wait out a cold-reboot RabbitMQ
+        # instead of dying (#384 WS3).
+        self._connection = await self._connect_with_retry(aio_pika, AMQPError)
         last_exc: Exception | None = None
         for attempt in range(self._QUEUE_MAX_ATTEMPTS):
             try:
@@ -213,7 +262,33 @@ class ScanAuditConsumer:
             await self._persist_audit(payload)
 
     async def run(self) -> None:
-        await self._ensure_connected()
+        from aio_pika.exceptions import AMQPError  # noqa: PLC0415
+
+        # (C) Supervised connect — retry connection-level failures so the
+        # consumer attaches once RabbitMQ is up, zero operator touch
+        # (invariant I2). ``CancelledError`` is re-raised, never swallowed;
+        # a missing URL / absent queue still surfaces as a RuntimeError.
+        attempt = 0
+        while True:
+            try:
+                await self._ensure_connected()
+                break
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, OSError, TimeoutError, AMQPError) as exc:
+                attempt += 1
+                delay = min(2**attempt, self._CONNECT_BACKOFF_CAP_SECONDS)
+                logger.warning(
+                    "scan_audit_consumer.reconnect",
+                    extra={
+                        "attempt": attempt,
+                        "delay_seconds": delay,
+                        "reason": str(exc),
+                    },
+                )
+                with contextlib.suppress(Exception):
+                    await self.aclose()
+                await asyncio.sleep(delay)
         assert self._queue is not None
         logger.info("scan_audit_consumer.run.start")
         try:

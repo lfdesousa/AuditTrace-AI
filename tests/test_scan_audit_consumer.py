@@ -272,6 +272,148 @@ class TestEnsureConnected:
         assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
+class TestConnectLevelRetry:
+    """#384 WS3 — INITIAL ``connect_robust`` wrapped in capped-backoff
+    retry over connection-level errors; on exhaustion the connection
+    error is re-raised (not wrapped) so run() can supervise it."""
+
+    async def test_connect_retries_on_connection_reset_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        connection = AsyncMock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=[
+                ConnectionResetError(104, "Connection reset by peer"),
+                connection,
+            ]
+        )
+        consumer = ScanAuditConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        got = await consumer._connect_with_retry(
+            aio_pika, aio_pika.exceptions.AMQPError
+        )
+        assert got is connection
+        assert aio_pika.connect_robust.await_count == 2
+
+    async def test_connect_exhaustion_reraises_connection_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=ConnectionResetError(104, "reset")
+        )
+        consumer = ScanAuditConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        with pytest.raises(ConnectionResetError):
+            await consumer._connect_with_retry(aio_pika, aio_pika.exceptions.AMQPError)
+        assert aio_pika.connect_robust.await_count == consumer._CONNECT_MAX_ATTEMPTS
+
+    async def test_connect_catches_aio_pika_amqp_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aio_pika.exceptions import AMQPError
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        connection = AsyncMock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=[AMQPError("broker not ready"), connection]
+        )
+        consumer = ScanAuditConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        got = await consumer._connect_with_retry(aio_pika, AMQPError)
+        assert got is connection
+        assert aio_pika.connect_robust.await_count == 2
+
+
+class _ParkingIter:
+    """queue.iterator() stand-in that parks so a supervised run()
+    reaches the message loop and waits for cancel."""
+
+    async def __aenter__(self) -> _ParkingIter:
+        return self
+
+    async def __aexit__(self, *a: Any) -> None:
+        return None
+
+    def __aiter__(self) -> _ParkingIter:
+        return self
+
+    async def __anext__(self) -> Any:
+        import asyncio as _asyncio
+
+        await _asyncio.Event().wait()
+
+
+class TestSupervisedRun:
+    """#384 WS3 — initial connect failure retries in run() (I2);
+    CancelledError propagates."""
+
+    async def test_run_retries_after_connect_failure_then_attaches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as _asyncio
+
+        real_sleep = _asyncio.sleep
+
+        async def _fast_sleep(_delay: float, *a: Any, **k: Any) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr("asyncio.sleep", _fast_sleep)
+        consumer = ScanAuditConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        calls = {"n": 0}
+
+        async def fake_ensure() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            queue = MagicMock()
+            queue.iterator = MagicMock(return_value=_ParkingIter())
+            consumer._queue = queue
+
+        monkeypatch.setattr(consumer, "_ensure_connected", fake_ensure)
+
+        task = _asyncio.create_task(consumer.run())
+        for _ in range(50):
+            await real_sleep(0)
+            if consumer._queue is not None:
+                break
+        assert calls["n"] == 2
+        assert consumer._queue is not None
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+
+    async def test_run_propagates_cancelled_during_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as _asyncio
+
+        consumer = ScanAuditConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        monkeypatch.setattr(
+            consumer,
+            "_ensure_connected",
+            AsyncMock(side_effect=_asyncio.CancelledError()),
+        )
+        with pytest.raises(_asyncio.CancelledError):
+            await consumer.run()
+
+
 class TestProcessOne:
     async def test_message_process_owns_ack_nack(self) -> None:
         _f = InMemoryPostgresFactory()

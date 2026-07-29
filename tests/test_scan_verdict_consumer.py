@@ -292,6 +292,162 @@ class TestEnsureConnected:
         assert ch.get_queue.await_count == consumer._QUEUE_MAX_ATTEMPTS
 
 
+class TestConnectLevelRetry:
+    """#384 WS3 — the INITIAL ``connect_robust`` is now wrapped in a
+    capped-backoff retry that catches connection-level errors (a
+    cold-reboot RabbitMQ is not AMQP-ready and resets the connection).
+    Previously ``connect_robust`` sat OUTSIDE the retry loop, so a
+    ``ConnectionResetError`` killed the consumer task permanently."""
+
+    async def test_connect_retries_on_connection_reset_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        connection = AsyncMock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=[
+                ConnectionResetError(104, "Connection reset by peer"),
+                connection,
+            ]
+        )
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        got = await consumer._connect_with_retry(
+            aio_pika, aio_pika.exceptions.AMQPError
+        )
+        assert got is connection
+        assert aio_pika.connect_robust.await_count == 2
+
+    async def test_connect_exhaustion_reraises_connection_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # On exhaustion the connection-level error is re-raised (NOT
+        # wrapped in RuntimeError) so run()'s supervised loop can catch
+        # it and keep retrying until RabbitMQ is up.
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=ConnectionResetError(104, "reset")
+        )
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        with pytest.raises(ConnectionResetError):
+            await consumer._connect_with_retry(aio_pika, aio_pika.exceptions.AMQPError)
+        assert aio_pika.connect_robust.await_count == consumer._CONNECT_MAX_ATTEMPTS
+
+    async def test_connect_catches_aio_pika_amqp_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aio_pika.exceptions import AMQPError
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        aio_pika = _aio_pika_mock()
+        connection = AsyncMock()
+        aio_pika.connect_robust = AsyncMock(
+            side_effect=[AMQPError("broker not ready"), connection]
+        )
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        got = await consumer._connect_with_retry(aio_pika, AMQPError)
+        assert got is connection
+        assert aio_pika.connect_robust.await_count == 2
+
+
+class _ParkingIter:
+    """queue.iterator() stand-in that yields nothing and parks so a
+    supervised run() reaches the message loop and waits for cancel."""
+
+    async def __aenter__(self) -> _ParkingIter:
+        return self
+
+    async def __aexit__(self, *a: Any) -> None:
+        return None
+
+    def __aiter__(self) -> _ParkingIter:
+        return self
+
+    async def __anext__(self) -> Any:
+        import asyncio as _asyncio
+
+        await _asyncio.Event().wait()  # park forever
+
+
+class TestSupervisedRun:
+    """#384 WS3 — a consumer whose initial connect fails must RETRY in
+    run(), not die permanently (invariant I2). CancelledError must
+    propagate, never be swallowed."""
+
+    async def test_run_retries_after_connect_failure_then_attaches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as _asyncio
+
+        # Fast-sleep the consumer's backoff (still yields to the loop)
+        # WITHOUT neutralising the test's own pump. Capture the real
+        # sleep before patching.
+        real_sleep = _asyncio.sleep
+
+        async def _fast_sleep(_delay: float, *a: Any, **k: Any) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr("asyncio.sleep", _fast_sleep)
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        calls = {"n": 0}
+
+        async def fake_ensure() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Cold RabbitMQ: first supervised attempt fails.
+                raise ConnectionResetError(104, "Connection reset by peer")
+            # Second attempt: RabbitMQ is up — attach.
+            queue = MagicMock()
+            queue.iterator = MagicMock(return_value=_ParkingIter())
+            consumer._queue = queue
+
+        monkeypatch.setattr(consumer, "_ensure_connected", fake_ensure)
+
+        task = _asyncio.create_task(consumer.run())
+        # Pump the loop until the consumer has retried and attached.
+        for _ in range(50):
+            await real_sleep(0)
+            if consumer._queue is not None:
+                break
+        # The consumer retried and is now parked in the message loop —
+        # NOT dead. Cancelling yields a clean CancelledError.
+        assert calls["n"] == 2  # retried once, then attached
+        assert consumer._queue is not None
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+
+    async def test_run_propagates_cancelled_during_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as _asyncio
+
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=await _make_factory(),
+        )
+        monkeypatch.setattr(
+            consumer,
+            "_ensure_connected",
+            AsyncMock(side_effect=_asyncio.CancelledError()),
+        )
+        with pytest.raises(_asyncio.CancelledError):
+            await consumer.run()
+
+
 class TestProcessOne:
     async def test_message_process_owns_ack_nack(self) -> None:
         # Verifies the consumer uses ``message.process`` async-CM so
