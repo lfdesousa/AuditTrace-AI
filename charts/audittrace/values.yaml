@@ -803,6 +803,47 @@ contentControl:
   serviceAccountName: "audittrace-content-control"
 
 # -- Vault (ADR-043) ---------------------------------------------------------
+# ── Exit-79 vault-injection auto-heal reaper (#384 WS4a) ─────────────────────
+# In-cluster controller that self-heals the vault-injection race: when the
+# vault-agent-injector is not Ready at a pod's admission moment, the
+# MutatingWebhookConfiguration's failurePolicy=Ignore admits the pod WITHOUT
+# the vault-agent sidecar. entrypoint.sh then exits 79 and the pod
+# CrashLoopBackOffs forever until a human runs `kubectl delete pod`. This
+# controller detects that exact signature on memory-server pods and deletes
+# them so the ReplicaSet recreates them through a now-healthy injector — with
+# a storm guard (skips the whole cycle while the injector itself is down) and a
+# per-pod cooldown. Runs the SAME memory-server image (no new dependency) as
+# its own single-replica Deployment via `python -m audittrace.ops.pod_reaper`.
+reaper:
+  enabled: true
+  # Poll cadence — how often to list memory-server pods and evaluate them.
+  pollIntervalSeconds: 15
+  # Per-pod cooldown — a pod already reaped is not deleted again within this
+  # window, guarding against racing the API before the ReplicaSet reconciles.
+  cooldownSeconds: 120
+  # Label selector used to LIST candidate pods. The pure reap decision
+  # re-checks the memory-server component label as defence in depth.
+  labelSelector: "app.kubernetes.io/component=memory-server"
+  # The vault-agent-injector Deployment to GET for the readiness (storm) guard.
+  # Empty default → the chart derives `<release>-vault-agent-injector`.
+  injectorDeploymentName: ""
+  # Image reuse: by default the reaper runs the memoryServer image + tag so it
+  # is always in lockstep with the entrypoint whose exit-79 signature it keys
+  # on. Override here only to pin the reaper to a different build.
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  # Minimal footprint — the reaper does a GET + a LIST + occasional DELETEs on
+  # a 15 s cadence. It never needs more than a sliver of a core.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
 # When vault.enabled=true, secrets are sourced from in-cluster Vault via the
 # Vault Agent Injector sidecar pattern. The legacy `secrets.*` plaintext keys
 # above are ignored. Production posture (global.productionMode=true) requires

@@ -855,3 +855,52 @@ class TestRealmAssessmentIngestScope:
         cm = _find_workload(out, "ConfigMap", "audittrace-memory-scopes-script")
         script = cm["data"]["ensure-memory-scopes.sh"]
         assert self._SCOPE in script, f"provisioner script missing {self._SCOPE}"
+
+
+class TestPodReaperComponent:
+    """The exit-79 vault-injection reaper (#384 WS4a) must render as a
+    least-privilege, injection-free component when enabled and vanish entirely
+    when disabled."""
+
+    def test_reaper_renders_when_enabled(self) -> None:
+        out = _render(["--set", "reaper.enabled=true"])
+        dep = _find_workload(out, "Deployment", "audittrace-pod-reaper")
+        spec = dep["spec"]["template"]["spec"]
+        container = spec["containers"][0]
+        assert container["command"] == ["python", "-m", "audittrace.ops.pod_reaper"]
+        # Reuses the memory-server image so it stays in lockstep with the
+        # entrypoint whose exit-79 signature it keys on.
+        assert "audittrace-memory-server" in container["image"]
+        # Must NOT depend on the injection path it repairs: no vault annotations
+        # and no Istio sidecar.
+        annotations = dep["spec"]["template"]["metadata"].get("annotations", {})
+        # Exact domain-segment match (not a substring `in` check) so CodeQL's
+        # incomplete-url-substring-sanitization does not flag the hostname
+        # literal: no annotation key is in the vault.hashicorp.com/ namespace.
+        assert not any(k.split("/", 1)[0] == "vault.hashicorp.com" for k in annotations)
+        labels = dep["spec"]["template"]["metadata"]["labels"]
+        assert labels.get("sidecar.istio.io/inject") == "false"
+        # Least-privilege RBAC: a NAMESPACED Role (never a ClusterRole) with no
+        # access to secrets.
+        role = _find_workload(out, "Role", "audittrace-pod-reaper")
+        assert "audittrace-pod-reaper" not in [
+            d.get("metadata", {}).get("name")
+            for d in _docs(out)
+            if d.get("kind") == "ClusterRole"
+        ]
+        resources = {r for rule in role["rules"] for r in rule.get("resources", [])}
+        assert "secrets" not in resources
+        assert "pods" in resources and "deployments" in resources
+        _find_workload(out, "ServiceAccount", "audittrace-pod-reaper")
+        _find_workload(out, "RoleBinding", "audittrace-pod-reaper")
+
+    def test_reaper_absent_when_disabled(self) -> None:
+        out = _render(["--set", "reaper.enabled=false"])
+        assert "audittrace-pod-reaper" not in out
+        for kind in ("Deployment", "Role", "RoleBinding", "ServiceAccount"):
+            names = [
+                d.get("metadata", {}).get("name")
+                for d in _docs(out)
+                if d.get("kind") == kind
+            ]
+            assert "audittrace-pod-reaper" not in names
