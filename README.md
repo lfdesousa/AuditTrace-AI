@@ -35,12 +35,13 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🔒 **TLS Everywhere** -- Istio Gateway terminates TLS in production (NodePort 30952). Traefik v3 + mkcert in dev (ADR-021).
 - 🔑 **Secrets via Vault** -- HashiCorp Vault is the sole production secret store (ADR-043). Auto-unseal at boot via systemd unit. `.env` files only used in dev.
 - 🔍 **Reconstructible by Design** -- Every interaction + memory tool call traced via Langfuse + OpenTelemetry; one `tool_calls` audit row per memory invocation with `interaction_id` FK. Test + Evidence + Reconstructibility gate (ADR-049) enforces unit + live-system evidence on every meaningful change; CI parses PR bodies for the three required sections.
+- 🪞 **Recursive Self-Audit** -- The recorder records its own security review. A dedicated least-privilege ingest (`POST /assessments`, scope `audittrace:assessment:ingest`) writes each assessment run as owner-scoped, trace-linked `assessment` audit rows with the raw payload content-addressed to object storage — so the system's governability becomes reconstructible through its own front door (ADR-058).
 - 📊 **Full-Stack Observability** -- `@log_call` aspect emits logs, OTel spans, and histogram metrics from a single decorator; stdout-only logging (12-factor). `service.version` templated from `Chart.AppVersion` so OTel resource attributes never lie about deployed code (ADR-055).
 - 🔄 **Transparent LLM Proxy** -- Raw dict pass-through for OpenAI tool-calling protocol (ADR-024); memory context injected into the system message without stripping `tools`, `tool_calls`, `tool_call_id`.
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 1027 tests, 93% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 1950 tests, 98% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
@@ -129,7 +130,7 @@ The same script works for both runtimes — only the in-runtime shippers (OTel C
 # or
 make install
 
-# Run tests (90% per-file coverage enforced; full suite is 1027 tests / 93% total)
+# Run tests (90% per-file coverage enforced; full suite is 1950 tests / 98% total)
 make test
 
 # Run RLS integration tests against an ephemeral docker postgres on :15432
@@ -183,8 +184,10 @@ and review the diff like any other dependency bump.
 | Endpoint | Method | Description |
 |---|---|---|
 | `/v1/chat/completions` | POST | OpenAI-compatible chat with memory augmentation |
+| `/v1/models` | GET | OpenAI-compatible model list, proxied from llama-server's `/v1/models` — lets any OpenAI SDK discover available models before sending completions. Scope: `audittrace:query`. |
 | `/context` | POST | 4-layer memory retrieval |
 | `/interactions` | GET | Human-facing audit browser — filters `project`, `user_id`, `session_id`, `source`, `since`; pagination via `limit` (≤1000) + `offset`. RLS scopes every caller to their own rows. See [Auditing conversations](#auditing-conversations-interactions). |
+| `/assessments` | POST | Recursive self-audit ingest (ADR-058) — records the recorder's own security-assessment run as first-class owner-scoped, trace-linked `assessment` audit rows; the raw payload is content-addressed to `assessments/{assessment_id}/{sha}.json` in object storage. Dedicated least-privilege scope: `audittrace:assessment:ingest`. |
 | `/session/save` | POST | Persist session data |
 | `/session/summary` | POST | Operator-driven session summary save (ADR-030) |
 | `/memory/upload` | POST | Two-path: **PDF** uploads (content-type `application/pdf` + magic-byte sniff) land in `quarantine/<user>/<scan_id>/` and return **HTTP 202** + `{scan_id, status:"pending_scan", poll_url}`; content-control scans + promotes to `episodic/papers/` asynchronously (ADR-048 PR-B3). **Non-PDF** (Markdown skills, ADRs, plain text) keeps the synchronous PUT-to-`{layer}/` path returning 200. |
@@ -401,6 +404,7 @@ The `audittrace-dev` client is the right choice for non-interactive scripts; see
 | ✅ Done | **PAdES trust store + Swiss TSL (ADR-052 + ADR-053)** | Pluggable `TrustStoreProvider` / `TrustStoreBuilder` ABCs (S3 + Mock + composite). EU LOTL walker via `pyhanko[etsi]` ~~830~~ + Swiss federal TSL fetcher (OFCOM/BAKOM TSLO) → composite ~897 EU + CH qualified-signature CAs. `POST /system/trust-store/refresh` admin endpoint + Helm post-install hook. Live evidence: `main_signed.pdf` flipped from `check_unavailable` → `signed_invalid` → `signed_valid` after refresh ran. |
 | ✅ Done | **As-of-signing-time validation (ADR-054)** | 9th class `signed_expired`: signature chain validates as-of self-reported signing time but the cert is no longer valid at present. 5-min Kerberos-style clock-skew tolerance handles cert NotBefore that lags signing time by seconds. |
 | ✅ Done | **Version-pin litany eliminated (ADR-055)** | Single chart-side source of truth (`Chart.AppVersion == pyproject.toml::version`). `make release VERSION=…` bumps both + regenerates OpenAPI snapshot + runs drift gate. `service.version` OTel attribute templated from `Chart.AppVersion` so it never drifts again. Dockerfile `pip install --no-deps .` closes the v1.0.13 stale-egg-info bug; `.dockerignore` rejects `.venv` / dist-info / `__pycache__`. |
+| ✅ Done | **Recursive self-audit (ADR-058)** | The recorder records its own security-assessment runs as first-class, owner-scoped, trace-linked `assessment` audit rows via `POST /assessments` under a dedicated least-privilege scope (`audittrace:assessment:ingest`); raw payload content-addressed to `assessments/{assessment_id}/{sha}.json`. Governability of the recorder becomes reconstructible through its own front door. |
 | ✅ Done | **PDF tier-C batch (ADR-056)** | 9/16 tier-C items shipped: document metadata extraction (`pdf_title` / `pdf_author` / `pdf_creator` / `pdf_creation_date` from pymupdf `doc.metadata`, Alembic 011); closed-set corruption taxonomy (`pdf_corrupted_xref` / `pdf_corrupted_structure` / `pdf_metadata_parse_error`); per-document audit granularity via `?details=true` on `/memory/index` (per-doc `ok/error/chunks/signature_status/page_count/extraction_warnings/document_sha256/pdf_*/pdfa_*/ltv_data`); dry-run mode (`?dry_run=true`); LTV summary (DSS dictionary counts); PDF/A conformance (`pdfa_part` + `pdfa_conformance` from XMP); TOC-aware chunking (`toc_section` per-chunk metadata); file-level surgical re-index (`?file=` path); #11 closed as subsumed by ADR-052 9-class taxonomy. Live on v1.0.17, evidence captured in `2026-05-09-adr-056-tier-c/`. |
 | ⏸ On hold | **ADR-031 Per-Request Memory-Mode Routing** | N=100 eval (2026-04-17) showed tools wins every category including ambiguous. Routing complexity not justified. Revisit only if a future model reintroduces a category gap. |
 | ✅ Done | **ADR-048 Content-Control** | External-PDF parser-exploit gap closed via a sibling pod (`audittrace-content-control`, separate identity, separate MinIO IAM role). Memory-server side: PR-B1 (contract scaffolding) + PR-B2 (Vault / bucket-init / quarantine denylist) + PR-B2.5 (RabbitMQ subchart + AMQP topology + ADR-057 broker decision) + PR-B3 (`/memory/upload` PDF rewrite to 202 + Hohpe outbox + asyncio.Queue producer + janitor) + PR-B4 (verdict + audit consumers — `memory_items.scan_status` transitions to terminal state, `interactions` row with `event_class='security'` written for SOC alerting) + PR-B5 (WebUI chips + Bruno + reconstructibility walkthrough) + PR-B7 (MinIO IAM split — `audittrace_app` policy with explicit `Deny` on `s3:GetObject` against `quarantine/*` enforces Decision rule §1 at the bucket-policy layer). Content-control side: PR-A1 skeleton + PR-A2 ClamAV adapter + PR-A3 async pipeline + PR-A4 operator surfaces (`/v1/scan/stats`, `/v1/scan/status`, `/v1/scan/retrigger`). ADR-048 flipped to **Accepted** 2026-05-10. Live cluster validation captured in a separate chart-flip PR (`scan_pipeline_enabled=true` + EICAR end-to-end). |
@@ -612,6 +616,7 @@ The Vault Agent injector renders `secret/audittrace/postgres`, `secret/audittrac
 - [ADR-054: As-of-signing-time validation](docs/ADR-054-pades-as-of-signing-time-validation.md)
 - [ADR-055: Eliminate version-pin litany](docs/ADR-055-eliminate-version-pin-litany.md)
 - [ADR-056: PDF tier-C batch (#10 / #16 / #24 + dry-run + LTV + PDF/A + TOC + surgical reindex)](docs/ADR-056-pdf-tier-c-batch.md)
+- [ADR-058: Recursive self-audit — the recorder records its own security review as audit events](docs/ADR-058-recursive-self-audit.md)
 
 ### Architecture Diagrams
 
