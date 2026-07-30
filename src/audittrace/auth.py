@@ -20,6 +20,7 @@ The §15 refactor removed the local ``users`` table and the PAT model;
 identity is now delegated entirely to Keycloak.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -184,17 +185,50 @@ _JWKS_FETCH_RETRIES = 3
 _JWKS_FETCH_BACKOFF_BASE = 2.0  # seconds — exponential: 2, 4, 8
 
 
+# One shared async client for the life of the process (PYTHON-ENGINEERING §2
+# — reuse the connection pool, never construct per call). Lazily created so
+# import stays side-effect-free for unit tests that never fetch JWKS. Mirrors
+# ``services/embedder.py::_embed_client_singleton``.
+_jwks_client: httpx.AsyncClient | None = None
+
+# Single-flight lock so that when the JWKS cache is expired, only ONE
+# coroutine performs the (potentially slow) fetch while concurrent callers
+# await and then read the freshly-populated cache. Created lazily on first
+# use — we must NOT bind an event loop at import time (asyncio.Lock() /
+# get_event_loop() at module top-level would attach to the import-time loop
+# and break under a different running loop).
+_jwks_fetch_lock: asyncio.Lock | None = None
+
+
+def _get_jwks_client() -> httpx.AsyncClient:
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+    return _jwks_client
+
+
+def _get_jwks_fetch_lock() -> asyncio.Lock:
+    global _jwks_fetch_lock
+    if _jwks_fetch_lock is None:
+        _jwks_fetch_lock = asyncio.Lock()
+    return _jwks_fetch_lock
+
+
 @log_call(logger=logger)
-def _fetch_jwks_keys(jwks_url: str) -> list[Any]:
+async def _fetch_jwks_keys(jwks_url: str) -> list[Any]:
     """Fetch public keys from Keycloak JWKS endpoint.
 
-    Retries with exponential backoff to handle the startup race where the
-    memory-server is ready before Keycloak has finished initialising.
+    Fully async (PYTHON-ENGINEERING §3): the HTTP call and the backoff sleep
+    both yield the event loop, so a JWKS-cache miss never stalls concurrent
+    requests (the whole point of #391). Retries with exponential backoff to
+    handle the startup race where the memory-server is ready before Keycloak
+    has finished initialising.
     """
+    client = _get_jwks_client()
     last_exc: Exception | None = None
     for attempt in range(_JWKS_FETCH_RETRIES + 1):
         try:
-            response = httpx.get(jwks_url, timeout=10)
+            response = await client.get(jwks_url)
             response.raise_for_status()
             jwks = response.json()
             return list(jwks.get("keys", []))
@@ -209,24 +243,43 @@ def _fetch_jwks_keys(jwks_url: str) -> list[Any]:
                     exc,
                     delay,
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
     raise last_exc  # type: ignore[misc]
 
 
-def _get_jwks_keys(jwks_url: str) -> list[Any]:
-    """Get JWKS keys with caching."""
-    now = time.time()
-    if (
+def _jwks_cache_fresh(now: float) -> bool:
+    """True when the in-process JWKS cache is populated and within TTL."""
+    return (
         "keys" in _jwks_cache
         and now - _jwks_cache.get("fetched_at", 0)
         < get_settings().jwks_cache_ttl_seconds
-    ):
+    )
+
+
+async def _get_jwks_keys(jwks_url: str) -> list[Any]:
+    """Get JWKS keys with caching + single-flight.
+
+    On a cache hit returns the cached keys without touching the network. On a
+    miss, a single-flight lock collapses concurrent misses into ONE fetch: the
+    winner fetches and populates the cache, the rest await the lock and then
+    read the freshly-populated cache (double-checked locking) rather than each
+    firing their own fetch (avoids the thundering herd against Keycloak).
+    """
+    now = time.time()
+    if _jwks_cache_fresh(now):
         return list(_jwks_cache["keys"])
 
-    keys = _fetch_jwks_keys(jwks_url)
-    _jwks_cache["keys"] = keys
-    _jwks_cache["fetched_at"] = now
-    return keys  # type: ignore[no-any-return]
+    async with _get_jwks_fetch_lock():
+        # Double-check inside the lock: a coroutine that waited on the lock
+        # while the winner fetched must NOT re-fetch.
+        now = time.time()
+        if _jwks_cache_fresh(now):
+            return list(_jwks_cache["keys"])
+
+        keys = await _fetch_jwks_keys(jwks_url)
+        _jwks_cache["keys"] = keys
+        _jwks_cache["fetched_at"] = now
+        return list(keys)
 
 
 async def validate_jwt(
@@ -264,7 +317,7 @@ async def validate_jwt(
         raise HTTPException(status_code=401, detail="Missing authentication token")
 
     try:
-        keys = _get_jwks_keys(settings.keycloak_jwks_url)
+        keys = await _get_jwks_keys(settings.keycloak_jwks_url)
         payload = _decode_jwt_with_allowed_issuers(
             token,
             keys,
@@ -407,7 +460,7 @@ async def require_user(
 
     # Cold path: validate JWT against Keycloak JWKS
     try:
-        keys = _get_jwks_keys(settings.keycloak_jwks_url)
+        keys = await _get_jwks_keys(settings.keycloak_jwks_url)
         payload = _decode_jwt_with_allowed_issuers(
             raw_token,
             keys,
