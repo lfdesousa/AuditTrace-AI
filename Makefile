@@ -1,6 +1,6 @@
 .PHONY: help venv install lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight verify-deploy sync-requirements check-requirements-sync
+       deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -234,6 +234,16 @@ sync-requirements: ## Regenerate requirements.txt from pyproject.toml (single so
 
 check-requirements-sync: ## Fail if requirements.txt has drifted from pyproject.toml (mirrors the pre-commit hook + CI job).
 	@python3 scripts/sync-requirements.py --check
+
+check-pr-body: ## Validate a PR-body file against the ADR-049 evidence gate (local mirror of CI). Usage: make check-pr-body BODY=scratchpad/PR-BODY-x.md
+	@if [ -z "$(BODY)" ]; then \
+		echo "❌ usage: make check-pr-body BODY=<path-to-pr-body.md>"; \
+		echo "   Runs the SAME parser as the CI evidence-check job"; \
+		echo "   (scripts/adr049_evidence_check.py) so a failing PR body"; \
+		echo "   is caught locally BEFORE push, not after (#396)."; \
+		exit 1; \
+	fi
+	@python3 scripts/adr049_evidence_check.py "$(BODY)"
 
 openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fixtures/openapi.snapshot.yaml from the live FastAPI app (ADR-046 / v1.0.10).
 	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov
