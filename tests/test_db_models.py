@@ -11,6 +11,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from audittrace.db.models import (
@@ -128,6 +129,7 @@ class TestSessionRecordCRUD:
         )
         assert len(results) == 2
 
+    @pytest.mark.filterwarnings("error::sqlalchemy.exc.SAWarning")
     def test_duplicate_id_raises(self, db_session: Session):
         record1 = SessionRecord(
             id="dup_id",
@@ -147,8 +149,12 @@ class TestSessionRecordCRUD:
         )
         db_session.add(record1)
         db_session.commit()
+        # Drop record1 from the identity map so the duplicate insert exercises
+        # the DB UNIQUE/PK constraint (a real IntegrityError) instead of the
+        # in-memory identity-map conflict (which only raises a SAWarning).
+        db_session.expunge_all()
         db_session.add(record2)
-        with pytest.raises(Exception):  # IntegrityError from DB constraint
+        with pytest.raises(IntegrityError):
             db_session.commit()
         db_session.rollback()
 
