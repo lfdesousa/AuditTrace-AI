@@ -4,8 +4,9 @@ Uses python-jose with a test RSA key pair to create JWTs.
 No real Keycloak required — all validation is tested in isolation.
 """
 
+import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -15,7 +16,12 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
 
-from audittrace.auth import _fetch_jwks_keys, _jwks_cache, require_scope
+from audittrace.auth import (
+    _fetch_jwks_keys,
+    _get_jwks_keys,
+    _jwks_cache,
+    require_scope,
+)
 
 # ── Test RSA key pair ──────────────────────────────────────────────────────────
 
@@ -92,16 +98,32 @@ def _create_test_app(scope: str) -> FastAPI:
 
 @pytest.fixture(autouse=True)
 def _clear_jwks_cache():
-    """Clear JWKS cache before each test."""
+    """Clear JWKS cache + reset lazy async singletons before each test.
+
+    The pooled ``httpx.AsyncClient`` and the single-flight ``asyncio.Lock``
+    are module-level and lazily bound to the running event loop; pytest-asyncio
+    (mode=auto) spins a fresh loop per test, so we null them out to avoid a
+    lock/future leaking across event loops.
+    """
+    import audittrace.auth as _auth_mod
+
     _jwks_cache.clear()
+    _auth_mod._jwks_client = None
+    _auth_mod._jwks_fetch_lock = None
     yield
     _jwks_cache.clear()
+    _auth_mod._jwks_client = None
+    _auth_mod._jwks_fetch_lock = None
 
 
 @pytest.fixture
 def mock_jwks():
-    """Patch JWKS fetching to return test public key."""
-    with patch("audittrace.auth._fetch_jwks_keys") as mock:
+    """Patch JWKS fetching to return test public key.
+
+    ``_fetch_jwks_keys`` is now ``async`` (#391), so the mock must be an
+    ``AsyncMock`` — ``_get_jwks_keys`` awaits it.
+    """
+    with patch("audittrace.auth._fetch_jwks_keys", new_callable=AsyncMock) as mock:
         mock.return_value = [TEST_PUBLIC_PEM]
         yield mock
 
@@ -109,70 +131,208 @@ def mock_jwks():
 # ── JWKS fetch retry tests ────────────────────────────────────────────────────
 
 
-class TestJWKSFetchRetry:
-    """_fetch_jwks_keys retries with exponential backoff on HTTP errors."""
+def _ok_response(keys):
+    """A stub httpx.Response exposing raise_for_status + json()."""
+    resp = MagicMock()
+    resp.json.return_value = {"keys": keys}
+    resp.raise_for_status = MagicMock()
+    return resp
 
-    def test_succeeds_on_second_attempt(self):
+
+def _client_with(get_side_effect):
+    """A stub pooled client whose async ``.get`` drives ``get_side_effect``."""
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=get_side_effect)
+    return client
+
+
+class TestJWKSFetchRetry:
+    """_fetch_jwks_keys retries with exponential backoff on HTTP errors.
+
+    Post-#391 the helper is ``async`` and pools an ``httpx.AsyncClient``; the
+    backoff sleep is ``await asyncio.sleep`` (non-blocking). We patch the
+    pooled client and ``asyncio.sleep`` to keep the tests instant.
+    """
+
+    async def test_succeeds_on_second_attempt(self):
         """First call fails, second succeeds — must return keys."""
         fake_keys = [{"kty": "RSA", "n": "abc"}]
-        ok_response = MagicMock()
-        ok_response.json.return_value = {"keys": fake_keys}
-        ok_response.raise_for_status = MagicMock()
+        client = _client_with([httpx.ConnectError("refused"), _ok_response(fake_keys)])
 
         with (
-            patch("audittrace.auth.httpx.get") as mock_get,
-            patch("audittrace.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth._get_jwks_client", return_value=client),
+            patch(
+                "audittrace.auth.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep,
         ):
-            mock_get.side_effect = [
-                httpx.ConnectError("refused"),
-                ok_response,
-            ]
-            result = _fetch_jwks_keys("http://keycloak:8080/jwks")
+            result = await _fetch_jwks_keys("http://keycloak:8080/jwks")
 
         assert result == fake_keys
-        assert mock_get.call_count == 2
-        mock_sleep.assert_called_once()
+        assert client.get.await_count == 2
+        mock_sleep.assert_awaited_once()
 
-    def test_exhausts_retries_and_reraises(self):
+    async def test_exhausts_retries_and_reraises(self):
         """All attempts fail — must raise the last exception."""
+        client = _client_with(httpx.ConnectError("down"))
         with (
-            patch("audittrace.auth.httpx.get") as mock_get,
-            patch("audittrace.auth.time.sleep"),
+            patch("audittrace.auth._get_jwks_client", return_value=client),
+            patch("audittrace.auth.asyncio.sleep", new_callable=AsyncMock),
         ):
-            mock_get.side_effect = httpx.ConnectError("down")
             with pytest.raises(httpx.ConnectError, match="down"):
-                _fetch_jwks_keys("http://keycloak:8080/jwks")
+                await _fetch_jwks_keys("http://keycloak:8080/jwks")
 
         # 1 initial + 3 retries = 4 calls
-        assert mock_get.call_count == 4
+        assert client.get.await_count == 4
 
-    def test_backoff_delays_are_exponential(self):
+    async def test_backoff_delays_are_exponential(self):
         """Sleep delays must follow 2^(attempt+1): 2, 4, 8."""
+        client = _client_with(httpx.ConnectError("down"))
         with (
-            patch("audittrace.auth.httpx.get") as mock_get,
-            patch("audittrace.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth._get_jwks_client", return_value=client),
+            patch(
+                "audittrace.auth.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep,
         ):
-            mock_get.side_effect = httpx.ConnectError("down")
             with pytest.raises(httpx.ConnectError):
-                _fetch_jwks_keys("http://keycloak:8080/jwks")
+                await _fetch_jwks_keys("http://keycloak:8080/jwks")
 
-        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        delays = [call.args[0] for call in mock_sleep.await_args_list]
         assert delays == [2.0, 4.0, 8.0]
 
-    def test_succeeds_immediately_without_sleep(self):
+    async def test_succeeds_immediately_without_sleep(self):
         """Happy path — no retries, no sleep."""
-        ok_response = MagicMock()
-        ok_response.json.return_value = {"keys": [{"kty": "RSA"}]}
-        ok_response.raise_for_status = MagicMock()
-
+        client = _client_with([_ok_response([{"kty": "RSA"}])])
         with (
-            patch("audittrace.auth.httpx.get", return_value=ok_response),
-            patch("audittrace.auth.time.sleep") as mock_sleep,
+            patch("audittrace.auth._get_jwks_client", return_value=client),
+            patch(
+                "audittrace.auth.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep,
         ):
-            result = _fetch_jwks_keys("http://keycloak:8080/jwks")
+            result = await _fetch_jwks_keys("http://keycloak:8080/jwks")
 
         assert result == [{"kty": "RSA"}]
-        mock_sleep.assert_not_called()
+        mock_sleep.assert_not_awaited()
+
+    async def test_retry_then_success_only_sleeps_between_failures(self):
+        """Fail twice then succeed → keys returned, sleeps awaited 2,4 only."""
+        client = _client_with(
+            [
+                httpx.ConnectError("a"),
+                httpx.ConnectError("b"),
+                _ok_response([{"kty": "RSA", "n": "ok"}]),
+            ]
+        )
+        with (
+            patch("audittrace.auth._get_jwks_client", return_value=client),
+            patch(
+                "audittrace.auth.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep,
+        ):
+            result = await _fetch_jwks_keys("http://keycloak:8080/jwks")
+
+        assert result == [{"kty": "RSA", "n": "ok"}]
+        assert client.get.await_count == 3
+        delays = [call.args[0] for call in mock_sleep.await_args_list]
+        assert delays == [2.0, 4.0]
+
+
+# ── #391: async hot path — event-loop-not-blocked + single-flight ─────────────
+
+
+class TestAsyncJWKSHotPath:
+    """#391: the JWKS fetch must not stall the event loop, and concurrent
+    cache misses must collapse into a single fetch (single-flight)."""
+
+    async def test_fetch_yields_event_loop_and_does_not_block(self):
+        """A slow (0.3s) JWKS fetch must NOT delay a trivial concurrent
+        coroutine — the fetch awaits and yields the loop.
+
+        Falsifiability (verified manually by the builder): flip the mocked
+        fetch body from ``await asyncio.sleep(0.3)`` to a blocking
+        ``time.sleep(0.3)`` (the pre-#391 behaviour) and this assertion
+        FAILS because the trivial coroutine is held off for the full 0.3s.
+        """
+
+        fetch_delay = 0.3
+
+        async def slow_fetch(_url):
+            await asyncio.sleep(fetch_delay)
+            return [TEST_PUBLIC_PEM]
+
+        # ``t0`` is captured BEFORE gather so ``trivial`` measures wall time
+        # since the concurrent work was scheduled — NOT just its own internal
+        # sleep. gather schedules the fetch task first; if that task BLOCKS the
+        # loop (pre-#391 sync sleep) ``trivial`` cannot run until it returns, so
+        # ``trivial_elapsed`` would be ~fetch_delay. With the async fix the
+        # fetch yields immediately and ``trivial`` completes in ~0.01s.
+        t0 = time.perf_counter()
+
+        async def trivial():
+            await asyncio.sleep(0.01)
+            return time.perf_counter() - t0
+
+        with (
+            patch("audittrace.auth._fetch_jwks_keys", slow_fetch),
+            patch("audittrace.auth.get_settings", return_value=_mock_settings()),
+        ):
+            keys, trivial_elapsed = await asyncio.gather(
+                _get_jwks_keys("http://keycloak:8080/jwks"),
+                trivial(),
+            )
+
+        assert keys == [TEST_PUBLIC_PEM]
+        # If the loop were blocked by the fetch, trivial() could not finish
+        # until the full fetch_delay elapsed. It must finish an order of
+        # magnitude faster because the fetch yields.
+        assert trivial_elapsed < fetch_delay / 2
+
+    async def test_single_flight_collapses_concurrent_misses(self):
+        """N concurrent calls against an expired cache → exactly ONE fetch."""
+        counter = {"n": 0}
+
+        async def counting_fetch(_url):
+            counter["n"] += 1
+            await asyncio.sleep(0.05)  # widen the race window
+            return [TEST_PUBLIC_PEM]
+
+        with (
+            patch("audittrace.auth._fetch_jwks_keys", counting_fetch),
+            patch("audittrace.auth.get_settings", return_value=_mock_settings()),
+        ):
+            results = await asyncio.gather(
+                *[_get_jwks_keys("http://keycloak:8080/jwks") for _ in range(10)]
+            )
+
+        assert counter["n"] == 1, f"expected single-flight, got {counter['n']} fetches"
+        assert all(r == [TEST_PUBLIC_PEM] for r in results)
+
+    async def test_jwks_client_singleton_is_pooled_and_reused(self):
+        """The module-level httpx.AsyncClient is created lazily and reused
+        (PYTHON-ENGINEERING §2 — one pooled client for the process)."""
+        import audittrace.auth as _auth_mod
+        from audittrace.auth import _get_jwks_client
+
+        assert _auth_mod._jwks_client is None  # reset by autouse fixture
+        c1 = _get_jwks_client()
+        c2 = _get_jwks_client()
+        try:
+            assert isinstance(c1, httpx.AsyncClient)
+            assert c1 is c2  # same pooled instance, not per-call
+        finally:
+            await c1.aclose()
+
+    async def test_cache_hit_skips_fetch_entirely(self):
+        """A warm, in-TTL cache returns without awaiting the fetch at all."""
+        fetch = AsyncMock(return_value=[TEST_PUBLIC_PEM])
+        with (
+            patch("audittrace.auth._fetch_jwks_keys", fetch),
+            patch("audittrace.auth.get_settings", return_value=_mock_settings()),
+        ):
+            first = await _get_jwks_keys("http://keycloak:8080/jwks")
+            second = await _get_jwks_keys("http://keycloak:8080/jwks")
+
+        assert first == second == [TEST_PUBLIC_PEM]
+        fetch.assert_awaited_once()
 
 
 # ── Auth disabled tests ────────────────────────────────────────────────────────
