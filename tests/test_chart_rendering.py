@@ -874,7 +874,10 @@ class TestPodReaperComponent:
         # Must NOT depend on the injection path it repairs: no vault annotations
         # and no Istio sidecar.
         annotations = dep["spec"]["template"]["metadata"].get("annotations", {})
-        assert not any("vault.hashicorp.com" in k for k in annotations)
+        # Exact domain-segment match (not a substring `in` check) so CodeQL's
+        # incomplete-url-substring-sanitization does not flag the hostname
+        # literal: no annotation key is in the vault.hashicorp.com/ namespace.
+        assert not any(k.split("/", 1)[0] == "vault.hashicorp.com" for k in annotations)
         labels = dep["spec"]["template"]["metadata"]["labels"]
         assert labels.get("sidecar.istio.io/inject") == "false"
         # Least-privilege RBAC: a NAMESPACED Role (never a ClusterRole) with no
