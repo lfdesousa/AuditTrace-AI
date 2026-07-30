@@ -236,7 +236,18 @@ scripts/audittrace-login`, not a workaround.
   `.github/workflows/ci.yml`) — parses the PR body via `gh api`;
   fails the check if the **Verification** / **Validation** /
   **Reconstruction** sections are missing or empty. Branch
-  protection enforces it for merges to `main`.
+  protection enforces it for merges to `main`. The parser is now
+  `scripts/adr049_evidence_check.py` (single source of truth); the
+  job just calls it.
+- **Local pre-PR mirror** — the CI-Agent's pre-PR gate MUST run
+  `make check-pr-body BODY=<pr-body.md>` before any push that will
+  open a PR, and refuse to hand over a PR whose body fails. This is
+  the local mirror of the CI `evidence-check` job (same
+  `scripts/adr049_evidence_check.py` parser, so no drift), so an
+  unfilled section is caught on the laptop, not after push
+  (#396, `feedback_mirror_every_ci_gate_locally`). Write the PR body
+  to a file (`feedback_gh_pr_body_from_file`), run the check, fix any
+  reported section, THEN push.
 - **PR template** (`.github/pull_request_template.md`) —
   pre-populates every new PR with the three required sections so
   the requirement is visible from the moment the PR opens.
