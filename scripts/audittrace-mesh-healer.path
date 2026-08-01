@@ -1,0 +1,18 @@
+[Unit]
+Description=AuditTrace-AI mesh-healer trigger (#384 WS5, Q3 Option B)
+Documentation=file:///home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-mesh-resettle.sh
+# The unprivileged deploy runner writes a validated request file into
+# /var/lib/audittrace/mesh-heal/requests/; this .path unit watches that dir and
+# activates audittrace-mesh-healer.service (root) to perform the whitelisted,
+# bounded host-root re-settle. The runner holds ZERO standing privilege — it can
+# only write a file. See scripts/audittrace-mesh-resettle.sh for the boundary.
+
+[Path]
+# Fire whenever a request file is present. The service processes + removes each
+# request, so the dir returns to empty and the unit re-arms. If MESH_HEAL_DIR is
+# overridden in the .service, update this path to match.
+DirectoryNotEmpty=/var/lib/audittrace/mesh-heal/requests
+Unit=audittrace-mesh-healer.service
+
+[Install]
+WantedBy=paths.target
