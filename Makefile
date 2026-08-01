@@ -166,6 +166,11 @@ CHART_DIR   := charts/audittrace
 RELEASE     := audittrace
 NAMESPACE   := audittrace
 VALUES_FILE := $(CHART_DIR)/values-local.yaml
+# #394 fix: the laptop always runs the internal-registry image, never the
+# chart-default docker.io/lfds ref. Pin the repository on every sanctioned
+# helm mutation so a --reset-then-reuse-values reset cannot resurface the
+# dockerhub default -> ImagePullBackOff. Single source for the literal.
+LOCAL_MEMORY_REPO := localhost:5000/audittrace/memory-server
 
 k8s-build: docker-build ## Build + push to local k3s registry. Honors TAG=... env var (default: latest). Use a unique TAG when rolling so k3s actually re-pulls instead of using the cached `:latest` digest.
 	@_TAG="$${TAG:-latest}"; \
@@ -290,22 +295,27 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"
 	@echo "  5. helm upgrade --reset-then-reuse-values --set memoryServer.image.tag=v$(VERSION)"
 
-k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight)
+k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight; pins the internal image repository — #394)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl label namespace $(NAMESPACE) istio-injection=enabled --overwrite
-	@helm install $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+	@helm install $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE) \
+	  --set memoryServer.image.repository=$(LOCAL_MEMORY_REPO)
 
-k8s-upgrade: deploy-preflight ## Upgrade the Helm release with values file (gated by preflight)
-	@helm upgrade $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE)
+k8s-upgrade: deploy-preflight ## Upgrade the Helm release with values file (gated by preflight; pins the internal image repository — #394)
+	@helm upgrade $(RELEASE) $(CHART_DIR) -f $(VALUES_FILE) -n $(NAMESPACE) \
+	  --set memoryServer.image.repository=$(LOCAL_MEMORY_REPO)
 
-k8s-rolling-image: deploy-preflight ## Quick image-only update preserving user-supplied values (gated by preflight; see 2026-05-03 incident — TLS-handshake failure on injector left CrashLoopBackOff pods undetected before this gate landed)
-	@# --reset-then-reuse-values MERGES the chart's new defaults with prior user-supplied values.
-	@# --reuse-values would FAIL if the chart gained a new top-level block since last install.
-	@helm upgrade $(RELEASE) $(CHART_DIR) \
-	  --reset-then-reuse-values \
-	  --set memoryServer.image.tag=$(TAG) \
-	  -n $(NAMESPACE) \
-	  --wait --timeout 180s
+k8s-rolling-image: ## Image-only roll via the CD runner (preflight + repo-pin + mesh-gate; folds #394; #384 WS4b)
+	@# WS4b: delegate the image roll to the CD runner (scripts.deploy.runner), which
+	@# already runs deploy-preflight.sh itself (phase_preflight), pins the internal
+	@# repository via --registry local (closing the #394 footgun), runs the mesh gate,
+	@# and emits a non-self-certifying report. No Make-level deploy-preflight prereq here:
+	@# the runner owns preflight, so keeping it would run preflight twice.
+	@python -m scripts.deploy.runner \
+	  --target-version $(TAG) \
+	  --release $(RELEASE) \
+	  --namespace $(NAMESPACE) \
+	  --registry local
 
 k8s-status: ## Show pod/service/Istio status
 	@echo "=== Pods ==="
