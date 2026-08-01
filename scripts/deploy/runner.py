@@ -261,10 +261,15 @@ class DeployRunner:
         self.converged: bool = False
         self.surge: dict[str, Any] = {}
         self.aborted: bool = False
-        # Injected so tests drive it without a cluster; the default WS1 gate ships
-        # the UnconfiguredHealer (fail-closed) until the WS5 privileged healer lands.
+        # Injected so tests drive it without a cluster. The default gate now ships
+        # the WS5 PrivilegedHealer: ``available`` reflects kubectl reachability, so
+        # the safe RBAC-tier istiod restart works on ANY reachable cluster; the
+        # host-root tier self-gates on the Option-B install and stays fail-closed
+        # where the out-of-band units are not present (#384 WS5, decoupled per Luis
+        # 2026-08-01). No cluster reachable → unavailable → gate fails closed.
         self.mesh_gate = mesh_gate or mesh.MeshGate(
-            mesh.MeshGateConfig(namespace=cfg.namespace)
+            mesh.MeshGateConfig(namespace=cfg.namespace),
+            healer=mesh.PrivilegedHealer(),
         )
 
     # -- phase plumbing --

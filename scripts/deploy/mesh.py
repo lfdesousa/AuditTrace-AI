@@ -46,10 +46,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess  # noqa: S404 - read-only kubectl reads; fixed argv, no shell
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -262,6 +265,279 @@ class UnconfiguredHealer:
                 "auto-heal not configured — the privileged recovery seam is "
                 "deferred to WS5 (Q3); failing closed"
             ),
+        )
+
+
+# ── WS5: the real privileged healer + its two-tier action map ─────────────────
+#
+# The heal model (spec §2): map each diagnosed ``Finding.signal`` to the
+# LEAST-privileged action that resolves it.
+#
+#   * RBAC tier  — an in-cluster ``kubectl rollout restart deployment/istiod``.
+#     No host privilege, no Q3 trigger; a stale/degraded control plane is re-
+#     rolled. Idempotent: restarting an already-healthy istiod is a no-op roll.
+#   * HOST-ROOT tier — the #307 class (a NotReady node, or istiod unable to
+#     reach the kube-API ClusterIP: "no route to host"). The fix is a k3s /
+#     ClusterIP-DNAT re-settle, which needs root the runner MUST NOT hold. This
+#     is the ONLY tier that crosses the Q3 privilege boundary, and it does so
+#     through exactly one narrow method, :meth:`PrivilegedHealer._trigger_host_resettle`.
+
+# RBAC-tier signals — healed by an in-cluster istiod rollout restart.
+RBAC_RESTART_SIGNALS = frozenset(
+    {"istiod-not-ready", "istiod-degraded", "istiod-no-endpoints"}
+)
+
+# HOST-ROOT-tier signals — the ONLY signals the privileged root re-settle unit
+# is allowed to act on. This set is the Python-side mirror of the hardcoded
+# whitelist in ``scripts/audittrace-mesh-resettle.sh`` (the actual security
+# boundary — the root executor re-validates independently and refuses anything
+# outside its own copy). Keep the two in sync; both are unit-tested.
+HOST_RESETTLE_WHITELIST = frozenset(
+    {"node-not-ready", "nodes-unreadable", "istiod-api-unreachable"}
+)
+
+# Option B (systemd path-unit) wiring. Both this healer and the root executor
+# agree on this directory (override via ``MESH_HEAL_DIR`` for tests / non-default
+# installs). The runner writes request files under ``requests/`` (the only thing
+# it is privileged to do — write a file); the root unit writes ``results/``.
+DEFAULT_MESH_HEAL_DIR = "/var/lib/audittrace/mesh-heal"
+
+# Bounded poll for the async root-unit result (Option B is fire-a-file + wait).
+DEFAULT_RESETTLE_TIMEOUT = 120.0
+DEFAULT_RESETTLE_POLL = 3.0
+
+
+def mesh_heal_dir() -> Path:
+    """The Option-B heal directory (env-overridable; read at call time)."""
+    return Path(os.environ.get("MESH_HEAL_DIR", DEFAULT_MESH_HEAL_DIR))
+
+
+def is_host_resettle_allowed(signal: str) -> bool:
+    """True iff ``signal`` is in the host-root re-settle whitelist (pure).
+
+    The single Python-side source of truth for host-root routing. Falsifiable:
+    a whitelisted signal returns True, anything else (including an empty string
+    or a near-miss) returns False so the healer never smuggles an un-vetted op
+    across the privilege boundary.
+    """
+    return signal in HOST_RESETTLE_WHITELIST
+
+
+class PrivilegedHealer:
+    """The real WS5 healer: bounded, idempotent, two-tier, fail-closed.
+
+    ``available`` reflects KUBECTL REACHABILITY (decoupled from the Option-B
+    install, ratified by Luis 2026-08-01), so the safe RBAC-tier istiod restart
+    is available on ANY reachable cluster — even before the systemd units are
+    installed — and an unreachable cluster keeps the gate failing closed. The
+    host-root re-settle tier SELF-GATES on the install via
+    :meth:`_host_root_installed` inside :meth:`_trigger_host_resettle`, so an
+    uninstalled host still fails closed for that fault class (no request written,
+    no raise → the gate re-diagnoses → UNSAFE).
+
+    ``heal`` performs at most ONE bounded action per call (the gate owns the
+    retry/backoff loop and re-diagnoses after each). It NEVER raises to mean
+    "couldn't fix" — it returns ``HealAttempt(performed=False, ...)`` and lets
+    the gate's re-diagnose decide; a raise is reserved for a true internal error
+    (the gate catches it → UNSAFE, ``mesh.py`` evaluate()).
+    """
+
+    def __init__(
+        self,
+        heal_dir: Path | None = None,
+        *,
+        resettle_timeout: float = DEFAULT_RESETTLE_TIMEOUT,
+        resettle_poll: float = DEFAULT_RESETTLE_POLL,
+    ) -> None:
+        self._heal_dir = heal_dir or mesh_heal_dir()
+        self._resettle_timeout = resettle_timeout
+        self._resettle_poll = resettle_poll
+
+    @property
+    def _requests_dir(self) -> Path:
+        return self._heal_dir / "requests"
+
+    @property
+    def _results_dir(self) -> Path:
+        return self._heal_dir / "results"
+
+    def _host_root_installed(self) -> bool:
+        """True iff the Option-B host-root trigger is wired + writable here."""
+        reqs = self._requests_dir
+        return reqs.is_dir() and os.access(reqs, os.W_OK)
+
+    @property
+    def available(self) -> bool:
+        """True iff kubectl can reach the cluster (RBAC-tier heals are possible).
+
+        DECOUPLED from the Option-B host-root install (Luis 2026-08-01): the safe
+        RBAC-tier istiod restart works on ANY reachable cluster, even before the
+        systemd units are installed, so the gate can recover the common degraded-
+        istiod case everywhere. The host-root tier self-gates on the request dir
+        inside :meth:`_trigger_host_resettle`, so an UNINSTALLED host still fails
+        closed for the host-root fault class (the gate re-diagnoses → UNSAFE).
+        Kubectl unreachable → unavailable → the gate fails closed with no heal.
+        """
+        ok, _ = self._kubectl(["version", "--request-timeout=5s", "-o", "json"])
+        return ok
+
+    # -- the least-privileged probe boundary for RBAC-tier heals --
+
+    def _kubectl(self, args: list[str]) -> tuple[bool, str]:
+        """Run a kubectl action through the module ``_run`` seam, fail-soft.
+
+        A transport failure (missing binary / timeout) or a non-zero exit is a
+        "couldn't fix" — returned as ``(False, msg)``, NEVER raised — so the gate
+        re-diagnoses and fails closed instead of falsely reporting HEALED.
+        """
+        try:
+            proc = _run(["kubectl", *args])
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error("healer kubectl failed: %s (%s)", " ".join(args), exc)
+            return False, str(exc)
+        if proc.returncode != 0:
+            return False, proc.stderr or proc.stdout
+        return True, proc.stdout
+
+    def _restart_istiod(self, finding: Finding) -> HealAttempt:
+        """RBAC tier: re-roll istiod (idempotent) + a bounded readiness wait."""
+        ok, out = self._kubectl(
+            [
+                "rollout",
+                "restart",
+                f"deployment/{ISTIOD_DEPLOYMENT}",
+                "-n",
+                ISTIO_NAMESPACE,
+            ]
+        )
+        if not ok:
+            return HealAttempt(
+                performed=False,
+                action="restart-istiod",
+                detail=f"kubectl rollout restart failed for {finding.signal}",
+                evidence={"signal": finding.signal, "error": out[-2000:]},
+            )
+        # Best-effort bounded wait; its outcome is EVIDENCE only — the gate's
+        # re-diagnose is the authority on whether the mesh actually recovered.
+        status_ok, status_out = self._kubectl(
+            [
+                "rollout",
+                "status",
+                f"deployment/{ISTIOD_DEPLOYMENT}",
+                "-n",
+                ISTIO_NAMESPACE,
+                f"--timeout={int(self._resettle_timeout)}s",
+            ]
+        )
+        return HealAttempt(
+            performed=True,
+            action="restart-istiod",
+            detail=f"rolled istiod for {finding.signal} (RBAC tier, no privilege seam)",
+            evidence={
+                "signal": finding.signal,
+                "rollout_status_ok": status_ok,
+                "rollout_status": status_out[-2000:],
+            },
+        )
+
+    def _trigger_host_resettle(self, finding: Finding) -> HealAttempt:
+        """HOST-ROOT tier (Q3 boundary): the ONLY method that touches privilege.
+
+        Writes a VALIDATED request file (signal + evidence, JSON) atomically into
+        the watched ``requests/`` dir, then polls ``results/`` for the root unit's
+        verdict within a bounded timeout. If Q3 is ever revisited, only this
+        method changes. Fails closed (``performed=False``) on refusal or timeout;
+        never raises for "couldn't fix".
+        """
+        if not is_host_resettle_allowed(finding.signal):
+            # Defence in depth: the caller already routed by tier, but never let
+            # an un-whitelisted signal reach the privilege boundary.
+            return HealAttempt(
+                performed=False,
+                action="host-resettle-refused",
+                detail=f"signal {finding.signal!r} is not in the host-resettle whitelist",
+                evidence={"signal": finding.signal},
+            )
+        # Self-gate on the Option-B install (decoupled from ``available``, which
+        # now only reflects kubectl reachability). If the host-root trigger is
+        # not wired on this host, do NOT write a request and do NOT raise — return
+        # a no-op so the gate re-diagnoses and, if the host-root fault persists,
+        # resolves to UNSAFE (still fail-closed for the unfixable class).
+        if not self._host_root_installed():
+            return HealAttempt(
+                performed=False,
+                action="none",
+                detail="host-root re-settle not installed on this host",
+                evidence={"signal": finding.signal},
+            )
+        self._results_dir.mkdir(parents=True, exist_ok=True)
+        request_id = f"{finding.signal}-{uuid.uuid4().hex[:12]}"
+        payload = {
+            "request_id": request_id,
+            "signal": finding.signal,
+            "detail": finding.detail,
+            "evidence": finding.evidence,
+            "requested_at": _now_iso(),
+        }
+        # Publish atomically: write a tmp file OUTSIDE requests/ then os.replace
+        # in, so the .path unit never fires on a half-written request.
+        tmp_path = self._heal_dir / f".{request_id}.json.tmp"
+        req_path = self._requests_dir / f"{request_id}.json"
+        result_path = self._results_dir / f"{request_id}.result.json"
+        tmp_path.write_text(json.dumps(payload))
+        os.replace(tmp_path, req_path)
+        logger.info("host-resettle requested: %s -> %s", finding.signal, req_path)
+
+        waited = 0.0
+        while waited < self._resettle_timeout:
+            if result_path.exists():
+                result = _parse_json(result_path.read_text())
+                performed = isinstance(result, dict) and bool(result.get("performed"))
+                return HealAttempt(
+                    performed=performed,
+                    action="host-resettle",
+                    detail=(
+                        f"root unit re-settled for {finding.signal}"
+                        if performed
+                        else f"root unit did not perform for {finding.signal}"
+                    ),
+                    evidence={"signal": finding.signal, "result": result},
+                )
+            _sleep(self._resettle_poll)
+            waited += self._resettle_poll
+
+        return HealAttempt(
+            performed=False,
+            action="host-resettle-timeout",
+            detail=(
+                f"no result from the root re-settle unit within "
+                f"{self._resettle_timeout:.0f}s for {finding.signal}"
+            ),
+            evidence={"signal": finding.signal, "request_id": request_id},
+        )
+
+    def heal(self, diagnosis: Diagnosis) -> HealAttempt:
+        """One bounded, least-privileged action for the given diagnosis.
+
+        Least-privilege ordering: try an RBAC-tier istiod re-roll first; only if
+        no RBAC-tier finding is present fall through to the host-root re-settle.
+        With the gate's bounded retry loop this converges (attempt 1 re-rolls
+        istiod, re-diagnose, attempt 2 re-settles the host if still degraded).
+        """
+        for finding in diagnosis.findings:
+            if finding.signal in RBAC_RESTART_SIGNALS:
+                return self._restart_istiod(finding)
+        for finding in diagnosis.findings:
+            if finding.signal in HOST_RESETTLE_WHITELIST:
+                return self._trigger_host_resettle(finding)
+        return HealAttempt(
+            performed=False,
+            action="none",
+            detail=(
+                "no privileged-healer action maps to signals: "
+                f"{', '.join(diagnosis.signals) or 'none'}"
+            ),
+            evidence={"signals": diagnosis.signals},
         )
 
 

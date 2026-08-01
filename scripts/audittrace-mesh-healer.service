@@ -1,0 +1,32 @@
+[Unit]
+Description=AuditTrace-AI privileged mesh re-settle (#384 WS5, Q3 Option B)
+Documentation=file:///home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-mesh-resettle.sh
+# Triggered by audittrace-mesh-healer.path when the deploy runner writes a
+# request file. This is the ONE root-owned unit in the WS5 heal path.
+#
+# Soft dependency on k3s.service (NOT Requires=) — same rule as
+# audittrace-vault-auto-unseal.service / audittrace-pod-reaper.service.
+# Requires= would cancel this unit's job if k3s's first start failed, and no
+# Restart= could recover a never-started unit. Wants= lets it run regardless;
+# the bounded op + Restart=on-failure cover recovery. See
+# feedback_systemd_requires_vs_wants (2026-05-07 incident anchor).
+After=k3s.service network-online.target
+Wants=k3s.service network-online.target
+# Bounded retry — the executor is idempotent (a re-run on an empty request dir
+# is a no-op) but a flat-out broken host should not loop forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+# NO User= — this unit runs as ROOT deliberately: it is the privilege boundary
+# the unprivileged runner cannot cross. The executor validates every request
+# against its hardcoded whitelist before performing a single bounded op.
+Environment=KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+Environment=MESH_HEAL_DIR=/var/lib/audittrace/mesh-heal
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-mesh-resettle.sh
+# systemctl restart k3s (the bounded op) plus request processing fit well
+# inside this budget on a healthy host; a degraded host is bounded by it.
+TimeoutStartSec=180s
+Restart=on-failure
+RestartSec=10s
