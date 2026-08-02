@@ -43,6 +43,22 @@ from scripts.deploy.mesh import (
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
 
+# The real _journal_cursor captured BEFORE any autouse patching, so the dedicated
+# cursor tests can exercise the true implementation while every certify_case test
+# gets the hermetic stub instead of shelling out to journalctl.
+_REAL_JOURNAL_CURSOR = fi._journal_cursor
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_journal_cursor(monkeypatch):
+    """Keep certify_case hermetic: stub the pre-inject cursor capture.
+
+    _journal_cursor now runs journalctl for EVERY case; without this every
+    certify_case test would shell out. Returns a fixed fake cursor so the
+    step-6 read receives a real (non-blank) value by default.
+    """
+    monkeypatch.setattr(fi, "_journal_cursor", lambda unit: "curs-pre-inject")
+
 
 def _proc(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(
@@ -330,9 +346,15 @@ def test_certify_case_teardown_error_is_recorded():
 
 
 def test_certify_case_host_root_requires_journal(monkeypatch):
-    monkeypatch.setattr(
-        fi, "_read_journal", lambda unit, *, since: "[mesh-resettle] EXECUTING"
-    )
+    # falsifiable: the step-6 read must be scoped by the PRE-INJECT cursor, so
+    # capture what after_cursor certify_case threads through.
+    seen = {}
+
+    def _fake_read(unit, *, after_cursor):
+        seen["after_cursor"] = after_cursor
+        return "[mesh-resettle] EXECUTING"
+
+    monkeypatch.setattr(fi, "_read_journal", _fake_read)
     case = _case(
         cid="F2",
         tier=fi.TIER_HOST_ROOT,
@@ -343,6 +365,8 @@ def test_certify_case_host_root_requires_journal(monkeypatch):
     res = fi.certify_case(case, gate, budget_s=180)
     assert res.passed
     assert res.journal_confirmed is True
+    # the cursor captured before inject (the hermetic stub) reaches the read.
+    assert seen["after_cursor"] == "curs-pre-inject"
 
 
 def test_certify_case_signal_mid_run_restores_exactly_once():
@@ -363,7 +387,7 @@ def test_certify_case_signal_mid_run_restores_exactly_once():
 
 def test_certify_case_host_root_fails_without_journal(monkeypatch):
     # heal reports HEALED but NO journald record -> not auditable -> FAIL.
-    monkeypatch.setattr(fi, "_read_journal", lambda unit, *, since: "")
+    monkeypatch.setattr(fi, "_read_journal", lambda unit, *, after_cursor: "")
     case = _case(
         cid="F2",
         tier=fi.TIER_HOST_ROOT,
@@ -572,21 +596,78 @@ def test_run_executes_real_subprocess():
     assert proc.returncode == 0 and proc.stdout == "hi"
 
 
-def test_sleep_monotonic_now_and_since():
+def test_sleep_monotonic_and_now():
     fi._sleep(0.0)
     assert isinstance(fi._monotonic(), float)
     assert "T" in fi._now_iso()
-    assert len(fi._journal_since_marker()) == len("2026-08-02 00:00:00")
 
 
-def test_read_journal_returns_stdout(monkeypatch):
-    monkeypatch.setattr(fi, "_run", lambda cmd, **kw: _proc(0, "log lines"))
-    assert fi._read_journal("u", since="x") == "log lines"
+# ── journald cursor + read (timezone-independent host-root proof) ──────────────
+
+
+def test_journal_cursor_parses_token_from_stderr(monkeypatch):
+    # journalctl prints the cursor on stderr as "-- cursor: <token>".
+    seen = {}
+
+    def _fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return _proc(0, stdout="", stderr="-- cursor: s=abc123;i=42;b=deadbeef\n")
+
+    monkeypatch.setattr(fi, "_run", _fake)
+    assert _REAL_JOURNAL_CURSOR("u") == "s=abc123;i=42;b=deadbeef"
+    # captured with -n0 --show-cursor so no entries are read, just the cursor.
+    assert "-n0" in seen["cmd"] and "--show-cursor" in seen["cmd"]
+
+
+def test_journal_cursor_blank_when_no_cursor_line(monkeypatch):
+    # a run that emits no "-- cursor:" line yields '' (stale/blank cursor path).
+    monkeypatch.setattr(fi, "_run", lambda cmd, **kw: _proc(0, "no cursor here", ""))
+    assert _REAL_JOURNAL_CURSOR("u") == ""
+
+
+def test_journal_cursor_blank_on_nonzero(monkeypatch):
+    monkeypatch.setattr(fi, "_run", lambda cmd, **kw: _proc(1, "", "err"))
+    assert _REAL_JOURNAL_CURSOR("u") == ""
+
+
+def test_journal_cursor_blank_on_oserror(monkeypatch):
+    def _boom(cmd, **kw):
+        raise FileNotFoundError("journalctl missing")
+
+    monkeypatch.setattr(fi, "_run", _boom)
+    assert _REAL_JOURNAL_CURSOR("u") == ""
+
+
+def test_read_journal_uses_after_cursor(monkeypatch):
+    seen = {}
+
+    def _fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return _proc(0, "log lines")
+
+    monkeypatch.setattr(fi, "_run", _fake)
+    assert fi._read_journal("u", after_cursor="curs-x") == "log lines"
+    assert "--after-cursor" in seen["cmd"]
+    assert "curs-x" in seen["cmd"]
+
+
+def test_read_journal_blank_cursor_omits_after_cursor(monkeypatch):
+    # a blank cursor (capture failed) degrades to a whole-unit read, no
+    # --after-cursor flag; still fail-closed via the marker check upstream.
+    seen = {}
+
+    def _fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return _proc(0, "log lines")
+
+    monkeypatch.setattr(fi, "_run", _fake)
+    assert fi._read_journal("u", after_cursor="") == "log lines"
+    assert "--after-cursor" not in seen["cmd"]
 
 
 def test_read_journal_empty_on_nonzero(monkeypatch):
     monkeypatch.setattr(fi, "_run", lambda cmd, **kw: _proc(1, "", "err"))
-    assert fi._read_journal("u", since="x") == ""
+    assert fi._read_journal("u", after_cursor="x") == ""
 
 
 def test_read_journal_empty_on_oserror(monkeypatch):
@@ -594,7 +675,7 @@ def test_read_journal_empty_on_oserror(monkeypatch):
         raise FileNotFoundError("journalctl missing")
 
     monkeypatch.setattr(fi, "_run", _boom)
-    assert fi._read_journal("u", since="x") == ""
+    assert fi._read_journal("u", after_cursor="x") == ""
 
 
 # ── the signal-handler restore re-arm ──────────────────────────────────────────

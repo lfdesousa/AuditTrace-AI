@@ -100,6 +100,10 @@ JOURNAL_FIRED_MARKERS = ("mesh-resettle", MESH_HEALER_UNIT, "systemctl restart k
 
 # The kube-API ClusterIP whose host route #307 breaks (istiod loses "route to
 # host" and can no longer sign CSRs). Single-node k3s default.
+# TODO(#384 WS7 cloud-profile seam b): this 10.43.0.1 is k3s-specific — lift it
+# (and the iptables-vs-EKS-security-group injection mechanism) into a cloud
+# profile constant so a non-k3s target selects its own kube-API ClusterIP /
+# route-break mechanism without editing F2's op.
 KUBE_API_CLUSTERIP = "10.43.0.1"
 
 # Default zero-touch recovery budget (seconds). A host-root k3s re-settle on a
@@ -150,26 +154,59 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _journal_since_marker() -> str:
-    """A ``journalctl --since`` timestamp captured before injection.
-
-    Used to scope the audit-record read to THIS run's heal window, so a stale
-    record from a previous run can never falsely satisfy the host-root proof.
-    """
-    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+# The prefix journalctl prints for the opaque cursor token in ``--show-cursor``.
+_CURSOR_PREFIX = "-- cursor: "
 
 
-def _read_journal(unit: str, *, since: str) -> str:
-    """Read the journald window for ``unit`` since ``since`` (fail-soft to '').
+def _journal_cursor(unit: str) -> str:
+    """Capture the journald cursor at the tail of ``unit`` BEFORE injection.
 
-    A transport failure (journalctl missing / non-zero) yields '' so the
-    host-root proof fails closed (no record → the case FAILS), never crashes.
+    Returns the opaque cursor token, or '' on any failure. A cursor is
+    timezone-independent (unlike ``--since``, which journalctl parses in the
+    host's LOCAL timezone — a real portability bug: west of UTC a UTC timestamp
+    starts the window in the future and false-FAILs a genuinely-healed case).
+    Scoping the step-6 read with ``--after-cursor`` guarantees we only ever see
+    records the heal wrote AFTER this point, so a stale record from a previous
+    run can never satisfy the proof.
+
+    ``-n0 --show-cursor`` prints no entries, just the trailing ``-- cursor: …``
+    line for the current tail. A blank/failed capture returns '' → the step-6
+    proof falls back to a whole-unit read and stays fail-closed (see
+    :func:`_read_journal`), never a false PASS.
     """
     try:
         proc = _run(
-            ["journalctl", "-u", unit, "--since", since, "--no-pager"],
+            ["journalctl", "-u", unit, "-n0", "--show-cursor", "--no-pager"],
             timeout=30,
         )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("journal cursor capture failed for %s: %s", unit, exc)
+        return ""
+    if proc.returncode != 0:
+        return ""
+    # ``--show-cursor`` emits the token on stderr as ``-- cursor: <token>``.
+    for line in (proc.stderr + proc.stdout).splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_CURSOR_PREFIX):
+            return stripped[len(_CURSOR_PREFIX) :].strip()
+    return ""
+
+
+def _read_journal(unit: str, *, after_cursor: str) -> str:
+    """Read ``unit``'s journal entries after ``after_cursor`` (fail-soft to '').
+
+    Timezone-independent: ``--after-cursor`` bounds the window by the opaque
+    cursor captured pre-injection, not a locale-parsed timestamp. A blank cursor
+    (capture failed) degrades to a whole-unit read — still bounded by the caller's
+    marker check, and any transport failure (journalctl missing / non-zero) yields
+    '' so the host-root proof fails closed (no record → the case FAILS), never
+    crashes and never a false PASS.
+    """
+    cmd = ["journalctl", "-u", unit, "--no-pager"]
+    if after_cursor:
+        cmd += ["--after-cursor", after_cursor]
+    try:
+        proc = _run(cmd, timeout=30)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.error("journal read failed for %s: %s", unit, exc)
         return ""
@@ -686,7 +723,10 @@ def certify_case(
         logger.error("[%s] %s", case.id, res.reason)
         return res
 
-    journal_since = _journal_since_marker()
+    # Capture the journald cursor BEFORE injecting so the step-6 host-root proof
+    # reads only records the heal writes after this point (timezone-independent,
+    # and stale-record-proof). Empty for non-host-root cases and harmless there.
+    journal_cursor = _journal_cursor(MESH_HEALER_UNIT)
 
     def _do_restore() -> None:
         if res.restored:
@@ -704,7 +744,7 @@ def certify_case(
         stack.callback(_do_restore)
         with _restore_on_signal(_do_restore):
             try:
-                _run_case_steps(case, gate, res, budget_s, journal_since)
+                _run_case_steps(case, gate, res, budget_s, journal_cursor)
                 res.verdict = VERDICT_PASS
                 res.reason = (
                     f"injected -> observed {res.observed_outcome} within "
@@ -727,7 +767,7 @@ def _run_case_steps(
     gate: GateLike,
     res: CaseResult,
     budget_s: float,
-    journal_since: str,
+    journal_cursor: str,
 ) -> None:
     """Steps 2-6 of :func:`certify_case`. Raises :class:`_CaseAbortedError` on any miss.
 
@@ -766,14 +806,21 @@ def _run_case_steps(
             f"(reason: {result.reason})"
         )
 
-    # Step 6 — host-root heal: the contemporaneous journald audit record must exist.
+    # Step 6 — host-root heal: the contemporaneous journald audit record must
+    # exist. Read only entries AFTER the pre-injection cursor (timezone-
+    # independent, stale-record-proof).
+    # TODO(#384 WS7 cloud-profile seam a): make this a per-case pluggable
+    # ``audit_proof_fn`` on FaultCase so a cloud profile can prove the host-root
+    # heal from a different contemporaneous source (e.g. CloudWatch Logs / an
+    # SSM run-command record) instead of laptop journald — plug-in, not a rewrite.
     if case.tier == TIER_HOST_ROOT and case.expected_outcome == HEALED:
-        journal = _read_journal(MESH_HEALER_UNIT, since=journal_since)
+        journal = _read_journal(MESH_HEALER_UNIT, after_cursor=journal_cursor)
         res.journal_confirmed = journal_shows_unit_fired(journal)
         if not res.journal_confirmed:
             raise _CaseAbortedError(
-                f"no journald record of {MESH_HEALER_UNIT} firing since "
-                f"{journal_since} — host-root heal is not auditable"
+                f"no journald record of {MESH_HEALER_UNIT} firing after cursor "
+                f"{journal_cursor or '(none captured)'} — host-root heal is not "
+                "auditable"
             )
 
 
@@ -854,6 +901,11 @@ def guard_live_or_refuse(
             f"refused: the live path requires {ENV_ARMED}=1 in the environment"
         )
 
+    # TODO(#384 WS7 cloud-profile seam c): the ``node count == 1`` blast-radius
+    # guard is laptop-specific. Lift it into a pluggable profile predicate (e.g.
+    # "is this the disposable ephemeral cloud-rig, not prod?") so a multi-node
+    # cloud rig can arm WS6 against its OWN safety invariant — plug-in, not a
+    # weakening of this control.
     nodes = _node_count()
     if nodes != 1:
         raise LiveGuardError(
