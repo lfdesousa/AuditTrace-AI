@@ -30,7 +30,11 @@ evidence it stands on):
 * **recall-e2e**             — a REAL front-door recall through the audit plane:
   ``POST /v1/chat/completions`` (scoped JWT, real model) that triggers a
   ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
-  was recorded. Memory + auth alone is not E2E.
+  was recorded. Memory + auth alone is not E2E. The chat call alone uses a
+  calibrated, configurable client timeout (``--e2e-timeout`` /
+  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 120s — see
+  :data:`E2E_CHAT_TIMEOUT_DEFAULT`); every other probe keeps the short,
+  unwidened fast-probe timeout (:data:`FAST_PROBE_TIMEOUT`).
 
 The four MESH-HEALTH probes (#384 WS2, spec §4) certify that the deploy did not
 leave the Istio mesh unable to cert, secret, or route — "up" means the mesh
@@ -195,6 +199,27 @@ MESH_LOG_WINDOW = mesh.DEFAULT_LOG_WINDOW
 # non-zero-exit sentinel rather than block run(). Single-sourced from the WS1 gate.
 PROBE_TIMEOUT = mesh.DEFAULT_PROBE_TIMEOUT
 
+# Client-side HTTP timeout (seconds) for the FAST front-door probes (health,
+# interactions list, tool-calls) — matches ``_http_request``'s own default so
+# there is exactly one number to change if it ever needs to move. These probes
+# do not invoke the LLM, so a short bound is appropriate and must NOT widen
+# (v1.17.0 SPEC: "calibrate probe only" — scope is the chat probe alone).
+FAST_PROBE_TIMEOUT = 30
+
+# Client-side HTTP timeout (seconds) for the recall-e2e CHAT probe
+# (``POST /v1/chat/completions``) ONLY. Calibrated, not arbitrary: the v1.17.0
+# deploy-verify FAIL recorded a real backend SUCCESS at 30.577s against the old
+# fixed 30s budget (interaction 806, Tempo trace 3c826281...), and the
+# 2026-07-20 v1.10.0 run observed 59s for max_tokens=2000 on a reasoning model.
+# 120s is ~2x the worst observed 59s — generous enough to cover a reasoning
+# model spending time in <think> on an architect-shaped prompt, while still a
+# REAL gate: a response past 120s is a genuine FAIL worth surfacing, not
+# something this bound papers over. Configurable via ``--e2e-timeout`` / the
+# ``AUDITTRACE_VERIFY_E2E_TIMEOUT`` env var so a different target/model can be
+# tuned without a code change (portability invariant).
+E2E_CHAT_TIMEOUT_DEFAULT = 120
+E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
+
 # The nine probe identifiers — fixed order (determinism contract). The four
 # mesh-health probes are APPENDED so the core five keep their indices.
 PROBES = (
@@ -259,7 +284,7 @@ def _http_request(  # pragma: no cover - thin urllib egress boundary; monkeypatc
     url: str,
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
-    timeout: int = 30,
+    timeout: int = FAST_PROBE_TIMEOUT,
     context: ssl.SSLContext | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     """Perform an HTTP request; return ``(status, response_headers, body)``.
@@ -350,6 +375,10 @@ class VerifyConfig:
     # STRICT TLS by default; --insecure is an explicit dev/self-signed opt-in.
     insecure: bool = False
     out_dir: Path = Path(__file__).resolve().parents[2] / "scripts" / "deploy" / "runs"
+    # Client-side timeout (seconds) for the recall-e2e CHAT probe ONLY — see
+    # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
+    # (fast HTTP + kubectl/helm) is untouched by this field.
+    e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
 
     @property
     def deployment(self) -> str:
@@ -839,8 +868,19 @@ class VerifyRunner:
         return status, _parse_json(body)
 
     def _front_post(
-        self, path: str, token: str | None, payload: dict[str, Any]
+        self,
+        path: str,
+        token: str | None,
+        payload: dict[str, Any],
+        timeout: int = FAST_PROBE_TIMEOUT,
     ) -> tuple[int, Any]:
+        """POST to the front door. ``timeout`` defaults to the FAST bound.
+
+        Only the recall-e2e chat probe overrides it (to
+        :attr:`VerifyConfig.e2e_timeout`) — every other caller of
+        ``_front_post``/``_front_get`` keeps the short, unwidened fast-probe
+        timeout (SPEC: "calibrate probe only").
+        """
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -850,6 +890,7 @@ class VerifyRunner:
             f"{self.cfg.front_door}{path}",
             headers,
             body,
+            timeout=timeout,
             context=ssl_context(self.cfg.insecure),
         )
         return status, _parse_json(resp)
@@ -1016,8 +1057,12 @@ class VerifyRunner:
                 }
             ],
         }
+        # The chat probe alone gets the calibrated (configurable) timeout — every
+        # other request in this probe (interactions list, tool-calls) and every
+        # other probe keeps the FAST_PROBE_TIMEOUT default (SPEC: "calibrate
+        # probe only").
         chat_status, chat_body = self._front_post(
-            "/v1/chat/completions", token, chat_payload
+            "/v1/chat/completions", token, chat_payload, timeout=self.cfg.e2e_timeout
         )
         if (
             chat_status != 200
@@ -1028,7 +1073,7 @@ class VerifyRunner:
                 PROBES[4],
                 FAIL,
                 f"front-door /v1/chat/completions returned HTTP {chat_status} without a completion",
-                {"http_status": chat_status},
+                {"http_status": chat_status, "e2e_timeout_s": self.cfg.e2e_timeout},
             )
         list_status, list_body = self._front_get(
             f"/interactions?limit={self.cfg.interactions_limit}", token
@@ -1077,6 +1122,7 @@ class VerifyRunner:
             {
                 "interaction_id": interaction_id,
                 "recall_tool_names": [tc.get("tool_name") for tc in recalls],
+                "e2e_timeout_s": self.cfg.e2e_timeout,
             },
         )
 
@@ -1316,6 +1362,25 @@ class VerifyRunner:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
+def _e2e_timeout_default() -> int:
+    """Resolve the recall-e2e chat-probe timeout default.
+
+    ``AUDITTRACE_VERIFY_E2E_TIMEOUT`` overrides :data:`E2E_CHAT_TIMEOUT_DEFAULT`
+    when set to a valid integer; an unset or non-integer value falls back
+    (fail-closed to the calibrated default, never a crash on a bad env var).
+    Read fresh on every call (NOT cached at import time) so tests can
+    monkeypatch ``os.environ`` without reload tricks, and so
+    :func:`build_parser` picks up the current environment each time it runs.
+    """
+    raw = os.environ.get(E2E_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return E2E_CHAT_TIMEOUT_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return E2E_CHAT_TIMEOUT_DEFAULT
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.deploy.verify",
@@ -1340,6 +1405,20 @@ def build_parser() -> argparse.ArgumentParser:
             "equivalent of curl -k). Default is STRICT verification."
         ),
     )
+    parser.add_argument(
+        "--e2e-timeout",
+        type=int,
+        default=_e2e_timeout_default(),
+        help=(
+            "client-side timeout in SECONDS for the recall-e2e CHAT probe "
+            "(POST /v1/chat/completions) ONLY -- every other probe (health, "
+            "kubectl, helm) keeps its own short, unwidened timeout. Default "
+            f"{E2E_CHAT_TIMEOUT_DEFAULT}s, calibrated to ~2x the worst observed "
+            "real-model latency (59s, 2026-07-20 v1.10.0 run); a response past "
+            "the bound is still a genuine FAIL. Portable across targets/models "
+            f"via this flag or the {E2E_TIMEOUT_ENV_VAR} env var."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
     return parser
 
@@ -1355,6 +1434,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         model=args.model,
         insecure=args.insecure,
         out_dir=args.out_dir,
+        e2e_timeout=args.e2e_timeout,
     )
 
 
