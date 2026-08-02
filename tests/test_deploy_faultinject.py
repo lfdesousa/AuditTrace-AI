@@ -525,17 +525,51 @@ def test_restore_istiod_degraded_argv(monkeypatch):
 
 
 def test_inject_clusterip_route_broken_argv(monkeypatch):
+    # WS6 F2 review (2026-08-02): the live cert caught the ORIGINAL version of
+    # this rule as vacuous — it inserted into the host's OUTPUT chain, which
+    # never sees a pod's (istiod's) forwarded/DNAT'd egress. This test is
+    # falsifiable in that specific direction: reverting to an OUTPUT-chain
+    # plain "-d <clusterip>" rule (no conntrack match) must turn it red.
     seen = []
     monkeypatch.setattr(fi, "_run", lambda cmd, **kw: seen.append(cmd) or _proc(0))
     fi.inject_clusterip_route_broken()
     assert seen[0][0] == "iptables"
     assert "-I" in seen[0]
-    assert fi.KUBE_API_CLUSTERIP in seen[0]
+    assert "INPUT" in seen[0]
+    # the vacuous bug: inserting into OUTPUT instead of INPUT.
+    assert "OUTPUT" not in seen[0]
     assert "REJECT" in seen[0]
+    assert "icmp-host-unreachable" in seen[0]
+    # the vacuous bug: matching the (already-rewritten-by-DNAT) live
+    # destination via a plain "-d" instead of the pre-NAT conntrack original.
+    assert "-d" not in seen[0]
+    assert "-m" in seen[0]
+    assert "conntrack" in seen[0]
+    assert "--ctorigdst" in seen[0]
+    assert fi.KUBE_API_CLUSTERIP in seen[0]
+    assert "--ctorigdstport" in seen[0]
+    assert "443" in seen[0]
+
+
+def test_restore_clusterip_route_targets_input_chain(monkeypatch):
+    # Teardown must reverse the SAME chain/match the (fixed) inject used, or a
+    # correct inject paired with a stale OUTPUT-chain delete would leave the
+    # INPUT-chain REJECT rule behind after a run.
+    seen = []
+    monkeypatch.setattr(fi, "_run", lambda cmd, **kw: seen.append(cmd) or _proc(0))
+    fi.restore_clusterip_route()
+    assert seen[0][0] == "iptables"
+    assert "-D" in seen[0]
+    assert "INPUT" in seen[0]
+    assert "OUTPUT" not in seen[0]
+    assert "--ctorigdst" in seen[0]
+    assert fi.KUBE_API_CLUSTERIP in seen[0]
 
 
 def test_restore_clusterip_route_is_idempotent(monkeypatch):
     # a non-zero delete (rule already gone) must NOT raise — fail-safe restore.
+    # Covers the "survives a systemctl restart k3s" requirement: whether k3s's
+    # resync already cleared the rule or not, the delete never raises.
     monkeypatch.setattr(fi, "_run", lambda cmd, **kw: _proc(1, "", "No chain/target"))
     fi.restore_clusterip_route()  # no exception
 

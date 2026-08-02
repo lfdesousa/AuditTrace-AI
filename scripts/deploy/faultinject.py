@@ -472,18 +472,34 @@ def restore_istiod_degraded() -> None:
 
 
 def _clusterip_reject_rule() -> list[str]:
-    """The iptables rule that severs istiod's route to the kube-API ClusterIP.
+    """The match+target that severs the kube-API ClusterIP path for the F2 fault.
 
-    A REJECT with ``icmp-host-unreachable`` reproduces the #307 signature — istiod
-    logs "no route to host" and cannot sign CSRs — which the diagnoser maps to
-    ``istiod-api-unreachable`` (the host-root class the root re-settle heals).
+    Matches on the ClusterIP's ORIGINAL (pre-DNAT) destination via ``conntrack
+    --ctorigdst``, not a plain ``-d``. On single-node k3s, kube-proxy's
+    ``KUBE-SERVICES`` chain DNATs ``10.43.0.1:443`` to the node's own
+    hostNetwork kube-apiserver (``<nodeIP>:6443``) in ``PREROUTING`` — BEFORE
+    the routing decision runs. Because the new destination is local, the
+    packet is delivered via ``INPUT``, not ``FORWARD``, and by the time it
+    reaches ``INPUT`` its destination has already been rewritten away from
+    the ClusterIP, so a plain ``-d 10.43.0.1`` match there would never fire.
+    ``conntrack --ctorigdst`` reaches back into the connection-tracking entry
+    recorded when kube-proxy's DNAT first ran, to the ORIGINAL destination —
+    the ClusterIP — regardless of what the packet's current addressing looks
+    like. That is what makes this rule catch a POD's egress to the ClusterIP
+    (istiod is a pod), while a REJECT with ``icmp-host-unreachable`` still
+    reproduces the exact #307 signature: istiod's Go client reports
+    ``EHOSTUNREACH`` as "no route to host" and cannot sign CSRs, which the
+    diagnoser maps to ``istiod-api-unreachable`` (the host-root class the
+    root re-settle heals).
     """
     return [
-        "-d",
-        KUBE_API_CLUSTERIP,
         "-p",
         "tcp",
-        "--dport",
+        "-m",
+        "conntrack",
+        "--ctorigdst",
+        KUBE_API_CLUSTERIP,
+        "--ctorigdstport",
         "443",
         "-j",
         "REJECT",
@@ -493,19 +509,39 @@ def _clusterip_reject_rule() -> list[str]:
 
 
 def inject_clusterip_route_broken() -> None:
-    """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route."""
-    _exec_or_raise(["iptables", "-I", "OUTPUT", *_clusterip_reject_rule()])
+    """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route.
+
+    FIXED 2026-08-02 (WS6 F2 review, live cert 2026-08-02 F2 FAIL): the prior
+    version inserted the REJECT into the host's ``OUTPUT`` chain, which only
+    intercepts packets a process ON THE HOST ITSELF originates. istiod is a
+    POD — its egress to the ClusterIP is DNAT'd and forwarded, so it never
+    traverses ``OUTPUT``. That made the old injection VACUOUS for istiod:
+    ``diagnose_mesh`` stayed HEALTHY after "inject" and the non-vacuous guard
+    correctly refused to claim a heal, leaving the crown-jewel #307 self-heal
+    unproven. Inserting into ``INPUT`` with the ``conntrack --ctorigdst``
+    match (see :func:`_clusterip_reject_rule`) catches the packet AFTER
+    kube-proxy's DNAT, keyed on its pre-NAT destination, so it severs
+    istiod's (and any pod's) path to the ClusterIP while leaving ``kubectl``'s
+    own ``127.0.0.1:6443`` kubeconfig path untouched — the gate's own probes
+    and the healer's own ``kubectl`` calls keep working, only the kube-API
+    route istiod needs is broken.
+    """
+    _exec_or_raise(["iptables", "-I", "INPUT", *_clusterip_reject_rule()])
 
 
 def restore_clusterip_route() -> None:
     """F2 restore: remove the REJECT rule (idempotent).
 
-    The heal's ``systemctl restart k3s`` rebuilds host iptables and may already
-    have flushed the rule, so a non-zero delete (rule absent) is tolerated — this
-    is the fail-safe restore, not a mutation whose success we assert.
+    The heal's ``systemctl restart k3s`` resyncs kube-proxy's iptables rules
+    and may already have removed or superseded this rule, so a non-zero
+    delete (rule absent) is tolerated — this is the fail-safe restore, not a
+    mutation whose success we assert. Survives a real ``systemctl restart
+    k3s`` unconditionally: the delete either removes a still-present rule or
+    no-ops on an already-cleared one, either way leaving no REJECT rule
+    behind.
     """
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        _run(["iptables", "-D", "OUTPUT", *_clusterip_reject_rule()])
+        _run(["iptables", "-D", "INPUT", *_clusterip_reject_rule()])
 
 
 def inject_unfixable_istiod_scaled_zero() -> None:
