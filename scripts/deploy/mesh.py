@@ -289,6 +289,18 @@ class UnconfiguredHealer:
 # present simultaneously (the real #307 shape: ``istiod-api-unreachable`` +
 # ``istiod-not-ready`` together), checking RBAC first stalls the bounded heal
 # loop in a tier that can never converge and starves the tier that would.
+#
+# FALL-THROUGH on "not installed" (fixed 2026-08-02, same marker; reviewer
+# REJECT item 4): host-root only OWNS the call when it can actually ACT. If
+# Option-B is not installed here, the host-root tier self-gates to a no-op
+# before ever touching the privilege boundary, and ``heal`` falls through to
+# the RBAC tier as a best-effort fallback — preserving the class-level
+# ``available`` guarantee ("RBAC-tier heal available on ANY reachable
+# cluster, even before the units are installed") for the co-occurring-signal
+# case too. A host-root attempt that genuinely FIRED (performed, timed out,
+# or refused) does NOT fall through: RBAC cannot fix a route loss, so trying
+# it would waste a bounded attempt; the gate's own retry/re-diagnose loop is
+# the correct mechanism for that outcome.
 
 # RBAC-tier signals — healed by an in-cluster istiod rollout restart.
 RBAC_RESTART_SIGNALS = frozenset(
@@ -350,8 +362,13 @@ class PrivilegedHealer:
     installed — and an unreachable cluster keeps the gate failing closed. The
     host-root re-settle tier SELF-GATES on the install via
     :meth:`_host_root_installed` inside :meth:`_trigger_host_resettle`, so an
-    uninstalled host still fails closed for that fault class (no request written,
-    no raise → the gate re-diagnoses → UNSAFE).
+    uninstalled host still fails closed for a HOST-ROOT-ONLY fault class (no
+    request written, no raise → the gate re-diagnoses → UNSAFE). When a
+    host-root signal co-occurs with an RBAC-fixable one on an uninstalled host
+    (fix 2026-08-02, marker WS5-HEALER-ESC-20260802, reviewer REJECT item 4),
+    :meth:`heal` falls through to the RBAC tier instead of returning that
+    no-op directly — so the ``available`` guarantee above holds for that
+    co-occurring cell too, not only the host-root-only case.
 
     ``heal`` performs at most ONE bounded action per call (the gate owns the
     retry/backoff loop and re-diagnoses after each). It NEVER raises to mean
@@ -556,13 +573,50 @@ class PrivilegedHealer:
         never converges and never reach the tier that does. Only when NO
         host-root signal is present does an RBAC-tier finding get actioned
         (e.g. an istiod-only fault with no node/route breakage — still the
-        least-privileged fix for that class). With the gate's bounded retry
-        loop this converges: co-present signals re-settle the host on attempt
-        1; an RBAC-only fault re-rolls istiod on attempt 1.
+        least-privileged fix for that class).
+
+        Fall-through on "not installed" (fix 2026-08-02, same marker; reviewer
+        REJECT item 4): a host-root signal only gets to OWN the call when the
+        host-root tier can actually act on it. If Option-B is not installed on
+        this host, :meth:`_trigger_host_resettle` self-gates to a no-op
+        (``action="none"``) *before* touching the privilege boundary — and in
+        that specific case ``heal`` falls through to the RBAC tier as a
+        best-effort fallback, so the class-level ``available`` guarantee
+        ("RBAC-tier heal available on ANY reachable cluster, even before the
+        units are installed") holds even when a host-root-whitelisted signal
+        happens to co-occur. A host-root attempt that genuinely FIRED
+        (performed, timed out, or refused as un-whitelisted) does NOT fall
+        through: RBAC cannot fix a route loss, so trying it would only waste a
+        bounded attempt — the gate's own retry/re-diagnose loop is the correct
+        mechanism for that outcome, not an in-call fallback.
+
+        With the gate's bounded retry loop this converges: co-present signals
+        on an INSTALLED host re-settle on attempt 1; an RBAC-only fault
+        re-rolls istiod on attempt 1; co-present signals on an UNINSTALLED
+        host fall through to that same RBAC re-roll on attempt 1 instead of a
+        silent no-op.
         """
-        for finding in diagnosis.findings:
-            if finding.signal in HOST_RESETTLE_WHITELIST:
-                return self._trigger_host_resettle(finding)
+        host_root_finding = next(
+            (f for f in diagnosis.findings if f.signal in HOST_RESETTLE_WHITELIST),
+            None,
+        )
+        if host_root_finding is not None:
+            attempt = self._trigger_host_resettle(host_root_finding)
+            if attempt.action != "none":
+                # A genuine host-root attempt fired (performed, timed out, or
+                # refused) — host-root owns this call. RBAC cannot fix a route
+                # loss, so no in-call fallback; the gate's bounded retry loop
+                # re-diagnoses and decides.
+                return attempt
+            # action == "none": Option-B isn't installed here. Fall through to
+            # the RBAC tier so a co-occurring RBAC-fixable signal still gets a
+            # best-effort remediation attempt instead of a silent no-op.
+            for finding in diagnosis.findings:
+                if finding.signal in RBAC_RESTART_SIGNALS:
+                    return self._restart_istiod(finding)
+            # No RBAC-tier signal to fall back to either: this is the
+            # original host-root-only, uninstalled no-op — still fails closed.
+            return attempt
         for finding in diagnosis.findings:
             if finding.signal in RBAC_RESTART_SIGNALS:
                 return self._restart_istiod(finding)
