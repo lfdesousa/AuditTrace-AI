@@ -103,6 +103,27 @@ class _FakeHttp:
         return status, {}, json.dumps(obj).encode()
 
 
+class _TimeoutSpy:
+    """Routes _http_request by (method, exact path) and RECORDS the ``timeout``
+    kwarg used for every call.
+
+    Distinct from ``_FakeHttp``: this fake exists specifically to prove the
+    e2e-timeout-calibration invariant — that the recall-e2e CHAT probe gets a
+    DIFFERENT (configurable) timeout from every other call made in the SAME
+    probe run, and that fast probes never see it widened.
+    """
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.timeouts: list[tuple[str, str, int]] = []  # (method, path, timeout)
+
+    def __call__(self, method, url, headers=None, body=None, timeout=30, context=None):
+        parsed = urlparse(url)
+        self.timeouts.append((method, parsed.path, timeout))
+        status, obj = self.routes[(method, parsed.path)]
+        return status, {}, json.dumps(obj).encode()
+
+
 def _pod(name, labels=None, ready=True):
     return {
         "metadata": {"name": name, "labels": labels or {}},
@@ -177,6 +198,37 @@ def test_front_post_without_token_omits_auth_header(tmp_path, monkeypatch):
     monkeypatch.setattr(verify, "_http_request", spy)
     VerifyRunner(_cfg(tmp_path))._front_post("/x", token=None, payload={"a": 1})
     assert "Authorization" not in seen["headers"]
+
+
+# ── e2e-timeout calibration: _front_post default vs override ─────────────────
+# (v1.17.0 SPEC — "calibrate probe only": the chat probe alone gets a wider,
+# configurable timeout; every other request keeps FAST_PROBE_TIMEOUT.)
+
+
+def test_front_post_default_timeout_is_the_fast_probe_bound(tmp_path, monkeypatch):
+    seen = {}
+
+    def spy(method, url, headers=None, body=None, timeout=30, context=None):
+        seen["timeout"] = timeout
+        return 200, {}, b"{}"
+
+    monkeypatch.setattr(verify, "_http_request", spy)
+    VerifyRunner(_cfg(tmp_path))._front_post("/x", token=None, payload={"a": 1})
+    assert seen["timeout"] == verify.FAST_PROBE_TIMEOUT == 30
+
+
+def test_front_post_honors_an_explicit_timeout_override(tmp_path, monkeypatch):
+    seen = {}
+
+    def spy(method, url, headers=None, body=None, timeout=30, context=None):
+        seen["timeout"] = timeout
+        return 200, {}, b"{}"
+
+    monkeypatch.setattr(verify, "_http_request", spy)
+    VerifyRunner(_cfg(tmp_path))._front_post(
+        "/x", token=None, payload={"a": 1}, timeout=999
+    )
+    assert seen["timeout"] == 999
 
 
 def test_component_readiness_matches_by_exact_label_not_name():
@@ -573,6 +625,104 @@ def test_recall_e2e_fail_recall_not_recorded(tmp_path, monkeypatch):
     assert res.status == FAIL and "NO recall_*" in res.detail
 
 
+# ── e2e-timeout calibration: recall-e2e chat probe ONLY ───────────────────────
+# The reviewer mandate (SPEC §4): confirm the calibrated timeout applies ONLY
+# to the chat probe, confirm the override takes effect, and confirm the pass
+# criteria are unchanged. This block is written so that hardcoding the chat
+# call back to FAST_PROBE_TIMEOUT (neutering the calibration) turns it red.
+
+
+def test_verify_config_default_e2e_timeout_is_120s(tmp_path):
+    assert _cfg(tmp_path).e2e_timeout == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+
+
+def test_recall_e2e_chat_probe_uses_the_configured_e2e_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    spy = _TimeoutSpy(_recall_routes())
+    monkeypatch.setattr(verify, "_http_request", spy)
+    res = VerifyRunner(_cfg(tmp_path, e2e_timeout=77)).probe_recall_e2e()
+    assert res.status == PASS
+    chat_timeout = next(t for m, p, t in spy.timeouts if p == "/v1/chat/completions")
+    assert chat_timeout == 77
+    # Falsifiable: every OTHER call in the SAME probe run (interactions list,
+    # tool-calls) must keep the FAST bound, unwidened — hardcoding a single
+    # shared timeout for the whole probe would turn this red.
+    other_timeouts = [t for m, p, t in spy.timeouts if p != "/v1/chat/completions"]
+    assert other_timeouts and all(
+        t == verify.FAST_PROBE_TIMEOUT for t in other_timeouts
+    )
+
+
+def test_recall_e2e_default_run_uses_120s_for_the_chat_call_only(tmp_path, monkeypatch):
+    # No e2e_timeout override — the calibrated DEFAULT (120s) must reach the
+    # chat call, and only the chat call.
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    spy = _TimeoutSpy(_recall_routes())
+    monkeypatch.setattr(verify, "_http_request", spy)
+    VerifyRunner(_cfg(tmp_path)).probe_recall_e2e()
+    chat_timeout = next(t for m, p, t in spy.timeouts if p == "/v1/chat/completions")
+    assert chat_timeout == verify.E2E_CHAT_TIMEOUT_DEFAULT == 120
+    other_timeouts = [t for m, p, t in spy.timeouts if p != "/v1/chat/completions"]
+    assert other_timeouts and all(
+        t == verify.FAST_PROBE_TIMEOUT for t in other_timeouts
+    )
+
+
+def test_recall_e2e_evidence_records_the_timeout_used_on_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    monkeypatch.setattr(verify, "_http_request", _FakeHttp(_recall_routes()))
+    res = VerifyRunner(_cfg(tmp_path, e2e_timeout=55)).probe_recall_e2e()
+    assert res.status == PASS and res.evidence["e2e_timeout_s"] == 55
+
+
+def test_recall_e2e_evidence_records_the_timeout_used_on_chat_fail(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    routes = _recall_routes()
+    routes[("POST", "/v1/chat/completions")] = (500, {})
+    monkeypatch.setattr(verify, "_http_request", _FakeHttp(routes))
+    res = VerifyRunner(_cfg(tmp_path, e2e_timeout=55)).probe_recall_e2e()
+    assert res.status == FAIL and res.evidence["e2e_timeout_s"] == 55
+
+
+def test_recall_e2e_pass_criteria_unchanged_by_calibration(tmp_path, monkeypatch):
+    # SPEC §3/§4: this is CALIBRATION, not softening. A recorded interaction
+    # with no recall_* tool call must still FAIL even with a huge e2e_timeout.
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    routes = _recall_routes(tool_names=("index_document",))
+    monkeypatch.setattr(verify, "_http_request", _FakeHttp(routes))
+    res = VerifyRunner(_cfg(tmp_path, e2e_timeout=600)).probe_recall_e2e()
+    assert res.status == FAIL and "NO recall_*" in res.detail
+
+
+def test_recall_e2e_transport_timeout_at_the_new_bound_still_fails(
+    tmp_path, monkeypatch
+):
+    # A genuine transport timeout (real seam raises OSError -> _http_request's
+    # status-0 sentinel, per the WS5 hardening) must still FAIL even against
+    # the widened, configured bound -- the gate stays REAL, not softened.
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+
+    def _timeout(*_a, **_k):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _timeout)
+    res = VerifyRunner(_cfg(tmp_path, e2e_timeout=120)).probe_recall_e2e()
+    assert res.status == FAIL and "HTTP 0" in res.detail
+
+
+def test_health_version_probe_timeout_unaffected_by_e2e_timeout_config(
+    tmp_path, monkeypatch
+):
+    # Fast probes must NOT widen even when e2e_timeout is configured large --
+    # scope of the calibration is the chat probe only (SPEC §2).
+    spy = _TimeoutSpy({("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"})})
+    monkeypatch.setattr(verify, "_http_request", spy)
+    VerifyRunner(_cfg(tmp_path, e2e_timeout=999)).probe_health_version()
+    assert spy.timeouts == [("GET", "/health", verify.FAST_PROBE_TIMEOUT)]
+
+
 # ── verdict aggregation + independence ───────────────────────────────────────
 
 
@@ -905,6 +1055,76 @@ def test_config_from_args_maps_and_normalizes(tmp_path):
     assert cfg.registry == "local" and cfg.namespace == "ns"
     assert cfg.front_door == "https://audittrace.example"  # trailing slash stripped
     assert cfg.image_tag == "1.13.0" and cfg.deployment == "audittrace-memory-server"
+
+
+# ── e2e-timeout calibration: CLI flag + env var wiring ────────────────────────
+# Portability invariant (SPEC §2): a different target/model can tune the
+# recall-e2e chat-probe timeout WITHOUT a code change, via --e2e-timeout or
+# AUDITTRACE_VERIFY_E2E_TIMEOUT. Precedence: flag > env var > 120s default.
+
+
+def _args(monkeypatch, extra=None):
+    monkeypatch.delenv(verify.E2E_TIMEOUT_ENV_VAR, raising=False)
+    return [
+        "--target-version",
+        "v9.9.9",
+        "--front-door",
+        "https://audittrace.example",
+        *(extra or []),
+    ]
+
+
+def test_e2e_timeout_default_unset_env_falls_back_to_120(monkeypatch):
+    monkeypatch.delenv(verify.E2E_TIMEOUT_ENV_VAR, raising=False)
+    assert verify._e2e_timeout_default() == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+
+
+def test_e2e_timeout_default_honors_the_env_var(monkeypatch):
+    monkeypatch.setenv(verify.E2E_TIMEOUT_ENV_VAR, "45")
+    assert verify._e2e_timeout_default() == 45
+
+
+def test_e2e_timeout_default_invalid_env_var_falls_back_fail_closed(monkeypatch):
+    monkeypatch.setenv(verify.E2E_TIMEOUT_ENV_VAR, "not-an-int")
+    assert verify._e2e_timeout_default() == verify.E2E_CHAT_TIMEOUT_DEFAULT
+
+
+def test_cli_e2e_timeout_defaults_to_120_without_flag_or_env(monkeypatch):
+    args = verify.build_parser().parse_args(_args(monkeypatch))
+    assert verify.config_from_args(args).e2e_timeout == 120
+
+
+def test_cli_e2e_timeout_flag_overrides_the_default(monkeypatch):
+    args = verify.build_parser().parse_args(_args(monkeypatch, ["--e2e-timeout", "55"]))
+    assert verify.config_from_args(args).e2e_timeout == 55
+
+
+def test_cli_e2e_timeout_env_var_sets_the_parser_default(monkeypatch):
+    monkeypatch.setenv(verify.E2E_TIMEOUT_ENV_VAR, "99")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+        ]
+    )
+    assert verify.config_from_args(args).e2e_timeout == 99
+
+
+def test_cli_e2e_timeout_flag_wins_over_env_var(monkeypatch):
+    monkeypatch.setenv(verify.E2E_TIMEOUT_ENV_VAR, "99")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+            "--e2e-timeout",
+            "12",
+        ]
+    )
+    assert verify.config_from_args(args).e2e_timeout == 12
 
 
 # ── low-level indirections (executed once for coverage honesty) ──────────────
