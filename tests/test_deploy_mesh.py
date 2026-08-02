@@ -622,6 +622,53 @@ def test_heal_prefers_host_root_over_rbac_when_co_present(monkeypatch, tmp_path)
     assert seen["signal"] == "istiod-api-unreachable"
 
 
+def test_heal_no_fallthrough_when_host_root_genuinely_fires_even_if_not_performed(
+    monkeypatch, tmp_path
+):
+    # WS5-HEALER-ESC-20260802, reviewer REJECT (2026-08-02, test-falsifiability
+    # not a code bug): pins the exact distinction `heal()` uses to decide
+    # fall-through -- `attempt.action != "none"`, NOT `attempt.performed`. A
+    # host-root attempt that genuinely FIRED (timed out here) but did not
+    # complete (`performed=False`) must NOT fall through to RBAC, even though
+    # `performed` is False just like the self-gated "not installed" case.
+    # Every pre-existing test either had action=="none" co-occurring with
+    # performed=False, or action!="none" co-occurring with performed=True --
+    # so neutering the guard to `if attempt.performed:` left the whole suite
+    # green. This test would go RED under that neutered guard (see the
+    # falsifiability self-check in the WS5 rework commit message).
+    healer = _rbac_ok_healer(tmp_path)
+
+    def _explode(cmd, *, timeout=None):  # the RBAC (kubectl) tier must not run
+        raise AssertionError(
+            "RBAC/kubectl tier reached despite a genuinely-fired host-root attempt"
+        )
+
+    monkeypatch.setattr(mesh, "_run", _explode)
+
+    def fake_trigger(finding):
+        # genuinely fired (timed out waiting on the root unit), NOT performed,
+        # and NOT the "none" self-gate action.
+        return HealAttempt(
+            performed=False,
+            action="host-resettle-timeout",
+            detail="no result from the root re-settle unit within 1s",
+        )
+
+    monkeypatch.setattr(healer, "_trigger_host_resettle", fake_trigger)
+    diag = Diagnosis(
+        findings=[
+            Finding("istiod-not-ready", "x"),  # co-occurring RBAC-tier signal
+            Finding("istiod-api-unreachable", "no route to host"),
+        ]
+    )
+    attempt = healer.heal(diag)
+    # host-root owns the call: its own (non-performed) attempt is returned
+    # unchanged, not superseded by an RBAC fallback.
+    assert attempt.performed is False
+    assert attempt.action == "host-resettle-timeout"
+    assert not (tmp_path / "requests").exists()
+
+
 def test_heal_falls_through_to_rbac_when_host_root_not_installed_and_co_present(
     monkeypatch, tmp_path
 ):
