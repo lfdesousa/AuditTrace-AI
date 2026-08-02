@@ -39,6 +39,7 @@ from scripts.deploy.mesh import (
     UNSAFE,
     Diagnosis,
     Finding,
+    HealAttempt,
 )
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -77,9 +78,30 @@ def _healthy():
 class _FakeResult:
     """A stand-in for MeshGateResult carrying only what certify_case reads."""
 
-    def __init__(self, outcome, reason="fake reason"):
+    def __init__(self, outcome, reason="fake reason", heal_attempts=None):
         self.outcome = outcome
         self.reason = reason
+        self.heal_attempts = [] if heal_attempts is None else heal_attempts
+
+
+def _host_resettle_attempt(performed=True):
+    """A HealAttempt shaped like a genuine host-root tier selection."""
+    return HealAttempt(
+        performed=performed,
+        action="host-resettle",
+        detail="root unit re-settled",
+        evidence={},
+    )
+
+
+def _rbac_restart_attempt():
+    """A HealAttempt shaped like the RBAC-tier fallback (host-root NOT selected)."""
+    return HealAttempt(
+        performed=True,
+        action="restart-istiod",
+        detail="rolled istiod",
+        evidence={},
+    )
 
 
 class _FakeGate:
@@ -211,6 +233,87 @@ def test_await_signal_landed_gives_up_after_timeout(monkeypatch):
     assert not fi.signal_landed(result, ("istiod-not-ready",))
 
 
+# ── post-scaffold-clear sanity poll (WS6-F2-TERMINATE-20260802 DoD #4) ─────────
+
+
+def test_await_healthy_returns_immediately_when_already_healthy(monkeypatch):
+    # the fast path: already healthy -> zero clock/sleep calls.
+    def _boom_monotonic():
+        raise AssertionError("must not touch the clock when already healthy")
+
+    def _boom_sleep(_seconds):
+        raise AssertionError("must not sleep when already healthy")
+
+    monkeypatch.setattr(fi, "_monotonic", _boom_monotonic)
+    monkeypatch.setattr(fi, "_sleep", _boom_sleep)
+    gate = _FakeGate([_healthy()], _FakeResult(HEALED))
+    result = fi._await_healthy(gate, 60.0)
+    assert result.healthy is True
+    assert gate.diag_calls == 1
+
+
+def test_await_healthy_polls_until_healthy(monkeypatch):
+    # a SLOW-to-clear scaffold: degraded on the first two checks, clears on
+    # the third — proving genuine polling (not a lucky first hit).
+    slept = []
+    monkeypatch.setattr(fi, "_sleep", lambda s: slept.append(s))
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    monkeypatch.setattr(fi, "_monotonic", lambda: next(ticks))
+    gate = _FakeGate(
+        [_diag("istiod-api-unreachable"), _diag("istiod-api-unreachable"), _healthy()],
+        _FakeResult(HEALED),
+    )
+    result = fi._await_healthy(gate, 60.0)
+    assert result.healthy is True
+    assert gate.diag_calls == 3
+    assert slept == [fi.DEFAULT_MANIFEST_POLL_INTERVAL_S] * 2
+
+
+def test_await_healthy_gives_up_after_timeout(monkeypatch):
+    # HEALTHY never arrives -> returns the last (still-degraded) diagnosis
+    # once the deadline is reached, never blocking indefinitely.
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    ticks = iter([0.0, 0.0, 10.0, 20.0, 70.0])
+    monkeypatch.setattr(fi, "_monotonic", lambda: next(ticks))
+    gate = _FakeGate([_diag("istiod-api-unreachable")], _FakeResult(HEALED))
+    result = fi._await_healthy(gate, 60.0)
+    assert result.healthy is False
+
+
+# ── host-root tier-selection guard (WS6-F2-TERMINATE-20260802) ─────────────────
+
+
+def test_host_root_tier_selected_true_for_host_resettle():
+    assert fi._host_root_tier_selected([_host_resettle_attempt()]) is True
+
+
+def test_host_root_tier_selected_true_for_host_resettle_timeout():
+    attempt = HealAttempt(
+        performed=False, action="host-resettle-timeout", detail="", evidence={}
+    )
+    assert fi._host_root_tier_selected([attempt]) is True
+
+
+def test_host_root_tier_selected_false_for_rbac_fallback():
+    assert fi._host_root_tier_selected([_rbac_restart_attempt()]) is False
+
+
+def test_host_root_tier_selected_false_for_refused():
+    attempt = HealAttempt(
+        performed=False, action="host-resettle-refused", detail="", evidence={}
+    )
+    assert fi._host_root_tier_selected([attempt]) is False
+
+
+def test_host_root_tier_selected_false_for_none_action():
+    attempt = HealAttempt(performed=False, action="none", detail="", evidence={})
+    assert fi._host_root_tier_selected([attempt]) is False
+
+
+def test_host_root_tier_selected_false_on_empty():
+    assert fi._host_root_tier_selected([]) is False
+
+
 def test_certify_case_settle_window_saves_a_slow_to_manifest_fault(monkeypatch):
     # THE fix, end to end: a fault that reads HEALTHY on the first post-inject
     # check but lands on a later poll now PASSES instead of being wrongly
@@ -225,13 +328,26 @@ def test_certify_case_settle_window_saves_a_slow_to_manifest_fault(monkeypatch):
         expected_signals=("istiod-api-unreachable",),
         expected_outcome=HEALED,
     )
+    # 5th element (healthy) is the post-scaffold-clear sanity poll — F2's PASS
+    # criterion is the journal chain, not this poll, but the harness still
+    # confirms HEALTHY once its own scaffold is cleared.
     gate = _FakeGate(
-        [_healthy(), _healthy(), _healthy(), _diag("istiod-api-unreachable")],
-        _FakeResult(HEALED),
+        [
+            _healthy(),
+            _healthy(),
+            _healthy(),
+            _diag("istiod-api-unreachable"),
+            _healthy(),
+        ],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
     )
     res = fi.certify_case(case, gate, budget_s=180, manifest_timeout_s=60.0)
     assert res.passed
     assert res.observed_signals == ["istiod-api-unreachable"]
+    # observed_outcome reports the harness's OWN final diagnosis (HEALTHY),
+    # not the raw gate.evaluate() outcome (UNSAFE here) — decoupled by design
+    # since evaluate()'s own re-diagnose can never see past the scaffold.
+    assert res.observed_outcome == HEALTHY
 
 
 def test_certify_case_settle_window_still_fails_true_vacuous_injection(monkeypatch):
@@ -448,7 +564,10 @@ def test_certify_case_host_root_requires_journal(monkeypatch):
         expected_signals=("istiod-api-unreachable",),
         expected_outcome=HEALED,
     )
-    gate = _FakeGate([_healthy(), _diag("istiod-api-unreachable")], _FakeResult(HEALED))
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable"), _healthy()],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
     res = fi.certify_case(case, gate, budget_s=180)
     assert res.passed
     assert res.journal_confirmed is True
@@ -473,7 +592,12 @@ def test_certify_case_signal_mid_run_restores_exactly_once():
 
 
 def test_certify_case_host_root_fails_without_journal(monkeypatch):
-    # heal reports HEALED but NO journald record -> not auditable -> FAIL.
+    # host-root tier fired but NO journald record -> not auditable -> FAIL.
+    # Non-vacuous (WS6-F2-TERMINATE-20260802 DoD #5): a missing journal proof
+    # must fail the case EVEN THOUGH the mesh would read healthy if the
+    # harness went on to clear the scaffold and poll — the chain, not an
+    # eventual healthy reading, is the criterion, so the case must abort
+    # BEFORE ever touching teardown or the final poll (asserted via diag_calls).
     monkeypatch.setattr(fi, "_read_journal", lambda unit, *, after_cursor: "")
     case = _case(
         cid="F2",
@@ -481,11 +605,223 @@ def test_certify_case_host_root_fails_without_journal(monkeypatch):
         expected_signals=("istiod-api-unreachable",),
         expected_outcome=HEALED,
     )
-    gate = _FakeGate([_healthy(), _diag("istiod-api-unreachable")], _FakeResult(HEALED))
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
     res = fi.certify_case(case, gate, budget_s=180)
     assert res.verdict == fi.VERDICT_FAIL
     assert "no journald record" in res.reason
     assert res.journal_confirmed is False
+    # the harness never reached the post-journal-check poll: exactly the two
+    # diagnose_mesh() calls from step 0 and step 3, nothing more.
+    assert gate.diag_calls == 2
+
+
+def test_certify_case_host_root_fails_when_rbac_tier_selected_instead(monkeypatch):
+    # the chain requires the HOST-ROOT tier to have fired, not a fallback to
+    # RBAC (e.g. an uninstalled Option-B host falling through per
+    # WS5-HEALER-ESC-20260802) — even with a PRESENT journal record, the
+    # wrong tier must FAIL, so a stale/unrelated journald entry can never
+    # rescue a case whose heal never actually engaged the privilege boundary.
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(UNSAFE, heal_attempts=[_rbac_restart_attempt()]),
+    )
+    res = fi.certify_case(case, gate, budget_s=180)
+    assert res.verdict == fi.VERDICT_FAIL
+    assert "host-root tier was not selected" in res.reason
+
+
+def test_certify_case_host_root_fails_when_no_heal_attempts_at_all():
+    # the healer never even tried (e.g. `available` was False) -> no tier was
+    # selected -> FAIL, before ever reading the journal.
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(UNSAFE, heal_attempts=[]),
+    )
+    res = fi.certify_case(case, gate, budget_s=180)
+    assert res.verdict == fi.VERDICT_FAIL
+    assert "host-root tier was not selected" in res.reason
+
+
+def test_certify_case_host_root_harness_clears_scaffold_after_chain_proven(monkeypatch):
+    # the HARNESS — not the heal — clears the scaffold, and only AFTER the
+    # chain (tier-selected + journal) is proven: assert the exact order —
+    # pre-check, landed-check, journal read, scaffold teardown, final poll.
+    order = []
+
+    def _fake_read(unit, *, after_cursor):
+        order.append("journal")
+        return "[mesh-resettle] EXECUTING"
+
+    monkeypatch.setattr(fi, "_read_journal", _fake_read)
+
+    def _teardown():
+        order.append("teardown")
+
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+        teardown_fn=_teardown,
+    )
+
+    class _OrderedGate(_FakeGate):
+        def diagnose_mesh(self):
+            d = super().diagnose_mesh()
+            order.append(f"diagnose:{'healthy' if d.healthy else 'degraded'}")
+            return d
+
+    gate = _OrderedGate(
+        [_healthy(), _diag("istiod-api-unreachable"), _healthy()],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
+    res = fi.certify_case(case, gate, budget_s=180)
+    assert res.passed
+    assert order == [
+        "diagnose:healthy",  # step 0 pre-check
+        "diagnose:degraded",  # step 3 landed
+        "journal",  # the load-bearing chain check
+        "teardown",  # harness clears ITS OWN scaffold, only now
+        "diagnose:healthy",  # post-teardown sanity poll
+    ]
+
+
+def test_certify_case_host_root_polls_to_budget_for_final_healthy(monkeypatch):
+    # DoD requirement (WS6-F2-TERMINATE-20260802 #4): the post-scaffold-clear
+    # observation window polls to the CASE BUDGET, not a fixed short cap — a
+    # live cert previously declared FAIL ~11s after k3s had already come back
+    # because the old code checked only once. Diagnose stays degraded for two
+    # polls after teardown, then clears on the third — proving genuine
+    # polling (not a lucky first hit) still passes within budget.
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    gate = _FakeGate(
+        [
+            _healthy(),
+            _diag("istiod-api-unreachable"),
+            _diag("istiod-api-unreachable"),
+            _diag("istiod-api-unreachable"),
+            _healthy(),
+        ],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
+    res = fi.certify_case(case, gate, budget_s=180)
+    assert res.passed
+    assert gate.diag_calls == 5
+
+
+def test_certify_case_host_root_final_poll_gives_up_within_budget(monkeypatch):
+    # if the mesh NEVER returns healthy after the scaffold is cleared, the
+    # case still FAILS — the sanity check is real, not decorative.
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
+    # budget_s=0.01 so the poll window expires almost immediately (hermetic,
+    # no real wall-clock wait since the diagnosis never lands healthy).
+    res = fi.certify_case(case, gate, budget_s=0.01)
+    assert res.verdict == fi.VERDICT_FAIL
+    assert "did not return HEALTHY within" in res.reason
+
+
+def test_certify_case_host_root_teardown_error_fails_the_case(monkeypatch):
+    # a scaffold that fails to clear must FAIL the case (never a silent PASS
+    # that leaves the laptop broken); the outer ExitStack still tries again.
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+
+    def _bad_teardown():
+        raise RuntimeError("iptables -D blew up")
+
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+        teardown_fn=_bad_teardown,
+    )
+    gate = _FakeGate(
+        [_healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
+    res = fi.certify_case(case, gate, budget_s=180)
+    assert res.verdict == fi.VERDICT_FAIL
+    assert "scaffold teardown failed" in res.reason
+    assert res.teardown_error == "iptables -D blew up"
+
+
+def test_certify_f2_then_n1_composes_cleanly(monkeypatch):
+    # DoD requirement #5: N1 must run cleanly after F2 — F2 must leave a
+    # HEALTHY mesh so N1's pre-state guard (step 0) passes. Both cases share
+    # ONE gate to prove the mesh state F2 leaves behind is what N1 observes.
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+    f2 = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    n1 = _case(
+        cid="N1",
+        tier=fi.TIER_NEGATIVE,
+        expected_signals=("istiod-not-ready",),
+        expected_outcome=UNSAFE,
+        is_negative_control=True,
+    )
+    gate = _FakeGate(
+        [
+            _healthy(),  # F2 step 0 pre-check
+            _diag("istiod-api-unreachable"),  # F2 step 3 landed
+            _healthy(),  # F2 post-scaffold-clear sanity poll
+            _healthy(),  # N1 step 0 pre-check (the mesh F2 left behind)
+            _diag("istiod-not-ready"),  # N1 step 3 landed
+        ],
+        _FakeResult(UNSAFE, heal_attempts=[_host_resettle_attempt()]),
+    )
+    r_f2 = fi.certify_case(f2, gate, budget_s=180)
+    r_n1 = fi.certify_case(n1, gate, budget_s=180)
+    assert r_f2.passed
+    assert r_n1.passed
+    assert gate.diag_calls == 5
 
 
 # ── certify: the batch + report ────────────────────────────────────────────────

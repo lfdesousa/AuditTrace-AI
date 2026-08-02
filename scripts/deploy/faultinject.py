@@ -17,6 +17,24 @@ single-node-laptop safety gate. It COMPOSES the frozen WS5 gate/healer unchanged
 — it only OBSERVES and DRIVES them. If a heal semantic ever needs to change, that
 is a WS5 bug to fix through the loop, never a WS6 edit.
 
+**F2 is permanently reframed (2026-08-02, marker WS6-F2-TERMINATE-20260802).**
+Live cert 2026-08-02 22:01 proved the healer worked PERFECTLY (journal: the
+host re-settle unit fired, ``systemctl restart k3s`` succeeded twice) while F2
+still FAILED — a test-harness design defect, not a healer defect. F2's fault
+is a hand-inserted iptables ``INPUT`` REJECT rule, a SCAFFOLD standing in for
+#307's real, kube-proxy-OWNED route loss; ``k3s restart`` genuinely rebuilds
+kube-proxy's own ``KUBE-*`` chains (the real fix) but never touches a rule
+this harness inserted OUTSIDE kube-proxy's ownership, so the old PASS
+criterion ("the heal clears the scaffold, then the gate re-diagnoses
+healthy") asserted a physically-impossible outcome. F2's PASS criterion is
+now the journald-verified healer CHAIN itself (diagnosis
+``istiod-api-unreachable`` → host-root tier selected → the root re-settle
+unit fired → ``systemctl restart k3s`` reported success), and the HARNESS —
+not the heal — removes its own scaffold once that chain is proven, then
+confirms the mesh returns HEALTHY as a sanity check, not the proof. See
+:func:`_verify_host_root_scaffold_recovery`. Per Luis's directive, this is
+the terminal shape of F2 — no further scaffold-fidelity work.
+
 Falsifiability is the whole point (the reviewer's mandate, §6 of the spec):
 
 * **Non-vacuous injection** — after injecting, :meth:`certify_case` asserts the
@@ -65,11 +83,13 @@ from typing import Any, Protocol
 from scripts.deploy import mesh
 from scripts.deploy.mesh import (
     HEALED,
+    HEALTHY,
     ISTIO_NAMESPACE,
     ISTIOD_DEPLOYMENT,
     ISTIOD_LABEL,
     UNSAFE,
     Diagnosis,
+    HealAttempt,
     MeshGateResult,
 )
 
@@ -305,6 +325,36 @@ def _await_signal_landed(
     return diagnosis
 
 
+def _await_healthy(
+    gate: GateLike,
+    timeout_s: float,
+    *,
+    poll_interval_s: float = DEFAULT_MANIFEST_POLL_INTERVAL_S,
+) -> Diagnosis:
+    """Poll ``gate.diagnose_mesh()`` for up to ``timeout_s`` until HEALTHY.
+
+    The mirror image of :func:`_await_signal_landed`: waiting for a signal to
+    CLEAR rather than land. Used ONLY as F2's post-scaffold-clear SANITY check
+    (WS6-F2-TERMINATE-20260802) — the journald chain, not this poll, is the
+    load-bearing PASS criterion, so a diagnosis that stays degraded for the
+    whole window is returned as-is and the caller's own ``.healthy`` check
+    fails the case; this function itself never raises. Bounded to
+    ``timeout_s`` (the caller passes whatever of the case ``budget_s``
+    remains) instead of a fixed attempt cap, because a k3s restart + istiod
+    reconnect can take materially longer than an RBAC rollout.
+    """
+    diagnosis = gate.diagnose_mesh()
+    if diagnosis.healthy:
+        return diagnosis
+    deadline = _monotonic() + timeout_s
+    while not diagnosis.healthy:
+        if _monotonic() >= deadline:
+            break
+        _sleep(poll_interval_s)
+        diagnosis = gate.diagnose_mesh()
+    return diagnosis
+
+
 def journal_shows_unit_fired(journal_text: str) -> bool:
     """True iff the journal window contains proof the root re-settle unit fired.
 
@@ -315,6 +365,26 @@ def journal_shows_unit_fired(journal_text: str) -> bool:
     if not journal_text:
         return False
     return any(marker in journal_text for marker in JOURNAL_FIRED_MARKERS)
+
+
+# The healer's own action vocabulary (mesh.py's ``PrivilegedHealer.heal``, frozen)
+# that means "the host-root tier OWNED this heal call" — as opposed to
+# ``restart-istiod`` (the RBAC fallback) or ``none`` / ``host-resettle-refused``
+# (self-gated: the tier never actually engaged the privilege boundary).
+_HOST_ROOT_TIER_ACTIONS = ("host-resettle", "host-resettle-timeout")
+
+
+def _host_root_tier_selected(heal_attempts: list[HealAttempt]) -> bool:
+    """True iff at least one heal attempt shows the host-root tier fired.
+
+    Part of F2's load-bearing chain (WS6-F2-TERMINATE-20260802): falsifiable in
+    the direction that matters — a run where the healer fell through to RBAC
+    (``restart-istiod``) or self-gated (``none`` / ``host-resettle-refused``)
+    returns False, so a case that never actually engaged the host-root
+    privilege boundary cannot pass on the strength of a stale, unrelated
+    journald record.
+    """
+    return any(a.action in _HOST_ROOT_TIER_ACTIONS for a in heal_attempts)
 
 
 # ── the fault-case model (data, not behaviour) ─────────────────────────────────
@@ -563,6 +633,20 @@ def inject_clusterip_route_broken() -> None:
     """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route
     AND force istiod onto the broken path.
 
+    THIS RULE IS A SCAFFOLD, not the real fault (permanent, 2026-08-02, marker
+    WS6-F2-TERMINATE-20260802). The real #307 fault is a kube-proxy-OWNED
+    route loss; ``systemctl restart k3s`` genuinely rebuilds kube-proxy's OWN
+    ``KUBE-*`` chains (the real fix, proven live twice the same night) but
+    deliberately never touches a hand-inserted ``INPUT`` rule that was never
+    kube-proxy's to own — nor should it: deleting arbitrary INPUT rules on
+    every restart would be a far broader, un-auditable privilege than the
+    real fix needs. This scaffold's only job is to reproduce the
+    ``istiod-api-unreachable`` SIGNAL so the real host-root re-settle chain
+    gets to run and prove itself over journald (see
+    :func:`_verify_host_root_scaffold_recovery`); the HARNESS removes this
+    scaffold once that chain is proven — never the heal, and never by
+    pretending ``k3s restart`` cleared it.
+
     FIXED 2026-08-02, attempt 2 (WS6 F2 review, live cert 2026-08-02 F2 FAIL):
     the prior version inserted the REJECT into the host's ``OUTPUT`` chain,
     which only intercepts packets a process ON THE HOST ITSELF originates.
@@ -597,13 +681,20 @@ def inject_clusterip_route_broken() -> None:
 def restore_clusterip_route() -> None:
     """F2 restore: remove the REJECT rule (idempotent).
 
-    The heal's ``systemctl restart k3s`` resyncs kube-proxy's iptables rules
-    and may already have removed or superseded this rule, so a non-zero
-    delete (rule absent) is tolerated — this is the fail-safe restore, not a
-    mutation whose success we assert. Survives a real ``systemctl restart
-    k3s`` unconditionally: the delete either removes a still-present rule or
-    no-ops on an already-cleared one, either way leaving no REJECT rule
-    behind.
+    CORRECTED 2026-08-02 (marker WS6-F2-TERMINATE-20260802): earlier drafts of
+    this docstring claimed "the heal's ``systemctl restart k3s`` resyncs
+    kube-proxy's iptables rules and may already have removed this rule" —
+    that claim was FALSE. This rule is a SCAFFOLD that lives OUTSIDE
+    kube-proxy's ownership (see :func:`inject_clusterip_route_broken`); a
+    real ``k3s restart`` only ever rebuilds kube-proxy's OWN ``KUBE-*``
+    chains and never touches it. Clearing this rule is deliberately the
+    HARNESS's job, never the heal's:
+    :func:`_verify_host_root_scaffold_recovery` calls this function (via its
+    ``do_restore`` seam) only AFTER the real host-root re-settle chain is
+    journald-proven, and :func:`certify_case`'s ``ExitStack`` calls it again
+    unconditionally on every exit path — idempotent either way: a non-zero
+    delete (rule already gone) is tolerated, this is the fail-safe restore,
+    not a mutation whose success we assert.
 
     Only the injected artefact (the iptables rule) is explicitly restored
     here. The istiod pod bounced by :func:`inject_clusterip_route_broken` is
@@ -802,8 +893,15 @@ def certify_case(
        landed; see :func:`_await_signal_landed`, WS6F2-LESSONS-20260802);
     4. run ``gate.evaluate()`` (the real WS5 diagnose -> bounded heal -> re-diagnose);
     5. assert the outcome equals the declared expectation within ``budget_s``,
-       with zero manual intervention;
-    6. for a host-root heal, assert a journald record of the root unit firing;
+       with zero manual intervention — EXCEPT for a HOST-ROOT SCAFFOLD case
+       (F2's shape, WS6-F2-TERMINATE-20260802), whose steps 5-6 are replaced
+       wholesale by :func:`_verify_host_root_scaffold_recovery`: its scaffold
+       fault lives outside the heal's own reach by design, so ``gate.evaluate``'s
+       raw outcome is never the PASS criterion there — the journald-verified
+       chain is;
+    6. for a host-root heal, assert a journald record of the root unit firing
+       (folded into step 5 above for the scaffold case, since there the chain
+       IS the proof, not a follow-on check);
     7. restore in every exit path (ExitStack + signal handler).
 
     Returns a :class:`CaseResult`; never raises for a fault-under-test failure
@@ -858,7 +956,13 @@ def certify_case(
         with _restore_on_signal(_do_restore):
             try:
                 _run_case_steps(
-                    case, gate, res, budget_s, journal_cursor, manifest_timeout_s
+                    case,
+                    gate,
+                    res,
+                    budget_s,
+                    journal_cursor,
+                    manifest_timeout_s,
+                    _do_restore,
                 )
                 res.verdict = VERDICT_PASS
                 res.reason = (
@@ -884,6 +988,7 @@ def _run_case_steps(
     budget_s: float,
     journal_cursor: str,
     manifest_timeout_s: float,
+    do_restore: Callable[[], None],
 ) -> None:
     """Steps 2-6 of :func:`certify_case`. Raises :class:`_CaseAbortedError` on any miss.
 
@@ -912,10 +1017,19 @@ def _run_case_steps(
     # Step 4 — arm the real gate + healer; measure the recovery wall-time.
     start = _monotonic()
     result = gate.evaluate()
-    res.elapsed_s = _monotonic() - start
     res.observed_outcome = result.outcome
 
+    if case.tier == TIER_HOST_ROOT and case.expected_outcome == HEALED:
+        # WS6-F2-TERMINATE-20260802: a HOST-ROOT SCAFFOLD case (F2's shape) is
+        # verified by a wholly different steps 5-6 — see the function docstring
+        # for why ``result.outcome`` is deliberately not read here.
+        _verify_host_root_scaffold_recovery(
+            gate, res, result, budget_s, start, journal_cursor, do_restore
+        )
+        return
+
     # Step 5 — bounded, zero-touch: within budget AND the declared outcome.
+    res.elapsed_s = _monotonic() - start
     if res.elapsed_s > budget_s:
         raise _CaseAbortedError(
             f"recovery exceeded budget: {res.elapsed_s:.1f}s > {budget_s:.0f}s "
@@ -927,22 +1041,93 @@ def _run_case_steps(
             f"(reason: {result.reason})"
         )
 
-    # Step 6 — host-root heal: the contemporaneous journald audit record must
-    # exist. Read only entries AFTER the pre-injection cursor (timezone-
-    # independent, stale-record-proof).
+
+def _verify_host_root_scaffold_recovery(
+    gate: GateLike,
+    res: CaseResult,
+    result: MeshGateResult,
+    budget_s: float,
+    start: float,
+    journal_cursor: str,
+    do_restore: Callable[[], None],
+) -> None:
+    """F2's PASS criterion (WS6-F2-TERMINATE-20260802): the journald-verified
+    host-root re-settle CHAIN, not "the scaffold cleared itself".
+
+    Live cert 2026-08-02 proved F2's injected fault — a hand-inserted iptables
+    ``INPUT`` REJECT rule — is a SCAFFOLD standing in for #307's real,
+    kube-proxy-OWNED route fault (see :func:`inject_clusterip_route_broken`).
+    ``systemctl restart k3s`` genuinely rebuilds kube-proxy's own ``KUBE-*``
+    chains (the real #307 fix, proven live twice the same night) but NEVER
+    touches a rule this harness inserted outside kube-proxy's ownership — so
+    ``gate.evaluate()``'s own re-diagnose can never observe the mesh healthy
+    while the scaffold still stands, and ``result.outcome`` (typically
+    ``unsafe`` here) is deliberately NOT the PASS criterion for this case,
+    unlike the RBAC / negative-control cases in :func:`_run_case_steps`.
+
+    The load-bearing, falsifiable proof is instead the CHAIN itself:
+
+    1. the fault landed as the case's expected host-root signal (already
+       proven by step 3 before this function is ever called);
+    2. the healer's OWN tier-routing selected host-root, not RBAC
+       (:func:`_host_root_tier_selected` — reads the frozen
+       ``PrivilegedHealer.heal``'s action vocabulary, never re-implements it);
+    3. the root re-settle unit fired and reported ``systemctl restart k3s``
+       success in its OWN journal (the pre-existing, unchanged
+       :func:`journal_shows_unit_fired` check, scoped by the pre-inject
+       cursor so a stale record can never satisfy the proof).
+
+    Only once ALL THREE hold does the HARNESS remove its OWN scaffold via
+    ``do_restore`` — explicitly NOT something the heal could ever do, because
+    the rule was never kube-proxy's to own — and poll for HEALTHY as a SANITY
+    check, not the proof. The poll runs to whatever of ``budget_s`` remains
+    (not a fixed attempt cap): a k3s restart + istiod reconnect can take
+    materially longer than an RBAC rollout, and a fixed-cap single-shot check
+    is exactly what declared a live cert FAIL ~11s after k3s had already come
+    back successfully.
+    """
+    if not _host_root_tier_selected(result.heal_attempts):
+        raise _CaseAbortedError(
+            "host-root tier was not selected for the heal attempt(s): actions="
+            f"{[a.action for a in result.heal_attempts] or ['none']} — expected "
+            f"one of {list(_HOST_ROOT_TIER_ACTIONS)}"
+        )
+
+    # The contemporaneous journald audit record must exist. Read only entries
+    # AFTER the pre-injection cursor (timezone-independent, stale-record-proof).
     # TODO(#384 WS7 cloud-profile seam a): make this a per-case pluggable
     # ``audit_proof_fn`` on FaultCase so a cloud profile can prove the host-root
     # heal from a different contemporaneous source (e.g. CloudWatch Logs / an
     # SSM run-command record) instead of laptop journald — plug-in, not a rewrite.
-    if case.tier == TIER_HOST_ROOT and case.expected_outcome == HEALED:
-        journal = _read_journal(MESH_HEALER_UNIT, after_cursor=journal_cursor)
-        res.journal_confirmed = journal_shows_unit_fired(journal)
-        if not res.journal_confirmed:
-            raise _CaseAbortedError(
-                f"no journald record of {MESH_HEALER_UNIT} firing after cursor "
-                f"{journal_cursor or '(none captured)'} — host-root heal is not "
-                "auditable"
-            )
+    journal = _read_journal(MESH_HEALER_UNIT, after_cursor=journal_cursor)
+    res.journal_confirmed = journal_shows_unit_fired(journal)
+    if not res.journal_confirmed:
+        raise _CaseAbortedError(
+            f"no journald record of {MESH_HEALER_UNIT} firing (re-settle + "
+            f"systemctl restart k3s) after cursor {journal_cursor or '(none captured)'}"
+            " — host-root heal is not auditable"
+        )
+
+    # The chain is proven. The harness now clears its OWN scaffold — the heal
+    # never could, by design (see the docstring above). Idempotent: safe even
+    # if the ExitStack unwind also calls it again later.
+    do_restore()
+    if res.teardown_error:
+        raise _CaseAbortedError(f"scaffold teardown failed: {res.teardown_error}")
+
+    # Sanity check, not the proof: the mesh must actually return HEALTHY once
+    # the scaffold is gone. Poll to whatever of the case budget remains (not a
+    # fixed attempt cap — see the docstring above).
+    remaining = max(0.0, budget_s - (_monotonic() - start))
+    final = _await_healthy(gate, remaining)
+    res.elapsed_s = _monotonic() - start
+    if not final.healthy:
+        raise _CaseAbortedError(
+            f"mesh did not return HEALTHY within the {budget_s:.0f}s case budget "
+            "after the harness cleared the scaffold (signals: "
+            f"{', '.join(final.signals) or 'unknown'})"
+        )
+    res.observed_outcome = HEALTHY
 
 
 def certify(
