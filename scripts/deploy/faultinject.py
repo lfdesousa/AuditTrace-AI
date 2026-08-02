@@ -1,0 +1,986 @@
+"""Fault-injection certification runner — #384 WS6 (the self-heal Definition-of-Done).
+
+WS1–WS5 built the machine: the deploy-time :class:`~scripts.deploy.mesh.MeshGate`
+diagnoses a degraded mesh and the :class:`~scripts.deploy.mesh.PrivilegedHealer`
+acts on it (an in-cluster istiod re-roll for the RBAC tier, a host-root k3s
+re-settle behind the Q3 privilege boundary for the #307 class), then re-diagnoses
+and returns ``HEALTHY`` / ``HEALED`` / ``UNSAFE`` fail-closed. On 2026-08-01 that
+gate earned its keep live *once*. WS6 turns "healed once" into "heals every time,
+on demand": it ACTIVELY INJECTS each substrate fault class the healer claims to
+cover, arms the real gate + real healer, and asserts **zero-touch recovery within
+a bound** — plus a **negative control** proving the gate still fails closed on an
+unfixable fault (no false ``HEALED``).
+
+This is a MAPE-K / chaos-engineering evaluation instrument (CHESS: perturbate →
+observe → assert bounded recovery), with blast radius held to zero by a
+single-node-laptop safety gate. It COMPOSES the frozen WS5 gate/healer unchanged
+— it only OBSERVES and DRIVES them. If a heal semantic ever needs to change, that
+is a WS5 bug to fix through the loop, never a WS6 edit.
+
+Falsifiability is the whole point (the reviewer's mandate, §6 of the spec):
+
+* **Non-vacuous injection** — after injecting, :meth:`certify_case` asserts the
+  gate's own ``diagnose_mesh`` actually shows the expected signal. If the fault
+  did not land (a "healthy after inject" reading), the case FAILS. An injection
+  that changes nothing can never masquerade as a pass.
+* **No false HEALED** — the negative control (N1) must resolve to ``UNSAFE``. A
+  case whose observed outcome differs from its declared expectation FAILS, so a
+  healer that reports success while the re-diagnose still finds the fault cannot
+  produce a green certification.
+* **Teardown-always** — restore is registered on an :class:`~contextlib.ExitStack`
+  BEFORE the fault is injected and re-armed by a SIGINT/SIGTERM handler, so an
+  exception mid-run, a budget timeout, or an operator abort all still restore the
+  mesh. WS6 never leaves the laptop in a broken state.
+* **Defence-in-depth safety gate** — the live (destructive) path refuses unless
+  an explicit ``--i-understand-this-breaks-the-mesh`` flag AND ``WS6_FAULT_INJECT=1``
+  AND a single-node-laptop guard (node count == 1 and the expected kube context)
+  ALL hold. Absent any, the tool hard-refuses, exits non-zero, and injects nothing.
+
+The default CLI invocation (no ``--live``) is a dry-run that lists the cases and
+their expected outcomes and exits 0. CI runs ONLY the hermetic unit suite (every
+inject / teardown / kubectl / iptables / journald / clock op is behind an injected
+seam mocked to a fake); no destructive op ever runs in CI or unattended.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import logging
+import os
+import signal
+import subprocess  # noqa: S404 - fixed argv, no shell; the live path is operator-gated
+import sys
+import time
+import types
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Protocol
+
+from scripts.deploy import mesh
+from scripts.deploy.mesh import (
+    HEALED,
+    ISTIO_NAMESPACE,
+    ISTIOD_DEPLOYMENT,
+    ISTIOD_LABEL,
+    UNSAFE,
+    Diagnosis,
+    MeshGateResult,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── vocabulary ────────────────────────────────────────────────────────────────
+
+# Per-case verdicts. PASS/FAIL are the falsifiable outcomes; SKIP is a DECLARED,
+# reasoned non-run (never a silent drop — the reason travels in the report).
+VERDICT_PASS = "pass"
+VERDICT_FAIL = "fail"
+VERDICT_SKIP = "skip"
+
+# The heal tier a case exercises. Mirrors the two PrivilegedHealer tiers plus the
+# deliberate negative control. The registry-integrity test couples each tier to
+# the matching routing set in ``mesh.py`` (falsifiable — a mis-tiered case fails).
+TIER_RBAC = "rbac"
+TIER_HOST_ROOT = "host-root"
+TIER_NEGATIVE = "negative-control"
+
+# The root-owned systemd unit whose firing is the contemporaneous audit record for
+# a host-root heal (``journalctl -u audittrace-mesh-healer.service``).
+MESH_HEALER_UNIT = "audittrace-mesh-healer.service"
+
+# Markers proving the root re-settle unit actually fired in the journal window.
+# The unit's ExecStart is the resettle script, which logs the ``[mesh-resettle]``
+# prefix; systemd also emits ``Started``/the unit name. Any one is sufficient
+# proof the contemporaneous audit record exists.
+JOURNAL_FIRED_MARKERS = ("mesh-resettle", MESH_HEALER_UNIT, "systemctl restart k3s")
+
+# The kube-API ClusterIP whose host route #307 breaks (istiod loses "route to
+# host" and can no longer sign CSRs). Single-node k3s default.
+KUBE_API_CLUSTERIP = "10.43.0.1"
+
+# Default zero-touch recovery budget (seconds). A host-root k3s re-settle on a
+# healthy laptop settles well within this; a degraded host is bounded by it.
+DEFAULT_BUDGET_S = 180.0
+
+# Safety-gate constants (defence in depth — the live path needs ALL of these).
+LIVE_FLAG = "i_understand_this_breaks_the_mesh"
+ENV_ARMED = "WS6_FAULT_INJECT"
+ENV_EXPECTED_CONTEXT = "WS6_EXPECTED_CONTEXT"
+# k3s writes ``default`` as the context name in /etc/rancher/k3s/k3s.yaml. The
+# operator can override for a differently-named laptop context.
+DEFAULT_EXPECTED_CONTEXT = "default"
+
+
+# ── external-effect indirections (the injected seams; monkeypatched in tests) ──
+#
+# Every side-effecting operation funnels through one of these module-level seams so
+# the whole orchestration is unit-testable with fakes and NO destructive op ever
+# runs under test. This mirrors ``mesh.py`` / ``runner.py`` exactly.
+
+
+def _run(cmd: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Run a command, bounded and captured. Sole subprocess entry point.
+
+    ``check=False`` — callers decide what a non-zero exit means. Fixed argv, no
+    shell. The live path is operator-gated; tests monkeypatch this to a fake so
+    the destructive argv is asserted but never executed.
+    """
+    logger.info("exec: %s", " ".join(cmd))
+    return subprocess.run(  # noqa: S603 - fixed argv lists, no shell
+        cmd, capture_output=True, text=True, check=False, timeout=timeout
+    )
+
+
+def _sleep(seconds: float) -> None:
+    """Pause. Not a control-flow branch on wall-clock; mocked to 0 in tests."""
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    """Monotonic clock for the recovery-budget measurement (seam for tests)."""
+    return time.monotonic()
+
+
+def _now_iso() -> str:
+    """UTC ISO-8601 timestamp — EVIDENCE ONLY, never read back into logic."""
+    return datetime.now(UTC).isoformat()
+
+
+def _journal_since_marker() -> str:
+    """A ``journalctl --since`` timestamp captured before injection.
+
+    Used to scope the audit-record read to THIS run's heal window, so a stale
+    record from a previous run can never falsely satisfy the host-root proof.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_journal(unit: str, *, since: str) -> str:
+    """Read the journald window for ``unit`` since ``since`` (fail-soft to '').
+
+    A transport failure (journalctl missing / non-zero) yields '' so the
+    host-root proof fails closed (no record → the case FAILS), never crashes.
+    """
+    try:
+        proc = _run(
+            ["journalctl", "-u", unit, "--since", since, "--no-pager"],
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("journal read failed for %s: %s", unit, exc)
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+class FaultInjectionError(RuntimeError):
+    """Raised by an inject/teardown op when its kubectl/iptables command fails."""
+
+
+def _exec_or_raise(cmd: list[str]) -> None:
+    """Run a mutating op through :func:`_run`; raise on any failure.
+
+    Used by the real (live) inject/teardown ops so a failed break surfaces as a
+    case FAIL (via :meth:`certify_case`'s error handling) rather than a silent,
+    non-vacuous "nothing happened". Restore ops that must be idempotent call
+    :func:`_run` directly instead and tolerate a non-zero exit.
+    """
+    try:
+        proc = _run(cmd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FaultInjectionError(f"{' '.join(cmd)} failed to execute: {exc}") from exc
+    if proc.returncode != 0:
+        raise FaultInjectionError(
+            f"{' '.join(cmd)} exited {proc.returncode}: {proc.stderr or proc.stdout}"
+        )
+
+
+# ── pure falsifiability helpers (no I/O; unit-tested directly) ─────────────────
+
+
+def signal_landed(diagnosis: Diagnosis, expected: tuple[str, ...]) -> bool:
+    """True iff the diagnosis shows at least one expected signal.
+
+    The non-vacuous guard: an injection that produced none of its expected
+    signals (e.g. a healthy diagnosis after "inject") returns False, so the case
+    FAILS instead of vacuously passing. Falsifiable in both directions — an empty
+    ``expected`` also returns False (a case must declare what landing looks like).
+    """
+    if not expected:
+        return False
+    present = set(diagnosis.signals)
+    return any(sig in present for sig in expected)
+
+
+def journal_shows_unit_fired(journal_text: str) -> bool:
+    """True iff the journal window contains proof the root re-settle unit fired.
+
+    Falsifiable: an empty window (no record) or unrelated log lines return False,
+    so the host-root proof fails closed. Any of :data:`JOURNAL_FIRED_MARKERS`
+    present is sufficient contemporaneous evidence.
+    """
+    if not journal_text:
+        return False
+    return any(marker in journal_text for marker in JOURNAL_FIRED_MARKERS)
+
+
+# ── the fault-case model (data, not behaviour) ─────────────────────────────────
+
+
+@dataclass(frozen=True)
+class FaultCase:
+    """One certifiable fault: how to break it, what breaking looks like, how it heals.
+
+    Immutable data. The behaviour lives entirely in :func:`certify_case`, which
+    reads these fields; the ``inject_fn`` / ``teardown_fn`` callables are the
+    injected side-effect seams (real ops for the live path, fakes under test).
+    """
+
+    id: str
+    label: str
+    tier: str
+    expected_signals: tuple[str, ...]
+    expected_outcome: str
+    inject_fn: Callable[[], None]
+    teardown_fn: Callable[[], None]
+    is_negative_control: bool = False
+    skip_reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "tier": self.tier,
+            "expected_signals": list(self.expected_signals),
+            "expected_outcome": self.expected_outcome,
+            "is_negative_control": self.is_negative_control,
+            "skip_reason": self.skip_reason,
+        }
+
+
+@dataclass
+class CaseResult:
+    """The falsifiable verdict for one certified case (mutable accumulator).
+
+    Mutated in place through :func:`certify_case` so the restore step (run on the
+    :class:`~contextlib.ExitStack` unwind) can stamp ``restored`` into the same
+    object the caller receives.
+    """
+
+    case_id: str
+    label: str
+    tier: str
+    expected_outcome: str
+    verdict: str = VERDICT_FAIL
+    reason: str = ""
+    observed_outcome: str | None = None
+    observed_signals: list[str] = field(default_factory=list)
+    injected: bool = False
+    restored: bool = False
+    teardown_error: str | None = None
+    elapsed_s: float | None = None
+    pre_healthy: bool | None = None
+    journal_confirmed: bool | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict == VERDICT_PASS
+
+    @property
+    def skipped(self) -> bool:
+        return self.verdict == VERDICT_SKIP
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "label": self.label,
+            "tier": self.tier,
+            "expected_outcome": self.expected_outcome,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "observed_outcome": self.observed_outcome,
+            "observed_signals": self.observed_signals,
+            "injected": self.injected,
+            "restored": self.restored,
+            "teardown_error": self.teardown_error,
+            "elapsed_s": self.elapsed_s,
+            "pre_healthy": self.pre_healthy,
+            "journal_confirmed": self.journal_confirmed,
+        }
+
+
+@dataclass
+class CertificationReport:
+    """The WS6 evidence artefact: the falsifiable self-heal certification result."""
+
+    results: list[CaseResult]
+    budget_s: float
+    generated_at: str = field(default_factory=_now_iso)
+
+    @property
+    def ran(self) -> list[CaseResult]:
+        """Cases that actually ran (skips excluded)."""
+        return [r for r in self.results if not r.skipped]
+
+    @property
+    def ok(self) -> bool:
+        """True iff NO case FAILED and at least one case actually ran.
+
+        Skips are allowed (a declared, reasoned non-run); a FAIL or a report where
+        every case was skipped is not a certification.
+        """
+        if any(r.verdict == VERDICT_FAIL for r in self.results):
+            return False
+        return bool(self.ran)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1",
+            "runner": "audittrace-ws6-faultinject",
+            "ok": self.ok,
+            "budget_s": self.budget_s,
+            "counts": {
+                "total": len(self.results),
+                "passed": sum(1 for r in self.results if r.passed),
+                "failed": sum(1 for r in self.results if r.verdict == VERDICT_FAIL),
+                "skipped": sum(1 for r in self.results if r.skipped),
+            },
+            "results": [r.as_dict() for r in self.results],
+            "generated_at": self.generated_at,
+        }
+
+    def human_summary(self) -> str:
+        lines = [
+            "AuditTrace WS6 fault-injection certification",
+            "=" * 44,
+            f"budget (s)   : {self.budget_s:.0f}",
+            f"overall      : {'PASS' if self.ok else 'FAIL'}",
+            "",
+            "cases:",
+        ]
+        for r in self.results:
+            lines.append(
+                f"  [{r.case_id}] {r.verdict.upper():5} — {r.label}"
+                f"  (expected {r.expected_outcome}, observed {r.observed_outcome})"
+            )
+            lines.append(f"        {r.reason}")
+        return "\n".join(lines) + "\n"
+
+
+# ── the gate seam (duck-typed so a fake drives certify with no cluster) ────────
+
+
+class GateLike(Protocol):
+    """The two gate methods :func:`certify_case` drives — nothing more.
+
+    Kept narrow (Interface Segregation) so a hermetic fake needs only these two;
+    the real :class:`scripts.deploy.mesh.MeshGate` satisfies it structurally.
+    """
+
+    def diagnose_mesh(self) -> Diagnosis: ...  # pragma: no cover - Protocol stub
+
+    def evaluate(self) -> MeshGateResult: ...  # pragma: no cover - Protocol stub
+
+
+# ── the live (real) fault operations — exercised only in the operator run ──────
+#
+# Each is a THIN wrapper over the kubectl/iptables seam. Unit tests assert the
+# exact argv with a fake ``_run`` (non-destructive); the real break happens only
+# on the operator-gated live path. NB the *injection* is a deliberate operator
+# break (it may need host privilege, e.g. iptables); the *heal* it certifies runs
+# through the unprivileged runner -> request-file -> root-unit WS5 boundary, so the
+# security property under test is preserved — the heal never borrows operator root.
+
+
+def inject_istiod_degraded() -> None:
+    """F1 inject (RBAC): delete the istiod pod so the control plane goes unready.
+
+    Deleting the pod drops istiod's ready endpoints (``istiod-no-endpoints`` /
+    ``istiod-not-ready``) — a fault a ``kubectl rollout restart`` (the healer's
+    RBAC-tier action) genuinely clears by rolling a fresh, ready replica.
+    """
+    _exec_or_raise(
+        ["kubectl", "delete", "pod", "-n", ISTIO_NAMESPACE, "-l", ISTIOD_LABEL]
+    )
+
+
+def restore_istiod_degraded() -> None:
+    """F1 restore: re-roll istiod and wait for Ready (idempotent)."""
+    _exec_or_raise(
+        [
+            "kubectl",
+            "rollout",
+            "restart",
+            f"deployment/{ISTIOD_DEPLOYMENT}",
+            "-n",
+            ISTIO_NAMESPACE,
+        ]
+    )
+    _exec_or_raise(
+        [
+            "kubectl",
+            "rollout",
+            "status",
+            f"deployment/{ISTIOD_DEPLOYMENT}",
+            "-n",
+            ISTIO_NAMESPACE,
+            "--timeout=120s",
+        ]
+    )
+
+
+def _clusterip_reject_rule() -> list[str]:
+    """The iptables rule that severs istiod's route to the kube-API ClusterIP.
+
+    A REJECT with ``icmp-host-unreachable`` reproduces the #307 signature — istiod
+    logs "no route to host" and cannot sign CSRs — which the diagnoser maps to
+    ``istiod-api-unreachable`` (the host-root class the root re-settle heals).
+    """
+    return [
+        "-d",
+        KUBE_API_CLUSTERIP,
+        "-p",
+        "tcp",
+        "--dport",
+        "443",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "icmp-host-unreachable",
+    ]
+
+
+def inject_clusterip_route_broken() -> None:
+    """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route."""
+    _exec_or_raise(["iptables", "-I", "OUTPUT", *_clusterip_reject_rule()])
+
+
+def restore_clusterip_route() -> None:
+    """F2 restore: remove the REJECT rule (idempotent).
+
+    The heal's ``systemctl restart k3s`` rebuilds host iptables and may already
+    have flushed the rule, so a non-zero delete (rule absent) is tolerated — this
+    is the fail-safe restore, not a mutation whose success we assert.
+    """
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        _run(["iptables", "-D", "OUTPUT", *_clusterip_reject_rule()])
+
+
+def inject_unfixable_istiod_scaled_zero() -> None:
+    """N1 inject (negative control): scale istiod to 0 replicas.
+
+    Signal ``istiod-not-ready`` IS RBAC-mapped, so the healer DOES attempt its
+    least-privileged action (a rollout restart) — but a restart does not change
+    the replica count, so istiod stays at 0, the re-diagnose still finds the
+    fault, and the gate fails closed to ``UNSAFE``. That is the strongest form of
+    negative control: it proves the gate trusts its own RE-DIAGNOSE, not the
+    healer's ``performed`` flag, so a healer that "succeeds" without fixing
+    anything can never yield a false ``HEALED``.
+    """
+    _exec_or_raise(
+        [
+            "kubectl",
+            "scale",
+            f"deployment/{ISTIOD_DEPLOYMENT}",
+            "-n",
+            ISTIO_NAMESPACE,
+            "--replicas=0",
+        ]
+    )
+
+
+def restore_istiod_scaled_zero() -> None:
+    """N1 restore: scale istiod back to 1 and wait for Ready (idempotent)."""
+    _exec_or_raise(
+        [
+            "kubectl",
+            "scale",
+            f"deployment/{ISTIOD_DEPLOYMENT}",
+            "-n",
+            ISTIO_NAMESPACE,
+            "--replicas=1",
+        ]
+    )
+    _exec_or_raise(
+        [
+            "kubectl",
+            "rollout",
+            "status",
+            f"deployment/{ISTIOD_DEPLOYMENT}",
+            "-n",
+            ISTIO_NAMESPACE,
+            "--timeout=120s",
+        ]
+    )
+
+
+def _f3_not_injectable() -> None:
+    """F3 placeholder: node NotReady is not independently injectable here.
+
+    On single-node k3s, stopping the kubelet == stopping k3s, so a node-NotReady
+    fault folds into F2's k3s re-settle and cannot be injected as a distinct,
+    cleanly-reversible fault. Registered as a DECLARED skip (never silently
+    dropped); this body is never reached because the case carries a skip_reason.
+    """
+    raise NotImplementedError("F3 folds into F2 on single-node k3s (see skip_reason)")
+
+
+# ── the frozen case registry (F1 + F2 + N1 mandatory core; F3 declared-skip) ───
+
+REGISTRY: dict[str, FaultCase] = {
+    "F1": FaultCase(
+        id="F1",
+        label="istiod degraded (RBAC re-roll) -> HEALED",
+        tier=TIER_RBAC,
+        expected_signals=("istiod-not-ready", "istiod-no-endpoints"),
+        expected_outcome=HEALED,
+        inject_fn=inject_istiod_degraded,
+        teardown_fn=restore_istiod_degraded,
+    ),
+    "F2": FaultCase(
+        id="F2",
+        label="#307 kube-API ClusterIP route broken (host-root re-settle) -> HEALED",
+        tier=TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+        inject_fn=inject_clusterip_route_broken,
+        teardown_fn=restore_clusterip_route,
+    ),
+    "F3": FaultCase(
+        id="F3",
+        label="node NotReady (host-root re-settle) -> HEALED",
+        tier=TIER_HOST_ROOT,
+        expected_signals=("node-not-ready", "nodes-unreadable"),
+        expected_outcome=HEALED,
+        inject_fn=_f3_not_injectable,
+        teardown_fn=_f3_not_injectable,
+        skip_reason=(
+            "node NotReady is not independently, reversibly injectable on "
+            "single-node k3s (stopping kubelet == stopping k3s); it folds into "
+            "F2's k3s re-settle"
+        ),
+    ),
+    "N1": FaultCase(
+        id="N1",
+        label="negative control: unfixable istiod scaled-to-0 -> UNSAFE (no false HEALED)",
+        tier=TIER_NEGATIVE,
+        expected_signals=("istiod-not-ready", "istiod-no-endpoints"),
+        expected_outcome=UNSAFE,
+        inject_fn=inject_unfixable_istiod_scaled_zero,
+        teardown_fn=restore_istiod_scaled_zero,
+        is_negative_control=True,
+    ),
+}
+
+# The mandatory core (spec §3). ``all`` runs these in order (F3 is a declared skip
+# surfaced in the report, not part of the auto-run core).
+CORE_CASE_IDS = ("F1", "F2", "N1")
+
+
+def cases_for(selector: str) -> list[FaultCase]:
+    """Resolve a CLI selector (``F1``/``F2``/``N1``/``F3``/``all``) to cases.
+
+    ``all`` returns the mandatory core in a fixed order. An unknown selector
+    raises :class:`KeyError` so the CLI fails loudly rather than running nothing.
+    """
+    if selector == "all":
+        return [REGISTRY[cid] for cid in CORE_CASE_IDS]
+    return [REGISTRY[selector]]
+
+
+# ── fail-safe teardown: an abort must still restore ────────────────────────────
+
+
+@contextlib.contextmanager
+def _restore_on_signal(restore: Callable[[], None]) -> Iterator[None]:
+    """Re-arm restore against SIGINT/SIGTERM for the duration of a case.
+
+    Defence in depth over the :class:`~contextlib.ExitStack`: if the operator
+    Ctrl-C's or the host sends SIGTERM mid-injection, the handler runs the restore
+    and re-raises ``KeyboardInterrupt`` so the ExitStack unwinds too (restore is
+    idempotent-guarded by the caller). Previous handlers are always reinstated on
+    exit. Installs only when running on the main thread (``signal`` requires it);
+    a non-main-thread caller relies on the ExitStack alone.
+    """
+
+    def _handler(signum: int, frame: types.FrameType | None) -> None:
+        logger.error("WS6 received signal %s mid-run — restoring the mesh", signum)
+        restore()
+        raise KeyboardInterrupt(f"aborted by signal {signum}")
+
+    try:
+        previous = {
+            signal.SIGINT: signal.signal(signal.SIGINT, _handler),
+            signal.SIGTERM: signal.signal(signal.SIGTERM, _handler),
+        }
+    except ValueError:
+        # Not the main thread → cannot install signal handlers. The ExitStack
+        # still guarantees restore; yield without the extra arming.
+        logger.warning("WS6 signal handlers unavailable (not main thread)")
+        yield
+        return
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+class _CaseAbortedError(RuntimeError):
+    """Internal: a controlled per-case failure carrying its reason (never leaks)."""
+
+
+# ── the certification flow (the 7-step per-case DoD) ───────────────────────────
+
+
+def certify_case(
+    case: FaultCase, gate: GateLike, *, budget_s: float = DEFAULT_BUDGET_S
+) -> CaseResult:
+    """Certify one fault case end to end, ALWAYS restoring the mesh afterwards.
+
+    The seven steps (spec §4), each a falsifiable assertion:
+
+    0. assert pre-state HEALTHY (refuse to inject onto an already-broken mesh);
+    1. register the restore on an ExitStack FIRST (before any break);
+    2. inject the fault;
+    3. assert the gate's ``diagnose_mesh`` now shows an expected signal
+       (non-vacuous — the fault actually landed);
+    4. run ``gate.evaluate()`` (the real WS5 diagnose -> bounded heal -> re-diagnose);
+    5. assert the outcome equals the declared expectation within ``budget_s``,
+       with zero manual intervention;
+    6. for a host-root heal, assert a journald record of the root unit firing;
+    7. restore in every exit path (ExitStack + signal handler).
+
+    Returns a :class:`CaseResult`; never raises for a fault-under-test failure
+    (those become ``verdict=FAIL``). A declared-skip case returns immediately
+    without touching the mesh.
+    """
+    res = CaseResult(
+        case_id=case.id,
+        label=case.label,
+        tier=case.tier,
+        expected_outcome=case.expected_outcome,
+    )
+
+    if case.skip_reason is not None:
+        res.verdict = VERDICT_SKIP
+        res.reason = f"skipped: {case.skip_reason}"
+        logger.warning("[%s] SKIP — %s", case.id, case.skip_reason)
+        return res
+
+    # Step 0 — refuse to inject onto an already-broken mesh (no compounding faults).
+    pre = gate.diagnose_mesh()
+    res.pre_healthy = pre.healthy
+    if not pre.healthy:
+        res.verdict = VERDICT_FAIL
+        res.reason = (
+            "refused: pre-state not HEALTHY "
+            f"(signals: {', '.join(pre.signals) or 'unknown'}) — will not inject "
+            "onto a broken mesh"
+        )
+        logger.error("[%s] %s", case.id, res.reason)
+        return res
+
+    journal_since = _journal_since_marker()
+
+    def _do_restore() -> None:
+        if res.restored:
+            return
+        try:
+            case.teardown_fn()
+            res.restored = True
+            logger.info("[%s] mesh restored", case.id)
+        except Exception as exc:  # noqa: BLE001 - restore is best-effort, never fatal
+            res.teardown_error = str(exc)
+            logger.error("[%s] restore FAILED: %s", case.id, exc)
+
+    # Step 1 — register restore FIRST, so any later exit path still restores.
+    with contextlib.ExitStack() as stack:
+        stack.callback(_do_restore)
+        with _restore_on_signal(_do_restore):
+            try:
+                _run_case_steps(case, gate, res, budget_s, journal_since)
+                res.verdict = VERDICT_PASS
+                res.reason = (
+                    f"injected -> observed {res.observed_outcome} within "
+                    f"{res.elapsed_s:.1f}s, zero-touch; mesh restored"
+                )
+                logger.info("[%s] PASS — %s", case.id, res.reason)
+            except _CaseAbortedError as fail:
+                res.verdict = VERDICT_FAIL
+                res.reason = str(fail)
+                logger.error("[%s] FAIL — %s", case.id, res.reason)
+            except Exception as exc:  # noqa: BLE001 - any seam error fails the case, still restores
+                res.verdict = VERDICT_FAIL
+                res.reason = f"unexpected error during certification: {exc}"
+                logger.error("[%s] FAIL — %s", case.id, res.reason)
+    return res
+
+
+def _run_case_steps(
+    case: FaultCase,
+    gate: GateLike,
+    res: CaseResult,
+    budget_s: float,
+    journal_since: str,
+) -> None:
+    """Steps 2-6 of :func:`certify_case`. Raises :class:`_CaseAbortedError` on any miss.
+
+    Split out so :func:`certify_case` keeps a single, legible try/except around the
+    whole break-observe-heal sequence (the ExitStack owns restore either way).
+    """
+    # Step 2 — inject the fault.
+    case.inject_fn()
+    res.injected = True
+
+    # Step 3 — non-vacuous: the fault must actually have landed.
+    post = gate.diagnose_mesh()
+    res.observed_signals = post.signals
+    if not signal_landed(post, case.expected_signals):
+        raise _CaseAbortedError(
+            "fault did not land: expected one of "
+            f"{list(case.expected_signals)} but diagnose shows "
+            f"{post.signals or 'HEALTHY'} — injection was vacuous"
+        )
+
+    # Step 4 — arm the real gate + healer; measure the recovery wall-time.
+    start = _monotonic()
+    result = gate.evaluate()
+    res.elapsed_s = _monotonic() - start
+    res.observed_outcome = result.outcome
+
+    # Step 5 — bounded, zero-touch: within budget AND the declared outcome.
+    if res.elapsed_s > budget_s:
+        raise _CaseAbortedError(
+            f"recovery exceeded budget: {res.elapsed_s:.1f}s > {budget_s:.0f}s "
+            f"(outcome {result.outcome})"
+        )
+    if result.outcome != case.expected_outcome:
+        raise _CaseAbortedError(
+            f"outcome {result.outcome!r} != expected {case.expected_outcome!r} "
+            f"(reason: {result.reason})"
+        )
+
+    # Step 6 — host-root heal: the contemporaneous journald audit record must exist.
+    if case.tier == TIER_HOST_ROOT and case.expected_outcome == HEALED:
+        journal = _read_journal(MESH_HEALER_UNIT, since=journal_since)
+        res.journal_confirmed = journal_shows_unit_fired(journal)
+        if not res.journal_confirmed:
+            raise _CaseAbortedError(
+                f"no journald record of {MESH_HEALER_UNIT} firing since "
+                f"{journal_since} — host-root heal is not auditable"
+            )
+
+
+def certify(
+    cases: list[FaultCase], gate: GateLike, *, budget_s: float = DEFAULT_BUDGET_S
+) -> CertificationReport:
+    """Certify each case in turn and collect the falsifiable report.
+
+    Cases run sequentially — each fully restores before the next injects — so the
+    blast radius is one fault at a time (CHESS: bounded chaos, restored between
+    perturbations).
+    """
+    results = [certify_case(case, gate, budget_s=budget_s) for case in cases]
+    return CertificationReport(results=results, budget_s=budget_s)
+
+
+# ── the safety gate (defence in depth — ALL conditions must hold to go live) ───
+
+
+class LiveGuardError(RuntimeError):
+    """Raised when the live path is refused; nothing is injected."""
+
+
+def _node_count() -> int:
+    """Number of cluster nodes (via the kubectl seam). -1 on any read failure.
+
+    -1 (not 0/1) so an unreadable cluster can never accidentally satisfy the
+    single-node guard — it fails closed.
+    """
+    try:
+        proc = _run(
+            ["kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"],
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return -1
+    if proc.returncode != 0:
+        return -1
+    return len(proc.stdout.split())
+
+
+def _current_context() -> str:
+    """The active kube context name (via the kubectl seam). '' on failure."""
+    try:
+        proc = _run(["kubectl", "config", "current-context"], timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def guard_live_or_refuse(
+    args: argparse.Namespace, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """Refuse the destructive live path unless EVERY safety condition holds.
+
+    The conjunction (all four, defence in depth):
+
+    * the explicit ``--i-understand-this-breaks-the-mesh`` flag;
+    * ``WS6_FAULT_INJECT=1`` in the environment;
+    * exactly one cluster node (blast-radius = the single laptop);
+    * the active kube context equals the expected laptop context.
+
+    Any failure raises :class:`LiveGuardError` BEFORE a single ``inject_fn`` is
+    called. Falsifiable: each condition is checked independently, so a test can
+    remove exactly one and prove the whole path is blocked.
+    """
+    env = os.environ if environ is None else environ
+
+    if not getattr(args, LIVE_FLAG, False):
+        raise LiveGuardError(
+            "refused: the live path requires the explicit "
+            "--i-understand-this-breaks-the-mesh flag"
+        )
+    if env.get(ENV_ARMED) != "1":
+        raise LiveGuardError(
+            f"refused: the live path requires {ENV_ARMED}=1 in the environment"
+        )
+
+    nodes = _node_count()
+    if nodes != 1:
+        raise LiveGuardError(
+            f"refused: single-node-laptop guard — node count is {nodes}, not 1 "
+            "(WS6 destructive injection is laptop-only)"
+        )
+
+    expected = env.get(ENV_EXPECTED_CONTEXT, DEFAULT_EXPECTED_CONTEXT)
+    context = _current_context()
+    if context != expected:
+        raise LiveGuardError(
+            f"refused: kube context is {context!r}, expected {expected!r} "
+            f"(override via {ENV_EXPECTED_CONTEXT})"
+        )
+    logger.warning(
+        "WS6 safety gate PASSED — live fault injection ARMED on context %r "
+        "(single node)",
+        context,
+    )
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.deploy.faultinject",
+        description=(
+            "WS6 fault-injection certification runner (#384). Default is a "
+            "non-destructive dry-run; --live actually breaks + heals the mesh."
+        ),
+    )
+    parser.add_argument(
+        "--case",
+        choices=("F1", "F2", "F3", "N1", "all"),
+        default="all",
+        help="which fault case(s) to certify (default: all)",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="actually inject faults (destructive; requires the safety gate)",
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=DEFAULT_BUDGET_S,
+        help=f"zero-touch recovery budget in seconds (default: {DEFAULT_BUDGET_S:.0f})",
+    )
+    parser.add_argument(
+        f"--{LIVE_FLAG.replace('_', '-')}",
+        dest=LIVE_FLAG,
+        action="store_true",
+        help="acknowledge the live path breaks the mesh (required with --live)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=mesh_out_dir_default(),
+        help="where to write the certification report artefact",
+    )
+    return parser
+
+
+def mesh_out_dir_default() -> Path:
+    """Default report directory (kept beside the deploy runner's run artefacts)."""
+    return Path(__file__).resolve().parent / "faultinject-runs"
+
+
+def dry_run_lines(cases: list[FaultCase], budget_s: float) -> list[str]:
+    """The dry-run plan: cases + expected outcomes, mutating nothing."""
+    lines = [
+        "WS6 fault-injection — DRY RUN (no --live; nothing will be injected)",
+        f"recovery budget: {budget_s:.0f}s",
+        "",
+    ]
+    for case in cases:
+        marker = " [SKIP]" if case.skip_reason else ""
+        lines.append(f"  [{case.id}] {case.label}{marker}")
+        lines.append(
+            f"        tier={case.tier}  expect signal(s)="
+            f"{list(case.expected_signals)}  expect outcome={case.expected_outcome}"
+        )
+        if case.skip_reason:
+            lines.append(f"        skip: {case.skip_reason}")
+    lines.append("")
+    lines.append(
+        "re-run with --live --i-understand-this-breaks-the-mesh (and "
+        f"{ENV_ARMED}=1) to certify."
+    )
+    return lines
+
+
+def _write_report(report: CertificationReport, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _now_iso().replace(":", "").replace("-", "")
+    base = out_dir / f"ws6-certification-{stamp}"
+    base.with_suffix(".json").write_text(json.dumps(report.as_dict(), indent=2))
+    base.with_suffix(".txt").write_text(report.human_summary())
+    return base.with_suffix(".json")
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    args = build_parser().parse_args(argv)
+    cases = cases_for(args.case)
+
+    if not args.live:
+        for line in dry_run_lines(cases, args.budget):
+            print(line)
+        return 0
+
+    try:
+        guard_live_or_refuse(args)
+    except LiveGuardError as exc:
+        print(f"WS6 LIVE REFUSED — {exc}", file=sys.stderr)
+        return 2
+
+    gate = mesh.MeshGate(healer=mesh.PrivilegedHealer())
+    report = certify(cases, gate, budget_s=args.budget)
+    report_path = _write_report(report, args.out_dir)
+    print(report.human_summary())
+    print(f"certification report: {report_path}")
+    return 0 if report.ok else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
