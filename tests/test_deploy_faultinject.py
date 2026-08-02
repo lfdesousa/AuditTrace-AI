@@ -161,6 +161,90 @@ def test_journal_shows_unit_fired_false_on_unrelated():
     assert fi.journal_shows_unit_fired("some other log line") is False
 
 
+# ── settle/poll window (WS6F2-LESSONS-20260802 root cause #1) ──────────────────
+
+
+def test_await_signal_landed_returns_immediately_on_first_check(monkeypatch):
+    # the fast path: already landed -> zero clock/sleep calls (F1/N1 add ~0
+    # latency). Poisoning _monotonic/_sleep proves neither is touched.
+    def _boom_monotonic():
+        raise AssertionError("must not touch the clock when already landed")
+
+    def _boom_sleep(_seconds):
+        raise AssertionError("must not sleep when already landed")
+
+    monkeypatch.setattr(fi, "_monotonic", _boom_monotonic)
+    monkeypatch.setattr(fi, "_sleep", _boom_sleep)
+    gate = _FakeGate([_diag("istiod-not-ready")], _FakeResult(HEALED))
+    result = fi._await_signal_landed(gate, ("istiod-not-ready",), 60.0)
+    assert result.signals == ["istiod-not-ready"]
+    assert gate.diag_calls == 1
+
+
+def test_await_signal_landed_polls_until_signal_manifests(monkeypatch):
+    # a SLOW fault: HEALTHY on the first two checks, lands on the third. This
+    # is the falsifiable proof of the fix — reverting to a single-shot check
+    # (no polling) would return the first (not-landed) diagnosis and never
+    # reach the third, landed one.
+    slept = []
+    monkeypatch.setattr(fi, "_sleep", lambda s: slept.append(s))
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    monkeypatch.setattr(fi, "_monotonic", lambda: next(ticks))
+    gate = _FakeGate(
+        [_healthy(), _healthy(), _diag("istiod-api-unreachable")], _FakeResult(HEALED)
+    )
+    result = fi._await_signal_landed(gate, ("istiod-api-unreachable",), 60.0)
+    assert result.signals == ["istiod-api-unreachable"]
+    assert gate.diag_calls == 3
+    assert slept == [fi.DEFAULT_MANIFEST_POLL_INTERVAL_S] * 2
+
+
+def test_await_signal_landed_gives_up_after_timeout(monkeypatch):
+    # the signal NEVER lands -> returns the last (not-landed) diagnosis once
+    # the deadline is reached, never blocking indefinitely.
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    ticks = iter([0.0, 0.0, 10.0, 20.0, 70.0])
+    monkeypatch.setattr(fi, "_monotonic", lambda: next(ticks))
+    gate = _FakeGate([_healthy()], _FakeResult(HEALED))
+    result = fi._await_signal_landed(gate, ("istiod-not-ready",), 60.0)
+    assert result.signals == []
+    assert not fi.signal_landed(result, ("istiod-not-ready",))
+
+
+def test_certify_case_settle_window_saves_a_slow_to_manifest_fault(monkeypatch):
+    # THE fix, end to end: a fault that reads HEALTHY on the first post-inject
+    # check but lands on a later poll now PASSES instead of being wrongly
+    # ruled vacuous (the exact failure mode of the two live WS6 F2 attempts).
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        fi, "_read_journal", lambda unit, *, after_cursor: "[mesh-resettle] EXECUTING"
+    )
+    case = _case(
+        cid="F2",
+        tier=fi.TIER_HOST_ROOT,
+        expected_signals=("istiod-api-unreachable",),
+        expected_outcome=HEALED,
+    )
+    gate = _FakeGate(
+        [_healthy(), _healthy(), _healthy(), _diag("istiod-api-unreachable")],
+        _FakeResult(HEALED),
+    )
+    res = fi.certify_case(case, gate, budget_s=180, manifest_timeout_s=60.0)
+    assert res.passed
+    assert res.observed_signals == ["istiod-api-unreachable"]
+
+
+def test_certify_case_settle_window_still_fails_true_vacuous_injection(monkeypatch):
+    # a genuinely vacuous injection (never lands) still FAILS even with the
+    # settle window — the guard's falsifiability is unchanged, only bounded.
+    monkeypatch.setattr(fi, "_sleep", lambda s: None)
+    case = _case()
+    gate = _FakeGate([_healthy(), _healthy()], _FakeResult(HEALED))
+    res = fi.certify_case(case, gate, budget_s=180, manifest_timeout_s=0.01)
+    assert res.verdict == fi.VERDICT_FAIL
+    assert "vacuous" in res.reason
+
+
 # ── registry integrity: the falsifiable coupling to mesh.py ────────────────────
 
 
@@ -254,12 +338,15 @@ def test_certify_case_refuses_when_pre_state_not_healthy():
 
 def test_certify_case_fails_when_fault_did_not_land():
     # non-vacuous: diagnose is HEALTHY after "inject" -> the fault never landed.
+    # manifest_timeout_s=0 keeps the settle-poll window from consuming real
+    # wall-clock time in this hermetic test (the timeout expires immediately).
     restored = []
     case = _case(teardown_fn=lambda: restored.append(1))
     gate = _FakeGate([_healthy(), _healthy()], _FakeResult(HEALED))
-    res = fi.certify_case(case, gate, budget_s=180)
+    res = fi.certify_case(case, gate, budget_s=180, manifest_timeout_s=0.0)
     assert res.verdict == fi.VERDICT_FAIL
     assert "did not land" in res.reason
+    assert "vacuous" in res.reason
     assert res.injected is True
     assert res.restored is True  # still restored
     assert restored == [1]
@@ -549,6 +636,38 @@ def test_inject_clusterip_route_broken_argv(monkeypatch):
     assert fi.KUBE_API_CLUSTERIP in seen[0]
     assert "--ctorigdstport" in seen[0]
     assert "443" in seen[0]
+
+
+def test_inject_clusterip_route_broken_bounces_istiod_after_the_rule(monkeypatch):
+    # WS6F2-LESSONS-20260802 root cause #2: a REJECT only blocks NEW
+    # connections; istiod's EXISTING kube-API watch stays up through it. The
+    # fix bounces istiod so the fresh replica must reconnect THROUGH the
+    # break. Falsifiable in two directions: reverting to inject-only (no
+    # delete pod call) must turn this red, and reordering (bounce BEFORE the
+    # rule lands) must also turn it red.
+    seen = []
+    monkeypatch.setattr(fi, "_run", lambda cmd, **kw: seen.append(cmd) or _proc(0))
+    fi.inject_clusterip_route_broken()
+    assert len(seen) == 2
+    assert seen[0][0] == "iptables" and "-I" in seen[0] and "INPUT" in seen[0]
+    assert seen[1][:3] == ["kubectl", "delete", "pod"]
+    assert "-n" in seen[1] and fi.ISTIO_NAMESPACE in seen[1]
+    assert "-l" in seen[1] and fi.ISTIOD_LABEL in seen[1]
+
+
+def test_inject_clusterip_route_broken_raises_if_rule_fails_before_bounce(monkeypatch):
+    # if the rule itself fails to insert, the pod must NOT be bounced (no
+    # point forcing a reconnect through a route that was never broken).
+    seen = []
+
+    def _fake(cmd, **kw):
+        seen.append(cmd)
+        return _proc(1, "", "iptables: permission denied")
+
+    monkeypatch.setattr(fi, "_run", _fake)
+    with pytest.raises(fi.FaultInjectionError):
+        fi.inject_clusterip_route_broken()
+    assert len(seen) == 1  # the kubectl delete never ran
 
 
 def test_restore_clusterip_route_targets_input_chain(monkeypatch):
@@ -860,6 +979,13 @@ def test_dry_run_lines_includes_budget_and_arm_hint():
     assert fi.ENV_ARMED in joined
 
 
+def test_dry_run_lines_includes_manifest_settle_window():
+    lines = fi.dry_run_lines(fi.cases_for("all"), 90.0, 45.0)
+    joined = "\n".join(lines)
+    assert "manifest settle window" in joined
+    assert "45s" in joined
+
+
 def test_main_live_refused_never_injects(monkeypatch, capsys):
     # missing env AND missing flag -> refuse; assert NO injection op ran.
     ran = []
@@ -930,6 +1056,7 @@ def test_build_parser_defaults():
     assert args.case == "all"
     assert args.live is False
     assert args.budget == fi.DEFAULT_BUDGET_S
+    assert args.manifest_timeout == fi.DEFAULT_MANIFEST_TIMEOUT_S
 
 
 def test_mesh_out_dir_default_is_under_deploy():

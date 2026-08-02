@@ -20,9 +20,11 @@ is a WS5 bug to fix through the loop, never a WS6 edit.
 Falsifiability is the whole point (the reviewer's mandate, §6 of the spec):
 
 * **Non-vacuous injection** — after injecting, :meth:`certify_case` asserts the
-  gate's own ``diagnose_mesh`` actually shows the expected signal. If the fault
-  did not land (a "healthy after inject" reading), the case FAILS. An injection
-  that changes nothing can never masquerade as a pass.
+  gate's own ``diagnose_mesh`` actually shows the expected signal, polling for
+  up to a bounded settle window (:func:`_await_signal_landed`) because a fault
+  is not instantaneous (WS6F2-LESSONS-20260802). If the fault never lands
+  within that window (a "healthy after inject" reading), the case FAILS. An
+  injection that changes nothing can never masquerade as a pass.
 * **No false HEALED** — the negative control (N1) must resolve to ``UNSAFE``. A
   case whose observed outcome differs from its declared expectation FAILS, so a
   healer that reports success while the re-diagnose still finds the fault cannot
@@ -109,6 +111,18 @@ KUBE_API_CLUSTERIP = "10.43.0.1"
 # Default zero-touch recovery budget (seconds). A host-root k3s re-settle on a
 # healthy laptop settles well within this; a degraded host is bounded by it.
 DEFAULT_BUDGET_S = 180.0
+
+# Bounded post-inject SETTLE window (seconds) — WS6F2-LESSONS-20260802 root
+# cause #1: a fault is not instantaneous. istiod's ``istiod-api-unreachable``
+# signal only appears once its own reconnect attempt fails and reaches its
+# logs, which can take longer than the gap between "inject" and the very next
+# diagnose call. This bounds how long :func:`_await_signal_landed` polls
+# before ruling an injection vacuous — well under ``DEFAULT_BUDGET_S`` so a
+# slow-to-manifest fault still leaves the heal itself most of the budget.
+DEFAULT_MANIFEST_TIMEOUT_S = 60.0
+
+# Poll cadence (seconds) while waiting for a fault to manifest.
+DEFAULT_MANIFEST_POLL_INTERVAL_S = 2.0
 
 # Safety-gate constants (defence in depth — the live path needs ALL of these).
 LIVE_FLAG = "i_understand_this_breaks_the_mesh"
@@ -252,6 +266,43 @@ def signal_landed(diagnosis: Diagnosis, expected: tuple[str, ...]) -> bool:
         return False
     present = set(diagnosis.signals)
     return any(sig in present for sig in expected)
+
+
+def _await_signal_landed(
+    gate: GateLike,
+    expected_signals: tuple[str, ...],
+    timeout_s: float,
+    *,
+    poll_interval_s: float = DEFAULT_MANIFEST_POLL_INTERVAL_S,
+) -> Diagnosis:
+    """Poll ``gate.diagnose_mesh()`` for up to ``timeout_s`` before giving up.
+
+    WS6F2-LESSONS-20260802 root cause #1: a fault is not instantaneous. F2's
+    ``istiod-api-unreachable`` signal only appears once istiod's own reconnect
+    attempt fails and the failure reaches its logs — that can take longer than
+    the gap between "inject" and the very next ``diagnose_mesh()`` call. A
+    single post-inject snapshot can catch the fault mid-flight, read HEALTHY,
+    and falsely rule a genuine injection "vacuous".
+
+    Returns on the FIRST landed diagnosis — the common case (F1/N1, which
+    manifest well inside one call) never touches the clock and behaves
+    identically to a single-shot check, so this adds ~0 latency to the
+    already-passing cases. Only a diagnosis that does NOT land on the first
+    check starts the bounded poll loop; if the signal never lands within
+    ``timeout_s`` the last (still-not-landed) diagnosis is returned and the
+    caller's own :func:`signal_landed` check still fails the case — the
+    guard's falsifiability is unchanged, only its patience is bounded.
+    """
+    diagnosis = gate.diagnose_mesh()
+    if signal_landed(diagnosis, expected_signals):
+        return diagnosis
+    deadline = _monotonic() + timeout_s
+    while not signal_landed(diagnosis, expected_signals):
+        if _monotonic() >= deadline:
+            break
+        _sleep(poll_interval_s)
+        diagnosis = gate.diagnose_mesh()
+    return diagnosis
 
 
 def journal_shows_unit_fired(journal_text: str) -> bool:
@@ -509,24 +560,38 @@ def _clusterip_reject_rule() -> list[str]:
 
 
 def inject_clusterip_route_broken() -> None:
-    """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route.
+    """F2 inject (host-root, THE #307 incident): break the kube-API ClusterIP route
+    AND force istiod onto the broken path.
 
-    FIXED 2026-08-02 (WS6 F2 review, live cert 2026-08-02 F2 FAIL): the prior
-    version inserted the REJECT into the host's ``OUTPUT`` chain, which only
-    intercepts packets a process ON THE HOST ITSELF originates. istiod is a
-    POD — its egress to the ClusterIP is DNAT'd and forwarded, so it never
-    traverses ``OUTPUT``. That made the old injection VACUOUS for istiod:
-    ``diagnose_mesh`` stayed HEALTHY after "inject" and the non-vacuous guard
-    correctly refused to claim a heal, leaving the crown-jewel #307 self-heal
-    unproven. Inserting into ``INPUT`` with the ``conntrack --ctorigdst``
-    match (see :func:`_clusterip_reject_rule`) catches the packet AFTER
-    kube-proxy's DNAT, keyed on its pre-NAT destination, so it severs
-    istiod's (and any pod's) path to the ClusterIP while leaving ``kubectl``'s
-    own ``127.0.0.1:6443`` kubeconfig path untouched — the gate's own probes
-    and the healer's own ``kubectl`` calls keep working, only the kube-API
-    route istiod needs is broken.
+    FIXED 2026-08-02, attempt 2 (WS6 F2 review, live cert 2026-08-02 F2 FAIL):
+    the prior version inserted the REJECT into the host's ``OUTPUT`` chain,
+    which only intercepts packets a process ON THE HOST ITSELF originates.
+    istiod is a POD — its egress to the ClusterIP is DNAT'd and forwarded, so
+    it never traverses ``OUTPUT``. Inserting into ``INPUT`` with the
+    ``conntrack --ctorigdst`` match (see :func:`_clusterip_reject_rule`)
+    catches the packet AFTER kube-proxy's DNAT, keyed on its pre-NAT
+    destination, so it severs istiod's (and any pod's) path to the ClusterIP
+    while leaving ``kubectl``'s own ``127.0.0.1:6443`` kubeconfig path
+    untouched — the gate's own probes and the healer's own ``kubectl`` calls
+    keep working, only the kube-API route istiod needs is broken.
+
+    FIXED 2026-08-02, attempt 3 (WS6F2-LESSONS-20260802 root cause #2): the
+    correct chain/match ALONE was still not enough — a second live run still
+    failed "vacuous". A REJECT only intercepts NEW connection attempts;
+    istiod's EXISTING long-lived kube-API watch connections stay ESTABLISHED
+    and keep working through them, so ``diagnose_mesh`` never sees a failure.
+    The real #307 is a node-level route loss that kills live connections too,
+    not just new ones. To reproduce that, insert the rule FIRST, then bounce
+    istiod (delete its pod) so the FRESH replica must establish its kube-API
+    connection THROUGH the now-broken route — producing a genuine, immediate
+    ``istiod-api-unreachable`` ("no route to host" / cannot get certs, the
+    real #307 signature) instead of a rule that only guards against traffic
+    that never needs to be sent again.
     """
     _exec_or_raise(["iptables", "-I", "INPUT", *_clusterip_reject_rule()])
+    _exec_or_raise(
+        ["kubectl", "delete", "pod", "-n", ISTIO_NAMESPACE, "-l", ISTIOD_LABEL]
+    )
 
 
 def restore_clusterip_route() -> None:
@@ -539,6 +604,13 @@ def restore_clusterip_route() -> None:
     k3s`` unconditionally: the delete either removes a still-present rule or
     no-ops on an already-cleared one, either way leaving no REJECT rule
     behind.
+
+    Only the injected artefact (the iptables rule) is explicitly restored
+    here. The istiod pod bounced by :func:`inject_clusterip_route_broken` is
+    a normal Deployment-managed replica; whether the case heals (a fresh
+    Ready istiod already exists by the time this runs) or aborts early (the
+    Deployment controller replaces the deleted pod on its own regardless of
+    this function), no separate pod-level restore step is needed.
     """
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         _run(["iptables", "-D", "INPUT", *_clusterip_reject_rule()])
@@ -712,7 +784,11 @@ class _CaseAbortedError(RuntimeError):
 
 
 def certify_case(
-    case: FaultCase, gate: GateLike, *, budget_s: float = DEFAULT_BUDGET_S
+    case: FaultCase,
+    gate: GateLike,
+    *,
+    budget_s: float = DEFAULT_BUDGET_S,
+    manifest_timeout_s: float = DEFAULT_MANIFEST_TIMEOUT_S,
 ) -> CaseResult:
     """Certify one fault case end to end, ALWAYS restoring the mesh afterwards.
 
@@ -721,8 +797,9 @@ def certify_case(
     0. assert pre-state HEALTHY (refuse to inject onto an already-broken mesh);
     1. register the restore on an ExitStack FIRST (before any break);
     2. inject the fault;
-    3. assert the gate's ``diagnose_mesh`` now shows an expected signal
-       (non-vacuous — the fault actually landed);
+    3. assert the gate's ``diagnose_mesh`` shows an expected signal within a
+       bounded post-inject SETTLE window (non-vacuous — the fault actually
+       landed; see :func:`_await_signal_landed`, WS6F2-LESSONS-20260802);
     4. run ``gate.evaluate()`` (the real WS5 diagnose -> bounded heal -> re-diagnose);
     5. assert the outcome equals the declared expectation within ``budget_s``,
        with zero manual intervention;
@@ -780,7 +857,9 @@ def certify_case(
         stack.callback(_do_restore)
         with _restore_on_signal(_do_restore):
             try:
-                _run_case_steps(case, gate, res, budget_s, journal_cursor)
+                _run_case_steps(
+                    case, gate, res, budget_s, journal_cursor, manifest_timeout_s
+                )
                 res.verdict = VERDICT_PASS
                 res.reason = (
                     f"injected -> observed {res.observed_outcome} within "
@@ -804,6 +883,7 @@ def _run_case_steps(
     res: CaseResult,
     budget_s: float,
     journal_cursor: str,
+    manifest_timeout_s: float,
 ) -> None:
     """Steps 2-6 of :func:`certify_case`. Raises :class:`_CaseAbortedError` on any miss.
 
@@ -814,12 +894,17 @@ def _run_case_steps(
     case.inject_fn()
     res.injected = True
 
-    # Step 3 — non-vacuous: the fault must actually have landed.
-    post = gate.diagnose_mesh()
+    # Step 3 — non-vacuous, with a bounded post-inject SETTLE window
+    # (WS6F2-LESSONS-20260802 root cause #1): the fault must actually land,
+    # but landing is not instantaneous, so poll for up to manifest_timeout_s
+    # before ruling it vacuous. Returns on first success — a fast fault
+    # (F1/N1) adds ~0 latency over the old single-shot check.
+    post = _await_signal_landed(gate, case.expected_signals, manifest_timeout_s)
     res.observed_signals = post.signals
     if not signal_landed(post, case.expected_signals):
         raise _CaseAbortedError(
-            "fault did not land: expected one of "
+            "fault did not land within "
+            f"{manifest_timeout_s:.0f}s settle window: expected one of "
             f"{list(case.expected_signals)} but diagnose shows "
             f"{post.signals or 'HEALTHY'} — injection was vacuous"
         )
@@ -861,7 +946,11 @@ def _run_case_steps(
 
 
 def certify(
-    cases: list[FaultCase], gate: GateLike, *, budget_s: float = DEFAULT_BUDGET_S
+    cases: list[FaultCase],
+    gate: GateLike,
+    *,
+    budget_s: float = DEFAULT_BUDGET_S,
+    manifest_timeout_s: float = DEFAULT_MANIFEST_TIMEOUT_S,
 ) -> CertificationReport:
     """Certify each case in turn and collect the falsifiable report.
 
@@ -869,7 +958,12 @@ def certify(
     blast radius is one fault at a time (CHESS: bounded chaos, restored between
     perturbations).
     """
-    results = [certify_case(case, gate, budget_s=budget_s) for case in cases]
+    results = [
+        certify_case(
+            case, gate, budget_s=budget_s, manifest_timeout_s=manifest_timeout_s
+        )
+        for case in cases
+    ]
     return CertificationReport(results=results, budget_s=budget_s)
 
 
@@ -992,6 +1086,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"zero-touch recovery budget in seconds (default: {DEFAULT_BUDGET_S:.0f})",
     )
     parser.add_argument(
+        "--manifest-timeout",
+        type=float,
+        default=DEFAULT_MANIFEST_TIMEOUT_S,
+        help=(
+            "bounded post-inject settle window in seconds — how long to poll "
+            "diagnose for the expected signal before ruling an injection "
+            f"vacuous (default: {DEFAULT_MANIFEST_TIMEOUT_S:.0f})"
+        ),
+    )
+    parser.add_argument(
         f"--{LIVE_FLAG.replace('_', '-')}",
         dest=LIVE_FLAG,
         action="store_true",
@@ -1011,11 +1115,16 @@ def mesh_out_dir_default() -> Path:
     return Path(__file__).resolve().parent / "faultinject-runs"
 
 
-def dry_run_lines(cases: list[FaultCase], budget_s: float) -> list[str]:
+def dry_run_lines(
+    cases: list[FaultCase],
+    budget_s: float,
+    manifest_timeout_s: float = DEFAULT_MANIFEST_TIMEOUT_S,
+) -> list[str]:
     """The dry-run plan: cases + expected outcomes, mutating nothing."""
     lines = [
         "WS6 fault-injection — DRY RUN (no --live; nothing will be injected)",
         f"recovery budget: {budget_s:.0f}s",
+        f"manifest settle window: {manifest_timeout_s:.0f}s",
         "",
     ]
     for case in cases:
@@ -1052,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
     cases = cases_for(args.case)
 
     if not args.live:
-        for line in dry_run_lines(cases, args.budget):
+        for line in dry_run_lines(cases, args.budget, args.manifest_timeout):
             print(line)
         return 0
 
@@ -1063,7 +1172,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     gate = mesh.MeshGate(healer=mesh.PrivilegedHealer())
-    report = certify(cases, gate, budget_s=args.budget)
+    report = certify(
+        cases, gate, budget_s=args.budget, manifest_timeout_s=args.manifest_timeout
+    )
     report_path = _write_report(report, args.out_dir)
     print(report.human_summary())
     print(f"certification report: {report_path}")
