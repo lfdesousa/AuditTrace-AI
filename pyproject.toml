@@ -178,8 +178,11 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # `source` AND to the `--cov=scripts/deploy` flag in `make test` / CI: config
 # `source` alone is filtered out by the CLI `--cov=src`, and `--cov` alone is
 # filtered out by config `source` — coverage.py measures a file only when it is
-# reachable via BOTH. No other `scripts/*` module is dragged into the gate.
-source = ["audittrace", "scripts/deploy"]
+# reachable via BOTH. `scripts/hooks` (#397, the pre-push hook's decision
+# logic package — `scripts/hooks/prepush_pr_body_gate.py`) joins it the same
+# way, so the new Python helper is subject to the same per-file gate as
+# everything else. No other `scripts/*` module is dragged into the gate.
+source = ["audittrace", "scripts/deploy", "scripts/hooks"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet

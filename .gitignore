@@ -126,3 +126,11 @@ scripts/deploy/runs/
 
 # Local Claude Code config + agent definitions — never committed (IP: kept local, not shared).
 .claude/
+
+# PR-body content is PRIVATE — it lives in
+# ~/work/audittrace-private/pr-bodies/ and is only ever pointed to via the
+# PR_BODY env var (see .githooks/pre-push, #397). This repo never tracks a
+# PR body; the guard below stops a stray copy from ever being staged from
+# the repo root.
+/PR-BODY-*.md
+/*.pr-body.md
