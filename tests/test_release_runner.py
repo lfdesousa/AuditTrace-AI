@@ -782,11 +782,21 @@ def test_print_plan_prints_phases(capsys):
     assert "tag_pushed: False" in out
 
 
-def test_main_aborts_on_wrong_branch_returns_2(capsys):
-    """Real (unmocked) invocation against THIS actual worktree: whatever
-    branch is currently checked out is (by construction of this test suite
-    running mid-feature-branch-work) never `main`, so R0 aborts before any
-    mutation is even attempted — a genuinely safe, read-only assertion."""
+def test_main_aborts_on_wrong_branch_returns_2(monkeypatch, capsys):
+    """main() returns 2 when R0 finds the checkout is not on `main`.
+
+    Hermetic: fake a non-`main` branch read so the abort is deterministic
+    regardless of the branch this suite actually runs on. (A previous version
+    made a REAL unmocked invocation and assumed the checkout was never `main` —
+    true on a feature branch, but false in CI on `main` after merge, where R0
+    correctly proceeds and rc is 0. The ambient-branch coupling was the bug.)"""
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda cmd, **k: (
+            _proc(0, "feature/x\n") if "abbrev-ref" in " ".join(cmd) else _proc(0, "")
+        ),
+    )
     rc = runner.main(["--version", "999.0.0", "--dry-run"])
     assert rc == 2
     out = capsys.readouterr().out
