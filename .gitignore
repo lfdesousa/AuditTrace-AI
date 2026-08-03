@@ -124,6 +124,9 @@ charts/audittrace/values-local.yaml
 # WS2 deploy-runner evidence bundles (deploy reports + pod samples)
 scripts/deploy/runs/
 
+# #398 release-cut runner evidence bundles (release-record JSON + summary)
+scripts/release/runs/
+
 # Local Claude Code config + agent definitions — never committed (IP: kept local, not shared).
 .claude/
 
