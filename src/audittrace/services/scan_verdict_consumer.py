@@ -1,8 +1,10 @@
 """ADR-048 PR-B4 — verdict consumer.
 
-Consumes the ``audittrace.scan.verdicts`` queue (declared by PR-B2.5
-topology Job, bound to the same-named exchange via routing key
-``scan.verdict.*``). On each message:
+Consumes the ``audittrace.scan.verdicts`` queue (also declared by the
+PR-B2.5 topology Job, bound to the same-named exchange via routing
+key ``scan.verdict.*``; #393 — this consumer self-declares the queue
+idempotently too, so a cold boot no longer depends on winning a race
+against the bootstrap Job). On each message:
 
     1. Parse the JSON ``Verdict`` (cross-repo contract).
     2. Map ``VerdictKind`` → closed-set ``scan_status`` value
@@ -105,22 +107,32 @@ class ScanVerdictConsumer:
         self._channel: Any = None
         self._queue: Any = None
 
+    # #393 — canonical queue-declare args. MUST match the
+    # ``job-amqp-topology-bootstrap`` Job byte-for-byte
+    # (``charts/audittrace/templates/rabbitmq/job-amqp-topology-bootstrap.yaml``,
+    # the ``audittrace.scan.verdicts`` PUT body: ``{"auto_delete":false,
+    # "durable":true,"arguments":{"x-queue-type":"quorum"}}``) — that
+    # Job is the single source of truth for the topology. A mismatch
+    # makes RabbitMQ raise ``ChannelPreconditionFailed`` on declare.
+    _CANONICAL_QUEUE_ARGUMENTS: dict[str, str] = {"x-queue-type": "quorum"}
+
     # 2026-05-14 B4b — fresh-install race budget. The chart's
     # `job-amqp-topology-bootstrap` Job is a post-install hook, so on
     # a fresh kind cluster memory-server can come up BEFORE the
-    # `audittrace.scan.verdicts` queue exists. ``get_queue`` does a
-    # passive declare that raises ``ChannelNotFoundEntity`` if the
-    # queue isn't there yet, killing the channel. Pre-fix that meant
-    # the consumer stayed detached and verdict messages piled up with
-    # ``consumers=0``. Cumulative max wait: 1+2+4+8+16 = 31 s of
-    # backoff — well past the ~11 s gap observed in CI between
-    # memory-server starting and the bootstrap Job declaring queues.
+    # `audittrace.scan.verdicts` queue exists. Pre-#393, ``get_queue``
+    # did a passive declare that raised ``ChannelNotFoundEntity`` if the
+    # queue wasn't there yet, killing the channel; the consumer stayed
+    # detached and verdict messages piled up with ``consumers=0`` until
+    # the retry budget below happened to outlast the bootstrap Job.
     #
-    # RESIDUAL GAP (#393): the supervised ``run()`` self-heals
-    # connection-level errors, but a cold-boot queue-declaration race
-    # that OUTLASTS this queue-retry budget still raises RuntimeError and
-    # kills the consumer (no supervised retry for queue-not-found). Rare
-    # (the bootstrap Job normally wins), tracked as a follow-up.
+    # #393 FIX: switched to idempotent active ``declare_queue`` (mirrors
+    # the exchange fix in ``ScanAmqpClient.ensure_connected``, PR-B10).
+    # The retry loop below is now a guard against transient AMQP errors
+    # while (re)opening the channel/declaring the queue, not the primary
+    # mechanism for waiting out a not-yet-created queue — the consumer
+    # declares the queue itself, so whichever side (this consumer or the
+    # bootstrap Job) runs first wins and the other adopts the existing
+    # queue (I2).
     _QUEUE_MAX_ATTEMPTS: int = 6
 
     # #384 WS3 — INITIAL-connect resilience. ``connect_robust`` was
@@ -179,10 +191,7 @@ class ScanVerdictConsumer:
         import asyncio  # noqa: PLC0415
 
         import aio_pika  # noqa: PLC0415 — avoid import on disabled paths
-        from aio_pika.exceptions import (  # noqa: PLC0415
-            AMQPError,
-            ChannelNotFoundEntity,
-        )
+        from aio_pika.exceptions import AMQPError  # noqa: PLC0415
 
         # (C) connection-level retry — a cold-reboot RabbitMQ is not
         # AMQP-ready yet and ``connect_robust`` raises a connection-level
@@ -191,20 +200,29 @@ class ScanVerdictConsumer:
         last_exc: Exception | None = None
         for attempt in range(self._QUEUE_MAX_ATTEMPTS):
             try:
-                # ``get_queue`` does a passive declare; a closed
-                # channel can't be reused, so we open a fresh one
-                # on every retry attempt.
+                # A closed channel can't be reused, so open a fresh one on
+                # every retry attempt.
                 self._channel = await self._connection.channel()
                 await self._channel.set_qos(prefetch_count=self._prefetch_count)
-                self._queue = await self._channel.get_queue(self._queue_name)
+                # #393 — idempotent ACTIVE declare (was passive
+                # ``get_queue``, which required the bootstrap Job to have
+                # already declared the queue). RabbitMQ no-ops if the
+                # queue already exists with matching arguments, so this
+                # composes safely with the bootstrap Job regardless of
+                # which side runs first (I2).
+                self._queue = await self._channel.declare_queue(
+                    self._queue_name,
+                    durable=True,
+                    arguments=self._CANONICAL_QUEUE_ARGUMENTS,
+                )
                 break
-            except ChannelNotFoundEntity as exc:
+            except (ConnectionError, OSError, TimeoutError, AMQPError) as exc:
                 last_exc = exc
                 if attempt == self._QUEUE_MAX_ATTEMPTS - 1:
                     break
                 delay = 2**attempt
                 logger.warning(
-                    "scan_verdict_consumer.queue_not_found_retry",
+                    "scan_verdict_consumer.queue_declare_retry",
                     extra={
                         "attempt": attempt + 1,
                         "max_attempts": self._QUEUE_MAX_ATTEMPTS,
@@ -216,8 +234,8 @@ class ScanVerdictConsumer:
                 await asyncio.sleep(delay)
         if self._queue is None:
             raise RuntimeError(
-                f"scan_verdict_consumer: queue {self._queue_name!r} not found "
-                f"after {self._QUEUE_MAX_ATTEMPTS} attempts "
+                f"scan_verdict_consumer: queue {self._queue_name!r} declare "
+                f"failed after {self._QUEUE_MAX_ATTEMPTS} attempts "
                 f"(last error: {last_exc})"
             ) from last_exc
         logger.info(
