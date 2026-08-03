@@ -592,24 +592,155 @@ def test_heal_host_root_finding_triggers_resettle(monkeypatch, tmp_path):
     assert seen["signal"] == "node-not-ready"
 
 
-def test_heal_prefers_rbac_over_host_root(monkeypatch, tmp_path):
-    # least-privilege first: with BOTH an RBAC and a host-root finding present,
-    # heal() does the RBAC action and does NOT cross the privilege boundary.
-    monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+def test_heal_prefers_host_root_over_rbac_when_co_present(monkeypatch, tmp_path):
+    # WS5-HEALER-ESC-20260802: with BOTH a host-root and an RBAC finding
+    # present (the real #307 F2 shape), heal() escalates straight to the
+    # host-root action and does NOT touch the RBAC (kubectl) tier at all — an
+    # RBAC rollout restart cannot fix a broken node route, so trying it first
+    # would waste a bounded heal attempt on a tier that can never converge.
+    healer = _rbac_ok_healer(tmp_path)
+
+    def _explode(cmd, *, timeout=None):  # the RBAC (kubectl) tier must not run
+        raise AssertionError("RBAC/kubectl tier reached despite a host-root finding")
+
+    monkeypatch.setattr(mesh, "_run", _explode)
+    seen = {}
+
+    def fake_trigger(finding):
+        seen["signal"] = finding.signal
+        return HealAttempt(True, "host-resettle", "faked")
+
+    monkeypatch.setattr(healer, "_trigger_host_resettle", fake_trigger)
+    diag = Diagnosis(
+        findings=[
+            Finding("istiod-not-ready", "x"),
+            Finding("istiod-api-unreachable", "no route to host"),
+        ]
+    )
+    attempt = healer.heal(diag)
+    assert attempt.action == "host-resettle"
+    assert seen["signal"] == "istiod-api-unreachable"
+
+
+def test_heal_no_fallthrough_when_host_root_genuinely_fires_even_if_not_performed(
+    monkeypatch, tmp_path
+):
+    # WS5-HEALER-ESC-20260802, reviewer REJECT (2026-08-02, test-falsifiability
+    # not a code bug): pins the exact distinction `heal()` uses to decide
+    # fall-through -- `attempt.action != "none"`, NOT `attempt.performed`. A
+    # host-root attempt that genuinely FIRED (timed out here) but did not
+    # complete (`performed=False`) must NOT fall through to RBAC, even though
+    # `performed` is False just like the self-gated "not installed" case.
+    # Every pre-existing test either had action=="none" co-occurring with
+    # performed=False, or action!="none" co-occurring with performed=True --
+    # so neutering the guard to `if attempt.performed:` left the whole suite
+    # green. This test would go RED under that neutered guard (see the
+    # falsifiability self-check in the WS5 rework commit message).
+    healer = _rbac_ok_healer(tmp_path)
+
+    def _explode(cmd, *, timeout=None):  # the RBAC (kubectl) tier must not run
+        raise AssertionError(
+            "RBAC/kubectl tier reached despite a genuinely-fired host-root attempt"
+        )
+
+    monkeypatch.setattr(mesh, "_run", _explode)
+
+    def fake_trigger(finding):
+        # genuinely fired (timed out waiting on the root unit), NOT performed,
+        # and NOT the "none" self-gate action.
+        return HealAttempt(
+            performed=False,
+            action="host-resettle-timeout",
+            detail="no result from the root re-settle unit within 1s",
+        )
+
+    monkeypatch.setattr(healer, "_trigger_host_resettle", fake_trigger)
+    diag = Diagnosis(
+        findings=[
+            Finding("istiod-not-ready", "x"),  # co-occurring RBAC-tier signal
+            Finding("istiod-api-unreachable", "no route to host"),
+        ]
+    )
+    attempt = healer.heal(diag)
+    # host-root owns the call: its own (non-performed) attempt is returned
+    # unchanged, not superseded by an RBAC fallback.
+    assert attempt.performed is False
+    assert attempt.action == "host-resettle-timeout"
+    assert not (tmp_path / "requests").exists()
+
+
+def test_heal_falls_through_to_rbac_when_host_root_not_installed_and_co_present(
+    monkeypatch, tmp_path
+):
+    # WS5-HEALER-ESC-20260802, reviewer REJECT item 4 (fixed): the missing
+    # 4th cell of the 2x2. Co-occurring signals {istiod-api-unreachable,
+    # istiod-not-ready} used to hit the host-root self-gate (Option-B NOT
+    # installed) and return a silent no-op WITHOUT ever trying the RBAC
+    # tier -- regressing the class-level `available` guarantee ("RBAC-tier
+    # heal available on ANY reachable cluster, even before the units are
+    # installed"). heal() must now fall through to a best-effort RBAC
+    # rollout in this exact cell instead of a bare no-op.
+    calls = []
+
+    def fake_run(cmd, *, timeout=None):
+        calls.append(cmd)
+        return _proc(0, "rolled")
+
+    monkeypatch.setattr(mesh, "_run", fake_run)
+    healer = _rbac_ok_healer(tmp_path)  # heal_dir has no requests/ -> not installed
+    diag = Diagnosis(
+        findings=[
+            Finding("istiod-not-ready", "readyReplicas=0"),
+            Finding("istiod-api-unreachable", "no route to host"),
+        ]
+    )
+    attempt = healer.heal(diag)
+    assert attempt.performed is True
+    assert attempt.action == "restart-istiod"
+    # the fall-through is RBAC-only -- the host-root self-gate must NOT have
+    # written a request file across the privilege boundary in this call.
+    assert not (tmp_path / "requests").exists()
+    assert any("rollout" in c and "restart" in c for c in calls)
+
+
+def test_heal_host_root_only_not_installed_stays_noop_no_rbac_fallback(tmp_path):
+    # Negative control for the fall-through: a host-root-ONLY diagnosis (no
+    # RBAC-tier signal anywhere) on an uninstalled host has nothing to fall
+    # back to, so heal() must return the original not-installed no-op
+    # unchanged -- not synthesize an action that never ran.
+    healer = _rbac_ok_healer(tmp_path)  # heal_dir has no requests/ -> not installed
+    attempt = healer.heal(Diagnosis(findings=[Finding("node-not-ready", "kubelet")]))
+    assert attempt.performed is False
+    assert attempt.action == "none"
+    assert "not installed on this host" in attempt.detail
+    assert not (tmp_path / "requests").exists()
+
+
+def test_heal_rbac_only_when_no_host_root_signal_present(monkeypatch, tmp_path):
+    # F1 shape: an RBAC-tier signal with NO host-root signal anywhere in the
+    # diagnosis still takes the RBAC action (least-privileged fix available).
+    calls = []
+
+    def fake_run(cmd, *, timeout=None):
+        calls.append(cmd)
+        return _proc(0, "rolled")
+
+    monkeypatch.setattr(mesh, "_run", fake_run)
     healer = _rbac_ok_healer(tmp_path)
 
     def _explode(finding):  # the host-root seam must not be reached
-        raise AssertionError("host-root seam reached despite an RBAC finding")
+        raise AssertionError("host-root seam reached despite no host-root finding")
 
     monkeypatch.setattr(healer, "_trigger_host_resettle", _explode)
     diag = Diagnosis(
         findings=[
-            Finding("node-not-ready", "kubelet"),
-            Finding("istiod-not-ready", "x"),
+            Finding("istiod-no-endpoints", "x"),
+            Finding("istiod-not-ready", "y"),
         ]
     )
     attempt = healer.heal(diag)
     assert attempt.action == "restart-istiod"
+    assert any("rollout" in c and "restart" in c for c in calls)
 
 
 def test_heal_single_op_per_call(monkeypatch, tmp_path):
@@ -777,6 +908,205 @@ def test_gate_host_root_fails_closed_without_install(monkeypatch, tmp_path):
     assert len(result.heal_attempts) >= 1
     assert result.heal_attempts[0].action == "none"
     assert "not installed" in result.heal_attempts[0].detail
+
+
+# ── WS5-HEALER-ESC-20260802: the escalation-ordering gap, at gate level ──────
+#
+# The real #307 (F2) fault always yields BOTH ``istiod-api-unreachable``
+# (host-root, root cause) and ``istiod-not-ready`` (RBAC, symptom of the same
+# break) at once. These tests prove the gate reaches HEALED via the host-root
+# tier for that co-occurring shape (not stuck looping RBAC), while F1
+# (RBAC-only) still heals via RBAC and N1 (RBAC-only, unfixable) still ends
+# UNSAFE — the three cases the spec's acceptance criteria name explicitly.
+#
+# The reviewer's REJECT (item 4) added a 4th cell: co-occurring signals on a
+# host where Option-B is NOT installed. `test_gate_co_occurring_not_installed_
+# falls_back_to_rbac_healed` below proves the gate reaches HEALED via the
+# RBAC fallback in that cell instead of exhausting max_heal_attempts on a
+# silent host-root no-op.
+
+
+def test_gate_f2_co_occurring_signals_reach_host_root_within_budget(
+    monkeypatch, tmp_path
+):
+    # F2 shape: node/route fault manifests as BOTH signals simultaneously. The
+    # host-root install IS wired here (Option-B present), so the gate must
+    # reach HEALED via the host-root tier on the FIRST attempt — proving it no
+    # longer starves in the RBAC tier across max_heal_attempts.
+    monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+    heal_dir = tmp_path / "wired"
+    (heal_dir / "requests").mkdir(parents=True)
+
+    def fake_sleep(_seconds):
+        for req in (heal_dir / "requests").glob("*.json"):
+            (heal_dir / "results" / f"{req.stem}.result.json").write_text(
+                json.dumps({"performed": True, "status": "performed"})
+            )
+
+    monkeypatch.setattr(mesh, "_sleep", fake_sleep)
+    gate = MeshGate(
+        MeshGateConfig(max_heal_attempts=2),
+        healer=PrivilegedHealer(
+            heal_dir=heal_dir, resettle_timeout=5.0, resettle_poll=0.01
+        ),
+    )
+    seq = iter(
+        [
+            Diagnosis(
+                findings=[
+                    Finding("istiod-not-ready", "readyReplicas=0"),
+                    Finding("istiod-api-unreachable", "no route to host"),
+                ]
+            ),
+            Diagnosis(findings=[]),
+        ]
+    )
+    last: dict[str, Diagnosis] = {}
+
+    def diag() -> Diagnosis:
+        try:
+            last["d"] = next(seq)
+        except StopIteration:
+            pass
+        return last["d"]
+
+    gate.diagnose_mesh = diag  # type: ignore[method-assign]
+    result = gate.evaluate()
+    assert result.outcome == HEALED
+    # exactly ONE heal attempt was needed — the gate did not burn a bounded
+    # attempt in the RBAC tier before reaching the tier that actually fixes it.
+    assert len(result.heal_attempts) == 1
+    assert result.heal_attempts[0].action == "host-resettle"
+
+
+def test_gate_co_occurring_not_installed_falls_back_to_rbac_healed(
+    monkeypatch, tmp_path
+):
+    # Gate-level companion to the fall-through fix: the same 4th cell (WS5-
+    # HEALER-ESC-20260802, reviewer REJECT item 4) proven end-to-end through
+    # MeshGate.evaluate() -- co-occurring signals with Option-B NOT installed
+    # must reach HEALED via the RBAC fallback on attempt 1, not exhaust
+    # max_heal_attempts on a silent host-root no-op and end UNSAFE.
+    monkeypatch.setattr(mesh, "_sleep", lambda s: None)
+    monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+    gate = MeshGate(
+        MeshGateConfig(max_heal_attempts=2),
+        healer=PrivilegedHealer(heal_dir=tmp_path / "not-wired"),
+    )
+    seq = iter(
+        [
+            Diagnosis(
+                findings=[
+                    Finding("istiod-not-ready", "readyReplicas=0"),
+                    Finding("istiod-api-unreachable", "no route to host"),
+                ]
+            ),
+            Diagnosis(findings=[]),
+        ]
+    )
+    last: dict[str, Diagnosis] = {}
+
+    def diag() -> Diagnosis:
+        try:
+            last["d"] = next(seq)
+        except StopIteration:
+            pass
+        return last["d"]
+
+    gate.diagnose_mesh = diag  # type: ignore[method-assign]
+    result = gate.evaluate()
+    assert result.outcome == HEALED
+    assert len(result.heal_attempts) == 1
+    assert result.heal_attempts[0].action == "restart-istiod"
+
+
+def test_gate_f1_rbac_only_signal_still_heals_via_rbac(monkeypatch, tmp_path):
+    # F1 shape: istiod degraded with NO host-root signal anywhere in the
+    # diagnosis. The escalation-order fix must not change this outcome.
+    monkeypatch.setattr(mesh, "_sleep", lambda s: None)
+    monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+    gate = MeshGate(
+        MeshGateConfig(max_heal_attempts=2),
+        healer=PrivilegedHealer(heal_dir=tmp_path / "not-wired"),
+    )
+    seq = iter(
+        [
+            Diagnosis(findings=[Finding("istiod-degraded", "control plane flapping")]),
+            Diagnosis(findings=[]),
+        ]
+    )
+    last: dict[str, Diagnosis] = {}
+
+    def diag() -> Diagnosis:
+        try:
+            last["d"] = next(seq)
+        except StopIteration:
+            pass
+        return last["d"]
+
+    gate.diagnose_mesh = diag  # type: ignore[method-assign]
+    result = gate.evaluate()
+    assert result.outcome == HEALED
+    assert result.heal_attempts[0].action == "restart-istiod"
+
+
+def test_gate_n1_rbac_only_unfixable_stays_unsafe(monkeypatch, tmp_path):
+    # N1 shape (negative control): istiod scaled to 0 → istiod-not-ready is
+    # the ONLY signal, and it is UNFIXABLE by any tier (no host-root signal
+    # is ever produced, so escalation never triggers; a rollout restart of an
+    # intentionally-scaled-to-0 deployment cannot make it ready). The gate
+    # must exhaust max_heal_attempts and end UNSAFE, never a false HEALED.
+    monkeypatch.setattr(mesh, "_sleep", lambda s: None)
+    monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+    gate = MeshGate(
+        MeshGateConfig(max_heal_attempts=2),
+        healer=PrivilegedHealer(heal_dir=tmp_path / "not-wired"),
+    )
+    gate.diagnose_mesh = lambda: Diagnosis(  # type: ignore[method-assign]
+        findings=[Finding("istiod-not-ready", "readyReplicas=0 of desired=0")]
+    )
+    result = gate.evaluate()
+    assert result.outcome == UNSAFE
+    assert len(result.heal_attempts) == 2
+    assert all(a.action == "restart-istiod" for a in result.heal_attempts)
+
+
+# ── WS5-HEALER-ESC-20260802: split RBAC/host-root timeouts, falsifiable ──────
+
+
+def test_restart_istiod_uses_rbac_rollout_timeout_not_resettle_timeout(
+    monkeypatch, tmp_path
+):
+    # Falsifiable: the RBAC rollout-status wait must use the SHORT
+    # rbac_rollout_timeout, NOT the (much longer) host-root resettle_timeout.
+    # If the two were still shared this assertion would fail.
+    calls = []
+
+    def fake_run(cmd, *, timeout=None):
+        calls.append(cmd)
+        return _proc(0, "rolled")
+
+    monkeypatch.setattr(mesh, "_run", fake_run)
+    healer = PrivilegedHealer(
+        heal_dir=tmp_path, resettle_timeout=999.0, rbac_rollout_timeout=7.0
+    )
+    healer.heal(Diagnosis(findings=[Finding("istiod-not-ready", "x")]))
+    status_calls = [c for c in calls if "status" in c]
+    assert len(status_calls) == 1
+    assert "--timeout=7s" in status_calls[0]
+    assert "--timeout=999s" not in status_calls[0]
+
+
+def test_rbac_rollout_timeout_defaults_shorter_than_resettle_timeout():
+    # The whole point of the split: the RBAC wait must not be able to consume
+    # the host-root budget. A regression that re-merges the two constants (or
+    # sets RBAC >= host-root) breaks the "don't starve the other tier" fix.
+    assert mesh.DEFAULT_RBAC_ROLLOUT_TIMEOUT < mesh.DEFAULT_RESETTLE_TIMEOUT
+
+
+def test_privileged_healer_rbac_rollout_timeout_default(tmp_path):
+    healer = PrivilegedHealer(heal_dir=tmp_path)
+    assert healer._rbac_rollout_timeout == mesh.DEFAULT_RBAC_ROLLOUT_TIMEOUT
 
 
 # ── the root executor script: the REAL whitelist boundary (dry-run) ──────────

@@ -270,8 +270,8 @@ class UnconfiguredHealer:
 
 # ── WS5: the real privileged healer + its two-tier action map ─────────────────
 #
-# The heal model (spec §2): map each diagnosed ``Finding.signal`` to the
-# LEAST-privileged action that resolves it.
+# The heal model (spec §2): map each diagnosed ``Finding.signal`` to the action
+# that resolves it, tiered by privilege:
 #
 #   * RBAC tier  — an in-cluster ``kubectl rollout restart deployment/istiod``.
 #     No host privilege, no Q3 trigger; a stale/degraded control plane is re-
@@ -281,6 +281,26 @@ class UnconfiguredHealer:
 #     ClusterIP-DNAT re-settle, which needs root the runner MUST NOT hold. This
 #     is the ONLY tier that crosses the Q3 privilege boundary, and it does so
 #     through exactly one narrow method, :meth:`PrivilegedHealer._trigger_host_resettle`.
+#
+# Escalation ORDER (fixed 2026-08-02, marker WS5-HEALER-ESC-20260802; see
+# :meth:`PrivilegedHealer.heal`): host-root is checked BEFORE RBAC, not "least
+# privilege first". A host-root signal is the DEEPER fault — RBAC's rollout
+# restart cannot fix a broken node route — so when both tiers' signals are
+# present simultaneously (the real #307 shape: ``istiod-api-unreachable`` +
+# ``istiod-not-ready`` together), checking RBAC first stalls the bounded heal
+# loop in a tier that can never converge and starves the tier that would.
+#
+# FALL-THROUGH on "not installed" (fixed 2026-08-02, same marker; reviewer
+# REJECT item 4): host-root only OWNS the call when it can actually ACT. If
+# Option-B is not installed here, the host-root tier self-gates to a no-op
+# before ever touching the privilege boundary, and ``heal`` falls through to
+# the RBAC tier as a best-effort fallback — preserving the class-level
+# ``available`` guarantee ("RBAC-tier heal available on ANY reachable
+# cluster, even before the units are installed") for the co-occurring-signal
+# case too. A host-root attempt that genuinely FIRED (performed, timed out,
+# or refused) does NOT fall through: RBAC cannot fix a route loss, so trying
+# it would waste a bounded attempt; the gate's own retry/re-diagnose loop is
+# the correct mechanism for that outcome.
 
 # RBAC-tier signals — healed by an in-cluster istiod rollout restart.
 RBAC_RESTART_SIGNALS = frozenset(
@@ -305,6 +325,16 @@ DEFAULT_MESH_HEAL_DIR = "/var/lib/audittrace/mesh-heal"
 # Bounded poll for the async root-unit result (Option B is fire-a-file + wait).
 DEFAULT_RESETTLE_TIMEOUT = 120.0
 DEFAULT_RESETTLE_POLL = 3.0
+
+# WS5 escalation fix (2026-08-02, marker WS5-HEALER-ESC-20260802): the RBAC-tier
+# rollout-status wait is a SEPARATE, SHORTER bound from the host-root poll above.
+# Before this split both tiers shared ``DEFAULT_RESETTLE_TIMEOUT`` (120s), so two
+# heal attempts stuck in the RBAC tier could burn 2*120s=240s and blow a case's
+# 180s budget. RBAC rollout-status is a fast in-cluster wait (no root op, no
+# systemd round-trip) so it does not need anywhere near the host-root budget;
+# 40s is generous for an istiod re-roll while leaving headroom for a later
+# host-root attempt within the same case budget.
+DEFAULT_RBAC_ROLLOUT_TIMEOUT = 40.0
 
 
 def mesh_heal_dir() -> Path:
@@ -332,8 +362,13 @@ class PrivilegedHealer:
     installed — and an unreachable cluster keeps the gate failing closed. The
     host-root re-settle tier SELF-GATES on the install via
     :meth:`_host_root_installed` inside :meth:`_trigger_host_resettle`, so an
-    uninstalled host still fails closed for that fault class (no request written,
-    no raise → the gate re-diagnoses → UNSAFE).
+    uninstalled host still fails closed for a HOST-ROOT-ONLY fault class (no
+    request written, no raise → the gate re-diagnoses → UNSAFE). When a
+    host-root signal co-occurs with an RBAC-fixable one on an uninstalled host
+    (fix 2026-08-02, marker WS5-HEALER-ESC-20260802, reviewer REJECT item 4),
+    :meth:`heal` falls through to the RBAC tier instead of returning that
+    no-op directly — so the ``available`` guarantee above holds for that
+    co-occurring cell too, not only the host-root-only case.
 
     ``heal`` performs at most ONE bounded action per call (the gate owns the
     retry/backoff loop and re-diagnoses after each). It NEVER raises to mean
@@ -348,10 +383,12 @@ class PrivilegedHealer:
         *,
         resettle_timeout: float = DEFAULT_RESETTLE_TIMEOUT,
         resettle_poll: float = DEFAULT_RESETTLE_POLL,
+        rbac_rollout_timeout: float = DEFAULT_RBAC_ROLLOUT_TIMEOUT,
     ) -> None:
         self._heal_dir = heal_dir or mesh_heal_dir()
         self._resettle_timeout = resettle_timeout
         self._resettle_poll = resettle_poll
+        self._rbac_rollout_timeout = rbac_rollout_timeout
 
     @property
     def _requests_dir(self) -> Path:
@@ -400,7 +437,14 @@ class PrivilegedHealer:
         return True, proc.stdout
 
     def _restart_istiod(self, finding: Finding) -> HealAttempt:
-        """RBAC tier: re-roll istiod (idempotent) + a bounded readiness wait."""
+        """RBAC tier: re-roll istiod (idempotent) + a bounded readiness wait.
+
+        The readiness wait uses ``_rbac_rollout_timeout`` — a SHORTER, separate
+        bound from the host-root poll's ``_resettle_timeout`` (WS5 escalation
+        fix, marker WS5-HEALER-ESC-20260802). Sharing one timeout let an RBAC
+        wait alone consume the whole heal-attempt budget; splitting it leaves
+        headroom for a later host-root attempt within the same case budget.
+        """
         ok, out = self._kubectl(
             [
                 "rollout",
@@ -426,7 +470,7 @@ class PrivilegedHealer:
                 f"deployment/{ISTIOD_DEPLOYMENT}",
                 "-n",
                 ISTIO_NAMESPACE,
-                f"--timeout={int(self._resettle_timeout)}s",
+                f"--timeout={int(self._rbac_rollout_timeout)}s",
             ]
         )
         return HealAttempt(
@@ -517,19 +561,65 @@ class PrivilegedHealer:
         )
 
     def heal(self, diagnosis: Diagnosis) -> HealAttempt:
-        """One bounded, least-privileged action for the given diagnosis.
+        """One bounded action for the given diagnosis, root-cause-first.
 
-        Least-privilege ordering: try an RBAC-tier istiod re-roll first; only if
-        no RBAC-tier finding is present fall through to the host-root re-settle.
-        With the gate's bounded retry loop this converges (attempt 1 re-rolls
-        istiod, re-diagnose, attempt 2 re-settles the host if still degraded).
+        Escalation ordering (WS5 fix, marker WS5-HEALER-ESC-20260802): a
+        HOST-ROOT signal is checked BEFORE an RBAC signal, because host-root is
+        the DEEPER fault when both are present — a broken node route (the real
+        #307 shape) always manifests as ``istiod-api-unreachable`` (host-root,
+        root cause) together with ``istiod-not-ready`` (RBAC, symptom of the
+        same break). RBAC's ``kubectl rollout restart`` cannot fix a route loss,
+        so checking RBAC first would loop the bounded heal budget in a tier that
+        never converges and never reach the tier that does. Only when NO
+        host-root signal is present does an RBAC-tier finding get actioned
+        (e.g. an istiod-only fault with no node/route breakage — still the
+        least-privileged fix for that class).
+
+        Fall-through on "not installed" (fix 2026-08-02, same marker; reviewer
+        REJECT item 4): a host-root signal only gets to OWN the call when the
+        host-root tier can actually act on it. If Option-B is not installed on
+        this host, :meth:`_trigger_host_resettle` self-gates to a no-op
+        (``action="none"``) *before* touching the privilege boundary — and in
+        that specific case ``heal`` falls through to the RBAC tier as a
+        best-effort fallback, so the class-level ``available`` guarantee
+        ("RBAC-tier heal available on ANY reachable cluster, even before the
+        units are installed") holds even when a host-root-whitelisted signal
+        happens to co-occur. A host-root attempt that genuinely FIRED
+        (performed, timed out, or refused as un-whitelisted) does NOT fall
+        through: RBAC cannot fix a route loss, so trying it would only waste a
+        bounded attempt — the gate's own retry/re-diagnose loop is the correct
+        mechanism for that outcome, not an in-call fallback.
+
+        With the gate's bounded retry loop this converges: co-present signals
+        on an INSTALLED host re-settle on attempt 1; an RBAC-only fault
+        re-rolls istiod on attempt 1; co-present signals on an UNINSTALLED
+        host fall through to that same RBAC re-roll on attempt 1 instead of a
+        silent no-op.
         """
+        host_root_finding = next(
+            (f for f in diagnosis.findings if f.signal in HOST_RESETTLE_WHITELIST),
+            None,
+        )
+        if host_root_finding is not None:
+            attempt = self._trigger_host_resettle(host_root_finding)
+            if attempt.action != "none":
+                # A genuine host-root attempt fired (performed, timed out, or
+                # refused) — host-root owns this call. RBAC cannot fix a route
+                # loss, so no in-call fallback; the gate's bounded retry loop
+                # re-diagnoses and decides.
+                return attempt
+            # action == "none": Option-B isn't installed here. Fall through to
+            # the RBAC tier so a co-occurring RBAC-fixable signal still gets a
+            # best-effort remediation attempt instead of a silent no-op.
+            for finding in diagnosis.findings:
+                if finding.signal in RBAC_RESTART_SIGNALS:
+                    return self._restart_istiod(finding)
+            # No RBAC-tier signal to fall back to either: this is the
+            # original host-root-only, uninstalled no-op — still fails closed.
+            return attempt
         for finding in diagnosis.findings:
             if finding.signal in RBAC_RESTART_SIGNALS:
                 return self._restart_istiod(finding)
-        for finding in diagnosis.findings:
-            if finding.signal in HOST_RESETTLE_WHITELIST:
-                return self._trigger_host_resettle(finding)
         return HealAttempt(
             performed=False,
             action="none",
