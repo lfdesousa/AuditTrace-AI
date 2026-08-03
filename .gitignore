@@ -130,7 +130,17 @@ scripts/deploy/runs/
 # PR-body content is PRIVATE — it lives in
 # ~/work/audittrace-private/pr-bodies/ and is only ever pointed to via the
 # PR_BODY env var (see .githooks/pre-push, #397). This repo never tracks a
-# PR body; the guard below stops a stray copy from ever being staged from
-# the repo root.
-/PR-BODY-*.md
-/*.pr-body.md
+# PR body; the guard below stops a stray copy from ever being staged,
+# anywhere in the tree (no leading `/`, so it matches at any depth, not
+# just the repo root).
+#
+# Matches the documented PR-body-authoring convention basename PR-BODY.md
+# (feedback_gh_pr_body_from_file) PLUS any case variant / prefixed /
+# suffixed shape (PR-BODY-393.md, my-PR-BODY-thing.md, pr-body.md, ...).
+# A single `/PR-BODY-*.md` glob (the original, too-narrow guard) missed
+# the bare `PR-BODY.md` convention name and the lowercase spelling —
+# caught by review 2026-08-03; verified below with `git check-ignore -v`
+# and pinned by tests/test_gitignore_pr_body_guard.py.
+*PR-BODY*.md
+*pr-body*.md
+*.pr-body.md
