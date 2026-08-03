@@ -1,4 +1,4 @@
-.PHONY: help venv install lint security-lint test test-cov test-coverage clean \
+.PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body
 
@@ -21,8 +21,12 @@ install: venv ## Install all dependencies (including dev)
 	@.venv/bin/pip install -e ".[dev]"
 	@echo "✅ Dependencies installed"
 	@.venv/bin/pre-commit install
+	@$(MAKE) install-hooks
 	@echo ""
 	@echo "Run tests: make test"
+
+install-hooks: ## Install the tracked pre-push hook (.githooks/pre-push -> git hooks dir). Idempotent, composes with gitleaks; does NOT touch core.hooksPath (pre-commit refuses `install` when it's set — see scripts/install-git-hooks.sh). #397.
+	@bash scripts/install-git-hooks.sh
 
 lint: security-lint ## Run linting and formatting (includes the offline security-lint gate)
 	@echo "🔍 Running linter..."
@@ -66,7 +70,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -104,7 +108,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "✅ Tests passed"

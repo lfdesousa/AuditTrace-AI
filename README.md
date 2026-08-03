@@ -41,7 +41,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 2165 tests, 98% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 2203 tests, 98% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
@@ -130,7 +130,7 @@ The same script works for both runtimes — only the in-runtime shippers (OTel C
 # or
 make install
 
-# Run tests (90% per-file coverage enforced; full suite is 2165 tests / 98% total)
+# Run tests (90% per-file coverage enforced; full suite is 2203 tests / 98% total)
 make test
 
 # Run RLS integration tests against an ephemeral docker postgres on :15432
