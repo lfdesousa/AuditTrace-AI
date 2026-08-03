@@ -1,0 +1,66 @@
+meta {
+  name: POST /v1/chat/completions (recall-paged, reviewer helper)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/v1/chat/completions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "model": "audittrace-default",
+    "messages": [
+      { "role": "user", "content": "{{recallPagedPrompt}}" }
+    ],
+    "stream": false,
+    "max_tokens": 1024
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("OpenAI choices shape preserved (feedback_openai_schema_inviolate)", function() {
+    const body = res.getBody();
+    expect(body.choices).to.be.an("array");
+    expect(body.choices[0].message.role).to.equal("assistant");
+    expect(body.choices[0].message.content).to.be.a("string");
+  });
+}
+
+docs {
+  Builder-added (ADR-059 loop, 2026-08-03 — backlog #15 residual, #375 /
+  RECALL-PAGINATION-20260803): the recall-tool equivalent of
+  `01b-list-paged.bru`. Recall tools (`recall_decisions`/`recall_skills`/
+  `recall_semantic`/`recall_recent_sessions`) are NOT a standalone REST
+  endpoint — they are invoked by the LLM inside the `/v1/chat/completions`
+  tool-call loop — so this helper is a templated chat-completions call
+  (same pattern as `02b-chat-completions-custom.bru`) whose `userPrompt`
+  env var asks the model to page a recall tool forward.
+
+  Set `recallPagedPrompt` to something like:
+
+    "Call recall_decisions with query='<marker text>' and offset=0 first.
+     If has_more is true, call it again with offset=5 (or offset += limit)
+     until you find <marker text> or has_more is false. Report the total,
+     has_more, and which offset surfaced it."
+
+  This is what proves, through the real chat surface (not a direct tool
+  invocation), that the tool SCHEMA alone teaches the model to page
+  forward instead of re-issuing the same query (R3) — the exact failure
+  mode that stalled a reviewer on 2026-08-02 (recall time-box `2b407e7`).
+
+  For a deterministic, non-LLM-dependent proof of the same pagination
+  mechanics, see `tests/test_memory_tool_handlers.py::
+  TestRecallDecisionsPaginationEndToEnd` (invokes the tool handler
+  directly against a seeded ChromaDB collection).
+}

@@ -85,6 +85,7 @@ from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.layer_listing import list_layer_objects
 from audittrace.services.memory_manifest import ManifestEntry
+from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
@@ -912,6 +913,11 @@ def _sort_and_paginate(
     ``key`` sort coalesces to ``""``, so no comparison ever touches ``None``
     (backlog #15, R5). Ties break on the object ``key`` ascending regardless
     of ``order`` (stable secondary sort) so paging is deterministic.
+
+    The sort/slice mechanic itself is the shared
+    :func:`audittrace.services.pagination.sort_and_paginate` core (backlog
+    #15 R2b / #375) — only the field-name-to-key-function mapping below is
+    specific to this endpoint's manifest-row shape.
     """
 
     def _int_key(field: str) -> Callable[[dict[str, Any]], Any]:
@@ -932,14 +938,14 @@ def _sort_and_paginate(
     else:
         primary = _int_key(_SORT_FIELD_MS.get(sort, "created_at_ms"))
 
-    # Stable secondary sort (key ascending) first, then the primary sort —
-    # Python's sort is stable, so equal-primary items keep the key-asc order.
-    ordered = sorted(items, key=lambda item: str(item.get("key") or ""))
-    ordered = sorted(ordered, key=primary, reverse=(order != "asc"))
-
-    total = len(ordered)
-    page = ordered[offset : offset + limit]
-    return page, total
+    return _core_sort_and_paginate(
+        items,
+        key_fn=primary,
+        tiebreak_fn=_str_key,
+        reverse=(order != "asc"),
+        limit=limit,
+        offset=offset,
+    )
 
 
 async def _merge_layer_items_with_s3(
