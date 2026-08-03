@@ -70,7 +70,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -108,7 +108,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "✅ Tests passed"
@@ -298,6 +298,9 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@echo "  3. open release PR; after merge, tag v$(VERSION) on main"
 	@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"
 	@echo "  5. helm upgrade --reset-then-reuse-values --set memoryServer.image.tag=v$(VERSION)"
+
+release-cut: ## Deterministic release CUT via the runner (#398): bump+gate+branch+push; NEVER tags. Usage: make release-cut VERSION=1.0.14 [DRY_RUN=1]
+	@python -m scripts.release.runner --version $(VERSION) $(if $(DRY_RUN),--dry-run,)
 
 k8s-install: k8s-deps deploy-preflight ## Install the Helm chart on k3s (gated by preflight; pins the internal image repository — #394)
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -

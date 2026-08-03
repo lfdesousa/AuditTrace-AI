@@ -181,8 +181,10 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # reachable via BOTH. `scripts/hooks` (#397, the pre-push hook's decision
 # logic package — `scripts/hooks/prepush_pr_body_gate.py`) joins it the same
 # way, so the new Python helper is subject to the same per-file gate as
-# everything else. No other `scripts/*` module is dragged into the gate.
-source = ["audittrace", "scripts/deploy", "scripts/hooks"]
+# everything else. `scripts/release` (#398, the deterministic release-cut
+# runner) joins the same way for the same reason. No other `scripts/*`
+# module is dragged into the gate.
+source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet
