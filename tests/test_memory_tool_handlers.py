@@ -1014,3 +1014,424 @@ class TestRecallReadsVectorStore383:
         assert m["source"] == "ADR-060.md"  # read-follow-up filename …
         assert m["id"] == "decisions:ADR-060.md:0"  # … durable chunk id for audit
         assert m["distance"] is not None  # vector store → non-null distance
+
+
+# ── Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803) ────
+
+
+class TestRecallToolPaginationShape:
+    """R2: every recall tool's response gains
+    ``limit``/``offset``/``sort``/``order``/``has_more``, and ``truncated``
+    becomes a DEPRECATED alias of ``has_more`` (no longer hardcoded False)."""
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_response_has_pagination_fields(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache compression"}, session_id="sess-1"
+        )
+        assert set(result.keys()) >= {
+            "matches",
+            "total",
+            "limit",
+            "offset",
+            "sort",
+            "order",
+            "has_more",
+            "truncated",
+        }
+        assert result["limit"] == 5  # _DISCOVERY_K
+        assert result["offset"] == 0
+        assert result["sort"] == "relevance"
+        assert result["order"] == "asc"
+        assert result["has_more"] is False
+        assert result["truncated"] == result["has_more"]
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_response_has_pagination_fields(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "OAuth2"}, session_id="sess-1"
+        )
+        assert result["limit"] == 5
+        assert result["offset"] == 0
+        assert result["truncated"] == result["has_more"]
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_response_has_pagination_fields(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "k": 4}, session_id="sess-1"
+        )
+        assert result["limit"] == 4
+        assert result["offset"] == 0
+        assert result["truncated"] == result["has_more"]
+
+    @pytest.mark.asyncio
+    async def test_recall_recent_sessions_response_has_pagination_fields(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+        result, _ = await invoke_tool(
+            user, tool, {"project": "AuditTrace", "n": 5}, session_id="sess-1"
+        )
+        assert result["limit"] == 5
+        assert result["offset"] == 0
+        assert result["sort"] == "recency"
+        assert result["order"] == "desc"
+        assert result["truncated"] == result["has_more"]
+
+
+class TestRecallToolPaginationValidation:
+    """Bad offset/sort/order args return an ``{"error": ...}`` dict — same
+    convention as the pre-existing query/k/n/project validation."""
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_bad_offset_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "offset": "not-a-number"}, "sess-1"
+        )
+        assert "error" in result
+        assert "offset" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_negative_offset_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "offset": -1}, "sess-1"
+        )
+        assert "error" in result
+        assert "offset" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_bad_sort_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "sort": "bogus"}, "sess-1"
+        )
+        assert "error" in result
+        assert "sort" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_bad_order_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "order": "sideways"}, "sess-1"
+        )
+        assert "error" in result
+        assert "order" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_bad_offset_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "oauth2", "offset": "nope"}, "sess-1"
+        )
+        assert "error" in result
+        assert "offset" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_bad_sort_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "oauth2", "sort": "bogus"}, "sess-1"
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_bad_offset_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "offset": "nope"}, "sess-1"
+        )
+        assert "error" in result
+        assert "offset" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_bad_sort_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "sort": "bogus"}, "sess-1"
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_bad_order_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache", "order": "bogus"}, "sess-1"
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_recall_recent_sessions_bad_offset_returns_error(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+        result, _ = await invoke_tool(
+            user,
+            tool,
+            {"project": "AuditTrace", "offset": "nope"},
+            "sess-1",
+        )
+        assert "error" in result
+        assert "offset" in result["error"]
+
+
+class TestRecallToolSchemasAdvertisePagination:
+    """R3: the LLM must be able to learn it can page from the schema alone
+    — the offset/sort/order params and their docs are advertised, not
+    just accepted."""
+
+    def test_recall_decisions_schema_advertises_offset_sort_order(self):
+        tool = get_tool_by_name("recall_decisions")
+        props = tool.parameters_schema["properties"]
+        assert "offset" in props
+        assert "sort" in props
+        assert "order" in props
+        assert "has_more" in props["offset"]["description"]
+        assert set(props["sort"]["enum"]) == {"relevance", "recency", "id"}
+        assert set(props["order"]["enum"]) == {"asc", "desc"}
+
+    def test_recall_skills_schema_advertises_offset_sort_order(self):
+        tool = get_tool_by_name("recall_skills")
+        props = tool.parameters_schema["properties"]
+        assert {"offset", "sort", "order"} <= props.keys()
+
+    def test_recall_semantic_schema_advertises_offset_sort_order(self):
+        tool = get_tool_by_name("recall_semantic")
+        props = tool.parameters_schema["properties"]
+        assert {"offset", "sort", "order"} <= props.keys()
+
+    def test_recall_recent_sessions_schema_advertises_offset_only(self):
+        """recall_recent_sessions is always recency-ordered at the service
+        layer (R2 scoping decision, documented in the handler docstring) —
+        it advertises ``offset`` but deliberately no ``sort``/``order``."""
+        tool = get_tool_by_name("recall_recent_sessions")
+        props = tool.parameters_schema["properties"]
+        assert "offset" in props
+        assert "sort" not in props
+        assert "order" not in props
+
+
+class _OrderedConversationalService:
+    """Test double whose ``load_sessions`` returns a FIXED,
+    already-recency-descending list truncated to ``n`` — mirrors
+    ``PostgresConversationalService``'s ``ORDER BY date DESC LIMIT n``
+    stable-prefix property (a bigger ``n`` is a stable EXTENSION of a
+    smaller one). ``MockConversationalService``'s ``filtered[-n:]``
+    slicing does NOT guarantee that property (each ``n`` re-anchors from
+    the END of the full list, so a bigger window can shift EVERY item,
+    not just add trailing ones) — harmless for the pre-existing single-call
+    usage, but it makes ``MockConversationalService`` unsuitable for
+    testing the offset+growing-window pagination added by this change. This
+    double isolates the handler's own offset/window/slice arithmetic from
+    that mock-only quirk (services/conversational.py is out of this
+    change's scope — see the spec's file list)."""
+
+    def __init__(self, sessions: list[dict[str, Any]]):
+        self._sessions = sessions  # already newest-first
+
+    async def load_sessions(
+        self, user_context: Any, project: str, n: int = 5
+    ) -> list[dict[str, Any]]:
+        del user_context, project
+        return self._sessions[:n]
+
+
+class TestRecallRecentSessionsPagination:
+    @pytest_asyncio.fixture
+    async def _many_sessions_container(self):
+        c = create_test_container()
+        sessions = [
+            {
+                "id": f"sess-{i}",
+                "date": f"2026-08-{i:02d}",
+                "summary": f"session summary {i}",
+                "key_points": ["decided X"] if i % 2 == 0 else [],
+                "synthetic": False,
+            }
+            for i in range(5)
+        ]
+        c._instances["conversational"] = _OrderedConversationalService(sessions)
+        prior = dependencies.container
+        dependencies.container = c
+        yield c
+        dependencies.container = prior
+
+    @pytest.mark.asyncio
+    async def test_offset_pages_past_first_n_sessions(
+        self, _many_sessions_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+
+        page0, _ = await invoke_tool(
+            user, tool, {"project": "AuditTrace", "n": 2, "offset": 0}, "sess-1"
+        )
+        page1, _ = await invoke_tool(
+            user, tool, {"project": "AuditTrace", "n": 2, "offset": 2}, "sess-2"
+        )
+        assert len(page0["matches"]) == 2
+        assert len(page1["matches"]) == 2
+        assert [m["title"] for m in page0["matches"]] == ["sess-0", "sess-1"]
+        assert [m["title"] for m in page1["matches"]] == ["sess-2", "sess-3"]
+        # "+1 probe" semantics (same honest-lower-bound rationale as
+        # ChromaSemanticService.search_page): total is the number of
+        # sessions actually fetched within the probe window, not
+        # necessarily the full 5-session corpus — but has_more is always
+        # correct because a saturated window always fetches at least one
+        # more than the page itself.
+        assert page0["total"] == 3  # window = min(0+2+1, 500) = 3
+        assert page0["has_more"] is True
+        assert page1["total"] == 5  # window = min(2+2+1, 500) = 5 (all of it)
+        assert page1["has_more"] is True  # sess-4 still unseen
+
+    @pytest.mark.asyncio
+    async def test_offset_beyond_total_returns_empty_page_and_no_more(
+        self, _many_sessions_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+        result, _ = await invoke_tool(
+            user,
+            tool,
+            {"project": "AuditTrace", "n": 5, "offset": 100},
+            "sess-1",
+        )
+        assert result["matches"] == []
+        assert result["has_more"] is False
+
+    @pytest.mark.asyncio
+    async def test_key_points_and_synthetic_flag_render_in_snippet(
+        self, _many_sessions_container, _fakeredis_cache
+    ):
+        """Covers the key_points-present branch (session 0, even index)
+        alongside the existing no-key-points coverage from
+        TestCanonicalShape."""
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+        result, _ = await invoke_tool(
+            user, tool, {"project": "AuditTrace", "n": 5, "offset": 0}, "sess-1"
+        )
+        snippets = " ".join(m["snippet"] for m in result["matches"])
+        assert "Key points: decided X" in snippets
+
+    @pytest.mark.asyncio
+    async def test_synthetic_session_flag_prefixes_snippet(self, _fakeredis_cache):
+        """ADR-030 Part 1: a draft (not-yet-summarised) session is flagged
+        inline so the LLM treats it as lower confidence."""
+        c = create_test_container()
+        c._instances["conversational"] = _OrderedConversationalService(
+            [
+                {
+                    "id": "sess-draft",
+                    "date": "2026-08-03",
+                    "summary": "draft session",
+                    "key_points": [],
+                    "synthetic": True,
+                }
+            ]
+        )
+        prior = dependencies.container
+        dependencies.container = c
+        try:
+            user = sentinel_user_context()
+            tool = get_tool_by_name("recall_recent_sessions")
+            result, _ = await invoke_tool(
+                user, tool, {"project": "AuditTrace"}, "sess-1"
+            )
+        finally:
+            dependencies.container = prior
+        assert result["matches"][0]["snippet"].startswith(
+            "[draft — not yet summarised]"
+        )
+
+
+class TestRecallDecisionsPaginationEndToEnd:
+    """Through the TOOL layer (invoke_tool), against a REAL
+    ChromaSemanticService over MockChromaDBFactory — the DoD scenario: a
+    marker seeded past the discovery ``k`` is unreachable at ``offset=0``
+    but reachable once the caller pages forward."""
+
+    @pytest.mark.asyncio
+    async def test_offset_reaches_marker_beyond_discovery_k(
+        self, _fakeredis_cache, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "audittrace.services.semantic.embed_via_nomic",
+            AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+        )
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        col = await client.get_or_create_collection(name="decisions_v2")
+        ids = [f"d{i:03d}" for i in range(20)]
+        documents = [f"filler decision {i}" for i in range(20)]
+        documents[12] = "MARKER-20260803 pagination reachability decision"
+        metadatas = [{"source": f"ADR-{i:03d}.md"} for i in range(20)]
+        await col.add(ids=ids, documents=documents, metadatas=metadatas)
+        service = ChromaSemanticService(
+            client=client,
+            default_collections=["decisions"],
+            embed_url="",
+            embed_model="nomic-embed-text",
+        )
+        c = create_test_container()
+        c._instances["semantic"] = service
+        prior = dependencies.container
+        dependencies.container = c
+        try:
+            user = sentinel_user_context()
+            tool = get_tool_by_name("recall_decisions")
+
+            page0, _ = await invoke_tool(
+                user, tool, {"query": "filler", "offset": 0}, "sess-1"
+            )
+            page1, _ = await invoke_tool(
+                user, tool, {"query": "filler", "offset": 12}, "sess-2"
+            )
+        finally:
+            dependencies.container = prior
+
+        assert not any("MARKER" in m["snippet"] for m in page0["matches"])
+        assert page0["has_more"] is True
+        assert any("MARKER" in m["snippet"] for m in page1["matches"])

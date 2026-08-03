@@ -1,10 +1,10 @@
 """Memory tool handlers (ADR-025 §Decision.1).
 
 The four tools exposed to the LLM by the proxy-internal tool-call loop.
-Each handler is a thin adapter from the canonical
-``{matches, total, truncated}`` tool result schema to the underlying
-memory service. All four handlers share the same shape so the LLM sees
-a stable result schema regardless of which layer answered.
+Each handler is a thin adapter from the canonical recall-tool result
+schema to the underlying memory service. All four handlers share the same
+shape so the LLM sees a stable result schema regardless of which layer
+answered.
 
 Handler contract (observed by every handler in this file):
 
@@ -12,11 +12,38 @@ Handler contract (observed by every handler in this file):
     always threaded into the underlying service's per-user filter.
   - Second positional argument is ``args: dict`` — the JSON payload
     the LLM produced for this tool call.
-  - Returns a dict. On success the dict is
-    ``{"matches": [...], "total": N, "truncated": bool}``. On known
-    bad input (e.g. missing required argument) the dict is
+  - Returns a dict. On success the dict is::
+
+        {
+            "matches": [...],
+            "total": N,        # true candidate count, bounded by
+                                # MAX_RECALL_WINDOW — NOT len(matches)
+            "limit": k,
+            "offset": offset,
+            "sort": "relevance" | "recency" | "id",
+            "order": "asc" | "desc",
+            "has_more": bool,  # offset + limit < total
+            "truncated": bool, # DEPRECATED alias of has_more — see
+                                # CHANGELOG note below. Removed one
+                                # release after 2026-08-03.
+        }
+
+    On known bad input (e.g. missing required argument) the dict is
     ``{"error": "..."}``. Unexpected exceptions propagate to
     ``tools.invoke_tool`` which wraps them as ``{"error": ...}``.
+
+CHANGELOG (backlog #15 residual, #375 / RECALL-PAGINATION-20260803,
+2026-08-03): recall_decisions/recall_skills/recall_semantic/
+recall_recent_sessions gained ``offset`` (all four) and ``sort``/``order``
+(the three ChromaDB-backed ones) so a caller can page past a relevance
+cut-off instead of being stuck re-issuing the same query. ``total`` used
+to be ``len(matches)`` (a lie — it was always <= the requested page size,
+so a caller could never tell how much more existed); it is now the true
+candidate count up to ``MAX_RECALL_WINDOW`` (services/semantic.py). A call
+with none of the new params returns the exact same top-k as before this
+change (backward-compat, R2/R6). ``truncated`` is kept as a DEPRECATED
+alias of ``has_more`` for one release; new callers should read
+``has_more``.
 
 The handlers do NOT check the scope gate — that is enforced at tool
 advertisement time by ``tools_visible_to``. By the time the tool-call
@@ -40,6 +67,7 @@ from audittrace.dependencies import (
     get_semantic_service,
 )
 from audittrace.identity import UserContext
+from audittrace.services.semantic import MAX_RECALL_WINDOW, SearchPage
 from audittrace.tools import register_memory_tool
 
 logger = logging.getLogger(__name__)
@@ -59,6 +87,72 @@ _SNIPPET_LIMIT = 400
 # substring hit; a vector store needs a bounded top-k. Kept small because these
 # are discovery previews (pick a candidate → read the full .md), not answers.
 _DISCOVERY_K = 5
+
+# Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803).
+_VALID_SORT = {"relevance", "recency", "id"}
+_VALID_ORDER = {"asc", "desc"}
+
+_PAGE_DOC = (
+    "Page forward when has_more is true by re-calling with a larger "
+    "offset (offset += limit) — do NOT re-issue the same query to find "
+    "more; the response's top-k already contains everything reachable "
+    "without paging."
+)
+_SORT_DOC = (
+    "Result order. 'relevance' (default) = closest semantic match first. "
+    "'recency' = newest first — turns recall into a pageable enumeration "
+    "over the whole collection, useful when you know roughly what you're "
+    "looking for but relevance ranking keeps missing it. 'id' = stable "
+    "lexicographic order, useful for exhaustive paging."
+)
+_ORDER_DOC = (
+    "Sort direction. Defaults to 'asc' for relevance/id and 'desc' "
+    "(newest-first) for recency."
+)
+
+
+def _parse_offset(args: dict[str, Any], tool_name: str) -> int | dict[str, Any]:
+    """Parse+validate the optional ``offset`` arg. Returns the int (>=0) on
+    success, or an ``{"error": ...}`` dict on bad input — the same
+    convention every other arg parser in this module follows."""
+    offset_raw = args.get("offset", 0)
+    try:
+        offset = int(offset_raw)
+    except (TypeError, ValueError):
+        return {"error": f"{tool_name}: 'offset' must be an integer"}
+    if offset < 0:
+        return {"error": f"{tool_name}: 'offset' must be >= 0"}
+    return offset
+
+
+def _parse_sort_order(
+    args: dict[str, Any], tool_name: str
+) -> tuple[str, str | None] | dict[str, Any]:
+    """Parse+validate the optional ``sort``/``order`` args. Returns
+    ``(sort, order)`` on success (``order`` may be ``None`` — the service
+    layer applies the per-sort default) or an ``{"error": ...}`` dict."""
+    sort = args.get("sort", "relevance")
+    if sort not in _VALID_SORT:
+        return {"error": f"{tool_name}: 'sort' must be one of {sorted(_VALID_SORT)}"}
+    order = args.get("order")
+    if order is not None and order not in _VALID_ORDER:
+        return {"error": f"{tool_name}: 'order' must be one of {sorted(_VALID_ORDER)}"}
+    return sort, order
+
+
+def _page_fields(page: SearchPage) -> dict[str, Any]:
+    """The pagination tail shared by every recall tool's response —
+    ``total``/``limit``/``offset``/``sort``/``order``/``has_more`` plus the
+    DEPRECATED ``truncated`` alias (R2, one-release compat window)."""
+    return {
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+        "sort": page.sort,
+        "order": page.order,
+        "has_more": page.has_more,
+        "truncated": page.has_more,
+    }
 
 
 def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +223,23 @@ def _recall_identity_fields(metadata: dict[str, Any]) -> dict[str, Any]:
                     "'KV cache compression' or 'OAuth2 token validation'."
                 ),
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -149,19 +260,34 @@ async def recall_decisions(
     """Discover decisions (ADRs) via the ChromaDB ``decisions`` vector
     collection (#383), shaped into the canonical tool-result schema.
 
-    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search_page``
     with ``collections=["decisions"]`` and the per-user ``where`` filter (the
     service derives it from ``user_context``). The match's ``source`` field
     stays the ``.md`` filename the indexer stamps (``metadata["source"]``), so
-    the model can chain recall → ``read_decision`` unchanged.
+    the model can chain recall → ``read_decision`` unchanged. Pagination
+    (offset/sort/order) — see the module CHANGELOG note.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_decisions: 'query' is required and must be a string"}
 
+    offset = _parse_offset(args, "recall_decisions")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_decisions")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(
-        user_context, query, k=_DISCOVERY_K, collections=["decisions"]
+    page = await semantic.search_page(
+        user_context,
+        query,
+        k=_DISCOVERY_K,
+        collections=["decisions"],
+        offset=offset,
+        sort=sort,
+        order=order,
     )
     return {
         "matches": [
@@ -182,10 +308,9 @@ async def recall_decisions(
                 # by — never the chunk id. ``file`` is a legacy fallback.
                 "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
 
 
@@ -210,6 +335,23 @@ async def recall_decisions(
                     "'OAuth2 BFF pattern' or 'C4 model Structurizr DSL'."
                 ),
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -227,18 +369,33 @@ async def recall_skills(
     """Discover skills via the ChromaDB ``skills`` vector collection (#383),
     shaped into the canonical tool-result schema.
 
-    Repointed from the S3 keyword layer to ``ChromaSemanticService.search``
+    Repointed from the S3 keyword layer to ``ChromaSemanticService.search_page``
     with ``collections=["skills"]`` and the per-user ``where`` filter. The
     match's ``source`` field stays the ``.md`` filename (``metadata["source"]``)
-    so the model can chain recall → ``read_skill`` unchanged.
+    so the model can chain recall → ``read_skill`` unchanged. Pagination
+    (offset/sort/order) — see the module CHANGELOG note.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_skills: 'query' is required and must be a string"}
 
+    offset = _parse_offset(args, "recall_skills")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_skills")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(
-        user_context, query, k=_DISCOVERY_K, collections=["skills"]
+    page = await semantic.search_page(
+        user_context,
+        query,
+        k=_DISCOVERY_K,
+        collections=["skills"],
+        offset=offset,
+        sort=sort,
+        order=order,
     )
     return {
         "matches": [
@@ -258,10 +415,9 @@ async def recall_skills(
                 # the chunk id.
                 "source": d.metadata.get("source") or d.metadata.get("file", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
 
 
@@ -293,6 +449,12 @@ async def recall_skills(
                 "minimum": 1,
                 "maximum": 50,
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
         },
         "required": ["project"],
     },
@@ -306,6 +468,24 @@ async def recall_recent_sessions(
     Session key points are appended to the ``snippet`` field so the LLM
     sees them inline without the schema needing a bespoke ``key_points``
     column.
+
+    Sessions are ALREADY ordered by recency (most-recent-first) at the
+    service layer — there is no relevance ranking to sort by here, so this
+    tool advertises ``offset`` only (R2) and reports a fixed
+    ``sort="recency"``/``order="desc"`` in the response rather than
+    exposing a ``sort``/``order`` request param that would have no other
+    valid value (a deliberate scoping choice, unlike the three ChromaDB-
+    backed recall tools which mirror the LIST endpoint's full sort
+    vocabulary). ``ConversationalService.load_sessions`` has no native
+    ``offset`` of its own (out of scope for this change — see
+    services/conversational.py), so pagination is applied HERE: request
+    ``offset + n + 1`` sessions (the same "+1 probe" refinement as
+    ``ChromaSemanticService.search_page``'s relevance path — see there for
+    the full rationale), bounded by ``MAX_RECALL_WINDOW``, and slice
+    locally. Without the +1, a fully-filled window makes
+    ``total == offset + n`` exactly and ``has_more`` (``offset + n <
+    total``) would incorrectly read ``False`` even when more sessions
+    exist.
     """
     project = args.get("project")
     if not isinstance(project, str) or not project.strip():
@@ -319,11 +499,19 @@ async def recall_recent_sessions(
     except (TypeError, ValueError):
         return {"error": "recall_recent_sessions: 'n' must be an integer"}
 
+    offset = _parse_offset(args, "recall_recent_sessions")
+    if isinstance(offset, dict):
+        return offset
+
     conversational = get_conversational_service()
-    sessions = await conversational.load_sessions(user_context, project, n)
+    window = min(offset + n + 1, MAX_RECALL_WINDOW)
+    sessions = await conversational.load_sessions(user_context, project, window)
+    total = len(sessions)
+    page_sessions = sessions[offset : offset + n]
+    has_more = offset + n < total
 
     matches: list[dict[str, Any]] = []
-    for s in sessions:
+    for s in page_sessions:
         snippet = s.get("summary", "")[:_SNIPPET_LIMIT]
         key_points = s.get("key_points") or []
         if key_points:
@@ -343,8 +531,13 @@ async def recall_recent_sessions(
         )
     return {
         "matches": matches,
-        "total": len(matches),
-        "truncated": False,
+        "total": total,
+        "limit": n,
+        "offset": offset,
+        "sort": "recency",
+        "order": "desc",
+        "has_more": has_more,
+        "truncated": has_more,
     }
 
 
@@ -373,6 +566,23 @@ async def recall_recent_sessions(
                 "minimum": 1,
                 "maximum": 20,
             },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recency", "id"],
+                "description": _SORT_DOC,
+                "default": "relevance",
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": _ORDER_DOC,
+            },
         },
         "required": ["query"],
     },
@@ -381,7 +591,8 @@ async def recall_recent_sessions(
 async def recall_semantic(
     user_context: UserContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Wrap ``ChromaSemanticService.search`` in the canonical shape."""
+    """Wrap ``ChromaSemanticService.search_page`` in the canonical shape.
+    Pagination (offset/sort/order) — see the module CHANGELOG note."""
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"error": "recall_semantic: 'query' is required and must be a string"}
@@ -392,8 +603,18 @@ async def recall_semantic(
     except (TypeError, ValueError):
         return {"error": "recall_semantic: 'k' must be an integer"}
 
+    offset = _parse_offset(args, "recall_semantic")
+    if isinstance(offset, dict):
+        return offset
+    sort_order = _parse_sort_order(args, "recall_semantic")
+    if isinstance(sort_order, dict):
+        return sort_order
+    sort, order = sort_order
+
     semantic = get_semantic_service()
-    matches = await semantic.search(user_context, query, k=k)
+    page = await semantic.search_page(
+        user_context, query, k=k, offset=offset, sort=sort, order=order
+    )
     return {
         "matches": [
             {
@@ -402,10 +623,9 @@ async def recall_semantic(
                 "snippet": d.page_content,
                 "source": d.metadata.get("collection", ""),
             }
-            for d in matches
+            for d in page.matches
         ],
-        "total": len(matches),
-        "truncated": False,
+        **_page_fields(page),
     }
 
 
