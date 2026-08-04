@@ -108,7 +108,8 @@ class TestUploadAuth:
                 headers={"Authorization": "Bearer fake-token"},
             )
         assert response.status_code == 200
-        assert response.json()["key"] == "episodic/doc.md"
+        # ADR-062 Phase B (WU-B5): private-tier key, not the shared prefix.
+        assert response.json()["key"] == "test-user/episodic/doc.md"
 
     def test_upload_cross_layer_denied(self, client: TestClient) -> None:
         """A ``memory:procedural:write`` token cannot upload to ``layer=episodic``.
@@ -288,61 +289,79 @@ class TestIndexAuth:
 
 
 class TestUpload:
-    """POST /memory/upload stores files in MinIO via the minio SDK."""
+    """POST /memory/upload stores files via the episodic/procedural
+    service's PRIVATE-tier write (ADR-062 Phase B, WU-B5).
+
+    Pre-WU-B5 these asserted a direct ``minio_client.put_object`` call
+    into the shared/corpus bucket unconditionally — that WAS the leak
+    WU-B5 closes (every /memory/upload landed visible to every caller
+    regardless of who uploaded). ``SENTINEL_SUBJECT`` is the bypass-mode
+    caller identity (``require_user`` with auth disabled — the default
+    in this test fixture)."""
+
+    _SENTINEL = "00000000-0000-0000-0000-000000000001"
+
+    @pytest.fixture(autouse=True)
+    def _no_real_minio(self):
+        """``upload_memory_file`` resolves the object-storage client
+        unconditionally near the top (needed by the PDF branch) before
+        it even knows whether this upload is PDF or not — patch it out
+        so the non-PDF tests below don't need real MinIO/AWS creds."""
+        with patch(
+            "audittrace.routes.memory._get_minio_client", return_value=MagicMock()
+        ):
+            yield
 
     def test_upload_stores_in_minio(self, client: TestClient) -> None:
-        """Verify put_object is called with the correct bucket/key/body."""
-        mock_minio = MagicMock()
-        with patch(
-            "audittrace.routes.memory._get_minio_client", return_value=mock_minio
-        ):
-            response = client.post(
-                "/memory/upload",
-                params={"layer": "episodic"},
-                files=_make_upload_file(b"hello world", "ADR-042.md"),
-            )
+        """Verify the private-tier write + response shape."""
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "episodic"},
+            files=_make_upload_file(b"hello world", "ADR-042.md"),
+        )
 
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "uploaded"
-        assert data["key"] == "episodic/ADR-042.md"
+        assert data["tier"] == "private"
+        assert data["key"] == f"{self._SENTINEL}/episodic/ADR-042.md"
         assert data["size_bytes"] == len(b"hello world")
-        assert data["bucket"] == "memory-shared"
+        assert data["bucket"] == "memory-private"
 
-        mock_minio.put_object.assert_called_once()
-        call_args = mock_minio.put_object.call_args
-        assert call_args[0][0] == "memory-shared"  # bucket
-        assert call_args[0][1] == "episodic/ADR-042.md"  # key
+        # Round-trips through the private tier: the caller reads back
+        # their own upload without needing a fresh manifest row.
+        from audittrace.dependencies import get_episodic_service
+
+        ep = get_episodic_service()
+        content = [
+            d for d in ep._private[self._SENTINEL] if d.metadata["file"] == "ADR-042.md"
+        ]
+        assert len(content) == 1
+        assert content[0].page_content == "hello world"
+        assert content[0].metadata["tier"] == "private"
 
     def test_upload_procedural_layer(self, client: TestClient) -> None:
-        """Procedural layer routes to the procedural/ prefix."""
-        mock_minio = MagicMock()
-        with patch(
-            "audittrace.routes.memory._get_minio_client", return_value=mock_minio
-        ):
-            response = client.post(
-                "/memory/upload",
-                params={"layer": "procedural"},
-                files=_make_upload_file(b"skill doc", "SKILL-deploy.md"),
-            )
+        """Procedural layer routes to the caller's private procedural tier."""
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "procedural"},
+            files=_make_upload_file(b"skill doc", "SKILL-deploy.md"),
+        )
 
         assert response.status_code == 200
-        assert response.json()["key"] == "procedural/SKILL-deploy.md"
+        assert response.json()["key"] == f"{self._SENTINEL}/procedural/SKILL-deploy.md"
+        assert response.json()["tier"] == "private"
 
     def test_upload_with_filename_override(self, client: TestClient) -> None:
         """Explicit filename param overrides the upload filename."""
-        mock_minio = MagicMock()
-        with patch(
-            "audittrace.routes.memory._get_minio_client", return_value=mock_minio
-        ):
-            response = client.post(
-                "/memory/upload",
-                params={"layer": "episodic", "filename": "ADR-099.md"},
-                files=_make_upload_file(b"content", "original.md"),
-            )
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "episodic", "filename": "ADR-099.md"},
+            files=_make_upload_file(b"content", "original.md"),
+        )
 
         assert response.status_code == 200
-        assert response.json()["key"] == "episodic/ADR-099.md"
+        assert response.json()["key"] == f"{self._SENTINEL}/episodic/ADR-099.md"
 
     def test_upload_rejects_invalid_layer(self, client: TestClient) -> None:
         """Unknown layer value yields 422 from Pydantic/FastAPI validation."""
@@ -358,18 +377,53 @@ class TestUpload:
         assert response.status_code == 422
 
     def test_upload_minio_failure_returns_502(self, client: TestClient) -> None:
-        """When MinIO is unreachable the endpoint returns 502."""
-        mock_minio = MagicMock()
-        mock_minio.put_object.side_effect = Exception("connection refused")
-        with patch(
-            "audittrace.routes.memory._get_minio_client", return_value=mock_minio
-        ):
+        """When the private-tier object-storage write fails, 502."""
+        from audittrace.dependencies import get_episodic_service
+
+        async def _boom(user, file, content):  # noqa: ANN001, ARG001
+            raise RuntimeError("connection refused")
+
+        with patch.object(get_episodic_service(), "write", side_effect=_boom):
             response = client.post(
                 "/memory/upload",
                 params={"layer": "episodic"},
                 files=_make_upload_file(),
             )
         assert response.status_code == 502
+
+    def test_upload_non_utf8_content_returns_400(self, client: TestClient) -> None:
+        """Non-PDF /memory/upload content must be UTF-8 text — binary
+        garbage that fails to decode is rejected cleanly (400), not a
+        500 from an unhandled UnicodeDecodeError."""
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "episodic"},
+            files=_make_upload_file(b"\xff\xfe\x00binary", "ADR-bin.md"),
+        )
+        assert response.status_code == 400
+
+    def test_upload_promote_corpus_rejected_for_episodic(
+        self, client: TestClient
+    ) -> None:
+        """ADR-062 Phase B (WU-B5): episodic has no declared corpus-write
+        scope — ``?promote=corpus`` is rejected (400), never silently
+        accepted or silently downgraded."""
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "episodic", "promote": "corpus"},
+            files=_make_upload_file(),
+        )
+        assert response.status_code == 400
+
+    def test_upload_promote_corpus_rejected_for_procedural(
+        self, client: TestClient
+    ) -> None:
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "procedural", "promote": "corpus"},
+            files=_make_upload_file(),
+        )
+        assert response.status_code == 400
 
 
 # ── index behaviour ──────────────────────────────────────────────────────────
@@ -2843,6 +2897,577 @@ class TestSemanticEdgeCases:
         assert keys == {"alpha/a-1"}
 
 
+# ── ADR-062 Phase B (WU-B4 + WU-B5) ─────────────────────────────────────────
+#
+# WU-B4: backoffice per-user scoping (manifest `tier` column, owner-or-corpus
+# predicate on list_*/read_*). WU-B5: default-write-private + corpus-write
+# promote gate. Shared helper below swaps the bypass-mode admin sentinel for
+# a plain non-admin identity with an explicit scope set — the shape every
+# scope-gate test in this section needs.
+
+
+def _override_identity(client: TestClient, user_id: str, scopes: tuple[str, ...]):
+    """Swap ``require_user`` for a non-admin ``UserContext``. Caller MUST
+    ``client.app.dependency_overrides.clear()`` in a ``finally`` block."""
+    from audittrace.auth import require_user
+    from audittrace.identity import UserContext
+
+    identity = UserContext(
+        user_id=user_id,
+        username=user_id,
+        agent_type="test",
+        scopes=scopes,
+        is_admin=False,
+    )
+    client.app.dependency_overrides[require_user] = lambda: identity
+    return identity
+
+
+class TestEpisodicProceduralCorpusPromoteRejected:
+    """ADR-062 Phase B (WU-B5): episodic/procedural have no declared
+    corpus-write scope (the ADR-062 §4 frozenset is exactly
+    decisions/skills/semantic — ``TestCorpusScopeGovernance`` in
+    ``test_chart_drift_guards.py`` pins it). A ``tier=corpus`` /
+    ``?promote=corpus`` request on these two layers is therefore
+    rejected (400 — "not supported", not "not authorized"), never
+    silently accepted."""
+
+    def test_create_episodic_default_write_is_private(self, client: TestClient) -> None:
+        r = client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-default.md", "content": "x"},
+        )
+        assert r.status_code == 200
+        assert r.json()["tier"] == "private"
+
+    def test_create_episodic_tier_corpus_in_body_rejected(
+        self, client: TestClient
+    ) -> None:
+        r = client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-nope.md", "content": "x", "tier": "corpus"},
+        )
+        assert r.status_code == 400
+
+    def test_create_episodic_promote_query_rejected(self, client: TestClient) -> None:
+        r = client.post(
+            "/memory/episodic?promote=corpus",
+            json={"filename": "ADR-nope2.md", "content": "x"},
+        )
+        assert r.status_code == 400
+
+    def test_create_procedural_default_write_is_private(
+        self, client: TestClient
+    ) -> None:
+        r = client.post(
+            "/memory/procedural",
+            json={"filename": "SKILL-default.md", "content": "x"},
+        )
+        assert r.status_code == 200
+        assert r.json()["tier"] == "private"
+
+    def test_create_procedural_tier_corpus_in_body_rejected(
+        self, client: TestClient
+    ) -> None:
+        r = client.post(
+            "/memory/procedural",
+            json={"filename": "SKILL-nope.md", "content": "x", "tier": "corpus"},
+        )
+        assert r.status_code == 400
+
+    def test_create_procedural_promote_query_rejected(self, client: TestClient) -> None:
+        r = client.post(
+            "/memory/procedural?promote=corpus",
+            json={"filename": "SKILL-nope2.md", "content": "x"},
+        )
+        assert r.status_code == 400
+
+
+class TestResolveRequestedTierHelper:
+    """Direct unit coverage of ``_resolve_requested_tier`` — the shared
+    body/query parser behind every WU-B5 promote path."""
+
+    def test_no_signal_defaults_private(self) -> None:
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        assert _resolve_requested_tier(None, None) == "private"
+        assert _resolve_requested_tier({}, None) == "private"
+
+    def test_body_tier_private_explicit(self) -> None:
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        assert _resolve_requested_tier({"tier": "private"}, None) == "private"
+
+    def test_body_tier_corpus(self) -> None:
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        assert _resolve_requested_tier({"tier": "corpus"}, None) == "corpus"
+
+    def test_promote_query_corpus(self) -> None:
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        assert _resolve_requested_tier(None, "corpus") == "corpus"
+
+    def test_agreeing_body_and_query_ok(self) -> None:
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        assert _resolve_requested_tier({"tier": "corpus"}, "corpus") == "corpus"
+
+    def test_conflicting_body_and_query_400(self) -> None:
+        from fastapi import HTTPException
+
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        with pytest.raises(HTTPException) as exc_info:
+            _resolve_requested_tier({"tier": "private"}, "corpus")
+        assert exc_info.value.status_code == 400
+
+    def test_garbage_value_400(self) -> None:
+        from fastapi import HTTPException
+
+        from audittrace.routes.memory import _resolve_requested_tier
+
+        with pytest.raises(HTTPException) as exc_info:
+            _resolve_requested_tier({"tier": "public"}, None)
+        assert exc_info.value.status_code == 400
+
+
+class TestSemanticCorpusPromoteGate:
+    """ADR-062 Phase B (WU-B5) — the promote-to-corpus scope gate on
+    ``POST /memory/semantic``.
+
+    FALSIFIABLE: neuter ``_require_corpus_scope`` (e.g. make it always
+    return without raising) and ``test_promote_without_scope_is_denied``
+    goes RED (a writer with no corpus scope promotes successfully);
+    restore it and it goes green.
+    ``test_promote_with_scope_succeeds``/``test_admin_bypasses_the_gate``
+    pin the two "should still work" arms so a "fix" can't just reject
+    everything.
+    """
+
+    def test_default_write_is_private(self, client: TestClient) -> None:
+        writer = _override_identity(
+            client, "writer-1", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={"collection": "decisions", "document_id": "d-1", "text": "x"},
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "private"
+        finally:
+            client.app.dependency_overrides.clear()
+        del writer
+
+    def test_promote_without_scope_is_denied(self, client: TestClient) -> None:
+        _override_identity(
+            client, "writer-2", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "d-2",
+                    "text": "x",
+                    "tier": "corpus",
+                },
+            )
+            assert r.status_code == 403
+            assert "memory:corpus:decisions:write" in r.json()["detail"]
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_promote_via_query_param_without_scope_is_denied(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(
+            client, "writer-2b", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic?promote=corpus",
+                json={"collection": "decisions", "document_id": "d-2b", "text": "x"},
+            )
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_promote_with_scope_succeeds(self, client: TestClient) -> None:
+        _override_identity(
+            client,
+            "curator-1",
+            (
+                "memory:semantic:write",
+                "memory:semantic:read",
+                "memory:corpus:decisions:write",
+            ),
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "d-3",
+                    "text": "shared content",
+                    "tier": "corpus",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "corpus"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_bypasses_the_gate(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel
+        — no explicit corpus scope needed."""
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "d-admin",
+                "text": "x",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["tier"] == "corpus"
+
+    def test_wrong_collection_scope_does_not_grant_another(
+        self, client: TestClient
+    ) -> None:
+        """Holding ``memory:corpus:skills:write`` must NOT authorize a
+        promote into the ``decisions`` collection — the scope is
+        per-collection, not a blanket corpus-write grant."""
+        _override_identity(
+            client,
+            "curator-2",
+            (
+                "memory:semantic:write",
+                "memory:semantic:read",
+                "memory:corpus:skills:write",
+            ),
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "d-4",
+                    "text": "x",
+                    "tier": "corpus",
+                },
+            )
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestSemanticCorpusReadGate:
+    """ADR-062 Phase B (WU-B4, D3) — reading CORPUS content through the
+    ``/memory/semantic`` backoffice requires
+    ``memory:corpus:<collection>:read``. The LLM recall path
+    (``recall_semantic``) is untouched by this gate — see
+    ``_filter_corpus_read_gate``'s docstring.
+
+    FALSIFIABLE: neuter ``_filter_corpus_read_gate``/the ``read_semantic``
+    scope check (e.g. make ``_has_corpus_scope`` always return ``True``)
+    and ``test_reader_without_corpus_scope_cannot_read_corpus_doc`` /
+    ``test_reader_without_corpus_scope_does_not_list_corpus_doc`` go RED;
+    restore and they go green. ``test_reader_sees_own_private_doc``
+    pins that the gate doesn't ALSO (wrongly) block a caller's own
+    content.
+    """
+
+    @staticmethod
+    def _seed_corpus_doc(client: TestClient) -> None:
+        """Admin (sentinel) promotes one doc into the `decisions` corpus."""
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "corpus-doc",
+                "text": "shared decision",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_reader_without_corpus_scope_cannot_read_corpus_doc(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client)
+        _override_identity(client, "reader-1", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic/decisions/corpus-doc")
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_reader_with_corpus_scope_can_read_corpus_doc(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client)
+        _override_identity(
+            client,
+            "curator-reader",
+            ("memory:semantic:read", "memory:corpus:decisions:read"),
+        )
+        try:
+            r = client.get("/memory/semantic/decisions/corpus-doc")
+            assert r.status_code == 200
+            assert r.json()["content"] == "shared decision"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_reader_without_corpus_scope_does_not_list_corpus_doc(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client)
+        _override_identity(client, "reader-2", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "decisions/corpus-doc" not in keys, f"leaked corpus doc: {keys}"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_reader_with_corpus_scope_lists_corpus_doc(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client)
+        _override_identity(
+            client,
+            "curator-reader-2",
+            ("memory:semantic:read", "memory:corpus:decisions:read"),
+        )
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "decisions/corpus-doc" in keys
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_reader_sees_own_private_doc_without_corpus_scope(
+        self, client: TestClient
+    ) -> None:
+        """The gate is corpus-specific — a caller's own private write is
+        never blocked by it."""
+        writer = _override_identity(
+            client, "reader-3", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "own-doc",
+                    "text": "mine",
+                },
+            )
+            assert r.status_code == 200
+            r = client.get("/memory/semantic/decisions/own-doc")
+            assert r.status_code == 200
+            assert r.json()["content"] == "mine"
+        finally:
+            client.app.dependency_overrides.clear()
+        del writer
+
+
+class TestBackofficeOwnerScopedManifest:
+    """ADR-062 Phase B (WU-B4) — the manifest-tracked half of the
+    owner-or-corpus predicate, proven through the real HTTP surface
+    (``list_episodic``/``list_procedural``/``list_semantic`` +
+    ``read_episodic``/``read_procedural``/``read_semantic``).
+
+    FALSIFIABLE: neuter ``list_for_layer``'s predicate (e.g. hardcode
+    the filter condition to ``True`` in
+    ``MemoryManifestService``/``MockMemoryManifestService``) and
+    ``test_list_episodic_hides_other_users_private_row`` (+ the
+    procedural/semantic siblings) go RED — user B's list includes user
+    A's private row; restore and they go green.
+    """
+
+    def test_list_episodic_hides_other_users_private_row(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(
+            client, "alice", ("memory:episodic:write", "memory:episodic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/episodic",
+                json={"filename": "ADR-alice.md", "content": "alice's note"},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+        _override_identity(client, "bob", ("memory:episodic:read",))
+        try:
+            r = client.get("/memory/episodic")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "ADR-alice.md" not in keys, f"leaked alice's row to bob: {keys}"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        _override_identity(
+            client, "alice", ("memory:episodic:write", "memory:episodic:read")
+        )
+        try:
+            r = client.get("/memory/episodic")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "ADR-alice.md" in keys
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_list_episodic_shows_corpus_row_to_everyone(
+        self, client: TestClient
+    ) -> None:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic", "ADR-shared.md", "Shared", 1, "curator", tier="corpus"
+            )
+        )
+        _override_identity(client, "bob", ("memory:episodic:read",))
+        try:
+            r = client.get("/memory/episodic")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "ADR-shared.md" in keys
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_list_procedural_hides_other_users_private_row(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(
+            client, "alice", ("memory:procedural:write", "memory:procedural:read")
+        )
+        try:
+            r = client.post(
+                "/memory/procedural",
+                json={"filename": "SKILL-alice.md", "content": "alice's skill"},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+        _override_identity(client, "bob", ("memory:procedural:read",))
+        try:
+            r = client.get("/memory/procedural")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "SKILL-alice.md" not in keys, f"leaked alice's row to bob: {keys}"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_list_semantic_hides_other_users_private_row(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(
+            client, "alice", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "alice-doc",
+                    "text": "alice's vector",
+                },
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+        _override_identity(client, "bob", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            keys = {i["key"] for i in r.json()["items"]}
+            assert "decisions/alice-doc" not in keys, (
+                f"leaked alice's row to bob: {keys}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_read_episodic_hides_other_users_manifest_metadata(
+        self, client: TestClient
+    ) -> None:
+        """ADR-062 Phase B (WU-B4) — ``_manifest_visible`` defense against
+        the pre-existing (layer, key) global-uniqueness manifest model
+        (see its docstring): engineer the filename-collision edge case
+        directly (monkeypatch the manifest getter) since the S3 content
+        lookup alone already prevents it in the common case."""
+        from audittrace.identity import UserContext
+        from audittrace.routes import memory as m
+        from audittrace.services.memory_manifest import ManifestEntry
+
+        alices_row = ManifestEntry(
+            id="mi-1",
+            layer="episodic",
+            key="collide.md",
+            title="alice's title",
+            size_bytes=1,
+            created_at_ms=1,
+            modified_at_ms=1,
+            created_by_user_id="alice",
+            modified_by_user_id="alice",
+            deleted_at_ms=None,
+            deleted_by_user_id=None,
+            tier="private",
+        )
+
+        class _FixedManifest:
+            async def get(self, layer, key):
+                return alices_row
+
+        bob = UserContext(
+            user_id="bob",
+            username="bob",
+            agent_type="test",
+            scopes=("memory:episodic:read",),
+            is_admin=False,
+        )
+
+        # Bob's OWN content lookup resolves normally (his private tier
+        # has "collide.md" too — a genuine same-filename collision).
+        get_episodic = m.get_episodic_service()
+        get_episodic.add_document(
+            content="bob's body",
+            file="collide.md",
+            tier="private",
+            user_id="bob",
+        )
+
+        original_get_manifest = m.get_memory_manifest_service
+        m.get_memory_manifest_service = lambda: _FixedManifest()  # type: ignore[assignment]
+        try:
+            import asyncio
+
+            from fastapi import BackgroundTasks
+
+            result = asyncio.run(
+                m.read_episodic(
+                    "collide.md",
+                    _auth={},
+                    user=bob,
+                    background_tasks=BackgroundTasks(),
+                )
+            )
+        finally:
+            m.get_memory_manifest_service = original_get_manifest
+
+        assert result["content"] == "bob's body"
+        assert result["manifest"] is None, (
+            "alice's manifest row (owner='alice') leaked to bob's read "
+            f"of his OWN file: {result['manifest']}"
+        )
+
+
 class TestRouteEdgeCases:
     def test_delete_existing_idempotent_via_endpoint(self, client: TestClient) -> None:
         client.post("/memory/episodic", json={"filename": "ADR-i.md", "content": "x"})
@@ -3884,8 +4509,15 @@ class TestOcrRenderPage:
             "conf": [95, -1, 90, 80],
         }
         # We need PIL.Image.open to succeed; mock it to return a
-        # MagicMock the rest of the code path doesn't inspect.
-        with patch("audittrace.routes.memory.io.BytesIO") as mock_bytesio:
+        # MagicMock the rest of the code path doesn't inspect. Patched
+        # on ``memory_pdf.extraction`` — where ``_ocr_render_page``
+        # actually lives and imports ``io`` itself (``routes/memory.py``
+        # only re-exports the name; ADR-062 Phase B WU-B5 removed its
+        # own now-unused ``import io``, so the old patch target no
+        # longer resolves).
+        with patch(
+            "audittrace.routes.memory_pdf.extraction.io.BytesIO"
+        ) as mock_bytesio:
             mock_bytesio.return_value = b"any"
             with patch.dict(
                 "sys.modules",
@@ -5544,7 +6176,7 @@ class TestMergeSemanticWithChroma:
         tracked = self._entry("audittrace_v2/doc-1")
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return [tracked]
 
         chroma = self._Chroma(
@@ -5573,7 +6205,7 @@ class TestMergeSemanticWithChroma:
         from audittrace.routes import memory as m
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return []
 
         chroma = self._Chroma(
@@ -5603,7 +6235,7 @@ class TestMergeSemanticWithChroma:
         from audittrace.routes import memory as m
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return []
 
         chroma = self._Chroma(
@@ -5641,7 +6273,7 @@ class TestMergeSemanticWithChroma:
         from audittrace.routes import memory as m
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return []
 
         chroma = self._Chroma(
@@ -5675,7 +6307,7 @@ class TestMergeSemanticWithChroma:
         from audittrace.routes import memory as m
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return []
 
         chroma = self._Chroma(
@@ -5702,7 +6334,7 @@ class TestMergeSemanticWithChroma:
         from audittrace.routes import memory as m
 
         class _Manifest:
-            async def list_for_layer(self, layer, include_deleted=False):
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
                 return []
 
         chroma = self._Chroma(

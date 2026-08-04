@@ -1449,7 +1449,24 @@ paths:
 
         ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
 
-        R5); ``total`` is the full pre-limit count.'
+        R5); ``total`` is the full pre-limit count.
+
+
+        ADR-062 Phase B (WU-B4): manifest-tracked rows are scoped to the
+
+        caller''s own private tier ∪ corpus (``list_for_layer(caller=user)``)
+
+        — a non-admin caller never sees another user''s private manifest
+
+        row. No corpus-read scope gate applies to this layer (episodic has
+
+        no declared ``memory:corpus:episodic:read`` — the ADR-062 §4
+
+        frozenset covers only decisions/skills/semantic); corpus content
+
+        stays visible to any ``memory:episodic:read`` holder, same as
+
+        before this PR.'
       operationId: list_episodic_memory_episodic_get
       parameters:
       - in: query
@@ -1533,8 +1550,34 @@ paths:
 
         Idempotent on the manifest: re-creating a soft-deleted item revives
 
-        it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.'
+        it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.
+
+
+        ADR-062 Phase B (WU-B5): every write lands in the caller''s PRIVATE
+
+        tier (``tier="private"``, owner=caller) — ``service.write`` already
+
+        only ever targets the private bucket (WU-B2); this just stamps the
+
+        manifest row to match. Episodic has no corpus-write scope in the
+
+        ADR-062 §4 catalogue, so a ``tier=corpus``/``?promote=corpus``
+
+        request is rejected (400) rather than silently downgraded.'
       operationId: create_episodic_memory_episodic_post
+      parameters:
+      - description: Set to 'corpus' to request a corpus-tier write. Episodic has no corpus-write scope declared (ADR-062
+          §4) — any corpus request here returns 400, not a partial/soft acceptance.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Episodic has no corpus-write scope declared (ADR-062
+            §4) — any corpus request here returns 400, not a partial/soft acceptance.
+          title: Promote
       requestBody:
         content:
           application/json:
@@ -1618,7 +1661,18 @@ paths:
       tags:
       - memory
     get:
-      description: Read ADR content + manifest metadata.
+      description: 'Read ADR content + manifest metadata.
+
+
+        ADR-062 Phase B (WU-B4): the content itself was already resolved
+
+        private-first-then-corpus by ``service.read`` (WU-B2), so a 404
+
+        here means genuinely missing (not a cross-user disclosure). The
+
+        manifest metadata block is additionally scoped by
+
+        ``_manifest_visible`` — see its docstring for why.'
       operationId: read_episodic_memory_episodic__filename__get
       parameters:
       - in: path
@@ -1794,7 +1848,12 @@ paths:
 
         `/memory/episodic` so all ``.md`` items appear alongside
 
-        operator-created ones (backlog #15).'
+        operator-created ones (backlog #15).
+
+
+        ADR-062 Phase B (WU-B4): same owner-or-corpus manifest scoping as
+
+        ``list_episodic`` — see its docstring.'
       operationId: list_procedural_memory_procedural_get
       parameters:
       - in: query
@@ -1873,8 +1932,28 @@ paths:
       tags:
       - memory
     post:
-      description: Create a SKILL document. Body shape mirrors POST /memory/episodic.
+      description: 'Create a SKILL document. Body shape mirrors POST /memory/episodic.
+
+
+        ADR-062 Phase B (WU-B5): default write is PRIVATE-tier, owner=caller;
+
+        see ``create_episodic``''s docstring for the corpus-promotion rejection
+
+        rationale (identical for procedural).'
       operationId: create_procedural_memory_procedural_post
+      parameters:
+      - description: Set to 'corpus' to request a corpus-tier write. Procedural has no corpus-write scope declared (ADR-062
+          §4) — any corpus request here returns 400.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Procedural has no corpus-write scope declared (ADR-062
+            §4) — any corpus request here returns 400.
+          title: Promote
       requestBody:
         content:
           application/json:
@@ -1947,6 +2026,9 @@ paths:
       tags:
       - memory
     get:
+      description: 'ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
+
+        ``read_episodic`` — see its docstring.'
       operationId: read_procedural_memory_procedural__filename__get
       parameters:
       - in: path
@@ -2037,15 +2119,26 @@ paths:
 
         ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
 
-        the manifest) are now filtered — non-admin sees only its own
+        the manifest) are filtered — non-admin sees only its own
 
         private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
 
-        §3 hole 2). Manifest-TRACKED rows (`entries` below) are still
+        §3 hole 2).
 
-        unfiltered by owner/tier — that predicate is WU-B4 (deferred; needs
 
-        the manifest `tier` column).'
+        ADR-062 Phase B (WU-B4): manifest-TRACKED rows (`entries` below) are
+
+        now ALSO owner-or-corpus scoped (`list_for_layer(caller=user)`) —
+
+        closes the gap the previous docstring flagged as deferred. On top
+
+        of ownership scoping, D3''s operator/curator-tier gate additionally
+
+        drops any CORPUS-tier item (tracked or discovered) the caller
+
+        lacks ``memory:corpus:<collection>:read`` for
+
+        (`_filter_corpus_read_gate`).'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.
@@ -2136,14 +2229,46 @@ paths:
     post:
       description: 'Upsert a semantic-layer document. The collection''s embedding
 
-        function (configured at chart install time) handles vectorisation.'
+        function (configured at chart install time) handles vectorisation.
+
+
+        ADR-062 Phase B (WU-B5): default write lands in the caller''s PRIVATE
+
+        tier (``tier="private"``, owner=caller — ``ChromaSemanticService.
+
+        upsert``''s own default). An explicit ``"tier": "corpus"`` body field
+
+        or ``?promote=corpus`` query param routes the write to the shared
+
+        corpus collection instead, but ONLY if the caller holds
+
+        ``memory:corpus:<collection>:write`` (or ``audittrace:admin`` /
+
+        admin) — this is the scope gate WU-B3 wired the write TARGET for but
+
+        deliberately left unenforced (see ``ChromaSemanticService.upsert``''s
+
+        docstring).'
       operationId: create_semantic_memory_semantic_post
+      parameters:
+      - description: Set to 'corpus' to write into the shared corpus collection instead of the caller's private tier. Requires
+          memory:corpus:<collection>:write (or audittrace:admin).
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to write into the shared corpus collection instead of the caller's private tier. Requires
+            memory:corpus:<collection>:write (or audittrace:admin).
+          title: Promote
       requestBody:
         content:
           application/json:
             schema:
               additionalProperties: true
-              description: '{collection, document_id, text, metadata?, title?}'
+              description: '{collection, document_id, text, metadata?, title?, tier?}'
               title: Payload
               type: object
         required: true
@@ -2220,6 +2345,19 @@ paths:
       tags:
       - memory
     get:
+      description: 'ADR-062 Phase B: ``service.get_document`` already applies the
+
+        owner-or-corpus predicate (WU-B3 §3 hole 1) — a cross-user private
+
+        doc is a 404, same as a genuine miss (no existence disclosure). On
+
+        top of that, D3 (WU-B4) requires ``memory:corpus:<collection>:read``
+
+        to read a CORPUS-tier doc through this backoffice route — a 403 (not
+
+        404: corpus existence isn''t user-specific, so there''s nothing to
+
+        hide by returning a miss instead).'
       operationId: read_semantic_memory_semantic__collection___document_id__get
       parameters:
       - in: path
@@ -2307,14 +2445,18 @@ paths:
         \ flow:\n  bytes land in ``quarantine/<user>/<scan_id>/<file>`` (not the\n  requested ``layer`` prefix), a ``memory_items``\
         \ row is inserted\n  with ``scan_status='pending_scan'``, and an AMQP scan-request is\n  enqueued. The response is\
         \ **HTTP 202** with a ``scan_id`` and\n  poll URL. Promotion to ``episodic/papers/`` happens\n  asynchronously in\
-        \ content-control once the verdict is clean.\n\n* **Non-PDF uploads** (markdown skills, ADRs, plain text)\n  keep\
-        \ the existing synchronous path: PUT to\n  ``{layer}/{filename}`` and return HTTP 200 with the\n  direct-write summary.\n\
-        \nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n\
-        (or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa.\
-        \ This is enforced\nby ``_require_layer_write`` on the first line below — the endpoint is\n**not** auth-only despite\
-        \ the static ``scopes=[]`` on the OAuth2\ndeclaration (which exists only so the spec lists the security scheme;\n\
-        the effective scope is dynamic in the ``layer`` parameter, so it\ncannot be declared statically — same contract as\
-        \ ``/memory/index``)."
+        \ content-control once the verdict is clean. This\n  branch is UNCHANGED by ADR-062 Phase B — the async quarantine\
+        \ →\n  verdict → promotion pipeline is ADR-048's content-control\n  concern, out of WU-B4/WU-B5's scope.\n\n* **Non-PDF\
+        \ uploads** (markdown skills, ADRs, plain text): ADR-062\n  Phase B (WU-B5) — writes to the caller's PRIVATE tier\
+        \ via the\n  episodic/procedural service's own ``write()`` (already wired to\n  the private bucket by WU-B2), closing\
+        \ a leak where every non-PDF\n  upload used to land unconditionally in the shared/corpus bucket\n  regardless of who\
+        \ uploaded it. Neither layer has a declared\n  corpus-write scope (ADR-062 §4's frozenset is exactly\n  decisions/skills/semantic),\
+        \ so ``?promote=corpus`` is rejected\n  with 400 rather than silently accepted or silently ignored.\n\nAuthorization\
+        \ (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n(or ``audittrace:admin``).\
+        \ A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa. This is enforced\n\
+        by ``_require_layer_write`` on the first line below — the endpoint is\n**not** auth-only despite the static ``scopes=[]``\
+        \ on the OAuth2\ndeclaration (which exists only so the spec lists the security scheme;\nthe effective scope is dynamic\
+        \ in the ``layer`` parameter, so it\ncannot be declared statically — same contract as ``/memory/index``)."
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query
@@ -2330,6 +2472,18 @@ paths:
           - type: string
           - type: 'null'
           title: Filename
+      - description: Set to 'corpus' to request a corpus-tier write. Neither episodic nor procedural has a corpus-write scope
+          declared (ADR-062 §4) — any corpus request here returns 400.
+        in: query
+        name: promote
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Set to 'corpus' to request a corpus-tier write. Neither episodic nor procedural has a corpus-write
+            scope declared (ADR-062 §4) — any corpus request here returns 400.
+          title: Promote
       requestBody:
         content:
           multipart/form-data:

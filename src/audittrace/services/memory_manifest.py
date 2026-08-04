@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
+from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,13 @@ class ManifestEntry:
     pdfa_part: str | None = None
     pdfa_conformance: str | None = None
     ltv_data: dict[str, Any] | None = None
+    # ── ADR-062 Phase B (WU-B4, migration 018) — per-user tiering ────
+    # Closed-set ``"corpus"`` | ``"private"``. Defaults ``"corpus"`` to
+    # match the DB column's ``server_default`` (D2) and to keep every
+    # pre-existing direct-construction call site (tests, the PDF
+    # manifest writer) reading the same value it always implicitly
+    # meant before this column existed.
+    tier: str = "corpus"
 
     @classmethod
     def from_row(cls, row: MemoryItem) -> ManifestEntry:
@@ -108,6 +116,7 @@ class ManifestEntry:
             pdfa_part=row.pdfa_part,
             pdfa_conformance=row.pdfa_conformance,
             ltv_data=row.ltv_data,
+            tier=row.tier,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,6 +151,7 @@ class ManifestEntry:
             "pdfa_part": self.pdfa_part,
             "pdfa_conformance": self.pdfa_conformance,
             "ltv_data": self.ltv_data,
+            "tier": self.tier,
         }
 
 
@@ -176,11 +186,21 @@ class MemoryManifestService:
         title: str | None,
         size_bytes: int | None,
         user_id: str,
+        tier: str = "private",
     ) -> ManifestEntry:
         """Insert a new manifest row, OR un-soft-delete + bump
         timestamps if a row with the same (layer, key) already exists
         (e.g. an operator deletes ADR-007 then recreates with the same
         key).
+
+        ``tier`` (ADR-062 Phase B, WU-B4/WU-B5) defaults ``"private"`` —
+        D2's "new writes default private" policy lives here as much as
+        at the route layer, so any future call site that forgets to
+        pass ``tier`` explicitly still lands on the fail-closed
+        (least-shared) side rather than silently defaulting to
+        ``"corpus"``. Recreating an existing row (revive-after-delete or
+        overwrite) also re-stamps ``tier`` to the caller's requested
+        value — same as ``title``/``size_bytes`` on that branch.
 
         Returns the resulting entry.
         """
@@ -202,6 +222,7 @@ class MemoryManifestService:
                     modified_at_ms=now,
                     created_by_user_id=user_id,
                     modified_by_user_id=user_id,
+                    tier=tier,
                 )
                 session.add(row)
             else:
@@ -216,6 +237,7 @@ class MemoryManifestService:
                 existing.size_bytes = size_bytes
                 existing.modified_at_ms = now
                 existing.modified_by_user_id = user_id
+                existing.tier = tier
                 row = existing
             await session.commit()
             await session.refresh(row)
@@ -286,7 +308,11 @@ class MemoryManifestService:
 
     @log_call(logger=logger)
     async def list_for_layer(
-        self, layer: str, *, include_deleted: bool = False
+        self,
+        layer: str,
+        *,
+        include_deleted: bool = False,
+        caller: UserContext | None = None,
     ) -> list[ManifestEntry]:
         """Return manifest entries for ``layer``, ordered by
         ``modified_at_ms DESC`` (most recently touched first).
@@ -294,7 +320,19 @@ class MemoryManifestService:
         ``include_deleted=False`` (default) hides soft-deleted rows —
         right answer for the standard LIST endpoint. Audit-scope
         callers can request ``include_deleted=True``.
-        """
+
+        ``caller`` (ADR-062 Phase B, WU-B4) is the owner-or-corpus
+        isolation predicate: when supplied and the caller is not an
+        admin, a row is only returned if ``row.created_by_user_id ==
+        caller.user_id`` OR ``row.tier == "corpus"`` — the same shape as
+        ``ChromaSemanticService._tier_authorized`` and the WU-B3
+        ``_merge_semantic_with_chroma`` discovery guard. ``caller=None``
+        (the default) is UNFILTERED — preserves the pre-WU-B4 behaviour
+        for internal/admin callers (e.g. the dedup-lookup passes in
+        ``_merge_layer_items_with_s3``/``_merge_semantic_with_chroma``
+        pass the real caller explicitly; anything that still omits
+        ``caller`` gets the full operator-global view, same as before
+        this column existed)."""
         _validate_layer(layer)
         async with self._session_factory() as session:
             q = select(MemoryItem).filter_by(layer=layer)
@@ -305,7 +343,14 @@ class MemoryManifestService:
                 .scalars()
                 .all()
             )
-            return [ManifestEntry.from_row(r) for r in rows]
+            entries = [ManifestEntry.from_row(r) for r in rows]
+            if caller is not None and not caller.is_admin:
+                entries = [
+                    e
+                    for e in entries
+                    if e.created_by_user_id == caller.user_id or e.tier == "corpus"
+                ]
+            return entries
 
     @log_call(logger=logger)
     async def upsert_pdf_metadata(
@@ -469,6 +514,7 @@ class MockMemoryManifestService(MemoryManifestService):
             pdfa_part=row.get("pdfa_part"),
             pdfa_conformance=row.get("pdfa_conformance"),
             ltv_data=row.get("ltv_data"),
+            tier=row.get("tier", "corpus"),
         )
 
     async def record_create(
@@ -478,6 +524,7 @@ class MockMemoryManifestService(MemoryManifestService):
         title: str | None,
         size_bytes: int | None,
         user_id: str,
+        tier: str = "private",
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -497,6 +544,7 @@ class MockMemoryManifestService(MemoryManifestService):
                 "modified_by_user_id": user_id,
                 "deleted_at_ms": None,
                 "deleted_by_user_id": None,
+                "tier": tier,
             }
             self._rows[(layer, key)] = existing
         else:
@@ -504,6 +552,7 @@ class MockMemoryManifestService(MemoryManifestService):
             existing["size_bytes"] = size_bytes
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
+            existing["tier"] = tier
             if existing.get("deleted_at_ms") is not None:
                 existing["deleted_at_ms"] = None
                 existing["deleted_by_user_id"] = None
@@ -544,12 +593,23 @@ class MockMemoryManifestService(MemoryManifestService):
         return self._to_entry(existing)
 
     async def list_for_layer(
-        self, layer: str, *, include_deleted: bool = False
+        self,
+        layer: str,
+        *,
+        include_deleted: bool = False,
+        caller: UserContext | None = None,
     ) -> list[ManifestEntry]:
         _validate_layer(layer)
         rows = [row for (row_layer, _), row in self._rows.items() if row_layer == layer]
         if not include_deleted:
             rows = [r for r in rows if r.get("deleted_at_ms") is None]
+        if caller is not None and not caller.is_admin:
+            rows = [
+                r
+                for r in rows
+                if r.get("created_by_user_id") == caller.user_id
+                or r.get("tier", "corpus") == "corpus"
+            ]
         rows.sort(key=lambda r: r["modified_at_ms"], reverse=True)
         return [self._to_entry(r) for r in rows]
 

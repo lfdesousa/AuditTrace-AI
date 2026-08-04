@@ -287,6 +287,22 @@ class MemoryItem(Base):
     # the async boundary.
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # ── ADR-062 Phase B (WU-B4, migration 018) — per-user tiering ──────
+    # Closed-set: ``"corpus"`` (Layer 5, shared-read) | ``"private"``
+    # (per-user, owner-only). ``server_default="corpus"`` means every row
+    # written BEFORE migration 018 reads ``tier="corpus"`` without a
+    # backfill script — D2 (2026-08-04): "existing content = corpus, new
+    # writes = private-default". The per-layer CRUD routes
+    # (create_episodic/create_procedural/create_semantic) pass an
+    # explicit ``tier`` on every new manifest row (WU-B5); this column's
+    # server-side default is a safety net for rows inserted through a
+    # path this PR does not touch (e.g. the PDF-indexing manifest writer
+    # in ``memory_pdf``, which sources bulk-reindexed shared content and
+    # is therefore correctly corpus-tier by default too).
+    tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="corpus"
+    )
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )
