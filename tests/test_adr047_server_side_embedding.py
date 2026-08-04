@@ -146,13 +146,29 @@ class TestSemanticNomic:
                 "metadatas": [[{"source": "ADR-1"}]],
             }
         )
+        # ADR-062 Phase B: search() also queries the corpus physical
+        # collection (`decisions_corpus_v2`) — give it a distinct, empty
+        # mock so this test's assertions stay about the PRIVATE tier.
+        corpus_collection = AsyncMock()
+        corpus_collection.count = AsyncMock(return_value=0)
         client = AsyncMock()
-        client.get_or_create_collection = AsyncMock(return_value=collection)
+
+        async def _select(name: str, **_kw: Any) -> AsyncMock:
+            return collection if name == "decisions_v2" else corpus_collection
+
+        client.get_or_create_collection = AsyncMock(side_effect=_select)
 
         docs = await _service(client).search(user_context, "a query", k=1)
 
         assert len(docs) == 1
-        open_kwargs = client.get_or_create_collection.call_args.kwargs
+        assert docs[0].metadata["tier"] == "private"
+        open_calls = [
+            c
+            for c in client.get_or_create_collection.call_args_list
+            if c.kwargs["name"] == "decisions_v2"
+        ]
+        assert len(open_calls) == 1
+        open_kwargs = open_calls[0].kwargs
         assert open_kwargs["name"] == "decisions_v2"
         assert open_kwargs["embedding_function"] is None
         query_kwargs = collection.query.call_args.kwargs
@@ -180,18 +196,22 @@ class TestSemanticNomic:
         assert collection.upsert.call_args.kwargs["embeddings"] == [[0.9, 0.8]]
 
     async def test_get_and_delete_open_with_no_ef(self, user_context):
+        # ADR-062 Phase B: a miss now checks BOTH physical collections
+        # (private then corpus) — the mock returns an empty payload for
+        # every name, so both lookups miss and the final call opened is
+        # the corpus one. Assert on the FIRST call (the private lookup,
+        # still `skills_v2`) to pin the physical-naming resolution this
+        # test exists for.
         collection = AsyncMock()
         collection.get = AsyncMock(return_value={"ids": []})
         client = AsyncMock()
         client.get_or_create_collection = AsyncMock(return_value=collection)
         svc = _service(client)
 
-        await svc.get_document(user_context, "skills", "x")
-        assert client.get_or_create_collection.call_args.kwargs["name"] == "skills_v2"
-        assert (
-            client.get_or_create_collection.call_args.kwargs["embedding_function"]
-            is None
-        )
+        assert await svc.get_document(user_context, "skills", "x") is None
+        first_call = client.get_or_create_collection.call_args_list[0]
+        assert first_call.kwargs["name"] == "skills_v2"
+        assert first_call.kwargs["embedding_function"] is None
         assert await svc.delete_document(user_context, "skills", "x") is False
 
 

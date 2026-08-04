@@ -2024,9 +2024,20 @@ paths:
 
         with no identity at all, so a future audit event can attribute the
 
-        read). This does NOT yet filter results by user — that per-user
+        read).
 
-        isolation lands in ADR-062 Phase B.'
+
+        ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
+
+        the manifest) are now filtered — non-admin sees only its own
+
+        private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
+
+        §3 hole 2). Manifest-TRACKED rows (`entries` below) are still
+
+        unfiltered by owner/tier — that predicate is WU-B4 (deferred; needs
+
+        the manifest `tier` column).'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.
