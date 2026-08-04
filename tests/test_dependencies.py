@@ -105,6 +105,60 @@ def test_register_default_dependencies_no_pg(monkeypatch):
     )
 
 
+def test_register_default_dependencies_wires_manifest_into_semantic_service(
+    monkeypatch,
+):
+    """ADR-062 §6 (WU-A5) production-wiring gate.
+
+    ``_register_memory_services`` passes ``manifest=memory_manifest`` into
+    the real ``ChromaSemanticService`` so recall honours the manifest
+    soft-delete tombstone (``ChromaSemanticService._filter_soft_deleted``).
+    The class-level behaviour was already covered by
+    ``tests/test_semantic_service.py::TestSoftDeleteTombstoneFiltersRecall``,
+    but those tests construct ``ChromaSemanticService(..., manifest=...)``
+    directly — they never exercise the DI wiring itself. Nothing in the
+    route tests (which run against ``MockSemanticService`` via
+    ``create_test_container``) or the rest of this file asserted that the
+    production container actually threads the manifest through. A future
+    edit that dropped the ``manifest=`` kwarg from ``dependencies.py``
+    would silently defeat WU-A5 in the deployed system with zero test
+    signal — this test closes that gap.
+
+    Falsifiable: delete ``manifest=memory_manifest`` from
+    ``ChromaSemanticService(...)`` in ``dependencies.py`` and this test
+    goes RED (``semantic._manifest`` becomes ``None``); restore it and the
+    test is GREEN again.
+    """
+    from audittrace import dependencies as deps_module
+    from audittrace.config import Settings
+    from audittrace.services.memory_manifest import MemoryManifestService
+    from audittrace.services.semantic import ChromaSemanticService
+
+    monkeypatch.setattr(
+        deps_module,
+        "HTTPChromaDBFactory",
+        lambda url, token=None: MockChromaDBFactory(),
+    )
+    monkeypatch.setattr(
+        deps_module,
+        "_create_object_storage_provider",
+        lambda settings: object(),
+    )
+    monkeypatch.setattr(deps_module, "_create_minio_client", lambda settings: object())
+
+    settings = Settings(chroma_url="http://localhost:8000")
+    register_default_dependencies(settings)
+
+    semantic = deps_module.container._instances["semantic"]
+    manifest = deps_module.container._instances["memory_manifest"]
+    assert isinstance(semantic, ChromaSemanticService)
+    assert isinstance(manifest, MemoryManifestService)
+    # Identity, not just type — the SAME instance the container hands out
+    # via get_memory_manifest_service() must be the one the semantic
+    # service consults, so both see the same soft-delete state.
+    assert semantic._manifest is manifest
+
+
 def test_register_default_dependencies_raises_when_minio_missing(monkeypatch):
     """The 2026-05-03 sweep removed the FS fallback for layers 1+2.
     A missing ``AUDITTRACE_MINIO_SECRET_KEY`` MUST surface as a startup-time
