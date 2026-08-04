@@ -177,6 +177,12 @@ class Settings(BaseSettings):
     # AWS S3 fields (used only when object_storage_backend = "aws")
     aws_region: str = ""
     aws_bucket: str = ""  # When set, overrides minio_shared_bucket for AWS path
+    # ADR-062 Phase B (WU-B1) — private-tier parity with ``aws_bucket``. Value
+    # + the S3/EKS provisioning of ``memory-private`` are the deferred cloud
+    # follow-up ([[#417]]); the field exists now so the code is env-
+    # parameterized (portability invariant) even though it is unset on the
+    # laptop/MinIO path this PR targets.
+    aws_private_bucket: str = ""
     aws_endpoint_url: str = ""  # Optional — for S3-compatible non-AWS endpoints
     aws_use_irsa: bool = True
     aws_access_key_id: str = ""  # Only when aws_use_irsa=False

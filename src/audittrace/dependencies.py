@@ -38,6 +38,7 @@ from audittrace.services.episodic import (
     EpisodicService,
     MockEpisodicService,
     S3EpisodicService,
+    UserScopedEpisodicService,
 )
 from audittrace.services.memory_manifest import (
     MemoryManifestService,
@@ -47,6 +48,7 @@ from audittrace.services.procedural import (
     MockProceduralService,
     ProceduralService,
     S3ProceduralService,
+    UserScopedProceduralService,
 )
 
 # ADR-006 — direct ``minio.Minio`` import removed; the bare client is
@@ -222,11 +224,26 @@ def _create_object_storage_provider(settings: Settings) -> object:
             secure=(parsed.scheme == "https"),
         )
     elif backend == "aws":
-        if not settings.aws_region or not settings.aws_bucket:
+        # ADR-062 Phase B (WU-B1) — ``aws_private_bucket`` is required
+        # alongside ``aws_bucket`` for the same reason ``aws_bucket`` already
+        # is: this function doesn't consume either value directly (the
+        # bucket name is threaded per-service in ``_register_memory_services``
+        # below), but failing fast here beats a private-tier write silently
+        # misrouting to an empty bucket name at request time. Fail-closed
+        # choice (ADR-062 Phase B population of the real S3 bucket + IAM
+        # policy is deferred to [[#417]]; the guard exists now so a future
+        # AWS-backend rollout cannot ship without it).
+        if (
+            not settings.aws_region
+            or not settings.aws_bucket
+            or not settings.aws_private_bucket
+        ):
             raise RuntimeError(
-                "AWS backend selected but AUDITTRACE_AWS_REGION or AUDITTRACE_AWS_BUCKET "
-                "is empty. Set both. With aws_use_irsa=True (default) no other secrets "
-                "are needed — boto3 resolves IRSA from the pod's ServiceAccount."
+                "AWS backend selected but AUDITTRACE_AWS_REGION, "
+                "AUDITTRACE_AWS_BUCKET, or AUDITTRACE_AWS_PRIVATE_BUCKET is "
+                "empty. Set all three. With aws_use_irsa=True (default) no "
+                "other secrets are needed — boto3 resolves IRSA from the "
+                "pod's ServiceAccount."
             )
         config = ObjectStorageConfig(
             backend="aws",
@@ -279,6 +296,16 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         if settings.object_storage_backend == "aws"
         else settings.minio_shared_bucket
     )
+    # ADR-062 Phase B (WU-B1) — mirrors ``effective_bucket`` above for the
+    # per-user private tier. Laptop/MinIO default: ``minio_private_bucket``
+    # ("memory-private"). AWS value + bucket/IAM provisioning deferred to
+    # the cloud follow-up ([[#417]]); ``_create_object_storage_provider``
+    # already fails startup fast if the AWS backend is selected without it.
+    effective_private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
     container._instances["object_storage"] = object_store
 
     # Backlog #15 — shared cross-replica listing cache. Redis-backed in
@@ -292,6 +319,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     episodic: EpisodicService = S3EpisodicService(
         minio_client=object_store,
         bucket=effective_bucket,
+        private_bucket=effective_private_bucket,
         prefix="episodic/",
         cache=layer_cache,
         cache_ttl_seconds=settings.memory_cache_ttl,
@@ -299,14 +327,16 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     procedural: ProceduralService = S3ProceduralService(
         minio_client=object_store,
         bucket=effective_bucket,
+        private_bucket=effective_private_bucket,
         prefix="procedural/",
         cache=layer_cache,
         cache_ttl_seconds=settings.memory_cache_ttl,
     )
     logger.info(
-        "Memory layers 1+2: %s-backed (bucket=%s)",
+        "Memory layers 1+2: %s-backed (corpus bucket=%s, private bucket=%s)",
         settings.object_storage_backend,
         effective_bucket,
+        effective_private_bucket,
     )
 
     conversational = PostgresConversationalService(
@@ -471,34 +501,44 @@ def get_postgres_factory() -> PostgresFactory:
 def get_context_builder(
     user: UserContext = Depends(require_user),
 ) -> ContextBuilderService:
-    """Return a per-request context builder with a user-scoped semantic layer.
+    """Return a per-request context builder with user-scoped layers.
 
-    DESIGN §16 Phase 4 follow-up. The episodic, procedural and
-    conversational services are shared singletons (their per-user
-    isolation is already enforced at the service layer via the Phase 2
-    `user_context` plumbing + Postgres RLS from migration 005). The
-    semantic service is the one layer that needs the extra
-    ``UserScopedSemanticService`` wrapper: ChromaDB has no native RLS
-    equivalent, and the wrapper enforces the isolation property by
-    construction — the bound UserContext cannot be overridden by the
-    per-call argument, so a bug that leaks an admin context elsewhere
-    in the code cannot bypass the filter.
+    DESIGN §16 Phase 4 + ADR-062 Phase B (WU-B1). The conversational
+    service is a shared singleton (its per-user isolation is enforced at
+    the service layer via Postgres RLS from migration 005 — no wrapper
+    needed, RLS reads ``app.current_user_id`` set per-request elsewhere).
+    Episodic, procedural, and semantic each get a request-scoped wrapper
+    (``UserScopedEpisodicService`` / ``UserScopedProceduralService`` /
+    ``UserScopedSemanticService``) bound to the caller's ``UserContext``:
+    episodic/procedural now read/write a real per-user private tier
+    (``memory-private/{jwt.sub}/...`` — ADR-062 §2/§3) and ChromaDB has no
+    native RLS equivalent, so both need the same "isolation by
+    construction" property the semantic wrapper pioneered — the bound
+    identity cannot be overridden by a per-call argument, so a bug that
+    threads the wrong (or an admin) context elsewhere in the code cannot
+    leak another caller's private tier.
 
-    One new ``DefaultContextBuilder`` instance is built per request.
-    The three shared services are referenced by identity (no copy);
-    only the semantic slot gets a fresh wrapper.
+    One new ``DefaultContextBuilder`` instance is built per request. The
+    three underlying shared services are referenced by identity (no copy)
+    inside their wrappers; the conversational slot is unwrapped.
     """
-    episodic = container._instances["episodic"]
-    procedural = container._instances["procedural"]
+    shared_episodic = container._instances["episodic"]
+    shared_procedural = container._instances["procedural"]
     conversational = container._instances["conversational"]
     shared_semantic = container._instances["semantic"]
 
+    scoped_episodic = UserScopedEpisodicService(
+        inner=shared_episodic, user_context=user
+    )
+    scoped_procedural = UserScopedProceduralService(
+        inner=shared_procedural, user_context=user
+    )
     scoped_semantic = UserScopedSemanticService(
         inner=shared_semantic, user_context=user
     )
     return DefaultContextBuilder(
-        episodic=episodic,
-        procedural=procedural,
+        episodic=scoped_episodic,
+        procedural=scoped_procedural,
         conversational=conversational,
         semantic=scoped_semantic,
     )

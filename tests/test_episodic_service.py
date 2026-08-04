@@ -2,16 +2,23 @@
 
 The service is **always S3-backed** in production (MinIO) — there is no
 filesystem implementation. Tests here exercise ``S3EpisodicService`` against a
-fake MinIO client and ``MockEpisodicService`` directly. See
+fake, bucket-aware MinIO client and ``MockEpisodicService`` directly. See
 ``feedback_storage_always_s3``.
 
 Phase 2 (DESIGN §15): every service method takes ``user_context`` as the first
-positional argument. The admin-sentinel fixture is defined in ``conftest.py``
-and reused here — Episodic is shared content, so the parameter is plumbing.
+positional argument.
+
+ADR-062 Phase B (WU-B2): the layer is dual-tier — a caller's own writes land
+in the PRIVATE tier (``private_bucket/{user_id}/episodic/``); the pre-existing
+``memory-shared`` content is the CORPUS tier (shared-read). ``TestDualTier*``
+classes below are the isolation-safety-bar falsifiable tests: a second user
+must never see another user's private writes, and every caller must still see
+the corpus.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -21,16 +28,23 @@ from audittrace.services.episodic import (
     EpisodicService,
     MockEpisodicService,
     S3EpisodicService,
+    UserScopedEpisodicService,
 )
 
-# ── Fake MinIO client ────────────────────────────────────────────────────────
+# ── Fake, bucket-aware MinIO client ──────────────────────────────────────────
 #
 # ADR-006 migration note: the four services now catch
 # :class:`ObjectNotFoundError` (from the shared package), NOT the
 # old minio-shaped ``S3Error`` with ``.code == "NoSuchKey"``. The
-# fakes below were updated to raise ``ObjectNotFoundError`` to match
-# the post-ADR-006 contract. The class shape + bucket-agnostic
-# storage is otherwise preserved.
+# fakes below raise ``ObjectNotFoundError`` to match the post-ADR-006
+# contract.
+#
+# ADR-062 Phase B: real MinIO partitions objects by BUCKET — a key in
+# ``memory-private`` is invisible to a client reading ``memory-shared``, even
+# if the key string is identical. The old fake ignored ``bucket`` entirely
+# (single global dict); that can no longer stand in for the private/corpus
+# boundary the dual-tier logic depends on, so the fake is now a real
+# ``{bucket: {key: bytes}}`` two-level store.
 
 
 class _FakeObject:
@@ -69,47 +83,56 @@ class _FakeResponse:
 
 
 class _FakeMinio:
-    """Minimal MinIO-client double covering ``list_objects`` + ``get_object``
-    + ``put_object`` + ``remove_object`` + ``stat_object`` (the methods our
-    services touch). All operate on the same in-memory `_objects` dict."""
+    """Bucket-partitioned MinIO-client double covering ``list_objects`` +
+    ``get_object`` + ``put_object`` + ``remove_object`` + ``stat_object``.
 
-    def __init__(self, objects: dict[str, bytes]) -> None:
-        # Keys are full S3 keys including the prefix (e.g. ``episodic/ADR-001.md``)
-        self._objects = dict(objects)
+    ``buckets`` is ``{bucket_name: {key: content_bytes}}``. A key written to
+    one bucket is invisible from another — the same isolation real MinIO
+    gives two distinct buckets.
+    """
+
+    def __init__(self, buckets: dict[str, dict[str, bytes]] | None = None) -> None:
+        self._buckets: dict[str, dict[str, bytes]] = {
+            b: dict(objs) for b, objs in (buckets or {}).items()
+        }
+
+    def _objects(self, bucket: str) -> dict[str, bytes]:
+        return self._buckets.setdefault(bucket, {})
 
     def list_objects(
         self, bucket: str, prefix: str = "", **kwargs: Any
     ) -> list[_FakeObject]:
-        del bucket, kwargs
-        return [_FakeObject(k) for k in self._objects if k.startswith(prefix)]
+        del kwargs
+        return [_FakeObject(k) for k in self._objects(bucket) if k.startswith(prefix)]
 
     def get_object(self, bucket: str, key: str) -> _FakeResponse:
-        del bucket
-        if key not in self._objects:
-            raise ObjectNotFoundError(f"Object does not exist: {key}")
-        return _FakeResponse(self._objects[key])
+        objs = self._objects(bucket)
+        if key not in objs:
+            raise ObjectNotFoundError(f"Object does not exist: {bucket}/{key}")
+        return _FakeResponse(objs[key])
 
     def put_object(self, bucket: str, key: str, body: Any, length: int) -> None:
-        del bucket, length
-        self._objects[key] = body.read()
+        del length
+        self._objects(bucket)[key] = body.read()
 
     def stat_object(self, bucket: str, key: str) -> object:
-        del bucket
-        if key not in self._objects:
-            raise ObjectNotFoundError(f"Object does not exist: {key}")
+        if key not in self._objects(bucket):
+            raise ObjectNotFoundError(f"Object does not exist: {bucket}/{key}")
         return object()  # opaque "exists" sentinel
 
     def remove_object(self, bucket: str, key: str) -> None:
-        del bucket
-        self._objects.pop(key, None)
+        self._objects(bucket).pop(key, None)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
+_SHARED = "memory-shared"
+_PRIVATE = "memory-private"
+
 
 @pytest.fixture
 def fake_bucket_objects() -> dict[str, bytes]:
-    """Three sample ADR-*.md objects under the ``episodic/`` prefix."""
+    """Three sample ADR-*.md objects under the ``episodic/`` prefix (corpus)."""
     return {
         "episodic/ADR-001-use-rocm.md": (
             b"# ADR-001: Use ROCm for GPU Acceleration\n\n"
@@ -130,13 +153,24 @@ def fake_bucket_objects() -> dict[str, bytes]:
 @pytest.fixture
 def s3_episodic(fake_bucket_objects: dict[str, bytes]) -> S3EpisodicService:
     return S3EpisodicService(
-        minio_client=_FakeMinio(fake_bucket_objects),
-        bucket="memory-shared",
+        minio_client=_FakeMinio({_SHARED: fake_bucket_objects}),
+        bucket=_SHARED,
+        private_bucket=_PRIVATE,
         prefix="episodic/",
     )
 
 
-# ── S3EpisodicService tests ──────────────────────────────────────────────────
+def _service(
+    corpus: dict[str, bytes] | None = None,
+    private: dict[str, bytes] | None = None,
+) -> S3EpisodicService:
+    client = _FakeMinio({_SHARED: corpus or {}, _PRIVATE: private or {}})
+    return S3EpisodicService(
+        client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+    )
+
+
+# ── S3EpisodicService tests (corpus-only, pre-existing coverage) ────────────
 
 
 class TestS3EpisodicService:
@@ -162,19 +196,19 @@ class TestS3EpisodicService:
             assert d.metadata["source"] == "episodic"
             assert d.metadata["file"].startswith("ADR-")
             assert d.metadata["file"].endswith(".md")
+            assert d.metadata["tier"] == "corpus"
 
     async def test_load_includes_all_md_objects(self, user_context):
         """Backlog #15 (R1): every ``.md`` object is enumerated, not just
         ADR-*.md. A non-ADR ``decision-*.md`` / ``README.md`` uploaded via
         /memory/upload MUST surface — that was the blind spot."""
-        client = _FakeMinio(
-            {
+        service = _service(
+            corpus={
                 "episodic/README.md": b"# Just a readme\n",
                 "episodic/decision-2026-07-24-x.md": b"# Decision\n\nbody\n",
                 "episodic/ADR-001-x.md": b"# ADR-001\n\nbody\n",
             }
         )
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         docs = await service.load(user_context)
         files = {d.metadata["file"] for d in docs}
         assert files == {"README.md", "decision-2026-07-24-x.md", "ADR-001-x.md"}
@@ -182,19 +216,17 @@ class TestS3EpisodicService:
     async def test_load_still_skips_non_md_objects(self, user_context):
         """Non-``.md`` objects (e.g. papers/*.pdf) are NOT loaded as docs —
         the unified rule is '.md under the prefix'."""
-        client = _FakeMinio(
-            {
+        service = _service(
+            corpus={
                 "episodic/ADR-001-x.md": b"# ADR-001\n\nbody\n",
                 "episodic/papers/foo.pdf": b"%PDF-1.7\n",
             }
         )
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         files = {d.metadata["file"] for d in await service.load(user_context)}
         assert files == {"ADR-001-x.md"}
 
     async def test_load_handles_empty_bucket(self, user_context):
-        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert await service.load(user_context) == []
+        assert await _service().load(user_context) == []
 
     async def test_load_handles_client_exception(self, user_context):
         """An unexpected client error logs + returns []. No exception bubbles."""
@@ -203,7 +235,9 @@ class TestS3EpisodicService:
             def list_objects(self, *a: Any, **kw: Any) -> list[_FakeObject]:
                 raise RuntimeError("connection refused")
 
-        service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
+        service = S3EpisodicService(
+            _Broken(), bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
         assert await service.load(user_context) == []
 
     async def test_search_filters_by_query(
@@ -228,7 +262,7 @@ class TestS3EpisodicService:
             ).encode()
             for i in range(1, 6)
         }
-        service = S3EpisodicService(_FakeMinio(objs), bucket="b", prefix="episodic/")
+        service = _service(corpus=objs)
         results = await service.search(user_context, "server configuration")
         assert len(results) == 5
 
@@ -252,10 +286,9 @@ class TestS3EpisodicService:
 
     async def test_load_handles_adr_with_no_h1_header(self, user_context):
         """An ADR file without a `# ` H1 line still loads — title is the stem."""
-        client = _FakeMinio(
-            {"episodic/ADR-100-no-header.md": b"Just body text, no H1 line.\n"}
+        service = _service(
+            corpus={"episodic/ADR-100-no-header.md": b"Just body text, no H1 line.\n"}
         )
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
         docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["title"] == "ADR-100-no-header"
@@ -279,6 +312,7 @@ class TestS3EpisodicServiceRead:
         assert doc.metadata["file"] == "ADR-009-kv-cache-compression.md"
         assert doc.metadata["title"] == "ADR-009: KV Cache Compression"
         assert doc.metadata["source"] == "episodic"
+        assert doc.metadata["tier"] == "corpus"
 
     async def test_read_missing_file_returns_none(
         self, s3_episodic: S3EpisodicService, user_context
@@ -315,18 +349,304 @@ class TestS3EpisodicServiceRead:
             def get_object(self, *a: Any, **kw: Any) -> _FakeResponse:
                 raise RuntimeError("connection reset")
 
-        service = S3EpisodicService(_Broken(), bucket="b", prefix="episodic/")
+        service = S3EpisodicService(
+            _Broken(), bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
         assert await service.read(user_context, "ADR-001.md") is None
 
     async def test_read_returns_full_untruncated_content(self, user_context):
         """Regression for the ADR-025 bug: full content, no 400-char limit."""
         big = ("# ADR-025\n\n" + ("body line.\n" * 5000)).encode()
-        client = _FakeMinio({"episodic/ADR-025.md": big})
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service = _service(corpus={"episodic/ADR-025.md": big})
         doc = await service.read(user_context, "ADR-025.md")
         assert doc is not None
         assert len(doc.page_content) == len(big.decode())
         assert len(doc.page_content) > 5000  # well over the old 400-char cap
+
+
+# ── ADR-062 Phase B — dual-tier isolation-safety-bar tests ──────────────────
+
+
+def _user(user_id: str) -> Any:
+    """Build a distinct UserContext from the shared admin-sentinel fixture
+    value at call sites that need two *different*, non-admin identities."""
+    from audittrace.identity import UserContext
+
+    return UserContext(
+        user_id=user_id,
+        username=user_id,
+        agent_type="opencode",
+        scopes=("memory:episodic:read", "memory:episodic:write"),
+        is_admin=False,
+    )
+
+
+class TestDualTierWrite:
+    async def test_write_lands_in_private_bucket_only(self, user_context) -> None:
+        """WU-B2 falsifiable: write() must NOT touch the corpus bucket."""
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        alice = _user("user-alice")
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        await service.write(alice, "note.md", "# note\n")
+        assert "user-alice/episodic/note.md" in client._buckets[_PRIVATE]
+        assert client._buckets.get(_SHARED, {}) == {}
+
+    async def test_write_stamps_tier_private(self, user_context) -> None:
+        service = _service()
+        doc = await service.write(user_context, "note.md", "# note\n")
+        assert doc.metadata["tier"] == "private"
+
+    async def test_write_never_shadows_another_users_key(self, user_context) -> None:
+        """Two users writing the SAME filename land at DIFFERENT S3 keys."""
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(alice, "note.md", "# alice's note\n")
+        await service.write(bob, "note.md", "# bob's note\n")
+        private = client._buckets[_PRIVATE]
+        assert private["user-alice/episodic/note.md"] == b"# alice's note\n"
+        assert private["user-bob/episodic/note.md"] == b"# bob's note\n"
+
+
+class TestDualTierListAndSearchIsolation:
+    """The ADR-062 §3 isolation-safety-bar, falsified end to end: user A
+    writes private content; user B's ``load``/``search`` must NOT return it,
+    but BOTH must still see the corpus, tagged ``tier=corpus``."""
+
+    async def test_private_write_not_visible_to_other_user_via_load(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_SHARED: {"episodic/ADR-seed.md": b"# Seed ADR\n\nCorpus content.\n"}}
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+
+        await service.write(alice, "alice-secret.md", "# Alice's private note\n")
+
+        alice_files = {d.metadata["file"] for d in await service.load(alice)}
+        bob_files = {d.metadata["file"] for d in await service.load(bob)}
+
+        assert "alice-secret.md" in alice_files
+        assert "alice-secret.md" not in bob_files  # THE isolation-safety-bar
+        # Both still see the corpus.
+        assert "ADR-seed.md" in alice_files
+        assert "ADR-seed.md" in bob_files
+
+    async def test_corpus_items_are_tagged_tier_corpus_for_every_caller(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_SHARED: {"episodic/ADR-seed.md": b"# Seed ADR\n\nCorpus content.\n"}}
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        bob = _user("user-bob")
+        docs = await service.load(bob)
+        seed = next(d for d in docs if d.metadata["file"] == "ADR-seed.md")
+        assert seed.metadata["tier"] == "corpus"
+
+    async def test_private_write_tagged_tier_private_for_owner(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}})
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice = _user("user-alice")
+        await service.write(alice, "alice-secret.md", "# secret\n")
+        docs = await service.load(alice)
+        mine = next(d for d in docs if d.metadata["file"] == "alice-secret.md")
+        assert mine.metadata["tier"] == "private"
+
+    async def test_private_write_not_found_by_other_user_via_search(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}})
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(
+            alice, "alice-cache-notes.md", "# Cache tuning notes\n\ncache cache\n"
+        )
+        alice_hits = await service.search(alice, "cache tuning")
+        bob_hits = await service.search(bob, "cache tuning")
+        assert any(d.metadata["file"] == "alice-cache-notes.md" for d in alice_hits)
+        assert not any(d.metadata["file"] == "alice-cache-notes.md" for d in bob_hits)
+
+    async def test_private_shadows_same_named_corpus_object(self, user_context) -> None:
+        """A private object with the SAME filename as a corpus object wins
+        the merge (ADR-062 §3: "private shadows corpus")."""
+        client = _FakeMinio(
+            {_SHARED: {"episodic/ADR-1.md": b"# ADR-1\n\ncorpus version\n"}}
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice = _user("user-alice")
+        await service.write(alice, "ADR-1.md", "# ADR-1\n\nalice's private version\n")
+        docs = await service.load(alice)
+        matches = [d for d in docs if d.metadata["file"] == "ADR-1.md"]
+        assert len(matches) == 1  # deduped, not duplicated
+        assert matches[0].metadata["tier"] == "private"
+        assert "alice's private version" in matches[0].page_content
+
+
+class TestDualTierRead:
+    async def test_read_tries_private_first(self, user_context) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {"episodic/ADR-1.md": b"# ADR-1\n\ncorpus\n"},
+                _PRIVATE: {
+                    "user-alice/episodic/ADR-1.md": b"# ADR-1\n\nprivate override\n"
+                },
+            }
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        doc = await service.read(_user("user-alice"), "ADR-1.md")
+        assert doc is not None
+        assert "private override" in doc.page_content
+        assert doc.metadata["tier"] == "private"
+
+    async def test_read_falls_back_to_corpus_when_no_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_SHARED: {"episodic/ADR-1.md": b"# ADR-1\n\ncorpus\n"}, _PRIVATE: {}}
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        doc = await service.read(_user("user-bob"), "ADR-1.md")
+        assert doc is not None
+        assert doc.metadata["tier"] == "corpus"
+
+    async def test_read_by_filename_never_leaks_another_users_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+        await service.write(alice, "alice-secret.md", "# secret\n")
+        # Bob asks for the exact filename by name — must 404 (None), never leak.
+        assert await service.read(bob, "alice-secret.md") is None
+        assert await service.read(alice, "alice-secret.md") is not None
+
+
+class TestDualTierDelete:
+    async def test_delete_only_removes_private_object_never_corpus(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {
+                _SHARED: {"episodic/ADR-1.md": b"# ADR-1\n\ncorpus\n"},
+                _PRIVATE: {"user-alice/episodic/ADR-1.md": b"# ADR-1\n\nprivate\n"},
+            }
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        alice = _user("user-alice")
+        deleted = await service.delete(alice, "ADR-1.md")
+        assert deleted is True
+        assert "user-alice/episodic/ADR-1.md" not in client._buckets[_PRIVATE]
+        # Corpus untouched.
+        assert "episodic/ADR-1.md" in client._buckets[_SHARED]
+        # Reading again now falls back to corpus.
+        doc = await service.read(alice, "ADR-1.md")
+        assert doc is not None
+        assert doc.metadata["tier"] == "corpus"
+
+    async def test_delete_cannot_remove_another_users_private_object(
+        self, user_context
+    ) -> None:
+        client = _FakeMinio(
+            {_PRIVATE: {"user-alice/episodic/note.md": b"# alice's note\n"}}
+        )
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
+        bob = _user("user-bob")
+        deleted = await service.delete(bob, "note.md")
+        assert deleted is False  # Bob has no such key — nothing to delete
+        assert "user-alice/episodic/note.md" in client._buckets[_PRIVATE]
+
+
+class TestDualTierCacheIsolation:
+    """The Redis-cache leak WU-B1 exists to close, exercised through the
+    REAL service by neutering the user_id dimension in the key it consults
+    (not just the key-scheme unit tests in ``test_layer_cache.py``).
+
+    NEUTER: monkeypatch ``layer_list_cache_key_private`` to ignore
+    ``user_id`` (the exact regression this key exists to prevent) → Bob's
+    ``load()`` picks up Alice's cached private write → RED (leak proven).
+    RESTORE: undo the monkeypatch → same scenario, same service instance →
+    GREEN (isolated again). Proves the isolation is load-bearing, not
+    vacuously true.
+    """
+
+    async def test_neutered_user_id_dimension_leaks_then_restored_key_isolates(
+        self, user_context, monkeypatch
+    ) -> None:
+        import audittrace.services.episodic as episodic_module
+        from audittrace.services.layer_cache import InMemoryLayerCacheStore
+
+        shared_cache = InMemoryLayerCacheStore()
+        client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        service = S3EpisodicService(
+            client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="episodic/",
+            cache=shared_cache,
+        )
+        alice, bob = _user("user-alice"), _user("user-bob")
+
+        # NEUTER — private cache key collapses to a single fleet-wide key
+        # (drops the user_id dimension), the exact bug the real key
+        # prevents.
+        monkeypatch.setattr(
+            episodic_module,
+            "layer_list_cache_key_private",
+            lambda layer, user_id: "audittrace:layer-cache:episodic:private:list",
+        )
+        await service.write(alice, "alice-secret.md", "# secret\n")
+        # Warm the (buggy, now user_id-agnostic) private cache with Alice's
+        # own listing — this is the read a normal "list my private items"
+        # call would make right after the write.
+        await service.load(alice)
+        # Bob's private listing now collapses onto the SAME cache key and
+        # gets served Alice's cached rows — the leak.
+        bob_files_neutered = {d.metadata["file"] for d in await service.load(bob)}
+        assert "alice-secret.md" in bob_files_neutered  # RED — leak proven
+
+        # RESTORE — undo the monkeypatch, fresh service + cache so no
+        # neutered-state cache entries linger.
+        monkeypatch.undo()
+        clean_cache = InMemoryLayerCacheStore()
+        clean_client = _FakeMinio({_SHARED: {}, _PRIVATE: {}})
+        clean_service = S3EpisodicService(
+            clean_client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="episodic/",
+            cache=clean_cache,
+        )
+        await clean_service.write(alice, "alice-secret.md", "# secret\n")
+        bob_files_restored = {d.metadata["file"] for d in await clean_service.load(bob)}
+        assert "alice-secret.md" not in bob_files_restored  # GREEN — isolated
 
 
 # ── MockEpisodicService tests ────────────────────────────────────────────────
@@ -346,6 +666,7 @@ class TestMockEpisodicService:
         docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["title"] == "ADR-009"
+        assert docs[0].metadata["tier"] == "corpus"
 
     async def test_mock_search_filters(self, user_context):
         service = MockEpisodicService()
@@ -408,36 +729,77 @@ class TestMockEpisodicService:
         service.add_document("contents", title="ADR-007", file="ADR-007.md")
         assert await service.read(user_context, "../etc/passwd.md") is None
 
+    def test_mock_add_document_private_requires_user_id(self) -> None:
+        service = MockEpisodicService()
+        with pytest.raises(ValueError, match="user_id"):
+            service.add_document("secret", tier="private")
+
+
+class TestMockEpisodicServiceDualTierIsolation:
+    """Same isolation-safety-bar as the S3 fake, exercised against the mock
+    (routes/tool tests use the mock via ``create_test_container``)."""
+
+    async def test_private_document_not_visible_to_other_user(
+        self, user_context
+    ) -> None:
+        service = MockEpisodicService()
+        service.add_document("corpus item", title="Seed", file="seed.md")
+        service.add_document(
+            "alice's private note",
+            title="Alice",
+            file="alice.md",
+            tier="private",
+            user_id="user-alice",
+        )
+        alice = _user("user-alice")
+        bob = _user("user-bob")
+
+        alice_files = {d.metadata["file"] for d in await service.load(alice)}
+        bob_files = {d.metadata["file"] for d in await service.load(bob)}
+
+        assert "alice.md" in alice_files
+        assert "alice.md" not in bob_files
+        assert "seed.md" in alice_files
+        assert "seed.md" in bob_files
+
+    async def test_mock_read_never_leaks_across_users(self, user_context) -> None:
+        service = MockEpisodicService()
+        service.add_document(
+            "secret", file="secret.md", tier="private", user_id="user-alice"
+        )
+        assert await service.read(_user("user-bob"), "secret.md") is None
+        assert await service.read(_user("user-alice"), "secret.md") is not None
+
 
 # ── write / delete / invalidate_cache (PR A — CRUD backoffice) ──────────────
 
 
 class TestS3EpisodicServiceWriteDelete:
     """write() and delete() round-trip through the fake MinIO and
-    invalidate the in-memory cache so subsequent load()/read() see
+    invalidate the private-tier cache so subsequent load()/read() see
     the change."""
 
     async def test_write_creates_object_and_invalidates_cache(
         self, user_context
     ) -> None:
-        client = _FakeMinio({})
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service = _service()
         # Warm the cache
         assert await service.load(user_context) == []
         # Write
         doc = await service.write(user_context, "ADR-100.md", "# ADR-100\n\nbody\n")
         assert doc.metadata["file"] == "ADR-100.md"
         assert doc.metadata["title"] == "ADR-100"
-        # Object landed in the fake MinIO
-        assert "episodic/ADR-100.md" in client._objects
+        # Object landed in the private bucket under the user prefix.
+        key = f"{user_context.user_id}/episodic/ADR-100.md"
+        assert key in service._client._buckets[_PRIVATE]
         # Cache was invalidated → next load() sees the new doc
         assert any(
             d.metadata["file"] == "ADR-100.md" for d in await service.load(user_context)
         )
 
     async def test_write_replaces_existing(self, user_context) -> None:
-        client = _FakeMinio({"episodic/ADR-x.md": b"# v1\n"})
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        key = f"{user_context.user_id}/episodic/ADR-x.md"
+        service = _service(private={key: b"# v1\n"})
         await service.write(user_context, "ADR-x.md", "# v2\n")
         # Re-fetch
         doc = await service.read(user_context, "ADR-x.md")
@@ -445,36 +807,40 @@ class TestS3EpisodicServiceWriteDelete:
         assert doc.page_content == "# v2\n"
 
     async def test_write_rejects_invalid_filename(self, user_context) -> None:
-        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
+        service = _service()
         with pytest.raises(ValueError):
             await service.write(user_context, "../escape.md", "x")
 
     async def test_delete_removes_existing(self, user_context) -> None:
-        client = _FakeMinio({"episodic/ADR-d.md": b"# bye\n"})
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        key = f"{user_context.user_id}/episodic/ADR-d.md"
+        service = _service(private={key: b"# bye\n"})
         # Warm cache
         await service.load(user_context)
         deleted = await service.delete(user_context, "ADR-d.md")
         assert deleted is True
-        assert "episodic/ADR-d.md" not in client._objects
+        assert key not in service._client._buckets[_PRIVATE]
         # Cache invalidated → not found
         assert await service.read(user_context, "ADR-d.md") is None
 
     async def test_delete_missing_returns_false(self, user_context) -> None:
-        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert await service.delete(user_context, "never.md") is False
+        assert await _service().delete(user_context, "never.md") is False
 
     async def test_delete_rejects_invalid_filename(self, user_context) -> None:
-        service = S3EpisodicService(_FakeMinio({}), bucket="b", prefix="episodic/")
-        assert await service.delete(user_context, "../escape.md") is False
+        assert await _service().delete(user_context, "../escape.md") is False
 
-    async def test_invalidate_cache_explicit(self, user_context) -> None:
-        client = _FakeMinio({"episodic/ADR-c.md": b"# c\n"})
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+    async def test_invalidate_cache_explicit_covers_corpus_tier(
+        self, user_context
+    ) -> None:
+        """The no-arg ``invalidate_cache()`` is the CORPUS-side hook — it
+        must surface a newly-appeared corpus object, same as before Phase B."""
+        client = _FakeMinio({_SHARED: {"episodic/ADR-c.md": b"# c\n"}})
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
         await service.load(user_context)  # warm
-        # Backdoor an extra object straight into MinIO
-        client._objects["episodic/ADR-side.md"] = b"# side\n"
-        # Without invalidation, cache hides it
+        # Backdoor an extra object straight into the corpus bucket.
+        client._buckets[_SHARED]["episodic/ADR-side.md"] = b"# side\n"
+        # Without invalidation, cache hides it.
         files_before = {d.metadata["file"] for d in await service.load(user_context)}
         assert "ADR-side.md" not in files_before
         service.invalidate_cache()
@@ -494,15 +860,24 @@ class _FakeObjectWithMeta:
 class _FakeMinioWithMeta(_FakeMinio):
     """As :class:`_FakeMinio` but ``list_objects`` yields last_modified."""
 
-    def __init__(self, objects: dict[str, tuple[bytes, Any]]) -> None:
-        self._rich = dict(objects)
-        super().__init__({k: v[0] for k, v in objects.items()})
+    def __init__(
+        self, buckets: dict[str, dict[str, tuple[bytes, Any]]] | None = None
+    ) -> None:
+        self._rich: dict[str, dict[str, tuple[bytes, Any]]] = {
+            b: dict(objs) for b, objs in (buckets or {}).items()
+        }
+        super().__init__(
+            {
+                bucket: {k: v[0] for k, v in objs.items()}
+                for bucket, objs in self._rich.items()
+            }
+        )
 
     def list_objects(self, bucket: str, prefix: str = "", **kwargs: Any):
-        del bucket, kwargs
+        del kwargs
         return [
             _FakeObjectWithMeta(k, len(v[0]), v[1])
-            for k, v in self._rich.items()
+            for k, v in self._rich.get(bucket, {}).items()
             if k.startswith(prefix)
         ]
 
@@ -515,9 +890,15 @@ class TestS3EpisodicServiceCacheAndTimestamps:
 
         lm = datetime(2026, 7, 24, 9, 30, 0, tzinfo=UTC)
         client = _FakeMinioWithMeta(
-            {"episodic/decision-2026-07-24.md": (b"# Decision\n\nbody\n", lm)}
+            {
+                _SHARED: {
+                    "episodic/decision-2026-07-24.md": (b"# Decision\n\nbody\n", lm)
+                }
+            }
         )
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
         docs = await service.load(user_context)
         assert len(docs) == 1
         assert docs[0].metadata["last_modified_ms"] == int(lm.timestamp() * 1000)
@@ -525,22 +906,34 @@ class TestS3EpisodicServiceCacheAndTimestamps:
     async def test_injected_shared_store_is_used_and_invalidation_surfaces_object(
         self, user_context
     ):
-        """The list path (load) consults the SHARED store; an invalidation
-        makes a newly-written object appear (R6d). Two services over one
-        store simulate two replicas (R2/Defect B)."""
+        """The list path (load) consults the SHARED corpus store; an
+        invalidation makes a newly-written corpus object appear (R6d). Two
+        services over one store simulate two replicas (R2/Defect B)."""
         from audittrace.services.layer_cache import InMemoryLayerCacheStore
 
         shared = InMemoryLayerCacheStore()
-        client = _FakeMinio({"episodic/ADR-c.md": b"# c\n"})
-        pod_a = S3EpisodicService(client, bucket="b", prefix="episodic/", cache=shared)
-        pod_b = S3EpisodicService(client, bucket="b", prefix="episodic/", cache=shared)
+        client = _FakeMinio({_SHARED: {"episodic/ADR-c.md": b"# c\n"}})
+        pod_a = S3EpisodicService(
+            client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="episodic/",
+            cache=shared,
+        )
+        pod_b = S3EpisodicService(
+            client,
+            bucket=_SHARED,
+            private_bucket=_PRIVATE,
+            prefix="episodic/",
+            cache=shared,
+        )
 
         # pod A warms the shared cache
         assert {d.metadata["file"] for d in await pod_a.load(user_context)} == {
             "ADR-c.md"
         }
         # A non-ADR object lands in S3 directly (as /memory/upload would do)
-        client._objects["episodic/decision-new.md"] = b"# decision\n"
+        client._buckets[_SHARED]["episodic/decision-new.md"] = b"# decision\n"
         # pod B still serves the shared cached listing (no re-read yet)
         assert "decision-new.md" not in {
             d.metadata["file"] for d in await pod_b.load(user_context)
@@ -559,16 +952,20 @@ class TestS3EpisodicServiceCacheAndTimestamps:
 
         client = _FakeMinio(
             {
-                "episodic/ADR-1.md": b"# ADR-1\n\nbody\n",
-                "episodic/decision-2026-07-24.md": b"# Decision\n\nbody\n",
+                _SHARED: {
+                    "episodic/ADR-1.md": b"# ADR-1\n\nbody\n",
+                    "episodic/decision-2026-07-24.md": b"# Decision\n\nbody\n",
+                }
             }
         )
-        service = S3EpisodicService(client, bucket="b", prefix="episodic/")
+        service = S3EpisodicService(
+            client, bucket=_SHARED, private_bucket=_PRIVATE, prefix="episodic/"
+        )
 
         load_files = {d.metadata["file"] for d in await service.load(user_context)}
         index_files = {
             o["filename"]
-            for o in _list_objects_from_minio(client, "b", "episodic/")
+            for o in _list_objects_from_minio(client, _SHARED, "episodic/")
             if o["filename"].endswith(".md")
         }
         read_doc = await service.read(user_context, "decision-2026-07-24.md")
@@ -611,3 +1008,78 @@ class TestMockEpisodicServiceWriteDelete:
         service = MockEpisodicService()
         service.invalidate_cache()
         service.invalidate_cache()  # idempotent
+
+
+# ── UserScopedEpisodicService (ADR-062 Phase B, WU-B1) ───────────────────────
+
+
+class TestUserScopedEpisodicService:
+    """Mirrors ``TestUserScopedSemanticService`` (semantic.py precedent):
+    the bound identity wins over any per-call ``user_context`` — true
+    isolation by construction at the ``get_context_builder()`` DI seam."""
+
+    async def test_bound_identity_overrides_call_time_argument(
+        self, user_context
+    ) -> None:
+        inner = MockEpisodicService()
+        inner.add_document(
+            "alice's note",
+            file="alice.md",
+            tier="private",
+            user_id="user-alice",
+        )
+        alice = _user("user-alice")
+        wrapper = UserScopedEpisodicService(inner=inner, user_context=alice)
+
+        # Call-time argument is an entirely different (bogus admin) context —
+        # the wrapper must ignore it and use the bound Alice identity.
+        bogus = replace(user_context, user_id="someone-else", is_admin=True)
+        docs = await wrapper.load(bogus)
+        assert any(d.metadata["file"] == "alice.md" for d in docs)
+
+    async def test_two_wrappers_stay_isolated(self, user_context) -> None:
+        inner = MockEpisodicService()
+        alice, bob = _user("user-alice"), _user("user-bob")
+        wrapper_a = UserScopedEpisodicService(inner=inner, user_context=alice)
+        wrapper_b = UserScopedEpisodicService(inner=inner, user_context=bob)
+
+        await wrapper_a.write(alice, "note.md", "alice's content")
+        alice_doc = await wrapper_a.read(alice, "note.md")
+        bob_doc = await wrapper_b.read(bob, "note.md")
+
+        assert alice_doc is not None
+        assert bob_doc is None  # never leaks across the two wrappers
+
+    async def test_search_and_as_context_and_delete_delegate_to_bound_user(
+        self, user_context
+    ) -> None:
+        inner = MockEpisodicService()
+        alice = _user("user-alice")
+        wrapper = UserScopedEpisodicService(inner=inner, user_context=alice)
+
+        await wrapper.write(alice, "cache-notes.md", "cache tuning details")
+        hits = await wrapper.search(alice, "cache tuning")
+        assert any(d.metadata["file"] == "cache-notes.md" for d in hits)
+
+        ctx = await wrapper.as_context(alice, "cache tuning")
+        assert "cache-notes.md" in ctx or "cache tuning" in ctx.lower()
+
+        deleted = await wrapper.delete(alice, "cache-notes.md")
+        assert deleted is True
+        assert await wrapper.read(alice, "cache-notes.md") is None
+
+    def test_invalidate_cache_delegates_to_inner(self) -> None:
+        class _Spy(MockEpisodicService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.invalidated = False
+
+            def invalidate_cache(self) -> None:
+                self.invalidated = True
+
+        inner = _Spy()
+        wrapper = UserScopedEpisodicService(
+            inner=inner, user_context=_user("user-alice")
+        )
+        wrapper.invalidate_cache()
+        assert inner.invalidated is True

@@ -220,26 +220,59 @@ class TestPerRequestContextBuilder:
         # Wrapper is bound to the caller's user_context identity.
         assert builder._semantic._bound_user.user_id == user_context.user_id
 
-    def test_context_builder_episodic_procedural_conversational_unchanged(
+    def test_context_builder_wraps_episodic_with_user_scope(
         self, test_container, user_context
     ):
-        """The wrapper is applied only to the semantic layer; the other
-        three services are shared singletons from the container."""
+        """ADR-062 Phase B (WU-B1): episodic now needs the same
+        isolation-by-construction wrapper as semantic — the private tier
+        is real, so a bug threading the wrong identity downstream must not
+        be able to leak it."""
+        from audittrace import dependencies as deps_module
+        from audittrace.dependencies import get_context_builder
+        from audittrace.services.episodic import UserScopedEpisodicService
+
+        deps_module.container = test_container
+        builder = get_context_builder(user_context)
+
+        assert isinstance(builder._episodic, UserScopedEpisodicService)
+        assert builder._episodic._bound_user.user_id == user_context.user_id
+        # The inner (unwrapped) service is still the shared singleton.
+        assert builder._episodic._inner is test_container._instances["episodic"]
+
+    def test_context_builder_wraps_procedural_with_user_scope(
+        self, test_container, user_context
+    ):
+        """Same rationale as episodic — see test above."""
+        from audittrace import dependencies as deps_module
+        from audittrace.dependencies import get_context_builder
+        from audittrace.services.procedural import UserScopedProceduralService
+
+        deps_module.container = test_container
+        builder = get_context_builder(user_context)
+
+        assert isinstance(builder._procedural, UserScopedProceduralService)
+        assert builder._procedural._bound_user.user_id == user_context.user_id
+        assert builder._procedural._inner is test_container._instances["procedural"]
+
+    def test_context_builder_conversational_unchanged(
+        self, test_container, user_context
+    ):
+        """Conversational stays a shared singleton — RLS is already the
+        per-user isolation mechanism there (migration 005), no wrapper
+        needed."""
         from audittrace import dependencies as deps_module
         from audittrace.dependencies import get_context_builder
 
         deps_module.container = test_container
         builder = get_context_builder(user_context)
 
-        # These must be IS-identical to the shared container instances.
-        assert builder._episodic is test_container._instances["episodic"]
-        assert builder._procedural is test_container._instances["procedural"]
         assert builder._conversational is test_container._instances["conversational"]
 
     def test_two_users_get_distinct_wrappers(self, test_container, user_context):
         """Two different users hitting the endpoint in the same session
         get two distinct wrapper instances, each bound to the right
-        identity."""
+        identity, across ALL three wrapped layers (episodic/procedural/
+        semantic)."""
         from dataclasses import replace
 
         from audittrace import dependencies as deps_module
@@ -255,6 +288,10 @@ class TestPerRequestContextBuilder:
         assert builder_a is not builder_b
         assert builder_a._semantic._bound_user.user_id == "user-alice"
         assert builder_b._semantic._bound_user.user_id == "user-bob"
+        assert builder_a._episodic._bound_user.user_id == "user-alice"
+        assert builder_b._episodic._bound_user.user_id == "user-bob"
+        assert builder_a._procedural._bound_user.user_id == "user-alice"
+        assert builder_b._procedural._bound_user.user_id == "user-bob"
 
 
 # ── Trust-store DI selection paths (#366 branch coverage) ──────────────────
@@ -483,6 +520,44 @@ class TestObjectStorageBackendSelection:
                 Settings(object_storage_backend="aws", aws_region="", aws_bucket="")
             )
         assert "AWS_REGION" in str(exc.value) or "AWS_BUCKET" in str(exc.value)
+
+    def test_aws_backend_requires_private_bucket_too(self) -> None:
+        """ADR-062 Phase B (WU-B1): ``aws_private_bucket`` is required with
+        the same fail-fast discipline as ``aws_bucket`` — a private-tier
+        write that silently targeted an empty bucket name would be a much
+        worse failure mode than a loud RuntimeError at startup."""
+        from audittrace.config import Settings
+        from audittrace.dependencies import _create_object_storage_provider
+
+        # Region + shared bucket both set; only the private bucket is missing.
+        with pytest.raises(RuntimeError) as exc:
+            _create_object_storage_provider(
+                Settings(
+                    object_storage_backend="aws",
+                    aws_region="eu-central-2",
+                    aws_bucket="audittrace-shared",
+                    aws_private_bucket="",
+                )
+            )
+        assert "AWS_PRIVATE_BUCKET" in str(exc.value)
+
+    def test_aws_backend_succeeds_with_all_three_set(self) -> None:
+        """Positive control for the two RED tests above — region + bucket +
+        private_bucket all set must NOT raise the config-validation error."""
+        from unittest.mock import patch
+
+        from audittrace.config import Settings
+        from audittrace.dependencies import _create_object_storage_provider
+
+        settings = Settings(
+            object_storage_backend="aws",
+            aws_region="eu-central-2",
+            aws_bucket="audittrace-shared",
+            aws_private_bucket="audittrace-private",
+        )
+        with patch("audittrace_object_storage.create_provider") as mock_create:
+            _create_object_storage_provider(settings)
+        assert mock_create.called
 
     def test_unknown_backend_names_the_valid_set(self) -> None:
         from audittrace.config import Settings
