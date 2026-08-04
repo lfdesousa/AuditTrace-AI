@@ -123,6 +123,8 @@ jobs:
             --cov=src \
             --cov=scripts/deploy \
             --cov=scripts/hooks \
+            --cov=scripts/release \
+            --cov=scripts/migrate \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html:htmlcov \
