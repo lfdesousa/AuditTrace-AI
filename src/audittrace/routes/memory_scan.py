@@ -58,8 +58,12 @@ _SCAN_STATUS_CODES: frozenset[str] = frozenset(
 # security-assessment recorded as first-class events, distinct from
 # runtime "security" verdicts so SOC alerting does not page on the
 # recorder's self-review rows.
+# "memory_access" — ADR-062 §5 (WU-A4): every /memory/* read/list/write/
+# delete emits a first-class audit row so "reading the recorder is
+# recorded" extends to the recorder's own knowledge base, not just chat
+# completions. Written by ``services/memory_audit.py``.
 _EVENT_CLASS_VALUES: frozenset[str] = frozenset(
-    {"interaction", "security", "assessment"}
+    {"interaction", "security", "assessment", "memory_access"}
 )
 
 __all__ = ["_SCAN_STATUS_CODES", "_EVENT_CLASS_VALUES"]

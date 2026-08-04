@@ -497,20 +497,41 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {
         "name": "context",
         "description": (
-            "Build the augmented system context across all four memory layers "
-            "(episodic, procedural, conversational, semantic) without going "
-            "through chat completions. Used by the webui memory tab and by "
-            "external agents that want to inspect what would be injected."
+            "Build the augmented system context across the four per-user "
+            "memory layers (episodic, procedural, conversational, semantic) "
+            "without going through chat completions — this is the "
+            "``memory_mode=inject`` aggregator (ADR-025) and does NOT include "
+            "Layer 5, the Shared Corpus (production runs "
+            "``memory_mode=tools``, where recall — including Layer 5 — happens "
+            "via the ``recall_*`` tools inside the chat-completions tool-call "
+            "loop instead; see the top-level API description). Used by the "
+            "webui memory tab and by external agents that want to inspect "
+            "what would be injected."
         ),
     },
     {
         "name": "memory",
         "description": (
-            "CRUD over the four memory layers. Episodic = ADRs, "
-            "Procedural = skill files, Conversational = past sessions "
-            "(read-only), Semantic = ChromaDB-backed RAG. Each write is "
-            "scoped to the caller's Keycloak ``sub`` and gated by RLS at the "
-            "Postgres + ChromaDB layers."
+            "Backoffice CRUD over the five-layer memory model (ADR-062) — "
+            "this is the operator/audit management surface, NOT where LLM "
+            "recall happens (see the top-level API description for that). "
+            "Episodic = ADRs, Procedural = skill files, Conversational = "
+            "past sessions (read-only), Semantic = ChromaDB-backed RAG. "
+            "Layers 1-4 are designed per-user-isolated (episodic/procedural "
+            "S3-tier wiring + semantic per-user source vectors ship in ADR-062 "
+            "Phase B; conversational RLS and semantic recall filtering are "
+            "already live). ``POST /memory/index`` bulk-rebuilds Layer 5 (the "
+            "Shared Corpus — decisions/skills/semantic collections) and is "
+            "admin-only. Every operation here — read, list, write, delete — "
+            "emits a first-class audit row (``event_class=memory_access``, "
+            "``GET /interactions``), owner-scoped and trace-linked (ADR-062 "
+            "§5). Deletes default to soft-delete (manifest tombstone, the "
+            "authoritative + recoverable + recall-honoured state for corpus "
+            "content per ADR-062 §6); ``?hard=true`` additionally purges the "
+            "underlying S3 object / ChromaDB vector and requires "
+            "``audittrace:admin``. Each write is scoped to the caller's "
+            "Keycloak ``sub`` and gated by RLS at the Postgres + ChromaDB "
+            "layers."
         ),
     },
     {
@@ -547,12 +568,23 @@ def create_app() -> FastAPI:
         title="AuditTrace-AI",
         description=(
             "EU-AI-Act-aligned audit trail for LLM workloads. "
-            "OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer memory "
-            "augmentation (episodic + procedural + conversational + semantic), "
-            "Keycloak-delegated identity, Postgres RLS per-user isolation, and "
-            "opt-in Redis-Streams async persistence (ADR-046).\n\n"
+            "OpenAI-compatible ``/v1/chat/completions`` proxy over a five-layer "
+            "memory model (ADR-062): four per-user-isolated layers — episodic, "
+            "procedural, conversational, semantic — plus Layer 5, the Shared "
+            "Corpus (org-wide knowledge, shared-read, operator/curator-tier "
+            "write). Keycloak-delegated identity, Postgres RLS per-user "
+            "isolation, opt-in Redis-Streams async persistence (ADR-046), and "
+            "a first-class audit event on every memory read/list/write/delete "
+            "(ADR-062 §5 — ``event_class=memory_access`` on ``GET "
+            "/interactions``).\n\n"
+            "Recall (the LLM reading its own memory) happens through the "
+            "``recall_*`` tools inside the ``/v1/chat/completions`` tool-call "
+            "loop (ADR-025) and through ``POST /context`` (the legacy "
+            "``inject``-mode aggregator) — NOT through the ``memory`` tag's "
+            "backoffice CRUD endpoints, which are the operator/audit surface "
+            "for managing memory content directly.\n\n"
             "See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set "
-            "(014–046) is the source of truth for design decisions."
+            "(014–062) is the source of truth for design decisions."
         ),
         version=_resolve_version(),
         openapi_tags=OPENAPI_TAGS,

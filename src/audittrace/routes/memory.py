@@ -39,6 +39,7 @@ from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Body,
     Depends,
     File,
@@ -84,6 +85,11 @@ from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.layer_listing import list_layer_objects
+from audittrace.services.memory_audit import (
+    MemoryOp,
+    emit_memory_audit_event,
+    schedule_read_audit,
+)
 from audittrace.services.memory_manifest import ManifestEntry
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 
@@ -279,6 +285,48 @@ def _require_admin(user: UserContext, action: str) -> None:
         status_code=403,
         detail=f"Required scope: audittrace:admin ({action})",
     )
+
+
+async def _emit_write_audit(
+    *,
+    user: UserContext,
+    op: MemoryOp,
+    layer: str,
+    collection: str | None = None,
+    key: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
+) -> None:
+    """Fail-closed wrapper around :func:`emit_memory_audit_event` for every
+    WRITE/DELETE call site (ADR-062 §5, WU-A4).
+
+    See ``services/memory_audit.py``'s module docstring for the full
+    read=fail-open / write=fail-closed rationale. This wrapper converts an
+    audit-store failure into an explicit ``HTTPException(500)`` rather than
+    letting a bare exception fall through to the app-wide catch-all
+    handler — the caller gets a precise, on-brand error (matching every
+    other 5xx in this file) instead of a generic unhandled-exception
+    envelope, and the failure is deterministically visible to
+    ``TestClient`` (Starlette's ``ServerErrorMiddleware`` always re-raises
+    after an unhandled exception, which ``TestClient`` in turn re-raises
+    into the caller's test — an explicit ``HTTPException`` is the
+    established pattern this file already uses everywhere else a service
+    call can fail, e.g. ``_require_admin``'s 403, the 502s below)."""
+    try:
+        await emit_memory_audit_event(
+            user=user,
+            op=op,
+            layer=layer,
+            collection=collection,
+            key=key,
+            detail_extra=detail_extra,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"memory audit-write failed — mutation not confirmed audited: {exc}"
+            ),
+        ) from exc
 
 
 @router.post("/upload")
@@ -802,6 +850,21 @@ async def index_memory(
         response["dry_run"] = True
     if details:
         response["documents"] = details_log
+    # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
+    # closed). One event per /memory/index call, naming every target
+    # collection touched; single-file mode additionally names the key.
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer="semantic",
+        collection=",".join(target_collections),
+        key=file,
+        detail_extra={
+            "mode": "single_file" if single_file_mode else "bulk",
+            "dry_run": dry_run,
+            "total_chunks": total_chunks,
+        },
+    )
     return response
 
 
@@ -879,6 +942,9 @@ async def create_episodic(
         size_bytes=len(content.encode("utf-8")),
         user_id=user.user_id,
     )
+    # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
+    # closed: see services/memory_audit.py module docstring).
+    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
 
@@ -1047,6 +1113,8 @@ async def list_episodic(
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """List ADRs / decision records. Merges manifest rows with S3 objects so
     content uploaded via /memory/upload or seeded via index-chromadb surfaces
@@ -1064,6 +1132,9 @@ async def list_episodic(
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
+    # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
+    # services/memory_audit.py module docstring).
+    schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1072,6 +1143,8 @@ async def read_episodic(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Read ADR content + manifest metadata."""
     _validate_filename_or_400(filename, "episodic")
@@ -1081,6 +1154,9 @@ async def read_episodic(
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
     entry: ManifestEntry | None = await manifest.get("episodic", filename)
+    schedule_read_audit(
+        background_tasks, user=user, op="read", layer="episodic", key=filename
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1127,6 +1203,7 @@ async def update_episodic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
 
@@ -1143,7 +1220,13 @@ async def delete_episodic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """Soft-delete by default; ``?hard=true`` also purges the S3 object."""
+    """Soft-delete by default; ``?hard=true`` also purges the S3 object.
+
+    ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
+    corpus content — ``?hard=true`` is NOT the default delete path (the
+    ``hard`` query param defaults to ``False`` and additionally requires
+    ``audittrace:admin``), and a hard purge is audited with
+    ``detail_extra={"hard": True}`` same as every other delete."""
     _validate_filename_or_400(filename, "episodic")
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
@@ -1163,6 +1246,13 @@ async def delete_episodic(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="episodic",
+        key=filename,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 
@@ -1200,6 +1290,7 @@ async def create_procedural(
         size_bytes=len(content.encode("utf-8")),
         user_id=user.user_id,
     )
+    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
 
@@ -1222,6 +1313,8 @@ async def list_procedural(
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """List SKILLs. Same merge-with-S3 + sort/paginate semantics as
     `/memory/episodic` so all ``.md`` items appear alongside
@@ -1234,6 +1327,7 @@ async def list_procedural(
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
+    schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1242,6 +1336,8 @@ async def read_procedural(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     _validate_filename_or_400(filename, "procedural")
     service = get_procedural_service()
@@ -1250,6 +1346,9 @@ async def read_procedural(
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
     entry: ManifestEntry | None = await manifest.get("procedural", filename)
+    schedule_read_audit(
+        background_tasks, user=user, op="read", layer="procedural", key=filename
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1293,6 +1392,7 @@ async def update_procedural(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
 
@@ -1303,6 +1403,8 @@ async def delete_procedural(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """Soft-delete by default; ``?hard=true`` also purges the S3 object
+    (ADR-062 §6 — same discipline as ``delete_episodic``)."""
     _validate_filename_or_400(filename, "procedural")
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
@@ -1322,6 +1424,13 @@ async def delete_procedural(
             await service.delete(user, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="procedural",
+        key=filename,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 
@@ -1374,6 +1483,13 @@ async def create_semantic(
         title=title,
         size_bytes=len(text.encode("utf-8")),
         user_id=user.user_id,
+    )
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
     )
     return entry.to_dict()
 
@@ -1488,6 +1604,8 @@ async def list_semantic(
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
     discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
@@ -1510,6 +1628,13 @@ async def list_semantic(
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="list",
+        layer="semantic",
+        collection=collection,
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1519,6 +1644,8 @@ async def read_semantic(
     document_id: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
+    *,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
@@ -1527,6 +1654,14 @@ async def read_semantic(
         raise HTTPException(status_code=404, detail="semantic doc not found")
     entry: ManifestEntry | None = await manifest.get(
         "semantic", _semantic_key(collection, document_id)
+    )
+    schedule_read_audit(
+        background_tasks,
+        user=user,
+        op="read",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
     )
     return {
         "content": doc.page_content,
@@ -1570,6 +1705,13 @@ async def update_semantic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="write",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
+    )
     return entry.to_dict()
 
 
@@ -1581,6 +1723,10 @@ async def delete_semantic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """Soft-delete by default; ``?hard=true`` also purges the Chroma
+    vector (ADR-062 §6 — same discipline as ``delete_episodic``). The
+    manifest tombstone alone is what ``search()``/``search_page()``
+    consult to keep a soft-deleted item out of recall (WU-A5)."""
     if hard and "audittrace:admin" not in user.scopes and not user.is_admin:
         raise HTTPException(
             status_code=403,
@@ -1600,6 +1746,14 @@ async def delete_semantic(
             await service.delete_document(user, collection, document_id)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _emit_write_audit(
+        user=user,
+        op="delete",
+        layer="semantic",
+        collection=collection,
+        key=document_id,
+        detail_extra={"hard": hard},
+    )
     return entry.to_dict()
 
 

@@ -313,6 +313,16 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         session_factory=pg_factory.get_session_factory(),
     )
 
+    # Memory-layer manifest (CRUD backoffice — migration 009 + the
+    # /memory/<layer> REST endpoints). Postgres-backed; same session
+    # factory as conversational since the table is in the same DB.
+    # Constructed BEFORE the semantic service so it can be threaded into
+    # ChromaSemanticService below (ADR-062 §6 / WU-A5 — recall consults
+    # the manifest's soft-delete tombstone).
+    memory_manifest = MemoryManifestService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     # Semantic service needs ChromaDB client — lazy-resolve via container
     chroma_client = container.get_instance("chromadb")
     semantic = ChromaSemanticService(
@@ -327,13 +337,9 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         # ADR-047 — vectors computed on the dedicated nomic embed server.
         embed_url=settings.embed_url,
         embed_model=settings.embed_model,
-    )
-
-    # Memory-layer manifest (CRUD backoffice — migration 009 + the
-    # /memory/<layer> REST endpoints). Postgres-backed; same session
-    # factory as conversational since the table is in the same DB.
-    memory_manifest = MemoryManifestService(
-        session_factory=pg_factory.get_session_factory(),
+        # ADR-062 §6 (WU-A5) — recall honours the manifest soft-delete
+        # tombstone; see ChromaSemanticService._filter_soft_deleted.
+        manifest=memory_manifest,
     )
 
     context_builder = DefaultContextBuilder(

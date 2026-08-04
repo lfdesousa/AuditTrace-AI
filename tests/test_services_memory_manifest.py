@@ -267,6 +267,53 @@ class TestGet:
         assert e.deleted_at_ms is not None
 
 
+class TestGetDeletedKeys:
+    """ADR-062 §6 (WU-A5) — ``get_deleted_keys`` is what
+    ``ChromaSemanticService`` consults to honour the manifest soft-delete
+    tombstone at recall time (see ``test_semantic_service.py::
+    TestSoftDeleteTombstoneFiltersRecall`` for the consumer-side proof)."""
+
+    async def test_empty_keys_short_circuits(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        assert await manifest.get_deleted_keys("semantic", []) == set()
+
+    async def test_live_key_not_returned(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create("semantic", "decisions/d1", None, 1, "u")
+        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == set()
+
+    async def test_deleted_key_is_returned(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create("semantic", "decisions/d1", None, 1, "u")
+        await manifest.record_delete("semantic", "decisions/d1", "u")
+        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == {
+            "decisions/d1"
+        }
+
+    async def test_only_the_requested_keys_are_checked(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create("semantic", "decisions/d1", None, 1, "u")
+        await manifest.record_delete("semantic", "decisions/d1", "u")
+        await manifest.record_create("semantic", "decisions/d2", None, 1, "u")
+        await manifest.record_delete("semantic", "decisions/d2", "u")
+        # d2 is soft-deleted too, but wasn't asked about — must not leak in.
+        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == {
+            "decisions/d1"
+        }
+
+    async def test_other_layer_is_isolated(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create("episodic", "decisions/d1", None, 1, "u")
+        await manifest.record_delete("episodic", "decisions/d1", "u")
+        # Same key string, different layer — must not match.
+        assert await manifest.get_deleted_keys("semantic", ["decisions/d1"]) == set()
+
+
 class TestManifestEntryFromRow:
     def test_from_row_with_real_orm_object(self) -> None:
         """`from_row` accepts duck-typed objects with the right attrs."""
@@ -457,6 +504,24 @@ class TestPostgresMemoryManifestService:
             await pg_manifest.list_for_layer("not-a-layer")
         with pytest.raises(ValueError):
             await pg_manifest.get("not-a-layer", "k")
+
+    async def test_get_deleted_keys_empty_short_circuits(self, pg_manifest) -> None:
+        assert await pg_manifest.get_deleted_keys("semantic", []) == set()
+
+    async def test_get_deleted_keys_returns_only_soft_deleted(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create("semantic", "decisions/live", None, 1, "u")
+        await pg_manifest.record_create("semantic", "decisions/gone", None, 1, "u")
+        await pg_manifest.record_delete("semantic", "decisions/gone", "u")
+        result = await pg_manifest.get_deleted_keys(
+            "semantic", ["decisions/live", "decisions/gone", "decisions/never-existed"]
+        )
+        assert result == {"decisions/gone"}
+
+    async def test_get_deleted_keys_invalid_layer_raises(self, pg_manifest) -> None:
+        with pytest.raises(ValueError):
+            await pg_manifest.get_deleted_keys("not-a-layer", ["k"])
 
 
 # ── Telemetry-coverage regression test ──────────────────────────────────────
