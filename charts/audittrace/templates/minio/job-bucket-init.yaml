@@ -1,8 +1,9 @@
-{{- /* ADR-048 PR-B2 + PR-B7 — MinIO bucket-init Job.
+{{- /* ADR-048 PR-B2 + PR-B7, ADR-062 Phase B — MinIO bucket-init Job.
 
        Post-install / post-upgrade Helm hook that:
        1. Ensures the memory-shared bucket has the `quarantine/`
-          prefix structure that ADR-048 expects (PR-B2).
+          prefix structure that ADR-048 expects (PR-B2), AND ensures the
+          memory-private bucket exists (ADR-062 Phase B).
        2. Provisions the IAM split per ADR-048 Decision rule §1:
           two policies (audittrace_app + content_control) and two
           users with the respective policy attached (PR-B7).
@@ -10,6 +11,13 @@
           `quarantine/*` so memory-server cannot read pre-scanned
           bytes even if its app-layer denylist (PR-B2's
           QuarantineDenyingMinioClient) were bypassed.
+       4. The audittrace_app policy grants full access to the
+          memory-private bucket (ADR-062 Phase B — per-user private tier,
+          `memory-private/{sub}/{layer}/...`). This closes the v1.19.0
+          gap where WU-B1 introduced the bucket in values.yaml but the
+          policy job was never updated to grant it — MinIO returned
+          AccessDenied on every private-tier write. content_control gets
+          NO memory-private access (isolation is the point of the split).
 
        Idempotent: re-running against an already-provisioned MinIO
        is a no-op (mc admin policy create / user add are
@@ -100,6 +108,16 @@ spec:
               value: "minioadmin"
             - name: SHARED_BUCKET
               value: {{ .Values.objectStorage.minio.sharedBucket | default "memory-shared" | quote }}
+            # ADR-062 Phase B — the per-user private tier bucket
+            # (`memory-private/{sub}/{layer}/...`, ADR-027). Introduced by
+            # WU-B1 (values.yaml `objectStorage.minio.privateBucket`,
+            # `defaultBuckets`) but the bucket-init policy job was never
+            # updated to grant `audittrace_app` access to it — the bucket
+            # existed, the policy statement did not, so per-user private-tier
+            # writes got AccessDenied from MinIO. This env + the policy
+            # statement below close that gap.
+            - name: PRIVATE_BUCKET
+              value: {{ .Values.objectStorage.minio.privateBucket | default "memory-private" | quote }}
             # Root password — sourced from the Bitnami Secret. Renders
             # under both vault.enabled branches because PR-B8 dropped
             # the gate on secret-minio-iam.yaml; secret-minio.yaml is
@@ -193,6 +211,16 @@ spec:
                 echo "  ✓ quarantine/.keep created"
               fi
 
+              echo "▶ Ensuring bucket ${PRIVATE_BUCKET} exists..."
+              # ADR-062 Phase B — per-user private tier bucket. Same
+              # idempotent create-if-missing shape as SHARED_BUCKET above.
+              if mc ls "local/${PRIVATE_BUCKET}" >/dev/null 2>&1; then
+                echo "  ✓ ${PRIVATE_BUCKET} already exists"
+              else
+                mc mb "local/${PRIVATE_BUCKET}"
+                echo "  ✓ created ${PRIVATE_BUCKET}"
+              fi
+
               echo "▶ Listing top-level prefixes:"
               mc ls "local/${SHARED_BUCKET}" || true
 
@@ -209,9 +237,22 @@ spec:
 
               # audittrace_app: PUT to quarantine/, full access to
               # episodic/ + procedural/ + trust-store/ + assessments/
-              # (ADR-058 WS-A4 raw self-audit artefacts). EXPLICIT DENY on
-              # GET/quarantine/* so a memory-server bug or compromised
-              # adapter cannot read pre-scanned bytes.
+              # (ADR-058 WS-A4 raw self-audit artefacts) on the SHARED
+              # bucket, PLUS full access to the entire PRIVATE bucket
+              # (ADR-062 Phase B — memory-private/{sub}/{layer}/... per-user
+              # tier). EXPLICIT DENY on GET/quarantine/* so a memory-server
+              # bug or compromised adapter cannot read pre-scanned bytes.
+              # The private-bucket grant is bucket-wide, not per-user-prefix
+              # scoped: MinIO IAM policy conditions on JWT-derived path
+              # segments are Phase C / #417 defence-in-depth (per-user
+              # isolation for memory-private is enforced today at the
+              # application layer via the JWT `sub` claim → path prefix,
+              # ADR-027 — this policy only grants the audittrace_app
+              # SERVICE identity access to the bucket, not to any
+              # individual end-user's prefix). content_control is
+              # deliberately NOT granted any memory-private access — the
+              # whole point of the IAM split is that content-control never
+              # touches user memory data.
               cat >/tmp/audittrace_app.json <<JSON
               {
                 "Version": "2012-10-17",
@@ -238,6 +279,17 @@ spec:
                       "arn:aws:s3:::${SHARED_BUCKET}/procedural/*",
                       "arn:aws:s3:::${SHARED_BUCKET}/trust-store/*",
                       "arn:aws:s3:::${SHARED_BUCKET}/assessments/*"
+                    ]
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+                      "s3:ListBucket", "s3:GetBucketLocation"
+                    ],
+                    "Resource": [
+                      "arn:aws:s3:::${PRIVATE_BUCKET}",
+                      "arn:aws:s3:::${PRIVATE_BUCKET}/*"
                     ]
                   }
                 ]
