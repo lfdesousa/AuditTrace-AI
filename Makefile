@@ -70,7 +70,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
