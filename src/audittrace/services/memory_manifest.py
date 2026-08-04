@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -400,6 +401,34 @@ class MemoryManifestService:
             ).scalar_one_or_none()
             return ManifestEntry.from_row(row) if row is not None else None
 
+    @log_call(logger=logger)
+    async def get_deleted_keys(self, layer: str, keys: Iterable[str]) -> set[str]:
+        """Return the subset of ``keys`` that are soft-deleted for ``layer``.
+
+        ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
+        corpus content — ``ChromaSemanticService.search``/``search_page``
+        consult this to keep a soft-deleted ``/memory/semantic`` item out
+        of recall, mirroring what ``list_for_layer(include_deleted=False)``
+        already enforces for the backoffice list (closes CS-7 / #374: soft-
+        delete and the Chroma vector were previously independent). Empty
+        ``keys`` short-circuits without touching the DB.
+        """
+        _validate_layer(layer)
+        key_list = list(keys)
+        if not key_list:
+            return set()
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(MemoryItem.key).where(
+                        MemoryItem.layer == layer,
+                        MemoryItem.key.in_(key_list),
+                        MemoryItem.deleted_at_ms.is_not(None),
+                    )
+                )
+            ).scalars()
+            return set(rows.all())
+
 
 class MockMemoryManifestService(MemoryManifestService):
     """In-memory variant for unit tests.
@@ -528,6 +557,19 @@ class MockMemoryManifestService(MemoryManifestService):
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         return self._to_entry(existing) if existing is not None else None
+
+    async def get_deleted_keys(self, layer: str, keys: Iterable[str]) -> set[str]:
+        _validate_layer(layer)
+        key_set = set(keys)
+        if not key_set:
+            return set()
+        return {
+            row_key
+            for (row_layer, row_key), row in self._rows.items()
+            if row_layer == layer
+            and row_key in key_set
+            and row.get("deleted_at_ms") is not None
+        }
 
     async def upsert_pdf_metadata(
         self,

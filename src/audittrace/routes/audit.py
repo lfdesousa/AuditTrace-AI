@@ -124,8 +124,10 @@ async def list_interactions(
         None,
         description=(
             "Filter by event_class: 'interaction' | 'security' | 'assessment' "
-            "(ADR-048 / ADR-058). Pull a whole recorded self-assessment with "
-            "event_class=assessment & session_id=<assessment_id>."
+            "| 'memory_access' (ADR-048 / ADR-058 / ADR-062 §5). Pull a whole "
+            "recorded self-assessment with event_class=assessment & "
+            "session_id=<assessment_id>; pull every /memory/* access with "
+            "event_class=memory_access."
         ),
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),

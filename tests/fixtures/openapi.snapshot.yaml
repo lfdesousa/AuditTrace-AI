@@ -939,12 +939,19 @@ components:
           tokenUrl: /protocol/openid-connect/token
       type: oauth2
 info:
-  description: 'EU-AI-Act-aligned audit trail for LLM workloads. OpenAI-compatible ``/v1/chat/completions`` proxy with 4-layer
-    memory augmentation (episodic + procedural + conversational + semantic), Keycloak-delegated identity, Postgres RLS per-user
-    isolation, and opt-in Redis-Streams async persistence (ADR-046).
+  description: 'EU-AI-Act-aligned audit trail for LLM workloads. OpenAI-compatible ``/v1/chat/completions`` proxy over a five-layer
+    memory model (ADR-062): four per-user-isolated layers — episodic, procedural, conversational, semantic — plus Layer 5,
+    the Shared Corpus (org-wide knowledge, shared-read, operator/curator-tier write). Keycloak-delegated identity, Postgres
+    RLS per-user isolation, opt-in Redis-Streams async persistence (ADR-046), and a first-class audit event on every memory
+    read/list/write/delete (ADR-062 §5 — ``event_class=memory_access`` on ``GET /interactions``).
 
 
-    See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set (014–046) is the source of truth for design decisions.'
+    Recall (the LLM reading its own memory) happens through the ``recall_*`` tools inside the ``/v1/chat/completions`` tool-call
+    loop (ADR-025) and through ``POST /context`` (the legacy ``inject``-mode aggregator) — NOT through the ``memory`` tag''s
+    backoffice CRUD endpoints, which are the operator/audit surface for managing memory content directly.
+
+
+    See ``docs/architecture/`` for C4 + sequence diagrams; the ADR set (014–062) is the source of truth for design decisions.'
   title: AuditTrace-AI
 openapi: 3.1.0
 paths:
@@ -1111,8 +1118,9 @@ paths:
           description: 'Filter by status: ''success'' or ''failed'' (migration 007 / ADR-033). Use ''failed'' to enumerate
             rows where the chat path errored out.'
           title: Status
-      - description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' (ADR-048 / ADR-058). Pull a whole
-          recorded self-assessment with event_class=assessment & session_id=<assessment_id>.'
+      - description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' (ADR-048
+          / ADR-058 / ADR-062 §5). Pull a whole recorded self-assessment with event_class=assessment & session_id=<assessment_id>;
+          pull every /memory/* access with event_class=memory_access.'
         in: query
         name: event_class
         required: false
@@ -1120,8 +1128,9 @@ paths:
           anyOf:
           - type: string
           - type: 'null'
-          description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' (ADR-048 / ADR-058). Pull a
-            whole recorded self-assessment with event_class=assessment & session_id=<assessment_id>.'
+          description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' (ADR-048
+            / ADR-058 / ADR-062 §5). Pull a whole recorded self-assessment with event_class=assessment & session_id=<assessment_id>;
+            pull every /memory/* access with event_class=memory_access.'
           title: Event Class
       - description: Max rows (1-1000).
         in: query
@@ -1550,7 +1559,18 @@ paths:
       - memory
   /memory/episodic/{filename}:
     delete:
-      description: Soft-delete by default; ``?hard=true`` also purges the S3 object.
+      description: 'Soft-delete by default; ``?hard=true`` also purges the S3 object.
+
+
+        ADR-062 §6 (WU-A5): the manifest soft-delete is authoritative for
+
+        corpus content — ``?hard=true`` is NOT the default delete path (the
+
+        ``hard`` query param defaults to ``False`` and additionally requires
+
+        ``audittrace:admin``), and a hard purge is audited with
+
+        ``detail_extra={"hard": True}`` same as every other delete.'
       operationId: delete_episodic_memory_episodic__filename__delete
       parameters:
       - in: path
@@ -1879,6 +1899,9 @@ paths:
       - memory
   /memory/procedural/{filename}:
     delete:
+      description: 'Soft-delete by default; ``?hard=true`` also purges the S3 object
+
+        (ADR-062 §6 — same discipline as ``delete_episodic``).'
       operationId: delete_procedural_memory_procedural__filename__delete
       parameters:
       - in: path
@@ -2128,6 +2151,13 @@ paths:
       - memory
   /memory/semantic/{collection}/{document_id}:
     delete:
+      description: 'Soft-delete by default; ``?hard=true`` also purges the Chroma
+
+        vector (ADR-062 §6 — same discipline as ``delete_episodic``). The
+
+        manifest tombstone alone is what ``search()``/``search_page()``
+
+        consult to keep a soft-deleted item out of recall (WU-A5).'
       operationId: delete_semantic_memory_semantic__collection___document_id__delete
       parameters:
       - in: path
@@ -2661,13 +2691,22 @@ tags:
     ``X-Persist-Mode: async`` header (ADR-046) routes the audit-row write through Redis Streams instead of the synchronous
     Postgres write on the response path.'
   name: chat
-- description: Build the augmented system context across all four memory layers (episodic, procedural, conversational, semantic)
-    without going through chat completions. Used by the webui memory tab and by external agents that want to inspect what
-    would be injected.
+- description: Build the augmented system context across the four per-user memory layers (episodic, procedural, conversational,
+    semantic) without going through chat completions — this is the ``memory_mode=inject`` aggregator (ADR-025) and does NOT
+    include Layer 5, the Shared Corpus (production runs ``memory_mode=tools``, where recall — including Layer 5 — happens
+    via the ``recall_*`` tools inside the chat-completions tool-call loop instead; see the top-level API description). Used
+    by the webui memory tab and by external agents that want to inspect what would be injected.
   name: context
-- description: CRUD over the four memory layers. Episodic = ADRs, Procedural = skill files, Conversational = past sessions
-    (read-only), Semantic = ChromaDB-backed RAG. Each write is scoped to the caller's Keycloak ``sub`` and gated by RLS at
-    the Postgres + ChromaDB layers.
+- description: Backoffice CRUD over the five-layer memory model (ADR-062) — this is the operator/audit management surface,
+    NOT where LLM recall happens (see the top-level API description for that). Episodic = ADRs, Procedural = skill files,
+    Conversational = past sessions (read-only), Semantic = ChromaDB-backed RAG. Layers 1-4 are designed per-user-isolated
+    (episodic/procedural S3-tier wiring + semantic per-user source vectors ship in ADR-062 Phase B; conversational RLS and
+    semantic recall filtering are already live). ``POST /memory/index`` bulk-rebuilds Layer 5 (the Shared Corpus — decisions/skills/semantic
+    collections) and is admin-only. Every operation here — read, list, write, delete — emits a first-class audit row (``event_class=memory_access``,
+    ``GET /interactions``), owner-scoped and trace-linked (ADR-062 §5). Deletes default to soft-delete (manifest tombstone,
+    the authoritative + recoverable + recall-honoured state for corpus content per ADR-062 §6); ``?hard=true`` additionally
+    purges the underlying S3 object / ChromaDB vector and requires ``audittrace:admin``. Each write is scoped to the caller's
+    Keycloak ``sub`` and gated by RLS at the Postgres + ChromaDB layers.
   name: memory
 - description: Save + summarise full chat sessions for replay and audit. Used by the OpenCode bridge to land long-running
     conversations into the conversational layer.

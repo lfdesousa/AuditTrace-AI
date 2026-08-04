@@ -498,6 +498,99 @@ class TestChromaSemanticServiceCrud:
         )
 
 
+class TestSoftDeleteTombstoneFiltersRecall:
+    """ADR-062 §6 (WU-A5) — the manifest soft-delete tombstone is
+    authoritative for corpus recall.
+
+    Falsifiable gate: soft-delete a corpus item via the manifest → it no
+    longer surfaces via ``search()``/``search_page()``, but is recoverable
+    by re-creating (manifest revive + a fresh upsert)."""
+
+    @pytest.fixture
+    async def manifest(self):
+        from audittrace.services.memory_manifest import MockMemoryManifestService
+
+        return MockMemoryManifestService()
+
+    @pytest.fixture
+    async def service(self, manifest):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(
+            client=client, default_collections=["decisions"], manifest=manifest
+        )
+
+    async def _seed(self, service, manifest, user_context, *, text="body v1") -> None:
+        await service.upsert(user_context, "decisions", "doc-tomb", text)
+        await manifest.record_create(
+            "semantic", "decisions/doc-tomb", "title", len(text), user_context.user_id
+        )
+
+    async def test_search_excludes_soft_deleted(
+        self, service, manifest, user_context
+    ) -> None:
+        await self._seed(service, manifest, user_context)
+        assert len(await service.search(user_context, "body", k=4)) == 1
+
+        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        assert await service.search(user_context, "body", k=4) == []
+
+    async def test_search_page_excludes_soft_deleted(
+        self, service, manifest, user_context
+    ) -> None:
+        await self._seed(service, manifest, user_context)
+        page = await service.search_page(user_context, "body", k=4)
+        assert page.total == 1
+
+        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        page = await service.search_page(user_context, "body", k=4)
+        assert page.matches == []
+        assert page.total == 0
+
+    async def test_recreate_after_soft_delete_is_recoverable(
+        self, service, manifest, user_context
+    ) -> None:
+        await self._seed(service, manifest, user_context)
+        await manifest.record_delete("semantic", "decisions/doc-tomb", "someone")
+        assert await service.search(user_context, "body", k=4) == []
+
+        # Re-create: manifest revives (record_create clears deleted_at_ms)
+        # and the Chroma doc is re-upserted — mirrors what
+        # create_semantic()/POST /memory/semantic does.
+        await self._seed(service, manifest, user_context, text="body v2 revived")
+        results = await service.search(user_context, "body", k=4)
+        assert len(results) == 1
+        assert results[0].page_content == "body v2 revived"
+
+    async def test_no_manifest_wired_is_a_no_op(self, user_context) -> None:
+        """Backward compatibility: a service constructed without
+        ``manifest=`` (every pre-existing test double / call site)
+        filters nothing — the capability is simply absent, not "nothing
+        is ever deleted"."""
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        service = ChromaSemanticService(
+            client=client, default_collections=["decisions"]
+        )
+        await service.upsert(user_context, "decisions", "doc-x", "unfiltered body")
+        assert len(await service.search(user_context, "unfiltered", k=4)) == 1
+
+    async def test_manifest_lookup_failure_fails_open(
+        self, service, manifest, user_context, monkeypatch
+    ) -> None:
+        """A manifest outage must not take recall down with it — the
+        candidate set is returned UNFILTERED (with a logged warning)
+        rather than raising or dropping everything."""
+        await self._seed(service, manifest, user_context)
+
+        async def _boom(layer, keys):
+            raise RuntimeError("manifest unreachable")
+
+        monkeypatch.setattr(manifest, "get_deleted_keys", _boom)
+        results = await service.search(user_context, "body", k=4)
+        assert len(results) == 1
+
+
 class TestMockSemanticServiceCrud:
     """In-memory variant — used by the route tests."""
 

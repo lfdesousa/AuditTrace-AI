@@ -152,6 +152,49 @@ class TestGetUploadStatus:
             client.app.dependency_overrides.pop(_get_session_factory, None)
         assert response.status_code == 404
 
+    async def test_produces_a_memory_access_audit_row(self, client: TestClient) -> None:
+        """ADR-062 §5 (WU-A4) falsifiable gate — GET /memory/upload/status
+        emits a first-class audit row queryable via /interactions under
+        the caller's identity."""
+        factory = InMemoryPostgresFactory().get_session_factory()
+        await _seed_pending(factory, "scan-audit")
+        client.app.dependency_overrides[_get_session_factory] = lambda: factory
+        try:
+            with (
+                patch("audittrace.auth.get_settings") as mock_settings,
+                patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+                patch(
+                    "audittrace.auth._decode_jwt_with_allowed_issuers"
+                ) as mock_decode,
+            ):
+                mock_settings.return_value = MagicMock(
+                    auth_enabled=True, auth_required=True
+                )
+                mock_jwks.return_value = ["fake-key"]
+                mock_decode.return_value = {
+                    "sub": "alice",
+                    "scope": "memory:episodic:write audittrace:audit",
+                }
+                response = client.get(
+                    "/memory/upload/status",
+                    params={"scan_id": "scan-audit"},
+                    headers={"Authorization": "Bearer fake-token"},
+                )
+                assert response.status_code == 200
+
+                r = client.get(
+                    "/interactions",
+                    params={"event_class": "memory_access"},
+                    headers={"Authorization": "Bearer fake-token"},
+                )
+        finally:
+            client.app.dependency_overrides.pop(_get_session_factory, None)
+
+        rows = r.json()["interactions"]
+        assert any(
+            row["question"] == "op=read layer=episodic key=scan-audit" for row in rows
+        ), rows
+
     async def test_admin_can_read_any_scan_id(self, client: TestClient) -> None:
         factory = InMemoryPostgresFactory().get_session_factory()
         await _seed_pending(factory, "scan-x", user_id="bob")

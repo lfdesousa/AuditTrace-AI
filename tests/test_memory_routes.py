@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC
 from io import BytesIO
 from typing import Any
@@ -3557,8 +3558,10 @@ class TestEventClassValues:
         # ``interaction`` is the legacy implicit value (chat completions,
         # tool calls); ``security`` is added by ADR-048's verdict
         # consumer; ``assessment`` is added by ADR-058's recursive
-        # self-audit (the recorder recording its own security review).
-        expected = {"interaction", "security", "assessment"}
+        # self-audit (the recorder recording its own security review);
+        # ``memory_access`` is added by ADR-062 §5 (WU-A4) — every
+        # /memory/* read/list/write/delete emits a first-class audit row.
+        expected = {"interaction", "security", "assessment", "memory_access"}
         assert _EVENT_CLASS_VALUES == expected
 
 
@@ -5603,3 +5606,213 @@ class TestMergeSemanticWithChroma:
             "named collection must resolve to its _v2 form and be the only "
             f"one opened; opened={chroma.opened}"
         )
+
+
+class TestMemoryAccessAuditEvents:
+    """ADR-062 §5 (WU-A4) falsifiable gate — every read/list/write/delete
+    through the ``/memory/*`` backoffice emits a first-class, owner-scoped
+    ``event_class="memory_access"`` audit row, reconstructable via
+    ``GET /interactions`` under the caller's identity.
+
+    Reviewer instruction (per the spec): neuter any of the
+    ``emit_memory_audit_event`` / ``schedule_read_audit`` call sites this
+    exercises in ``routes/memory.py`` — the corresponding test below must
+    fail. Restore it — green again."""
+
+    @staticmethod
+    def _memory_access_rows(client: TestClient) -> list[dict[str, Any]]:
+        r = client.get("/interactions", params={"event_class": "memory_access"})
+        assert r.status_code == 200
+        return r.json()["interactions"]
+
+    def test_list_episodic_produces_audit_row(self, client: TestClient) -> None:
+        client.get("/memory/episodic")
+        rows = self._memory_access_rows(client)
+        assert any(row["question"] == "op=list layer=episodic key=-" for row in rows), (
+            rows
+        )
+
+    def test_read_episodic_produces_audit_row(self, client: TestClient) -> None:
+        client.post(
+            "/memory/episodic", json={"filename": "ADR-audit.md", "content": "x"}
+        )
+        client.get("/memory/episodic/ADR-audit.md")
+        rows = self._memory_access_rows(client)
+        assert any(
+            row["question"] == "op=read layer=episodic key=ADR-audit.md" for row in rows
+        ), rows
+
+    def test_create_episodic_produces_audit_row(self, client: TestClient) -> None:
+        client.post("/memory/episodic", json={"filename": "ADR-w.md", "content": "x"})
+        rows = self._memory_access_rows(client)
+        assert any(
+            row["question"] == "op=write layer=episodic key=ADR-w.md" for row in rows
+        ), rows
+
+    def test_update_episodic_produces_audit_row(self, client: TestClient) -> None:
+        client.post(
+            "/memory/episodic", json={"filename": "ADR-upd.md", "content": "v1"}
+        )
+        client.put("/memory/episodic/ADR-upd.md", json={"content": "v2"})
+        rows = self._memory_access_rows(client)
+        writes = [
+            r for r in rows if r["question"] == "op=write layer=episodic key=ADR-upd.md"
+        ]
+        assert len(writes) == 2  # one for POST (create), one for PUT (update)
+
+    def test_delete_episodic_produces_audit_row(self, client: TestClient) -> None:
+        client.post("/memory/episodic", json={"filename": "ADR-del.md", "content": "x"})
+        client.delete("/memory/episodic/ADR-del.md")
+        rows = self._memory_access_rows(client)
+        assert any(
+            row["question"] == "op=delete layer=episodic key=ADR-del.md" for row in rows
+        ), rows
+
+    def test_procedural_and_semantic_crud_produce_audit_rows(
+        self, client: TestClient
+    ) -> None:
+        client.post(
+            "/memory/procedural", json={"filename": "SKILL-audit.md", "content": "x"}
+        )
+        client.get("/memory/procedural")
+        client.get("/memory/procedural/SKILL-audit.md")
+        client.put("/memory/procedural/SKILL-audit.md", json={"content": "v2"})
+        client.delete("/memory/procedural/SKILL-audit.md")
+
+        client.post(
+            "/memory/semantic",
+            json={"collection": "decisions", "document_id": "d-audit", "text": "x"},
+        )
+        client.get("/memory/semantic")
+        client.get("/memory/semantic/decisions/d-audit")
+        client.put("/memory/semantic/decisions/d-audit", json={"text": "v2"})
+        client.delete("/memory/semantic/decisions/d-audit")
+
+        questions = {row["question"] for row in self._memory_access_rows(client)}
+        expected = {
+            "op=write layer=procedural key=SKILL-audit.md",
+            "op=list layer=procedural key=-",
+            "op=read layer=procedural key=SKILL-audit.md",
+            "op=delete layer=procedural key=SKILL-audit.md",
+            "op=write layer=semantic key=d-audit",
+            "op=list layer=semantic key=-",
+            "op=read layer=semantic key=d-audit",
+            "op=delete layer=semantic key=d-audit",
+        }
+        assert expected.issubset(questions), expected - questions
+
+    def test_bulk_index_produces_audit_row(self, client: TestClient) -> None:
+        """Sentinel test identity is admin by construction (bypass mode),
+        so bulk (no ``?file=``) /memory/index needs no extra override."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = []
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            r = client.post("/memory/index", params={"collections": "decisions"})
+        assert r.status_code == 200, r.text
+        rows = self._memory_access_rows(client)
+        assert any(
+            row["question"].startswith("op=write layer=semantic") for row in rows
+        ), rows
+
+    def test_hard_delete_is_audited_with_hard_flag(self, client: TestClient) -> None:
+        client.post(
+            "/memory/episodic", json={"filename": "ADR-hard.md", "content": "x"}
+        )
+        r = client.delete("/memory/episodic/ADR-hard.md?hard=true")
+        assert r.status_code == 200
+        deletes = [
+            row
+            for row in self._memory_access_rows(client)
+            if row["question"] == "op=delete layer=episodic key=ADR-hard.md"
+        ]
+        assert len(deletes) == 1
+        detail = json.loads(deletes[0]["error_detail"])
+        assert detail["hard"] is True
+
+
+class TestMemoryAuditWriteFailsClosed:
+    """ADR-062 §5 read=fail-open / write=fail-closed decision (WU-A4):
+    a write-path audit-emit failure must fail the REQUEST closed — the
+    caller must not see a 200 for a mutation that could not be proven
+    audited (see ``services/memory_audit.py`` module docstring for the
+    full rationale)."""
+
+    @staticmethod
+    async def _boom(**_kwargs: Any) -> None:
+        raise RuntimeError("audit store unavailable")
+
+    def test_create_episodic_returns_500_when_audit_emit_fails(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.routes import memory as m
+
+        monkeypatch.setattr(m, "emit_memory_audit_event", self._boom)
+        r = client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-failclosed.md", "content": "x"},
+        )
+        assert r.status_code == 500
+
+    def test_delete_episodic_returns_500_when_audit_emit_fails_but_soft_delete_lands(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The 500 is a caller-visible signal demanding investigation/retry
+        — it is NOT proof the underlying mutation was rolled back. Phase A
+        deliberately excludes distributed-transaction/saga machinery (ADR-
+        062 §9); the manifest soft-delete has already committed by the
+        time the audit emit runs."""
+        from audittrace.routes import memory as m
+
+        client.post("/memory/episodic", json={"filename": "ADR-fc2.md", "content": "x"})
+
+        with monkeypatch.context() as mp:
+            mp.setattr(m, "emit_memory_audit_event", self._boom)
+            r = client.delete("/memory/episodic/ADR-fc2.md")
+        assert r.status_code == 500
+
+        body = client.get("/memory/episodic?include_deleted=true").json()
+        deleted = [i for i in body["items"] if i["key"] == "ADR-fc2.md"]
+        assert deleted and deleted[0]["deleted_at_ms"] is not None
+
+
+class TestMemoryAuditReadFailsOpen:
+    """The complementary decision: a read must succeed even when its
+    BACKGROUND audit emit fails — availability over completeness for the
+    read path (reads vastly outnumber writes; every ``recall_*`` tool call
+    is effectively a read)."""
+
+    def test_list_episodic_succeeds_when_background_audit_emit_fails(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Asserts via a patched module logger rather than ``caplog``: some
+        other test in the full suite calls ``setup_logging`` (which does
+        ``root.handlers.clear()``), detaching pytest's LogCaptureHandler —
+        the same order-fragility documented in
+        ``test_scan_verdict_consumer.py``. Patching the module logger
+        directly is hermetic and survives test ordering."""
+
+        async def _boom(**_kwargs: Any) -> None:
+            raise RuntimeError("audit store unavailable")
+
+        monkeypatch.setattr(
+            "audittrace.services.memory_audit.emit_memory_audit_event", _boom
+        )
+        with patch("audittrace.services.memory_audit.logger") as mock_logger:
+            r = client.get("/memory/episodic")
+        assert r.status_code == 200
+        assert mock_logger.exception.call_count == 1
+        assert "memory_audit.read_emit_failed" in mock_logger.exception.call_args[0][0]

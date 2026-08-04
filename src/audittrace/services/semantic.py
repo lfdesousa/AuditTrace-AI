@@ -12,9 +12,9 @@ every row, which keeps the sentinel-backed test fixtures visible.
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from langchain_core.documents import Document
 
@@ -25,6 +25,20 @@ from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.pagination import sort_and_paginate
 
 logger = logging.getLogger(__name__)
+
+
+class _ManifestTombstoneCheck(Protocol):
+    """Structural type for the one manifest capability recall needs.
+
+    Deliberately NOT importing ``MemoryManifestService`` — this module
+    should not gain a hard dependency on the manifest module just to
+    honour ADR-062 §6's soft-delete tombstone (WU-A5). Both
+    ``MemoryManifestService`` and ``MockMemoryManifestService`` satisfy
+    this protocol structurally.
+    """
+
+    async def get_deleted_keys(self, layer: str, keys: Iterable[str]) -> set[str]: ...
+
 
 # ── Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803) ──
 #
@@ -253,6 +267,7 @@ class ChromaSemanticService(SemanticService):
         *,
         embed_url: str = "",
         embed_model: str = "nomic-embed-text",
+        manifest: _ManifestTombstoneCheck | None = None,
     ):
         self._client = client
         self._default_collections = default_collections or ["audittrace"]
@@ -261,6 +276,14 @@ class ChromaSemanticService(SemanticService):
         # ChromaDB never embeds client-side.
         self._embed_url = embed_url
         self._embed_model = embed_model
+        # ADR-062 §6 (WU-A5) — optional so every existing call site /
+        # test double that constructs this class with just ``client=``
+        # keeps working unchanged; production wiring
+        # (``dependencies.py``) passes the real manifest so recall
+        # honours the soft-delete tombstone. ``None`` here means "this
+        # service instance cannot filter soft-deletes", not "nothing is
+        # deleted" — see ``_filter_soft_deleted``.
+        self._manifest = manifest
 
     async def _embed_one(self, text: str) -> list[float]:
         """Vectorise a single string on the nomic server."""
@@ -364,7 +387,48 @@ class ChromaSemanticService(SemanticService):
                     "Semantic search failed on collection %s: %s", col_name, e
                 )
 
-        return all_docs
+        return await self._filter_soft_deleted(all_docs)
+
+    async def _filter_soft_deleted(self, docs: list[Document]) -> list[Document]:
+        """Drop candidates whose manifest row is soft-deleted (ADR-062 §6).
+
+        The Postgres manifest is authoritative for corpus soft-delete
+        (WU-A5); ChromaDB itself has no delete state for a
+        ``/memory/semantic``-CRUD-created document, so without this check
+        a soft-deleted item would keep surfacing via recall even though
+        the backoffice list already hides it (CS-7 / #374 — soft-delete
+        and the underlying Chroma vector were previously independent).
+
+        No-ops (returns ``docs`` unfiltered) when this service was
+        constructed without a manifest (test doubles, legacy wiring) OR
+        when the manifest lookup itself fails — fail-open on the
+        FILTERING CAPABILITY (a manifest outage must not take recall
+        down with it), never a silent "nothing is deleted" assumption
+        once the manifest IS reachable and says otherwise.
+        """
+        if self._manifest is None or not docs:
+            return docs
+        keys = {
+            f"{doc.metadata.get('collection')}/{doc.metadata.get('chunk_id')}"
+            for doc in docs
+        }
+        try:
+            deleted = await self._manifest.get_deleted_keys("semantic", keys)
+        except Exception as exc:
+            logger.warning(
+                "soft-delete tombstone check failed — candidates NOT "
+                "filtered this call: %s",
+                exc,
+            )
+            return docs
+        if not deleted:
+            return docs
+        return [
+            doc
+            for doc in docs
+            if f"{doc.metadata.get('collection')}/{doc.metadata.get('chunk_id')}"
+            not in deleted
+        ]
 
     @staticmethod
     def _shape_query_results(results: dict[str, Any], col_name: str) -> list[Document]:
@@ -561,6 +625,17 @@ class ChromaSemanticService(SemanticService):
                         col_name,
                         e,
                     )
+
+        # ADR-062 §6 (WU-A5) — drop soft-deleted candidates before paging.
+        # Filtering here (rather than post-page) means a soft-deleted item
+        # can never occupy a page slot; the documented "honest lower
+        # bound when saturated" property of total/has_more above is
+        # preserved (filtering only ever shrinks the pool, never invents
+        # extra unseen candidates), so the "never lies" guarantee holds —
+        # a caller may need one extra page fetch in the rare case a probe
+        # window was saturated with tombstoned candidates, but total is
+        # never overstated.
+        pool = await self._filter_soft_deleted(pool)
 
         page, total = sort_and_paginate(
             pool,
