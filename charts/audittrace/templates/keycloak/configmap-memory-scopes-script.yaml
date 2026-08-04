@@ -59,6 +59,22 @@ data:
       "audittrace:assessment:ingest"
     )
 
+    # ADR-062 §4 — Layer 5 (Shared Corpus) granular scopes. Separate
+    # array from SCOPES above: bound ONLY to admin-client (operator/
+    # curator-tier, optional) in the dedicated bind loop below — never
+    # to audittrace-opencode / audittrace-webui in either scope set,
+    # and never to the reserved SC-09 audittrace-restricted client
+    # (WU-A3). Kept in lock-step with scripts/setup-memory-scopes.sh's
+    # CORPUS_SCOPES array (tests/test_chart_drift_guards.py asserts it).
+    CORPUS_SCOPES=(
+      "memory:corpus:decisions:read"
+      "memory:corpus:decisions:write"
+      "memory:corpus:skills:read"
+      "memory:corpus:skills:write"
+      "memory:corpus:semantic:read"
+      "memory:corpus:semantic:write"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -144,7 +160,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -236,6 +252,17 @@ data:
       for SCOPE in "${SCOPES[@]}"; do
         bind_scope "${CLIENT_ID}" "${SCOPE}" "${KIND}"
       done
+    done
+
+    # ── Step 2b: bind corpus scopes (operator/curator-tier only) ──
+    # admin-client only, as OPTIONAL — never audittrace-opencode or
+    # audittrace-webui, and never audittrace-restricted (SC-09). A
+    # separate loop (not folded into CLIENT_KIND above) so a future
+    # edit to CLIENT_KIND cannot silently widen corpus-scope
+    # distribution to the user-facing clients (WU-A3, ADR-062 §4).
+    echo "▶ binding corpus scopes to client admin-client (optional)..."
+    for SCOPE in "${CORPUS_SCOPES[@]}"; do
+      bind_scope "admin-client" "${SCOPE}" "optional"
     done
 
     # ── Step 3: ensure user-identity protocol mappers ─────────────

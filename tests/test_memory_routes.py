@@ -2654,6 +2654,23 @@ class TestSemanticCrud:
         r = client.post("/memory/semantic", json={"collection": "x"})
         assert r.status_code == 400
 
+    def test_list_requires_authenticated_user(self, client: TestClient) -> None:
+        """ADR-062 WU-A1: ``GET /memory/semantic`` must carry
+        ``Depends(require_user)`` like every sibling list/read handler
+        (closes the CS-4 anomaly). ``validate_jwt`` alone (the
+        pre-existing ``Security(...)`` scope check) is gated on
+        ``auth_enabled``, not ``auth_required`` — so we disable that
+        gate and isolate ``require_user``'s own ``auth_required`` gate
+        to prove THIS dependency, specifically, rejects an unauthenticated
+        caller. Falsifiable: removing ``Depends(require_user)`` from
+        ``list_semantic`` makes this 401 regress to 200."""
+        with patch("audittrace.auth.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock(
+                auth_enabled=False, auth_required=True
+            )
+            response = client.get("/memory/semantic")
+        assert response.status_code == 401
+
 
 class TestTimestampShape:
     """The user explicitly chose Unix-epoch milliseconds UTC for created/

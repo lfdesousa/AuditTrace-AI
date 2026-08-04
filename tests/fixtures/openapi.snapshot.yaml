@@ -911,6 +911,18 @@ components:
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
+            memory:corpus:decisions:read: Read the shared-corpus ``decisions`` collection (Layer 5, ADR-062 §4) — distinct
+              from the per-user memory:semantic:read.
+            memory:corpus:decisions:write: Create/update/delete documents in the shared-corpus ``decisions`` collection (Layer
+              5, ADR-062 §4). Operator/curator-tier; never granted by default.
+            memory:corpus:semantic:read: Read the shared-corpus ``semantic`` collection (Layer 5, ADR-062 §4) — distinct from
+              the per-user memory:semantic:read.
+            memory:corpus:semantic:write: Create/update/delete documents in the shared-corpus ``semantic`` collection (Layer
+              5, ADR-062 §4). Operator/curator-tier; never granted by default.
+            memory:corpus:skills:read: Read the shared-corpus ``skills`` collection (Layer 5, ADR-062 §4) — distinct from
+              the per-user memory:semantic:read.
+            memory:corpus:skills:write: Create/update/delete documents in the shared-corpus ``skills`` collection (Layer 5,
+              ADR-062 §4). Operator/curator-tier; never granted by default.
             memory:decisions:write: Create/update/delete documents in the ``decisions`` ChromaDB collection (ADR/decision
               records — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:episodic:read: Read episodic-layer (ADR-style) documents
@@ -1980,7 +1992,18 @@ paths:
 
         alongside operator-created ones. Sort/paginate mirror the other layer
 
-        lists for consistency (backlog #15, R5).'
+        lists for consistency (backlog #15, R5).
+
+
+        ADR-062 WU-A1: requires an authenticated user like every sibling
+
+        list/read handler (closes the CS-4 anomaly of a memory-list endpoint
+
+        with no identity at all, so a future audit event can attribute the
+
+        read). This does NOT yet filter results by user — that per-user
+
+        isolation lands in ADR-062 Phase B.'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.

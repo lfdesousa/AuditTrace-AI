@@ -123,9 +123,25 @@ SCOPES=(
   "audittrace:assessment:ingest"
 )
 
+# ADR-062 §4 — Layer 5 (Shared Corpus) granular scopes. Kept in a
+# separate array from SCOPES above because they are NOT bound with the
+# same CLIENT_KIND fan-out below: corpus scopes are operator/curator-tier
+# only (admin-client, optional) and must NEVER reach audittrace-opencode
+# or audittrace-webui in either scope set (WU-A3,
+# project_restricted_client_sc09_reserved). See the dedicated bind loop
+# after the SCOPES one.
+CORPUS_SCOPES=(
+  "memory:corpus:decisions:read"
+  "memory:corpus:decisions:write"
+  "memory:corpus:skills:read"
+  "memory:corpus:skills:write"
+  "memory:corpus:semantic:read"
+  "memory:corpus:semantic:write"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -193,6 +209,17 @@ for CLIENT_ID in "${!CLIENT_KIND[@]}"; do
   for SCOPE in "${SCOPES[@]}"; do
     bind_scope "${CLIENT_ID}" "${SCOPE}" "${KIND}"
   done
+done
+
+# ----- Bind corpus scopes (operator/curator-tier only) -----
+# admin-client only, as OPTIONAL — never audittrace-opencode or
+# audittrace-webui, and never audittrace-restricted (SC-09). This is a
+# separate loop (not folded into CLIENT_KIND above) precisely so a
+# future edit to CLIENT_KIND cannot silently widen corpus-scope
+# distribution to the user-facing clients.
+echo "▶ binding corpus scopes to client admin-client (optional)..."
+for SCOPE in "${CORPUS_SCOPES[@]}"; do
+  bind_scope "admin-client" "${SCOPE}" "optional"
 done
 
 # ----- User-identity protocol mappers -----
