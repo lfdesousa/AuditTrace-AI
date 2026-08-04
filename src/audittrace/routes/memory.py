@@ -384,6 +384,39 @@ def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
     return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
 
 
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id"})
+
+
+def _sanitize_semantic_metadata(metadata: Any) -> Any:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — strip
+    caller-supplied ``tier``/``user_id`` keys from a semantic-document
+    ``metadata`` payload before it reaches the service layer.
+
+    ``tier`` and ``user_id`` are TOKEN-DERIVED / route-authorized
+    values (ADR-027 §1), never caller-supplied — see
+    ``ChromaSemanticService.upsert``'s docstring for the exploit this
+    closes: a writer holding only ``memory:semantic:write`` could
+    smuggle ``metadata={"tier": "corpus"}`` past the top-level promote
+    gate (``_resolve_requested_tier`` only ever inspected the top-level
+    body/query signal, never nested ``metadata``), and the forged tag
+    was then trusted downstream by ``_tier_authorized`` on every
+    subsequent read. This strip is belt-and-suspenders on top of the
+    service layer's own unconditional stamp — it protects any
+    ``SemanticService`` implementation (including a future/alternate
+    one) that hasn't been hardened the same way, and applies in BOTH
+    ``create_semantic`` (POST) and ``update_semantic`` (PUT) — a scope
+    gate on one write path is worthless if the sibling path reaches the
+    same sink unguarded.
+
+    Non-dict input (the existing 400 validation elsewhere handles a
+    malformed ``metadata``) passes through unchanged."""
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        k: v for k, v in metadata.items() if k not in _SEMANTIC_METADATA_SECURITY_KEYS
+    }
+
+
 def _reject_corpus_promotion_for(layer: str, tier: str) -> None:
     """400 (not 403) if *tier* asks for corpus on a layer that has no
     corpus-write scope declared (episodic/procedural — see the module
@@ -1716,7 +1749,7 @@ async def create_semantic(
             status_code=400,
             detail="collection, document_id and text are required strings",
         )
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     tier = _resolve_requested_tier(payload, promote)
     if tier == "corpus":
@@ -2015,10 +2048,20 @@ async def update_semantic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04): ``metadata`` is
+    sanitized the same way as ``create_semantic`` — a caller-supplied
+    ``tier``/``user_id`` in the body's ``metadata`` field is stripped
+    before it reaches the service, and ``ChromaSemanticService.upsert``
+    additionally stamps both unconditionally regardless. This route
+    does not accept a promote request at all (no ``tier``/``?promote=``
+    parsing) — every update stays private-tier, matching the pre-review
+    WU-B5 scope decision (updates were never in the promote-gate call
+    site list); the fix here closes the metadata-forgery bypass, not a
+    missing feature."""
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text is a required string field")
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()

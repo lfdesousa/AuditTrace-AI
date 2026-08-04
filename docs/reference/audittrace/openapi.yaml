@@ -2394,6 +2394,25 @@ paths:
       tags:
       - memory
     put:
+      description: 'ADR-062 Phase B (WU-B5 review fix, 2026-08-04): ``metadata`` is
+
+        sanitized the same way as ``create_semantic`` — a caller-supplied
+
+        ``tier``/``user_id`` in the body''s ``metadata`` field is stripped
+
+        before it reaches the service, and ``ChromaSemanticService.upsert``
+
+        additionally stamps both unconditionally regardless. This route
+
+        does not accept a promote request at all (no ``tier``/``?promote=``
+
+        parsing) — every update stays private-tier, matching the pre-review
+
+        WU-B5 scope decision (updates were never in the promote-gate call
+
+        site list); the fix here closes the metadata-forgery bypass, not a
+
+        missing feature.'
       operationId: update_semantic_memory_semantic__collection___document_id__put
       parameters:
       - in: path

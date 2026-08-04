@@ -1326,6 +1326,119 @@ class TestUpsertTierWiring:
         assert doc is not None
 
 
+class TestUpsertStampsFromContextUnconditionally:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — ``upsert`` must
+    stamp ``metadata["tier"]``/``metadata["user_id"]`` from the ``tier``
+    parameter / ``user_context`` UNCONDITIONALLY, never honouring a
+    caller-supplied value in ``metadata``.
+
+    Reproduces the reviewer's finding directly against the REAL
+    ``ChromaSemanticService`` (not ``MockSemanticService``, which does
+    not enforce isolation by design): before this fix, ``upsert`` used
+    ``dict.setdefault``, which SILENTLY HONOURED caller-supplied
+    ``metadata["tier"]``/``metadata["user_id"]`` — a writer holding only
+    ``memory:semantic:write`` (private-tier target, gated at the route
+    by ``_require_corpus_scope`` only for the TOP-LEVEL ``tier``/
+    ``?promote=`` signal) could smuggle ``metadata={"tier": "corpus"}``
+    past that gate entirely, and the forged tag was then trusted by
+    ``_tier_authorized`` on every subsequent read.
+
+    FALSIFIABLE: revert the unconditional assignment in
+    ``ChromaSemanticService.upsert`` back to ``dict.setdefault`` and
+    every test below goes RED (the forged value survives)."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_forged_metadata_tier_corpus_does_not_stick_on_private_write(
+        self, service, user_context
+    ) -> None:
+        """``tier="private"`` (the route's authorized target) wins over
+        a caller-supplied ``metadata={"tier": "corpus"}`` — the exact
+        top-level-vs-nested-metadata smuggling path the reviewer found."""
+        await service.upsert(
+            user_context,
+            "decisions",
+            "forge-tier",
+            "attacker body",
+            metadata={"tier": "corpus"},
+            tier="private",
+        )
+        doc = await service.get_document(user_context, "decisions", "forge-tier")
+        assert doc is not None
+        assert doc.metadata["tier"] == "private", (
+            f"forged metadata['tier'] survived: {doc.metadata}"
+        )
+        # Physically landed in the PRIVATE physical collection too — the
+        # forgery didn't even smuggle the write TARGET, only the tag
+        # (which is the actually-exploitable half via _tier_authorized).
+        private_col = await service._client.get_or_create_collection(
+            name="decisions_v2"
+        )
+        assert (await private_col.get(ids=["forge-tier"]))["ids"] == ["forge-tier"]
+
+    async def test_forged_metadata_tier_corpus_is_unreadable_by_a_stranger(
+        self, service, user_context
+    ) -> None:
+        """The end-to-end consequence: because the forged tag doesn't
+        stick, a non-owner stranger's read is still denied (None) —
+        BEFORE the fix this would have returned the document."""
+        alice = replace(user_context, user_id="alice", is_admin=False, scopes=())
+        await service.upsert(
+            alice,
+            "decisions",
+            "forge-tier-2",
+            "alice's private body",
+            metadata={"tier": "corpus"},
+            tier="private",
+        )
+        stranger = replace(user_context, user_id="bob", is_admin=False, scopes=())
+        doc = await service.get_document(stranger, "decisions", "forge-tier-2")
+        assert doc is None, (
+            "forged metadata['tier']='corpus' leaked alice's private doc to bob"
+        )
+
+    async def test_forged_metadata_user_id_does_not_stick(
+        self, service, user_context
+    ) -> None:
+        """A caller cannot attribute their write to another user by
+        forging ``metadata["user_id"]``."""
+        attacker = replace(user_context, user_id="attacker", is_admin=False, scopes=())
+        await service.upsert(
+            attacker,
+            "decisions",
+            "forge-user",
+            "attacker body",
+            metadata={"user_id": "victim"},
+        )
+        doc = await service.get_document(attacker, "decisions", "forge-user")
+        assert doc is not None
+        assert doc.metadata["user_id"] == "attacker", (
+            f"forged metadata['user_id'] survived: {doc.metadata}"
+        )
+
+    async def test_forged_metadata_user_id_does_not_grant_the_forged_owner_access(
+        self, service, user_context
+    ) -> None:
+        attacker = replace(user_context, user_id="attacker", is_admin=False, scopes=())
+        await service.upsert(
+            attacker,
+            "decisions",
+            "forge-user-2",
+            "attacker body 2",
+            metadata={"user_id": "victim"},
+        )
+        victim = replace(user_context, user_id="victim", is_admin=False, scopes=())
+        doc = await service.get_document(victim, "decisions", "forge-user-2")
+        assert doc is None, (
+            "forged metadata['user_id']='victim' let 'victim' read attacker's "
+            "private doc as if they owned it"
+        )
+
+
 class TestGetDocumentClosesHole:
     """§3 hole 1 — ``get_document`` used to be `del user_context`
     (fully unfiltered). Now: owner or corpus-tier or admin."""

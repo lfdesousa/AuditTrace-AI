@@ -3032,6 +3032,61 @@ class TestResolveRequestedTierHelper:
         assert exc_info.value.status_code == 400
 
 
+class TestSanitizeSemanticMetadataHelper:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — direct unit
+    coverage of ``_sanitize_semantic_metadata``, the route-layer half of
+    the metadata-forgery fix (the service-layer half is the
+    unconditional stamp in ``ChromaSemanticService.upsert``, proven in
+    ``tests/test_semantic_service.py::TestUpsertStampsFromContextUnconditionally``).
+
+    FALSIFIABLE: this helper's own logic is trivially neutered by
+    making it an identity function (``return metadata``) — every test
+    below goes RED immediately since the forged keys would then survive."""
+
+    def test_strips_tier_key(self) -> None:
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        out = _sanitize_semantic_metadata({"tier": "corpus", "source": "adr"})
+        assert "tier" not in out
+        assert out == {"source": "adr"}
+
+    def test_strips_user_id_key(self) -> None:
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        out = _sanitize_semantic_metadata({"user_id": "victim", "title": "x"})
+        assert "user_id" not in out
+        assert out == {"title": "x"}
+
+    def test_strips_both_keys_together(self) -> None:
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        out = _sanitize_semantic_metadata(
+            {"tier": "corpus", "user_id": "victim", "title": "x"}
+        )
+        assert out == {"title": "x"}
+
+    def test_none_passes_through(self) -> None:
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        assert _sanitize_semantic_metadata(None) is None
+
+    def test_non_dict_passes_through_unchanged(self) -> None:
+        """Malformed metadata isn't this helper's job to validate — the
+        existing downstream error handling covers it."""
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        assert _sanitize_semantic_metadata("not-a-dict") == "not-a-dict"
+
+    def test_input_dict_not_mutated(self) -> None:
+        """Returns a new dict — the caller's original payload dict must
+        not be mutated as a side effect."""
+        from audittrace.routes.memory import _sanitize_semantic_metadata
+
+        original = {"tier": "corpus", "k": "v"}
+        _sanitize_semantic_metadata(original)
+        assert original == {"tier": "corpus", "k": "v"}
+
+
 class TestSemanticCorpusPromoteGate:
     """ADR-062 Phase B (WU-B5) — the promote-to-corpus scope gate on
     ``POST /memory/semantic``.
@@ -3273,6 +3328,221 @@ class TestSemanticCorpusReadGate:
         finally:
             client.app.dependency_overrides.clear()
         del writer
+
+
+class TestSemanticMetadataForgeryClosed:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — end-to-end proof
+    that ``tier``/``user_id`` smuggled inside the nested ``metadata``
+    field of ``POST``/``PUT /memory/semantic`` cannot bypass the
+    promote gate or forge attribution.
+
+    Exercised against the REAL ``ChromaSemanticService`` (swapped in via
+    the ``real_semantic`` fixture below) rather than the default
+    ``client`` fixture's ``MockSemanticService`` — the mock deliberately
+    does not enforce ADR-062 isolation
+    (``services/semantic.py::MockSemanticService`` docstring), so a
+    "corpus-read stranger gets 404" assertion is only meaningful against
+    the implementation that actually gates cross-user reads.
+
+    Original hole (reviewer, 2026-08-04): ``create_semantic`` gated only
+    the TOP-LEVEL body ``tier`` / ``?promote=`` signal via
+    ``_require_corpus_scope``. A token with ONLY ``memory:semantic:write``
+    (no corpus-write scope) could POST ``{"metadata": {"tier": "corpus"}}``
+    with no top-level ``tier`` — the route believed it wrote "private",
+    but ``ChromaSemanticService.upsert``'s ``dict.setdefault`` silently
+    honoured the caller-supplied tag, so ChromaDB actually stored
+    ``tier=corpus``. Every subsequent ``get_document`` then trusted that
+    forged tag via ``_tier_authorized`` — any corpus-read-scoped
+    stranger (never touched the write, not the owner) could read it.
+    ``metadata.user_id`` was forgeable the same way (attribution
+    forgery). ``update_semantic`` (PUT) had the identical hole.
+
+    FALSIFIABLE: reverting EITHER the route-level
+    ``_sanitize_semantic_metadata`` strip OR (more definitively, since
+    the service is the authoritative choke point — see
+    ``ChromaSemanticService.upsert``'s docstring) the unconditional
+    stamp in ``ChromaSemanticService.upsert`` back to ``dict.setdefault``
+    turns every test below RED (the "stranger" assertions start
+    succeeding — i.e. the forged doc becomes readable).
+    """
+
+    @pytest.fixture
+    def real_semantic(self, monkeypatch):
+        """Swap the route layer's semantic service for the REAL
+        ``ChromaSemanticService`` backed by the in-repo Chroma mock
+        client (isolation-enforcing, unlike ``MockSemanticService``).
+        ``ChromaSemanticService.upsert`` always vectorises on the nomic
+        server (ADR-047) via its OWN ``embed_via_nomic`` import — stub
+        it so this stays offline (mirrors
+        ``test_semantic_service.py``'s ``_mock_nomic_embed`` fixture;
+        the module-level ``_mock_nomic_embed`` autouse fixture in THIS
+        file only patches ``routes.memory.embed_via_nomic``, a
+        different call site)."""
+        import asyncio
+
+        from audittrace.db.factory import MockChromaDBFactory
+        from audittrace.routes import memory as m
+        from audittrace.services.semantic import ChromaSemanticService
+
+        monkeypatch.setattr(
+            "audittrace.services.semantic.embed_via_nomic",
+            AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+        )
+        factory = MockChromaDBFactory()
+        chroma_client = asyncio.run(factory.get_client())
+        service = ChromaSemanticService(
+            client=chroma_client, default_collections=["decisions"]
+        )
+        monkeypatch.setattr(m, "get_semantic_service", lambda: service)
+        return service
+
+    def test_create_tier_forgery_via_metadata_is_ineffective(
+        self, client: TestClient, real_semantic
+    ) -> None:
+        """A writer holding only ``memory:semantic:write`` cannot
+        promote by hiding ``tier=corpus`` inside ``metadata`` instead of
+        the top-level field/``?promote=``."""
+        _override_identity(
+            client, "attacker-1", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "forge-1",
+                    "text": "attacker body",
+                    "metadata": {"tier": "corpus"},
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "private"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        # A corpus-read-scoped STRANGER (never touched the write, not
+        # the owner) must NOT be able to read it — bare 404, no
+        # existence disclosure.
+        _override_identity(
+            client,
+            "stranger-1",
+            ("memory:semantic:read", "memory:corpus:decisions:read"),
+        )
+        try:
+            r = client.get("/memory/semantic/decisions/forge-1")
+            assert r.status_code == 404, (
+                "forged metadata['tier']='corpus' leaked the doc to a "
+                f"stranger: {r.status_code} {r.text}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_create_user_id_forgery_via_metadata_is_ineffective(
+        self, client: TestClient, real_semantic
+    ) -> None:
+        """A caller cannot attribute a private write to another user by
+        forging ``metadata.user_id``."""
+        _override_identity(
+            client, "attacker-2", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "forge-2",
+                    "text": "attacker body 2",
+                    "metadata": {"user_id": "victim"},
+                },
+            )
+            assert r.status_code == 200, r.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+        # The forged "owner" must NOT see it as their own — they never
+        # wrote it, and it's private-tier (owned by the real attacker).
+        _override_identity(client, "victim", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic/decisions/forge-2")
+            assert r.status_code == 404, (
+                "forged metadata['user_id']='victim' let 'victim' read "
+                f"attacker's private doc: {r.status_code}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_update_tier_forgery_via_metadata_is_ineffective(
+        self, client: TestClient, real_semantic
+    ) -> None:
+        """PUT /memory/semantic had the identical unvalidated
+        ``metadata`` passthrough — same forgery, same fix."""
+        writer = _override_identity(
+            client, "attacker-3", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "forge-3",
+                    "text": "v1",
+                },
+            )
+            assert r.status_code == 200
+            r = client.put(
+                "/memory/semantic/decisions/forge-3",
+                json={"text": "v2", "metadata": {"tier": "corpus"}},
+            )
+            assert r.status_code == 200, r.text
+        finally:
+            client.app.dependency_overrides.clear()
+        del writer
+
+        _override_identity(
+            client,
+            "stranger-3",
+            ("memory:semantic:read", "memory:corpus:decisions:read"),
+        )
+        try:
+            r = client.get("/memory/semantic/decisions/forge-3")
+            assert r.status_code == 404, (
+                f"PUT metadata['tier'] forgery leaked the doc: {r.status_code} {r.text}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_update_user_id_forgery_via_metadata_is_ineffective(
+        self, client: TestClient, real_semantic
+    ) -> None:
+        _override_identity(
+            client, "attacker-4", ("memory:semantic:write", "memory:semantic:read")
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "forge-4",
+                    "text": "v1",
+                },
+            )
+            assert r.status_code == 200
+            r = client.put(
+                "/memory/semantic/decisions/forge-4",
+                json={"text": "v2", "metadata": {"user_id": "victim2"}},
+            )
+            assert r.status_code == 200, r.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+        _override_identity(client, "victim2", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic/decisions/forge-4")
+            assert r.status_code == 404, (
+                f"PUT metadata['user_id'] forgery leaked the doc: {r.status_code}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
 
 
 class TestBackofficeOwnerScopedManifest:
@@ -3669,6 +3939,62 @@ class TestS3DiscoveryMerge:
     items because the manifest table was empty — the underlying ADRs
     were in MinIO already.
     """
+
+    def test_all_known_caller_filter_prevents_key_collision_hiding_own_doc(
+        self, client: TestClient
+    ) -> None:
+        """ADR-062 Phase B (WU-B4 review fix, 2026-08-04) — the
+        episodic/procedural twin of the same ``_merge_semantic_with_
+        chroma`` gap the reviewer flagged: ``_merge_layer_items_with_
+        s3``'s ``all_known`` dedup lookup must ALSO be caller-scoped, or
+        another user's manifest-tracked PRIVATE row under the SAME
+        filename makes that key "already known" fleet-wide, hiding the
+        caller's OWN legitimately-discoverable S3 object.
+
+        FALSIFIABLE: drop ``caller=user`` from the ``all_known`` call in
+        ``_merge_layer_items_with_s3`` and this goes RED — alice's own
+        discovered file disappears because bob's colliding manifest row
+        (a different key entirely, same filename) makes "collide.md"
+        look already-tracked."""
+        import asyncio
+
+        from audittrace.dependencies import (
+            get_episodic_service,
+            get_memory_manifest_service,
+        )
+
+        # Bob's manifest-TRACKED row for "collide.md" — never actually
+        # written to S3 in this test, only the manifest row exists
+        # (mirrors the real (layer,key) global-uniqueness gap:
+        # `_manifest_visible`'s docstring).
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic", "collide.md", "bob's title", 1, "bob", tier="private"
+            )
+        )
+
+        # Alice's own file is DISCOVERED (S3-only, no manifest row) —
+        # deliberately the identical filename.
+        get_episodic_service().add_document(
+            content="alice's body",
+            file="collide.md",
+            tier="private",
+            user_id="alice",
+        )
+
+        _override_identity(
+            client, "alice", ("memory:episodic:write", "memory:episodic:read")
+        )
+        try:
+            r = client.get("/memory/episodic")
+            items = [i for i in r.json()["items"] if i["key"] == "collide.md"]
+            assert items, (
+                "alice's own discovered file was hidden by bob's colliding "
+                f"manifest row: {r.json()['items']}"
+            )
+            assert items[0]["discovered"] is True
+        finally:
+            client.app.dependency_overrides.clear()
 
     def test_episodic_list_includes_s3_objects(self, client: TestClient) -> None:
         # Seed the mock episodic service with an "uploaded" item that
@@ -6356,6 +6682,90 @@ class TestMergeSemanticWithChroma:
         keys = [i["key"] for i in items]
         assert any("mine" in k for k in keys)
         assert any("theirs" in k for k in keys)
+
+    # ── ADR-062 Phase B (WU-B4 review fix, 2026-08-04) ────────────────────
+    # The reviewer found the `caller=user` argument on the `all_known`
+    # (dedup) `list_for_layer` lookup inside `_merge_semantic_with_chroma`
+    # had zero falsifying tests — removing it caused no failures across the
+    # existing suite. Root cause: `all_known`/`known_keys` only affects
+    # DEDUP (is a key "already tracked", so skip re-emitting it as
+    # "discovered"), never authorization (the discovery loop has its own
+    # independent owner-or-corpus check on every Chroma-discovered row).
+    # An UNFILTERED `all_known` is only OBSERVABLE in the manifest
+    # (layer,key)-collision case: another user's manifest-tracked PRIVATE
+    # row for the same key makes that key "known" fleet-wide, so the
+    # caller's OWN legitimately-visible Chroma doc under the identical key
+    # gets silently skipped (a false-negative — hidden content, not a
+    # leak — which is why leak-shaped tests never caught it). This test
+    # exercises exactly that collision.
+
+    @pytest.mark.asyncio
+    async def test_all_known_caller_filter_prevents_key_collision_hiding_own_doc(
+        self, monkeypatch, user_context
+    ) -> None:
+        """FALSIFIABLE: drop ``caller=user`` from the ``all_known`` call
+        in ``_merge_semantic_with_chroma`` and this goes RED — alice's
+        own doc disappears because bob's colliding manifest key makes
+        it look "already known"."""
+        from dataclasses import replace
+
+        from audittrace.routes import memory as m
+        from audittrace.services.memory_manifest import ManifestEntry
+
+        # Key must match the PHYSICAL collection name the discovery
+        # loop actually scans (`_Chroma`'s default `names`), not the
+        # logical "decisions" name — `_merge_semantic_with_chroma`
+        # builds discovered keys as f"{col_name}/{doc_id}" using
+        # whatever `chroma.list_collections()` returns.
+        bobs_row = ManifestEntry(
+            id="mi-bob",
+            layer="semantic",
+            key="audittrace_v2/collide",
+            title="bob's",
+            size_bytes=1,
+            created_at_ms=1,
+            modified_at_ms=1,
+            created_by_user_id="bob",
+            modified_by_user_id="bob",
+            deleted_at_ms=None,
+            deleted_by_user_id=None,
+            tier="private",
+        )
+
+        class _CallerAwareManifest:
+            """Mirrors the real owner-or-corpus predicate — respects
+            ``caller`` the way ``MemoryManifestService.list_for_layer``
+            does, unlike this test class's other bare ``_Manifest``
+            fakes (which ignore ``caller`` entirely)."""
+
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
+                rows = [bobs_row]
+                if caller is None or caller.is_admin:
+                    return rows
+                return [
+                    r
+                    for r in rows
+                    if r.created_by_user_id == caller.user_id or r.tier == "corpus"
+                ]
+
+        chroma = self._Chroma(
+            {
+                "ids": ["collide"],
+                "documents": ["alice's body"],
+                "metadatas": [{"user_id": "alice", "tier": "private"}],
+            }
+        )
+        monkeypatch.setattr(
+            m, "get_memory_manifest_service", lambda: _CallerAwareManifest()
+        )
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        alice = replace(user_context, user_id="alice", is_admin=False, scopes=())
+        items = await m._merge_semantic_with_chroma([], collection=None, user=alice)
+        keys = [i["key"] for i in items]
+        assert any("collide" in k for k in keys), (
+            f"alice's own doc was hidden by bob's colliding manifest key: {keys}"
+        )
 
 
 class TestMemoryAccessAuditEvents:
