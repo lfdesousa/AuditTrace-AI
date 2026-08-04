@@ -884,6 +884,201 @@ class TestKeycloakOpencodeMemoryWriteScopes:
         )
 
 
+class TestCorpusScopeGovernance:
+    """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
+    scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
+    collection (``decisions``, ``skills``, ``semantic``).
+
+    Write (and, in this Phase-A pass, read too — there is no Curator client
+    yet) is operator/curator-tier: optional-only on ``admin-client``, never
+    granted (default or optional) to end-user clients (``audittrace-opencode``,
+    ``audittrace-webui``) or to the reserved SC-09 ``audittrace-restricted``
+    client (see the sibling guard added to
+    ``TestRestrictedClientStaysRestricted`` below).
+
+    Falsifiable:
+
+    * a corpus scope declared in a realm file but missing from
+      ``audittrace.auth.ALL_SCOPES`` (or vice-versa) fails
+      ``test_corpus_scopes_match_all_scopes_dict``;
+    * granting a corpus scope to ``audittrace-opencode``/``audittrace-webui``
+      fails ``test_corpus_scopes_not_on_end_user_clients``;
+    * granting a corpus scope to any client other than ``admin-client``
+      fails ``test_corpus_write_only_granted_to_admin_client``.
+    """
+
+    _EXPECTED_CORPUS_SCOPES: frozenset[str] = frozenset(
+        {
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    _END_USER_CLIENT_IDS: tuple[str, ...] = ("audittrace-opencode", "audittrace-webui")
+
+    def test_realm_declares_all_corpus_scopes(self) -> None:
+        """Chart-rendered realm (the file actually imported on a fresh
+        cluster) declares all six corpus scopes as clientScopes."""
+        realm = _rendered_realm_json(_render())
+        declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+        missing = self._EXPECTED_CORPUS_SCOPES - declared
+        assert not missing, (
+            "Drift: charts/audittrace/files/realm-audittrace.json is "
+            "missing corpus clientScope declarations for: " + ", ".join(sorted(missing))
+        )
+
+    def test_top_level_realm_declares_all_corpus_scopes(self) -> None:
+        """The dev/standalone import file declares the same six corpus
+        scopes as the chart file (WU-A2: declare in BOTH realm files, kept
+        identical)."""
+        realm = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+        missing = self._EXPECTED_CORPUS_SCOPES - declared
+        assert not missing, (
+            "Drift: keycloak/realm-audittrace.json is missing corpus "
+            "clientScope declarations for: "
+            + ", ".join(sorted(missing))
+            + " — it must mirror charts/audittrace/files/realm-audittrace.json."
+        )
+
+    def test_corpus_scopes_match_all_scopes_dict(self) -> None:
+        """Cross-check the realm-declared corpus scopes against
+        ``audittrace.auth.ALL_SCOPES`` in both directions. The OpenAPI
+        security scheme is generated FROM ``ALL_SCOPES``, so a realm-only
+        scope would be grantable but invisible in Swagger/OpenAPI, and an
+        ``ALL_SCOPES``-only entry would be documented but never issuable —
+        this is the drift class WU-A2 exists to prevent."""
+        from audittrace.auth import ALL_SCOPES
+
+        code_corpus = {s for s in ALL_SCOPES if s.startswith("memory:corpus:")}
+        realm = _rendered_realm_json(_render())
+        realm_corpus = {
+            s.get("name")
+            for s in realm.get("clientScopes", []) or []
+            if (s.get("name") or "").startswith("memory:corpus:")
+        }
+        assert code_corpus == realm_corpus, (
+            "Drift between audittrace.auth.ALL_SCOPES and the realm's "
+            f"declared memory:corpus:* scopes. In ALL_SCOPES only: "
+            f"{sorted(code_corpus - realm_corpus)}. In realm only: "
+            f"{sorted(realm_corpus - code_corpus)}."
+        )
+        assert code_corpus == self._EXPECTED_CORPUS_SCOPES
+
+    @pytest.mark.parametrize("client_id", ["audittrace-opencode", "audittrace-webui"])
+    def test_corpus_scopes_not_on_end_user_clients(self, client_id: str) -> None:
+        """WU-A3: end-user clients get NO corpus scope in EITHER set for
+        this governance-floor pass — the whole ``memory:corpus:*`` family
+        stays operator/curator-tier."""
+        realm = _rendered_realm_json(_render())
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") != client_id:
+                continue
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            offenders = sorted(s for s in both if s.startswith("memory:corpus:"))
+            assert not offenders, (
+                f"Drift: client {client_id!r} was granted corpus scope(s) "
+                f"{offenders} — WU-A3 (ADR-062 §4) requires corpus scopes "
+                "stay operator/curator-tier; end-user clients never get "
+                "them, in either scope set."
+            )
+            return
+        raise AssertionError(f"Client {client_id!r} not found in rendered realm")
+
+    def test_corpus_write_only_granted_to_admin_client(self) -> None:
+        """No client other than the operator-tier ``admin-client`` may hold
+        ANY corpus scope (read or write) in this Phase-A pass — there is no
+        Curator client yet (SDLC-ADR-002 is future work)."""
+        realm = _rendered_realm_json(_render())
+        offenders: dict[str, list[str]] = {}
+        for c in realm.get("clients", []) or []:
+            client_id = c.get("clientId")
+            if client_id == "admin-client":
+                continue
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            granted = sorted(s for s in both if s.startswith("memory:corpus:"))
+            if granted:
+                offenders[client_id] = granted
+        assert not offenders, (
+            f"Drift: non-operator client(s) hold corpus scopes: {offenders}. "
+            "Only admin-client (operator-tier) may hold memory:corpus:* in "
+            "this Phase-A pass."
+        )
+
+    @staticmethod
+    def _corpus_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{CORPUS_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                'CORPUS_SCOPES bind loop (`for SCOPE in "${CORPUS_SCOPES[@]}"; '
+                "do ... done`) not found — WU-A3 requires a bind loop scoped "
+                "to admin-client only, separate from the CLIENT_KIND fan-out."
+            )
+        return m.group(1)
+
+    def test_provisioner_corpus_scopes_match_and_admin_only(self) -> None:
+        """scripts/setup-memory-scopes.sh and the chart's in-cluster Job
+        ConfigMap must maintain identical ``CORPUS_SCOPES`` arrays (all six
+        scopes), and the corpus bind loop must target ``admin-client``
+        only — never ``audittrace-opencode``/``audittrace-webui``."""
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_text = script_path.read_text()
+        cm_text = cm_path.read_text()
+
+        def _corpus_scopes_in(text: str) -> set[str]:
+            m = re.search(r"CORPUS_SCOPES=\(([^)]*)\)", text)
+            if m is None:
+                raise AssertionError(
+                    f"CORPUS_SCOPES=( ... ) block not in: {text[:200]}"
+                )
+            return set(re.findall(r'"(memory:corpus:[^"]+)"', m.group(1)))
+
+        script_corpus = _corpus_scopes_in(script_text)
+        cm_corpus = _corpus_scopes_in(cm_text)
+
+        assert script_corpus == cm_corpus == self._EXPECTED_CORPUS_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete CORPUS_SCOPES arrays. Script: "
+            f"{sorted(script_corpus)}. ConfigMap: {sorted(cm_corpus)}. "
+            f"Expected: {sorted(self._EXPECTED_CORPUS_SCOPES)}."
+        )
+
+        for text, label in ((script_text, "script"), (cm_text, "configmap")):
+            loop_body = self._corpus_bind_loop_body(text)
+            assert "admin-client" in loop_body, (
+                f"{label}: the CORPUS_SCOPES bind loop does not bind to "
+                "admin-client — WU-A3 requires corpus scopes reach only "
+                "the operator-tier client."
+            )
+            for forbidden_client in self._END_USER_CLIENT_IDS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the CORPUS_SCOPES bind loop references "
+                    f"{forbidden_client!r} — corpus scopes must never reach "
+                    "end-user clients (WU-A3, ADR-062 §4)."
+                )
+
+
 class TestPostDeployVerifyKeycloakScopeGuard:
     """Check 11 of ``scripts/post-deploy-verify.sh`` (#370).
 
@@ -1053,6 +1248,47 @@ class TestRestrictedClientStaysRestricted:
             "purpose is that these scopes are unobtainable, not merely "
             "unrequested. Remove them, or stop citing SC-09."
         )
+
+    def test_no_corpus_scope_on_restricted_client(self) -> None:
+        """WU-A3 (ADR-062 §4) — ``memory:corpus:*`` scopes are operator/
+        curator-tier and must never appear on ``audittrace-restricted``
+        (SC-09), in EITHER scope set, in EITHER realm file. Same VOID
+        mechanism as ``test_top_level_realm_grants_no_audit_scope`` above:
+        Keycloak silently drops a requested-but-not-offered scope, so "the
+        client does not offer it" is the entire guarantee an adversarial
+        cross-tenant/corpus-boundary test relies on.
+
+        Checked against both realm files (not the FORBIDDEN tuple above,
+        which predates ADR-062 and is a fixed literal list) so a corpus
+        scope added to either file's audittrace-restricted client fails
+        here regardless of which realm file it landed in. The top-level
+        file is plain JSON; the chart file has Helm templating elsewhere
+        (webui redirectUris/webOrigins) so it's read via the rendered
+        realm, same as every other chart-file check in this module."""
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._restricted(realm)
+            both = list(c.get("defaultClientScopes", [])) + list(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = [s for s in both if s.startswith("memory:corpus:")]
+            assert not offenders, (
+                f"{label}: audittrace-restricted was granted corpus scope(s) "
+                f"{offenders} — this VOIDS every SC-09 result the same way "
+                "an audit/admin scope would. Corpus scopes are operator/"
+                "curator-tier (WU-A3, ADR-062 §4); remove them."
+            )
 
     def test_description_fits_keycloak_column(self) -> None:
         """Keycloak stores client.description in a varchar(255).

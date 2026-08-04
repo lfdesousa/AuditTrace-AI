@@ -103,6 +103,48 @@
       }
     },
     {
+      "name": "memory:corpus:decisions:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:decisions:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:skills:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:skills:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:semantic:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:corpus:semantic:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:upload:write",
       "protocol": "openid-connect",
       "attributes": {
@@ -192,7 +234,14 @@
         "memory:procedural:write",
         "memory:semantic:write"
       ],
-      "optionalClientScopes": []
+      "optionalClientScopes": [
+        "memory:corpus:decisions:read",
+        "memory:corpus:decisions:write",
+        "memory:corpus:skills:read",
+        "memory:corpus:skills:write",
+        "memory:corpus:semantic:read",
+        "memory:corpus:semantic:write"
+      ]
     },
     {
       "description": "Dev client \u2014 client_credentials grant with audience mapper (aud=audittrace-server). Secret in secrets/dev_client_secret.txt. See DESIGN \u00a716 Phase 7.",

@@ -1487,11 +1487,18 @@ async def list_semantic(
     ),
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
+    user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
     discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
     alongside operator-created ones. Sort/paginate mirror the other layer
-    lists for consistency (backlog #15, R5)."""
+    lists for consistency (backlog #15, R5).
+
+    ADR-062 WU-A1: requires an authenticated user like every sibling
+    list/read handler (closes the CS-4 anomaly of a memory-list endpoint
+    with no identity at all, so a future audit event can attribute the
+    read). This does NOT yet filter results by user — that per-user
+    isolation lands in ADR-062 Phase B."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=include_deleted

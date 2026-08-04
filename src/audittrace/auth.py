@@ -94,6 +94,43 @@ ALL_SCOPES: dict[str, str] = {
         "collection (SKILL/procedural records — vector-searchable via "
         "/memory/index single-file mode and recall_semantic)."
     ),
+    # ── ADR-062 §4 — Layer 5 (Shared Corpus) granular scopes ────────────
+    #
+    # Distinct from the per-user memory:<layer>:* scopes above: these
+    # govern the org-wide shared corpus, one read/write pair per recall
+    # collection so a papers-ingester can hold e.g. only
+    # memory:corpus:semantic:write while the Memory Curator holds
+    # decisions + skills write (SDLC-ADR-002). Write is operator/
+    # curator-tier — optional-only on operator clients, never granted
+    # (default or optional) to end-user clients or to the reserved SC-09
+    # audittrace-restricted client (WU-A3, project_restricted_client_sc09_reserved).
+    "memory:corpus:decisions:read": (
+        "Read the shared-corpus ``decisions`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:decisions:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``decisions`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
+    "memory:corpus:skills:read": (
+        "Read the shared-corpus ``skills`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:skills:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``skills`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
+    "memory:corpus:semantic:read": (
+        "Read the shared-corpus ``semantic`` collection (Layer 5, "
+        "ADR-062 §4) — distinct from the per-user memory:semantic:read."
+    ),
+    "memory:corpus:semantic:write": (
+        "Create/update/delete documents in the shared-corpus "
+        "``semantic`` collection (Layer 5, ADR-062 §4). Operator/"
+        "curator-tier; never granted by default."
+    ),
     "memory:conversational:read-own": (
         "Read your own past conversations from the conversational layer"
     ),
