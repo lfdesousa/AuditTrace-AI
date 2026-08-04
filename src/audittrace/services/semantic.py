@@ -245,7 +245,18 @@ class SemanticService(ABC):
         (``memory:corpus:<collection>:write``) is enforced at the route
         layer in WU-B5 — this parameter only wires the write TARGET so
         WU-B5 has something to gate; it does not itself authorize a
-        promote."""
+        promote.
+
+        ``metadata["tier"]`` and ``metadata["user_id"]`` are ALWAYS
+        overwritten from ``tier``/``user_context`` (WU-B5 review fix,
+        2026-08-04) — never honoured from caller-supplied ``metadata``,
+        even if the caller is an operator. Both are TOKEN-DERIVED /
+        route-authorized values (ADR-027 §1); a caller-supplied override
+        used to be silently accepted (``dict.setdefault``), which let a
+        writer holding only ``memory:semantic:write`` smuggle
+        ``metadata={"tier": "corpus"}`` past the entire WU-B5 promote
+        gate (the gate only ever inspected the top-level body/query
+        signal) and forge another user's ``user_id`` for attribution."""
 
     @abstractmethod
     async def delete_document(
@@ -788,20 +799,31 @@ class ChromaSemanticService(SemanticService):
         *,
         tier: str = "private",
     ) -> None:
-        # Stamp user_id into the metadata so the per-user `where` filter
-        # in `search()` keeps working for the new doc. Operator overrides
-        # are honoured if the caller provided their own user_id.
+        # Stamp user_id + tier into the metadata UNCONDITIONALLY (WU-B5
+        # review fix, 2026-08-04) — both are TOKEN-DERIVED / route-
+        # authorized values (ADR-027 §1), never caller-supplied. This
+        # used to be `dict.setdefault`, which silently HONOURED a
+        # caller-provided override — a writer holding only
+        # `memory:semantic:write` could smuggle
+        # `metadata={"tier": "corpus"}` past the entire WU-B5 promote
+        # gate (the gate only ever inspected the top-level body/query
+        # `tier`/`?promote=` signal, never nested `metadata`), and the
+        # forged tag was then trusted by `_tier_authorized` on every
+        # subsequent read — an unauthorized-promote + attribution-
+        # forgery bypass. Direct assignment makes both fields
+        # true-by-construction: no caller input can ever reach the
+        # stored value.
         meta = dict(metadata or {})
-        meta.setdefault("user_id", user_context.user_id)
+        meta["user_id"] = user_context.user_id
         if tier == "corpus":
             # ADR-062 Phase B (D1): the corpus write TARGET. The
             # promote SCOPE-GATE (memory:corpus:<collection>:write) is
             # enforced by the route layer in WU-B5, not here.
             physical_name = self._physical_corpus(collection)
-            meta.setdefault("tier", "corpus")
+            meta["tier"] = "corpus"
         else:
             physical_name = self._physical(collection)
-            meta.setdefault("tier", "private")
+            meta["tier"] = "private"
         col = await self._client.get_or_create_collection(
             name=physical_name, embedding_function=None
         )

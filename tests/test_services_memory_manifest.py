@@ -17,6 +17,7 @@ import time
 import pytest
 import pytest_asyncio
 
+from audittrace.identity import UserContext
 from audittrace.services.memory_manifest import (
     ManifestEntry,
     MockMemoryManifestService,
@@ -28,6 +29,17 @@ from audittrace.services.memory_manifest import (
 @pytest.fixture
 def manifest() -> MockMemoryManifestService:
     return MockMemoryManifestService()
+
+
+def _user(user_id: str, *, is_admin: bool = False) -> UserContext:
+    """Minimal non-admin UserContext for the WU-B4 caller-predicate tests."""
+    return UserContext(
+        user_id=user_id,
+        username=user_id,
+        agent_type="test",
+        scopes=(),
+        is_admin=is_admin,
+    )
 
 
 class TestNowMs:
@@ -100,6 +112,38 @@ class TestRecordCreate:
     ) -> None:
         with pytest.raises(ValueError):
             await manifest.record_create("conversational", "x", None, 0, "u")
+
+    # ── ADR-062 Phase B (WU-B4/B5) — tier default + persistence ──────────
+
+    async def test_tier_defaults_to_private(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        """D2: new writes default private — even a caller of the SERVICE
+        (not just the route) that forgets to pass ``tier`` explicitly
+        lands on the fail-closed (least-shared) side."""
+        entry = await manifest.record_create("episodic", "new.md", None, 1, "alice")
+        assert entry.tier == "private"
+
+    async def test_tier_explicit_corpus_is_persisted(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        entry = await manifest.record_create(
+            "semantic", "decisions/x", None, 1, "curator", tier="corpus"
+        )
+        assert entry.tier == "corpus"
+
+    async def test_recreate_re_stamps_tier(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        """Recreating an existing row updates its tier too (same branch
+        that already updates title/size_bytes on overwrite)."""
+        await manifest.record_create(
+            "episodic", "k.md", None, 1, "alice", tier="private"
+        )
+        again = await manifest.record_create(
+            "episodic", "k.md", None, 1, "curator", tier="corpus"
+        )
+        assert again.tier == "corpus"
 
 
 class TestRecordUpdate:
@@ -204,6 +248,67 @@ class TestListForLayer:
         rows = await manifest.list_for_layer("episodic")
         # `first.md` was modified most recently → ordered first.
         assert [r.key for r in rows] == ["first.md", "second.md"]
+
+
+class TestListForLayerCallerPredicate:
+    """ADR-062 Phase B (WU-B4) — ``list_for_layer(caller=...)`` owner-or-
+    corpus isolation. FALSIFIABLE: neuter the predicate in
+    ``MockMemoryManifestService.list_for_layer`` (e.g. hardcode the
+    filter condition to ``True``) and
+    ``test_non_admin_sees_own_and_corpus_not_others_private`` goes RED
+    (bob's private row leaks to alice); restore it and it goes green.
+    ``test_corpus_row_visible_to_everyone`` and
+    ``test_admin_bypasses_the_predicate`` pin the two non-leak arms so a
+    "fix" can't just hide everything.
+    """
+
+    async def test_caller_none_is_unfiltered(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        """Backward compatibility: omitting ``caller`` (the pre-WU-B4
+        default) returns the full operator-global view, same as every
+        pre-existing call site that doesn't pass it."""
+        await manifest.record_create("episodic", "a.md", None, 1, "alice")
+        await manifest.record_create("episodic", "b.md", None, 1, "bob")
+        rows = await manifest.list_for_layer("episodic")
+        assert {r.key for r in rows} == {"a.md", "b.md"}
+
+    async def test_non_admin_sees_own_and_corpus_not_others_private(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "alice-private.md", None, 1, "alice", tier="private"
+        )
+        await manifest.record_create(
+            "episodic", "bob-private.md", None, 1, "bob", tier="private"
+        )
+        rows = await manifest.list_for_layer("episodic", caller=_user("alice"))
+        keys = {r.key for r in rows}
+        assert "alice-private.md" in keys
+        assert "bob-private.md" not in keys, f"leaked bob's private row: {keys}"
+
+    async def test_corpus_row_visible_to_everyone(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "shared-adr.md", None, 1, "curator", tier="corpus"
+        )
+        rows = await manifest.list_for_layer("episodic", caller=_user("alice"))
+        assert {r.key for r in rows} == {"shared-adr.md"}
+
+    async def test_admin_bypasses_the_predicate(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "alice-private.md", None, 1, "alice", tier="private"
+        )
+        await manifest.record_create(
+            "episodic", "bob-private.md", None, 1, "bob", tier="private"
+        )
+        rows = await manifest.list_for_layer(
+            "episodic", caller=_user("ops", is_admin=True)
+        )
+        assert {r.key for r in rows} == {"alice-private.md", "bob-private.md"}
 
 
 class TestManifestEntryRoundTrip:
@@ -349,12 +454,15 @@ class TestManifestEntryFromRow:
             pdfa_part=None,
             pdfa_conformance=None,
             ltv_data=None,
+            # ADR-062 Phase B (WU-B4, migration 018).
+            tier="corpus",
         )
         e = ManifestEntry.from_row(row)
         assert e.id == "abc"
         assert e.size_bytes == 42
         assert e.page_count is None
         assert e.attachment_count is None
+        assert e.tier == "corpus"
 
 
 # ── Postgres-backed MemoryManifestService (uses InMemoryPostgresFactory) ─────

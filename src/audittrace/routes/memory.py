@@ -30,7 +30,6 @@ content itself lives in S3 (episodic/procedural) or ChromaDB
 import asyncio
 import contextlib
 import hashlib
-import io
 import logging
 import time
 from collections.abc import Callable
@@ -84,6 +83,7 @@ from audittrace.models import (
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.services.embedder import embed_via_nomic
+from audittrace.services.episodic import EpisodicService
 from audittrace.services.layer_listing import list_layer_objects
 from audittrace.services.memory_audit import (
     MemoryOp,
@@ -92,6 +92,7 @@ from audittrace.services.memory_audit import (
 )
 from audittrace.services.memory_manifest import ManifestEntry
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
+from audittrace.services.procedural import ProceduralService
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
@@ -287,6 +288,152 @@ def _require_admin(user: UserContext, action: str) -> None:
     )
 
 
+# ── ADR-062 Phase B (WU-B5) — corpus-write promote gate ─────────────────────
+#
+# The granular ``memory:corpus:<collection>:{read,write}`` scopes are a
+# CLOSED, drift-guarded set (``tests/test_chart_drift_guards.py::
+# TestCorpusScopeGovernance``) declared for exactly the three ChromaDB
+# recall collections (``decisions``/``skills``/``semantic`` — ADR-062 §4,
+# WU-A2/A3). They do NOT exist for the episodic/procedural S3 layers —
+# adding new entries to that frozenset is explicitly out of scope for this
+# PR (it would fail the drift guard). Consequently the promote-to-corpus
+# mechanism this section wires is meaningful ONLY for ``/memory/semantic``;
+# episodic/procedural writes stay private-only (see
+# ``_reject_corpus_promotion_for`` below).
+
+
+def _has_corpus_scope(user: UserContext, collection: str, action: str) -> bool:
+    """``True`` iff *user* holds ``memory:corpus:<collection>:<action>``
+    (or an admin bypass). Boolean twin of ``_require_corpus_scope`` for
+    call sites that need to silently FILTER (list endpoints) rather than
+    reject the whole request (single-doc read/write)."""
+    required = f"memory:corpus:{collection}:{action}"
+    return user.is_admin or "audittrace:admin" in user.scopes or required in user.scopes
+
+
+def _require_corpus_scope(user: UserContext, collection: str, action: str) -> None:
+    """Raise 403 unless *user* holds ``memory:corpus:<collection>:<action>``.
+
+    Mirrors ``_require_layer_write``'s shape (admin bypass +
+    ``audittrace:admin`` bypass + exact-scope match). ``action`` is
+    ``"read"`` or ``"write"``. Falsifiable: a token without the scope
+    (and without admin) is refused; a token WITH the scope (or admin) is
+    let through — see ``TestSemanticCorpusPromoteGate`` /
+    ``TestSemanticCorpusReadGate`` in ``tests/test_memory_routes.py``.
+    """
+    if _has_corpus_scope(user, collection, action):
+        return
+    required = f"memory:corpus:{collection}:{action}"
+    raise HTTPException(
+        status_code=403,
+        detail=f"Required scope: {required} (or audittrace:admin)",
+    )
+
+
+def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
+    """Resolve the caller's requested write tier from an optional JSON
+    body ``"tier"`` field and/or an optional ``?promote=`` query param
+    (ADR-062 Phase B, WU-B5 — "explicit tier=corpus / ?promote=corpus").
+
+    Returns ``"private"`` (the D2 default — no explicit request, or an
+    explicit request for ``"private"``) or ``"corpus"`` (either signal
+    asking for it). Raises 400 on a garbage value or a body/query
+    conflict (e.g. ``{"tier": "private"}`` with ``?promote=corpus``) so a
+    caller never silently gets a different tier than the one they asked
+    for.
+    """
+    body_tier = payload.get("tier") if payload is not None else None
+    if body_tier is not None and promote is not None and body_tier != promote:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"conflicting tier request: body tier={body_tier!r} vs "
+                f"?promote={promote!r}"
+            ),
+        )
+    requested = body_tier if body_tier is not None else promote
+    if requested is None or requested == "private":
+        return "private"
+    if requested == "corpus":
+        return "corpus"
+    raise HTTPException(
+        status_code=400,
+        detail=f"invalid tier {requested!r}; expected 'private' or 'corpus'",
+    )
+
+
+def _manifest_visible(entry: ManifestEntry, user: UserContext) -> bool:
+    """ADR-062 Phase B (WU-B4) — owner-or-corpus predicate for a SINGLE
+    manifest entry, used by the ``read_*`` routes to decide whether the
+    manifest metadata block is safe to return alongside a resolved
+    read. Same shape as ``MemoryManifestService.list_for_layer``'s
+    per-row filter and ``ChromaSemanticService._tier_authorized``.
+
+    Defense-in-depth against the pre-existing ``(layer, key)``
+    global-uniqueness manifest model (migration 009 — "operator-global,
+    not per-user"): a private-tier filename collision across two
+    different callers shares ONE manifest row, so without this check a
+    caller whose OWN content-read already resolved correctly (via the
+    private-tier-first S3/Chroma lookup) could still see a stranger's
+    ``created_by_user_id`` in the ``manifest`` block. This does not fix
+    that collision (out of WU-B4/B5 scope — flagged as a known
+    follow-up), it just stops the row's authorship metadata leaking
+    when it isn't the caller's own."""
+    if user.is_admin:
+        return True
+    return entry.created_by_user_id == user.user_id or entry.tier == "corpus"
+
+
+_SEMANTIC_METADATA_SECURITY_KEYS = frozenset({"tier", "user_id"})
+
+
+def _sanitize_semantic_metadata(metadata: Any) -> Any:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04) — strip
+    caller-supplied ``tier``/``user_id`` keys from a semantic-document
+    ``metadata`` payload before it reaches the service layer.
+
+    ``tier`` and ``user_id`` are TOKEN-DERIVED / route-authorized
+    values (ADR-027 §1), never caller-supplied — see
+    ``ChromaSemanticService.upsert``'s docstring for the exploit this
+    closes: a writer holding only ``memory:semantic:write`` could
+    smuggle ``metadata={"tier": "corpus"}`` past the top-level promote
+    gate (``_resolve_requested_tier`` only ever inspected the top-level
+    body/query signal, never nested ``metadata``), and the forged tag
+    was then trusted downstream by ``_tier_authorized`` on every
+    subsequent read. This strip is belt-and-suspenders on top of the
+    service layer's own unconditional stamp — it protects any
+    ``SemanticService`` implementation (including a future/alternate
+    one) that hasn't been hardened the same way, and applies in BOTH
+    ``create_semantic`` (POST) and ``update_semantic`` (PUT) — a scope
+    gate on one write path is worthless if the sibling path reaches the
+    same sink unguarded.
+
+    Non-dict input (the existing 400 validation elsewhere handles a
+    malformed ``metadata``) passes through unchanged."""
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        k: v for k, v in metadata.items() if k not in _SEMANTIC_METADATA_SECURITY_KEYS
+    }
+
+
+def _reject_corpus_promotion_for(layer: str, tier: str) -> None:
+    """400 (not 403) if *tier* asks for corpus on a layer that has no
+    corpus-write scope declared (episodic/procedural — see the module
+    note above). This is a "not supported", not a "not authorized"
+    response: no scope, held by anyone, could ever satisfy this request,
+    so a 403 would misleadingly suggest a missing grant would fix it."""
+    if tier == "corpus":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"corpus promotion is not supported for the {layer!r} layer; "
+                "only /memory/semantic collections support corpus promotion "
+                "(ADR-062 Phase B, WU-B5)"
+            ),
+        )
+
+
 async def _emit_write_audit(
     *,
     user: UserContext,
@@ -329,6 +476,35 @@ async def _emit_write_audit(
         ) from exc
 
 
+async def _write_layer_private(
+    layer: MemoryLayer, user: UserContext, filename: str, content: str
+) -> None:
+    """Dispatch to the episodic/procedural service's PRIVATE-tier write
+    (ADR-062 Phase B, WU-B5), normalizing its exceptions to the same
+    400/502 shape every other CRUD route in this file uses.
+
+    Shared by ``upload_memory_file``'s legacy non-PDF branch so a plain
+    /memory/upload gets WU-B2's private-tier routing + cache
+    invalidation + filename validation for free, instead of hand-rolling
+    a raw S3 ``put_object`` that used to land unconditionally in the
+    shared/corpus bucket regardless of who uploaded (the leak this WU
+    closes — see ``upload_memory_file``'s docstring)."""
+    service: EpisodicService | ProceduralService = (
+        get_episodic_service()
+        if layer == MemoryLayer.episodic
+        else get_procedural_service()
+    )
+    try:
+        await service.write(user, filename, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Object storage write failed: %s", exc)
+        raise HTTPException(
+            status_code=502, detail="Object storage write failed"
+        ) from exc
+
+
 @router.post("/upload")
 async def upload_memory_file(
     # ``Request[Any]`` would satisfy pre-commit mypy 1.8 (which can't
@@ -341,6 +517,14 @@ async def upload_memory_file(
     file: UploadFile = File(...),
     layer: MemoryLayer = Query(...),
     filename: str | None = Query(None),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Neither "
+            "episodic nor procedural has a corpus-write scope declared "
+            "(ADR-062 §4) — any corpus request here returns 400."
+        ),
+    ),
     # NOT auth-only: the real gate is the dynamic per-layer
     # ``_require_layer_write`` below. The static ``scopes=[]`` only keeps
     # OAuth2 declared in the OpenAPI spec (same pattern as /memory/index);
@@ -359,12 +543,20 @@ async def upload_memory_file(
       with ``scan_status='pending_scan'``, and an AMQP scan-request is
       enqueued. The response is **HTTP 202** with a ``scan_id`` and
       poll URL. Promotion to ``episodic/papers/`` happens
-      asynchronously in content-control once the verdict is clean.
+      asynchronously in content-control once the verdict is clean. This
+      branch is UNCHANGED by ADR-062 Phase B — the async quarantine →
+      verdict → promotion pipeline is ADR-048's content-control
+      concern, out of WU-B4/WU-B5's scope.
 
-    * **Non-PDF uploads** (markdown skills, ADRs, plain text)
-      keep the existing synchronous path: PUT to
-      ``{layer}/{filename}`` and return HTTP 200 with the
-      direct-write summary.
+    * **Non-PDF uploads** (markdown skills, ADRs, plain text): ADR-062
+      Phase B (WU-B5) — writes to the caller's PRIVATE tier via the
+      episodic/procedural service's own ``write()`` (already wired to
+      the private bucket by WU-B2), closing a leak where every non-PDF
+      upload used to land unconditionally in the shared/corpus bucket
+      regardless of who uploaded it. Neither layer has a declared
+      corpus-write scope (ADR-062 §4's frozenset is exactly
+      decisions/skills/semantic), so ``?promote=corpus`` is rejected
+      with 400 rather than silently accepted or silently ignored.
 
     Authorization (per-layer): the caller's JWT must carry
     ``memory:<layer>:write`` matching the ``layer`` query parameter
@@ -418,47 +610,44 @@ async def upload_memory_file(
         return body
 
     # ── Legacy synchronous path (markdown, etc.) ────────────────
-    # ADR-006 — effective bucket switches between MinIO (default) and
-    # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
-    # variable name in settings is kept for backwards compatibility.
-    bucket = (
-        settings.aws_bucket
-        if settings.object_storage_backend == "aws"
-        else settings.minio_shared_bucket
-    )
-    key = f"{layer.value}/{target_filename}"
-
+    # ADR-062 Phase B (WU-B5): defaults to the caller's PRIVATE tier.
+    # See the docstring above + `_write_layer_private` for the leak this
+    # closes. ``?promote=corpus`` has no declared scope for these two
+    # layers, so it is rejected outright (fail-closed) rather than
+    # silently downgraded to private or silently ignored.
+    tier = _resolve_requested_tier(None, promote)
+    _reject_corpus_promotion_for(layer.value, tier)
     try:
-        minio_client.put_object(
-            bucket,
-            key,
-            io.BytesIO(content),
-            length=len(content),
-        )
-    except Exception as exc:
-        logger.error("MinIO upload failed: %s", exc)
+        text_content = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise HTTPException(
-            status_code=502, detail="Object storage write failed"
+            status_code=400,
+            detail="non-PDF /memory/upload content must be UTF-8 text",
         ) from exc
 
+    await _write_layer_private(layer, user, target_filename, text_content)
+
+    private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
+    key = f"{user.user_id}/{layer.value}/{target_filename}"
+
     logger.info(
-        "Uploaded %s (%d bytes) to s3://%s/%s",
+        "Uploaded %s (%d bytes) to s3://%s/%s (tier=private)",
         target_filename,
         len(content),
-        bucket,
+        private_bucket,
         key,
     )
 
-    # Backlog #15, R3: /memory/upload writes S3 directly, so it must invalidate
-    # the shared listing cache or the new object stays invisible to the list
-    # (fleet-wide, since the cache is shared) until the TTL expires.
-    _invalidate_layer_list_cache(layer.value)
-
     return {
         "status": "uploaded",
-        "bucket": bucket,
+        "bucket": private_bucket,
         "key": key,
         "size_bytes": len(content),
+        "tier": "private",
     }
 
 
@@ -910,6 +1099,14 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
 @router.post("/episodic")
 async def create_episodic(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Episodic has no "
+            "corpus-write scope declared (ADR-062 §4) — any corpus request "
+            "here returns 400, not a partial/soft acceptance."
+        ),
+    ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
@@ -917,6 +1114,13 @@ async def create_episodic(
 
     Idempotent on the manifest: re-creating a soft-deleted item revives
     it (clearing ``deleted_at_ms``) and bumps ``modified_at_ms``.
+
+    ADR-062 Phase B (WU-B5): every write lands in the caller's PRIVATE
+    tier (``tier="private"``, owner=caller) — ``service.write`` already
+    only ever targets the private bucket (WU-B2); this just stamps the
+    manifest row to match. Episodic has no corpus-write scope in the
+    ADR-062 §4 catalogue, so a ``tier=corpus``/``?promote=corpus``
+    request is rejected (400) rather than silently downgraded.
     """
     filename = payload.get("filename")
     content = payload.get("content")
@@ -926,6 +1130,8 @@ async def create_episodic(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "episodic")
+    tier = _resolve_requested_tier(payload, promote)
+    _reject_corpus_promotion_for("episodic", tier)
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
@@ -941,6 +1147,7 @@ async def create_episodic(
         title=title,
         size_bytes=len(content.encode("utf-8")),
         user_id=user.user_id,
+        tier=tier,
     )
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed: see services/memory_audit.py module docstring).
@@ -1037,12 +1244,23 @@ async def _merge_layer_items_with_s3(
     resurrect on every list as "discovered" because the S3 object
     is still there — we'd be papering over the operator's delete
     intent.
+
+    ADR-062 Phase B (WU-B4): ``visible_entries`` is already
+    owner-or-corpus scoped by the caller (``list_episodic``/
+    ``list_procedural`` pass ``caller=user`` to ``list_for_layer``).
+    ``all_known`` (used only to build ``known_keys`` for the dedup
+    check below) is scoped the same way — a key only visible via
+    another caller's private manifest row is treated as "not yet
+    known" here, but the discovery loop's own per-user
+    ``service.load(user)`` call (already private∪corpus-scoped since
+    WU-B2) never surfaces that other caller's content either, so no
+    leak results: the key just correctly doesn't appear at all.
     """
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
-        layer, include_deleted=True
+        layer, include_deleted=True, caller=user
     )
     known_keys = {e.key for e in all_known}
 
@@ -1089,6 +1307,10 @@ async def _merge_layer_items_with_s3(
                 "deleted_at_ms": None,
                 "deleted_by_user_id": None,
                 "discovered": True,
+                # ADR-062 Phase B (WU-B4) — surface tier on discovered
+                # rows too; `service.load(user)` (WU-B2) already stamps
+                # `metadata["tier"]` on every returned Document.
+                "tier": doc.metadata.get("tier", "corpus"),
             }
         )
     return items
@@ -1123,10 +1345,19 @@ async def list_episodic(
     ``include_deleted=true`` returns soft-deleted manifest rows; it has no
     effect on discovered entries (they have no soft-delete state).
     ``sort``/``order``/``limit``/``offset`` page the merged set (backlog #15,
-    R5); ``total`` is the full pre-limit count."""
+    R5); ``total`` is the full pre-limit count.
+
+    ADR-062 Phase B (WU-B4): manifest-tracked rows are scoped to the
+    caller's own private tier ∪ corpus (``list_for_layer(caller=user)``)
+    — a non-admin caller never sees another user's private manifest
+    row. No corpus-read scope gate applies to this layer (episodic has
+    no declared ``memory:corpus:episodic:read`` — the ADR-062 §4
+    frozenset covers only decisions/skills/semantic); corpus content
+    stays visible to any ``memory:episodic:read`` holder, same as
+    before this PR."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "episodic", include_deleted=include_deleted
+        "episodic", include_deleted=include_deleted, caller=user
     )
     items = await _merge_layer_items_with_s3("episodic", entries, user)
     page, total = _sort_and_paginate(
@@ -1146,7 +1377,13 @@ async def read_episodic(
     *,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
-    """Read ADR content + manifest metadata."""
+    """Read ADR content + manifest metadata.
+
+    ADR-062 Phase B (WU-B4): the content itself was already resolved
+    private-first-then-corpus by ``service.read`` (WU-B2), so a 404
+    here means genuinely missing (not a cross-user disclosure). The
+    manifest metadata block is additionally scoped by
+    ``_manifest_visible`` — see its docstring for why."""
     _validate_filename_or_400(filename, "episodic")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
@@ -1154,6 +1391,8 @@ async def read_episodic(
     if doc is None:
         raise HTTPException(status_code=404, detail="ADR not found")
     entry: ManifestEntry | None = await manifest.get("episodic", filename)
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="episodic", key=filename
     )
@@ -1262,10 +1501,22 @@ async def delete_episodic(
 @router.post("/procedural")
 async def create_procedural(
     payload: dict[str, Any] = Body(..., description="{filename, content, title?}"),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to request a corpus-tier write. Procedural has "
+            "no corpus-write scope declared (ADR-062 §4) — any corpus "
+            "request here returns 400."
+        ),
+    ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
-    """Create a SKILL document. Body shape mirrors POST /memory/episodic."""
+    """Create a SKILL document. Body shape mirrors POST /memory/episodic.
+
+    ADR-062 Phase B (WU-B5): default write is PRIVATE-tier, owner=caller;
+    see ``create_episodic``'s docstring for the corpus-promotion rejection
+    rationale (identical for procedural)."""
     filename = payload.get("filename")
     content = payload.get("content")
     if not isinstance(filename, str) or not isinstance(content, str):
@@ -1274,6 +1525,8 @@ async def create_procedural(
             detail="filename and content are required string fields",
         )
     _validate_filename_or_400(filename, "procedural")
+    tier = _resolve_requested_tier(payload, promote)
+    _reject_corpus_promotion_for("procedural", tier)
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
@@ -1289,6 +1542,7 @@ async def create_procedural(
         title=title,
         size_bytes=len(content.encode("utf-8")),
         user_id=user.user_id,
+        tier=tier,
     )
     await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
@@ -1318,10 +1572,13 @@ async def list_procedural(
 ) -> dict[str, Any]:
     """List SKILLs. Same merge-with-S3 + sort/paginate semantics as
     `/memory/episodic` so all ``.md`` items appear alongside
-    operator-created ones (backlog #15)."""
+    operator-created ones (backlog #15).
+
+    ADR-062 Phase B (WU-B4): same owner-or-corpus manifest scoping as
+    ``list_episodic`` — see its docstring."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "procedural", include_deleted=include_deleted
+        "procedural", include_deleted=include_deleted, caller=user
     )
     items = await _merge_layer_items_with_s3("procedural", entries, user)
     page, total = _sort_and_paginate(
@@ -1339,6 +1596,8 @@ async def read_procedural(
     *,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
+    """ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
+    ``read_episodic`` — see its docstring."""
     _validate_filename_or_400(filename, "procedural")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
@@ -1346,6 +1605,8 @@ async def read_procedural(
     if doc is None:
         raise HTTPException(status_code=404, detail="SKILL not found")
     entry: ManifestEntry | None = await manifest.get("procedural", filename)
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="procedural", key=filename
     )
@@ -1450,13 +1711,32 @@ def _semantic_key(collection: str, document_id: str) -> str:
 @router.post("/semantic")
 async def create_semantic(
     payload: dict[str, Any] = Body(
-        ..., description="{collection, document_id, text, metadata?, title?}"
+        ...,
+        description="{collection, document_id, text, metadata?, title?, tier?}",
+    ),
+    promote: str | None = Query(
+        None,
+        description=(
+            "Set to 'corpus' to write into the shared corpus collection "
+            "instead of the caller's private tier. Requires "
+            "memory:corpus:<collection>:write (or audittrace:admin)."
+        ),
     ),
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
     """Upsert a semantic-layer document. The collection's embedding
-    function (configured at chart install time) handles vectorisation."""
+    function (configured at chart install time) handles vectorisation.
+
+    ADR-062 Phase B (WU-B5): default write lands in the caller's PRIVATE
+    tier (``tier="private"``, owner=caller — ``ChromaSemanticService.
+    upsert``'s own default). An explicit ``"tier": "corpus"`` body field
+    or ``?promote=corpus`` query param routes the write to the shared
+    corpus collection instead, but ONLY if the caller holds
+    ``memory:corpus:<collection>:write`` (or ``audittrace:admin`` /
+    admin) — this is the scope gate WU-B3 wired the write TARGET for but
+    deliberately left unenforced (see ``ChromaSemanticService.upsert``'s
+    docstring)."""
     collection = payload.get("collection")
     document_id = payload.get("document_id")
     text = payload.get("text")
@@ -1469,12 +1749,15 @@ async def create_semantic(
             status_code=400,
             detail="collection, document_id and text are required strings",
         )
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
+    tier = _resolve_requested_tier(payload, promote)
+    if tier == "corpus":
+        _require_corpus_scope(user, collection, "write")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     try:
-        await service.upsert(user, collection, document_id, text, metadata)
+        await service.upsert(user, collection, document_id, text, metadata, tier=tier)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     entry: ManifestEntry = await manifest.record_create(
@@ -1483,6 +1766,7 @@ async def create_semantic(
         title=title,
         size_bytes=len(text.encode("utf-8")),
         user_id=user.user_id,
+        tier=tier,
     )
     await _emit_write_audit(
         user=user,
@@ -1517,16 +1801,23 @@ async def _merge_semantic_with_chroma(
     the row's `metadata["user_id"]` matches the caller — the same
     predicate as `ChromaSemanticService._tier_authorized` (deliberately
     not imported here: this function reads raw ChromaDB responses, not
-    through the service). Manifest-TRACKED rows (`visible_entries`) are
-    NOT re-filtered here — the manifest's own owner/tier predicate is
-    WU-B4 (deferred); this PR closes only the raw-Chroma enumeration
-    hole.
+    through the service).
+
+    ADR-062 Phase B (WU-B4): ``visible_entries`` is now ALSO scoped by
+    the caller — ``list_semantic`` passes ``caller=user`` into
+    ``list_for_layer``, closing the gap this docstring used to flag as
+    deferred. ``all_known`` (dedup lookup only) is scoped the same way;
+    see ``_merge_layer_items_with_s3``'s docstring for why that's safe
+    (the discovery loop below has its own independent owner-or-corpus
+    check, so a key hidden from ``known_keys`` by the caller filter
+    still can't leak through as a "discovered" row for someone else's
+    private vector).
     """
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
     manifest = get_memory_manifest_service()
     all_known: list[ManifestEntry] = await manifest.list_for_layer(
-        "semantic", include_deleted=True
+        "semantic", include_deleted=True, caller=user
     )
     known_keys = {e.key for e in all_known}
 
@@ -1595,9 +1886,40 @@ async def _merge_semantic_with_chroma(
                     "deleted_at_ms": None,
                     "deleted_by_user_id": None,
                     "discovered": True,
+                    # ADR-062 Phase B (WU-B4) — surface tier; D3's corpus
+                    # read-scope gate is applied by the caller
+                    # (`list_semantic`) over the full merged item list.
+                    "tier": meta.get("tier", "corpus"),
                 }
             )
     return items
+
+
+def _filter_corpus_read_gate(
+    items: list[dict[str, Any]], user: UserContext
+) -> list[dict[str, Any]]:
+    """ADR-062 Phase B (WU-B4, D3) — drop corpus-tier semantic items the
+    caller isn't cleared to see through the BACKOFFICE list surface.
+
+    D3: "reading corpus content through /memory/{layer} requires the
+    granular memory:corpus:<collection>:read". Applied here (not inside
+    ``_merge_semantic_with_chroma``) so it uniformly covers BOTH
+    manifest-tracked and discovered rows in one pass, keyed off each
+    item's already-stamped ``tier``. Corpus recall via the LLM tool loop
+    (``recall_semantic``) is NOT affected — that path stays
+    deliberately unfiltered per D1; this gate is specific to the
+    ``/memory/semantic`` REST surface (the operator/curator-tier
+    backoffice), matching "Phase-A operator-tier corpus scoping"."""
+    visible = []
+    for item in items:
+        if item.get("tier") != "corpus":
+            visible.append(item)
+            continue
+        key = item.get("key") or ""
+        collection = key.split("/", 1)[0] if "/" in key else key
+        if _has_corpus_scope(user, collection, "read"):
+            visible.append(item)
+    return visible
 
 
 # Cap per-collection discovery scan so the list endpoint stays snappy
@@ -1642,19 +1964,26 @@ async def list_semantic(
     read).
 
     ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
-    the manifest) are now filtered — non-admin sees only its own
+    the manifest) are filtered — non-admin sees only its own
     private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
-    §3 hole 2). Manifest-TRACKED rows (`entries` below) are still
-    unfiltered by owner/tier — that predicate is WU-B4 (deferred; needs
-    the manifest `tier` column)."""
+    §3 hole 2).
+
+    ADR-062 Phase B (WU-B4): manifest-TRACKED rows (`entries` below) are
+    now ALSO owner-or-corpus scoped (`list_for_layer(caller=user)`) —
+    closes the gap the previous docstring flagged as deferred. On top
+    of ownership scoping, D3's operator/curator-tier gate additionally
+    drops any CORPUS-tier item (tracked or discovered) the caller
+    lacks ``memory:corpus:<collection>:read`` for
+    (`_filter_corpus_read_gate`)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
-        "semantic", include_deleted=include_deleted
+        "semantic", include_deleted=include_deleted, caller=user
     )
     if collection is not None:
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
     items = await _merge_semantic_with_chroma(entries, collection, user)
+    items = _filter_corpus_read_gate(items, user)
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
@@ -1677,14 +2006,25 @@ async def read_semantic(
     *,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
+    """ADR-062 Phase B: ``service.get_document`` already applies the
+    owner-or-corpus predicate (WU-B3 §3 hole 1) — a cross-user private
+    doc is a 404, same as a genuine miss (no existence disclosure). On
+    top of that, D3 (WU-B4) requires ``memory:corpus:<collection>:read``
+    to read a CORPUS-tier doc through this backoffice route — a 403 (not
+    404: corpus existence isn't user-specific, so there's nothing to
+    hide by returning a miss instead)."""
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     doc = await service.get_document(user, collection, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="semantic doc not found")
+    if doc.metadata.get("tier") == "corpus":
+        _require_corpus_scope(user, collection, "read")
     entry: ManifestEntry | None = await manifest.get(
         "semantic", _semantic_key(collection, document_id)
     )
+    if entry is not None and not _manifest_visible(entry, user):
+        entry = None
     schedule_read_audit(
         background_tasks,
         user=user,
@@ -1708,10 +2048,20 @@ async def update_semantic(
     _scope: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:write"]),
     user: UserContext = Depends(require_user),
 ) -> dict[str, Any]:
+    """ADR-062 Phase B (WU-B5 review fix, 2026-08-04): ``metadata`` is
+    sanitized the same way as ``create_semantic`` — a caller-supplied
+    ``tier``/``user_id`` in the body's ``metadata`` field is stripped
+    before it reaches the service, and ``ChromaSemanticService.upsert``
+    additionally stamps both unconditionally regardless. This route
+    does not accept a promote request at all (no ``tier``/``?promote=``
+    parsing) — every update stays private-tier, matching the pre-review
+    WU-B5 scope decision (updates were never in the promote-gate call
+    site list); the fix here closes the metadata-forgery bypass, not a
+    missing feature."""
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text is a required string field")
-    metadata = payload.get("metadata")
+    metadata = _sanitize_semantic_metadata(payload.get("metadata"))
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()

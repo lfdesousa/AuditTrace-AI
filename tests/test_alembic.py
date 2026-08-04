@@ -218,3 +218,66 @@ class TestForwardMigration004KeycloakDelegated:
             assert "users" in inspector.get_table_names()
             assert "user_roles" in inspector.get_table_names()
             assert "pat_tokens" in inspector.get_table_names()
+
+
+class TestMigration018AddTierToMemoryItems:
+    """ADR-062 Phase B (WU-B4) — migration 018 adds ``memory_items.tier``.
+
+    D2 (ratified 2026-08-04): existing rows (and any INSERT that doesn't
+    set the column explicitly) read ``tier="corpus"`` — today's shared
+    knowledge base stays visible to everyone unchanged, zero backfill
+    required for this migration alone."""
+
+    def test_upgrade_adds_tier_column_not_null(self, alembic_cfg, engine):
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+            inspector = inspect(conn)
+            columns = {c["name"]: c for c in inspector.get_columns("memory_items")}
+            assert "tier" in columns
+            assert columns["tier"]["nullable"] is False
+
+    def test_pre_migration_018_row_reads_tier_corpus(self, alembic_cfg, engine):
+        """D2's falsifiable core claim: a row inserted WITHOUT ``tier``
+        (simulating every pre-migration-018 row, and any INSERT path
+        this PR didn't touch) reads back ``tier="corpus"`` via the
+        column's ``server_default`` — never NULL, never silently
+        ``"private"``."""
+        import sqlalchemy as sa
+
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+
+            memory_items = sa.Table("memory_items", sa.MetaData(), autoload_with=conn)
+            conn.execute(
+                memory_items.insert().values(
+                    id="legacy-row-1",
+                    layer="episodic",
+                    key="ADR-legacy.md",
+                    created_at_ms=1,
+                    modified_at_ms=1,
+                    created_by_user_id="legacy-user",
+                    modified_by_user_id="legacy-user",
+                    # tier intentionally omitted — server_default must fire.
+                )
+            )
+            row = conn.execute(
+                sa.select(memory_items.c.tier).where(
+                    memory_items.c.id == "legacy-row-1"
+                )
+            ).scalar_one()
+            assert row == "corpus"
+
+    def test_downgrade_removes_tier_column(self, alembic_cfg, engine):
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+            inspector = inspect(conn)
+            assert "tier" in {c["name"] for c in inspector.get_columns("memory_items")}
+
+            command.downgrade(alembic_cfg, "d8a0c2e4f637")  # migration 017 (pre-018)
+            inspector = inspect(conn)
+            assert "tier" not in {
+                c["name"] for c in inspector.get_columns("memory_items")
+            }
