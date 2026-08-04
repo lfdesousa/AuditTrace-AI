@@ -5528,14 +5528,16 @@ class TestMergeSemanticWithChroma:
 
     @pytest.mark.asyncio
     async def test_document_already_tracked_is_not_listed_twice(
-        self, monkeypatch
+        self, monkeypatch, user_context
     ) -> None:
         """A doc present in BOTH manifest and ChromaDB must appear once.
 
         Without the `key in known_keys` guard the same document is emitted
         twice — once as a tracked row and once as a discovered one — and an
         auditor counting the semantic layer gets an inflated number that no
-        query can reconcile.
+        query can reconcile. Called as admin (``user_context`` sentinel) —
+        this test is about dedup, not the ADR-062 Phase B ownership
+        predicate (covered separately below).
         """
         from audittrace.routes import memory as m
 
@@ -5551,16 +5553,22 @@ class TestMergeSemanticWithChroma:
         monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
         monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
 
-        items = await m._merge_semantic_with_chroma([tracked], collection=None)
+        items = await m._merge_semantic_with_chroma(
+            [tracked], collection=None, user=user_context
+        )
         keys = [i["key"] for i in items]
         assert keys.count("audittrace_v2/doc-1") == 1, f"duplicated: {keys}"
 
     @pytest.mark.asyncio
-    async def test_untracked_document_is_discovered(self, monkeypatch) -> None:
+    async def test_untracked_document_is_discovered(
+        self, monkeypatch, user_context
+    ) -> None:
         """The complementary arm: indexed-but-untracked must still surface.
 
         These are documents in ChromaDB with no manifest row. Dropping them
-        would hide real indexed content from the audit listing.
+        would hide real indexed content from the audit listing. Called as
+        admin — see the ownership-predicate tests below for the Phase B
+        filter itself.
         """
         from audittrace.routes import memory as m
 
@@ -5574,13 +5582,17 @@ class TestMergeSemanticWithChroma:
         monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
         monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
 
-        items = await m._merge_semantic_with_chroma([], collection=None)
+        items = await m._merge_semantic_with_chroma(
+            [], collection=None, user=user_context
+        )
         assert [i["key"] for i in items] == ["audittrace_v2/ghost"]
         assert items[0]["title"] == "T"
         assert items[0]["id"] is None, "discovered rows carry no manifest id"
 
     @pytest.mark.asyncio
-    async def test_named_collection_skips_discovery_listing(self, monkeypatch) -> None:
+    async def test_named_collection_skips_discovery_listing(
+        self, monkeypatch, user_context
+    ) -> None:
         """?collection= must target ONE physical collection, not scan all.
 
         The unfiltered path caps at 5 collections; if the filter fell through
@@ -5601,11 +5613,117 @@ class TestMergeSemanticWithChroma:
         monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
         monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
 
-        await m._merge_semantic_with_chroma([], collection="audittrace")
+        await m._merge_semantic_with_chroma(
+            [], collection="audittrace", user=user_context
+        )
         assert chroma.opened == ["audittrace_v2"], (
             "named collection must resolve to its _v2 form and be the only "
             f"one opened; opened={chroma.opened}"
         )
+
+    # ── ADR-062 Phase B (WU-B3, §3 hole 2) — ownership predicate ─────────
+    # The raw `col.get()` discovery scan used to enumerate every row with
+    # no `where` at all. These tests are the FALSIFIABLE gate: neuter the
+    # `if not (user.is_admin or ...): continue` guard in
+    # `_merge_semantic_with_chroma` (e.g. hardcode it to `False`) and
+    # `test_non_admin_discovery_excludes_other_users_private_row` goes RED
+    # (the other user's row leaks through); restore it and it goes green
+    # again. `test_non_admin_discovery_includes_corpus_row` and
+    # `test_admin_discovery_sees_everything` pin the two non-leak arms so
+    # a reviewer can't "fix" the leak by simply hiding everything.
+
+    @pytest.mark.asyncio
+    async def test_non_admin_discovery_excludes_other_users_private_row(
+        self, monkeypatch, user_context
+    ) -> None:
+        from dataclasses import replace
+
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return []
+
+        chroma = self._Chroma(
+            {
+                "ids": ["mine", "theirs"],
+                "documents": ["my body", "their body"],
+                "metadatas": [
+                    {"user_id": "user-alice", "tier": "private"},
+                    {"user_id": "user-bob", "tier": "private"},
+                ],
+            }
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        items = await m._merge_semantic_with_chroma([], collection=None, user=alice)
+        keys = [i["key"] for i in items]
+        assert any("mine" in k for k in keys)
+        assert not any("theirs" in k for k in keys), f"leaked bob's row: {keys}"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_discovery_includes_corpus_row(
+        self, monkeypatch, user_context
+    ) -> None:
+        """A corpus-tier row (someone else's `user_id`, `tier="corpus"`)
+        IS visible to a non-admin caller — the deliberate shared-read half
+        of D1, so the fix above isn't just "hide everything not mine"."""
+        from dataclasses import replace
+
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return []
+
+        chroma = self._Chroma(
+            {
+                "ids": ["shared-adr"],
+                "documents": ["corpus body"],
+                "metadatas": [{"user_id": "user-operator", "tier": "corpus"}],
+            }
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        items = await m._merge_semantic_with_chroma([], collection=None, user=alice)
+        keys = [i["key"] for i in items]
+        assert any("shared-adr" in k for k in keys), f"corpus row hidden: {keys}"
+
+    @pytest.mark.asyncio
+    async def test_admin_discovery_sees_everything(
+        self, monkeypatch, user_context
+    ) -> None:
+        """Admin (the sentinel bypass) is unaffected by the Phase B
+        predicate — sees both users' rows, no regression to Phase A."""
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False):
+                return []
+
+        chroma = self._Chroma(
+            {
+                "ids": ["mine", "theirs"],
+                "documents": ["my body", "their body"],
+                "metadatas": [
+                    {"user_id": "user-alice", "tier": "private"},
+                    {"user_id": "user-bob", "tier": "private"},
+                ],
+            }
+        )
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        items = await m._merge_semantic_with_chroma(
+            [], collection=None, user=user_context
+        )
+        keys = [i["key"] for i in items]
+        assert any("mine" in k for k in keys)
+        assert any("theirs" in k for k in keys)
 
 
 class TestMemoryAccessAuditEvents:

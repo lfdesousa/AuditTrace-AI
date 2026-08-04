@@ -227,13 +227,25 @@ class SemanticService(ABC):
         document_id: str,
         text: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        tier: str = "private",
     ) -> None:
         """Insert or replace a single document in ``collection`` keyed by
         ``document_id``. The collection's embedding function (configured
         when the collection was created) handles vectorisation. The
         item's ``user_id`` field in ``metadata`` is set from
         ``user_context`` if not already provided so the existing per-user
-        ``where`` filter in ``search()`` continues to apply."""
+        ``where`` filter in ``search()`` continues to apply.
+
+        ADR-062 Phase B (D1): ``tier`` selects the physical write target —
+        ``"private"`` (default) writes to the caller's per-user collection
+        stamped ``tier="private"``; ``"corpus"`` writes to the shared
+        collection stamped ``tier="corpus"`` (read unfiltered by every
+        caller). The corpus-write SCOPE GATE
+        (``memory:corpus:<collection>:write``) is enforced at the route
+        layer in WU-B5 — this parameter only wires the write TARGET so
+        WU-B5 has something to gate; it does not itself authorize a
+        promote."""
 
     @abstractmethod
     async def delete_document(
@@ -244,7 +256,9 @@ class SemanticService(ABC):
     ) -> bool:
         """Hard-delete a document from a ChromaDB collection. Returns
         ``True`` if the document existed and was removed, ``False`` if
-        it didn't exist."""
+        it didn't exist OR the caller is not authorized to delete it
+        (ADR-062 Phase B §3 — no existence disclosure, see
+        ``ChromaSemanticService.delete_document``)."""
 
     @abstractmethod
     async def get_document(
@@ -254,7 +268,10 @@ class SemanticService(ABC):
         document_id: str,
     ) -> Document | None:
         """Fetch a single document by ID. Returns ``None`` if the
-        document doesn't exist in the collection."""
+        document doesn't exist in the collection OR the caller is not
+        authorized to read it (ADR-062 Phase B §3 — a cross-user read of
+        a private-tier document returns the SAME ``None`` as a genuine
+        miss; no existence disclosure)."""
 
 
 class ChromaSemanticService(SemanticService):
@@ -300,6 +317,85 @@ class ChromaSemanticService(SemanticService):
         and re-indexing is incremental (ADR-047)."""
         return f"{name}_v2"
 
+    @staticmethod
+    def _physical_corpus(name: str) -> str:
+        """Physical ChromaDB collection name for the CORPUS tier of
+        ``name`` (ADR-062 Phase B, D1). A genuinely SEPARATE collection —
+        never merged into ``_physical`` via ``$or``/``$in`` — because the
+        in-repo mock only supports flat-equality ``where``
+        (``db/factory.py:183-269``); two independent flat-equality queries
+        (one ``where``-scoped, one unfiltered) are mock-safe where a
+        single ``$or`` query would not be. Separate collections also give
+        PHYSICAL isolation: a bug in the ``where`` filter can never leak a
+        private row through a corpus read, because the private row simply
+        does not live in this collection. Keeps the same ``_v2`` (nomic)
+        generation suffix as ``_physical`` so a corpus write never
+        collides with a legacy 384-dim collection."""
+        return f"{name}_corpus_v2"
+
+    @staticmethod
+    def _tier_authorized(meta: dict[str, Any], user_context: UserContext) -> bool:
+        """ADR-062 Phase B §3 ownership predicate — shared by
+        ``get_document`` and ``delete_document`` (the two formerly-
+        unfiltered reads/writes-by-id). A non-admin caller is authorized
+        for a document iff they own it (``metadata["user_id"] ==
+        caller``) OR the document is corpus-tier
+        (``metadata["tier"] == "corpus"``, deliberately unfiltered — D1).
+        Admins are always authorized, mirroring ``search()``/
+        ``search_page()``, which never filter for admin callers."""
+        if user_context.is_admin:
+            return True
+        return (
+            meta.get("user_id") == user_context.user_id or meta.get("tier") == "corpus"
+        )
+
+    async def _query_tier(
+        self,
+        physical_name: str,
+        query_embedding: list[float],
+        n_results: int,
+        where: dict[str, Any] | None,
+        col_name: str,
+        tier: str,
+    ) -> list[Document]:
+        """Query ONE physical ChromaDB collection — either the private or
+        the corpus physical name for ``col_name`` — and tag every result
+        with ``metadata["tier"]`` (ADR-062 Phase B, D1). Isolated
+        exception handling per physical collection: a corpus-collection
+        outage must not take the private-tier results down with it, and
+        vice versa (mirrors the pre-Phase-B per-collection isolation)."""
+        try:
+            collection = await self._client.get_or_create_collection(
+                name=physical_name, embedding_function=None
+            )
+            count = await collection.count()
+            if count == 0:
+                return []
+            query_kwargs: dict[str, Any] = {
+                "query_embeddings": [query_embedding],
+                "n_results": min(n_results, count),
+                # ``distances`` rides along so each match records HOW
+                # strongly it matched (#372 D2). ``ids`` is always returned
+                # by ChromaDB and IS the stable ``document_id`` supplied at
+                # upsert.
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where is not None:
+                query_kwargs["where"] = where
+            results = await collection.query(**query_kwargs)
+        except Exception as e:
+            logger.warning(
+                "Semantic search failed on physical collection %s (tier=%s): %s",
+                physical_name,
+                tier,
+                e,
+            )
+            return []
+        docs = self._shape_query_results(results, col_name)
+        for doc in docs:
+            doc.metadata["tier"] = tier
+        return docs
+
     @log_call(logger=logger)
     async def search(
         self,
@@ -310,11 +406,20 @@ class ChromaSemanticService(SemanticService):
     ) -> list[Document]:
         """Search across ChromaDB collections. No arbitrary caps.
 
-        Non-admin callers get a ``where={"user_id": ...}`` filter so they
-        only see rows they own. Admins (including the bypass-mode sentinel)
-        see every row in the collection — no filter applied. This is a
-        Phase 4 preview; the authoritative ChromaDB scoped wrapper lands
-        with the RLS + cross-user isolation test work.
+        ADR-062 Phase B (D1): each requested (logical) collection resolves
+        to TWO physical ChromaDB collections — a per-user PRIVATE one
+        (``_physical``, ``where={"user_id": ...}`` for non-admin, #383)
+        and a shared CORPUS one (``_physical_corpus``, always unfiltered).
+        Both are queried and the results merged, each tagged
+        ``metadata["tier"]`` (``"private"``/``"corpus"``). Two separate
+        flat-equality queries — never ``$or``/``$in`` (the in-repo mock
+        only supports flat-equality ``where``, ``db/factory.py``).
+
+        Non-admin callers get the private-tier ``where={"user_id": ...}``
+        filter (#383, unchanged since Phase 2/4). Admins (including the
+        bypass-mode sentinel) see every private-tier row too — this
+        predates Phase B. The corpus-tier query has NO filter for anyone —
+        that is the deliberate shared-read design (D1), not a gap.
         """
         target_collections = collections or self._default_collections
         all_docs: list[Document] = []
@@ -323,69 +428,37 @@ class ChromaSemanticService(SemanticService):
         if not user_context.is_admin:
             where = {"user_id": user_context.user_id}
 
+        # Vectorise the query once on the nomic server (shared across both
+        # tiers and every target collection); an embed failure degrades the
+        # whole call to "no hits" rather than raising, same posture as a
+        # per-collection Chroma failure.
+        try:
+            query_embedding = await self._embed_one(query)
+        except Exception as e:
+            logger.warning("Semantic search embed failed: %s", e)
+            return []
+
         for col_name in target_collections:
-            try:
-                collection = await self._client.get_or_create_collection(
-                    name=self._physical(col_name), embedding_function=None
+            all_docs.extend(
+                await self._query_tier(
+                    self._physical(col_name),
+                    query_embedding,
+                    k,
+                    where,
+                    col_name,
+                    "private",
                 )
-                count = await collection.count()
-                if count == 0:
-                    continue
-                # Vectorise the query on the nomic server; an embed failure
-                # raises EmbeddingServerError, which the surrounding except
-                # degrades to "no hits for this collection" (same posture as
-                # a Chroma failure).
-                query_kwargs: dict[str, Any] = {
-                    "query_embeddings": [await self._embed_one(query)],
-                    "n_results": min(k, count),
-                    # ``distances`` rides along so each match records HOW
-                    # strongly it matched (#372 D2). ``ids`` is always returned
-                    # by ChromaDB and IS the stable ``document_id`` supplied at
-                    # upsert — we now thread it through instead of using it only
-                    # as a loop counter, so a ``tool_calls`` row names the exact
-                    # passage that shaped an answer, not just its text (#372 D1).
-                    "include": ["documents", "metadatas", "distances"],
-                }
-                if where is not None:
-                    query_kwargs["where"] = where
-                results = await collection.query(**query_kwargs)
-                ids_row = results["ids"][0]
-                # ``distances`` may be absent (older client / include dropped)
-                # or None — guard so a distance-less response never raises and
-                # ``distance`` degrades to ``None`` for that match.
-                distances = results.get("distances")
-                dist_row = distances[0] if distances else None
-                for i in range(len(ids_row)):
-                    doc_content = results["documents"][0][i]
-                    doc_metadata = (
-                        results["metadatas"][0][i] if results.get("metadatas") else {}
-                    )
-                    distance = (
-                        dist_row[i]
-                        if dist_row is not None and i < len(dist_row)
-                        else None
-                    )
-                    all_docs.append(
-                        Document(
-                            page_content=doc_content,
-                            metadata={
-                                **doc_metadata,
-                                "collection": col_name,
-                                # #372 D1 — the ChromaDB id is the durable
-                                # document_id from upsert; recording it lets a
-                                # reconstruction query fetch this exact passage.
-                                "chunk_id": ids_row[i],
-                                # #372 D2 — the RAW ChromaDB distance (lower =
-                                # closer). Recorded honestly named, not converted
-                                # to a similarity score.
-                                "distance": distance,
-                            },
-                        )
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Semantic search failed on collection %s: %s", col_name, e
+            )
+            all_docs.extend(
+                await self._query_tier(
+                    self._physical_corpus(col_name),
+                    query_embedding,
+                    k,
+                    None,
+                    col_name,
+                    "corpus",
                 )
+            )
 
         return await self._filter_soft_deleted(all_docs)
 
@@ -487,6 +560,41 @@ class ChromaSemanticService(SemanticService):
             )
         return docs
 
+    async def _get_tier(
+        self,
+        physical_name: str,
+        where: dict[str, Any] | None,
+        col_name: str,
+        tier: str,
+    ) -> list[Document]:
+        """Non-ranked ``.get()`` fetch of ONE physical collection (private
+        OR corpus) for the enumeration sort paths (recency/id), tagged
+        with ``metadata["tier"]`` (ADR-062 Phase B, D1)."""
+        try:
+            collection = await self._client.get_or_create_collection(
+                name=physical_name, embedding_function=None
+            )
+            get_kwargs: dict[str, Any] = {
+                "limit": MAX_RECALL_WINDOW,
+                "include": ["documents", "metadatas"],
+            }
+            if where is not None:
+                get_kwargs["where"] = where
+            results = await collection.get(**get_kwargs)
+        except Exception as e:
+            logger.warning(
+                "search_page enumeration failed on physical collection %s "
+                "(tier=%s): %s",
+                physical_name,
+                tier,
+                e,
+            )
+            return []
+        docs = self._shape_get_results(results, col_name)
+        for doc in docs:
+            doc.metadata["tier"] = tier
+        return docs
+
     @log_call(logger=logger)
     async def search_page(
         self,
@@ -526,7 +634,14 @@ class ChromaSemanticService(SemanticService):
           outrank it locally, meaning it ranks at position <= W within that
           collection's native (distance-ascending) order too. Fetching each
           collection's own top-W and merging is therefore guaranteed to
-          contain the true global top-W merged pool.
+          contain the true global top-W merged pool. ADR-062 Phase B (D1)
+          extends this WITHOUT changing the proof: each logical collection
+          now resolves to two PHYSICAL collections (private + corpus,
+          ``_physical``/``_physical_corpus``), each queried independently
+          at its own top-W — the proof only relies on "every physical
+          collection queried contributes its own top-W", which does not
+          care whether a physical collection is the private or the corpus
+          half of a logical name.
 
           ``total = len(merged pool)``: exact when a collection returned
           FEWER than requested (that collection is provably exhausted); an
@@ -554,10 +669,14 @@ class ChromaSemanticService(SemanticService):
           as the relevance path, just without ChromaDB doing the ranking.
 
         Non-admin callers get the same per-user ``where`` filter as
-        ``search()``. A call with no ``offset``/``sort``/``order`` returns
-        the same relevance top-k as today (R2 backward-compat): with
-        ``offset=0``, the probe window is ``min(k + 1, MAX_RECALL_WINDOW)``
-        and the returned page is still exactly the top ``k`` by distance.
+        ``search()``, applied ONLY to the private physical collection; the
+        corpus physical collection is always queried unfiltered and every
+        result — either tier — is tagged ``metadata["tier"]``
+        (ADR-062 Phase B, D1). A call with no ``offset``/``sort``/``order``
+        returns the same relevance top-k as today (R2 backward-compat):
+        with ``offset=0``, the probe window is
+        ``min(k + 1, MAX_RECALL_WINDOW)`` and the returned page is still
+        exactly the top ``k`` by distance.
         """
         if offset < 0:
             offset = 0
@@ -578,53 +697,48 @@ class ChromaSemanticService(SemanticService):
 
         if efficient:
             probe_window = min(offset + k + 1, MAX_RECALL_WINDOW)
-            query_embedding: list[float] | None = None
-            for col_name in target_collections:
-                try:
-                    collection = await self._client.get_or_create_collection(
-                        name=self._physical(col_name), embedding_function=None
+            # Vectorise once, shared across both tiers and every target
+            # collection — an embed failure degrades the whole call to an
+            # empty pool rather than raising (same posture as search()).
+            try:
+                query_embedding: list[float] | None = await self._embed_one(query)
+            except Exception as e:
+                logger.warning("search_page (relevance) embed failed: %s", e)
+                query_embedding = None
+            if query_embedding is not None:
+                for col_name in target_collections:
+                    pool.extend(
+                        await self._query_tier(
+                            self._physical(col_name),
+                            query_embedding,
+                            probe_window,
+                            where,
+                            col_name,
+                            "private",
+                        )
                     )
-                    count = await collection.count()
-                    if count == 0:
-                        continue
-                    if query_embedding is None:
-                        query_embedding = await self._embed_one(query)
-                    query_kwargs: dict[str, Any] = {
-                        "query_embeddings": [query_embedding],
-                        "n_results": min(probe_window, count),
-                        "include": ["documents", "metadatas", "distances"],
-                    }
-                    if where is not None:
-                        query_kwargs["where"] = where
-                    results = await collection.query(**query_kwargs)
-                    pool.extend(self._shape_query_results(results, col_name))
-                except Exception as e:
-                    logger.warning(
-                        "search_page (relevance) failed on collection %s: %s",
-                        col_name,
-                        e,
+                    pool.extend(
+                        await self._query_tier(
+                            self._physical_corpus(col_name),
+                            query_embedding,
+                            probe_window,
+                            None,
+                            col_name,
+                            "corpus",
+                        )
                     )
         else:
             for col_name in target_collections:
-                try:
-                    collection = await self._client.get_or_create_collection(
-                        name=self._physical(col_name), embedding_function=None
+                pool.extend(
+                    await self._get_tier(
+                        self._physical(col_name), where, col_name, "private"
                     )
-                    get_kwargs: dict[str, Any] = {
-                        "limit": MAX_RECALL_WINDOW,
-                        "include": ["documents", "metadatas"],
-                    }
-                    if where is not None:
-                        get_kwargs["where"] = where
-                    results = await collection.get(**get_kwargs)
-                    pool.extend(self._shape_get_results(results, col_name))
-                except Exception as e:
-                    logger.warning(
-                        "search_page (%s) failed on collection %s: %s",
-                        sort,
-                        col_name,
-                        e,
+                )
+                pool.extend(
+                    await self._get_tier(
+                        self._physical_corpus(col_name), None, col_name, "corpus"
                     )
+                )
 
         # ADR-062 §6 (WU-A5) — drop soft-deleted candidates before paging.
         # Filtering here (rather than post-page) means a soft-deleted item
@@ -671,14 +785,25 @@ class ChromaSemanticService(SemanticService):
         document_id: str,
         text: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        tier: str = "private",
     ) -> None:
         # Stamp user_id into the metadata so the per-user `where` filter
         # in `search()` keeps working for the new doc. Operator overrides
         # are honoured if the caller provided their own user_id.
         meta = dict(metadata or {})
         meta.setdefault("user_id", user_context.user_id)
+        if tier == "corpus":
+            # ADR-062 Phase B (D1): the corpus write TARGET. The
+            # promote SCOPE-GATE (memory:corpus:<collection>:write) is
+            # enforced by the route layer in WU-B5, not here.
+            physical_name = self._physical_corpus(collection)
+            meta.setdefault("tier", "corpus")
+        else:
+            physical_name = self._physical(collection)
+            meta.setdefault("tier", "private")
         col = await self._client.get_or_create_collection(
-            name=self._physical(collection), embedding_function=None
+            name=physical_name, embedding_function=None
         )
         # ChromaDB's `upsert` is exactly what we want — insert or replace.
         # The vector is computed on the nomic server and supplied explicitly;
@@ -690,36 +815,14 @@ class ChromaSemanticService(SemanticService):
             metadatas=[meta],
         )
 
-    @log_call(logger=logger)
-    async def delete_document(
-        self,
-        user_context: UserContext,
-        collection: str,
-        document_id: str,
-    ) -> bool:
-        del user_context  # operator-side write; not user-scoped
-        col = await self._client.get_or_create_collection(
-            name=self._physical(collection), embedding_function=None
-        )
-        # ChromaDB's `delete` is silently idempotent (deleting a non-
-        # existent ID does not raise). To return a faithful boolean we
-        # check existence first.
-        existing = await col.get(ids=[document_id], include=["documents"])
-        if not existing.get("ids"):
-            return False
-        await col.delete(ids=[document_id])
-        return True
-
-    @log_call(logger=logger)
-    async def get_document(
-        self,
-        user_context: UserContext,
-        collection: str,
-        document_id: str,
+    async def _get_from_physical(
+        self, physical_name: str, logical_collection: str, document_id: str
     ) -> Document | None:
-        del user_context  # operator-side read; admin scope gates the route
+        """Fetch a document by id from ONE physical ChromaDB collection,
+        with NO ownership check — the caller applies
+        ``_tier_authorized``."""
         col = await self._client.get_or_create_collection(
-            name=self._physical(collection), embedding_function=None
+            name=physical_name, embedding_function=None
         )
         result = await col.get(ids=[document_id], include=["documents", "metadatas"])
         if not result.get("ids"):
@@ -730,8 +833,80 @@ class ChromaSemanticService(SemanticService):
         meta = (result.get("metadatas") or [{}])[0] or {}
         return Document(
             page_content=documents[0],
-            metadata={**meta, "collection": collection},
+            metadata={**meta, "collection": logical_collection},
         )
+
+    @log_call(logger=logger)
+    async def delete_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> bool:
+        """Hard-delete a document by id.
+
+        ADR-062 Phase B (§3 hole 1) mirrors ``get_document``'s ownership
+        check — this method previously ``del user_context`` unconditionally.
+        Checks the private physical collection first, then the corpus one;
+        returns ``False`` (not a distinct "forbidden" signal) both when
+        the id genuinely doesn't exist AND when it exists but the caller
+        isn't authorized — the same no-existence-disclosure posture as
+        ``get_document``. The route layer additionally requires
+        ``audittrace:admin`` for ``?hard=true`` (``delete_semantic``), so
+        in practice only admins reach this today; the service-level check
+        is defense in depth for any future caller."""
+        for physical_name in (
+            self._physical(collection),
+            self._physical_corpus(collection),
+        ):
+            col = await self._client.get_or_create_collection(
+                name=physical_name, embedding_function=None
+            )
+            # ChromaDB's `delete` is silently idempotent (deleting a non-
+            # existent ID does not raise). To return a faithful boolean we
+            # check existence (and ownership) first.
+            existing = await col.get(
+                ids=[document_id], include=["documents", "metadatas"]
+            )
+            if not existing.get("ids"):
+                continue
+            meta = (existing.get("metadatas") or [{}])[0] or {}
+            if not self._tier_authorized(meta, user_context):
+                return False
+            await col.delete(ids=[document_id])
+            return True
+        return False
+
+    @log_call(logger=logger)
+    async def get_document(
+        self,
+        user_context: UserContext,
+        collection: str,
+        document_id: str,
+    ) -> Document | None:
+        """Fetch a single document by id.
+
+        ADR-062 Phase B (§3 hole 1) closes the formerly-unfiltered read:
+        before this change ANY caller with ``memory:semantic:read`` could
+        read ANY document by id regardless of ownership (``del
+        user_context`` at the top of this method). Now a document is
+        returned only if the caller is admin, the document is
+        corpus-tier, or the caller owns it (``_tier_authorized``). A
+        cross-user attempt returns ``None`` — the SAME signal as a
+        genuine miss, so the route layer's 404 never discloses that the
+        document exists under someone else's identity."""
+        doc = await self._get_from_physical(
+            self._physical(collection), collection, document_id
+        )
+        if doc is None:
+            doc = await self._get_from_physical(
+                self._physical_corpus(collection), collection, document_id
+            )
+        if doc is None:
+            return None
+        if not self._tier_authorized(doc.metadata, user_context):
+            return None
+        return doc
 
 
 class UserScopedSemanticService(SemanticService):
@@ -814,10 +989,12 @@ class UserScopedSemanticService(SemanticService):
         document_id: str,
         text: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        tier: str = "private",
     ) -> None:
         del user_context
         await self._inner.upsert(
-            self._bound_user, collection, document_id, text, metadata
+            self._bound_user, collection, document_id, text, metadata, tier=tier
         )
 
     @log_call(logger=logger)
@@ -896,11 +1073,19 @@ class MockSemanticService(SemanticService):
         document_id: str,
         text: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        tier: str = "private",
     ) -> None:
-        del user_context  # mock: no scoping
+        # mock: no scoping. This double deliberately does NOT enforce the
+        # ADR-062 Phase B ownership predicate — real isolation is proven
+        # against ChromaSemanticService (see its docstrings). `tier` is
+        # still recorded so route-layer code that reads it back (e.g. a
+        # future backoffice tier column) sees a consistent value.
+        del user_context
         meta = dict(metadata or {})
         meta.setdefault("collection", collection)
         meta.setdefault("document_id", document_id)
+        meta.setdefault("tier", tier)
         if collection not in self._docs:
             self._docs[collection] = []
         # Replace if same document_id, else append.

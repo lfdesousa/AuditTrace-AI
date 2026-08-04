@@ -241,8 +241,17 @@ class TestChromaSemanticServiceRecordsIdentity:
                 # NO "distances" key on purpose.
             }
         )
+        # ADR-062 Phase B: search() now also queries the corpus physical
+        # collection (`decisions_corpus_v2`) — give it a distinct, empty
+        # mock so this test's assertions stay about the PRIVATE tier only.
+        corpus_col = AsyncMock()
+        corpus_col.count = AsyncMock(return_value=0)
         client = MagicMock()
-        client.get_or_create_collection = AsyncMock(return_value=col)
+
+        async def _select(name: str, **_kw: object) -> AsyncMock:
+            return col if name == "decisions_v2" else corpus_col
+
+        client.get_or_create_collection = AsyncMock(side_effect=_select)
         service = ChromaSemanticService(
             client=client, default_collections=["decisions"]
         )
@@ -250,6 +259,7 @@ class TestChromaSemanticServiceRecordsIdentity:
         assert len(results) == 1
         assert results[0].metadata["chunk_id"] == "only-chunk"
         assert results[0].metadata["distance"] is None
+        assert results[0].metadata["tier"] == "private"
 
     async def test_search_still_passes_user_id_where_filter(self, user_context):
         """The per-user isolation filter is UNTOUCHED by the id/score change:
@@ -1043,8 +1053,19 @@ class TestChromaSemanticServiceSearchPage:
         col.get = AsyncMock(
             return_value={"ids": ["doc-1"], "documents": [], "metadatas": []}
         )
+        # ADR-062 Phase B: the enumeration path also fetches the corpus
+        # physical collection — give it a distinct, empty mock so this
+        # test's single-match assertion stays about the PRIVATE tier only.
+        corpus_col = AsyncMock()
+        corpus_col.get = AsyncMock(
+            return_value={"ids": [], "documents": [], "metadatas": []}
+        )
         client = MagicMock()
-        client.get_or_create_collection = AsyncMock(return_value=col)
+
+        async def _select(name: str, **_kw: object) -> AsyncMock:
+            return col if name == "decisions_v2" else corpus_col
+
+        client.get_or_create_collection = AsyncMock(side_effect=_select)
         service = ChromaSemanticService(
             client=client, default_collections=["decisions"]
         )
@@ -1091,3 +1112,354 @@ class TestUserScopedSemanticServiceSearchPage:
         )
         assert page.sort == "id"
         assert page.order == "desc"
+
+
+# ── ADR-062 Phase B (WU-B3) — corpus collections + isolation-safety bar ────
+#
+# D1: every logical collection resolves to TWO physical ChromaDB
+# collections — a per-user PRIVATE one (`_physical`, `where`-scoped for
+# non-admin, #383) and a shared CORPUS one (`_physical_corpus`, always
+# unfiltered). §3's two holes: `get_document`/`delete_document` used to be
+# fully unfiltered (`del user_context`); `_merge_semantic_with_chroma` in
+# routes/memory.py (tested separately, test_memory_routes.py) used to
+# enumerate every row via a raw, unfiltered `col.get()`.
+#
+# THE FALSIFIABLE BAR (per the spec): user A upserts a PRIVATE vector →
+# user B's `search`/`search_page` does NOT return it AND `get_document` by
+# id returns None (404 at the route); a CORPUS-tier vector hits for BOTH.
+
+
+class TestPhysicalCorpusNaming:
+    def test_physical_corpus_naming(self):
+        assert ChromaSemanticService._physical_corpus("decisions") == (
+            "decisions_corpus_v2"
+        )
+        # Disjoint from the private physical name for the same logical
+        # collection — the whole point of D1's physical separation.
+        assert ChromaSemanticService._physical_corpus(
+            "decisions"
+        ) != ChromaSemanticService._physical("decisions")
+
+
+class TestSearchEmbedFailureDegrades:
+    """The hoisted single-embed-call refactor (search()/search_page()
+    relevance path now embed ONCE, shared across both tiers) must still
+    degrade to an empty result on an embed failure, not raise."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_search_returns_empty_on_embed_failure(
+        self, service, user_context, monkeypatch
+    ):
+        async def _boom(self, text):
+            raise RuntimeError("nomic unreachable")
+
+        monkeypatch.setattr(ChromaSemanticService, "_embed_one", _boom)
+        assert await service.search(user_context, "anything", k=4) == []
+
+    async def test_search_page_relevance_returns_empty_page_on_embed_failure(
+        self, service, user_context, monkeypatch
+    ):
+        async def _boom(self, text):
+            raise RuntimeError("nomic unreachable")
+
+        monkeypatch.setattr(ChromaSemanticService, "_embed_one", _boom)
+        page = await service.search_page(user_context, "anything", k=4)
+        assert page.matches == []
+        assert page.total == 0
+
+
+class TestSearchDualTier:
+    """search()/search_page() query BOTH physical collections and tag
+    `metadata["tier"]`."""
+
+    @pytest.fixture
+    async def two_tier_service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        private_col = await client.get_or_create_collection(name="decisions_v2")
+        await private_col.add(
+            ids=["alice-private"],
+            documents=["alice private cache note"],
+            metadatas=[{"user_id": "user-alice", "tier": "private"}],
+        )
+        corpus_col = await client.get_or_create_collection(name="decisions_corpus_v2")
+        await corpus_col.add(
+            ids=["shared-adr"],
+            documents=["shared corpus cache note"],
+            metadatas=[{"user_id": "user-operator", "tier": "corpus"}],
+        )
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_search_tags_private_and_corpus_results(
+        self, two_tier_service, user_context
+    ):
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        results = await two_tier_service.search(alice, "cache", k=10)
+        by_content = {d.page_content: d for d in results}
+        assert by_content["alice private cache note"].metadata["tier"] == "private"
+        assert by_content["shared corpus cache note"].metadata["tier"] == "corpus"
+
+    async def test_search_non_admin_private_isolation_corpus_shared(
+        self, two_tier_service, user_context
+    ):
+        """FALSIFIABLE BAR: user A's private vector is invisible to user
+        B; the corpus vector is visible to both."""
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        results = await two_tier_service.search(bob, "cache", k=10)
+        contents = [d.page_content for d in results]
+        assert "alice private cache note" not in contents
+        assert "shared corpus cache note" in contents
+
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        alice_results = await two_tier_service.search(alice, "cache", k=10)
+        alice_contents = [d.page_content for d in alice_results]
+        assert "alice private cache note" in alice_contents
+        assert "shared corpus cache note" in alice_contents
+
+    async def test_search_page_relevance_tags_and_isolates(
+        self, two_tier_service, user_context
+    ):
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        page = await two_tier_service.search_page(bob, "cache", k=10)
+        contents = [d.page_content for d in page.matches]
+        assert "alice private cache note" not in contents
+        assert "shared corpus cache note" in contents
+        tiers = {d.metadata["tier"] for d in page.matches}
+        assert tiers == {"corpus"}
+
+    async def test_search_page_enumeration_tags_and_isolates(
+        self, two_tier_service, user_context
+    ):
+        """The recency/id enumeration path (non-``query()``) gets the same
+        dual-tier treatment as the relevance path."""
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        page = await two_tier_service.search_page(bob, "cache", k=10, sort="id")
+        contents = [d.page_content for d in page.matches]
+        assert "alice private cache note" not in contents
+        assert "shared corpus cache note" in contents
+
+    async def test_search_admin_sees_both_tiers(self, two_tier_service, user_context):
+        # user_context fixture is the admin sentinel.
+        results = await two_tier_service.search(user_context, "cache", k=10)
+        contents = {d.page_content for d in results}
+        assert "alice private cache note" in contents
+        assert "shared corpus cache note" in contents
+
+    async def test_falsifiability_neuter_private_where_leaks_across_users(
+        self, two_tier_service, user_context, monkeypatch
+    ):
+        """Prove the private-tier `where` filter is load-bearing (not
+        vacuous): if `_query_tier` is neutered to ignore `where`, bob's
+        search MUST start returning alice's private row. Restoring the
+        neuter (this test's teardown is implicit — monkeypatch reverts
+        automatically) brings back isolation."""
+        real_query_tier = ChromaSemanticService._query_tier
+
+        async def _neutered_query_tier(
+            self, physical_name, query_embedding, n_results, where, col_name, tier
+        ):
+            # Drop the where filter entirely — simulates the #383 guard
+            # being removed.
+            return await real_query_tier(
+                self, physical_name, query_embedding, n_results, None, col_name, tier
+            )
+
+        monkeypatch.setattr(ChromaSemanticService, "_query_tier", _neutered_query_tier)
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        results = await two_tier_service.search(bob, "cache", k=10)
+        contents = [d.page_content for d in results]
+        assert "alice private cache note" in contents, (
+            "neutering the where filter should leak alice's row to bob — "
+            "if this assertion fails, the neuter didn't actually disable "
+            "the isolation guard, so the guard's falsifiability is unproven"
+        )
+
+
+class TestUpsertTierWiring:
+    """``upsert(..., tier=...)`` writes to the correct physical
+    collection and stamps `metadata["tier"]`."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_default_tier_is_private(self, service, user_context):
+        await service.upsert(user_context, "decisions", "doc-1", "hello")
+        doc = await service.get_document(user_context, "decisions", "doc-1")
+        assert doc is not None
+        assert doc.metadata["tier"] == "private"
+        assert doc.metadata["user_id"] == user_context.user_id
+
+    async def test_corpus_tier_writes_to_corpus_physical_collection(
+        self, service, user_context
+    ):
+        await service.upsert(
+            user_context, "decisions", "doc-c", "shared body", tier="corpus"
+        )
+        # Visible via get_document (checks both physical collections).
+        doc = await service.get_document(user_context, "decisions", "doc-c")
+        assert doc is not None
+        assert doc.metadata["tier"] == "corpus"
+        # Physically landed in the corpus collection, not the private one.
+        private_col = await service._client.get_or_create_collection(
+            name="decisions_v2"
+        )
+        assert (await private_col.get(ids=["doc-c"]))["ids"] == []
+        corpus_col = await service._client.get_or_create_collection(
+            name="decisions_corpus_v2"
+        )
+        assert (await corpus_col.get(ids=["doc-c"]))["ids"] == ["doc-c"]
+
+    async def test_corpus_write_visible_to_every_non_admin(self, service, user_context):
+        await service.upsert(
+            user_context, "decisions", "doc-c2", "shared body 2", tier="corpus"
+        )
+        other = replace(user_context, user_id="someone-else", is_admin=False, scopes=())
+        doc = await service.get_document(other, "decisions", "doc-c2")
+        assert doc is not None
+
+
+class TestGetDocumentClosesHole:
+    """§3 hole 1 — ``get_document`` used to be `del user_context`
+    (fully unfiltered). Now: owner or corpus-tier or admin."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def _seed_private(self, service, user_context, owner: str) -> None:
+        alice_like = replace(user_context, user_id=owner, is_admin=False, scopes=())
+        await service.upsert(alice_like, "decisions", "priv-doc", "alice's secret")
+
+    async def test_owner_can_read_own_private_doc(self, service, user_context):
+        await self._seed_private(service, user_context, "user-alice")
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        doc = await service.get_document(alice, "decisions", "priv-doc")
+        assert doc is not None
+        assert doc.page_content == "alice's secret"
+
+    async def test_non_owner_gets_none_not_the_document(self, service, user_context):
+        """FALSIFIABLE BAR: cross-user read returns None — the same
+        signal as a genuine miss (no existence disclosure)."""
+        await self._seed_private(service, user_context, "user-alice")
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        doc = await service.get_document(bob, "decisions", "priv-doc")
+        assert doc is None
+
+    async def test_admin_bypasses_ownership_check(self, service, user_context):
+        await self._seed_private(service, user_context, "user-alice")
+        # user_context fixture is the admin sentinel.
+        doc = await service.get_document(user_context, "decisions", "priv-doc")
+        assert doc is not None
+
+    async def test_corpus_doc_readable_by_any_non_admin(self, service, user_context):
+        await service.upsert(
+            user_context, "decisions", "corpus-doc", "shared", tier="corpus"
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        doc = await service.get_document(bob, "decisions", "corpus-doc")
+        assert doc is not None
+
+    async def test_falsifiability_neuter_tier_authorized_leaks_cross_user(
+        self, service, user_context, monkeypatch
+    ):
+        """Prove the ownership check is load-bearing: neutering
+        `_tier_authorized` to always return True must resurrect the
+        cross-user leak this hole-closure fixes."""
+        await self._seed_private(service, user_context, "user-alice")
+        monkeypatch.setattr(
+            ChromaSemanticService,
+            "_tier_authorized",
+            staticmethod(lambda meta, uc: True),
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        doc = await service.get_document(bob, "decisions", "priv-doc")
+        assert doc is not None, (
+            "neutering _tier_authorized should resurrect the cross-user "
+            "leak — if this assertion fails, the check wasn't actually "
+            "load-bearing"
+        )
+
+    async def test_get_document_checks_corpus_when_absent_from_private(
+        self, service, user_context
+    ):
+        """A doc_id that only exists in the corpus physical collection
+        (never written to the private one) must still be found."""
+        await service.upsert(
+            user_context, "decisions", "corpus-only", "corpus body", tier="corpus"
+        )
+        other = replace(user_context, user_id="nobody", is_admin=False, scopes=())
+        doc = await service.get_document(other, "decisions", "corpus-only")
+        assert doc is not None
+        assert doc.page_content == "corpus body"
+
+
+class TestDeleteDocumentClosesHole:
+    """§3 hole 1 — ``delete_document`` mirrors get_document's ownership
+    check (previously `del user_context`, fully unfiltered)."""
+
+    @pytest.fixture
+    async def service(self):
+        factory = MockChromaDBFactory()
+        client = await factory.get_client()
+        return ChromaSemanticService(client=client, default_collections=["decisions"])
+
+    async def test_owner_can_delete_own_private_doc(self, service, user_context):
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        assert await service.delete_document(alice, "decisions", "priv-doc") is True
+        assert await service.get_document(alice, "decisions", "priv-doc") is None
+
+    async def test_non_owner_delete_returns_false_and_does_not_delete(
+        self, service, user_context
+    ):
+        """FALSIFIABLE BAR: a non-owner's delete attempt is a no-op —
+        returns False, and the document survives."""
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        assert await service.delete_document(bob, "decisions", "priv-doc") is False
+        # Still there — the delete must not have gone through.
+        assert await service.get_document(alice, "decisions", "priv-doc") is not None
+
+    async def test_admin_can_delete_any_users_private_doc(self, service, user_context):
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        # user_context fixture is the admin sentinel.
+        assert (
+            await service.delete_document(user_context, "decisions", "priv-doc") is True
+        )
+
+    async def test_any_non_admin_can_delete_corpus_doc(self, service, user_context):
+        await service.upsert(
+            user_context, "decisions", "corpus-doc", "shared", tier="corpus"
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        assert await service.delete_document(bob, "decisions", "corpus-doc") is True
+
+    async def test_falsifiability_neuter_tier_authorized_allows_cross_user_delete(
+        self, service, user_context, monkeypatch
+    ):
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        await service.upsert(alice, "decisions", "priv-doc", "secret")
+        monkeypatch.setattr(
+            ChromaSemanticService,
+            "_tier_authorized",
+            staticmethod(lambda meta, uc: True),
+        )
+        bob = replace(user_context, user_id="user-bob", is_admin=False, scopes=())
+        deleted = await service.delete_document(bob, "decisions", "priv-doc")
+        assert deleted is True, (
+            "neutering _tier_authorized should allow the cross-user delete "
+            "this hole-closure prevents — if this assertion fails, the "
+            "check wasn't actually load-bearing"
+        )

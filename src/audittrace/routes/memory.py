@@ -1497,6 +1497,7 @@ async def create_semantic(
 async def _merge_semantic_with_chroma(
     visible_entries: list[ManifestEntry],
     collection: str | None,
+    user: UserContext,
 ) -> list[dict[str, Any]]:
     """Same shape as `_merge_layer_items_with_s3` for the semantic layer.
 
@@ -1506,6 +1507,20 @@ async def _merge_semantic_with_chroma(
     on collections that grow large; operators who need to browse a
     large semantic store can paginate via the manifest's offset/limit
     once they've created tracked rows for the items they care about.
+
+    ADR-062 Phase B (§3 hole 2): the raw `col.get()` discovery scan below
+    used to enumerate EVERY row in every scanned collection with no
+    `where` at all — any caller with `memory:semantic:read` could list
+    another user's private vectors this way. A discovered row is now
+    included only if the caller is admin, the row is CORPUS-tier
+    (`metadata["tier"] == "corpus"`, deliberately unfiltered — D1), or
+    the row's `metadata["user_id"]` matches the caller — the same
+    predicate as `ChromaSemanticService._tier_authorized` (deliberately
+    not imported here: this function reads raw ChromaDB responses, not
+    through the service). Manifest-TRACKED rows (`visible_entries`) are
+    NOT re-filtered here — the manifest's own owner/tier predicate is
+    WU-B4 (deferred); this PR closes only the raw-Chroma enumeration
+    hole.
     """
     items: list[dict[str, Any]] = [e.to_dict() for e in visible_entries]
 
@@ -1556,6 +1571,15 @@ async def _merge_semantic_with_chroma(
                 continue
             content = docs[i] if i < len(docs) else ""
             meta = metas[i] if i < len(metas) and metas[i] else {}
+            # ADR-062 Phase B (§3 hole 2) — close the raw-Chroma enumeration
+            # hole: skip a discovered row the caller does not own and that
+            # isn't corpus-tier. See the function docstring.
+            if not (
+                user.is_admin
+                or meta.get("tier") == "corpus"
+                or meta.get("user_id") == user.user_id
+            ):
+                continue
             title = meta.get("title") or meta.get("source") or doc_id
             items.append(
                 {
@@ -1615,8 +1639,14 @@ async def list_semantic(
     ADR-062 WU-A1: requires an authenticated user like every sibling
     list/read handler (closes the CS-4 anomaly of a memory-list endpoint
     with no identity at all, so a future audit event can attribute the
-    read). This does NOT yet filter results by user — that per-user
-    isolation lands in ADR-062 Phase B."""
+    read).
+
+    ADR-062 Phase B (WU-B3): the ChromaDB-DISCOVERED rows (untracked in
+    the manifest) are now filtered — non-admin sees only its own
+    private-tier rows plus corpus-tier rows (`_merge_semantic_with_chroma`
+    §3 hole 2). Manifest-TRACKED rows (`entries` below) are still
+    unfiltered by owner/tier — that predicate is WU-B4 (deferred; needs
+    the manifest `tier` column)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=include_deleted
@@ -1624,7 +1654,7 @@ async def list_semantic(
     if collection is not None:
         prefix = f"{collection}/"
         entries = [e for e in entries if e.key.startswith(prefix)]
-    items = await _merge_semantic_with_chroma(entries, collection)
+    items = await _merge_semantic_with_chroma(entries, collection, user)
     page, total = _sort_and_paginate(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
