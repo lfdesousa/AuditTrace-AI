@@ -43,12 +43,34 @@ KEY_PREFIX = "audittrace:layer-cache:"
 
 
 def layer_list_cache_key(layer: str) -> str:
-    """Deterministic shared-cache key for a layer's object listing.
+    """Deterministic shared-cache key for a layer's CORPUS object listing.
 
     One key per layer (``episodic`` / ``procedural``) so an invalidation on
-    a write to one layer never evicts the other.
+    a write to one layer never evicts the other. This key is fleet-shared
+    AND caller-agnostic — appropriate only for Layer 5 (the shared corpus,
+    ADR-062 §1), never for per-user content.
     """
     return f"{KEY_PREFIX}{layer}:list"
+
+
+def layer_list_cache_key_private(layer: str, user_id: str) -> str:
+    """Deterministic shared-cache key for a layer's PRIVATE object listing.
+
+    ADR-062 Phase B (WU-B1) — **security boundary**, not a convenience
+    helper. The per-user ``user_id`` dimension is what stops the fail-open
+    Redis cache from serving user A's private listing to user B: without it,
+    every caller would collide on the same ``<layer>:list`` key that
+    :func:`layer_list_cache_key` already claims for the shared corpus, and a
+    Redis hit for one caller's private listing would silently answer another
+    caller's private ``load()``/``list()`` (a cross-tenant leak the cache's
+    own fail-open design would otherwise mask as "just a cache hit").
+
+    ``user_id`` MUST be the validated JWT ``sub`` claim (``UserContext.
+    user_id``), never a request parameter (ADR-027 §1) — the caller who owns
+    the identity, not the caller who names it, is the only one allowed to
+    address this key.
+    """
+    return f"{KEY_PREFIX}{layer}:private:{user_id}:list"
 
 
 class LayerCacheStore(ABC):
