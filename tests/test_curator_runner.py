@@ -57,6 +57,7 @@ from scripts.curator.runner import (
     intake_records,
     jaccard,
     list_semantic_collection,
+    manifest_indicates_deleted,
     merge_tags,
     normalize_iso_date,
     normalize_record,
@@ -171,6 +172,13 @@ class _QueueRecorder:
     def __call__(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return self.results.pop(0)
+
+
+# A ``read_semantic_doc`` 200-body for a manifest-tracked, NOT-soft-deleted
+# record — the realistic shape for anything C7 curates (intake only takes
+# manifest-tracked rows), used across the verify/isolation tests below so a
+# "recallable" mock means the SAME thing everywhere.
+_NOT_DELETED: dict[str, object] = {"content": "x", "manifest": {"deleted_at_ms": None}}
 
 
 # ── STEP 0: session-auth gate (falsifiability (a)) ────────────────────────────
@@ -1022,15 +1030,76 @@ def test_verify_retrievability_fails_run(monkeypatch, tmp_path):
 
 
 def test_verify_retrievability_passes_when_recallable(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        crun, "read_semantic_doc", lambda *a, **k: (200, {"content": "x"})
-    )
+    monkeypatch.setattr(crun, "read_semantic_doc", lambda *a, **k: (200, _NOT_DELETED))
     runner = CuratorRunner(_cfg(tmp_path))
     runner.curated = [_curated(document_id="ok-1", tier="private")]
     runner._token = "tok"
     runner.phase_verify()
     assert runner.unretrievable == []
     assert runner.curated[0].verified is True
+
+
+def test_verify_retrievability_fails_on_soft_deleted_manifest(monkeypatch, tmp_path):
+    """FALSIFIABILITY (soundness fix, 2026-08-05 reviewer REJECT): a curated
+    record whose manifest is TOMBSTONED (``deleted_at_ms`` set) 200s on the raw
+    point-read but must be scored UNRETRIEVABLE — it is permanently invisible to
+    the real ``recall_decisions``/``recall_skills``/``recall_semantic`` tools
+    (``_filter_soft_deleted``, ``services/semantic.py``), which is exactly the
+    #374/#383 "written but doesn't surface" failure class verify-retrievability
+    exists to catch. Neuter :func:`manifest_indicates_deleted` (e.g. make it
+    always return ``False``) — or drop its use from ``phase_verify`` — and this
+    test goes RED (the soft-deleted record is wrongly scored ``verified=True``)."""
+    monkeypatch.setattr(
+        crun,
+        "read_semantic_doc",
+        lambda *a, **k: (
+            200,
+            {"content": "x", "manifest": {"deleted_at_ms": 1_700_000_000_000}},
+        ),
+    )
+    runner = CuratorRunner(_cfg(tmp_path))
+    runner.curated = [_curated(document_id="tombstoned-1", tier="private")]
+    runner._token = "tok"
+    runner.phase_verify()
+
+    assert runner.unretrievable == ["decisions/tombstoned-1"]
+    assert runner.curated[0].verified is False
+    assert "soft-deleted" in runner.curated[0].verify_detail
+    assert runner.records[-1].status == "flagged"
+
+    report = runner.build_report()
+    assert exit_code_for(report) == crun.EXIT_UNRETRIEVABLE
+
+
+def test_verify_retrievability_fails_when_manifest_missing_on_200(
+    monkeypatch, tmp_path
+):
+    """Companion to the tombstone gate: every record C7 curates is manifest-
+    tracked by construction (intake skips ``discovered`` rows), so a MISSING
+    ``manifest`` block on an otherwise-200 point-read is treated as NOT
+    retrievable too (fail-safe direction — this also covers the independent
+    reviewer's live-traced report that a tombstoned row can surface with
+    ``"manifest": null`` rather than a populated ``deleted_at_ms``)."""
+    monkeypatch.setattr(
+        crun,
+        "read_semantic_doc",
+        lambda *a, **k: (200, {"content": "x", "manifest": None}),
+    )
+    runner = CuratorRunner(_cfg(tmp_path))
+    runner.curated = [_curated(document_id="vanished-1", tier="private")]
+    runner._token = "tok"
+    runner.phase_verify()
+    assert runner.unretrievable == ["decisions/vanished-1"]
+    assert runner.curated[0].verified is False
+
+
+def test_manifest_indicates_deleted_true_cases():
+    assert manifest_indicates_deleted(None) is True
+    assert manifest_indicates_deleted({"deleted_at_ms": 123}) is True
+
+
+def test_manifest_indicates_deleted_false_case():
+    assert manifest_indicates_deleted({"deleted_at_ms": None}) is False
 
 
 def test_verify_dry_run_plans_only(tmp_path):
@@ -1046,9 +1115,7 @@ def test_isolation_regression_fails_the_run(monkeypatch, tmp_path):
     check the probe token) and this test goes RED."""
     # Primary owner sees it (200); the second-identity probe ALSO sees it (200) —
     # an isolation regression.
-    monkeypatch.setattr(
-        crun, "read_semantic_doc", lambda *a, **k: (200, {"content": "x"})
-    )
+    monkeypatch.setattr(crun, "read_semantic_doc", lambda *a, **k: (200, _NOT_DELETED))
     runner = CuratorRunner(_cfg(tmp_path, isolation_probe_token="other-subject-token"))
     runner.curated = [_curated(document_id="leak-1", tier="private")]
     runner._token = "owner-token"
@@ -1069,7 +1136,7 @@ def test_isolation_probe_correctly_isolated_no_regression(monkeypatch, tmp_path)
 
     def fake_read(cfg, token, collection, document_id):
         calls["n"] += 1
-        return (200, {"content": "x"}) if token == "owner-token" else (404, None)
+        return (200, _NOT_DELETED) if token == "owner-token" else (404, None)
 
     monkeypatch.setattr(crun, "read_semantic_doc", fake_read)
     runner = CuratorRunner(_cfg(tmp_path, isolation_probe_token="other-subject-token"))
@@ -1083,9 +1150,7 @@ def test_isolation_probe_correctly_isolated_no_regression(monkeypatch, tmp_path)
 
 
 def test_isolation_probe_skipped_without_second_identity(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        crun, "read_semantic_doc", lambda *a, **k: (200, {"content": "x"})
-    )
+    monkeypatch.setattr(crun, "read_semantic_doc", lambda *a, **k: (200, _NOT_DELETED))
     runner = CuratorRunner(_cfg(tmp_path, isolation_probe_token=None))
     runner.curated = [_curated(document_id="ok-1", tier="private")]
     runner._token = "owner-token"
@@ -1104,7 +1169,7 @@ def test_isolation_probe_not_applied_to_corpus_records(monkeypatch, tmp_path):
 
     def fake_read(cfg, token, collection, document_id):
         calls["n"] += 1
-        return 200, {"content": "x"}
+        return 200, _NOT_DELETED
 
     monkeypatch.setattr(crun, "read_semantic_doc", fake_read)
     runner = CuratorRunner(_cfg(tmp_path, isolation_probe_token="other-subject-token"))
@@ -1383,9 +1448,7 @@ def _wire_happy_path(monkeypatch):
         "promote_to_corpus",
         lambda cfg, token, record: (403, {"detail": "no scope"}),
     )
-    monkeypatch.setattr(
-        crun, "read_semantic_doc", lambda *a, **k: (200, {"content": "x"})
-    )
+    monkeypatch.setattr(crun, "read_semantic_doc", lambda *a, **k: (200, _NOT_DELETED))
     monkeypatch.setattr(
         crun, "upload_self_log", lambda *a, **k: {"key": "u/episodic/f.md"}
     )

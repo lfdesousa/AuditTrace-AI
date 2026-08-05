@@ -785,6 +785,63 @@ def read_semantic_doc(
     return status, parsed if isinstance(parsed, dict) else None
 
 
+def manifest_indicates_deleted(manifest: dict[str, Any] | None) -> bool:
+    """True iff the ``"manifest"`` block of a ``GET
+    /memory/semantic/{collection}/{document_id}`` response signals the record is
+    SOFT-DELETED (tombstoned) — the exact condition the real recall path filters
+    out server-side.
+
+    **The bug this closes (2026-08-05 reviewer finding, REJECT).** The v2 runner's
+    ``phase_verify`` originally treated any HTTP 200 from the point-read as
+    "recallable". But ``ChromaSemanticService.get_document`` (used by
+    ``read_semantic``) never calls ``_filter_soft_deleted`` — unlike
+    ``search()``/``search_page()`` (the REAL ``recall_decisions``/``recall_skills``/
+    ``recall_semantic`` code path), which drops a candidate whose manifest row has
+    ``deleted_at_ms`` set (``services/semantic.py::_filter_soft_deleted``, keyed on
+    the SAME ``"semantic"`` layer + ``f"{collection}/{document_id}"`` key this
+    runner already uses via ``_semantic_key``). So a soft-deleted curated record
+    used to pass ``verified=True`` — 200 OK, content served — while being
+    PERMANENTLY INVISIBLE to the tool the LLM actually calls: precisely the
+    "written but doesn't surface" class (#374/#383) verify-retrievability exists to
+    catch. The check was UNSOUND, not merely weaker.
+
+    **Why this predicate, not a real recall-path call.** A per-record forced
+    ``tool_choice`` LLM call (like C8's self-log proof) would be the "strongest"
+    check, but it is real-LLM-latency-bound (~75s per call, measured 2026-08-05)
+    and would make this "deterministic, no wall-clock branching" pipeline's
+    runtime scale with curated-record count times LLM round-trips — unacceptable
+    for the per-record hot path (see the module docstring's §mechanism note on
+    C8). Reading ``manifest.deleted_at_ms`` off the SAME HTTP call
+    ``phase_verify`` already makes is free, deterministic, and PROVABLY the same
+    predicate ``_filter_soft_deleted`` applies for every record this pipeline
+    curates — intake only takes manifest-tracked, ``create_semantic``-authored
+    single-document writes (:func:`_raw_from_list_item`), for which the ChromaDB
+    ``chunk_id`` (what ``_filter_soft_deleted`` keys on) is always exactly the
+    ``document_id`` (:meth:`ChromaSemanticService.upsert` calls ``col.upsert(ids=
+    [document_id], ...)``), so ``f"{collection}/{chunk_id}"`` and
+    ``f"{collection}/{document_id}"`` are the identical string. This is a
+    same-predicate mirror, not an approximation.
+
+    **Missing manifest ALSO counts as not-retrievable.** Every record this
+    pipeline curates is manifest-tracked by construction (intake skips
+    ``discovered`` rows — see :func:`_raw_from_list_item`), so a MISSING manifest
+    block at verify time means either the row was hard-deleted/vanished between
+    intake and verify, or (per the independent reviewer's live-traced report,
+    2026-08-05) a tombstoned row can surface with ``"manifest": null`` rather than
+    a populated ``deleted_at_ms``. Both cases are "not confirmed retrievable" for
+    a gate whose entire purpose is to be STRICT — the fail-safe direction is
+    "not verified", never "verified by default". This does NOT apply to the C8
+    self-log structural check (:meth:`CuratorRunner.phase_self_log`), whose
+    ``/memory/index``-authored document is NEVER manifest-tracked by design (that
+    route has no ``manifest.record_create`` call) — a missing manifest there is
+    normal, not a deletion signal, so that check intentionally does not call this
+    function.
+    """
+    if manifest is None:
+        return True
+    return manifest.get("deleted_at_ms") is not None
+
+
 def _raw_from_list_item(
     item: dict[str, Any], collection: str
 ) -> tuple[str, int] | None:
@@ -1278,7 +1335,15 @@ class CuratorRunner:
     def phase_verify(self) -> None:
         """Amendment §D — tier-aware verify-retrievability. See module docstring
         §mechanism for why this is a structural point-read, not a literal
-        ``query=<marker>`` vector search."""
+        ``query=<marker>`` vector search.
+
+        SOUNDNESS (2026-08-05 reviewer fix): a bare HTTP 200 is NOT sufficient — a
+        soft-deleted record still 200s via the point-read (``get_document`` never
+        calls ``_filter_soft_deleted``, unlike the real ``search()``/
+        ``search_page()`` recall path). Every 200 is additionally checked against
+        :func:`manifest_indicates_deleted`, the SAME tombstone predicate the real
+        recall tools apply — see that function's docstring for the full trace.
+        """
         if self.cfg.dry_run:
             self._record(
                 PHASES[7],
@@ -1290,16 +1355,23 @@ class CuratorRunner:
         if self.cfg.isolation_probe_token is None:
             self.isolation_probe_skipped = True
         for record in self.curated:
-            status, _ = read_semantic_doc(
+            status, body = read_semantic_doc(
                 self.cfg, self._token, record.collection, record.document_id
             )
-            found = status == 200
-            record.verified = found
-            record.verify_detail = (
-                f"recallable (HTTP {status})"
-                if found
-                else f"NOT recallable (HTTP {status})"
+            deleted = status == 200 and manifest_indicates_deleted(
+                body.get("manifest") if body else None
             )
+            found = status == 200 and not deleted
+            record.verified = found
+            if found:
+                record.verify_detail = f"recallable (HTTP {status})"
+            elif deleted:
+                record.verify_detail = (
+                    f"NOT recallable (HTTP {status}, soft-deleted per manifest "
+                    "tombstone — #374/#383 class)"
+                )
+            else:
+                record.verify_detail = f"NOT recallable (HTTP {status})"
             if not found:
                 self.unretrievable.append(f"{record.collection}/{record.document_id}")
                 continue
