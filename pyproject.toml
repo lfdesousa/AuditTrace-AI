@@ -182,9 +182,10 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # logic package — `scripts/hooks/prepush_pr_body_gate.py`) joins it the same
 # way, so the new Python helper is subject to the same per-file gate as
 # everything else. `scripts/release` (#398, the deterministic release-cut
-# runner) joins the same way for the same reason. No other `scripts/*`
-# module is dragged into the gate.
-source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release"]
+# runner) joins the same way for the same reason. `scripts/curator`
+# (SDLC-ADR-002, the tier-aware Memory Curator runner) joins the same way too.
+# No other `scripts/*` module is dragged into the gate.
+source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release", "scripts/curator"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet
