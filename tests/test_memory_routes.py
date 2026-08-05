@@ -1036,6 +1036,310 @@ class TestIndexErrorPaths:
         mock_collection.upsert.assert_called()
 
 
+class TestIndexPrivateTier:
+    """POST /memory/index single-file mode accepts private-tier keys
+    (ADR-062 Phase B regression, #426).
+
+    Since WU-B5, ``POST /memory/upload`` writes to the caller's PRIVATE
+    tier and returns ``key = "{jwt.sub}/{layer}/{filename}"``. Tier is
+    disambiguated by testing whether ``?file=`` starts with the TOKEN
+    sub (never the caller-supplied value, per ADR-027 §1) — see the
+    tier-disambiguation block at the top of ``index_memory``. Six
+    falsifiable gates from SPEC #426, one test class member each.
+    """
+
+    @staticmethod
+    def _mock_chroma() -> tuple[MagicMock, AsyncMock]:
+        mock_collection = AsyncMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+        return mock_chroma, mock_collection
+
+    def test_private_tier_index_accepted(self, client: TestClient) -> None:
+        """Gate 1 — ``?file={token_sub}/episodic/foo.md`` against a
+        private object indexes successfully (200, >=1 chunk) and the
+        upserted vector is stamped ``user_id=<token_sub>``. Neuter: revert
+        the tier-anchored parser to the old ``file.split("/", 1)`` ->
+        400 -> RED."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# private note\nsome body"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "user-abc",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "user-abc/episodic/foo.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["collections"]["decisions"] >= 1
+        mock_collection.upsert.assert_called()
+        call_kwargs = mock_collection.upsert.call_args.kwargs
+        assert call_kwargs["metadatas"][0]["user_id"] == "user-abc"
+
+    def test_private_bucket_is_read_not_shared(self, client: TestClient) -> None:
+        """Gate 2 — the private branch reads ``memory-private``, never
+        ``memory-shared``. Neuter: force ``bucket = shared_bucket``
+        unconditionally -> the object read targets the wrong bucket
+        (object-not-found on a real MinIO) -> RED."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# body\ntext"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "user-abc",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "user-abc/episodic/foo.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert mock_minio.get_object.call_count == 1
+        call_args = mock_minio.get_object.call_args
+        assert call_args.args[0] == "memory-private"
+        assert call_args.args[1] == "user-abc/episodic/foo.md"
+
+    def test_cross_user_private_key_rejected(self, client: TestClient) -> None:
+        """Gate 3 (SECURITY, load-bearing) — a foreign sub in ``?file=``
+        must NEVER be accepted as this caller's private tier. It falls to
+        the corpus branch, where the foreign sub is not a valid
+        MemoryLayer -> 400, and ``memory-private`` is never read for the
+        victim. Neuter: take the private branch unconditionally (drop the
+        ``file.startswith(token_prefix)`` test) -> cross-user read -> RED."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            # The caller ("attacker") holds a valid write scope for
+            # episodic — the point of this gate is that scope is never
+            # even reached, because the foreign sub fails layer
+            # resolution first.
+            mock_decode.return_value = {
+                "sub": "attacker-sub",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "victim-sub/episodic/secret.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 400, response.text
+        assert "known layer prefix" in response.json()["detail"]
+        # The private bucket (or any bucket) must NEVER be touched when
+        # tier resolution fails for a foreign sub.
+        mock_minio.get_object.assert_not_called()
+
+    def test_corpus_key_still_reads_shared_bucket(self, client: TestClient) -> None:
+        """Gate 4 (backward-compat regression guard) — a legacy
+        ``{layer}/{filename}`` key (no sub prefix) still resolves to the
+        shared bucket, byte-identical to pre-#426 behaviour (admin bulk
+        rebuild, the ``ai_research_papers`` PDF loop)."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# body\ntext"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "episodic/ADR-007.md"},
+            )
+
+        assert response.status_code == 200, response.text
+        mock_collection.upsert.assert_called()
+        call_args = mock_minio.get_object.call_args
+        assert call_args.args[0] == "memory-shared"
+        assert call_args.args[1] == "episodic/ADR-007.md"
+
+    def test_private_tier_scope_enforcement_preserved(self, client: TestClient) -> None:
+        """Gate 5 — private-tier index still requires
+        ``memory:<layer>:write`` (or admin); a token holding a
+        DIFFERENT layer's write scope gets 403, matching the corpus
+        path. Neuter: drop the ``_require_layer_write`` call -> RED."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "user-abc",
+                "scope": "memory:procedural:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "user-abc/episodic/foo.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_private_tier_index_invalidates_episodic_cache(
+        self, client: TestClient
+    ) -> None:
+        """Parity fix — cache invalidation is keyed off the RESOLVED
+        layer (``layer_for_scope``), not the raw ``file`` prefix, so a
+        private-tier index still self-heals the episodic list cache.
+        Neuter: revert to ``file.startswith("episodic/")`` -> a private
+        key never matches -> the cache is never invalidated -> RED."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# body\ntext"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, _mock_collection = self._mock_chroma()
+        mock_episodic_service = MagicMock()
+
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+            patch(
+                "audittrace.routes.memory.get_episodic_service",
+                return_value=mock_episodic_service,
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "user-abc",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "user-abc/episodic/foo.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 200, response.text
+        mock_episodic_service.invalidate_cache.assert_called_once()
+
+    def test_private_tier_audit_row_carries_tier_field(
+        self, client: TestClient
+    ) -> None:
+        """Parity fix — the write-audit event's ``detail_extra`` carries
+        ``tier`` additively (audit schema frozen at 1.17.0: only fields
+        ADDED, never removed/renamed). Uses bypass-mode auth (default
+        ``client`` fixture) so the sentinel identity's admin scope can
+        read the resulting row back via ``GET /interactions``."""
+        from audittrace.identity import SENTINEL_SUBJECT
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# body\ntext"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        private_key = f"{SENTINEL_SUBJECT}/episodic/foo.md"
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": private_key},
+            )
+        assert response.status_code == 200, response.text
+
+        rows = client.get(
+            "/interactions", params={"event_class": "memory_access"}
+        ).json()["interactions"]
+        writes = [
+            r
+            for r in rows
+            if r["question"].startswith("op=write layer=semantic")
+            and r.get("error_detail")
+            and json.loads(r["error_detail"]).get("mode") == "single_file"
+        ]
+        assert writes, rows
+        detail = json.loads(writes[-1]["error_detail"])
+        assert detail["tier"] == "private"
+
+
 class TestPdfProvenance:
     """Per-chunk provenance schema (gap-inventory item #21).
 

@@ -274,6 +274,37 @@ def test_log_custom_layer_and_collections(monkeypatch):
     assert index["query"]["collections"] == ["decisions,skills"]
 
 
+def test_log_private_tier_key_round_trips(monkeypatch):
+    """Gate 6 (#426) — since WU-B5, ``POST /memory/upload`` returns a
+    PRIVATE-tier key shaped ``{jwt.sub}/{layer}/{filename}``, not the
+    legacy ``{layer}/{filename}``. ``log_deploy_record`` already round-
+    trips whatever ``key`` the upload response carries straight into
+    ``?file=`` — this locks that contract against the ADR-062 Phase B key
+    shape so the fleet self-log -> decisions fold path is provably intact.
+    Neuter: if the helper ever derives ``file=`` from ``layer``/``filename``
+    instead of the upload response's ``key``, this test goes RED (the
+    private sub-prefixed key would be lost).
+    """
+    _clear_env_token(monkeypatch)
+    private_key = "b1946ac9-2f1e-4c3a-9e1b-000000000001/episodic/rec.md"
+    fake = _install(
+        monkeypatch,
+        {
+            "/memory/upload": (200, json.dumps({"key": private_key}).encode()),
+            "/memory/index": (200, json.dumps({"status": "indexed"}).encode()),
+        },
+    )
+    out = log_deploy_record(
+        "some record text", front_door=FRONT, token=TOKEN, filename="rec.md"
+    )
+    assert out["status"] == "logged"
+    assert out["key"] == private_key
+    index = next(c for c in fake.calls if c["path"] == "/memory/index")
+    # The exact private key (WITH the sub prefix) must be what gets
+    # indexed — never a truncated/derived {layer}/{filename} shape.
+    assert index["query"]["file"] == [private_key]
+
+
 # ── log: failures are LOUD (raise DeployLogError) ───────────────────────────────
 
 

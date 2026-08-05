@@ -847,11 +847,35 @@ async def index_memory(
       static ``scopes=[]`` keeps OAuth2 declared in the OpenAPI
       spec; the prose contract lives here.
     """
+    # ADR-062 Phase B (#426) — tier disambiguation anchored on the TOKEN
+    # sub, never the caller-supplied key (ADR-027 §1: tenancy is
+    # token-derived, NEVER caller-supplied). ``tier``/``layer_for_scope``
+    # are set here and consumed further down for bucket selection, object
+    # dispatch, cache invalidation, and the write-audit ``detail_extra``.
+    # Bulk mode always stays "corpus" (admin cross-user shared rebuild;
+    # ``layer_for_scope`` stays ``None`` — bulk indexes both layers).
+    tier: str = "corpus"
+    layer_for_scope: MemoryLayer | None = None
     if file is None:
         _require_admin(user, "bulk /memory/index rebuild")
     else:
+        # A private-tier key from POST /memory/upload has shape
+        # "{jwt.sub}/{layer}/{filename}" (memory.py:635). The legacy
+        # corpus/shared key shape is "{layer}/{filename}". Testing the
+        # TOKEN prefix first means a foreign sub can never take the
+        # private branch: "{other_sub}/episodic/x.md" does not start
+        # with this caller's token prefix, so it falls to the corpus
+        # branch below, where "{other_sub}" is not a valid MemoryLayer
+        # -> 400. Cross-user private read is impossible by construction.
+        token_prefix = f"{user.user_id}/"
         try:
-            layer_str, _ = file.split("/", 1)
+            if file.startswith(token_prefix):
+                tier = "private"
+                remainder = file[len(token_prefix) :]
+                layer_str = remainder.split("/", 1)[0]
+            else:
+                tier = "corpus"
+                layer_str = file.split("/", 1)[0]
             layer_for_scope = MemoryLayer(layer_str)
         except (KeyError, ValueError):
             raise HTTPException(
@@ -882,11 +906,22 @@ async def index_memory(
     # ADR-006 — effective bucket switches between MinIO (default) and
     # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
     # variable name in settings is kept for backwards compatibility.
-    bucket = (
+    shared_bucket = (
         settings.aws_bucket
         if settings.object_storage_backend == "aws"
         else settings.minio_shared_bucket
     )
+    # ADR-062 Phase B (#426) — private bucket mirrors the write side
+    # (memory.py:630-634). Bulk mode never selects it (tier stays
+    # "corpus" — admin cross-user shared-corpus rebuild); single-file
+    # mode selects it only when the tier disambiguation above resolved
+    # ``tier == "private"``.
+    private_bucket = (
+        settings.aws_private_bucket
+        if settings.object_storage_backend == "aws"
+        else settings.minio_private_bucket
+    )
+    bucket = private_bucket if tier == "private" else shared_bucket
     minio_client = _get_minio_client()
     chroma_client = get_chromadb()
 
@@ -917,18 +952,32 @@ async def index_memory(
                     "(single-file mode is per-collection)."
                 ),
             )
+        # Dispatch on the RESOLVED layer (``layer_for_scope``), not on the
+        # raw key's prefix (#426): a private key's first segment is the
+        # token sub, not a layer, so a ``file.startswith("episodic/")``
+        # test would silently miss every private-tier object. The FULL
+        # key (incl. sub prefix for private keys) is kept as ``"key"`` so
+        # ``minio_client.get_object(bucket, key)`` resolves either tier.
         single_obj: dict[str, str] = {
             "key": file,
             "filename": file.rsplit("/", 1)[-1],
         }
-        if file.startswith("episodic/"):
+        if layer_for_scope == MemoryLayer.episodic:
             episodic_objects = [single_obj]
-        elif file.startswith("procedural/"):
+        elif layer_for_scope == MemoryLayer.procedural:
             procedural_objects = [single_obj]
         else:
-            raise HTTPException(
+            # Defensive only — unreachable while MemoryLayer has exactly
+            # these two members (already validated above by the
+            # ``MemoryLayer(layer_str)`` construction, which 400s on any
+            # other value). Guards against a future MemoryLayer addition
+            # being wired into the enum without updating this dispatch.
+            raise HTTPException(  # pragma: no cover
                 status_code=400,
-                detail="file= must start with 'episodic/' or 'procedural/'",
+                detail=(
+                    "single-file /memory/index supports only "
+                    "episodic/ and procedural/ layers"
+                ),
             )
     else:
         episodic_objects = _list_objects_from_minio(minio_client, bucket, "episodic/")
@@ -1023,9 +1072,13 @@ async def index_memory(
     # shared listing caches so any objects the seed run touched are re-read
     # fresh on the next list. Skipped for dry-run (no side effects).
     if not dry_run:
-        if file is None or file.startswith("episodic/"):
+        # #426: keyed off the RESOLVED layer (``layer_for_scope``), not the
+        # raw key prefix — a private key's first segment is the token sub,
+        # so ``file.startswith("episodic/")`` would never match and a
+        # private-tier index would fail to self-heal the list cache.
+        if file is None or layer_for_scope == MemoryLayer.episodic:
             _invalidate_layer_list_cache(MemoryLayer.episodic.value)
-        if file is None or file.startswith("procedural/"):
+        if file is None or layer_for_scope == MemoryLayer.procedural:
             _invalidate_layer_list_cache(MemoryLayer.procedural.value)
 
     duration = time.time() - start
@@ -1052,6 +1105,10 @@ async def index_memory(
             "mode": "single_file" if single_file_mode else "bulk",
             "dry_run": dry_run,
             "total_chunks": total_chunks,
+            # ADR-062 Phase B (#426) — additive-only field (audit schema
+            # frozen at 1.17.0): "private" or "corpus", per the tier
+            # resolution above.
+            "tier": tier,
         },
     )
     return response
