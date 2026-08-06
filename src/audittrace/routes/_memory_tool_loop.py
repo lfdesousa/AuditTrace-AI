@@ -46,6 +46,7 @@ import httpx
 from opentelemetry import trace
 
 from audittrace.identity import UserContext
+from audittrace.routes._model_route import upstream_host
 from audittrace.tools import get_tool_by_name, invoke_tool
 
 logger = logging.getLogger(__name__)
@@ -460,6 +461,10 @@ async def run_memory_tool_loop(
             gen_span.set_attribute("langfuse.user.id", user_context.user_id)
             gen_span.set_attribute("user.id", user_context.user_id)
             gen_span.set_attribute("gen_ai.iteration", iteration)
+            # FLEET-ROUTE (SPEC invariant 6) — additive; which engine
+            # actually served this generation (llama_url is already the
+            # caller-resolved upstream — see chat.py resolve_chat_upstream).
+            gen_span.set_attribute("audittrace.upstream.host", upstream_host(llama_url))
             try:
                 gen_span.set_attribute(
                     "input.value",

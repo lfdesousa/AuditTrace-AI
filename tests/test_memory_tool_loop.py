@@ -947,6 +947,41 @@ class TestSpanEmission:
         assert second.get("gen_ai.iteration") == 1
 
     @pytest.mark.asyncio
+    async def test_generation_span_carries_resolved_upstream_host(
+        self, _populated_container, _fakeredis_cache, span_exporter
+    ):
+        """FLEET-ROUTE SPEC invariant 6: the generation span carries an
+        ADDITIVE ``audittrace.upstream.host`` attribute derived from the
+        caller-resolved ``llama_url`` — so a reviewer can see WHICH
+        engine served the call, alongside the pre-existing
+        ``gen_ai.request.model``. Neuter the attribute-set call in
+        ``run_memory_tool_loop`` and this goes RED."""
+        user = sentinel_user_context()
+        fake = _SequencedClient([_text_response("ok")])
+        with _patch_async_client(fake):
+            await run_memory_tool_loop(
+                llama_url="http://host.docker.internal:11438/v1/chat/completions",
+                payload={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "q"}],
+                    "tools": [],
+                },
+                user_context=user,
+                session_id="sess-upstream-host",
+                max_iterations=5,
+            )
+        gen_spans = [
+            s
+            for s in span_exporter.get_finished_spans()
+            if s.name == "llm.chat.completions"
+        ]
+        assert len(gen_spans) == 1
+        attrs = gen_spans[0].attributes or {}
+        assert attrs.get("audittrace.upstream.host") == "host.docker.internal:11438"
+        # gen_ai.request.model is unaffected — additive, not a replacement.
+        assert attrs.get("gen_ai.request.model") == "mistral-small-3.1-24b"
+
+    @pytest.mark.asyncio
     async def test_scope_denied_span_marked_error(
         self, _populated_container, _fakeredis_cache, span_exporter
     ):

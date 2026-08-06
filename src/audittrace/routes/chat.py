@@ -54,6 +54,7 @@ from audittrace.routes._memory_tool_loop import (
     _tool_call_signatures,
     run_memory_tool_loop,
 )
+from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
 from audittrace.services.context_builder import (
     ContextBuilderService,
     build_ambient_context,
@@ -637,13 +638,26 @@ async def _persist_or_enqueue(
 
 
 def _set_genai_request_attributes(
-    payload: dict[str, Any], query: str, session_id: str, source: str, user_id: str
+    payload: dict[str, Any],
+    query: str,
+    session_id: str,
+    source: str,
+    user_id: str,
+    chat_upstream: str = "",
 ) -> None:
     """Tag the current span with gen_ai.* request attributes for Langfuse.
 
     DESIGN §15 Phase 2: ``langfuse.user.id`` now carries the Keycloak
     ``sub`` claim (the real identity) and ``sovereign.source`` keeps the
     agent string for observability.
+
+    FLEET-ROUTE (SPEC invariant 6): ``chat_upstream`` — the resolved
+    base upstream URL for this request (``resolve_chat_upstream``
+    output) — is ADDITIVE: it surfaces which engine served the call
+    (``audittrace.upstream.host``) alongside the existing
+    ``gen_ai.request.model``, without displacing any pre-existing
+    attribute. Empty string is tolerated (defaults to "" so callers
+    that don't yet resolve an upstream keep working unchanged).
     """
     messages = payload.get("messages") or []
     telemetry.set_current_span_attributes(
@@ -662,6 +676,10 @@ def _set_genai_request_attributes(
             "sovereign.memory.project": payload.get("project") or "",
             "sovereign.source": source,
             "sovereign.user.id": user_id,
+            # FLEET-ROUTE additive attribute (SPEC invariant 6).
+            # upstream_host("") returns "" (no crash), so this is safe to
+            # call unconditionally even for callers that pass no upstream.
+            "audittrace.upstream.host": upstream_host(chat_upstream),
         }
     )
 
@@ -753,6 +771,7 @@ async def _build_memory_context_with_trace(
     session_id: str,
     source: str,
     user_context: UserContext,
+    chat_upstream: str = "",
 ) -> tuple[str, str | None]:
     """Build memory context inside a Langfuse span; return (context, trace_id).
 
@@ -765,9 +784,14 @@ async def _build_memory_context_with_trace(
 
     DESIGN §15 Phase 2: ``user_context`` is threaded into the context
     builder so every layer can apply per-user scoping.
+
+    FLEET-ROUTE: ``chat_upstream`` is the resolved upstream base URL for
+    this request (passed by the caller, which has already computed it
+    with ``resolve_chat_upstream`` — this function stays pure w.r.t.
+    routing, it only tags the span with the result).
     """
     _set_genai_request_attributes(
-        payload, query, session_id, source, user_context.user_id
+        payload, query, session_id, source, user_context.user_id, chat_upstream
     )
     memory_context = await context_builder.build_system_context(
         user_context,
@@ -1225,15 +1249,23 @@ async def _stream_memory_tool_loop(
 @router.get("/models")
 @log_call(logger=logger)
 async def list_models(
+    model: str | None = None,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["audittrace:query"]),
 ) -> Any:
     """Proxy GET /v1/models to llama-server.
 
     OpenAI-compatible clients (OpenCode, Continue) call this to discover
-    available models before sending chat completions.
+    available models before sending chat completions. FLEET-ROUTE: an
+    optional ``?model=`` query param lets a caller ask which models a
+    SPECIFIC routed engine serves (e.g. ``?model=mistral`` to list the
+    Mistral upstream's models) — additive, defaults to the unrouted
+    ``llama_url`` behaviour so existing callers are unaffected.
     """
     settings = get_settings()
-    models_url = settings.llama_url.rstrip("/") + "/models"
+    upstream = resolve_chat_upstream(
+        model or "", settings.model_routes, settings.llama_url
+    )
+    models_url = upstream.rstrip("/") + "/models"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(models_url)
@@ -1257,6 +1289,7 @@ def _prepare_tools_mode_trace(
     session_id: str,
     source: str,
     user_context: UserContext,
+    chat_upstream: str = "",
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Set gen_ai.* request attributes on the active Langfuse span and
     return ``(tools_for_user, trace_id)``.
@@ -1278,9 +1311,13 @@ def _prepare_tools_mode_trace(
     span is the LLM reply, which ``_record_langfuse_output`` pushes via
     the ingestion API *after* the tool-call loop completes. Without this
     flag the tools list clobbers the real answer in the Langfuse UI.
+
+    FLEET-ROUTE: ``chat_upstream`` is the already-resolved upstream base
+    URL (see ``_build_memory_context_with_trace`` docstring — same
+    contract, this function stays pure w.r.t. routing).
     """
     _set_genai_request_attributes(
-        payload, query, session_id, source, user_context.user_id
+        payload, query, session_id, source, user_context.user_id, chat_upstream
     )
     tools_for_user = tools_visible_to(user_context)
     trace_id: str | None = None
@@ -1346,6 +1383,13 @@ async def _handle_tools_mode(
     requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
+    # FLEET-ROUTE: resolve the upstream BEFORE opening the trace span so
+    # the resolved host can be tagged on it (SPEC invariant 6). Pure/
+    # synchronous — safe to compute ahead of the @_lf_observe call below.
+    resolved_upstream = resolve_chat_upstream(
+        requested_model, settings.model_routes, settings.llama_url
+    )
+
     # 1 — Open the parent Langfuse span, capture trace_id, and compute
     # which memory tools the caller is scoped for. Runs in a worker
     # thread so the synchronous @_lf_observe decorator doesn't block the
@@ -1357,6 +1401,7 @@ async def _handle_tools_mode(
         session_id,
         source,
         user,
+        resolved_upstream,
     )
 
     ambient = build_ambient_context(user, project, tools_for_user)
@@ -1370,7 +1415,7 @@ async def _handle_tools_mode(
     loop_payload["tools"] = augmented_tools
     loop_payload["stream"] = False  # loop is always non-streaming internally
 
-    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+    llama_url = resolved_upstream.rstrip("/") + "/chat/completions"
 
     # ───────────────────── Streaming branch (#299) ──────────────────────
     # Stream the agentic loop turn-by-turn so content (including <think>)
@@ -1799,6 +1844,15 @@ async def chat_completions(
             persist_mode=persist_mode,
         )
 
+    # FLEET-ROUTE: resolve the upstream from the request `model` BEFORE
+    # opening the trace span so the resolved host can be tagged on it
+    # (SPEC invariant 6). Pure/synchronous — safe to compute ahead of
+    # the @_lf_observe call below.
+    requested_model = payload.get("model", "")
+    resolved_upstream = resolve_chat_upstream(
+        requested_model, settings.model_routes, settings.llama_url
+    )
+
     # Build memory context inside an @observe span (off-loop because the
     # context builder hits ChromaDB and disk synchronously) and capture an
     # explicit trace_id for the post-stream Langfuse update.
@@ -1809,6 +1863,7 @@ async def chat_completions(
         session_id,
         source,
         user,
+        resolved_upstream,
     )
 
     # Augment messages list — every other message field is preserved verbatim.
@@ -1816,9 +1871,8 @@ async def chat_completions(
     proxy_payload = dict(payload)  # shallow copy of top-level keys
     proxy_payload["messages"] = augmented_messages
 
-    llama_url = settings.llama_url.rstrip("/") + "/chat/completions"
+    llama_url = resolved_upstream.rstrip("/") + "/chat/completions"
     project = payload["project"]  # ADR-029: set by _resolve_project on entry
-    requested_model = payload.get("model", "")
     is_stream = bool(payload.get("stream"))
 
     # ─────────────────────────── Streaming branch ───────────────────────────
@@ -2029,6 +2083,9 @@ async def chat_completions(
             gen_span.set_attribute("langfuse.user.id", user.user_id)
             gen_span.set_attribute("user.id", user.user_id)
             gen_span.set_attribute("audittrace.memory_mode", "inject")
+            # FLEET-ROUTE (SPEC invariant 6) — additive; which engine
+            # actually served this generation.
+            gen_span.set_attribute("audittrace.upstream.host", upstream_host(llama_url))
             try:
                 gen_span.set_attribute(
                     "input.value",

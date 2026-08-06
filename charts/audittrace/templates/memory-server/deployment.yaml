@@ -151,6 +151,16 @@ spec:
               value: "http://{{ .Release.Name }}-llm-embed:{{ .Values.externalLLM.embed.port }}/v1"
             - name: AUDITTRACE_SUMMARIZER_URL
               value: "http://{{ .Release.Name }}-llm-summarizer:{{ .Values.externalLLM.summarizer.port }}/v1"
+            # FLEET-ROUTE (Phase 1): model-field routing for the chat path.
+            # JSON object, prefix-matched against the request `model` by
+            # routes/_model_route.py::resolve_chat_upstream — first match
+            # wins, no match / empty model → AUDITTRACE_LLAMA_URL above.
+            # Empty (the default) byte-preserves today's single-upstream
+            # behaviour. memoryServer.modelRoutes is a plain YAML map so
+            # operators don't hand-write JSON; toJson here mirrors the
+            # audittrace.keycloakIssuerExtras precedent.
+            - name: AUDITTRACE_MODEL_ROUTES
+              value: {{ .Values.memoryServer.modelRoutes | default (dict) | toJson | quote }}
             - name: AUDITTRACE_OTLP_ENDPOINT
               value: "http://{{ .Release.Name }}-otel-collector:4318"
             # AUDITTRACE_LANGFUSE_HOST is rendered only when

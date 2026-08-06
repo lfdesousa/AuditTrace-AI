@@ -7,6 +7,7 @@ into the system entry. These tests assert that pass-through holds for
 regression that triggered ADR-024.
 """
 
+import os
 from datetime import date
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
@@ -61,6 +62,7 @@ class _FakeAsyncClient:
         self.last_post_json: dict | None = None
         self.last_stream_json: dict | None = None
         self.last_post_url: str | None = None
+        self.last_get_url: str | None = None
         # Full call history — useful when a single request fans out to multiple
         # POSTs (LLM upstream + Langfuse ingestion).
         self.post_calls: list[dict] = []
@@ -83,6 +85,7 @@ class _FakeAsyncClient:
         return resp
 
     async def get(self, url, **kwargs):
+        self.last_get_url = url
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = self._get_json
@@ -689,6 +692,165 @@ class TestChatProxy:
         body = response.json()
         assert body["object"] == "list"
         assert body["data"][0]["id"] == "qwen3.5"
+
+    def test_models_endpoint_routes_by_optional_model_query_param(self, client):
+        """FLEET-ROUTE: ?model=mistral is additive — old callers that omit
+        it keep hitting llama_url unchanged (default-unchanged, invariant
+        1); a caller that names a routed model gets that engine's
+        /models list."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = (
+            '{"qwen":"http://q.test:11435/v1","mistral":"http://m.test:11438/v1"}'
+        )
+        config_mod.get_settings.cache_clear()
+        try:
+            fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+            with _patch_async_client(fake):
+                response = client.get("/v1/models", params={"model": "mistral-small"})
+            assert response.status_code == 200
+            assert fake.last_get_url == "http://m.test:11438/v1/models"
+        finally:
+            del os.environ["AUDITTRACE_MODEL_ROUTES"]
+            config_mod.get_settings.cache_clear()
+
+    # ─────────────────────────── FLEET-ROUTE ────────────────────────────────
+
+    def _with_model_routes(self, routes_json: str):
+        """Set AUDITTRACE_MODEL_ROUTES for the duration of one test,
+        clearing the @lru_cache'd get_settings before and after (same
+        pattern as TestToolsModeIntegration._flip_to_tools_mode)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = routes_json
+        config_mod.get_settings.cache_clear()
+
+    def _clear_model_routes(self):
+        from audittrace import config as config_mod
+
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+        config_mod.get_settings.cache_clear()
+
+    def test_default_unchanged_when_model_routes_empty(self, client):
+        """SPEC invariant 1: with model_routes at its default ({}), every
+        request — regardless of model — resolves to llama_url, byte-for-
+        byte identical to today's single-upstream URL."""
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert response.status_code == 200
+        assert (
+            fake.last_post_url
+            == "http://host.docker.internal:11435/v1/chat/completions"
+        )
+
+    def test_routes_to_mistral_when_model_matches(self, client):
+        """SPEC invariant 2: model=mistral-... resolves to the configured
+        Mistral upstream, not the default llama_url."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11438/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_routes_to_qwen_when_model_matches(self, client):
+        """SPEC invariant 2, other side of the laptop map."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "qwen3.6-35b-a3b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_unknown_model_falls_back_to_default_never_crashes(self, client):
+        """SPEC invariant 3: a model that matches no configured prefix
+        (e.g. a plain OpenAI-shaped client default) falls back to
+        llama_url — no 500, no dropped request."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_openai_response_shape_unchanged_when_routed(self, client):
+        """SPEC invariant 5: routing changes WHERE the request goes, never
+        the request/response body shape. The response still parses as a
+        standard OpenAI chat.completion object."""
+        self._with_model_routes('{"mistral":"http://host.docker.internal:11438/v1"}')
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("routed ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["choices"][0]["message"]["role"] == "assistant"
+            assert body["choices"][0]["message"]["content"] == "routed ok"
+            # No new required field leaked into the forwarded request body.
+            forwarded_keys = set(fake.last_post_json.keys())
+            assert forwarded_keys.issubset({"model", "messages", "stream", "project"})
+        finally:
+            self._clear_model_routes()
 
     # ──────────────────────────── Streaming branch ─────────────────────────
 
@@ -1351,6 +1513,41 @@ class TestToolsModeIntegration:
         assert len(interactions) >= 1
         assert interactions[-1].user_id == SENTINEL_SUBJECT
         assert tool_calls_rows == []
+
+    async def test_tools_mode_routes_to_mistral_when_model_matches(
+        self, client, _tools_mode, monkeypatch
+    ):
+        """FLEET-ROUTE SPEC invariant 2/5, tools-mode side: the
+        proxy-internal loop POSTs to the RESOLVED upstream, not the bare
+        llama_url, when the request model matches a configured route —
+        while the OpenAI request/response shape is untouched."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv(
+            "AUDITTRACE_MODEL_ROUTES",
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}',
+        )
+        config_mod.get_settings.cache_clear()
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert (
+            fake.post_calls[0]["url"]
+            == "http://host.docker.internal:11438/v1/chat/completions"
+        )
+        assert response.json()["choices"][0]["message"]["role"] == "assistant"
 
     async def test_tools_mode_memory_prompt_fires_loop_and_audits(
         self, client, _tools_mode
