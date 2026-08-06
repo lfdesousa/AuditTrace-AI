@@ -44,6 +44,7 @@ WS2's scope, not this module's.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -513,12 +514,31 @@ class PrivilegedHealer:
         (``self._heal_dir`` / ``self._requests_dir`` — #411 v2, no unwatched
         fallback); propagates ``PermissionError``/``OSError`` unchanged so the
         caller can log the specific failure before it turns UNSAFE.
+
+        **#411 v3 (cleanup on every exit path, PYTHON-ENGINEERING §1).** The
+        ``audittrace-mesh-heal.tmpfiles.conf`` rule recreates ``heal_dir`` and
+        ``heal_dir/requests`` as TWO SEPARATE ``d`` lines, so they can fall out
+        of sync at that exact granularity: ``heal_dir`` (parent, where
+        ``tmp_path`` is written) stays writable while ``requests/`` (where
+        ``os.replace`` lands) does not. In that case the tmp-write above
+        succeeds but ``os.replace`` raises — and without this guard the
+        ``.{request_id}.json.tmp`` sitting in ``heal_dir`` was never cleaned
+        up, an orphaned resource leak the v2 reviewer caught. The ``try`` below
+        wraps both the write and the rename so ANY exception on either step
+        cleans up ``tmp_path`` (``contextlib.suppress(OSError)`` — the unlink
+        itself must never mask the original error, and is a no-op if the write
+        never got far enough to create the file) before re-raising unchanged.
         """
         tmp_path = self._heal_dir / f".{request_id}.json.tmp"
         req_path = self._requests_dir / f"{request_id}.json"
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload))
-        os.replace(tmp_path, req_path)
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload))
+            os.replace(tmp_path, req_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
         return req_path
 
     def _trigger_host_resettle(self, finding: Finding) -> HealAttempt:

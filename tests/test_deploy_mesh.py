@@ -1356,6 +1356,77 @@ def test_g3_gate_resolves_unsafe_not_false_healed_on_unwritable_dir(
         heal_dir.chmod(0o775)
 
 
+# ── #411 v3 — no orphaned tmp file when ONLY requests/ is unwritable ────────
+#
+# G3 above makes heal_dir (the PARENT) unwritable, so the tmp-write inside
+# heal_dir fails FIRST and never reaches os.replace — it never exercises the
+# narrower gap the v2 reviewer found. audittrace-mesh-heal.tmpfiles.conf
+# recreates heal_dir and heal_dir/requests as TWO SEPARATE `d` lines, so they
+# can drift out of sync at exactly that granularity: heal_dir stays writable
+# (the self-gate's os.access(reqs, W_OK) check would otherwise refuse to even
+# attempt the write — see PrivilegedHealer._host_root_installed), but
+# requests/ specifically is not. That is a TOCTOU: the self-gate's snapshot
+# can pass and the dir can still turn unwritable by the time os.replace()
+# actually runs (root re-recreated it, a race with the tmpfiles rule, ...).
+# This test simulates that race deterministically by bypassing the snapshot
+# check (monkeypatching _host_root_installed to True, exactly as its own
+# docstring warns callers not to rely on it as a guarantee) while the real
+# filesystem state has ONLY requests/ chmod'd unwritable.
+def test_publish_request_cleans_up_orphan_tmp_when_only_requests_subdir_unwritable(
+    monkeypatch, caplog, tmp_path
+):
+    heal_dir = tmp_path / "heal"
+    (heal_dir / "requests").mkdir(parents=True)
+    (heal_dir / "results").mkdir(parents=True)
+    (heal_dir / "requests").chmod(0o500)  # ONLY requests/ unwritable
+    try:
+        healer = PrivilegedHealer(heal_dir=heal_dir)
+        # Bypass the os.access snapshot so the TOCTOU race is exercised
+        # deterministically instead of self-gating to a no-op before ever
+        # reaching _publish_request.
+        monkeypatch.setattr(healer, "_host_root_installed", lambda: True)
+        gate = MeshGate(
+            MeshGateConfig(max_heal_attempts=2),
+            healer=healer,
+        )
+        monkeypatch.setattr(mesh, "_sleep", lambda s: None)
+        monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+        gate.diagnose_mesh = lambda: Diagnosis(  # type: ignore[method-assign]
+            findings=[Finding("node-not-ready", "kubelet")]
+        )
+        with caplog.at_level(logging.ERROR, logger="scripts.deploy.mesh"):
+            result = gate.evaluate()
+
+        # (a) no orphaned .tmp file leaked into heal_dir across the failed
+        # os.replace — the exact resource-cleanup gap the v2 reviewer flagged.
+        leaked = list(heal_dir.glob(".*.json.tmp"))
+        assert not leaked, f"orphaned tmp file(s) leaked: {leaked}"
+        # (b) still honest: the gate resolves UNSAFE, never a false "healed",
+        # exactly like the parent-unwritable G3 case.
+        assert result.outcome == UNSAFE
+        assert result.safe is False
+        assert len(result.heal_attempts) == 1
+        assert result.heal_attempts[0].action == "error"
+    finally:
+        (heal_dir / "requests").chmod(0o775)
+
+
+def test_publish_request_reraises_permission_error_unchanged(tmp_path):
+    # Direct unit test of _publish_request itself (the method the fix touches):
+    # the write into heal_dir succeeds, os.replace into requests/ raises, the
+    # SAME exception type propagates (never swallowed/wrapped by the cleanup).
+    heal_dir = tmp_path / "heal"
+    (heal_dir / "requests").mkdir(parents=True)
+    (heal_dir / "requests").chmod(0o500)
+    try:
+        healer = PrivilegedHealer(heal_dir=heal_dir)
+        with pytest.raises(PermissionError):
+            healer._publish_request("req-direct", {"foo": "bar"})
+        assert not list(heal_dir.glob(".*.json.tmp"))
+    finally:
+        (heal_dir / "requests").chmod(0o775)
+
+
 # ── G4 — the tmpfiles.d rule targets the watched dir, can't drift ───────────
 
 
