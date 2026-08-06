@@ -90,15 +90,24 @@ memoryServer:
     # to Always — same 2026-04-18 trap.
     pullPolicy: IfNotPresent
   # -- FLEET-ROUTE (Phase 1) — model-field routing for the chat path --------
-  # Rendered as AUDITTRACE_MODEL_ROUTES (JSON object) — see
+  # Rendered as AUDITTRACE_MODEL_ROUTES (JSON object) via the
+  # audittrace.modelRoutes helper (templates/_helpers.tpl) — see
   # templates/memory-server/deployment.yaml. Prefix-matched against the
   # request `model` field, first match wins; no match / empty model falls
   # back to AUDITTRACE_LLAMA_URL. Empty map (the default) byte-preserves
   # today's single-upstream behaviour — safe to ship dark on every target.
-  # Laptop FLEET override (builder=Mistral, reviewer=Qwen — both already
-  # reachable via host.docker.internal, same as llama_url's laptop path):
-  #   --set memoryServer.modelRoutes.qwen=http://host.docker.internal:11435/v1 \
-  #   --set memoryServer.modelRoutes.mistral=http://host.docker.internal:11438/v1
+  # An explicit entry here always wins over any chart-computed default
+  # (Sprig `merge`: dst keys win over src).
+  #
+  # FLEET-ROUTE-ENABLE (2026-08-06): the preferred way to light up Mistral
+  # is `--set externalLLM.mistral.enabled=true` (see the `externalLLM`
+  # block below) — it routes through the in-cluster `-llm-mistral`
+  # ExternalName Service + no-mTLS DestinationRule, mirroring how
+  # AUDITTRACE_LLAMA_URL/_EMBED_URL/_SUMMARIZER_URL are wired, so the call
+  # stays inside the mesh boundary. Setting `modelRoutes.mistral` directly
+  # to a raw `host.docker.internal:11438` URL (as this comment used to
+  # suggest) bypasses that boundary — the ExternalName Service exists so
+  # nothing has to.
   modelRoutes: {}
   summariser:
     # When true, a post-install/post-upgrade Helm hook provisions a
@@ -336,6 +345,24 @@ externalLLM:
   summarizer:
     name: llm-summarizer
     port: 11437
+  # FLEET-ROUTE-ENABLE (2026-08-06, #229 follow-up) — addressable upstream
+  # for the host `:11438` Mistral llama-server (the local sovereign fleet's
+  # workhorse — project_local_sovereign_fleet_opencode). Mirrors chat/embed/
+  # summarizer above exactly, gated by its own `enabled` flag so this stays
+  # additive/default-safe: `enabled: false` (the default) renders NO
+  # `-llm-mistral` Service, NO DestinationRule entry, and
+  # AUDITTRACE_MODEL_ROUTES stays `{}` — byte-identical to pre-FLEET-ROUTE-
+  # ENABLE behaviour for every model. Set `enabled: true` (e.g. `--set
+  # externalLLM.mistral.enabled=true`) to render the `-llm-mistral`
+  # ExternalName Service + no-mTLS DestinationRule and default
+  # AUDITTRACE_MODEL_ROUTES to route `mistral*` models to it through the
+  # mesh (audittrace.modelRoutes helper, templates/_helpers.tpl). Qwen
+  # intentionally has no equivalent block — it stays the default
+  # fall-through upstream (AUDITTRACE_LLAMA_URL), never a modelRoutes entry.
+  mistral:
+    name: llm-mistral
+    port: 11438
+    enabled: false
 
 # -- LLM stub (in-cluster, wiring/integration tests only) ---------------------
 # An in-cluster OpenAI-compatible stub that serves deterministic canned

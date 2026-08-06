@@ -142,6 +142,35 @@ iss was not in externalIssuers. 2026-05-28 burn (cloud Tier-0 login).
 {{- end }}
 
 {{/*
+FLEET-ROUTE-ENABLE (2026-08-06, #229 follow-up) — computes
+AUDITTRACE_MODEL_ROUTES (rendered by templates/memory-server/deployment.yaml).
+
+Starts from the operator-provided memoryServer.modelRoutes map (default:
+{}), then — only when externalLLM.enabled AND externalLLM.mistral.enabled
+are both true — fills in a `mistral` key that routes through the
+in-cluster `<release>-llm-mistral` ExternalName Service on
+externalLLM.mistral.port, mirroring how AUDITTRACE_LLAMA_URL /
+_EMBED_URL / _SUMMARIZER_URL address their upstreams (NOT a
+host.docker.internal bypass). An operator-set
+memoryServer.modelRoutes.mistral value always wins over the computed
+default (Sprig `merge`: dst keys are never overwritten by src).
+
+With externalLLM.mistral.enabled=false (the default) this renders `{}`
+— byte-identical to pre-FLEET-ROUTE-ENABLE behaviour (G3
+additive/default-safe). Qwen has no equivalent branch: it is the
+default fall-through upstream (AUDITTRACE_LLAMA_URL) and must never get
+a redundant modelRoutes entry.
+*/}}
+{{- define "audittrace.modelRoutes" -}}
+{{- $routes := .Values.memoryServer.modelRoutes | default dict -}}
+{{- if and .Values.externalLLM.enabled .Values.externalLLM.mistral.enabled -}}
+{{- $mistralUrl := printf "http://%s-llm-mistral:%v/v1" .Release.Name .Values.externalLLM.mistral.port -}}
+{{- $routes = merge $routes (dict "mistral" $mistralUrl) -}}
+{{- end -}}
+{{- $routes | toJson -}}
+{{- end -}}
+
+{{/*
 Object-storage backend selector (ADR-006). Returns "minio" or "aws".
 Anything else fails `objectStorageAssertAws` below.
 */}}
