@@ -7,6 +7,7 @@ into the system entry. These tests assert that pass-through holds for
 regression that triggered ADR-024.
 """
 
+import os
 from datetime import date
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from audittrace.routes.chat import (
     _apply_thinking_mode,
     _compute_session_id,
     _resolve_project,
+    _resolve_session_id,
     _resolve_thinking,
 )
 from audittrace.services.context_builder import PROFILE_SECTION_HEADER
@@ -61,6 +63,7 @@ class _FakeAsyncClient:
         self.last_post_json: dict | None = None
         self.last_stream_json: dict | None = None
         self.last_post_url: str | None = None
+        self.last_get_url: str | None = None
         # Full call history — useful when a single request fans out to multiple
         # POSTs (LLM upstream + Langfuse ingestion).
         self.post_calls: list[dict] = []
@@ -83,6 +86,7 @@ class _FakeAsyncClient:
         return resp
 
     async def get(self, url, **kwargs):
+        self.last_get_url = url
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = self._get_json
@@ -444,6 +448,39 @@ class _FakeRequest:
         self.headers = headers or {}
 
 
+class TestResolveSessionId:
+    """FLEET-ROUTE Gate #6 — client-settable run id (unit level).
+
+    The probe found ``X-Session-Id`` was IGNORED; ``_resolve_session_id``
+    honours it when present and falls through to ``_compute_session_id``
+    (byte-for-byte) when absent — per-agent-run reconstruction depends on
+    this so ``GET /interactions?session_id=<run>`` returns exactly one
+    OpenCode fleet-agent run."""
+
+    def test_header_present_wins_over_computed(self):
+        req = _FakeRequest({"x-session-id": "agent-run-42"})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_is_whitespace_trimmed(self):
+        req = _FakeRequest({"x-session-id": "  agent-run-42  "})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_absent_falls_through_to_computed_byte_for_byte(self):
+        """Gate #6, absence side: identical to today's exact behaviour —
+        the resolved session_id must equal ``_compute_session_id`` called
+        with the same inputs, not merely 'be present'."""
+        req = _FakeRequest()
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
+
+    def test_blank_header_falls_through_to_computed(self):
+        """An empty/whitespace-only header is treated as absent, same
+        honesty model as ``_resolve_project``."""
+        req = _FakeRequest({"x-session-id": "   "})
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
+
+
 class TestResolveProject:
     """ADR-029 project tag precedence: header → metadata.project → body.project → default."""
 
@@ -690,6 +727,165 @@ class TestChatProxy:
         assert body["object"] == "list"
         assert body["data"][0]["id"] == "qwen3.5"
 
+    def test_models_endpoint_routes_by_optional_model_query_param(self, client):
+        """FLEET-ROUTE: ?model=mistral is additive — old callers that omit
+        it keep hitting llama_url unchanged (default-unchanged, invariant
+        1); a caller that names a routed model gets that engine's
+        /models list."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = (
+            '{"qwen":"http://q.test:11435/v1","mistral":"http://m.test:11438/v1"}'
+        )
+        config_mod.get_settings.cache_clear()
+        try:
+            fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+            with _patch_async_client(fake):
+                response = client.get("/v1/models", params={"model": "mistral-small"})
+            assert response.status_code == 200
+            assert fake.last_get_url == "http://m.test:11438/v1/models"
+        finally:
+            del os.environ["AUDITTRACE_MODEL_ROUTES"]
+            config_mod.get_settings.cache_clear()
+
+    # ─────────────────────────── FLEET-ROUTE ────────────────────────────────
+
+    def _with_model_routes(self, routes_json: str):
+        """Set AUDITTRACE_MODEL_ROUTES for the duration of one test,
+        clearing the @lru_cache'd get_settings before and after (same
+        pattern as TestToolsModeIntegration._flip_to_tools_mode)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        os.environ["AUDITTRACE_MODEL_ROUTES"] = routes_json
+        config_mod.get_settings.cache_clear()
+
+    def _clear_model_routes(self):
+        from audittrace import config as config_mod
+
+        del os.environ["AUDITTRACE_MODEL_ROUTES"]
+        config_mod.get_settings.cache_clear()
+
+    def test_default_unchanged_when_model_routes_empty(self, client):
+        """SPEC invariant 1: with model_routes at its default ({}), every
+        request — regardless of model — resolves to llama_url, byte-for-
+        byte identical to today's single-upstream URL."""
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert response.status_code == 200
+        assert (
+            fake.last_post_url
+            == "http://host.docker.internal:11435/v1/chat/completions"
+        )
+
+    def test_routes_to_mistral_when_model_matches(self, client):
+        """SPEC invariant 2: model=mistral-... resolves to the configured
+        Mistral upstream, not the default llama_url."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11438/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_routes_to_qwen_when_model_matches(self, client):
+        """SPEC invariant 2, other side of the laptop map."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "qwen3.6-35b-a3b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_unknown_model_falls_back_to_default_never_crashes(self, client):
+        """SPEC invariant 3: a model that matches no configured prefix
+        (e.g. a plain OpenAI-shaped client default) falls back to
+        llama_url — no 500, no dropped request."""
+        self._with_model_routes(
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}'
+        )
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            assert (
+                fake.last_post_url
+                == "http://host.docker.internal:11435/v1/chat/completions"
+            )
+        finally:
+            self._clear_model_routes()
+
+    def test_openai_response_shape_unchanged_when_routed(self, client):
+        """SPEC invariant 5: routing changes WHERE the request goes, never
+        the request/response body shape. The response still parses as a
+        standard OpenAI chat.completion object."""
+        self._with_model_routes('{"mistral":"http://host.docker.internal:11438/v1"}')
+        try:
+            fake = _FakeAsyncClient(post_json=_ok_chat_response("routed ok"))
+            with _patch_async_client(fake):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "mistral-small-3.1-24b",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["choices"][0]["message"]["role"] == "assistant"
+            assert body["choices"][0]["message"]["content"] == "routed ok"
+            # No new required field leaked into the forwarded request body.
+            forwarded_keys = set(fake.last_post_json.keys())
+            assert forwarded_keys.issubset({"model", "messages", "stream", "project"})
+        finally:
+            self._clear_model_routes()
+
     # ──────────────────────────── Streaming branch ─────────────────────────
 
     def test_chat_proxy_streams_when_stream_true(self, client):
@@ -792,6 +988,50 @@ class TestChatProxy:
         assert "bash" in latest.answer
         assert "wc -l" in latest.answer
 
+    async def test_chat_proxy_streaming_persists_request_alias_not_upstream_echo(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #5 (inject-mode, STREAMING path): the streamed
+        SSE chunk's ``model`` field echoes a GGUF path, different from the
+        request alias. The persisted row must record the request alias,
+        never ``state.model``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            'data: {"choices":[{"finish_reason":"stop","delta":{}}],'
+            f'"model":"{upstream_echo}",'
+            '"timings":{"cache_n":100,"prompt_n":50,"predicted_n":2}}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
     async def test_chat_proxy_persists_interaction(self, client):
         """A successful chat completion writes a row to interactions."""
         from audittrace.db.models import InteractionRecord
@@ -840,6 +1080,112 @@ class TestChatProxy:
         assert latest.model == "qwen3.5-35b"
         # Phase 2: every audit row carries the sentinel user_id in bypass mode.
         assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_chat_proxy_persists_request_alias_not_upstream_echo(self, client):
+        """FLEET-ROUTE Gate #5 (non-streaming, inject-mode path): the
+        interactions row must record the request alias FLEET-ROUTE routed
+        on, NOT llama.cpp's echoed GGUF path. ``_ok_chat_response`` hardcodes
+        the mock upstream ``model``, which never surfaces this divergence —
+        so this test uses a DIFFERENT model on the request than the mocked
+        upstream echoes."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _FakeAsyncClient(
+            post_json={
+                "id": "cmpl-divergent",
+                "model": upstream_echo,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi there!"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 4,
+                    "total_tokens": 16,
+                },
+            }
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "Persist this"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        # The divergence assertion: recorded model is the REQUEST alias,
+        # never the upstream's echoed GGUF path.
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    async def test_chat_proxy_x_session_id_header_becomes_persisted_session_id(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #6: a caller-supplied ``X-Session-Id`` becomes
+        the persisted ``session_id`` verbatim, so ``GET
+        /interactions?session_id=<run>`` reconstructs exactly that agent
+        run."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-Id": "fleet-run-2026-08-06-001"},
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == "fleet-run-2026-08-06-001"
+
+    async def test_chat_proxy_without_x_session_id_preserves_computed_session_id(
+        self, client
+    ):
+        """Gate #6, absence side: byte-for-byte the prior computed
+        behaviour — the persisted session_id equals
+        ``_compute_session_id(source, first_user_message, user_id)``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+        from audittrace.identity import SENTINEL_SUBJECT as _SENTINEL
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "no header here"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        expected = _compute_session_id("unknown", "no header here", _SENTINEL)
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == expected
 
     def test_chat_proxy_with_project(self, client):
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
@@ -1241,11 +1587,11 @@ class TestChatProxy:
 #     user_id, and flushes ToolCall audit rows after the interaction lands.
 
 
-def _tools_mode_response_text(text: str = "done") -> dict:
+def _tools_mode_response_text(text: str = "done", model: str = "qwen3.5-35b") -> dict:
     return {
         "id": "cmpl-test",
         "object": "chat.completion",
-        "model": "qwen3.5-35b",
+        "model": model,
         "choices": [
             {
                 "index": 0,
@@ -1352,6 +1698,41 @@ class TestToolsModeIntegration:
         assert interactions[-1].user_id == SENTINEL_SUBJECT
         assert tool_calls_rows == []
 
+    async def test_tools_mode_routes_to_mistral_when_model_matches(
+        self, client, _tools_mode, monkeypatch
+    ):
+        """FLEET-ROUTE SPEC invariant 2/5, tools-mode side: the
+        proxy-internal loop POSTs to the RESOLVED upstream, not the bare
+        llama_url, when the request model matches a configured route —
+        while the OpenAI request/response shape is untouched."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv(
+            "AUDITTRACE_MODEL_ROUTES",
+            '{"qwen":"http://host.docker.internal:11435/v1",'
+            '"mistral":"http://host.docker.internal:11438/v1"}',
+        )
+        config_mod.get_settings.cache_clear()
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mistral-small-3.1-24b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert (
+            fake.post_calls[0]["url"]
+            == "http://host.docker.internal:11438/v1/chat/completions"
+        )
+        assert response.json()["choices"][0]["message"]["role"] == "assistant"
+
     async def test_tools_mode_memory_prompt_fires_loop_and_audits(
         self, client, _tools_mode
     ):
@@ -1400,6 +1781,41 @@ class TestToolsModeIntegration:
         assert tc_row.granted_scope == "memory:episodic:read"
         assert tc_row.error is None
         assert tc_row.interaction_id == latest_interaction.id
+
+    async def test_tools_mode_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, non-streaming path):
+        ``_tools_mode_response_text`` accepts a ``model=`` override so this
+        test can make the mocked upstream echo a DIFFERENT model (a GGUF
+        path) than the request alias — the divergence that hardcoding both
+        to the same string would hide. The persisted row must record the
+        request alias FLEET-ROUTE routed on, not the upstream echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedClient(
+            [_tools_mode_response_text("Just text.", model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
 
     def test_tools_mode_streams_content_token_by_token(self, client, _tools_mode):
         """#299: stream=true must stream the answer as MULTIPLE content
@@ -1466,6 +1882,40 @@ class TestToolsModeIntegration:
         latest = interactions[-1]
         assert latest.answer == "The answer is 42."
         assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_tools_mode_streaming_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, STREAMING path): the streamed
+        SSE turn echoes a different model (a GGUF path) than the request
+        alias. The persisted row must record the request alias, never the
+        streamed ``result.model`` echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedStreamClient(
+            [_sse_content_lines(["The ", "answer ", "is 42."], model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "q"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
 
     async def test_tools_mode_streaming_through_memory_tool_loop(
         self, client, _tools_mode

@@ -89,6 +89,17 @@ memoryServer:
     # explicitly --set image.tag=latest should also flip pullPolicy back
     # to Always — same 2026-04-18 trap.
     pullPolicy: IfNotPresent
+  # -- FLEET-ROUTE (Phase 1) — model-field routing for the chat path --------
+  # Rendered as AUDITTRACE_MODEL_ROUTES (JSON object) — see
+  # templates/memory-server/deployment.yaml. Prefix-matched against the
+  # request `model` field, first match wins; no match / empty model falls
+  # back to AUDITTRACE_LLAMA_URL. Empty map (the default) byte-preserves
+  # today's single-upstream behaviour — safe to ship dark on every target.
+  # Laptop FLEET override (builder=Mistral, reviewer=Qwen — both already
+  # reachable via host.docker.internal, same as llama_url's laptop path):
+  #   --set memoryServer.modelRoutes.qwen=http://host.docker.internal:11435/v1 \
+  #   --set memoryServer.modelRoutes.mistral=http://host.docker.internal:11438/v1
+  modelRoutes: {}
   summariser:
     # When true, a post-install/post-upgrade Helm hook provisions a
     # dedicated, minimum-privilege `audittrace_summariser` role with

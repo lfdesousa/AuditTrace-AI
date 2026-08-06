@@ -71,6 +71,20 @@ class Settings(BaseSettings):
 
     # LLM servers (external, on host machine)
     llama_url: str = "http://host.docker.internal:11435/v1"
+    # FLEET-ROUTE (Phase 1): model-field routing for the chat path.
+    # Prefix-matched (case-insensitive) against the request `model` by
+    # routes/_model_route.py::resolve_chat_upstream; first match wins;
+    # no match / empty model → llama_url. Generalises the summarizer_url
+    # per-role-upstream precedent below to the interactive chat path —
+    # empty dict (the default) byte-preserves today's single-upstream
+    # behaviour, so this is safe to ship dark. Populated from env
+    # AUDITTRACE_MODEL_ROUTES (JSON object), same mechanism pydantic-
+    # settings already uses for AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS /
+    # AUDITTRACE_CORS_ORIGINS. Laptop value (set via chart
+    # memoryServer.modelRoutes):
+    #   {"qwen": "http://host.docker.internal:11435/v1",
+    #    "mistral": "http://host.docker.internal:11438/v1"}
+    model_routes: dict[str, str] = {}
     embed_url: str = "http://host.docker.internal:11436/v1"
     # ADR-047 — embedding always runs on the dedicated nomic-embed-server;
     # the request gateway hosts no in-process model. 768-dim.

@@ -2862,8 +2862,25 @@ paths:
 
         OpenAI-compatible clients (OpenCode, Continue) call this to discover
 
-        available models before sending chat completions.'
+        available models before sending chat completions. FLEET-ROUTE: an
+
+        optional ``?model=`` query param lets a caller ask which models a
+
+        SPECIFIC routed engine serves (e.g. ``?model=mistral`` to list the
+
+        Mistral upstream''s models) — additive, defaults to the unrouted
+
+        ``llama_url`` behaviour so existing callers are unaffected.'
       operationId: list_models_v1_models_get
+      parameters:
+      - in: query
+        name: model
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
       responses:
         '200':
           content:
@@ -2871,6 +2888,12 @@ paths:
               schema:
                 title: Response List Models V1 Models Get
           description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
       security:
       - audittrace-oauth2:
         - audittrace:query
