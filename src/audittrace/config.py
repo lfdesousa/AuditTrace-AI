@@ -80,10 +80,12 @@ class Settings(BaseSettings):
     # behaviour, so this is safe to ship dark. Populated from env
     # AUDITTRACE_MODEL_ROUTES (JSON object), same mechanism pydantic-
     # settings already uses for AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS /
-    # AUDITTRACE_CORS_ORIGINS. Laptop value (set via chart
-    # memoryServer.modelRoutes):
-    #   {"qwen": "http://host.docker.internal:11435/v1",
-    #    "mistral": "http://host.docker.internal:11438/v1"}
+    # AUDITTRACE_CORS_ORIGINS. Qwen intentionally has NO entry — it is
+    # the default fall-through (llama_url above), never a redundant
+    # route. FLEET-ROUTE-ENABLE (2026-08-06): the chart computes this
+    # to route mistral* through the mesh-addressable `<release>-llm-
+    # mistral` Service (--set externalLLM.mistral.enabled=true), e.g.:
+    #   {"mistral": "http://audittrace-llm-mistral:11438/v1"}
     model_routes: dict[str, str] = {}
     embed_url: str = "http://host.docker.internal:11436/v1"
     # ADR-047 — embedding always runs on the dedicated nomic-embed-server;

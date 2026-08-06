@@ -1,7 +1,11 @@
 {{- if .Values.istio.enabled }}
 {{- $ns := .Release.Namespace }}
 {{- $rel := .Release.Name }}
-{{- range list "llm-chat" "llm-embed" "llm-summarizer" }}
+{{- $components := list "llm-chat" "llm-embed" "llm-summarizer" }}
+{{- if and .Values.externalLLM.enabled .Values.externalLLM.mistral.enabled }}
+{{- $components = append $components "llm-mistral" }}
+{{- end }}
+{{- range $components }}
 ---
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule

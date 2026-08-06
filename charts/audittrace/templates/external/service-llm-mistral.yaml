@@ -1,0 +1,18 @@
+{{- if and .Values.externalLLM.enabled .Values.externalLLM.mistral.enabled }}
+{{- $host := required "externalLLM.host (FQDN) is required when externalLLM.enabled=true — see ADR-045 (FQDN-only)" .Values.externalLLM.host }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-llm-mistral
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-mistral
+spec:
+  type: ExternalName
+  externalName: {{ $host | quote }}
+  ports:
+    - port: {{ .Values.externalLLM.mistral.port }}
+      targetPort: {{ .Values.externalLLM.mistral.port }}
+      protocol: TCP
+      name: http
+{{- end }}
