@@ -10,6 +10,7 @@ converge MUST NOT loop forever — all asserted here in both directions.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -37,9 +38,11 @@ from scripts.deploy.mesh import (
     is_host_resettle_allowed,
 )
 
-RESETTLE_SCRIPT = (
-    Path(mesh.__file__).resolve().parents[1] / "audittrace-mesh-resettle.sh"
-)
+SCRIPTS_DIR = Path(mesh.__file__).resolve().parents[1]
+RESETTLE_SCRIPT = SCRIPTS_DIR / "audittrace-mesh-resettle.sh"
+PATH_UNIT = SCRIPTS_DIR / "audittrace-mesh-healer.path"
+SERVICE_UNIT = SCRIPTS_DIR / "audittrace-mesh-healer.service"
+TMPFILES_RULE = SCRIPTS_DIR / "audittrace-mesh-heal.tmpfiles.conf"
 
 
 def _proc(returncode=0, stdout="", stderr=""):
@@ -1183,3 +1186,248 @@ def test_executor_noop_when_no_requests(tmp_path):
     )
     assert proc.returncode == 0
     assert "no pending requests" in proc.stderr
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #411 v2 — durable watched-dir ownership (G1-G4)
+#
+# v1 was REJECTED: it wrote heal-state to an unwatched FALLBACK dir on
+# PermissionError and called that "healed". Nothing watches a fallback dir, so
+# the root .path unit never fires and the deploy still ends UNSAFE — just
+# slower and silently. These tests are designed to KILL that exact vacuity:
+# G1 proves the code writes into the SAME dir the .path unit watches (parsed
+# from the real unit file, not asserted against a hardcoded literal); G2
+# drives the REAL root executor script against that SAME dir (never a
+# monkeypatched result-drop into an unwatched location); G3 proves an
+# unwritable watched dir produces a loud ERROR + UNSAFE, never a false
+# "healed"; G4 proves the shipped tmpfiles.d rule targets that SAME dir with
+# runner ownership + 0775, so the rule cannot silently drift from the unit.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _path_unit_watched_dir() -> Path:
+    """Parse ``DirectoryNotEmpty=`` out of the REAL audittrace-mesh-healer.path
+    unit — never a hardcoded literal, so this test cannot pass by coincidence.
+    """
+    for line in PATH_UNIT.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("DirectoryNotEmpty="):
+            return Path(stripped.split("=", 1)[1].strip())
+    raise AssertionError(f"DirectoryNotEmpty= not found in {PATH_UNIT}")
+
+
+def _service_unit_heal_dir() -> Path:
+    """Parse ``Environment=MESH_HEAL_DIR=`` out of the REAL .service unit."""
+    for line in SERVICE_UNIT.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Environment=MESH_HEAL_DIR="):
+            return Path(stripped.split("=", 2)[2].strip())
+    raise AssertionError(f"Environment=MESH_HEAL_DIR= not found in {SERVICE_UNIT}")
+
+
+# ── G1 — THE anti-vacuity gate: written dir == watched dir ───────────────────
+
+
+def test_g1_default_requests_dir_matches_path_units_watched_dir():
+    # Neuter-and-restore proof (done by hand during the build, reverted): if
+    # PrivilegedHealer's default heal_dir pointed at any OTHER path than
+    # DEFAULT_MESH_HEAL_DIR, this assertion goes red. That is the exact
+    # divergence that hid the v1 bug.
+    watched = _path_unit_watched_dir()
+    assert mesh.mesh_heal_dir() / "requests" == watched
+    assert PrivilegedHealer()._requests_dir == watched
+
+
+def test_g1_service_unit_heal_dir_is_the_single_source_of_truth():
+    # The .service's MESH_HEAL_DIR (joined with "requests") must be
+    # byte-identical to the .path unit's watched dir — both units and the
+    # code all key off the ONE env var, never independent literals.
+    assert _service_unit_heal_dir() / "requests" == _path_unit_watched_dir()
+    assert _service_unit_heal_dir() == Path(mesh.DEFAULT_MESH_HEAL_DIR)
+
+
+def test_g1_env_override_still_targets_requests_subdir_of_mesh_heal_dir(
+    monkeypatch,
+):
+    # The env-override path (MESH_HEAL_DIR, what the .service actually sets)
+    # must resolve to the same "<dir>/requests" shape the .path unit expects.
+    monkeypatch.setenv("MESH_HEAL_DIR", "/tmp/custom-heal-dir")
+    assert mesh.mesh_heal_dir() / "requests" == Path("/tmp/custom-heal-dir/requests")
+
+
+# ── G2 — end-to-end via the REAL watched dir, REAL executor script ──────────
+
+
+def test_g2_end_to_end_via_real_watched_dir_and_real_executor(monkeypatch, tmp_path):
+    # Writes the request via the UNMOCKED code path (_trigger_host_resettle ->
+    # _publish_request), into tmp_path/requests. The poll's sleep then drives
+    # the REAL scripts/audittrace-mesh-resettle.sh (dry-run: selects the
+    # bounded op, never executes systemctl) against that SAME dir — exactly
+    # the .path unit's job in production. This is NOT a monkeypatched
+    # result-drop into an unwatched dir: the result file comes from the real
+    # script reading + writing the same watched dir the healer wrote into.
+    (tmp_path / "requests").mkdir()
+    healer = PrivilegedHealer(
+        heal_dir=tmp_path, resettle_timeout=10.0, resettle_poll=1.0
+    )
+    finding = Finding("node-not-ready", "1 NotReady", {"ready_statuses": ["False"]})
+
+    executor_runs = []
+
+    def fake_sleep(_seconds):
+        proc = subprocess.run(
+            ["bash", str(RESETTLE_SCRIPT)],
+            env={
+                "MESH_HEAL_DIR": str(tmp_path),
+                "MESH_RESETTLE_DRY_RUN": "1",
+                "PATH": "/usr/bin:/bin",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        executor_runs.append(proc)
+
+    monkeypatch.setattr(mesh, "_sleep", fake_sleep)
+    attempt = healer._trigger_host_resettle(finding)
+
+    assert len(executor_runs) == 1
+    assert executor_runs[0].returncode == 0, executor_runs[0].stderr
+    assert attempt.action == "host-resettle"
+    # the bounded op was genuinely selected by the REAL whitelist boundary.
+    assert attempt.evidence["result"]["would_run"] == "systemctl restart k3s"
+    assert attempt.evidence["result"]["status"] == "dry-run"
+
+
+# ── G3 — loud on an unwritable watched dir, never a false "healed" ───────────
+
+
+def test_g3_unwritable_watched_dir_logs_error_names_dir_and_raises(caplog, tmp_path):
+    heal_dir = tmp_path / "heal"
+    (heal_dir / "requests").mkdir(parents=True)
+    (heal_dir / "results").mkdir(parents=True)
+    heal_dir.chmod(0o500)  # root re-recreated it without write perms (#411)
+    try:
+        healer = PrivilegedHealer(heal_dir=heal_dir)
+        finding = Finding("node-not-ready", "1 NotReady")
+        with caplog.at_level(logging.ERROR, logger="scripts.deploy.mesh"):
+            with pytest.raises((PermissionError, OSError)):
+                healer._trigger_host_resettle(finding)
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR log naming the unwritable dir"
+        assert any(str(heal_dir) in r.getMessage() for r in error_records)
+        assert any("tmpfiles" in r.getMessage() for r in error_records)
+        # no half-published request left behind across the privilege boundary.
+        assert not list((heal_dir / "requests").glob("*.json"))
+    finally:
+        heal_dir.chmod(0o775)  # restore so tmp_path teardown can remove it
+
+
+def test_g3_gate_resolves_unsafe_not_false_healed_on_unwritable_dir(
+    monkeypatch, caplog, tmp_path
+):
+    heal_dir = tmp_path / "heal"
+    (heal_dir / "requests").mkdir(parents=True)
+    (heal_dir / "results").mkdir(parents=True)
+    heal_dir.chmod(0o500)
+    try:
+        monkeypatch.setattr(mesh, "_sleep", lambda s: None)
+        monkeypatch.setattr(mesh, "_run", lambda cmd, *, timeout=None: _proc(0, "ok"))
+        gate = MeshGate(
+            MeshGateConfig(max_heal_attempts=2),
+            healer=PrivilegedHealer(heal_dir=heal_dir),
+        )
+        gate.diagnose_mesh = lambda: Diagnosis(  # type: ignore[method-assign]
+            findings=[Finding("node-not-ready", "kubelet")]
+        )
+        with caplog.at_level(logging.ERROR, logger="scripts.deploy.mesh"):
+            result = gate.evaluate()
+        assert result.outcome == UNSAFE
+        assert result.safe is False
+        # honest, not a false "healed": exactly ONE attempt (the raise stops
+        # the bounded loop immediately) and it is recorded as an error.
+        assert len(result.heal_attempts) == 1
+        assert result.heal_attempts[0].action == "error"
+        assert any(
+            r.levelno == logging.ERROR and str(heal_dir) in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        heal_dir.chmod(0o775)
+
+
+# ── G4 — the tmpfiles.d rule targets the watched dir, can't drift ───────────
+
+
+def _tmpfiles_rule_entries() -> dict[str, list[str]]:
+    entries: dict[str, list[str]] = {}
+    for line in TMPFILES_RULE.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if fields[0] == "d":
+            entries[fields[1]] = fields
+    return entries
+
+
+def test_g4_tmpfiles_rule_targets_the_watched_dirs_with_0775():
+    watched_requests = _path_unit_watched_dir()
+    watched_results = watched_requests.parent / "results"
+    entries = _tmpfiles_rule_entries()
+    assert str(watched_requests) in entries
+    assert str(watched_results) in entries
+    for fields in entries.values():
+        assert fields[0] == "d"
+        assert fields[2] == "0775"
+
+
+def test_g4_tmpfiles_rule_owner_is_parameterised_not_hardcoded():
+    # Portability invariant: the runner user/group are placeholders
+    # substituted at INSTALL time (see audittrace-mesh-resettle.sh's header),
+    # never a hardcoded username baked into the shipped file.
+    rule_text = TMPFILES_RULE.read_text()
+    assert "lfdesousa" not in rule_text
+    entries = _tmpfiles_rule_entries()
+    for fields in entries.values():
+        assert fields[3] == "@RUNNER_USER@"
+        assert fields[4] == "@RUNNER_GROUP@"
+
+
+def test_g4_tmpfiles_rule_cannot_drift_from_env_default():
+    # Ties the rule back to the SAME DEFAULT_MESH_HEAL_DIR the code and the
+    # .service key off — a future edit to any ONE of the three without the
+    # others goes red here.
+    entries = _tmpfiles_rule_entries()
+    default_dir = Path(mesh.DEFAULT_MESH_HEAL_DIR)
+    assert str(default_dir / "requests") in entries
+    assert str(default_dir / "results") in entries
+
+
+# ── install wiring: resettle.sh + units reference the tmpfiles rule ─────────
+
+
+def test_resettle_script_install_block_references_tmpfiles_rule():
+    content = RESETTLE_SCRIPT.read_text()
+    assert "audittrace-mesh-heal.tmpfiles.conf" in content
+    assert "systemd-tmpfiles" in content
+
+
+def test_path_unit_references_tmpfiles_rule_as_durable_guarantee():
+    content = PATH_UNIT.read_text()
+    assert "tmpfiles" in content.lower()
+
+
+def test_service_unit_references_tmpfiles_rule_as_durable_guarantee():
+    content = SERVICE_UNIT.read_text()
+    assert "tmpfiles" in content.lower()
+
+
+# ── #411 v2: no unwatched-fallback path anywhere in mesh.py ─────────────────
+
+
+def test_no_fallback_dir_symbol_exists_in_mesh_module():
+    # Falsifiable regression guard against re-introducing the rejected v1
+    # shape (a second, unwatched heal-state dir).
+    assert not hasattr(mesh, "fallback_mesh_heal_dir")
+    assert not hasattr(mesh, "MESH_HEAL_STATE_DIR_ENV")

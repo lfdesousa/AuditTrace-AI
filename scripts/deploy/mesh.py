@@ -375,6 +375,25 @@ class PrivilegedHealer:
     "couldn't fix" — it returns ``HealAttempt(performed=False, ...)`` and lets
     the gate's re-diagnose decide; a raise is reserved for a true internal error
     (the gate catches it → UNSAFE, ``mesh.py`` evaluate()).
+
+    **#411 v2 (write ONLY to the watched dir, loud-fail, no fallback).** The
+    request is written to ``heal_dir/requests`` — the SAME dir
+    ``audittrace-mesh-healer.path``'s ``DirectoryNotEmpty=`` watches, sourced
+    from the SAME ``MESH_HEAL_DIR`` the ``.service`` sets (single source of
+    truth; see :func:`mesh_heal_dir`). There is deliberately no fallback dir:
+    the rejected v1 fix wrote to an unwatched location on
+    ``PermissionError`` and called that "healed" — nothing was ever watching
+    the fallback, so the root ``.path`` unit never fired and the deploy still
+    ended UNSAFE, just slower and silently. The durable fix is
+    ``scripts/audittrace-mesh-heal.tmpfiles.conf`` (recreates the watched dir
+    runner-owned on every boot), not a fallback in this class. If the write
+    still raises ``PermissionError``/``OSError`` — a genuine, un-recovered
+    misconfiguration — :meth:`_trigger_host_resettle` logs an ERROR naming the
+    dir and the tmpfiles fix, then RE-RAISES: this is exactly the "true
+    internal error" case the class docstring above carves out, so the gate's
+    ``evaluate()`` resolves UNSAFE immediately and loudly rather than either
+    fabricating a false "healed" or burning the bounded retry budget against a
+    static permission problem retries cannot fix.
     """
 
     def __init__(
@@ -484,6 +503,24 @@ class PrivilegedHealer:
             },
         )
 
+    def _publish_request(self, request_id: str, payload: dict[str, Any]) -> Path:
+        """Atomically publish the request JSON into the watched ``requests/`` dir.
+
+        Write a tmp file OUTSIDE ``requests/`` then ``os.replace`` it in, so the
+        ``.path`` unit never fires on a half-written request. Context-managed
+        write (``feedback_use_context_managers`` — the handle is always closed,
+        on every exit path, before the rename). Writes ONLY to the watched dir
+        (``self._heal_dir`` / ``self._requests_dir`` — #411 v2, no unwatched
+        fallback); propagates ``PermissionError``/``OSError`` unchanged so the
+        caller can log the specific failure before it turns UNSAFE.
+        """
+        tmp_path = self._heal_dir / f".{request_id}.json.tmp"
+        req_path = self._requests_dir / f"{request_id}.json"
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload))
+        os.replace(tmp_path, req_path)
+        return req_path
+
     def _trigger_host_resettle(self, finding: Finding) -> HealAttempt:
         """HOST-ROOT tier (Q3 boundary): the ONLY method that touches privilege.
 
@@ -491,7 +528,8 @@ class PrivilegedHealer:
         the watched ``requests/`` dir, then polls ``results/`` for the root unit's
         verdict within a bounded timeout. If Q3 is ever revisited, only this
         method changes. Fails closed (``performed=False``) on refusal or timeout;
-        never raises for "couldn't fix".
+        never raises for "couldn't fix" — EXCEPT the write itself (see #411 v2
+        note below, and the class docstring).
         """
         if not is_host_resettle_allowed(finding.signal):
             # Defence in depth: the caller already routed by tier, but never let
@@ -514,7 +552,6 @@ class PrivilegedHealer:
                 detail="host-root re-settle not installed on this host",
                 evidence={"signal": finding.signal},
             )
-        self._results_dir.mkdir(parents=True, exist_ok=True)
         request_id = f"{finding.signal}-{uuid.uuid4().hex[:12]}"
         payload = {
             "request_id": request_id,
@@ -523,13 +560,32 @@ class PrivilegedHealer:
             "evidence": finding.evidence,
             "requested_at": _now_iso(),
         }
-        # Publish atomically: write a tmp file OUTSIDE requests/ then os.replace
-        # in, so the .path unit never fires on a half-written request.
-        tmp_path = self._heal_dir / f".{request_id}.json.tmp"
-        req_path = self._requests_dir / f"{request_id}.json"
         result_path = self._results_dir / f"{request_id}.result.json"
-        tmp_path.write_text(json.dumps(payload))
-        os.replace(tmp_path, req_path)
+        try:
+            self._results_dir.mkdir(parents=True, exist_ok=True)
+            req_path = self._publish_request(request_id, payload)
+        except (PermissionError, OSError) as exc:
+            # #411 v2 — the anti-vacuity fix: NEVER write to an unwatched
+            # fallback and call it "healed" (the exact bug the reviewer proved
+            # live in v1). ``_host_root_installed`` passing is only a snapshot
+            # (os.access at call time), not a guarantee the write itself will
+            # succeed — root re-recreated the dir, a read-only remount, disk
+            # pressure, .... Log the specific dir + the durable fix, then
+            # RE-RAISE: a true internal error (class docstring), never a
+            # "couldn't fix" HealAttempt, so evaluate() resolves UNSAFE loudly
+            # and immediately instead of burning the bounded retry budget on a
+            # static permission problem retries cannot resolve.
+            logger.error(
+                "mesh-heal watched dir %s is not writable (%s: %s) — install/"
+                "verify scripts/audittrace-mesh-heal.tmpfiles.conf (systemd-"
+                "tmpfiles --create) so the runner owns it durably across "
+                "reboots; refusing to fabricate a false heal via an unwatched "
+                "fallback (#411 v1 was rejected for exactly that)",
+                self._heal_dir,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         logger.info("host-resettle requested: %s -> %s", finding.signal, req_path)
 
         waited = 0.0
