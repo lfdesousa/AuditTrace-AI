@@ -20,6 +20,7 @@ from audittrace.routes.chat import (
     _apply_thinking_mode,
     _compute_session_id,
     _resolve_project,
+    _resolve_session_id,
     _resolve_thinking,
 )
 from audittrace.services.context_builder import PROFILE_SECTION_HEADER
@@ -445,6 +446,39 @@ class _FakeRequest:
 
     def __init__(self, headers: dict[str, str] | None = None) -> None:
         self.headers = headers or {}
+
+
+class TestResolveSessionId:
+    """FLEET-ROUTE Gate #6 — client-settable run id (unit level).
+
+    The probe found ``X-Session-Id`` was IGNORED; ``_resolve_session_id``
+    honours it when present and falls through to ``_compute_session_id``
+    (byte-for-byte) when absent — per-agent-run reconstruction depends on
+    this so ``GET /interactions?session_id=<run>`` returns exactly one
+    OpenCode fleet-agent run."""
+
+    def test_header_present_wins_over_computed(self):
+        req = _FakeRequest({"x-session-id": "agent-run-42"})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_is_whitespace_trimmed(self):
+        req = _FakeRequest({"x-session-id": "  agent-run-42  "})
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == "agent-run-42"
+
+    def test_header_absent_falls_through_to_computed_byte_for_byte(self):
+        """Gate #6, absence side: identical to today's exact behaviour —
+        the resolved session_id must equal ``_compute_session_id`` called
+        with the same inputs, not merely 'be present'."""
+        req = _FakeRequest()
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
+
+    def test_blank_header_falls_through_to_computed(self):
+        """An empty/whitespace-only header is treated as absent, same
+        honesty model as ``_resolve_project``."""
+        req = _FakeRequest({"x-session-id": "   "})
+        expected = _compute_session_id("opencode", "hello", "user-1")
+        assert _resolve_session_id(req, "opencode", "hello", "user-1") == expected
 
 
 class TestResolveProject:
@@ -954,6 +988,50 @@ class TestChatProxy:
         assert "bash" in latest.answer
         assert "wc -l" in latest.answer
 
+    async def test_chat_proxy_streaming_persists_request_alias_not_upstream_echo(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #5 (inject-mode, STREAMING path): the streamed
+        SSE chunk's ``model`` field echoes a GGUF path, different from the
+        request alias. The persisted row must record the request alias,
+        never ``state.model``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            'data: {"choices":[{"finish_reason":"stop","delta":{}}],'
+            f'"model":"{upstream_echo}",'
+            '"timings":{"cache_n":100,"prompt_n":50,"predicted_n":2}}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
     async def test_chat_proxy_persists_interaction(self, client):
         """A successful chat completion writes a row to interactions."""
         from audittrace.db.models import InteractionRecord
@@ -1002,6 +1080,112 @@ class TestChatProxy:
         assert latest.model == "qwen3.5-35b"
         # Phase 2: every audit row carries the sentinel user_id in bypass mode.
         assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_chat_proxy_persists_request_alias_not_upstream_echo(self, client):
+        """FLEET-ROUTE Gate #5 (non-streaming, inject-mode path): the
+        interactions row must record the request alias FLEET-ROUTE routed
+        on, NOT llama.cpp's echoed GGUF path. ``_ok_chat_response`` hardcodes
+        the mock upstream ``model``, which never surfaces this divergence —
+        so this test uses a DIFFERENT model on the request than the mocked
+        upstream echoes."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _FakeAsyncClient(
+            post_json={
+                "id": "cmpl-divergent",
+                "model": upstream_echo,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi there!"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 4,
+                    "total_tokens": 16,
+                },
+            }
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "Persist this"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = rows[-1]
+        # The divergence assertion: recorded model is the REQUEST alias,
+        # never the upstream's echoed GGUF path.
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
+    async def test_chat_proxy_x_session_id_header_becomes_persisted_session_id(
+        self, client
+    ):
+        """FLEET-ROUTE Gate #6: a caller-supplied ``X-Session-Id`` becomes
+        the persisted ``session_id`` verbatim, so ``GET
+        /interactions?session_id=<run>`` reconstructs exactly that agent
+        run."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-Id": "fleet-run-2026-08-06-001"},
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == "fleet-run-2026-08-06-001"
+
+    async def test_chat_proxy_without_x_session_id_preserves_computed_session_id(
+        self, client
+    ):
+        """Gate #6, absence side: byte-for-byte the prior computed
+        behaviour — the persisted session_id equals
+        ``_compute_session_id(source, first_user_message, user_id)``."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+        from audittrace.identity import SENTINEL_SUBJECT as _SENTINEL
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "no header here"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        expected = _compute_session_id("unknown", "no header here", _SENTINEL)
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert rows[-1].session_id == expected
 
     def test_chat_proxy_with_project(self, client):
         fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
@@ -1403,11 +1587,11 @@ class TestChatProxy:
 #     user_id, and flushes ToolCall audit rows after the interaction lands.
 
 
-def _tools_mode_response_text(text: str = "done") -> dict:
+def _tools_mode_response_text(text: str = "done", model: str = "qwen3.5-35b") -> dict:
     return {
         "id": "cmpl-test",
         "object": "chat.completion",
-        "model": "qwen3.5-35b",
+        "model": model,
         "choices": [
             {
                 "index": 0,
@@ -1598,6 +1782,41 @@ class TestToolsModeIntegration:
         assert tc_row.error is None
         assert tc_row.interaction_id == latest_interaction.id
 
+    async def test_tools_mode_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, non-streaming path):
+        ``_tools_mode_response_text`` accepts a ``model=`` override so this
+        test can make the mocked upstream echo a DIFFERENT model (a GGUF
+        path) than the request alias — the divergence that hardcoding both
+        to the same string would hide. The persisted row must record the
+        request alias FLEET-ROUTE routed on, not the upstream echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedClient(
+            [_tools_mode_response_text("Just text.", model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
+
     def test_tools_mode_streams_content_token_by_token(self, client, _tools_mode):
         """#299: stream=true must stream the answer as MULTIPLE content
         deltas (real token-by-token), not one buffered chunk. The pieces
@@ -1663,6 +1882,40 @@ class TestToolsModeIntegration:
         latest = interactions[-1]
         assert latest.answer == "The answer is 42."
         assert latest.user_id == SENTINEL_SUBJECT
+
+    async def test_tools_mode_streaming_persists_request_alias_not_upstream_echo(
+        self, client, _tools_mode
+    ):
+        """FLEET-ROUTE Gate #5 (tools-mode, STREAMING path): the streamed
+        SSE turn echoes a different model (a GGUF path) than the request
+        alias. The persisted row must record the request alias, never the
+        streamed ``result.model`` echo."""
+        from audittrace.db.models import InteractionRecord
+        from audittrace.dependencies import get_postgres_factory
+
+        requested_alias = "mistral-small-3.1-24b"
+        upstream_echo = "/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        fake = _SequencedStreamClient(
+            [_sse_content_lines(["The ", "answer ", "is 42."], model=upstream_echo)]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": requested_alias,
+                    "messages": [{"role": "user", "content": "q"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 200
+        _ = response.content  # drain the stream so the generator finalises
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest = interactions[-1]
+        assert latest.model == requested_alias
+        assert latest.model != upstream_echo
 
     async def test_tools_mode_streaming_through_memory_tool_loop(
         self, client, _tools_mode

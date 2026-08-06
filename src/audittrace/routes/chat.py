@@ -272,6 +272,29 @@ def _compute_session_id(source: str, first_user_content: str, user_id: str) -> s
     return f"{source}-{today}-{h}"
 
 
+def _resolve_session_id(
+    request: Request, source: str, first_user_content: str, user_id: str
+) -> str:
+    """Resolve the ``session_id`` for this request (FLEET-ROUTE Gate #6).
+
+    Precedence:
+      1. ``X-Session-Id`` request header — lets a caller (an OpenCode fleet
+         agent, in particular) set its own run/session grouping explicitly,
+         so ``GET /interactions?session_id=<run>`` reconstructs exactly
+         that agent run across every turn and every routed engine
+         (per-agent-run reconstruction, SPEC "Telemetry accuracy" #3).
+         Trusted at face value — same honesty model as ``_resolve_project``
+         / ``_detect_source``; this is audit-correlation metadata, not a
+         security field.
+      2. The existing deterministic ``_compute_session_id(...)`` — BYTE-
+         FOR-BYTE the prior behaviour when the header is absent or blank.
+    """
+    header = request.headers.get("x-session-id")
+    if isinstance(header, str) and header.strip():
+        return header.strip()
+    return _compute_session_id(source, first_user_content, user_id)
+
+
 def _resolve_project(request: Request, payload: dict[str, Any]) -> str:
     """Resolve the project tag for this request (ADR-029).
 
@@ -1544,6 +1567,12 @@ async def _handle_tools_mode(
                 return
 
             # Success persistence — record exactly the streamed answer.
+            # Gate #5 (request-model fidelity): the interactions row records
+            # the CLIENT-REQUESTED alias — the value FLEET-ROUTE routed on —
+            # NEVER the upstream's echoed ``result.model`` (llama.cpp echoes
+            # the full GGUF path). The resolved engine is asserted on the
+            # linked trace span (``audittrace.upstream.host``), not here
+            # (Option A, operator decision 2026-08-06 — no schema change).
             await _persist_or_enqueue(
                 persist_mode=persist_mode,
                 pending_tool_calls=result.pending,
@@ -1554,7 +1583,7 @@ async def _handle_tools_mode(
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
                 session_id=session_id,
-                model=result.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - stream_perf_start) * 1000),
             )
@@ -1566,7 +1595,7 @@ async def _handle_tools_mode(
                 finish_reason=result.finish_reason,
                 tool_calls=result.external_tool_calls or None,
                 session_id=session_id,
-                model=result.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 input_messages=payload.get("messages"),
             )
@@ -1695,7 +1724,11 @@ async def _handle_tools_mode(
         )
     usage = final_body.get("usage") or {}
     finish_reason = first.get("finish_reason") or "stop"
-    response_model = final_body.get("model") or requested_model
+    # Gate #5 (request-model fidelity): the interactions row + Langfuse
+    # generation record the CLIENT-REQUESTED alias unconditionally — NEVER
+    # ``final_body["model"]`` (llama.cpp's echoed GGUF path). The resolved
+    # engine is asserted on the linked trace span, not a row column
+    # (Option A, operator decision 2026-08-06 — no schema change).
 
     # 4 — Persist interaction + flush audit rows. ADR-046: async branch
     # XADDs to audittrace:persist:stream when the caller opts in via
@@ -1712,7 +1745,7 @@ async def _handle_tools_mode(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         session_id=session_id,
-        model=response_model,
+        model=requested_model,
         user_id=user.user_id,
         duration_ms=int((time.perf_counter() - perf_start) * 1000),
     )
@@ -1728,7 +1761,7 @@ async def _handle_tools_mode(
         finish_reason=finish_reason,
         tool_calls=final_tool_calls or None,
         session_id=session_id,
-        model=response_model,
+        model=requested_model,
         user_id=user.user_id,
         input_messages=payload.get("messages"),
     )
@@ -1826,7 +1859,7 @@ async def chat_completions(
         ),
         query or "",
     )
-    session_id = _compute_session_id(source, first_user, user.user_id)
+    session_id = _resolve_session_id(http_request, source, first_user, user.user_id)
 
     # ADR-025 Phase 4: branch on memory_mode. The inject path (default)
     # runs the pre-Phase-4 4-layer context build; the tools path runs
@@ -2031,6 +2064,10 @@ async def chat_completions(
                 answer = text_answer
 
             # ADR-046: success-path persistence honours X-Persist-Mode.
+            # Gate #5 (request-model fidelity): record the CLIENT-REQUESTED
+            # alias unconditionally — never ``state.model`` (llama.cpp's
+            # echoed GGUF path). Resolved engine lives on the trace span
+            # (Option A, operator decision 2026-08-06).
             await _persist_or_enqueue(
                 persist_mode=persist_mode,
                 project=project,
@@ -2040,7 +2077,7 @@ async def chat_completions(
                 prompt_tokens=state.prompt_tokens,
                 completion_tokens=state.completion_tokens,
                 session_id=session_id,
-                model=state.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 duration_ms=int((time.perf_counter() - perf_start) * 1000),
             )
@@ -2056,7 +2093,7 @@ async def chat_completions(
                     else None
                 ),
                 session_id=session_id,
-                model=state.model or requested_model,
+                model=requested_model,
                 user_id=user.user_id,
                 input_messages=payload.get("messages"),
             )
@@ -2182,7 +2219,8 @@ async def chat_completions(
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            # Gate #5: request alias unconditionally, never body["model"].
+            model=requested_model,
             user_id=user.user_id,
             status="failed",
             failure_class=_map_error_code_to_failure_class(err_envelope.get("code")),
@@ -2204,6 +2242,11 @@ async def chat_completions(
         usage = body.get("usage") or {}
         finish_reason = (choices[0].get("finish_reason") if choices else None) or "stop"
         # ADR-046: success-path persistence honours X-Persist-Mode.
+        # Gate #5 (request-model fidelity): record the CLIENT-REQUESTED
+        # alias unconditionally — never ``body["model"]`` (llama.cpp's
+        # echoed GGUF path). Resolved engine lives on the trace span
+        # (``audittrace.upstream.host``, Option A, operator decision
+        # 2026-08-06 — no schema change).
         await _persist_or_enqueue(
             persist_mode=persist_mode,
             project=project,
@@ -2213,7 +2256,7 @@ async def chat_completions(
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            model=requested_model,
             user_id=user.user_id,
             duration_ms=int((time.perf_counter() - ns_perf_start) * 1000),
         )
@@ -2225,7 +2268,7 @@ async def chat_completions(
             finish_reason=finish_reason,
             tool_calls=ns_tool_calls or None,
             session_id=session_id,
-            model=body.get("model") or requested_model,
+            model=requested_model,
             user_id=user.user_id,
             input_messages=payload.get("messages"),
         )
