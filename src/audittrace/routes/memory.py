@@ -2114,7 +2114,15 @@ async def _merge_semantic_with_chroma(
                     "size_bytes": len((content or "").encode("utf-8")),
                     "created_at_ms": None,
                     "modified_at_ms": None,
-                    "created_by_user_id": None,
+                    # ADR-059 WU-1b — propagate the row's owner (the SAME
+                    # ``user_id`` key ``_index_md_objects`` stamps and this
+                    # function's own owner-or-corpus predicate above already
+                    # reads) instead of the previous hardcoded ``None``. This
+                    # is what lets ``_filter_corpus_read_gate``'s ownership
+                    # exemption recognise a discovered row as the caller's
+                    # own even when its ``tier`` reads (or mis-defaults to)
+                    # ``"corpus"``.
+                    "created_by_user_id": meta.get("user_id"),
                     "modified_by_user_id": None,
                     "deleted_at_ms": None,
                     "deleted_by_user_id": None,
@@ -2142,10 +2150,29 @@ def _filter_corpus_read_gate(
     (``recall_semantic``) is NOT affected — that path stays
     deliberately unfiltered per D1; this gate is specific to the
     ``/memory/semantic`` REST surface (the operator/curator-tier
-    backoffice), matching "Phase-A operator-tier corpus scoping"."""
+    backoffice), matching "Phase-A operator-tier corpus scoping".
+
+    ADR-059 WU-1b (2026-08-07) — OWNERSHIP EXEMPTION. A caller reading
+    their OWN content never needs a corpus scope: a row the caller wrote
+    is exempted from this gate regardless of what its ``tier`` reads.
+    This is the robust fix for the live fleet-recall gap — WU-1 (2026-08-07)
+    fixed the tier STAMP written at index time, but a caller's own row
+    must be visible independent of whether the tier stamp is honest,
+    missing (pre-WU-1 legacy rows), or mis-defaulted to ``"corpus"`` by
+    ``_merge_semantic_with_chroma``'s ``meta.get("tier", "corpus")``
+    fallback. Checked BEFORE the scope lookup so an owner never needs
+    ``memory:corpus:<collection>:read`` to see their own fold. Applies
+    uniformly to manifest-tracked items (``created_by_user_id`` is the
+    manifest's writer) and to discovered items (populated from the
+    ChromaDB row's ``user_id`` metadata by ``_merge_semantic_with_chroma``,
+    WU-1b) — the SAME ownership key ``ChromaSemanticService.search``
+    filters on (see ``_index_md_objects``'s docstring)."""
     visible = []
     for item in items:
         if item.get("tier") != "corpus":
+            visible.append(item)
+            continue
+        if item.get("created_by_user_id") == user.user_id:
             visible.append(item)
             continue
         key = item.get("key") or ""

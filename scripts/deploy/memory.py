@@ -241,7 +241,7 @@ def _ensure_md(name: str) -> str:
 
 
 def recall_deploy_lessons(
-    query: str,
+    query: str = "",
     *,
     front_door: str = DEFAULT_FRONT_DOOR,
     token: str | None = None,
@@ -262,7 +262,13 @@ def recall_deploy_lessons(
     server's job (and is the degraded part), so this helper does not fabricate
     client-side relevance — it returns the decisions-layer items as the server
     ordered them (most-recent-first), leaving selection to the agent that reads
-    them.
+    them. Defaults to ``""`` (ADR-059 WU-1b, 2026-08-07): a live fleet caller
+    invoked this keyword-only-after-``query`` — ``memory.recall_deploy_lessons(
+    front_door=..., insecure=...)`` — and hit ``TypeError: missing 1 required
+    positional argument: 'query'`` because the parameter had no default. Recall
+    is best-effort and ``query`` is logging-only (never used to filter/rank), so
+    a caller omitting it should degrade to "no intent recorded", not crash the
+    whole recall-before step of the ADR-059 loop.
     """
     try:
         base = _normalize_front_door(front_door)
