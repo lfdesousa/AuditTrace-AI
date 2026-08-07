@@ -99,6 +99,24 @@ def test_recall_returns_lessons(monkeypatch):
     assert call["headers"]["Authorization"] == f"Bearer {TOKEN}"
 
 
+def test_recall_works_without_a_query_argument(monkeypatch):
+    """SPEC-wu1b (2026-08-07) — live symptom: a fleet caller invoked
+    ``memory.recall_deploy_lessons(front_door=..., insecure=...)`` (no
+    positional/keyword ``query``) and got ``TypeError: missing 1 required
+    positional argument: 'query'`` because the parameter had no default.
+    ``query`` is logging-only (never used to filter/rank — see the
+    docstring), so omitting it must degrade gracefully, not crash the
+    ADR-059 recall-before step. Neutering the default (``query: str`` with
+    no default again) turns this RED with the exact live ``TypeError``."""
+    _clear_env_token(monkeypatch)
+    items = [{"key": "decisions/surge-safe.md", "content": "maxSurge=0"}]
+    _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": items}).encode())}
+    )
+    out = recall_deploy_lessons(front_door=FRONT, token=TOKEN)
+    assert out == items
+
+
 def test_recall_filters_non_dict_items(monkeypatch):
     _clear_env_token(monkeypatch)
     body = json.dumps({"items": [{"key": "a"}, "junk", 3]}).encode()

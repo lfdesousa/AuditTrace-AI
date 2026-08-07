@@ -7650,16 +7650,129 @@ class TestMergeSemanticWithChroma:
 
 
 class TestADR059FleetRecallGap:
-    """WU-1 (SPEC-recall-loop-and-telemetry, 2026-08-07) — TRUE end-to-end
+    """WU-1 (SPEC-recall-loop-and-telemetry, 2026-08-07) + WU-1b
+    (SPEC-wu1b-fleet-recall-live-fix, 2026-08-07) — TRUE end-to-end
     through the real `GET /memory/semantic` route (the endpoint
     `scripts/deploy/memory.py::recall_deploy_lessons` reads) using the
     REAL in-repo ChromaDB test double (`db.factory.MockCollection`), not a
     hand-rolled fake. Closes the ADR-059 self-improvement loop: fleet
-    lessons written by the fleet must be recallable BY the fleet."""
+    lessons written by the fleet must be recallable BY the fleet.
+
+    WU-1b note: WU-1's own forever-guard test used to hand-set
+    ``metadata: {"tier": "private"}`` directly onto ``MockCollection.data``
+    for the caller's own canary row — bypassing the real
+    ``_index_md_objects`` tier-computation entirely. That is EXACTLY the
+    shortcut the live symptom slipped through: the mock passed while the
+    live pod returned zero. ``test_fleet_agent_recalls_its_own_just_folded_canary``
+    below now folds the canary through the REAL ``POST /memory/upload`` ->
+    ``POST /memory/index`` write path (what `log_deploy_record` drives), so
+    the tier value it lists back is whatever that code path actually
+    produces — not an assumption baked into the fixture."""
 
     def test_fleet_agent_recalls_its_own_just_folded_canary(
         self, client: TestClient, monkeypatch
     ) -> None:
+        """#423 (SPEC-wu1b) — the REAL upload->index->list path, no hand-set
+        tier fixture. Noise rows (representing OTHER users' pre-existing
+        Chroma rows) are still seeded directly — they are not the caller's
+        own content, so driving them through the real write path adds
+        nothing to the assertion — but the fleet's OWN canary is folded via
+        the actual HTTP routes end to end."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        # A well-used shared collection: `_SEMANTIC_DISCOVERY_LIMIT` noise
+        # rows from OTHER users sort ahead of the fleet's freshly-folded
+        # canary in ChromaDB's raw get() order — the WU-1 discovery-cap
+        # scenario this test also still covers.
+        collection.data = [
+            {
+                "id": f"noise-{i}",
+                "document": "noise",
+                "metadata": {"user_id": "some-other-user", "tier": "private"},
+            }
+            for i in range(m._SEMANTIC_DISCOVERY_LIMIT)
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        fleet_sub = "fleet-service-0b0cdd4d"
+        _override_identity(
+            client, fleet_sub, ("memory:episodic:write", "memory:semantic:read")
+        )
+        try:
+            content = b"the teal otter named Daronne recalls memory on Tuesdays"
+            with patch.object(m, "_get_minio_client", return_value=MagicMock()):
+                up = client.post(
+                    "/memory/upload",
+                    params={"layer": "episodic", "filename": "deploy-record-canary.md"},
+                    files={
+                        "file": ("deploy-record-canary.md", content, "text/markdown")
+                    },
+                )
+            assert up.status_code == 200, up.text
+            key = up.json()["key"]
+            assert key == f"{fleet_sub}/episodic/deploy-record-canary.md"
+            assert up.json()["tier"] == "private"
+
+            def get_object(bucket: str, k: str) -> MagicMock:
+                assert (bucket, k) == ("memory-private", key), (bucket, k)
+                response = MagicMock()
+                response.__enter__.return_value = response
+                response.__exit__.return_value = False
+                response.read.return_value = content
+                return response
+
+            fake_minio = MagicMock()
+            fake_minio.get_object.side_effect = get_object
+            with (
+                patch.object(m, "_get_minio_client", return_value=fake_minio),
+                patch.object(
+                    m,
+                    "embed_via_nomic",
+                    AsyncMock(
+                        side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]
+                    ),
+                ),
+            ):
+                ix = client.post(
+                    "/memory/index",
+                    params={"file": key, "collections": "decisions"},
+                )
+            assert ix.status_code == 200, ix.text
+            assert ix.json()["total_chunks"] == 1
+
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            titles = {i["title"] for i in r.json()["items"]}
+            assert "deploy-record-canary.md" in titles, (
+                "fleet's own just-folded canary is invisible to list_semantic "
+                f"(the endpoint recall_deploy_lessons reads): {r.json()['items']}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_fleet_agent_recalls_own_row_even_when_tier_reads_corpus(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        """#423 hardening (SPEC-wu1b) — the robust fix: a caller's OWN row
+        must be visible even when its ChromaDB tier reads (or mis-defaults
+        to) "corpus" — exactly what a pre-tier-stamp legacy row, or any
+        future tier-stamping regression, looks like. Deliberately NOT the
+        "hand-set tier=private" antipattern the spec forbids: this
+        constructs the FAILURE precondition (an owner-owned row whose tier
+        is NOT private) and proves the new ownership exemption in
+        `_filter_corpus_read_gate` — not the tier stamp — is what makes it
+        visible. Neutering EITHER the exemption check in
+        `_filter_corpus_read_gate` OR the `created_by_user_id` propagation
+        in `_merge_semantic_with_chroma` turns this RED."""
         import asyncio
 
         from audittrace.db.factory import MockChromaDBFactory, MockCollection
@@ -7668,23 +7781,13 @@ class TestADR059FleetRecallGap:
         factory = MockChromaDBFactory()
         physical = "decisions_v2"
         collection = MockCollection(physical)
-        # A well-used shared collection: `_SEMANTIC_DISCOVERY_LIMIT` rows
-        # from OTHER users/admin bulk-indexing sort ahead of the fleet's
-        # freshly-folded canary in ChromaDB's raw get() order.
         collection.data = [
             {
-                "id": f"noise-{i}",
-                "document": "noise",
-                "metadata": {"user_id": "some-other-user"},
-            }
-            for i in range(m._SEMANTIC_DISCOVERY_LIMIT)
-        ] + [
-            {
-                "id": "fleet-canary",
-                "document": "the teal otter named Daronne recalls memory on Tuesdays",
-                # Matches what the (now-fixed) `_index_md_objects` write path
-                # actually stamps for a private-tier single-file fold.
-                "metadata": {"user_id": "fleet-service-0b0cdd4d", "tier": "private"},
+                "id": "legacy-owned-row",
+                "document": "a lesson folded before the tier stamp existed",
+                # No "tier" key at all: `_merge_semantic_with_chroma`
+                # defaults this to "corpus" (`meta.get("tier", "corpus")`).
+                "metadata": {"user_id": "fleet-service-0b0cdd4d"},
             }
         ]
         factory.collections[physical] = collection
@@ -7696,9 +7799,46 @@ class TestADR059FleetRecallGap:
             r = client.get("/memory/semantic?collection=decisions")
             assert r.status_code == 200, r.text
             keys = {i["key"] for i in r.json()["items"]}
-            assert any("fleet-canary" in k for k in keys), (
-                "fleet's own just-folded canary is invisible to list_semantic "
-                f"(the endpoint recall_deploy_lessons reads): {keys}"
+            assert any("legacy-owned-row" in k for k in keys), (
+                "caller's own row was dropped by the corpus-read gate despite "
+                f"being owned by the caller: {r.json()['items']}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_non_owner_still_gated_from_corpus_defaulted_row(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        """The WU-1b ownership exemption must not become an over-broad
+        leak: a corpus-tier row NOT owned by the caller still requires
+        `memory:corpus:<collection>:read` — proves the exemption checks
+        ownership, not just presence of a `created_by_user_id` key."""
+        import asyncio
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        collection.data = [
+            {
+                "id": "victim-corpus-row",
+                "document": "victim's corpus-tier lesson",
+                "metadata": {"user_id": "victim-service", "tier": "corpus"},
+            }
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        _override_identity(client, "attacker-service", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            keys = {i["key"] for i in r.json()["items"]}
+            assert not any("victim-corpus-row" in k for k in keys), (
+                f"non-owner leaked a corpus-tier row it doesn't own: {r.json()['items']}"
             )
         finally:
             client.app.dependency_overrides.clear()
