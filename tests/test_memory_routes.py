@@ -1232,11 +1232,11 @@ class TestIndexZeroChunksLoud:
         The object WAS routed to and processed by the ``ai_research_papers``
         indexer — it just had nothing to embed — so this must 200, not 422.
 
-        Neuter: revert the guard's discriminator from
-        ``objects_attempted == 0`` back to ``total_chunks == 0`` -> this
-        test goes RED (a benign 0-chunk PDF wrongly 422s, reproducing the
-        reviewer's live repro `file=episodic/papers/blank.pdf&collections=
-        ai_research_papers`)."""
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` (v3) back to ``total_chunks == 0`` (v1) ->
+        this test goes RED (a benign 0-chunk PDF wrongly 422s, reproducing
+        the reviewer's live repro `file=episodic/papers/blank.pdf&
+        collections=ai_research_papers`)."""
         from unittest.mock import MagicMock, patch
 
         raw_bytes = b"%PDF-1.4 blank-page-stub"
@@ -1323,6 +1323,108 @@ class TestIndexZeroChunksLoud:
                 "error": None,
             }
         ]
+        mock_collection.upsert.assert_not_called()
+
+    def test_single_file_extension_mismatch_is_422(self, client: TestClient) -> None:
+        """Gate 7 (REVIEW REJECT #2 2026-08-07 fix) — a single-file index
+        of a ``.pdf``-keyed object into a ``.md``-only collection
+        (episodic layer -> ``decisions``) is a genuine extension
+        mismatch: the object IS routed to ``_index_md_objects`` (the
+        layer matches ``decisions``) but is REJECTED there on the
+        ``.md`` suffix check (memory.py's extension guard) before any
+        MinIO read. v2 wrongly 200d this — reviewer-proven live:
+        ``?collections=decisions&file=episodic/foo.pdf`` — because its
+        ``objects_attempted`` counter only measured "was the layer
+        routed", not "was the object accepted". Must 422.
+
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` back to v2's ``objects_attempted == 0``
+        -> this test goes RED (expects 422, gets 200 — the object was
+        routed, so v2's counter is nonzero even though the object was
+        rejected on extension)."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "episodic/foo.pdf"},
+            )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "episodic/foo.pdf" in detail
+        assert "decisions" in detail
+        # The extension check rejects the object before any MinIO read.
+        mock_minio.get_object.assert_not_called()
+
+    def test_single_file_corrupted_pdf_is_422(self, client: TestClient) -> None:
+        """Gate 8 (REVIEW REJECT #2 2026-08-07 fix) — a single-file index
+        of a corrupted PDF (pymupdf raises mid-parse) into
+        ``ai_research_papers`` is a genuine processing failure: the
+        object IS routed to ``_index_pdf_objects`` and read
+        successfully, but the pipeline's outer ``except Exception``
+        classifies the raise and flushes ``ok=False``
+        (memory_pdf/pipeline.py's exception handler). v2 wrongly 200d
+        this — reviewer-proven live:
+        ``?collections=ai_research_papers&file=episodic/broken.pdf`` —
+        for the same reason as Gate 7: routed-but-rejected still counted
+        as "attempted" under v2. Must 422.
+
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` back to v2's ``objects_attempted == 0``
+        -> this test goes RED (expects 422, gets 200)."""
+        raw_bytes = b"%PDF-1.4 garbage-pretending-to-be-pdf"
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.side_effect = RuntimeError("invalid xref offset")
+
+        mock_chroma, mock_collection = self._mock_chroma()
+        mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/broken.pdf",
+                },
+            )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "episodic/broken.pdf" in detail
+        assert "ai_research_papers" in detail
         mock_collection.upsert.assert_not_called()
 
 

@@ -722,21 +722,39 @@ async def _index_md_objects(
     col_name: str,
     category: str,
     user_id: str,
+    outcomes: list[bool] | None = None,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
     Per-file: read → chunk → add → drop. Avoids holding the cross-corpus
     document list in memory.
+
+    *outcomes* (#430 v3) — when supplied, every object in *objects*
+    appends exactly one ``bool`` here: ``True`` once the object clears
+    both the extension check AND the MinIO read (i.e. it was actually
+    ACCEPTED for processing — independent of how many chunks the
+    content happens to yield), ``False`` when the object is rejected
+    on extension mismatch or the read fails. This is the per-object
+    OUTCOME signal the ``/memory/index`` handler uses to distinguish a
+    genuine routing/read rejection from a benign empty-content file —
+    unconditionally available (unlike ``?details``), so the handler's
+    loud-422 guard never depends on an opt-in query flag.
     """
     total = 0
     for obj in objects:
         if not obj["filename"].endswith(".md"):
+            if outcomes is not None:
+                outcomes.append(False)
             continue
         raw = await asyncio.to_thread(
             _read_minio_object, minio_client, bucket, obj["key"]
         )
         if raw is None:
+            if outcomes is not None:
+                outcomes.append(False)
             continue
+        if outcomes is not None:
+            outcomes.append(True)
         content = raw.decode("utf-8", errors="replace")
         chunks = _chunk_text(content)
         if not chunks:
@@ -933,20 +951,28 @@ async def index_memory(
     ingestion_ts_ms = int(start * 1000)
     results: dict[str, int] = {}
     total_chunks = 0
-    # #430 v2 (REVIEW REJECT 2026-08-07 fix) — the discriminator for the
-    # loud-422 guard below. Counts how many objects were actually routed
-    # into an indexer call (``_index_md_objects`` / ``_index_pdf_objects``
-    # invoked with a non-empty ``objects`` list) during this request. This
-    # is ALWAYS available (unlike ``details_log``, which is opt-in via
+    # #430 v3 (REVIEW REJECT #2 2026-08-07 fix) — the discriminator for the
+    # loud-422 guard below. v2 gated on ``objects_attempted == 0``, which
+    # only measured "was the layer ROUTED to an indexer call" — it did NOT
+    # measure whether the routed object was actually ACCEPTED, so a
+    # single-file extension mismatch (routed to ``_index_md_objects`` but
+    # rejected there on the ``.md`` suffix check) or a corrupted-PDF
+    # exception (routed to ``_index_pdf_objects`` but flushed ``ok=False``)
+    # both wrongly stayed 200. ``object_outcomes`` instead accumulates the
+    # ACTUAL per-object outcome — one ``bool`` per object dispatched to
+    # either indexer, appended by the indexer itself: ``True`` once the
+    # object clears extension/read (md) or reaches the pipeline's
+    # ``ok=True`` flush (pdf) — regardless of how many chunks it yields —
+    # ``False`` on any rejection/skip/failure (extension mismatch, read
+    # failure, bomb-defense reject, encryption, corrupted-PDF exception).
+    # This is ALWAYS available (unlike ``details_log``, which is opt-in via
     # ``?details``) and answers the principled question "was the object
-    # actually processed vs rejected/skipped by collection routing" rather
-    # than "did processing yield chunks" — a text-free/image-free PDF page
-    # is legitimately processed (``ok=True``) with 0 chunks to embed
-    # (memory_pdf/pipeline.py:511-513, "truly empty page — benign, no
-    # warning"), so ``total_chunks == 0`` alone conflates that benign case
-    # with a genuine layer/collection mismatch where the object was never
-    # even dispatched to an indexer (its list stayed empty).
-    objects_attempted = 0
+    # actually processed vs rejected/skipped" rather than "did processing
+    # yield chunks" — a text-free/image-free PDF page is legitimately
+    # processed (``ok=True``) with 0 chunks to embed (memory_pdf/pipeline.py
+    # "truly empty page — benign, no warning"), so ``total_chunks == 0``
+    # alone conflates that benign case with a genuine rejection.
+    object_outcomes: list[bool] = []
     # Tier-C #24 (ADR-056) — when ?details=true, every PDF processed
     # appends one outcome row here for inclusion in the response.
     # Allocated unconditionally to keep the call sites uniform; only
@@ -1022,7 +1048,6 @@ async def index_memory(
 
         chunk_count = 0
         if col_name in ("decisions", "semantic"):
-            objects_attempted += len(episodic_objects)
             chunk_count += await _index_md_objects(
                 collection,
                 minio_client,
@@ -1031,9 +1056,9 @@ async def index_memory(
                 col_name,
                 category="episodic",
                 user_id=user.user_id,
+                outcomes=object_outcomes,
             )
         if col_name in ("skills", "semantic"):
-            objects_attempted += len(procedural_objects)
             chunk_count += await _index_md_objects(
                 collection,
                 minio_client,
@@ -1042,6 +1067,7 @@ async def index_memory(
                 col_name,
                 category="procedural",
                 user_id=user.user_id,
+                outcomes=object_outcomes,
             )
         if col_name == "ai_research_papers":
             # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
@@ -1049,9 +1075,10 @@ async def index_memory(
             # accumulator AND the dry-run flag. The manifest service
             # writes Postgres rows (skipped under dry_run); the details
             # accumulator collects per-doc outcomes for the
-            # ?details=true response shape.
+            # ?details=true response shape. ``outcomes`` (#430 v3) is the
+            # separate, ALWAYS-populated per-object ok/reject signal the
+            # loud-422 guard below reads.
             manifest_service = get_memory_manifest_service()
-            objects_attempted += len(episodic_objects)
             chunk_count += await _index_pdf_objects(
                 collection,
                 minio_client,
@@ -1065,8 +1092,8 @@ async def index_memory(
                 manifest_service=manifest_service,
                 details_log=details_log,
                 dry_run=dry_run,
+                outcomes=object_outcomes,
             )
-            objects_attempted += len(procedural_objects)
             chunk_count += await _index_pdf_objects(
                 collection,
                 minio_client,
@@ -1080,6 +1107,7 @@ async def index_memory(
                 manifest_service=manifest_service,
                 details_log=details_log,
                 dry_run=dry_run,
+                outcomes=object_outcomes,
             )
 
         results[col_name] = chunk_count
@@ -1129,38 +1157,46 @@ async def index_memory(
             "tier": tier,
         },
     )
-    # #430 — a single-file index that never dispatches the object to any
-    # collection indexer is a silent failure wearing a 200: the caller
-    # believes the object landed and it was never even attempted (typically
-    # a content/layer vs target-collection mismatch, e.g. a ``procedural/``
-    # key indexed into ``collections=decisions``, whose routing only draws
-    # from episodic objects). The write ATTEMPT is still audited above
+    # #430 — a single-file index whose object was never actually accepted by
+    # an indexer is a silent failure wearing a 200: the caller believes the
+    # object landed and it was not. The write ATTEMPT is still audited above
     # (ADR-058 — the attempt, with ``total_chunks: 0``, is already in
     # ``detail_extra``) before this loud fail.
     #
-    # v2 (REVIEW REJECT 2026-08-07): gate on ``objects_attempted == 0``, NOT
-    # ``total_chunks == 0``. A text-free/image-free PDF page is legitimately
-    # processed (``ok=True``) and yields 0 chunks — that is benign, not a
-    # mismatch, and must stay 200. ``objects_attempted`` is incremented only
-    # when an indexer was actually invoked with a non-empty objects list, so
-    # it is 0 precisely when the object never matched any collection's
-    # ingestion routing. Bulk mode is exempt (an admin whole-collection
-    # rebuild legitimately attempts 0 objects when nothing matches) and
-    # dry-run is exempt (no write intended) — both keep returning 200.
-    if single_file_mode and not dry_run and objects_attempted == 0:
+    # v3 (REVIEW REJECT #2 2026-08-07): gate on ``any(object_outcomes)``, NOT
+    # ``objects_attempted == 0`` (v2) or ``total_chunks == 0`` (v1). v2's
+    # ``objects_attempted`` only proved the object's LAYER was routed to an
+    # indexer call — it said nothing about whether the indexer then ACCEPTED
+    # the object, so an extension mismatch (``.pdf`` key indexed into a
+    # ``.md``-only collection, rejected inside ``_index_md_objects``) or a
+    # corrupted-PDF parse exception (rejected inside ``_index_pdf_objects``,
+    # flushed ``ok=False``) both wrongly stayed 200 under v2 — reopening
+    # #430. ``object_outcomes`` is populated by the indexers themselves with
+    # the ACTUAL per-object outcome (True = accepted/processed, independent
+    # of resulting chunk count; False = rejected/skipped/failed), so
+    # ``not any(object_outcomes)`` is true both when the object was routed
+    # but rejected AND when it was never routed at all (empty list). A
+    # text-free/image-free PDF page still appends True (the pipeline reaches
+    # its ``ok=True`` flush even with 0 chunks written) — benign, stays 200.
+    # Bulk mode is exempt (an admin whole-collection rebuild legitimately
+    # attempts 0 objects when nothing matches) and dry-run is exempt (no
+    # write intended) — both keep returning 200.
+    if single_file_mode and not dry_run and not any(object_outcomes):
         raise HTTPException(
             status_code=422,
             detail=(
                 f"single-file index of file={file!r} into "
                 f"collections={target_collections!r} wrote 0 chunks — "
-                "the object was NOT indexed (0 documents were routed to "
-                "an indexer for this collection). Plausible causes: the "
+                "the object was NOT indexed (it was not accepted by any "
+                "indexer for this collection). Plausible causes: the "
                 "object's layer prefix does not match the target "
                 "collection's ingestion routing (e.g. a procedural/ or "
                 "episodic/ key indexed into a collection that only "
-                "accepts the other layer), the collection does not "
-                "accept this object's file type, or the key does not "
-                "resolve to the expected bucket/tier."
+                "accepts the other layer), the object's file extension "
+                "does not match what this collection ingests (e.g. a "
+                ".pdf key indexed into a .md-only collection), the file "
+                "could not be read from object storage, or the file "
+                "could not be parsed (e.g. a corrupted/unreadable PDF)."
             ),
         )
     return response
