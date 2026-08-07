@@ -74,6 +74,7 @@ async def _index_pdf_objects(
     manifest_service: Any | None = None,
     details_log: list[dict[str, Any]] | None = None,
     dry_run: bool = False,
+    outcomes: list[bool] | None = None,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -99,6 +100,18 @@ async def _index_pdf_objects(
     page_count, signature_status, ocr_coverage_pct, attachment_count,
     form_field_count, the structured ``extraction_warnings`` list,
     and document_sha256 (plus the tier-C ADR-056 fields).
+
+    *outcomes* (#430 v3) — when supplied, every object in *objects*
+    appends exactly one ``bool``: ``True`` once the document reaches
+    the pipeline's terminal ``ok=True`` flush (i.e. it was actually
+    ACCEPTED and processed — independent of how many chunks the pages
+    happen to yield, so a text-free/image-free PDF still appends
+    ``True``), ``False`` on every rejection path (extension mismatch,
+    unreadable object, bomb-defense reject, encrypted, or a parse
+    exception classified + flushed ``ok=False``). This is the
+    per-object OUTCOME signal the ``/memory/index`` handler's
+    loud-422 guard reads — unconditionally available, unlike
+    ``details_log`` which is only surfaced when ``?details=true``.
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
@@ -124,14 +137,21 @@ async def _index_pdf_objects(
     # for the manifest's ``layer`` column.
     manifest_layer = layer_prefix.rstrip("/")
 
+    def _record_outcome(ok: bool) -> None:
+        """Append this document's #430 v3 outcome, if the caller wants it."""
+        if outcomes is not None:
+            outcomes.append(ok)
+
     total = 0
     for obj in objects:
         if not obj["filename"].lower().endswith(".pdf"):
+            _record_outcome(False)
             continue
         raw = await asyncio.to_thread(
             _read_minio_object, minio_client, bucket, obj["key"]
         )
         if raw is None:
+            _record_outcome(False)
             continue
 
         # Per-document state — accumulated through the per-page loop
@@ -196,6 +216,7 @@ async def _index_pdf_objects(
                 error="max_size",
                 details_log=details_log,
             )
+            _record_outcome(False)
             continue
         source_key = (
             obj["key"][len(layer_prefix) :]
@@ -246,6 +267,7 @@ async def _index_pdf_objects(
                         error="encrypted",
                         details_log=details_log,
                     )
+                    _record_outcome(False)
                     continue
                 # Tier-C item #10 — extract document metadata.
                 (
@@ -304,6 +326,7 @@ async def _index_pdf_objects(
                         error="max_pages",
                         details_log=details_log,
                     )
+                    _record_outcome(False)
                     continue
                 xref_count = doc.xref_length()
                 if xref_count > settings.pdf_max_xref_count:
@@ -347,6 +370,7 @@ async def _index_pdf_objects(
                         error="max_xref",
                         details_log=details_log,
                     )
+                    _record_outcome(False)
                     continue
                 # Tier-B item #6 — quarantine embedded attachments.
                 attachment_count_doc, attachment_warnings = _quarantine_pdf_attachments(
@@ -622,6 +646,7 @@ async def _index_pdf_objects(
                 error=None,
                 details_log=details_log,
             )
+            _record_outcome(True)
         except Exception as exc:
             # Tier-C item #16 — classify pymupdf raises into closed-set
             # codes. Falls through to ``pdf_corrupted_structure`` for
@@ -660,5 +685,6 @@ async def _index_pdf_objects(
                 error=str(exc) or code,
                 details_log=details_log,
             )
+            _record_outcome(False)
             continue
     return total

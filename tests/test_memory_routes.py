@@ -1036,6 +1036,398 @@ class TestIndexErrorPaths:
         mock_collection.upsert.assert_called()
 
 
+class TestIndexZeroChunksLoud:
+    """POST /memory/index single-file mode is LOUD (422) when a write
+    ATTEMPT indexes 0 chunks (#430 — a content/layer vs target-collection
+    mismatch used to return a cheerful 200 that nothing landed). Five
+    falsifiable gates from SPEC #430, one test each. Uses bypass-mode
+    auth (default ``client`` fixture, admin sentinel identity) — the
+    auth surface itself is already covered by TestIndexAuth /
+    TestIndexPrivateTier."""
+
+    @staticmethod
+    def _mock_chroma() -> tuple[MagicMock, AsyncMock]:
+        mock_collection = AsyncMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+        return mock_chroma, mock_collection
+
+    def test_single_file_zero_chunks_is_422(self, client: TestClient) -> None:
+        """Gate 1 — the repro: a ``procedural/`` key indexed into
+        ``collections=decisions`` (``decisions`` only draws from episodic
+        objects, so a procedural key resolves to zero) yields 0 chunks ->
+        422, and the detail names both the file and the target
+        collections. Neuter: drop the loud-fail block added after
+        ``_emit_write_audit`` (reverting to the unconditional
+        ``"status": "indexed"`` 200) -> this test goes RED (expects 422,
+        gets 200)."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "procedural/x.md"},
+            )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "procedural/x.md" in detail
+        assert "decisions" in detail
+        # decisions only draws from episodic objects; a procedural key
+        # never reaches a MinIO read on this branch.
+        mock_minio.get_object.assert_not_called()
+
+    def test_single_file_success_unchanged(self, client: TestClient) -> None:
+        """Gate 2 — the happy path is untouched: a matching single-file
+        index (an episodic key into ``decisions``) still 200s with
+        ``status: indexed`` and ``total_chunks > 0``. Proves the fix does
+        not regress the case it must never touch."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# A note\nsome real body text"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "episodic/ADR-430.md"},
+            )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "indexed"
+        assert data["total_chunks"] > 0
+        mock_collection.upsert.assert_called()
+
+    def test_bulk_zero_chunks_still_200(self, client: TestClient) -> None:
+        """Gate 3 — bulk mode (``?file`` absent) with 0 matching objects
+        still 200s ``{status: indexed, total_chunks: 0}``: an admin
+        whole-collection rebuild that legitimately finds nothing to
+        rebuild is not a failure. Neuter: drop the ``single_file_mode
+        and`` clause from the guard so it fires on ``total_chunks == 0``
+        alone -> this test goes RED (expects 200, gets 422)."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = []
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post("/memory/index", params={"collections": "decisions"})
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "indexed"
+        assert data["total_chunks"] == 0
+
+    def test_dry_run_zero_chunks_still_ok(self, client: TestClient) -> None:
+        """Gate 4 — a dry-run single-file index that would have
+        0-chunked (the same layer/collection mismatch as Gate 1, plus
+        ``dry_run=true``) still 200s ``{status: dry_run}``: no write was
+        ever intended, so the loud-fail guard must not fire."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "procedural/x.md",
+                    "dry_run": "true",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "dry_run"
+        assert data["total_chunks"] == 0
+
+    def test_audit_still_emitted_on_zero_chunk_422(self, client: TestClient) -> None:
+        """Gate 5 — the write ATTEMPT is audited (ADR-058) BEFORE the 422
+        is raised: the same 0-chunk mismatch request that 422s still
+        produces a ``memory_access`` write-audit row naming
+        ``mode: single_file`` with ``total_chunks: 0`` in its
+        ``detail_extra`` — the audit trail records the attempt even
+        though the caller sees a loud failure, not a false success."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "procedural/y.md"},
+            )
+        assert response.status_code == 422, response.text
+
+        rows = client.get(
+            "/interactions", params={"event_class": "memory_access"}
+        ).json()["interactions"]
+        writes = [
+            r
+            for r in rows
+            if r["question"].startswith("op=write layer=semantic")
+            and r.get("error_detail")
+            and json.loads(r["error_detail"]).get("mode") == "single_file"
+        ]
+        assert writes, rows
+        detail = json.loads(writes[-1]["error_detail"])
+        assert detail["total_chunks"] == 0
+
+    def test_single_file_blank_pdf_benign_zero_chunks_is_200(
+        self, client: TestClient
+    ) -> None:
+        """Gate 6 (REVIEW REJECT 2026-08-07 fix) — a single-file index of a
+        text-free AND image-free PDF page into ``ai_research_papers`` is
+        NOT a mismatch: the PDF pipeline legitimately marks such a page
+        ``ok=True, "benign, no warning", chunks_written=0``
+        (memory_pdf/pipeline.py:511-513, the "truly empty page" branch).
+        The object WAS routed to and processed by the ``ai_research_papers``
+        indexer — it just had nothing to embed — so this must 200, not 422.
+
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` (v3) back to ``total_chunks == 0`` (v1) ->
+        this test goes RED (a benign 0-chunk PDF wrongly 422s, reproducing
+        the reviewer's live repro `file=episodic/papers/blank.pdf&
+        collections=ai_research_papers`)."""
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 blank-page-stub"
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = ""  # text-free
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []  # image-free
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/papers/blank.pdf",
+                    "details": "true",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "indexed"
+        assert data["total_chunks"] == 0
+        # The object WAS routed to and processed by the PDF indexer — the
+        # manifest write was attempted (proving dispatch happened) and the
+        # ``?details=true`` per-document outcome shows ``ok: True`` with
+        # ``chunks: 0``, the "benign, no warning" path, not a rejection.
+        mock_manifest.upsert_pdf_metadata.assert_called_once()
+        assert data["documents"] == [
+            {
+                "file": "episodic/papers/blank.pdf",
+                "chunks": 0,
+                "signature_status": data["documents"][0]["signature_status"],
+                "page_count": 1,
+                "extraction_warnings": [],
+                "document_sha256": data["documents"][0]["document_sha256"],
+                "pdf_title": None,
+                "pdf_author": None,
+                "pdf_creator": None,
+                "pdf_creation_date": None,
+                "pdfa_part": None,
+                "pdfa_conformance": None,
+                "ltv_data": None,
+                "ok": True,
+                "error": None,
+            }
+        ]
+        mock_collection.upsert.assert_not_called()
+
+    def test_single_file_extension_mismatch_is_422(self, client: TestClient) -> None:
+        """Gate 7 (REVIEW REJECT #2 2026-08-07 fix) — a single-file index
+        of a ``.pdf``-keyed object into a ``.md``-only collection
+        (episodic layer -> ``decisions``) is a genuine extension
+        mismatch: the object IS routed to ``_index_md_objects`` (the
+        layer matches ``decisions``) but is REJECTED there on the
+        ``.md`` suffix check (memory.py's extension guard) before any
+        MinIO read. v2 wrongly 200d this — reviewer-proven live:
+        ``?collections=decisions&file=episodic/foo.pdf`` — because its
+        ``objects_attempted`` counter only measured "was the layer
+        routed", not "was the object accepted". Must 422.
+
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` back to v2's ``objects_attempted == 0``
+        -> this test goes RED (expects 422, gets 200 — the object was
+        routed, so v2's counter is nonzero even though the object was
+        rejected on extension)."""
+        mock_minio = MagicMock()
+        mock_chroma, _mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions", "file": "episodic/foo.pdf"},
+            )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "episodic/foo.pdf" in detail
+        assert "decisions" in detail
+        # The extension check rejects the object before any MinIO read.
+        mock_minio.get_object.assert_not_called()
+
+    def test_single_file_corrupted_pdf_is_422(self, client: TestClient) -> None:
+        """Gate 8 (REVIEW REJECT #2 2026-08-07 fix) — a single-file index
+        of a corrupted PDF (pymupdf raises mid-parse) into
+        ``ai_research_papers`` is a genuine processing failure: the
+        object IS routed to ``_index_pdf_objects`` and read
+        successfully, but the pipeline's outer ``except Exception``
+        classifies the raise and flushes ``ok=False``
+        (memory_pdf/pipeline.py's exception handler). v2 wrongly 200d
+        this — reviewer-proven live:
+        ``?collections=ai_research_papers&file=episodic/broken.pdf`` —
+        for the same reason as Gate 7: routed-but-rejected still counted
+        as "attempted" under v2. Must 422.
+
+        Neuter: revert the guard's discriminator from ``not
+        any(object_outcomes)`` back to v2's ``objects_attempted == 0``
+        -> this test goes RED (expects 422, gets 200)."""
+        raw_bytes = b"%PDF-1.4 garbage-pretending-to-be-pdf"
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.side_effect = RuntimeError("invalid xref offset")
+
+        mock_chroma, mock_collection = self._mock_chroma()
+        mock_manifest = MagicMock()
+        mock_manifest.upsert_pdf_metadata = AsyncMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/broken.pdf",
+                },
+            )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "episodic/broken.pdf" in detail
+        assert "ai_research_papers" in detail
+        mock_collection.upsert.assert_not_called()
+
+
 class TestIndexPrivateTier:
     """POST /memory/index single-file mode accepts private-tier keys
     (ADR-062 Phase B regression, #426).
