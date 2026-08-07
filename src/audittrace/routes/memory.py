@@ -722,6 +722,7 @@ async def _index_md_objects(
     col_name: str,
     category: str,
     user_id: str,
+    tier: str,
     outcomes: list[bool] | None = None,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
@@ -779,6 +780,25 @@ async def _index_md_objects(
                 # documents", so the model read it as "this does not exist"
                 # (#374). Do not introduce a second ownership key.
                 "user_id": user_id,
+                # ADR-059 fleet-recall gap (WU-1, 2026-08-07): stamp the
+                # ALREADY-resolved (`index_memory`'s token-derived, ADR-027
+                # §1 tenancy) tier onto every chunk. Before this fix, no
+                # `tier` key was ever written here — the backoffice
+                # discovery-merge builder (`_merge_semantic_with_chroma`)
+                # defaults an untagged row's surfaced tier to `"corpus"`
+                # (its `meta.get("tier", "corpus")`), and `list_semantic`'s
+                # `_filter_corpus_read_gate` then drops any corpus-tagged
+                # item the caller lacks `memory:corpus:<collection>:read`
+                # for. So a caller's OWN genuinely-private single-file fold
+                # (e.g. the ADR-059 fleet helper's `log_deploy_record`) was
+                # silently misclassified as corpus and gated out, even
+                # though it was never meant to require a corpus scope at
+                # all. This is metadata accuracy, not a scope/tenancy
+                # decision — `tier` is the SAME value the caller's
+                # ``POST /memory/upload``/``?file=`` key prefix already
+                # resolved (private vs corpus), just not previously
+                # propagated into ChromaDB.
+                "tier": tier,
             }
             for i in range(len(chunks))
         ]
@@ -1056,6 +1076,7 @@ async def index_memory(
                 col_name,
                 category="episodic",
                 user_id=user.user_id,
+                tier=tier,
                 outcomes=object_outcomes,
             )
         if col_name in ("skills", "semantic"):
@@ -1067,6 +1088,7 @@ async def index_memory(
                 col_name,
                 category="procedural",
                 user_id=user.user_id,
+                tier=tier,
                 outcomes=object_outcomes,
             )
         if col_name == "ai_research_papers":
@@ -1923,6 +1945,75 @@ async def create_semantic(
     return entry.to_dict()
 
 
+async def _discover_rows_for_caller(
+    col: Any, user: UserContext
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Fetch discovery candidate rows from one physical ChromaDB collection,
+    scoped so a caller's OWN rows always survive ``_SEMANTIC_DISCOVERY_LIMIT``.
+
+    ADR-059 fleet-recall gap (WU-1, 2026-08-07): the discovery scan used to
+    be a single UNFILTERED ``col.get(limit=_SEMANTIC_DISCOVERY_LIMIT)`` —
+    the owner-or-corpus predicate was applied only AFTER that raw slice was
+    taken. On a physical collection with more rows than the cap (the normal
+    case for a well-used collection like ``decisions_v2``), a caller's own
+    freshly-written private row can sort anywhere in ChromaDB's internal
+    `get()` order and simply never land inside the first `limit` rows — so
+    `list_semantic` (and therefore the fleet helper
+    ``scripts/deploy/memory.py::recall_deploy_lessons``, which reads this
+    endpoint) reported "0 lessons" for a caller's OWN just-folded decision
+    even though the row existed and was owned by them.
+
+    Fix: for a non-admin caller, run an ADDITIONAL flat-equality scan scoped
+    to ``where={"user_id": user.user_id}`` so every row the caller owns is a
+    candidate for the cap, not just whichever ones happened to land in an
+    unfiltered top-N slice; merge it (de-duplicated by id) with the original
+    unfiltered scan so existing corpus/shared visibility within the cap is
+    unchanged. Two separate flat-equality queries rather than one `$or`
+    clause — mirrors ``ChromaSemanticService.search``'s established
+    two-query pattern (`services/semantic.py`), because the in-repo
+    ChromaDB test double only supports flat-equality `where`
+    (`db/factory.py::MockCollection.get`). Admin keeps the single
+    unfiltered scan, unchanged — an admin's discovery view must stay
+    uncapped by ownership.
+    """
+    if user.is_admin:
+        res = await col.get(
+            limit=_SEMANTIC_DISCOVERY_LIMIT, include=["documents", "metadatas"]
+        )
+        return (
+            list(res.get("ids") or []),
+            list(res.get("documents") or []),
+            list(res.get("metadatas") or []),
+        )
+
+    own_res, general_res = (
+        await col.get(
+            where={"user_id": user.user_id},
+            limit=_SEMANTIC_DISCOVERY_LIMIT,
+            include=["documents", "metadatas"],
+        ),
+        await col.get(
+            limit=_SEMANTIC_DISCOVERY_LIMIT, include=["documents", "metadatas"]
+        ),
+    )
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for res in (own_res, general_res):
+        res_ids = res.get("ids") or []
+        res_docs = res.get("documents") or []
+        res_metas = res.get("metadatas") or []
+        for i, doc_id in enumerate(res_ids):
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            ids.append(doc_id)
+            docs.append(res_docs[i] if i < len(res_docs) else "")
+            metas.append(res_metas[i] if i < len(res_metas) and res_metas[i] else {})
+    return ids, docs, metas
+
+
 async def _merge_semantic_with_chroma(
     visible_entries: list[ManifestEntry],
     collection: str | None,
@@ -1936,6 +2027,9 @@ async def _merge_semantic_with_chroma(
     on collections that grow large; operators who need to browse a
     large semantic store can paginate via the manifest's offset/limit
     once they've created tracked rows for the items they care about.
+    ``_discover_rows_for_caller`` (above) additionally guarantees a
+    non-admin caller's OWN rows are never dropped by that cap (ADR-059
+    WU-1).
 
     ADR-062 Phase B (§3 hole 2): the raw `col.get()` discovery scan below
     used to enumerate EVERY row in every scanned collection with no
@@ -1991,16 +2085,10 @@ async def _merge_semantic_with_chroma(
                 name=col_name,
                 embedding_function=None,
             )
-            res = await col.get(
-                limit=_SEMANTIC_DISCOVERY_LIMIT,
-                include=["documents", "metadatas"],
-            )
+            ids, docs, metas = await _discover_rows_for_caller(col, user)
         except Exception as exc:
             logger.warning("ChromaDB get failed for collection %s: %s", col_name, exc)
             continue
-        ids = res.get("ids") or []
-        docs = res.get("documents") or []
-        metas = res.get("metadatas") or []
         for i, doc_id in enumerate(ids):
             key = _semantic_key(col_name, doc_id)
             if key in known_keys:
