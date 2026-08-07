@@ -1221,6 +1221,110 @@ class TestIndexZeroChunksLoud:
         detail = json.loads(writes[-1]["error_detail"])
         assert detail["total_chunks"] == 0
 
+    def test_single_file_blank_pdf_benign_zero_chunks_is_200(
+        self, client: TestClient
+    ) -> None:
+        """Gate 6 (REVIEW REJECT 2026-08-07 fix) — a single-file index of a
+        text-free AND image-free PDF page into ``ai_research_papers`` is
+        NOT a mismatch: the PDF pipeline legitimately marks such a page
+        ``ok=True, "benign, no warning", chunks_written=0``
+        (memory_pdf/pipeline.py:511-513, the "truly empty page" branch).
+        The object WAS routed to and processed by the ``ai_research_papers``
+        indexer — it just had nothing to embed — so this must 200, not 422.
+
+        Neuter: revert the guard's discriminator from
+        ``objects_attempted == 0`` back to ``total_chunks == 0`` -> this
+        test goes RED (a benign 0-chunk PDF wrongly 422s, reproducing the
+        reviewer's live repro `file=episodic/papers/blank.pdf&collections=
+        ai_research_papers`)."""
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 blank-page-stub"
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = ""  # text-free
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []  # image-free
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/papers/blank.pdf",
+                    "details": "true",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "indexed"
+        assert data["total_chunks"] == 0
+        # The object WAS routed to and processed by the PDF indexer — the
+        # manifest write was attempted (proving dispatch happened) and the
+        # ``?details=true`` per-document outcome shows ``ok: True`` with
+        # ``chunks: 0``, the "benign, no warning" path, not a rejection.
+        mock_manifest.upsert_pdf_metadata.assert_called_once()
+        assert data["documents"] == [
+            {
+                "file": "episodic/papers/blank.pdf",
+                "chunks": 0,
+                "signature_status": data["documents"][0]["signature_status"],
+                "page_count": 1,
+                "extraction_warnings": [],
+                "document_sha256": data["documents"][0]["document_sha256"],
+                "pdf_title": None,
+                "pdf_author": None,
+                "pdf_creator": None,
+                "pdf_creation_date": None,
+                "pdfa_part": None,
+                "pdfa_conformance": None,
+                "ltv_data": None,
+                "ok": True,
+                "error": None,
+            }
+        ]
+        mock_collection.upsert.assert_not_called()
+
 
 class TestIndexPrivateTier:
     """POST /memory/index single-file mode accepts private-tier keys
