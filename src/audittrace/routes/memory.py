@@ -1111,6 +1111,28 @@ async def index_memory(
             "tier": tier,
         },
     )
+    # #430 — a single-file index that writes ZERO chunks is a silent
+    # failure wearing a 200: the caller believes the object landed and
+    # nothing did (typically a content/layer vs target-collection
+    # mismatch, e.g. a ``procedural/`` key indexed into
+    # ``collections=decisions``). The write ATTEMPT is still audited
+    # above (ADR-058 — the attempt, with ``total_chunks: 0``, is already
+    # in ``detail_extra``) before this loud fail. Bulk mode is exempt
+    # (an admin whole-collection rebuild legitimately yields 0 chunks
+    # when nothing matches) and dry-run is exempt (no write intended, 0
+    # chunks is expected) — both keep returning 200.
+    if single_file_mode and not dry_run and total_chunks == 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"single-file index of file={file!r} into "
+                f"collections={target_collections!r} wrote 0 chunks — "
+                "the object was NOT indexed. Likely cause: the object's "
+                "layer prefix does not match the target collection "
+                "(e.g. a procedural/ or episodic/ key indexed into a "
+                "collection that only accepts the other layer)."
+            ),
+        )
     return response
 
 
