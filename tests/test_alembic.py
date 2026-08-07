@@ -281,3 +281,37 @@ class TestMigration018AddTierToMemoryItems:
             assert "tier" not in {
                 c["name"] for c in inspector.get_columns("memory_items")
             }
+
+
+class TestEnvPyDoesNotDisableOtherLoggers:
+    """Regression guard for a session-wide footgun found building #411 v2.
+
+    ``src/audittrace/migrations/env.py`` calls ``fileConfig(alembic.ini)`` on
+    EVERY ``command.upgrade``/``command.downgrade``. ``fileConfig``'s DEFAULT
+    (``disable_existing_loggers=True``) silently sets ``.disabled = True`` on
+    every Python logger that already exists in the process — and under
+    pytest ALL test modules (so every module-scoped
+    ``logging.getLogger(__name__)``) are imported at collection time, before
+    any test body runs. So the FIRST alembic upgrade anywhere in the session
+    used to permanently mute every OTHER module's logger for the rest of the
+    run: ``scripts.deploy.mesh``'s ``logger.error(...)`` in the #411 v2 G3
+    tests went silently no-op whenever ``tests/test_alembic.py`` happened to
+    collect/run first (alphabetically before ``test_deploy_mesh.py``) — never
+    reproducible in isolation, only in the full suite. Falsifiable: reverting
+    ``env.py`` to a bare ``fileConfig(config.config_file_name)`` call turns
+    this RED.
+    """
+
+    def test_upgrade_does_not_disable_a_pre_existing_module_logger(
+        self, alembic_cfg, engine
+    ):
+        import logging
+
+        canary = logging.getLogger("audittrace.tests.canary_for_env_py_disable")
+        assert canary.disabled is False  # sanity: freshly created, not disabled
+
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+
+        assert canary.disabled is False

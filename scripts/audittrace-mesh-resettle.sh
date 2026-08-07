@@ -31,14 +31,41 @@
 # This script + its two units are HOST infra, like audittrace-vault-auto-unseal.
 # They are installed out-of-band on the laptop, NOT shipped in charts/. Install:
 #
-#   sudo install -d -o lfdesousa -g lfdesousa /var/lib/audittrace/mesh-heal/requests
-#   sudo install -d -o lfdesousa -g lfdesousa /var/lib/audittrace/mesh-heal/results
+#   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/audittrace/mesh-heal/requests
+#   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/audittrace/mesh-heal/results
 #   sudo cp scripts/audittrace-mesh-healer.{path,service} /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now audittrace-mesh-healer.path
 #
-# The requests/ + results/ dirs are chown'd to the runner user so the
+# The requests/ + results/ dirs are chown'd to the invoking runner's own
+# user/group (portability invariant — never hardcode a username) so the
 # unprivileged runner can write requests and read results; root writes results.
+#
+# ── #411 v2: the DURABLE guarantee (survives reboots) ───────────────────────
+# The `install -d` above only sets ownership ONCE, at install time. #411 was
+# exactly this ownership NOT being durable — a reboot / manual `mkdir` / a
+# drifted install silently re-creates the dir root-owned, and the runner can
+# no longer write into the ONE dir `audittrace-mesh-healer.path`'s
+# `DirectoryNotEmpty=` watches. `scripts/audittrace-mesh-heal.tmpfiles.conf`
+# is the durable fix: a systemd-tmpfiles(5) rule that recreates BOTH dirs,
+# runner-owned + mode 0775, on EVERY BOOT. Render it with the invoking
+# runner's user/group substituted (its shipped copy carries the
+# @RUNNER_USER@ / @RUNNER_GROUP@ placeholders — portability invariant, never
+# a hardcoded username) and install it alongside the two units:
+#
+#   sed -e "s/@RUNNER_USER@/$(id -un)/" -e "s/@RUNNER_GROUP@/$(id -gn)/" \
+#     scripts/audittrace-mesh-heal.tmpfiles.conf \
+#     | sudo tee /etc/tmpfiles.d/audittrace-mesh-heal.conf >/dev/null
+#   sudo systemd-tmpfiles --create /etc/tmpfiles.d/audittrace-mesh-heal.conf
+#
+# `systemd-tmpfiles --create` both applies it immediately (so the `install -d`
+# step above becomes redundant once this is in place, but is kept for a fresh
+# install before the tmpfiles rule is ever rendered) AND re-applies it on every
+# subsequent boot via `systemd-tmpfiles-setup.service`, which runs before
+# `paths.target` — so the watched dir is runner-writable before
+# `audittrace-mesh-healer.path` ever re-arms. #411 code-side loud-fail (never
+# a false "healed") lives in `scripts/deploy/mesh.py`'s
+# `PrivilegedHealer._trigger_host_resettle`.
 #
 # ── Testing ─────────────────────────────────────────────────────────────────
 # Set MESH_RESETTLE_DRY_RUN=1 to validate + select the op and record a result

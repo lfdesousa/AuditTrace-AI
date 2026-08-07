@@ -15,8 +15,23 @@ from audittrace.db.models import Base
 config = context.config
 
 # Configure Python logging from .ini file.
+#
+# disable_existing_loggers=False (the non-default): fileConfig()'s DEFAULT
+# (True) silently sets ``.disabled = True`` on every Python logger that
+# already exists in the process at call time — e.g. every module-scoped
+# ``logging.getLogger(__name__)`` created at import time. Under pytest, ALL
+# test modules are imported during collection before any test body runs, so
+# by the time the FIRST alembic upgrade/downgrade call reaches here (fired
+# from any test using the ``alembic_cfg``/``engine`` fixtures), every OTHER
+# module's logger already exists — and gets silently disabled for the rest
+# of the session, breaking any later test's ``caplog`` assertions on THAT
+# module with zero visible cause (discovered via #411 v2's mesh-heal ERROR
+# log assertions going empty only when run after ``tests/test_alembic.py``,
+# never in isolation). ``False`` scopes fileConfig() to configuring
+# formatters/handlers as declared, without silently muting the rest of the
+# process's loggers.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # SQLAlchemy MetaData for autogenerate support.
 target_metadata = Base.metadata

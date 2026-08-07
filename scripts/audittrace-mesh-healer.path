@@ -6,6 +6,14 @@ Documentation=file:///home/lfdesousa/work/AuditTrace-AI/scripts/audittrace-mesh-
 # activates audittrace-mesh-healer.service (root) to perform the whitelisted,
 # bounded host-root re-settle. The runner holds ZERO standing privilege — it can
 # only write a file. See scripts/audittrace-mesh-resettle.sh for the boundary.
+#
+# #411 v2 — DURABILITY: the runner must ALWAYS be able to write into the exact
+# dir DirectoryNotEmpty= below watches, across reboots. That durability comes
+# from scripts/audittrace-mesh-heal.tmpfiles.conf (a systemd-tmpfiles(5) rule,
+# installed alongside this unit — see audittrace-mesh-resettle.sh's header),
+# NOT from this unit. If DirectoryNotEmpty= below ever changes, the tmpfiles
+# rule (and MESH_HEAL_DIR in the .service) MUST change with it —
+# tests/test_deploy_mesh.py asserts they cannot drift apart.
 
 [Path]
 # Fire whenever a request file is present. The service processes + removes each
