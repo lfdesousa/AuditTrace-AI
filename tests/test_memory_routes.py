@@ -1493,6 +1493,63 @@ class TestIndexPrivateTier:
         call_kwargs = mock_collection.upsert.call_args.kwargs
         assert call_kwargs["metadatas"][0]["user_id"] == "user-abc"
 
+    def test_private_tier_index_stamps_tier_metadata(self, client: TestClient) -> None:
+        """ADR-059 fleet-recall gap (WU-1, 2026-08-07) — the token-derived
+        tier resolved by ``index_memory`` (private, from the ``?file=``
+        key-prefix disambiguation) must be STAMPED into every chunk's
+        ChromaDB metadata, not just used for bucket routing.
+
+        Before this fix, no ``tier`` key was ever written here. The
+        backoffice discovery-merge builder
+        (``_merge_semantic_with_chroma``) defaults an untagged row's
+        surfaced tier to ``"corpus"``, and ``list_semantic``'s
+        ``_filter_corpus_read_gate`` then drops any corpus-tagged item the
+        caller lacks ``memory:corpus:<collection>:read`` for — so a
+        caller's OWN genuinely-private single-file fold (e.g. the ADR-059
+        fleet helper's ``log_deploy_record``) was silently misclassified
+        as corpus and gated out.
+
+        Neuter: drop the ``"tier": tier`` metadata field in
+        ``_index_md_objects`` and this test goes RED."""
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# private note\nsome body"
+        mock_minio.get_object.return_value = response_obj
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "user-abc",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "user-abc/episodic/foo.md",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+
+        assert response.status_code == 200, response.text
+        call_kwargs = mock_collection.upsert.call_args.kwargs
+        assert call_kwargs["metadatas"][0]["tier"] == "private", (
+            "single-file private-tier index did not stamp tier metadata: "
+            f"{call_kwargs['metadatas'][0]}"
+        )
+
     def test_private_bucket_is_read_not_shared(self, client: TestClient) -> None:
         """Gate 2 — the private branch reads ``memory-private``, never
         ``memory-shared``. Neuter: force ``bucket = shared_bucket``
@@ -7462,6 +7519,224 @@ class TestMergeSemanticWithChroma:
         assert any("collide" in k for k in keys), (
             f"alice's own doc was hidden by bob's colliding manifest key: {keys}"
         )
+
+    # ── ADR-059 fleet-recall gap (WU-1, 2026-08-07) ───────────────────────
+    # `scripts/deploy/memory.py::recall_deploy_lessons` reads this same
+    # `list_semantic` -> `_merge_semantic_with_chroma` code path with a
+    # SERVICE identity. Fleet lessons are folded PRIVATE-tier under that
+    # identity into a large, shared physical collection (`decisions_v2`)
+    # that also holds every other user's + admin's rows. The pre-fix
+    # discovery scan pulled an UNFILTERED top-`_SEMANTIC_DISCOVERY_LIMIT`
+    # slice and applied the owner-or-corpus gate AFTER the cap — so a
+    # caller's own freshly-folded row, sorting anywhere in ChromaDB's raw
+    # `get()` order, could simply never appear inside the cap. These tests
+    # use a `where`-AWARE fake (unlike `_Col`/`_Chroma` above, which
+    # ignore `where` and only prove the Python-side gate) so they exercise
+    # the actual mechanism `_discover_rows_for_caller` now relies on.
+
+    class _WhereAwareCol:
+        """A ChromaDB collection double that ACTUALLY applies `where` and
+        `limit` server-side (flat-equality only, mirroring the real
+        in-repo ChromaDB test double `db.factory.MockCollection.get`).
+        Records every `get()` call so a test can pin the exact `where`
+        clause issued, not just the end result."""
+
+        def __init__(self, ids, documents, metadatas):
+            self._rows = list(zip(ids, documents, metadatas))
+            self.get_calls: list[dict[str, Any]] = []
+
+        async def get(self, where=None, limit=None, include=None, **_kw):
+            self.get_calls.append({"where": where, "limit": limit})
+            rows = self._rows
+            if where:
+                rows = [
+                    r for r in rows if all(r[2].get(k) == v for k, v in where.items())
+                ]
+            if limit is not None:
+                rows = rows[:limit]
+            return {
+                "ids": [r[0] for r in rows],
+                "documents": [r[1] for r in rows],
+                "metadatas": [r[2] for r in rows],
+            }
+
+    class _WhereAwareChroma:
+        def __init__(self, col):
+            self._col = col
+
+        async def get_or_create_collection(self, name, embedding_function=None):
+            return self._col
+
+    @pytest.mark.asyncio
+    async def test_callers_own_private_row_survives_the_discovery_cap(
+        self, monkeypatch, user_context
+    ) -> None:
+        """FOREVER GUARD: a caller's OWN just-folded private-tier row must
+        be recallable via `list_semantic` even when the physical
+        collection holds MORE than `_SEMANTIC_DISCOVERY_LIMIT` other rows
+        sorting ahead of it in ChromaDB's raw `get()` order — exactly the
+        fleet's real shape.
+
+        FALSIFIABLE: in `_discover_rows_for_caller`, drop the
+        `where={"user_id": ...}` scan for non-admin callers (fall back to
+        the single unfiltered `col.get()`, the pre-fix behaviour) and this
+        test goes RED — alice's canary, parked past the cap, never
+        surfaces."""
+        from dataclasses import replace
+
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
+                return []
+
+        noise = m._SEMANTIC_DISCOVERY_LIMIT
+        ids = [f"noise-{i}" for i in range(noise)] + ["alice-canary"]
+        documents = ["noise body"] * noise + [
+            "the teal otter named Daronne recalls memory on Tuesdays"
+        ]
+        metadatas = [{"user_id": "someone-else"} for _ in range(noise)] + [
+            {"user_id": "user-alice"}
+        ]
+        col = self._WhereAwareCol(ids, documents, metadatas)
+        chroma = self._WhereAwareChroma(col)
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        items = await m._merge_semantic_with_chroma(
+            [], collection="decisions", user=alice
+        )
+        keys = [i["key"] for i in items]
+        assert any("alice-canary" in k for k in keys), (
+            f"alice's own just-folded canary was dropped by the discovery cap: {keys}"
+        )
+        # Pin the mechanism itself: the non-admin scan issued a
+        # where={"user_id": ...} query — not just a lucky unfiltered slice.
+        assert {"user_id": "user-alice"} in [c["where"] for c in col.get_calls]
+
+    @pytest.mark.asyncio
+    async def test_where_aware_discovery_still_isolates_cross_user_rows(
+        self, monkeypatch, user_context
+    ) -> None:
+        """Cross-user isolation holds under the where-scoped scan too — the
+        fix must never become an over-broad query that leaks. Uses the
+        SAME `where`-aware fake as the forever-canary test above (not the
+        older `_Col`/`_Chroma` fakes, which ignore `where` entirely)."""
+        from dataclasses import replace
+
+        from audittrace.routes import memory as m
+
+        class _Manifest:
+            async def list_for_layer(self, layer, include_deleted=False, caller=None):
+                return []
+
+        col = self._WhereAwareCol(
+            ["mine", "theirs"],
+            ["my body", "their body"],
+            [{"user_id": "user-alice"}, {"user_id": "user-bob"}],
+        )
+        chroma = self._WhereAwareChroma(col)
+        monkeypatch.setattr(m, "get_memory_manifest_service", lambda: _Manifest())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma)
+
+        alice = replace(user_context, user_id="user-alice", is_admin=False, scopes=())
+        items = await m._merge_semantic_with_chroma(
+            [], collection="decisions", user=alice
+        )
+        keys = [i["key"] for i in items]
+        assert any("mine" in k for k in keys)
+        assert not any("theirs" in k for k in keys), f"leaked bob's row: {keys}"
+
+
+class TestADR059FleetRecallGap:
+    """WU-1 (SPEC-recall-loop-and-telemetry, 2026-08-07) — TRUE end-to-end
+    through the real `GET /memory/semantic` route (the endpoint
+    `scripts/deploy/memory.py::recall_deploy_lessons` reads) using the
+    REAL in-repo ChromaDB test double (`db.factory.MockCollection`), not a
+    hand-rolled fake. Closes the ADR-059 self-improvement loop: fleet
+    lessons written by the fleet must be recallable BY the fleet."""
+
+    def test_fleet_agent_recalls_its_own_just_folded_canary(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        import asyncio
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        # A well-used shared collection: `_SEMANTIC_DISCOVERY_LIMIT` rows
+        # from OTHER users/admin bulk-indexing sort ahead of the fleet's
+        # freshly-folded canary in ChromaDB's raw get() order.
+        collection.data = [
+            {
+                "id": f"noise-{i}",
+                "document": "noise",
+                "metadata": {"user_id": "some-other-user"},
+            }
+            for i in range(m._SEMANTIC_DISCOVERY_LIMIT)
+        ] + [
+            {
+                "id": "fleet-canary",
+                "document": "the teal otter named Daronne recalls memory on Tuesdays",
+                # Matches what the (now-fixed) `_index_md_objects` write path
+                # actually stamps for a private-tier single-file fold.
+                "metadata": {"user_id": "fleet-service-0b0cdd4d", "tier": "private"},
+            }
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        _override_identity(client, "fleet-service-0b0cdd4d", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            keys = {i["key"] for i in r.json()["items"]}
+            assert any("fleet-canary" in k for k in keys), (
+                "fleet's own just-folded canary is invisible to list_semantic "
+                f"(the endpoint recall_deploy_lessons reads): {keys}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_fleet_agent_cannot_recall_another_services_private_canary(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        """Cross-user isolation, end-to-end: the same fix must not leak
+        another caller's private row to a different service identity."""
+        import asyncio
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        collection.data = [
+            {
+                "id": "victim-row",
+                "document": "victim's private lesson",
+                "metadata": {"user_id": "victim-service", "tier": "private"},
+            }
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        _override_identity(client, "attacker-service", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            keys = {i["key"] for i in r.json()["items"]}
+            assert not any("victim-row" in k for k in keys), (
+                f"leaked victim-service's private row: {keys}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
 
 
 class TestMemoryAccessAuditEvents:
