@@ -5824,6 +5824,74 @@ class TestPdfFlushManifest:
         manifest.upsert_pdf_metadata.assert_called_once()
 
 
+class TestFlushMdManifestHelper:
+    """ADR-059 WU-1c — ``memory_md_manifest._flush_md_manifest`` resilience,
+    mirroring ``TestPdfFlushManifest`` above for the ``.md`` fold path:
+    missing service is a no-op; per-chunk service errors are logged +
+    swallowed (a Postgres outage must not undo the ChromaDB chunks already
+    committed by ``_index_md_objects``)."""
+
+    async def test_none_service_is_silent_noop(self) -> None:
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+
+        # Should not raise. No assertion needed beyond "did not crash".
+        await _flush_md_manifest(
+            None,
+            keys=["decisions/abc123"],
+            filename="x.md",
+            sizes_bytes=[42],
+            user_id="u",
+            tier="private",
+        )
+
+    async def test_per_chunk_failure_is_swallowed_and_others_still_attempted(
+        self,
+    ) -> None:
+        """One chunk's Postgres failure must not abort the remaining
+        chunks in the same file — each chunk is an independent best-effort
+        write."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock(side_effect=[RuntimeError("pg down"), None])
+        # Should NOT raise, despite the first chunk's write failing.
+        await _flush_md_manifest(
+            manifest,
+            keys=["decisions/chunk-0", "decisions/chunk-1"],
+            filename="x.md",
+            sizes_bytes=[10, 20],
+            user_id="u",
+            tier="private",
+        )
+        assert manifest.record_create.call_count == 2
+
+    async def test_writes_one_row_per_chunk_with_matching_fields(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock()
+        await _flush_md_manifest(
+            manifest,
+            keys=["decisions/chunk-0"],
+            filename="deploy-record-canary.md",
+            sizes_bytes=[57],
+            user_id="fleet-service-0b0cdd4d",
+            tier="private",
+        )
+        manifest.record_create.assert_awaited_once_with(
+            layer="semantic",
+            key="decisions/chunk-0",
+            title="deploy-record-canary.md",
+            size_bytes=57,
+            user_id="fleet-service-0b0cdd4d",
+            tier="private",
+        )
+
+
 # ── Tier-C: PDF document metadata + corruption taxonomy + per-doc audit (ADR-056) ──
 
 
@@ -7874,6 +7942,186 @@ class TestADR059FleetRecallGap:
             keys = {i["key"] for i in r.json()["items"]}
             assert not any("victim-row" in k for k in keys), (
                 f"leaked victim-service's private row: {keys}"
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestWU1cManifestThreadedListingSurvivesDominantOwnerCap:
+    """ADR-059 WU-1c (SPEC-wu1c-fleet-recall-discovery-cap, 2026-08-08) —
+    the layer UNDER WU-1b. WU-1b fixed the tier stamp + the ownership
+    exemption; a caller's own row was then visible IF it survived the
+    ``_SEMANTIC_DISCOVERY_LIMIT`` cap. This class reproduces the residual
+    live v1.20.3 gap WU-1b's own tests didn't cover: the DOMINANT-OWNER
+    case, where the caller itself already owns MORE than
+    ``_SEMANTIC_DISCOVERY_LIMIT`` rows (the fleet's real shape on the
+    single-tenant laptop), so even the WU-1 owner-scoped
+    ``where={"user_id": ...}`` discovery scan ALSO hits the cap and a
+    fresh fold — added to the collection AFTER the 200 pre-existing rows —
+    sorts outside ChromaDB's ``.get(limit=200)`` window (non-recency
+    ordered doc ids).
+
+    #423 non-negotiable: drives the REAL fold -> list path end to end
+    (``POST /memory/upload`` -> ``POST /memory/index`` -> ``GET
+    /memory/semantic``) with a precondition where the caller already owns
+    201 rows (> the 200 cap) BEFORE the fresh fold — no fixture pre-seeds
+    fewer than the cap, and no result is hand-ordered; the 201 legacy rows
+    sit ahead of the fresh fold in ``MockCollection``'s insertion-ordered
+    ``.get()`` exactly as ChromaDB's real non-recency doc-id order would
+    strand a fresh write behind a large existing corpus.
+
+    FALSIFIABLE: this test is RED without the WU-1c fix. Neutering the fix
+    by not threading ``manifest_service`` into ``_index_md_objects`` (i.e.
+    reverting the ``manifest_service=manifest_service`` kwarg at either
+    ``index_memory`` call site, or gutting
+    ``memory_md_manifest._flush_md_manifest`` to a no-op) leaves the fresh
+    canary tracked ONLY via the capped, unordered ``.get()`` discovery
+    scan — which the 201 pre-existing legacy (un-manifested) rows already
+    fill past the cap, so the canary drops out of both the unfiltered AND
+    the owner-scoped discovery slice and never reaches ``GET
+    /memory/semantic``."""
+
+    def test_fresh_fold_visible_when_caller_already_owns_gt_cap_rows(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        # The dominant-owner precondition: the caller (not "some other
+        # user") already owns MORE than `_SEMANTIC_DISCOVERY_LIMIT` rows,
+        # inserted BEFORE the fresh fold below, and NONE of them carry a
+        # manifest entry — exactly what every real .md fold looked like
+        # before this WU-1c fix (the pre-fix `_index_md_objects` never
+        # wrote a manifest row at all). This is what makes the caller's
+        # OWN owner-scoped `where={"user_id": ...}` discovery scan ALSO
+        # hit the cap, not just the unfiltered scan WU-1 already handled.
+        fleet_sub = "fleet-service-0b0cdd4d"
+        noise_count = m._SEMANTIC_DISCOVERY_LIMIT + 1
+        collection.data = [
+            {
+                "id": f"legacy-{i}",
+                "document": "a lesson folded before WU-1c",
+                "metadata": {"user_id": fleet_sub, "tier": "private"},
+            }
+            for i in range(noise_count)
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        _override_identity(
+            client, fleet_sub, ("memory:episodic:write", "memory:semantic:read")
+        )
+        try:
+            content = (
+                b"the teal otter named Daronne recalls memory past the discovery cap"
+            )
+            with patch.object(m, "_get_minio_client", return_value=MagicMock()):
+                up = client.post(
+                    "/memory/upload",
+                    params={"layer": "episodic", "filename": "wu1c-canary.md"},
+                    files={"file": ("wu1c-canary.md", content, "text/markdown")},
+                )
+            assert up.status_code == 200, up.text
+            key = up.json()["key"]
+            assert key == f"{fleet_sub}/episodic/wu1c-canary.md"
+
+            def get_object(bucket: str, k: str) -> MagicMock:
+                assert (bucket, k) == ("memory-private", key), (bucket, k)
+                response = MagicMock()
+                response.__enter__.return_value = response
+                response.__exit__.return_value = False
+                response.read.return_value = content
+                return response
+
+            fake_minio = MagicMock()
+            fake_minio.get_object.side_effect = get_object
+            with (
+                patch.object(m, "_get_minio_client", return_value=fake_minio),
+                patch.object(
+                    m,
+                    "embed_via_nomic",
+                    AsyncMock(
+                        side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]
+                    ),
+                ),
+            ):
+                ix = client.post(
+                    "/memory/index",
+                    params={"file": key, "collections": "decisions"},
+                )
+            assert ix.status_code == 200, ix.text
+            assert ix.json()["total_chunks"] == 1
+
+            # Sanity: the dominant-owner precondition really is in place —
+            # the physical collection now holds > cap legacy rows owned by
+            # the SAME caller, plus the fresh chunk.
+            assert len(collection.data) == noise_count + 1
+
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            items = r.json()["items"]
+            titles = {i["title"] for i in items}
+            assert "wu1c-canary.md" in titles, (
+                "fleet's own fold is invisible to list_semantic even though the "
+                f"caller already owned {noise_count} (> the "
+                f"{m._SEMANTIC_DISCOVERY_LIMIT}-row cap) rows before folding it: "
+                f"{items}"
+            )
+            # The item that saved the canary must be the MANIFEST-tracked
+            # one (real created_at_ms), not a lucky discovery-scan hit —
+            # pins the actual mechanism, not just the end symptom.
+            canary_item = next(i for i in items if i["title"] == "wu1c-canary.md")
+            assert canary_item["created_at_ms"] is not None, (
+                "canary surfaced via the capped/unordered discovery scan, not "
+                f"the manifest — the WU-1c fix isn't actually wired: {canary_item}"
+            )
+            assert canary_item.get("discovered") is not True
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_legacy_unmanifested_row_still_falls_back_to_discovery(
+        self, client: TestClient, monkeypatch
+    ) -> None:
+        """Backward-compat: a pre-WU-1c row that was written straight to
+        ChromaDB with no manifest entry (simulating content indexed before
+        this fix shipped) must still be discoverable through the existing
+        ``.get()`` fallback — WU-1c demotes discovery to a fallback, it
+        does not remove it. Stays well under the cap so this test isolates
+        "legacy row still visible" from the dominant-owner cap mechanic
+        covered above."""
+        import asyncio
+
+        from audittrace.db.factory import MockChromaDBFactory, MockCollection
+        from audittrace.routes import memory as m
+
+        factory = MockChromaDBFactory()
+        physical = "decisions_v2"
+        collection = MockCollection(physical)
+        collection.data = [
+            {
+                "id": "pre-wu1c-legacy-row",
+                "document": "folded before the manifest was threaded in",
+                "metadata": {"user_id": "fleet-service-0b0cdd4d", "tier": "private"},
+            }
+        ]
+        factory.collections[physical] = collection
+        chroma_client = asyncio.run(factory.get_client())
+        monkeypatch.setattr(m, "get_chromadb", lambda: chroma_client)
+
+        _override_identity(client, "fleet-service-0b0cdd4d", ("memory:semantic:read",))
+        try:
+            r = client.get("/memory/semantic?collection=decisions")
+            assert r.status_code == 200, r.text
+            keys = {i["key"] for i in r.json()["items"]}
+            assert any("pre-wu1c-legacy-row" in k for k in keys), (
+                f"legacy un-manifested row lost visibility: {r.json()['items']}"
             )
         finally:
             client.app.dependency_overrides.clear()

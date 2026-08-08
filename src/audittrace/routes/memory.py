@@ -82,6 +82,7 @@ from audittrace.models import (
 # working unchanged.
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
+from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.layer_listing import list_layer_objects
@@ -724,6 +725,7 @@ async def _index_md_objects(
     user_id: str,
     tier: str,
     outcomes: list[bool] | None = None,
+    manifest_service: Any | None = None,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
@@ -740,6 +742,16 @@ async def _index_md_objects(
     genuine routing/read rejection from a benign empty-content file —
     unconditionally available (unlike ``?details``), so the handler's
     loud-422 guard never depends on an opt-in query flag.
+
+    *manifest_service* (ADR-059 WU-1c, 2026-08-08) — when supplied, every
+    chunk written to ChromaDB also gets a manifest row via
+    ``memory_md_manifest._flush_md_manifest`` (best-effort, mirrors
+    ``_flush_pdf_manifest`` for the PDF path, ADR-056). This is the
+    durable fix for the fleet-recall discovery-cap bug: a manifest row
+    makes the fold visible through ``list_semantic``'s UNCAPPED,
+    ``created_at_ms``-ordered manifest scan instead of relying solely on
+    the capped, non-recency-ordered ``col.get()`` discovery fallback. See
+    the module docstring on ``memory_md_manifest`` for the full story.
     """
     total = 0
     for obj in objects:
@@ -808,6 +820,20 @@ async def _index_md_objects(
                 m["skill"] = skill_name
         await _upsert_in_batches(collection, ids, chunks, metadatas)
         total += len(chunks)
+        # ADR-059 WU-1c — thread the manifest write (see this function's
+        # docstring + the memory_md_manifest module docstring). Runs after
+        # the ChromaDB upsert, same ordering as the PDF path
+        # (_flush_pdf_manifest is called once the chunks/pages are
+        # committed) — the manifest is a durable INDEX onto ChromaDB
+        # content, not a precondition for it.
+        await _flush_md_manifest(
+            manifest_service,
+            keys=[_semantic_key(col_name, doc_id) for doc_id in ids],
+            filename=obj["filename"],
+            sizes_bytes=[len(c.encode("utf-8")) for c in chunks],
+            user_id=user_id,
+            tier=tier,
+        )
     return total
 
 
@@ -962,6 +988,10 @@ async def index_memory(
     bucket = private_bucket if tier == "private" else shared_bucket
     minio_client = _get_minio_client()
     chroma_client = get_chromadb()
+    # ADR-059 WU-1c — resolved once and threaded into BOTH the .md path
+    # (_index_md_objects) and the PDF path (already consumed it) so every
+    # indexer in this call writes to the same manifest instance.
+    manifest_service = get_memory_manifest_service()
 
     start = time.time()
     # One ingestion timestamp per /memory/index call — every chunk
@@ -1078,6 +1108,7 @@ async def index_memory(
                 user_id=user.user_id,
                 tier=tier,
                 outcomes=object_outcomes,
+                manifest_service=manifest_service,
             )
         if col_name in ("skills", "semantic"):
             chunk_count += await _index_md_objects(
@@ -1090,6 +1121,7 @@ async def index_memory(
                 user_id=user.user_id,
                 tier=tier,
                 outcomes=object_outcomes,
+                manifest_service=manifest_service,
             )
         if col_name == "ai_research_papers":
             # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
@@ -1099,8 +1131,9 @@ async def index_memory(
             # accumulator collects per-doc outcomes for the
             # ?details=true response shape. ``outcomes`` (#430 v3) is the
             # separate, ALWAYS-populated per-object ok/reject signal the
-            # loud-422 guard below reads.
-            manifest_service = get_memory_manifest_service()
+            # loud-422 guard below reads. (ADR-059 WU-1c: ``manifest_service``
+            # is now resolved once, above the ``for col_name`` loop, and
+            # shared with the ``.md`` path too — no longer re-fetched here.)
             chunk_count += await _index_pdf_objects(
                 collection,
                 minio_client,
