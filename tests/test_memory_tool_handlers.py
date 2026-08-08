@@ -1016,6 +1016,156 @@ class TestRecallReadsVectorStore383:
         assert m["distance"] is not None  # vector store → non-null distance
 
 
+# ───────────────────────── Recall telemetry (WU-2.1) ────────────────────────
+
+
+class _SpyInstrument:
+    """Minimal OTel counter/histogram double — records every ``add``/
+    ``record`` call as ``(amount, labels)`` so a test can assert exactly
+    what :func:`audittrace.tools.memory_handlers._emit_recall_telemetry`
+    emitted, without standing up a real MeterProvider/exporter."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, dict[str, Any]]] = []
+
+    def add(self, amount: float, attributes: dict[str, Any] | None = None) -> None:
+        self.calls.append((amount, dict(attributes or {})))
+
+    def record(self, amount: float, attributes: dict[str, Any] | None = None) -> None:
+        self.calls.append((amount, dict(attributes or {})))
+
+
+@pytest.fixture
+def _recall_telemetry_spy(monkeypatch):
+    """Swap the module-level ``_recall_counter``/``_recall_results_histogram``
+    for spies for the duration of one test. Must be installed AFTER the
+    autouse ``_fresh_registry_with_handlers`` fixture's ``importlib.reload``
+    (fixture ordering: autouse fixtures run first), so it patches the
+    live instances the handlers actually call."""
+    import audittrace.tools.memory_handlers as handlers_mod
+
+    counter = _SpyInstrument()
+    histogram = _SpyInstrument()
+    monkeypatch.setattr(handlers_mod, "_recall_counter", counter)
+    monkeypatch.setattr(handlers_mod, "_recall_results_histogram", histogram)
+    return counter, histogram
+
+
+class TestRecallTelemetry:
+    """WU-2.1 non-vacuous proof (#423): the counter/histogram increment with
+    ``hit="true"`` on a non-empty recall and ``hit="false"`` on an empty one.
+    Neutering the ``_emit_recall_telemetry(...)`` call in any ``recall_*``
+    handler turns these RED — that was verified by hand during the build
+    (call temporarily commented out, ``pytest`` re-run, restored) and is the
+    forever-guard against a silent regression of the metric wiring."""
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_hit_true_increments_with_hit_true_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert result["total"] >= 1
+        assert counter.calls == [(1, {"collection": "decisions", "hit": "true"})]
+        assert histogram.calls == [
+            (result["total"], {"collection": "decisions", "hit": "true"})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_hit_false_increments_with_hit_false_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert counter.calls == [(1, {"collection": "decisions", "hit": "false"})]
+        assert histogram.calls == [(0, {"collection": "decisions", "hit": "false"})]
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_hit_true_uses_skills_collection_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, _histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(user, tool, {"query": "OAuth2"}, "sess-1")
+        assert result["total"] >= 1
+        assert counter.calls == [(1, {"collection": "skills", "hit": "true"})]
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_hit_false_uses_semantic_collection_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, _histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert counter.calls == [(1, {"collection": "semantic", "hit": "false"})]
+
+    @pytest.mark.asyncio
+    async def test_recall_recent_sessions_hit_true_uses_sessions_collection_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_recent_sessions")
+        result, _ = await invoke_tool(
+            user, tool, {"project": "AuditTrace", "n": 5}, "sess-1"
+        )
+        assert result["total"] >= 1
+        assert counter.calls == [(1, {"collection": "sessions", "hit": "true"})]
+        assert histogram.calls == [
+            (result["total"], {"collection": "sessions", "hit": "true"})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_recall_recent_sessions_hit_false_uses_sessions_collection_label(
+        self, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        counter, histogram = _recall_telemetry_spy
+        c = create_test_container()
+        c._instances["conversational"] = _OrderedConversationalService([])
+        prior = dependencies.container
+        dependencies.container = c
+        try:
+            user = sentinel_user_context()
+            tool = get_tool_by_name("recall_recent_sessions")
+            result, _ = await invoke_tool(
+                user, tool, {"project": "AuditTrace", "n": 5}, "sess-1"
+            )
+        finally:
+            dependencies.container = prior
+        assert result["total"] == 0
+        assert counter.calls == [(1, {"collection": "sessions", "hit": "false"})]
+        assert histogram.calls == [(0, {"collection": "sessions", "hit": "false"})]
+
+    @pytest.mark.asyncio
+    async def test_no_pii_in_labels(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        """Labels are ``collection`` + ``hit`` ONLY — no user_id, no query
+        text, matching the spec's non-negotiable NO-PII-in-labels rule."""
+        counter, histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+        await invoke_tool(user, tool, {"query": "a secret query about alice"}, "sess-1")
+        for _amount, labels in counter.calls + histogram.calls:
+            assert set(labels.keys()) == {"collection", "hit"}
+            assert user.user_id not in labels.values()
+            assert "secret" not in str(labels.values())
+
+
 # ── Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803) ────
 
 
