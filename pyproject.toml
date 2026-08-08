@@ -142,13 +142,13 @@ dev = [
 # not metadata. The shipped image never sees it (installs from
 # requirements.txt, no semgrep, keeps 0.65b0). So this group exists only as
 # the PINNED SOURCE OF TRUTH for the version; the actual install is:
-#     pipx install 'semgrep==1.171.0'   # its own venv, exposed on PATH
+#     pipx install 'semgrep==1.172.0'   # its own venv, exposed on PATH
 # Keep the CI (`.github/workflows/ci.yml`) + Makefile pins in lockstep with
 # the version here. semgrep is PINNED for determinism: same code + same rules
 # + same engine → same findings, no wall-clock, no network. See
 # ci/semgrep/rules.yml and the `security-lint` Makefile target.
 gate = [
-    "semgrep==1.171.0",
+    "semgrep==1.172.0",
 ]
 
 [project.urls]
