@@ -82,9 +82,41 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from scripts.deploy import mesh, registry
+from scripts.deploy.frontdoor import (
+    DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
+)
+from scripts.deploy.frontdoor import (
+    FRONT_DOOR_ENV_VAR as _FRONT_DOOR_ENV_VAR,
+)
+from scripts.deploy.frontdoor import (
+    resolve_front_door,
+)
 from scripts.deploy.runner import extract_digest, normalize_version
 
 logger = logging.getLogger("audittrace.deploy.verify")
+
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from verify; tests assert verify.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
+# Re-export the env-var NAME too (external code / tests reference
+# verify.FRONT_DOOR_ENV_VAR). The precedence lives ONCE in
+# scripts.deploy.frontdoor; these are backward-compat aliases.
+FRONT_DOOR_ENV_VAR = _FRONT_DOOR_ENV_VAR  # noqa: F401
+
+
+def _front_door_default() -> str:
+    """Thin backward-compat wrapper over the shared resolver (SPEC #401).
+
+    The precedence (explicit > AUDITTRACE_FRONT_DOOR env > hardcoded fallback)
+    is defined ONCE in :func:`scripts.deploy.frontdoor.resolve_front_door`;
+    this no-arg wrapper is kept so external callers / tests can reference
+    ``verify._front_door_default`` and so the CLI-omission path resolves the
+    env/fallback default through a single seam.
+    """
+    return resolve_front_door()
+
 
 # Independence is NOT a self-attested boolean. It is proven two ways: (1) the
 # report exposes the FULL enumerated list of evidence sources this runner
@@ -101,21 +133,7 @@ INDEPENDENCE_NOTE = (
     "runner's report is never read and its success claims never move this verdict"
 )
 
-DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
-FRONT_DOOR_ENV_VAR = "AUDITTRACE_FRONT_DOOR"
-
-
-def _front_door_default() -> str:
-    """Resolve the front-door default with env-var override.
-
-    ``AUDITTRACE_FRONT_DOOR`` overrides :data:`DEFAULT_FRONT_DOOR` when set
-    to a non-empty value; an unset or empty value falls back to the hardcoded
-    constant. Read fresh on every call (NOT cached at import time) so tests
-    can monkeypatch ``os.environ`` without reload tricks.
-    """
-    raw = os.environ.get(FRONT_DOOR_ENV_VAR)
-    return raw if raw else DEFAULT_FRONT_DOOR
 
 
 # Every in-cluster app component that must have a Ready pod for the deploy to be
@@ -382,7 +400,7 @@ class VerifyConfig:
     namespace: str = "audittrace"
     release: str = "audittrace"
     registry: str = "hub"
-    front_door: str = DEFAULT_FRONT_DOOR
+    front_door: str | None = None
     token_file: Path = DEFAULT_TOKEN_FILE
     model: str = "audittrace-chat"
     interactions_limit: int = 5
@@ -393,6 +411,14 @@ class VerifyConfig:
     # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
     # (fast HTTP + kubectl/helm) is untouched by this field.
     e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
+
+    def __post_init__(self) -> None:
+        # Resolve None → the environment-dynamic default (env var > fallback).
+        # When constructed via config_from_args the value is already resolved,
+        # but direct construction (tests) may pass None — this ensures a real
+        # URL is always present without callers having to remember to resolve.
+        if self.front_door is None:
+            object.__setattr__(self, "front_door", resolve_front_door())
 
     @property
     def deployment(self) -> str:
@@ -1406,7 +1432,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", default="audittrace")
     parser.add_argument("--release", default="audittrace")
     parser.add_argument("--registry", choices=("hub", "local"), default="hub")
-    parser.add_argument("--front-door", default=_front_door_default())
+    parser.add_argument("--front-door", default=None)
     parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument(
         "--model", default="audittrace-chat", help="chat model for the recall E2E"
@@ -1443,7 +1469,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         namespace=args.namespace,
         release=args.release,
         registry=args.registry,
-        front_door=_normalize_front_door(args.front_door),
+        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
         token_file=args.token_file,
         model=args.model,
         insecure=args.insecure,

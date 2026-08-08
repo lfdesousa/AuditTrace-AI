@@ -46,9 +46,16 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
+from scripts.deploy.frontdoor import DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR
+from scripts.deploy.frontdoor import resolve_front_door
+
 logger = logging.getLogger("audittrace.deploy.memory")
 
-DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from memory; tests assert memory.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 
 # The decisions collection is where deploy lessons are indexed (the ``collections``
@@ -243,7 +250,7 @@ def _ensure_md(name: str) -> str:
 def recall_deploy_lessons(
     query: str = "",
     *,
-    front_door: str = DEFAULT_FRONT_DOOR,
+    front_door: str | None = None,
     token: str | None = None,
     insecure: bool = False,
     limit: int = DEFAULT_RECALL_LIMIT,
@@ -271,7 +278,7 @@ def recall_deploy_lessons(
     whole recall-before step of the ADR-059 loop.
     """
     try:
-        base = _normalize_front_door(front_door)
+        base = _normalize_front_door(resolve_front_door(front_door))
     except ValueError as exc:
         logger.warning("recall skipped — bad front-door URL: %s", exc)
         return []
@@ -322,7 +329,7 @@ def recall_deploy_lessons(
 def log_deploy_record(
     path_or_text: str | Path,
     *,
-    front_door: str = DEFAULT_FRONT_DOOR,
+    front_door: str | None = None,
     token: str | None = None,
     layer: str = "episodic",
     collections: tuple[str, ...] = (DECISIONS_COLLECTION,),
@@ -342,7 +349,7 @@ def log_deploy_record(
     :class:`DeployLogError` with the failing step and HTTP status. The LOG side of
     the memory server is reliable even while recall (#383) is degraded.
     """
-    base = _normalize_front_door(front_door)
+    base = _normalize_front_door(resolve_front_door(front_door))
     resolved = _resolve_token(token)
     if not resolved:
         raise DeployLogError(
