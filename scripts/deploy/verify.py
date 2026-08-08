@@ -113,7 +113,6 @@ INDEPENDENCE_NOTE = (
     "runner's report is never read and its success claims never move this verdict"
 )
 
-DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 
 # Every in-cluster app component that must have a Ready pod for the deploy to be

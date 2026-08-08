@@ -69,27 +69,6 @@ def test_env_read_is_fresh_at_call_time(monkeypatch):
     assert resolve_front_door(None) == "https://fresh.host"
 
 
-def test_neutering_env_branch_makes_fresh_read_fall_back(monkeypatch):
-    """Proves the env branch is the FALSIFIABLE path: if we remove env
-    from the resolution chain, a set env var is IGNORED and fallback is used.
-    This test MUST go RED if the env branch is accidentally neutered."""
-    monkeypatch.delenv("AUDITTRACE_FRONT_DOOR", raising=False)
-    monkeypatch.setenv("AUDITTRACE_FRONT_DOOR", "https://neuter-test.host")
-
-    # Temporarily replace resolve_front_door with a version that skips env
-    def _no_env(explicit=None):
-        if explicit:
-            return explicit
-        return DEFAULT_FRONT_DOOR
-
-    monkeypatch.setattr(frontdoor, "resolve_front_door", _no_env)
-    # With env branch neutered, call through frontdoor module (not the
-    # imported name — the import captured the original function)
-    assert frontdoor.resolve_front_door() == DEFAULT_FRONT_DOOR
-    # The explicit arg still works (precedence not broken)
-    assert _no_env("https://explicit.host") == "https://explicit.host"
-
-
 # ── memory.py integration: env drives the target ─────────────────────────────
 
 # SPEC §4: AUDITTRACE_FRONT_DOOR=https://audittrace.local (no explicit arg)
@@ -219,6 +198,15 @@ def test_verify_reexports_default_front_door():
     from scripts.deploy import verify
 
     assert verify.DEFAULT_FRONT_DOOR == "https://audittrace.allaboutdata.eu"
+
+
+def test_verify_default_front_door_is_shared_module_identity():
+    """verify.DEFAULT_FRONT_DOOR is the SAME object as frontdoor.DEFAULT_FRONT_DOOR
+    (not a copy or a literal). A future re-hardcode in verify.py would break
+    the identity check, catching the DRY violation immediately."""
+    from scripts.deploy import frontdoor, verify
+
+    assert verify.DEFAULT_FRONT_DOOR is frontdoor.DEFAULT_FRONT_DOOR
 
 
 def test_verify_config_front_door_none_defaults_to_resolved(monkeypatch):
