@@ -48,7 +48,7 @@ EXPECTED_DASHBOARDS: dict[str, dict[str, str]] = {
     },
 }
 
-# WU-2.2 — the recall-hit-rate panel is the demo's money panel (#423
+# WU-2.2 — the recall-hit-rate panel is the demo's headline panel (#423
 # non-vacuous proof): this guard fails if the panel OR its
 # ``audittrace_recall_total`` metric target is removed from the dashboard.
 AGENTS_LEARNING_FILE = "audittrace-agents-learning.json"
@@ -146,7 +146,7 @@ class TestAgentsLearningDashboardRecallMetrics:
                 "without it (#423 REJECT trigger)."
             )
 
-    def test_recall_hit_rate_money_panel_present(self) -> None:
+    def test_recall_hit_rate_panel_present(self) -> None:
         # The headline metric (spec: WU-2 §1) is recall-hit-rate = rate(hit
         # ="true") / rate(total). Find the panel that computes it and assert
         # its expr actually references audittrace_recall_total with BOTH the
@@ -162,7 +162,7 @@ class TestAgentsLearningDashboardRecallMetrics:
         ]
         assert hit_rate_panels, (
             f"{AGENTS_LEARNING_FILE} has no panel titled with 'hit-rate' / "
-            "'hit rate' — the money panel is missing."
+            "'hit rate' — the headline recall panel is missing."
         )
         exprs = " ".join(_all_target_exprs({"panels": hit_rate_panels}))
         assert "audittrace_recall_total" in exprs

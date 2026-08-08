@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────── Telemetry (WU-2.1) ────────────────────────────
-# The "agents learning" dashboard's money panel — recall-hit-rate — is built
+# The "agents learning" dashboard's headline panel — recall-hit-rate — is built
 # on these two instruments. Mirrors the established module-level OTel-meter
 # idiom (services/async_persist.py:56-68, services/session_summarizer.py:65)
 # — ``metrics.get_meter(...)`` returns a no-op meter until ``telemetry.py``

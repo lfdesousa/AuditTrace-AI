@@ -48,7 +48,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Recall Hit-Rate (the money panel)",
+      "title": "Recall Hit-Rate",
       "description": "The fleet's own recall_* tool calls, resolved: share of calls that returned at least one match (page.total > 0). This is what 'the fleet learns from its own recorded lessons' looks like as a number. Source: audittrace_recall_total{hit=...} (WU-2.1, tools/memory_handlers.py).",
       "gridPos": {
         "h": 8,
