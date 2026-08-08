@@ -82,9 +82,21 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from scripts.deploy import mesh, registry
+from scripts.deploy.frontdoor import (
+    DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
+)
+from scripts.deploy.frontdoor import (
+    resolve_front_door,
+)
 from scripts.deploy.runner import extract_digest, normalize_version
 
 logger = logging.getLogger("audittrace.deploy.verify")
+
+# Re-export DEFAULT_FRONT_DOOR for backward compatibility (external code may
+# import it from verify; tests assert verify.DEFAULT_FRONT_DOOR == the shared
+# module's value). The noqa silences ruff's "unused import" because the name
+# is re-exported at the module level, not used in the function body.
+DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
 
 # Independence is NOT a self-attested boolean. It is proven two ways: (1) the
 # report exposes the FULL enumerated list of evidence sources this runner
@@ -368,7 +380,7 @@ class VerifyConfig:
     namespace: str = "audittrace"
     release: str = "audittrace"
     registry: str = "hub"
-    front_door: str = DEFAULT_FRONT_DOOR
+    front_door: str | None = None
     token_file: Path = DEFAULT_TOKEN_FILE
     model: str = "audittrace-chat"
     interactions_limit: int = 5
@@ -379,6 +391,14 @@ class VerifyConfig:
     # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
     # (fast HTTP + kubectl/helm) is untouched by this field.
     e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
+
+    def __post_init__(self) -> None:
+        # Resolve None → the environment-dynamic default (env var > fallback).
+        # When constructed via config_from_args the value is already resolved,
+        # but direct construction (tests) may pass None — this ensures a real
+        # URL is always present without callers having to remember to resolve.
+        if self.front_door is None:
+            object.__setattr__(self, "front_door", resolve_front_door())
 
     @property
     def deployment(self) -> str:
@@ -1392,7 +1412,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", default="audittrace")
     parser.add_argument("--release", default="audittrace")
     parser.add_argument("--registry", choices=("hub", "local"), default="hub")
-    parser.add_argument("--front-door", default=DEFAULT_FRONT_DOOR)
+    parser.add_argument("--front-door", default=None)
     parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument(
         "--model", default="audittrace-chat", help="chat model for the recall E2E"
@@ -1429,7 +1449,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         namespace=args.namespace,
         release=args.release,
         registry=args.registry,
-        front_door=_normalize_front_door(args.front_door),
+        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
         token_file=args.token_file,
         model=args.model,
         insecure=args.insecure,
