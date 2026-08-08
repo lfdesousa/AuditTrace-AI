@@ -8335,3 +8335,157 @@ class TestMemoryAuditReadFailsOpen:
         assert r.status_code == 200
         assert mock_logger.exception.call_count == 1
         assert "memory_audit.read_emit_failed" in mock_logger.exception.call_args[0][0]
+
+
+# ───────────────────────── Recall telemetry REST routes (WU-A + WU-B) ────────
+
+
+class TestRecallTelemetryRestRoutes:
+    """WU-A + WU-B non-vacuous proof (#423): every GET /memory/* read
+    route must emit audittrace_recall_total{source=backoffice} AND
+    a structured memory.read INFO log line. Neuter each → RED.
+
+    The shared helper lives in :mod:`audittrace.services.recall_telemetry`;
+    both the in-process tool recalls AND the REST routes call it."""
+
+    def test_get_memory_semantic_increments_counter_with_backoffice_source(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A GET /memory/semantic list call must increment
+        audittrace_recall_total{source="backoffice", collection="semantic",
+        hit=...}. Neuter the counter → RED."""
+        from audittrace.services import recall_telemetry as telemetry_mod
+
+        # Install a spy on the counter
+        counter_spy: list[tuple[float, dict[str, Any]]] = []
+
+        class _SpyCounter:
+            def add(self, amount: float, labels: dict[str, Any] | None = None) -> None:
+                counter_spy.append((amount, dict(labels or {})))
+
+        real_counter = telemetry_mod._recall_counter
+        telemetry_mod._recall_counter = _SpyCounter()
+        try:
+            r = client.get("/memory/semantic")
+            assert r.status_code == 200
+            # The counter must have been called once with source=backoffice
+            assert len(counter_spy) >= 1
+            last_call = counter_spy[-1]
+            assert last_call[0] == 1
+            assert last_call[1].get("source") == "backoffice"
+            assert last_call[1].get("collection") in (
+                "semantic",
+                "decisions",
+                "skills",
+                "ai_research_papers",
+            )
+        finally:
+            telemetry_mod._recall_counter = real_counter
+
+    def test_get_memory_semantic_emits_memory_read_log_line(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A GET /memory/semantic list call must emit a structured
+        memory.read INFO log line with surface=backoffice.
+        Neuter the logger → RED.
+
+        The shared helper emits the log from its own module-scoped
+        logger (audittrace.services.recall_telemetry), not from
+        routes/memory.py."""
+        with patch("audittrace.services.recall_telemetry.logger") as mock_logger:
+            r = client.get("/memory/semantic")
+            assert r.status_code == 200
+            # Check that an INFO log with "memory.read" was emitted
+            # The logger uses % formatting: logger.info("memory.read | ...", "backoffice", ...)
+            info_calls = []
+            for c in mock_logger.info.call_args_list:
+                if c[0] and "memory.read" in str(c[0][0]):
+                    info_calls.append(c)
+            assert info_calls, (
+                "GET /memory/semantic did not emit a 'memory.read' INFO log line"
+            )
+            # The format string is c[0][0], the args are c[0][1:]
+            # First arg after format string should be surface ("backoffice")
+            last_call = info_calls[-1]
+            if last_call[0]:
+                args = last_call[0][1:]  # skip format string
+                assert args and args[0] == "backoffice", (
+                    f"Expected surface='backoffice', got {args}"
+                )
+
+    def test_get_memory_episodic_increments_counter(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A GET /memory/episodic list call must increment
+        audittrace_recall_total{source="backoffice", collection="episodic"}."""
+        from audittrace.services import recall_telemetry as telemetry_mod
+
+        counter_spy: list[tuple[float, dict[str, Any]]] = []
+
+        class _SpyCounter:
+            def add(self, amount: float, labels: dict[str, Any] | None = None) -> None:
+                counter_spy.append((amount, dict(labels or {})))
+
+        real_counter = telemetry_mod._recall_counter
+        telemetry_mod._recall_counter = _SpyCounter()
+        try:
+            r = client.get("/memory/episodic")
+            assert r.status_code == 200
+            assert len(counter_spy) >= 1
+            last_call = counter_spy[-1]
+            assert last_call[0] == 1
+            assert last_call[1].get("source") == "backoffice"
+            assert last_call[1].get("collection") == "episodic"
+        finally:
+            telemetry_mod._recall_counter = real_counter
+
+    def test_get_memory_procedural_increments_counter(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A GET /memory/procedural list call must increment
+        audittrace_recall_total{source="backoffice", collection="procedural"}."""
+        from audittrace.services import recall_telemetry as telemetry_mod
+
+        counter_spy: list[tuple[float, dict[str, Any]]] = []
+
+        class _SpyCounter:
+            def add(self, amount: float, labels: dict[str, Any] | None = None) -> None:
+                counter_spy.append((amount, dict(labels or {})))
+
+        real_counter = telemetry_mod._recall_counter
+        telemetry_mod._recall_counter = _SpyCounter()
+        try:
+            r = client.get("/memory/procedural")
+            assert r.status_code == 200
+            assert len(counter_spy) >= 1
+            last_call = counter_spy[-1]
+            assert last_call[0] == 1
+            assert last_call[1].get("source") == "backoffice"
+            assert last_call[1].get("collection") == "procedural"
+        finally:
+            telemetry_mod._recall_counter = real_counter
+
+    def test_no_pii_in_rest_metric_labels(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REST route metric labels are {source, collection, hit} ONLY —
+        no user_id, no query, no content."""
+        from audittrace.services import recall_telemetry as telemetry_mod
+
+        counter_spy: list[tuple[float, dict[str, Any]]] = []
+
+        class _SpyCounter:
+            def add(self, amount: float, labels: dict[str, Any] | None = None) -> None:
+                counter_spy.append((amount, dict(labels or {})))
+
+        real_counter = telemetry_mod._recall_counter
+        telemetry_mod._recall_counter = _SpyCounter()
+        try:
+            r = client.get("/memory/semantic")
+            assert r.status_code == 200
+            for _amount, labels in counter_spy:
+                assert set(labels.keys()) == {"source", "collection", "hit"}, (
+                    f"REST metric labels contain unexpected keys: {labels.keys()}"
+                )
+        finally:
+            telemetry_mod._recall_counter = real_counter

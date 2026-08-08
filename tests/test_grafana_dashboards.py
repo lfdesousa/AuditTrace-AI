@@ -164,6 +164,13 @@ class TestAgentsLearningDashboardRecallMetrics:
             f"{AGENTS_LEARNING_FILE} has no panel titled with 'hit-rate' / "
             "'hit rate' — the headline recall panel is missing."
         )
+        # WU-C: the panel title must be the public-credibility name
+        # ("Recall Hit-Rate"), NOT the internal-speak "(the money panel)".
+        title = hit_rate_panels[0].get("title", "")
+        assert "money" not in title.lower(), (
+            f"{AGENTS_LEARNING_FILE} panel {title!r} still carries "
+            "internal-speak '(the money panel)' — must be 'Recall Hit-Rate'."
+        )
         exprs = " ".join(_all_target_exprs({"panels": hit_rate_panels}))
         assert "audittrace_recall_total" in exprs
         assert 'hit="true"' in exprs, (
@@ -190,3 +197,67 @@ class TestDashboardSetCompleteness:
             "decide whether the file is a chart-shipped artefact or a "
             "Grafana-side experiment that should live elsewhere."
         )
+
+
+class TestRecallRestCallPanels:
+    """WU-C: the 'Recall — Memory Read REST Calls' panel set must be
+    present in the agents-learning dashboard (ids 6–9). These panels
+    use the existing HTTP-server metric and are already confirmed
+    live on the obs-stack."""
+
+    def test_row_panel_present(self) -> None:
+        dash = _load(AGENTS_LEARNING_FILE)
+        rows = [
+            p
+            for p in dash.get("panels", [])
+            if p.get("type") == "row" and "Memory Read REST" in p.get("title", "")
+        ]
+        assert rows, (
+            f"{AGENTS_LEARNING_FILE} is missing the 'Recall — Memory Read "
+            "REST Calls' row panel."
+        )
+
+    def test_rate_by_route_panel_present(self) -> None:
+        dash = _load(AGENTS_LEARNING_FILE)
+        panels = [
+            p
+            for p in dash.get("panels", [])
+            if "rate by route" in p.get("title", "").lower()
+            and "memory read" in p.get("title", "").lower()
+        ]
+        assert panels, (
+            f"{AGENTS_LEARNING_FILE} is missing the 'Memory Read Calls — "
+            "rate by route' panel."
+        )
+        exprs = " ".join(_all_target_exprs({"panels": panels}))
+        assert "http_server_request_duration_seconds_count" in exprs
+        assert "http_request_method" in exprs
+
+    def test_table_24h_totals_panel_present(self) -> None:
+        dash = _load(AGENTS_LEARNING_FILE)
+        panels = [
+            p
+            for p in dash.get("panels", [])
+            if "24h total" in p.get("title", "")
+            and "memory read" in p.get("title", "").lower()
+        ]
+        assert panels, (
+            f"{AGENTS_LEARNING_FILE} is missing the 'Memory Reads by Route — "
+            "24h total' panel."
+        )
+        assert panels[0].get("type") == "table"
+
+    def test_status_by_code_panel_present(self) -> None:
+        dash = _load(AGENTS_LEARNING_FILE)
+        panels = [
+            p
+            for p in dash.get("panels", [])
+            if "response code" in p.get("title", "").lower()
+            and "memory read" in p.get("title", "").lower()
+        ]
+        assert panels, (
+            f"{AGENTS_LEARNING_FILE} is missing the 'Memory Read Status — "
+            "by response code' panel."
+        )
+        exprs = " ".join(_all_target_exprs({"panels": panels}))
+        assert "http_response_status_code" in exprs

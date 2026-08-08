@@ -94,6 +94,7 @@ from audittrace.services.memory_audit import (
 from audittrace.services.memory_manifest import ManifestEntry
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
+from audittrace.services.recall_telemetry import emit_recall_telemetry
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
@@ -1566,6 +1567,7 @@ async def list_episodic(
     # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
     # services/memory_audit.py module docstring).
     schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
+    emit_recall_telemetry("backoffice", "episodic", total)
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1596,6 +1598,7 @@ async def read_episodic(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="episodic", key=filename
     )
+    emit_recall_telemetry("backoffice", "episodic", 1)
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1785,6 +1788,7 @@ async def list_procedural(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
     schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
+    emit_recall_telemetry("backoffice", "procedural", total)
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1810,6 +1814,7 @@ async def read_procedural(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="procedural", key=filename
     )
+    emit_recall_telemetry("backoffice", "procedural", 1)
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -2287,6 +2292,7 @@ async def list_semantic(
         layer="semantic",
         collection=collection,
     )
+    emit_recall_telemetry("backoffice", collection or "semantic", total)
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -2326,6 +2332,7 @@ async def read_semantic(
         collection=collection,
         key=document_id,
     )
+    emit_recall_telemetry("backoffice", collection, 1)
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
