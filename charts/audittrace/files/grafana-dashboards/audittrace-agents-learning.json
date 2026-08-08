@@ -49,7 +49,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "Recall Hit-Rate",
-      "description": "The fleet's own recall_* tool calls, resolved: share of calls that returned at least one match (page.total > 0). This is what 'the fleet learns from its own recorded lessons' looks like as a number. Source: audittrace_recall_total{hit=...} (WU-2.1, tools/memory_handlers.py).",
+      "description": "The fleet's recall* tool calls AND backoffice list/read calls, resolved: share of calls that returned at least one match (page.total > 0). Headline metric = recall-hit-rate = rate(hit='true') / rate(total). Source: audittrace_recall_total{source=tool, hit=...} + audittrace_recall_total{source=backoffice, hit=...} (WU-2.1 tools/memory_handlers.py + WU-A routes/memory.py).",
       "gridPos": {
         "h": 8,
         "w": 18,
@@ -112,7 +112,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Knowledge-Base Growth",
-      "description": "Chunks indexed per interval (the same 'Indexed' log line as the writes/day panel, at finer granularity) — the corpus the fleet recalls against getting bigger over time.",
+      "description": "Chunks indexed per interval (the same 'Indexed' log line as the writes/day panel, at finer granularity) \u2014 the corpus the fleet recalls against getting bigger over time.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -140,7 +140,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Recall Calls by Collection (governance view)",
-      "description": "Every recall_* call in this panel left an audited tool_calls row (ADR-029 end-to-end traceability) — recall volume by collection is the governance-facing read of 'every access is audited'. Source: audittrace_recall_total (WU-2.1).",
+      "description": "Every recall_* call in this panel left an audited tool_calls row (ADR-029 end-to-end traceability) \u2014 recall volume by collection is the governance-facing read of 'every access is audited'. Source: audittrace_recall_total (WU-2.1).",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -156,6 +156,108 @@
           "refId": "A",
           "expr": "sum by (collection) (rate(audittrace_recall_total[$__rate_interval]))",
           "legendFormat": "{{collection}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Recall \u2014 Memory Read REST Calls (live HTTP metrics)",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "panels": [],
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Memory Read Calls \u2014 rate by route (GET)",
+      "description": "Rate of GET requests to memory read routes, broken down by http_route. Confirmed live 2026-08-08: /memory/semantic=59.1, /memory/episodic=4.0 GET/24h.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count{http_route=~\"/memory/(semantic|episodic|procedural|conversational).*\", http_request_method=\"GET\"}[$__rate_interval]))",
+          "legendFormat": "{{http_route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Memory Reads by Route \u2014 24h total (GET)",
+      "description": "24-hour totals for GET requests to memory read routes.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (increase(http_server_request_duration_seconds_count{http_route=~\"/memory/(semantic|episodic|procedural|conversational).*\", http_request_method=\"GET\"}[24h]))",
+          "legendFormat": "{{http_route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Memory Read Status \u2014 by response code (GET)",
+      "description": "Distribution of HTTP response codes for GET requests to memory read routes.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{http_route=~\"/memory/(semantic|episodic|procedural|conversational).*\", http_request_method=\"GET\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}"
         }
       ],
       "fieldConfig": {
@@ -183,7 +285,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "AuditTrace-AI — Agents Learning",
+  "title": "AuditTrace-AI \u2014 Agents Learning",
   "uid": "audittrace-agents-learning",
-  "version": 1
+  "version": 2
 }

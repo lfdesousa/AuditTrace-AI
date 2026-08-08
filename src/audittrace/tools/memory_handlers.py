@@ -60,8 +60,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from opentelemetry import metrics
-
 from audittrace.dependencies import (
     get_conversational_service,
     get_episodic_service,
@@ -69,53 +67,11 @@ from audittrace.dependencies import (
     get_semantic_service,
 )
 from audittrace.identity import UserContext
+from audittrace.services.recall_telemetry import emit_recall_telemetry
 from audittrace.services.semantic import MAX_RECALL_WINDOW, SearchPage
 from audittrace.tools import register_memory_tool
 
 logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────── Telemetry (WU-2.1) ────────────────────────────
-# The "agents learning" dashboard's headline panel — recall-hit-rate — is built
-# on these two instruments. Mirrors the established module-level OTel-meter
-# idiom (services/async_persist.py:56-68, services/session_summarizer.py:65)
-# — ``metrics.get_meter(...)`` returns a no-op meter until ``telemetry.py``
-# configures a real MeterProvider, so this is safe/no-op when
-# ``AUDITTRACE_OTLP_ENDPOINT`` is unset (laptop-default off).
-_recall_meter = metrics.get_meter("audittrace.recall")
-_recall_counter = _recall_meter.create_counter(
-    name="audittrace_recall_total",
-    description=(
-        "Recall-tool invocations by collection and whether the call hit "
-        "(page.total > 0). Headline metric = recall-hit-rate = "
-        "rate(hit='true') / rate(total)."
-    ),
-)
-_recall_results_histogram = _recall_meter.create_histogram(
-    name="audittrace_recall_results",
-    description=(
-        "True candidate count (SearchPage.total) returned per recall call, "
-        "by collection and hit."
-    ),
-)
-
-
-def _emit_recall_telemetry(collection: str, page: SearchPage) -> None:
-    """Emit the two recall-telemetry instruments for one recall-tool call.
-
-    Called by each ``recall_*`` handler right after it obtains ``page`` —
-    kept OUT of :func:`_page_fields` so that helper stays a pure formatter
-    with no side effects. Labels are deliberately narrow: ``collection`` +
-    ``hit`` (bool-as-string) ONLY. No user_id, no query text — no PII in a
-    metric label, ever ([[feedback_never_trust_caller_metadata_for_security_fields]]
-    spirit). ``hit = page.total > 0`` is the true-candidate-count signal, not
-    ``len(page.matches)``, matching the rest of the pagination contract
-    (module docstring CHANGELOG).
-    """
-    hit = page.total > 0
-    labels = {"collection": collection, "hit": str(hit).lower()}
-    _recall_counter.add(1, labels)
-    _recall_results_histogram.record(page.total, labels)
 
 
 # Snippet length for the discovery tools (recall_decisions / recall_skills).
@@ -334,7 +290,7 @@ async def recall_decisions(
         sort=sort,
         order=order,
     )
-    _emit_recall_telemetry("decisions", page)
+    emit_recall_telemetry("tool", "decisions", page.total)
     return {
         "matches": [
             {
@@ -443,7 +399,7 @@ async def recall_skills(
         sort=sort,
         order=order,
     )
-    _emit_recall_telemetry("skills", page)
+    emit_recall_telemetry("tool", "skills", page.total)
     return {
         "matches": [
             {
@@ -561,18 +517,7 @@ async def recall_recent_sessions(
     # minimal SearchPage carrying only the page fields telemetry needs
     # (``total``); ``matches=[]`` is fine, ``_emit_recall_telemetry`` never
     # reads it.
-    _emit_recall_telemetry(
-        "sessions",
-        SearchPage(
-            matches=[],
-            total=total,
-            limit=n,
-            offset=offset,
-            sort="recency",
-            order="desc",
-            has_more=has_more,
-        ),
-    )
+    emit_recall_telemetry("tool", "sessions", total)
 
     matches: list[dict[str, Any]] = []
     for s in page_sessions:
@@ -679,7 +624,7 @@ async def recall_semantic(
     page = await semantic.search_page(
         user_context, query, k=k, offset=offset, sort=sort, order=order
     )
-    _emit_recall_telemetry("semantic", page)
+    emit_recall_telemetry("tool", "semantic", page.total)
     return {
         "matches": [
             {

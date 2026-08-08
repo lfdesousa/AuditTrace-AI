@@ -1037,17 +1037,18 @@ class _SpyInstrument:
 
 @pytest.fixture
 def _recall_telemetry_spy(monkeypatch):
-    """Swap the module-level ``_recall_counter``/``_recall_results_histogram``
-    for spies for the duration of one test. Must be installed AFTER the
-    autouse ``_fresh_registry_with_handlers`` fixture's ``importlib.reload``
+    """Swap the module-level counter/histogram in the shared
+    :mod:`audittrace.services.recall_telemetry` for spies for the
+    duration of one test.  Must be installed AFTER the autouse
+    ``_fresh_registry_with_handlers`` fixture's ``importlib.reload``
     (fixture ordering: autouse fixtures run first), so it patches the
     live instances the handlers actually call."""
-    import audittrace.tools.memory_handlers as handlers_mod
+    from audittrace.services import recall_telemetry as telemetry_mod
 
     counter = _SpyInstrument()
     histogram = _SpyInstrument()
-    monkeypatch.setattr(handlers_mod, "_recall_counter", counter)
-    monkeypatch.setattr(handlers_mod, "_recall_results_histogram", histogram)
+    monkeypatch.setattr(telemetry_mod, "_recall_counter", counter)
+    monkeypatch.setattr(telemetry_mod, "_recall_results_histogram", histogram)
     return counter, histogram
 
 
@@ -1070,9 +1071,14 @@ class TestRecallTelemetry:
             user, tool, {"query": "cache compression"}, "sess-1"
         )
         assert result["total"] >= 1
-        assert counter.calls == [(1, {"collection": "decisions", "hit": "true"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "decisions", "hit": "true"})
+        ]
         assert histogram.calls == [
-            (result["total"], {"collection": "decisions", "hit": "true"})
+            (
+                result["total"],
+                {"source": "tool", "collection": "decisions", "hit": "true"},
+            )
         ]
 
     @pytest.mark.asyncio
@@ -1086,8 +1092,12 @@ class TestRecallTelemetry:
             user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
         )
         assert result["total"] == 0
-        assert counter.calls == [(1, {"collection": "decisions", "hit": "false"})]
-        assert histogram.calls == [(0, {"collection": "decisions", "hit": "false"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "decisions", "hit": "false"})
+        ]
+        assert histogram.calls == [
+            (0, {"source": "tool", "collection": "decisions", "hit": "false"})
+        ]
 
     @pytest.mark.asyncio
     async def test_recall_skills_hit_true_uses_skills_collection_label(
@@ -1098,7 +1108,9 @@ class TestRecallTelemetry:
         tool = get_tool_by_name("recall_skills")
         result, _ = await invoke_tool(user, tool, {"query": "OAuth2"}, "sess-1")
         assert result["total"] >= 1
-        assert counter.calls == [(1, {"collection": "skills", "hit": "true"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "skills", "hit": "true"})
+        ]
 
     @pytest.mark.asyncio
     async def test_recall_semantic_hit_false_uses_semantic_collection_label(
@@ -1111,7 +1123,9 @@ class TestRecallTelemetry:
             user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
         )
         assert result["total"] == 0
-        assert counter.calls == [(1, {"collection": "semantic", "hit": "false"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "semantic", "hit": "false"})
+        ]
 
     @pytest.mark.asyncio
     async def test_recall_recent_sessions_hit_true_uses_sessions_collection_label(
@@ -1124,9 +1138,14 @@ class TestRecallTelemetry:
             user, tool, {"project": "AuditTrace", "n": 5}, "sess-1"
         )
         assert result["total"] >= 1
-        assert counter.calls == [(1, {"collection": "sessions", "hit": "true"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "sessions", "hit": "true"})
+        ]
         assert histogram.calls == [
-            (result["total"], {"collection": "sessions", "hit": "true"})
+            (
+                result["total"],
+                {"source": "tool", "collection": "sessions", "hit": "true"},
+            )
         ]
 
     @pytest.mark.asyncio
@@ -1147,21 +1166,28 @@ class TestRecallTelemetry:
         finally:
             dependencies.container = prior
         assert result["total"] == 0
-        assert counter.calls == [(1, {"collection": "sessions", "hit": "false"})]
-        assert histogram.calls == [(0, {"collection": "sessions", "hit": "false"})]
+        assert counter.calls == [
+            (1, {"source": "tool", "collection": "sessions", "hit": "false"})
+        ]
+        assert histogram.calls == [
+            (0, {"source": "tool", "collection": "sessions", "hit": "false"})
+        ]
 
     @pytest.mark.asyncio
     async def test_no_pii_in_labels(
         self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
     ):
-        """Labels are ``collection`` + ``hit`` ONLY — no user_id, no query
-        text, matching the spec's non-negotiable NO-PII-in-labels rule."""
+        """Labels are ``source`` + ``collection`` + ``hit`` ONLY — no
+        user_id, no query text, matching the spec's non-negotiable
+        NO-PII-in-labels rule."""
         counter, histogram = _recall_telemetry_spy
         user = sentinel_user_context()
         tool = get_tool_by_name("recall_decisions")
         await invoke_tool(user, tool, {"query": "a secret query about alice"}, "sess-1")
         for _amount, labels in counter.calls + histogram.calls:
-            assert set(labels.keys()) == {"collection", "hit"}
+            assert set(labels.keys()) == {"source", "collection", "hit"}
+            assert "source" in labels
+            assert labels["source"] == "tool"
             assert user.user_id not in labels.values()
             assert "secret" not in str(labels.values())
 
