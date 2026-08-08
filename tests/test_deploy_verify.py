@@ -1185,16 +1185,17 @@ def test_cli_front_door_omission_uses_hardcoded_fallback(monkeypatch):
 
 
 def test_front_door_resolution_neutered_fallback_goes_red(monkeypatch):
-    """Neuter _front_door_default to return '' so the config front_door is ''
-    instead of the hardcoded DEFAULT_FRONT_DOOR. A different expected value
-    would mean the test is vacuous (it would still pass even if
-    _front_door_default returned the correct DEFAULT_FRONT_DOOR).
+    """Neuter the shared resolver to return '' so the config front_door is ''
+    instead of the hardcoded DEFAULT_FRONT_DOOR. ``config_from_args`` delegates
+    the front-door default to ``scripts.deploy.frontdoor.resolve_front_door``
+    (imported into verify), so THAT is the seam to neuter — a different expected
+    value would mean the test is vacuous.
 
     The _normalize_front_door stub avoids a ValueError on empty string so the
-    assertion itself is what goes RED when the function is NOT neutered.
+    assertion itself is what proves the test is non-vacuous.
     """
     monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
-    monkeypatch.setattr(verify, "_front_door_default", lambda: "")
+    monkeypatch.setattr(verify, "resolve_front_door", lambda *a, **k: "")
     # Stub the normalizer so empty string does not raise ValueError — the
     # assertion below is what proves the test is non-vacuous.
     monkeypatch.setattr(verify, "_normalize_front_door", lambda u: u)
@@ -1204,10 +1205,35 @@ def test_front_door_resolution_neutered_fallback_goes_red(monkeypatch):
             "v9.9.9",
         ]
     )
-    # With the neutered function returning '', this MUST be '' — a different
-    # expected value would mean the test is vacuous (it would still pass even
-    # if _front_door_default returned the correct DEFAULT_FRONT_DOOR).
+    # With the neutered resolver returning '', this MUST be '' — a different
+    # expected value would mean the test is vacuous.
     assert verify.config_from_args(args).front_door == ""
+
+
+def test_cli_front_door_empty_string_falls_back_to_hardcoded(monkeypatch):
+    """Regression (hand-merge 2026-08-08 REJECT): ``--front-door ""`` must NOT
+    be treated as an explicitly-set value. It flows through
+    ``resolve_front_door``, which treats an empty string as falsy → falls
+    through to env/fallback. The buggy ternary form
+    (``args.front_door if args.front_door is not None else ...``) passed '' to
+    the normalizer and raised ``ValueError`` on the empty URL. With no env set,
+    an empty flag resolves to the hardcoded fallback.
+    """
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    args = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", ""]
+    )
+    assert verify.config_from_args(args).front_door == verify.DEFAULT_FRONT_DOOR
+
+
+def test_cli_front_door_empty_string_honors_env(monkeypatch):
+    """Companion to the regression above: an empty ``--front-door`` with the
+    env var set falls through to the env value (not a crash, not '')."""
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", ""]
+    )
+    assert verify.config_from_args(args).front_door == "https://env.example.com"
 
 
 # ── low-level indirections (executed once for coverage honesty) ──────────────

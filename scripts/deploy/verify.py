@@ -1469,9 +1469,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         namespace=args.namespace,
         release=args.release,
         registry=args.registry,
-        front_door=_normalize_front_door(
-            args.front_door if args.front_door is not None else _front_door_default()
-        ),
+        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
         token_file=args.token_file,
         model=args.model,
         insecure=args.insecure,
