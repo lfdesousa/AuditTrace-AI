@@ -1,0 +1,189 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Memory Writes / Day",
+      "description": "Chunks folded into the memory server (episodic/decisions + procedural/skills + semantic corpus), counted per day from the indexer's own log line (routes/memory.py).",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({service_name=\"audittrace\"} |= \"Indexed\" [1d]))",
+          "legendFormat": "writes/day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Recall Hit-Rate (the money panel)",
+      "description": "The fleet's own recall_* tool calls, resolved: share of calls that returned at least one match (page.total > 0). This is what 'the fleet learns from its own recorded lessons' looks like as a number. Source: audittrace_recall_total{hit=...} (WU-2.1, tools/memory_handlers.py).",
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(audittrace_recall_total{hit=\"true\"}[$__rate_interval])) / sum(rate(audittrace_recall_total[$__rate_interval]))",
+          "legendFormat": "recall hit-rate %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Results per Recall",
+      "description": "Average true-candidate count (SearchPage.total) returned per recall call, overall and broken down by collection. Source: audittrace_recall_results histogram (WU-2.1).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(audittrace_recall_results_sum[$__rate_interval])) / sum(rate(audittrace_recall_results_count[$__rate_interval]))",
+          "legendFormat": "avg results/recall"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (collection) (rate(audittrace_recall_results_sum[$__rate_interval])) / sum by (collection) (rate(audittrace_recall_results_count[$__rate_interval]))",
+          "legendFormat": "{{collection}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Knowledge-Base Growth",
+      "description": "Chunks indexed per interval (the same 'Indexed' log line as the writes/day panel, at finer granularity) — the corpus the fleet recalls against getting bigger over time.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({service_name=\"audittrace\"} |= \"Indexed\" [$__interval]))",
+          "legendFormat": "chunks indexed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Recall Calls by Collection (governance view)",
+      "description": "Every recall_* call in this panel left an audited tool_calls row (ADR-029 end-to-end traceability) — recall volume by collection is the governance-facing read of 'every access is audited'. Source: audittrace_recall_total (WU-2.1).",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (collection) (rate(audittrace_recall_total[$__rate_interval]))",
+          "legendFormat": "{{collection}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "audittrace-ai",
+    "agents-learning",
+    "adr-059",
+    "observability"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AuditTrace-AI — Agents Learning",
+  "uid": "audittrace-agents-learning",
+  "version": 1
+}
