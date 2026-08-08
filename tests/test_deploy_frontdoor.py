@@ -13,6 +13,15 @@ from urllib.parse import parse_qs, urlparse
 from scripts.deploy import frontdoor, memory
 from scripts.deploy.frontdoor import DEFAULT_FRONT_DOOR, resolve_front_door
 
+
+def _origin(url: str) -> str:
+    """Scheme+host of a URL, EXACT-matched (never a substring ``in`` check) so a
+    request URL's path/query can't let an arbitrary-position match slip through.
+    Clears CodeQL py/incomplete-url-substring-sanitization."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 # ── resolve_front_door: precedence ────────────────────────────────────────────
 
 
@@ -130,8 +139,8 @@ def test_log_deploy_record_targets_env_front_door_not_hardcoded_fallback(
     # No explicit front_door arg — should resolve via env → audittrace.local
     memory.log_deploy_record("test record", token="fake.jwt", filename="rec.md")
     upload_call = next(c for c in fake.calls if c["path"] == "/memory/upload")
-    assert "https://audittrace.local" in upload_call["url"]
-    assert "allaboutdata" not in upload_call["url"]
+    assert _origin(upload_call["url"]) == "https://audittrace.local"
+    assert _origin(upload_call["url"]) != "https://audittrace.allaboutdata.eu"
 
 
 def test_log_deploy_record_explicit_front_door_overrides_env(monkeypatch, tmp_path):
@@ -150,7 +159,7 @@ def test_log_deploy_record_explicit_front_door_overrides_env(monkeypatch, tmp_pa
         "t", token="fake.jwt", filename="x.md", front_door="https://explicit.host"
     )
     upload_call = next(c for c in fake.calls if c["path"] == "/memory/upload")
-    assert "https://explicit.host" in upload_call["url"]
+    assert _origin(upload_call["url"]) == "https://explicit.host"
 
 
 def test_recall_deploy_lessons_targets_env_front_door(monkeypatch):
@@ -164,7 +173,7 @@ def test_recall_deploy_lessons_targets_env_front_door(monkeypatch):
     )
     memory.recall_deploy_lessons("q", token="fake.jwt")
     call = fake.calls[0]
-    assert "https://env-serve.test" in call["url"]
+    assert _origin(call["url"]) == "https://env-serve.test"
 
 
 def test_default_front_door_constant_is_backward_compat():
