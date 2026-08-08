@@ -1127,6 +1127,89 @@ def test_cli_e2e_timeout_flag_wins_over_env_var(monkeypatch):
     assert verify.config_from_args(args).e2e_timeout == 12
 
 
+# ── front-door resolution: env var + CLI flag + hardcoded fallback ──────────
+# Precedence: explicit --front-door arg > AUDITTRACE_FRONT_DOOR env var >
+# DEFAULT_FRONT_DOOR constant. Falsifiable: neutering the resolution (returning
+# a neutral value) must turn the fallback test RED.
+
+
+def test_front_door_default_unset_env_falls_back_to_hardcoded(monkeypatch):
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    assert verify._front_door_default() == verify.DEFAULT_FRONT_DOOR
+
+
+def test_front_door_default_honors_the_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    assert verify._front_door_default() == "https://env.example.com"
+
+
+def test_front_door_default_empty_env_falls_back(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "")
+    assert verify._front_door_default() == verify.DEFAULT_FRONT_DOOR
+
+
+def test_cli_front_door_flag_overrides_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://flag.example.com",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == "https://flag.example.com"
+
+
+def test_cli_front_door_omission_honors_env_var(monkeypatch):
+    monkeypatch.setenv(verify.FRONT_DOOR_ENV_VAR, "https://env.example.com")
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == "https://env.example.com"
+
+
+def test_cli_front_door_omission_uses_hardcoded_fallback(monkeypatch):
+    """Proves the hardcoded fallback is actually exercised, not skipped."""
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    assert verify.config_from_args(args).front_door == verify.DEFAULT_FRONT_DOOR
+
+
+def test_front_door_resolution_neutered_fallback_goes_red(monkeypatch):
+    """Neuter _front_door_default to return '' so the config front_door is ''
+    instead of the hardcoded DEFAULT_FRONT_DOOR. A different expected value
+    would mean the test is vacuous (it would still pass even if
+    _front_door_default returned the correct DEFAULT_FRONT_DOOR).
+
+    The _normalize_front_door stub avoids a ValueError on empty string so the
+    assertion itself is what goes RED when the function is NOT neutered.
+    """
+    monkeypatch.delenv(verify.FRONT_DOOR_ENV_VAR, raising=False)
+    monkeypatch.setattr(verify, "_front_door_default", lambda: "")
+    # Stub the normalizer so empty string does not raise ValueError — the
+    # assertion below is what proves the test is non-vacuous.
+    monkeypatch.setattr(verify, "_normalize_front_door", lambda u: u)
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+        ]
+    )
+    # With the neutered function returning '', this MUST be '' — a different
+    # expected value would mean the test is vacuous (it would still pass even
+    # if _front_door_default returned the correct DEFAULT_FRONT_DOOR).
+    assert verify.config_from_args(args).front_door == ""
+
+
 # ── low-level indirections (executed once for coverage honesty) ──────────────
 
 

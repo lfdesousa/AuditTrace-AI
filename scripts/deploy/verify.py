@@ -103,6 +103,20 @@ INDEPENDENCE_NOTE = (
 
 DEFAULT_FRONT_DOOR = "https://audittrace.allaboutdata.eu"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
+FRONT_DOOR_ENV_VAR = "AUDITTRACE_FRONT_DOOR"
+
+
+def _front_door_default() -> str:
+    """Resolve the front-door default with env-var override.
+
+    ``AUDITTRACE_FRONT_DOOR`` overrides :data:`DEFAULT_FRONT_DOOR` when set
+    to a non-empty value; an unset or empty value falls back to the hardcoded
+    constant. Read fresh on every call (NOT cached at import time) so tests
+    can monkeypatch ``os.environ`` without reload tricks.
+    """
+    raw = os.environ.get(FRONT_DOOR_ENV_VAR)
+    return raw if raw else DEFAULT_FRONT_DOOR
+
 
 # Every in-cluster app component that must have a Ready pod for the deploy to be
 # "up", matched by EXACT LABEL (never a pod-NAME substring — a rogue/old pod
@@ -1392,7 +1406,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", default="audittrace")
     parser.add_argument("--release", default="audittrace")
     parser.add_argument("--registry", choices=("hub", "local"), default="hub")
-    parser.add_argument("--front-door", default=DEFAULT_FRONT_DOOR)
+    parser.add_argument("--front-door", default=_front_door_default())
     parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument(
         "--model", default="audittrace-chat", help="chat model for the recall E2E"
