@@ -8489,34 +8489,3 @@ class TestRecallTelemetryRestRoutes:
                 )
         finally:
             telemetry_mod._recall_counter = real_counter
-
-    def test_neuter_counter_makes_recall_total_zero(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Neuter the shared counter → the route still returns 200 but the
-        counter must NOT be called.  Proves the positive assertion
-        (counter WAS called) in the other tests is non-vacuous."""
-        from audittrace.services import recall_telemetry as telemetry_mod
-
-        class _NoopCounter:
-            def add(self, *a: Any, **k: Any) -> None:
-                pass
-
-        monkeypatch.setattr(telemetry_mod, "_recall_counter", _NoopCounter())
-
-        r = client.get("/memory/semantic")
-        assert r.status_code == 200
-
-    def test_neuter_logger_makes_memory_read_log_absent(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Neuter logger.info → no memory.read log emitted.  Proves the
-        positive assertion (logger.info WAS called) in the other tests
-        is non-vacuous."""
-        monkeypatch.setattr(
-            "audittrace.services.recall_telemetry.logger",
-            type("NoopLogger", (), {"info": staticmethod(lambda *a, **k: None)})(),
-        )
-
-        r = client.get("/memory/semantic")
-        assert r.status_code == 200
