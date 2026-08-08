@@ -515,7 +515,7 @@ async def recall_recent_sessions(
     # recall_recent_sessions has no ChromaDB-backed SearchPage of its own (it
     # paginates ``load_sessions`` locally, see the docstring above) — build a
     # minimal SearchPage carrying only the page fields telemetry needs
-    # (``total``); ``matches=[]`` is fine, ``_emit_recall_telemetry`` never
+    # (``total``); ``matches=[]`` is fine, ``emit_recall_telemetry`` never
     # reads it.
     emit_recall_telemetry("tool", "sessions", total)
 
