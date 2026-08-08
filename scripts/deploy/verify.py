@@ -86,6 +86,9 @@ from scripts.deploy.frontdoor import (
     DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR,
 )
 from scripts.deploy.frontdoor import (
+    FRONT_DOOR_ENV_VAR as _FRONT_DOOR_ENV_VAR,
+)
+from scripts.deploy.frontdoor import (
     resolve_front_door,
 )
 from scripts.deploy.runner import extract_digest, normalize_version
@@ -97,6 +100,23 @@ logger = logging.getLogger("audittrace.deploy.verify")
 # module's value). The noqa silences ruff's "unused import" because the name
 # is re-exported at the module level, not used in the function body.
 DEFAULT_FRONT_DOOR = _DEFAULT_FRONT_DOOR  # noqa: F401
+# Re-export the env-var NAME too (external code / tests reference
+# verify.FRONT_DOOR_ENV_VAR). The precedence lives ONCE in
+# scripts.deploy.frontdoor; these are backward-compat aliases.
+FRONT_DOOR_ENV_VAR = _FRONT_DOOR_ENV_VAR  # noqa: F401
+
+
+def _front_door_default() -> str:
+    """Thin backward-compat wrapper over the shared resolver (SPEC #401).
+
+    The precedence (explicit > AUDITTRACE_FRONT_DOOR env > hardcoded fallback)
+    is defined ONCE in :func:`scripts.deploy.frontdoor.resolve_front_door`;
+    this no-arg wrapper is kept so external callers / tests can reference
+    ``verify._front_door_default`` and so the CLI-omission path resolves the
+    env/fallback default through a single seam.
+    """
+    return resolve_front_door()
+
 
 # Independence is NOT a self-attested boolean. It is proven two ways: (1) the
 # report exposes the FULL enumerated list of evidence sources this runner
@@ -114,6 +134,7 @@ INDEPENDENCE_NOTE = (
 )
 
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
+
 
 # Every in-cluster app component that must have a Ready pod for the deploy to be
 # "up", matched by EXACT LABEL (never a pod-NAME substring — a rogue/old pod
@@ -1448,7 +1469,9 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         namespace=args.namespace,
         release=args.release,
         registry=args.registry,
-        front_door=_normalize_front_door(resolve_front_door(args.front_door)),
+        front_door=_normalize_front_door(
+            args.front_door if args.front_door is not None else _front_door_default()
+        ),
         token_file=args.token_file,
         model=args.model,
         insecure=args.insecure,
