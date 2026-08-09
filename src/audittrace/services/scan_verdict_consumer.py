@@ -17,6 +17,12 @@ against the bootstrap Job). On each message:
          URI (content-control promoted the bytes; memory-server
          re-points the manifest at the new location so
          ``/memory/index`` can find it).
+       - On clean: ``indexed_at_ms`` reset to NULL — the SPEC #387
+         Phase 1 (WU-1) auto-index outbox marker — and an
+         ``IndexRequestEnvelope`` is enqueued onto ``index_queue`` so
+         ``IndexWorker`` picks the object up with zero operator touch
+         (closes GAP-1: previously nothing triggered indexing after a
+         clean verdict at all).
 
 Discipline:
 
@@ -44,6 +50,8 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import update
 
 from audittrace.db.models import MemoryItem
+from audittrace.services.index_routing import collection_for_key
+from audittrace.services.index_worker import IndexRequestEnvelope
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -67,6 +75,27 @@ _VERDICT_TO_SCAN_STATUS: dict[str, str] = {
 }
 
 
+def _episodic_bare_key(
+    *,
+    prefix: str,
+    scan_id: str,
+    quarantine_key: str,
+) -> str:
+    """Bucket-relative form of the post-promotion episodic key.
+
+    Pattern: ``{prefix}{scan_id}/{filename}``. The filename is the last
+    path component of the quarantine URI (``s3://memory-shared/
+    quarantine/<user>/<scan_id>/<filename>``). This is the SAME key
+    ``minio_client.get_object(bucket, key)`` / ``_index_pdf_objects``
+    expect — SPEC #387 (WU-1) uses it to build the ``IndexRequestEnvelope``
+    enqueued on a clean verdict, so the outbox and the manifest's stored
+    ``s3://`` URI (see :func:`_episodic_uri`) can never disagree on what
+    the filename actually is.
+    """
+    filename = quarantine_key.rsplit("/", 1)[-1] or "object.bin"
+    return f"{prefix}{scan_id}/{filename}"
+
+
 def _episodic_uri(
     *,
     bucket: str,
@@ -76,12 +105,13 @@ def _episodic_uri(
 ) -> str:
     """Mirror of content-control's ``ScanWorker._episodic_uri``.
 
-    Pattern: ``s3://{bucket}/{prefix}{scan_id}/{filename}``. The
-    filename is the last path component of the quarantine URI
-    (``s3://memory-shared/quarantine/<user>/<scan_id>/<filename>``).
+    Pattern: ``s3://{bucket}/{prefix}{scan_id}/{filename}`` — the full
+    manifest URI, built from :func:`_episodic_bare_key`.
     """
-    filename = quarantine_key.rsplit("/", 1)[-1] or "object.bin"
-    return f"s3://{bucket}/{prefix}{scan_id}/{filename}"
+    bare = _episodic_bare_key(
+        prefix=prefix, scan_id=scan_id, quarantine_key=quarantine_key
+    )
+    return f"s3://{bucket}/{bare}"
 
 
 class ScanVerdictConsumer:
@@ -96,6 +126,7 @@ class ScanVerdictConsumer:
         prefetch_count: int = 16,
         episodic_bucket: str = "memory-shared",
         episodic_prefix: str = "episodic/papers/",
+        index_queue: asyncio.Queue[IndexRequestEnvelope] | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
@@ -103,6 +134,11 @@ class ScanVerdictConsumer:
         self._prefetch_count = prefetch_count
         self._episodic_bucket = episodic_bucket
         self._episodic_prefix = episodic_prefix
+        # SPEC #387 Phase 1 (WU-1) — the auto-index outbox queue. ``None``
+        # (the default) keeps this consumer usable standalone (existing
+        # tests, and any caller that doesn't wire the index pipeline) —
+        # the clean-verdict branch below simply skips enqueueing.
+        self._index_queue = index_queue
         self._connection: Any = None
         self._channel: Any = None
         self._queue: Any = None
@@ -265,17 +301,31 @@ class ScanVerdictConsumer:
                     extra={"scan_id": scan_id},
                 )
                 return
+            # Captured BEFORE commit — SPEC #387 (WU-1) needs these to
+            # build the IndexRequestEnvelope, and an expired ORM attribute
+            # read after commit (session-config-dependent) is a footgun
+            # this sidesteps entirely.
+            row_user_id = row.created_by_user_id
+            row_trace_id = row.trace_id or ""
+
             updates: dict[str, Any] = {
                 "scan_status": scan_status,
                 "modified_at_ms": _now_ms(),
             }
+            index_bare_key: str | None = None
             if kind == "clean":
-                updates["key"] = _episodic_uri(
-                    bucket=self._episodic_bucket,
+                index_bare_key = _episodic_bare_key(
                     prefix=self._episodic_prefix,
                     scan_id=scan_id,
                     quarantine_key=row.key,
                 )
+                updates["key"] = f"s3://{self._episodic_bucket}/{index_bare_key}"
+                # SPEC #387 Phase 1 (WU-1) — the auto-index outbox marker.
+                # Explicit reset (not just "already NULL by default") so a
+                # duplicate clean-verdict re-delivery for an
+                # already-indexed row is idempotently re-queued rather
+                # than silently trusting a stale timestamp.
+                updates["indexed_at_ms"] = None
             await session.execute(
                 update(MemoryItem).where(MemoryItem.id == scan_id).values(**updates)
             )
@@ -287,6 +337,25 @@ class ScanVerdictConsumer:
                     "verdict": kind,
                     "scan_status": scan_status,
                 },
+            )
+
+        # Enqueue OUTSIDE the session block — the outbox row is already
+        # durably NULL-marked, so an enqueue failure (or a process crash
+        # right here) is exactly the case IndexJanitor's grace-window
+        # re-drive exists for (mirrors ScanRequestPublisher's shape).
+        if (
+            kind == "clean"
+            and index_bare_key is not None
+            and self._index_queue is not None
+        ):
+            await self._index_queue.put(
+                IndexRequestEnvelope(
+                    scan_id=scan_id,
+                    key=index_bare_key,
+                    collection=collection_for_key(index_bare_key),
+                    user_id=row_user_id,
+                    trace_id=row_trace_id,
+                )
             )
 
     async def _process_one(self, message: Any) -> None:

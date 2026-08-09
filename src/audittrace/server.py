@@ -182,11 +182,22 @@ async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
     once the broker is up. ``app.state.scan_queue`` is always set so the
     ``/memory/upload`` route handler can enqueue immediately.
 
+    SPEC #387 Phase 1 additionally starts ``IndexWorker`` + ``IndexJanitor``
+    here — the place→index leg of the pipeline, one hop after
+    place→publish. ``ScanVerdictConsumer`` is wired with the new
+    ``index_queue`` so a ``scanned_clean`` verdict enqueues an
+    auto-index request with zero operator touch (closes GAP-1).
+
     Returns the ``AsyncExitStack`` owning broker-close + task-cancel, to
     be unwound on shutdown.
     """
     import contextlib  # noqa: PLC0415 — local to keep import surface tight
 
+    from audittrace.services.index_janitor import IndexJanitor  # noqa: PLC0415
+    from audittrace.services.index_worker import (  # noqa: PLC0415
+        IndexRequestEnvelope,
+        IndexWorker,
+    )
     from audittrace.services.scan_amqp_client import ScanAmqpClient  # noqa: PLC0415
     from audittrace.services.scan_audit_consumer import (  # noqa: PLC0415
         ScanAuditConsumer,
@@ -229,8 +240,36 @@ async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
         ).run(),
         name="scan-request-janitor",
     )
+    # ─── SPEC #387 Phase 1 — auto-index outbox (WU-1/WU-2/WU-3) ───────────
+    # One hop after the scan outbox: ``IndexWorker`` drains the queue
+    # ``ScanVerdictConsumer`` feeds on every ``scanned_clean`` verdict
+    # (WU-1 wiring — passed as ``index_queue=`` below); ``IndexJanitor``
+    # re-drives any ``indexed_at_ms IS NULL`` row past the grace window.
+    # Same supervised create_task + AsyncExitStack-cancel shape as the
+    # scan pipeline above, gated by the same ``scan_pipeline_enabled``
+    # flag (indexing only matters once the scan pipeline is active).
+    index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue(maxsize=10000)
+    index_worker_task = asyncio.create_task(
+        IndexWorker(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=index_queue,
+        ).run(),
+        name="index-worker",
+    )
+    index_janitor_task = asyncio.create_task(
+        IndexJanitor(
+            settings=settings,
+            session_factory=scan_session_factory,
+            queue=index_queue,
+        ).run(),
+        name="index-janitor",
+    )
+
     verdict_consumer = ScanVerdictConsumer(
-        settings=settings, session_factory=scan_session_factory
+        settings=settings,
+        session_factory=scan_session_factory,
+        index_queue=index_queue,
     )
     stack.push_async_callback(verdict_consumer.aclose)
     audit_consumer = ScanAuditConsumer(
@@ -250,6 +289,8 @@ async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
             scan_janitor_task,
             scan_verdict_task,
             scan_audit_task,
+            index_worker_task,
+            index_janitor_task,
         )
         for t in tasks:
             t.cancel()
@@ -262,7 +303,8 @@ async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
     app.state.scan_queue = scan_queue
     logger.info(
         "Scan-request pipeline scheduled — exchange=%s routing_key=%s "
-        "(publisher + janitor + verdict-consumer + audit-consumer)",
+        "(publisher + janitor + verdict-consumer + audit-consumer + "
+        "index-worker + index-janitor)",
         settings.scan_request_exchange,
         settings.scan_request_routing_key,
     )

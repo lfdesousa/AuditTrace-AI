@@ -490,6 +490,18 @@ class Settings(BaseSettings):
     scan_janitor_interval_seconds: int = 30
     scan_janitor_grace_seconds: int = 60
 
+    # ─── SPEC #387 Phase 1 — auto-index outbox (WU-2/WU-3) ────────────────
+    # One hop after the scan outbox above: ``IndexWorker`` drains the
+    # in-process index queue that ``ScanVerdictConsumer`` feeds on every
+    # ``scanned_clean`` verdict; ``IndexJanitor`` re-drives any
+    # ``indexed_at_ms IS NULL`` row past the grace window. Same two-knob
+    # shape as ``scan_janitor_*`` above — grace must be > the worker's
+    # typical embed+upsert latency so a healthy index-in-flight isn't
+    # double-indexed (idempotent upsert makes double-indexing harmless,
+    # but redundant work is still redundant work).
+    index_janitor_interval_seconds: int = 30
+    index_janitor_grace_seconds: int = 60
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
