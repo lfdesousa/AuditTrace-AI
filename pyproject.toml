@@ -213,7 +213,6 @@ exclude_lines = [
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-extend-exclude = ["**/*.json"]
 
 [tool.ruff.lint]
 select = [
