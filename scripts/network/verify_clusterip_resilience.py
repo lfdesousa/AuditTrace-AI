@@ -1,48 +1,51 @@
 #!/usr/bin/env python3
-"""Deterministic ClusterIP-path resilience check (SPEC #443, the #307 family).
+"""Deterministic ClusterIP-path resilience check (SPEC #443 v2, the #307 family).
 
-This is the **neuterable guard** for SPEC #443 ("Mesh survives a wifi<->wired
-network switch"). It answers one falsifiable question, exit-coded so it can be
-driven by an operator, a NetworkManager dispatcher hook
-(``NN-k3s-clusterip-guard``), or CI: **is the pod -> ClusterIP path currently
-bound to the stable ``k3s0`` dummy interface, or has it drifted back onto
-whichever physical NIC owns the default route (the pre-fix, #307-class
-failure mode)?**
+This is the **neuterable guard** for SPEC #443 v2 ("Mesh survives a
+wifi<->wired network switch, the correct way"). It answers one falsifiable
+question, exit-coded so it can be driven by an operator, the NetworkManager
+dispatcher hook (``scripts/network/k3s_clusterip_dispatcher.py``), or CI:
+**is the pod -> ClusterIP path that a wifi<->wired switch actually breaks
+currently working, right now, regardless of which physical NIC owns the
+default route?**
 
-Filename note (deviation from SPEC #443 s5's literal
-``verify-clusterip-resilience.py``): this module uses an underscore, not a
-hyphen, so it (a) is a syntactically valid module name — ``ruff``'s N999
-pep8-naming rule, enforced by the repo's pre-commit gate on every staged
-``.py`` file including ``scripts/**``, rejects hyphenated module names outright
-— and (b) matches every other coverage-gated ``scripts/*`` package in this
-repo (``scripts/deploy``, ``scripts/hooks``, ``scripts/release``,
-``scripts/curator``), all of which are plain Python identifiers so they can be
-both ``import``ed normally in tests and run via ``python -m``. The deliverable
-is otherwise unchanged: same path prefix (``scripts/network/``), same CLI
-contract, same neuterable-guard role.
+## Why v2 (the checks changed shape, 2026-08-09)
 
-Root cause this guards against (SPEC #443 s2, evidenced 2026-08-09): with no
-``/etc/rancher/k3s/config.yaml``, k3s auto-detects its node IP from the
-default-route interface. ``ip route get 10.43.0.1`` (the kube-API ClusterIP)
-then egresses whichever NIC currently holds the default route. A wifi<->wired
-switch changes the default route -> the ClusterIP path breaks -> istiod loses
-its watch on the kube-API -> every sidecar goes ``Unauthenticated`` mesh-wide.
-The fix (SPEC #443 s3) pins the node IP + flannel interface to a persistent
-``k3s0`` dummy interface with a fixed ``/32`` outside the pod (10.42.0.0/16),
-service (10.43.0.0/16), and LAN (192.168.1.0/24) ranges, so the ClusterIP path
-no longer depends on which physical NIC is active.
+The v1 guard asserted an *implementation detail* — that the node's routing
+table and ``kubectl``-reported ``InternalIP`` were pinned to a dummy ``k3s0``
+interface. That assumption was **wrong**: the v1 fix (pin k3s ``node-ip`` /
+``flannel-iface`` to a ``k3s0`` /32) was built, unit-tested, and independently
+reviewed PASS, then **broke the mesh on live host-apply** — pinning node-ip
+does not control kube-proxy/service-CIDR routing, and giving the node an
+unreachable /32 as its primary IP broke istiod<->kube-API outright. See
+SPEC #443 v2 RE-SPEC s1 and ``feedback_infra_fix_needs_live_dry_run``. The
+v1 approach was reverted (2026-08-09) and MUST NOT be repeated: **no
+node-ip/flannel-iface pin, no dummy interface, no steady-state host change.**
 
-Four checks (SPEC #443 s5), each independently falsifiable:
+v2's guard instead tests the *real failing path directly*: a live in-cluster
+TCP probe from the pod network to the kube-API ClusterIP
+(``10.43.0.1:443``), the exact hop that goes stale when a wifi<->wired
+switch changes the host's default route and kube-proxy/flannel (node IP
+auto-detected at start) don't re-derive their programming. "Healthy" now
+means "the path that breaks on a switch works" — independent of which NIC
+is currently active, independent of any node-ip/interface assumption.
 
-    (a) ``ip route get <service-cidr-probe>`` egresses the pinned dummy
-        interface (default: ``k3s0``), not the physical NIC/default gateway.
-    (b) the node's ``InternalIP`` (via kubectl) equals the pinned IP
-        (default: ``10.10.10.1``).
-    (c) istiod is reachable AND its recent log window carries zero
-        ``no route to host`` / ``Unauthenticated`` / ``tokenreviews`` lines
-        (the #307 smoking-gun signature, see ``scripts/deploy/mesh.py``).
-    (d) the front door's ``GET /health`` reports ``status=ok`` (external
-        ingress plane, SPEC #443 s7: "must validate both planes").
+Three checks, each independently falsifiable:
+
+    (a) **pod-clusterip-reachable** — an ephemeral in-cluster pod
+        (``kubectl run --rm``) opens a real TCP connection to the kube-API
+        ClusterIP (default ``10.43.0.1:443``). This is the literal failing
+        hop from SPEC #443 v2 s2: pod network -> kube-proxy/flannel ->
+        kube-API. A failed connect here IS the #443 failure signature,
+        regardless of which interface currently holds the default route.
+    (b) **istiod-reachable-no-route** — istiod is reachable AND its recent
+        log window carries zero ``no route to host`` / ``Unauthenticated`` /
+        ``tokenreviews`` lines (the #307 smoking-gun signature, see
+        ``scripts/deploy/mesh.py``). Kept unchanged from v1 — this check was
+        never approach-specific.
+    (c) **front-door-health** — the front door's ``GET /health`` reports
+        ``status=ok`` (external ingress plane, SPEC #443 s7: "must validate
+        both planes"). Kept unchanged from v1.
 
 Every external effect (subprocess, HTTP) funnels through a single seam
 (``_run`` / ``_http_get``) so tests never touch a real cluster or socket,
@@ -56,10 +59,14 @@ Usage::
     python scripts/network/verify_clusterip_resilience.py \\
       --front-door https://audittrace.local --insecure
 
-Exit code ``0`` when all four checks PASS (the fixed, k3s0-bound state);
-``1`` when any check FAILS (including the pre-fix, default-route-bound
-state) — this asymmetry is what SPEC #443 acceptance criterion 4 requires
-and what ``tests/test_verify_clusterip_resilience.py`` proves non-vacuous.
+Exit code ``0`` when all three checks PASS (the pod->ClusterIP path is
+genuinely working); ``1`` when any check FAILS. This asymmetry is what the
+dispatcher (``k3s_clusterip_dispatcher.py``) relies on: it makes its
+restart-or-noop decision from this exit code ALONE, never from parsing this
+script's stdout, so a future change to this script's print format can never
+silently break the dispatcher's safety decision. See
+``tests/test_verify_clusterip_resilience.py`` for the non-vacuous proof (RED
+on broken evidence, GREEN on healthy evidence, per check).
 
 Front-door resolution is intentionally self-contained (no cross-package
 import of ``scripts.deploy.frontdoor.resolve_front_door``): this script is
@@ -72,6 +79,16 @@ hardcoded default); only the hardcoded default differs, because this is a
 host/laptop-network tool whose reference environment IS the laptop (the
 portability invariant's own "laptop is the reference profile" rule) rather
 than the general deploy tooling's cloud-first default.
+
+Filename note (deviation from SPEC #443 s5's literal
+``verify-clusterip-resilience.py``): this module uses an underscore, not a
+hyphen, so it (a) is a syntactically valid module name — ``ruff``'s N999
+pep8-naming rule, enforced by the repo's pre-commit gate on every staged
+``.py`` file including ``scripts/**``, rejects hyphenated module names
+outright — and (b) matches every other coverage-gated ``scripts/*`` package
+in this repo (``scripts/deploy``, ``scripts/hooks``, ``scripts/release``,
+``scripts/curator``), all of which are plain Python identifiers so they can
+be both ``import``ed normally in tests and run via ``python -m``.
 """
 
 from __future__ import annotations
@@ -80,11 +97,11 @@ import argparse
 import json
 import logging
 import os
-import re
 import ssl
 import subprocess  # noqa: S404 - read-only ip/kubectl reads; fixed argv, no shell
 import sys
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -96,10 +113,11 @@ logger = logging.getLogger(__name__)
 PASS = "pass"
 FAIL = "fail"
 
-# ── defaults (SPEC #443 s3 / s5) ───────────────────────────────────────────────
-DEFAULT_SERVICE_CIDR_PROBE = "10.43.0.1"  # kube-API ClusterIP (SPEC #443 s2)
-DEFAULT_DUMMY_IFACE = "k3s0"
-DEFAULT_PINNED_NODE_IP = "10.10.10.1"
+# ── defaults (SPEC #443 v2 s4) ──────────────────────────────────────────────
+DEFAULT_PROBE_IP = "10.43.0.1"  # kube-API ClusterIP (SPEC #443 s2)
+DEFAULT_PROBE_PORT = 443
+DEFAULT_PROBE_IMAGE = "busybox:1.36"
+DEFAULT_PROBE_POD_TIMEOUT = "20s"
 DEFAULT_ISTIOD_NAMESPACE = "istio-system"
 DEFAULT_ISTIOD_LABEL = "app=istiod"
 # SPEC #443 acceptance criterion 1: "0 no route to host in the 2 min after the
@@ -123,6 +141,14 @@ NO_ROUTE_PATTERNS: tuple[str, ...] = (
     "Unauthenticated",
     "tokenreviews",
 )
+
+# The pod->ClusterIP probe's two possible outcomes, printed by the ephemeral
+# probe pod's shell one-liner (see gather_pod_clusterip_probe). Distinct,
+# greppable sentinels — never inferred from returncode alone, because
+# `kubectl run --rm` can exit non-zero for reasons unrelated to the probe
+# itself (image pull, scheduling) and those must ALSO fail closed.
+CLUSTERIP_PROBE_OK_MARKER = "AUDITTRACE_CLUSTERIP_TCP_OK"
+CLUSTERIP_PROBE_FAIL_MARKER = "AUDITTRACE_CLUSTERIP_TCP_FAIL"
 
 
 # ── external-effect seams (monkeypatched in tests; nothing else opens a
@@ -207,7 +233,7 @@ class CheckResult:
 
 @dataclass
 class ResilienceReport:
-    """The four-check verdict, SPEC #443 s5. ``healthy`` is the exit-code driver."""
+    """The three-check verdict, SPEC #443 v2 s4. ``healthy`` drives the exit code."""
 
     checks: list[CheckResult]
     generated_at: str
@@ -227,22 +253,19 @@ class ResilienceReport:
 # ── pure parsers (no I/O — trivially unit-testable) ────────────────────────────
 
 
-def parse_route_get_iface(route_output: str) -> str | None:
-    """Extract the egress interface from ``ip route get <ip>`` stdout.
+def parse_clusterip_probe_result(output: str) -> bool | None:
+    """Extract the probe verdict from the ephemeral pod's captured stdout.
 
-    Pre-fix / RED (default-route-bound)::
-
-        10.43.0.1 via 192.168.1.1 dev enxa0cec8afb44d src 192.168.1.231 uid 1000
-
-    Fixed / GREEN (k3s0-bound)::
-
-        10.43.0.1 dev k3s0 src 10.10.10.1 uid 1000
-
-    Returns ``None`` if no ``dev <iface>`` token is present (unparseable ->
-    the caller treats this as a FAIL, never a silent PASS).
+    Returns ``True`` (reached), ``False`` (explicitly could not reach), or
+    ``None`` if neither sentinel is present (the pod never ran its command —
+    e.g. ``ImagePullBackOff``, scheduling timeout — an inconclusive result
+    that the caller MUST treat as a FAIL, never a silent PASS).
     """
-    match = re.search(r"\bdev\s+(\S+)", route_output)
-    return match.group(1) if match else None
+    if CLUSTERIP_PROBE_OK_MARKER in output:
+        return True
+    if CLUSTERIP_PROBE_FAIL_MARKER in output:
+        return False
+    return None
 
 
 def count_no_route_lines(
@@ -266,59 +289,45 @@ def count_no_route_lines(
 # ── decision functions (pure — evidence in, CheckResult out) ──────────────────
 
 
-def check_route_via_iface(
-    route_output: str, expected_iface: str = DEFAULT_DUMMY_IFACE
+def check_pod_clusterip_reachable(
+    returncode: int,
+    output: str,
+    probe_ip: str = DEFAULT_PROBE_IP,
+    probe_port: int = DEFAULT_PROBE_PORT,
 ) -> CheckResult:
-    """Acceptance criterion 1 / 4: the ClusterIP path must egress ``expected_iface``."""
-    iface = parse_route_get_iface(route_output)
-    if iface is None:
+    """SPEC #443 v2 s4(a): the literal failing hop, tested for real.
+
+    ``returncode`` is ``kubectl run``'s own exit code (nonzero can mean the
+    probe pod never got to run its command at all — scheduling/image-pull
+    failure — a DIFFERENT failure mode from a clean TCP-connect-refused, but
+    one that must ALSO fail this check, per the fail-closed contract).
+    """
+    result = parse_clusterip_probe_result(output)
+    if result is True and returncode == 0:
         return CheckResult(
-            "route-via-dummy-iface",
-            FAIL,
-            "could not parse an egress interface from `ip route get` output "
-            "(fail-closed)",
-            {"raw": route_output},
+            "pod-clusterip-reachable",
+            PASS,
+            f"in-cluster TCP probe reached {probe_ip}:{probe_port} "
+            "(the path a wifi<->wired switch breaks)",
+            {"returncode": returncode},
         )
-    if iface != expected_iface:
+    if result is False:
         return CheckResult(
-            "route-via-dummy-iface",
+            "pod-clusterip-reachable",
             FAIL,
-            f"ClusterIP path egresses {iface!r}, not {expected_iface!r} "
-            "(default-route-bound — the pre-fix #307-class state)",
-            {"iface": iface, "expected": expected_iface, "raw": route_output},
+            f"in-cluster TCP probe could NOT reach {probe_ip}:{probe_port} "
+            "(the #443/#307 failure signature — pod network -> ClusterIP path "
+            "is broken, independent of which NIC currently owns the default "
+            "route)",
+            {"returncode": returncode, "raw": output},
         )
     return CheckResult(
-        "route-via-dummy-iface",
-        PASS,
-        f"ClusterIP path egresses {expected_iface!r}",
-        {"iface": iface},
-    )
-
-
-def check_node_internal_ip(
-    node_ip: str | None, expected_ip: str = DEFAULT_PINNED_NODE_IP
-) -> CheckResult:
-    """Acceptance criterion 2: node InternalIP must equal the pinned dummy IP."""
-    if not node_ip:
-        return CheckResult(
-            "node-internal-ip-pinned",
-            FAIL,
-            "could not read the node's InternalIP via kubectl (fail-closed)",
-            {},
-        )
-    if node_ip != expected_ip:
-        return CheckResult(
-            "node-internal-ip-pinned",
-            FAIL,
-            f"node InternalIP={node_ip!r}, expected {expected_ip!r} "
-            "(was the physical NIC's IP, which changes on a wifi<->wired switch)",
-            {"internal_ip": node_ip, "expected": expected_ip},
-        )
-    return CheckResult(
-        "node-internal-ip-pinned",
-        PASS,
-        f"node InternalIP == {expected_ip!r}",
-        {"internal_ip": node_ip},
+        "pod-clusterip-reachable",
+        FAIL,
+        "in-cluster TCP probe produced no parseable result "
+        f"(`kubectl run` exited {returncode}; fail-closed — never assume "
+        "reachability on missing evidence)",
+        {"returncode": returncode, "raw": output},
     )
 
 
@@ -362,8 +371,8 @@ def check_front_door(status_code: int, body: bytes) -> CheckResult:
     """Acceptance criterion 3: the front door must still serve `/health` ok.
 
     SPEC #443 s7: "front-door ingress is on the physical IP ... only the
-    cluster-internal node IP moves to k3s0. Must validate both planes." This
-    check is the ingress-plane half; the other three cover the internal plane.
+    cluster-internal path is at risk. Must validate both planes." This check
+    is the ingress-plane half; the other two cover the internal plane.
     """
     if status_code != 200:
         return CheckResult(
@@ -391,23 +400,48 @@ def check_front_door(status_code: int, body: bytes) -> CheckResult:
 # ── evidence gathering (the only I/O in this module) ───────────────────────────
 
 
-def gather_route_output(service_cidr_probe: str = DEFAULT_SERVICE_CIDR_PROBE) -> str:
-    proc = _run(["ip", "route", "get", service_cidr_probe])
-    return proc.stdout if proc.returncode == 0 else ""
+def gather_pod_clusterip_probe(
+    probe_ip: str = DEFAULT_PROBE_IP,
+    probe_port: int = DEFAULT_PROBE_PORT,
+    image: str = DEFAULT_PROBE_IMAGE,
+    pod_timeout: str = DEFAULT_PROBE_POD_TIMEOUT,
+) -> tuple[int, str]:
+    """Spin an ephemeral in-cluster pod that TCP-connects to the ClusterIP.
 
-
-def gather_node_internal_ip() -> str | None:
+    ``kubectl run --rm -i --restart=Never`` schedules a throwaway pod, runs
+    one shell one-liner (``nc -z`` — a plain TCP connect, no TLS/HTTP needed
+    to prove the hop is open), prints one of the two sentinel markers, and is
+    deleted on exit (``--rm``). This is a REAL round trip through the same
+    pod-network -> kube-proxy/flannel -> kube-API path that goes stale on a
+    wifi<->wired switch (SPEC #443 v2 s2/s4) — not an assertion about routing
+    table contents, so it cannot be fooled by an implementation that "looks"
+    fixed but isn't (the v1 lesson).
+    """
+    pod_name = f"audittrace-clusterip-probe-{uuid.uuid4().hex[:8]}"
+    shell_probe = (
+        f"nc -z -w 5 {probe_ip} {probe_port} "
+        f"&& echo {CLUSTERIP_PROBE_OK_MARKER} "
+        f"|| echo {CLUSTERIP_PROBE_FAIL_MARKER}"
+    )
     proc = _run(
         [
             "kubectl",
-            "get",
-            "node",
-            "-o",
-            "jsonpath={.items[0].status.addresses[?(@.type=='InternalIP')].address}",
+            "run",
+            pod_name,
+            "--rm",
+            "-i",
+            "--restart=Never",
+            "--image",
+            image,
+            f"--pod-running-timeout={pod_timeout}",
+            "--command",
+            "--",
+            "sh",
+            "-c",
+            shell_probe,
         ]
     )
-    ip = proc.stdout.strip()
-    return ip if proc.returncode == 0 and ip else None
+    return proc.returncode, proc.stdout
 
 
 def gather_istiod_probe(
@@ -447,20 +481,20 @@ def run_all(
     *,
     front_door: str,
     insecure: bool,
-    expected_iface: str = DEFAULT_DUMMY_IFACE,
-    expected_node_ip: str = DEFAULT_PINNED_NODE_IP,
-    service_cidr_probe: str = DEFAULT_SERVICE_CIDR_PROBE,
+    probe_ip: str = DEFAULT_PROBE_IP,
+    probe_port: int = DEFAULT_PROBE_PORT,
+    probe_image: str = DEFAULT_PROBE_IMAGE,
     log_window: str = DEFAULT_LOG_WINDOW,
 ) -> ResilienceReport:
-    """Gather all evidence, run the four checks, return the structured report."""
-    route_output = gather_route_output(service_cidr_probe)
-    node_ip = gather_node_internal_ip()
+    """Gather all evidence, run the three checks, return the structured report."""
+    probe_rc, probe_output = gather_pod_clusterip_probe(
+        probe_ip, probe_port, probe_image
+    )
     istiod_reachable, istiod_logs = gather_istiod_probe(window=log_window)
     fd_status, fd_body = gather_front_door(front_door, insecure=insecure)
 
     checks = [
-        check_route_via_iface(route_output, expected_iface),
-        check_node_internal_ip(node_ip, expected_node_ip),
+        check_pod_clusterip_reachable(probe_rc, probe_output, probe_ip, probe_port),
         check_istiod_no_route(istiod_reachable, istiod_logs, log_window),
         check_front_door(fd_status, fd_body),
     ]
@@ -486,8 +520,8 @@ def _resolve_front_door(explicit: str | None) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "SPEC #443 — verify the pod->ClusterIP path is bound to the "
-            "pinned k3s0 dummy interface, not the physical NIC/default route."
+            "SPEC #443 v2 — verify the pod->ClusterIP path that a wifi<->wired "
+            "switch breaks is genuinely reachable, right now."
         )
     )
     parser.add_argument(
@@ -500,9 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip TLS verification (the laptop front door's self-signed cert)",
     )
-    parser.add_argument("--expected-iface", default=DEFAULT_DUMMY_IFACE)
-    parser.add_argument("--expected-node-ip", default=DEFAULT_PINNED_NODE_IP)
-    parser.add_argument("--service-cidr-probe", default=DEFAULT_SERVICE_CIDR_PROBE)
+    parser.add_argument("--probe-ip", default=DEFAULT_PROBE_IP)
+    parser.add_argument("--probe-port", type=int, default=DEFAULT_PROBE_PORT)
+    parser.add_argument("--probe-image", default=DEFAULT_PROBE_IMAGE)
     parser.add_argument("--log-window", default=DEFAULT_LOG_WINDOW)
     parser.add_argument(
         "--json", action="store_true", help="Also print the full report as JSON"
@@ -518,9 +552,9 @@ def main(argv: list[str] | None = None) -> int:
     report = run_all(
         front_door=front_door,
         insecure=args.insecure,
-        expected_iface=args.expected_iface,
-        expected_node_ip=args.expected_node_ip,
-        service_cidr_probe=args.service_cidr_probe,
+        probe_ip=args.probe_ip,
+        probe_port=args.probe_port,
+        probe_image=args.probe_image,
         log_window=args.log_window,
     )
 
@@ -532,9 +566,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report.as_dict(), indent=2))
 
     if report.healthy:
-        print("RESULT: healthy (ClusterIP path is k3s0-bound)")
+        print("RESULT: healthy (pod->ClusterIP path is genuinely reachable)")
     else:
-        print("RESULT: UNHEALTHY (ClusterIP path is NOT reliably k3s0-bound)")
+        print("RESULT: UNHEALTHY (pod->ClusterIP path is NOT reliably reachable)")
 
     return 0 if report.healthy else 1
 
