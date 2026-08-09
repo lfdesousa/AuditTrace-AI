@@ -561,6 +561,103 @@ class TestIndex:
         assert response.json()["total_chunks"] == 0
 
 
+class TestM2WriteTelemetryWiring:
+    """Route-level proof that the M2 write-telemetry emit calls are
+    actually wired into POST /memory/upload and POST /memory/index — not
+    merely exercised via a direct unit call into
+    ``write_telemetry.emit_*``. ``test_write_telemetry.py`` proves the
+    helper functions behave correctly in isolation; these prove the
+    ROUTES call them.
+
+    Spies patch the import SITE inside ``audittrace.routes.memory``
+    (``audittrace.routes.memory.emit_memory_write`` /
+    ``.emit_chunks_indexed``), not the ``write_telemetry`` module those
+    names were imported from — ``routes/memory.py`` does
+    ``from audittrace.services.write_telemetry import emit_memory_write,
+    emit_chunks_indexed``, which binds a NEW name in the ``routes.memory``
+    module namespace; patching the origin module would leave that bound
+    name untouched and the spy would never be called (review fix,
+    2026-08-09 — a route-deletion neuter of both call sites passed the
+    full suite before this class existed)."""
+
+    def test_upload_emits_memory_write_with_layer(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POST /memory/upload must call
+        ``emit_memory_write(layer=<resolved layer>)`` exactly once."""
+        spy = MagicMock()
+        monkeypatch.setattr("audittrace.routes.memory.emit_memory_write", spy)
+
+        with patch(
+            "audittrace.routes.memory._get_minio_client", return_value=MagicMock()
+        ):
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "procedural"},
+                files=_make_upload_file(b"skill doc", "SKILL-emit-check.md"),
+            )
+
+        assert response.status_code == 200
+        spy.assert_called_once_with(layer="procedural")
+
+    def test_index_emits_chunks_indexed_with_matching_count(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POST /memory/index must call
+        ``emit_chunks_indexed(collection=<name>, chunk_count=<n>)`` for the
+        indexed collection, with ``chunk_count`` equal to the same number
+        the response reports for that collection."""
+        mock_minio = MagicMock()
+
+        def list_objects(bucket: str, prefix: str = "", **_kw: Any) -> list[Any]:
+            if prefix == "episodic/":
+                return [_mock_minio_object("episodic/ADR-emit-check.md")]
+            return []
+
+        mock_minio.list_objects.side_effect = list_objects
+
+        def get_object(bucket: str, key: str) -> MagicMock:
+            response = MagicMock()
+            response.read.return_value = b"# Test document\nSome content here."
+            return response
+
+        mock_minio.get_object.side_effect = get_object
+
+        mock_collection = AsyncMock()
+        mock_collection.count.return_value = 0
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+
+        spy = MagicMock()
+        monkeypatch.setattr("audittrace.routes.memory.emit_chunks_indexed", spy)
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"collections": "decisions"},
+            )
+
+        assert response.status_code == 200
+        expected_chunk_count = response.json()["collections"]["decisions"]
+        assert expected_chunk_count > 0, (
+            "fixture must produce at least one chunk for this assertion to "
+            "be non-vacuous"
+        )
+        spy.assert_called_once_with(
+            collection="decisions", chunk_count=expected_chunk_count
+        )
+
+
 # ── chunking unit tests ─────────────────────────────────────────────────────
 
 

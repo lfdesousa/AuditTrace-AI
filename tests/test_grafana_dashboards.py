@@ -493,6 +493,71 @@ class TestAgentsLearningWaveAPanels:
                 "(connected-nulls OFF) so gaps stay visible per D1/D2."
             )
 
+    def test_recall_hit_rate_24h_summary_denominator_not_percent(self) -> None:
+        """4.2 companion stat 'Recall Hit-Rate — 24h summary' plots TWO
+        series: a percentage (hit-rate) and a raw count (the denominator,
+        'total recalls (denominator)'). The panel default unit is
+        ``percent`` for the hit-rate series' sake — without a per-series
+        override, the denominator's raw count (e.g. 26) renders as
+        '26.0%' and picks up the hit-rate thresholds (red/yellow/green),
+        i.e. a small-n denominator can render RED even though the value
+        is correct — value right, render wrong (live-render bug caught
+        by the operator on the deployed dashboard, 2026-08-09)."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        panels = [
+            p
+            for p in dash.get("panels", [])
+            if p.get("title") == "Recall Hit-Rate — 24h summary"
+        ]
+        assert panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Recall Hit-Rate — 24h summary' panel."
+        )
+        panel = panels[0]
+
+        # The panel default stays percent — that's correct for the
+        # hit-rate series, which carries no override.
+        assert panel.get("fieldConfig", {}).get("defaults", {}).get("unit") == (
+            "percent"
+        ), "24h-summary panel default unit must remain 'percent' (hit-rate series)."
+
+        # The denominator target's legend/display name must be the exact
+        # string a byName override matches on.
+        denominator_targets = [
+            t
+            for t in panel.get("targets", [])
+            if t.get("legendFormat") == "total recalls (denominator)"
+        ]
+        assert denominator_targets, (
+            "24h-summary panel missing the 'total recalls (denominator)' target."
+        )
+
+        overrides = panel.get("fieldConfig", {}).get("overrides", [])
+        denominator_overrides = [
+            o
+            for o in overrides
+            if o.get("matcher", {}).get("id") == "byName"
+            and o.get("matcher", {}).get("options") == "total recalls (denominator)"
+        ]
+        assert denominator_overrides, (
+            "24h-summary panel must carry a byName override for "
+            "'total recalls (denominator)' — otherwise the raw count "
+            "inherits the panel's percent unit + hit-rate thresholds."
+        )
+        override_props = {
+            p["id"]: p["value"] for p in denominator_overrides[0].get("properties", [])
+        }
+        assert override_props.get("unit") != "percent", (
+            "Denominator override must NOT use 'percent' — it is a raw count."
+        )
+        assert override_props.get("unit") == "short", (
+            "Denominator override should render as a plain number (unit=short)."
+        )
+        color = override_props.get("color", {})
+        assert color.get("mode") == "fixed", (
+            "Denominator override must fix the colour so it does not inherit "
+            "the hit-rate RED/yellow/green thresholds on a small-n count."
+        )
+
     def test_results_per_recall_panel_wave_a(self) -> None:
         """4.3: Results per Recall — p50/p95 from histogram_quantile.
         PromQL must reference audittrace_recall_results_bucket (existing
