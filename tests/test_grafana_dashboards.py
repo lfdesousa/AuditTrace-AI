@@ -432,6 +432,14 @@ class TestAgentsLearningWaveAPanels:
             "total' panel (Wave A v2 restructure)."
         )
         assert panels[0].get("type") == "table"
+        # Must be an INSTANT query: a range query renders one row per scrape
+        # step (the "Time | 0 | /memory/episodic" list), not the intended
+        # single 24h-total row per route. Live-render bug caught 2026-08-09.
+        for tgt in panels[0].get("targets", []):
+            assert tgt.get("instant") is True, (
+                "24h-totals table target must set instant:true (range query "
+                "renders a per-scrape time series, not the 24h total per route)."
+            )
         exprs = " ".join(_all_target_exprs({"panels": panels}))
         assert "http_server_request_duration_seconds_count" in exprs
         assert "http_request_method" in exprs
@@ -451,6 +459,13 @@ class TestAgentsLearningWaveAPanels:
             f"{AGENTS_LEARNING_FILE} missing 'Memory Read Status — by "
             "response code' panel (Wave A v2 restructure)."
         )
+        # Must be an INSTANT query (same 24h-total-per-code rendering rule as
+        # the by-route table; range query would list a row per scrape).
+        for tgt in panels[0].get("targets", []):
+            assert tgt.get("instant") is True, (
+                "status-by-code table target must set instant:true (range "
+                "query renders a per-scrape time series, not 24h totals)."
+            )
         # Must reference http_response_status_code in the expr.
         exprs = " ".join(_all_target_exprs({"panels": panels}))
         assert "http_response_status_code" in exprs

@@ -11,8 +11,8 @@
     {
       "id": 101,
       "type": "row",
-      "title": "Accumulation — the corpus grows",
-      "description": "Wave B: memory-write and chunks-indexed counters (M2) must exist before this row is populated. Currently empty — accumulation panels gated on new OTel instrumentation.",
+      "title": "Accumulation \u2014 the corpus grows",
+      "description": "Wave B: memory-write and chunks-indexed counters (M2) must exist before this row is populated. Currently empty \u2014 accumulation panels gated on new OTel instrumentation.",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -26,7 +26,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "Recall Hit-Rate",
-      "description": "Rolling ratio of recall calls that returned at least one match, over a 1-hour window: sum(increase(audittrace_recall_total{hit=\"true\"}[1h])) / sum(increase(audittrace_recall_total[1h])). Rendered with min-interval ≥ 15m and connected-nulls OFF — gaps (hours with no recalls) render as absence, never interpolated. Companion stat (24h hit-rate + total recall count) is shown as a separate stat panel below. This panel proxies 'the corpus is being used usefully'; token-level causal influence (recall → output quality) is out of scope. Every ratio exposes its denominator (total recall count). Labels: {source, collection, hit}. No PII.",
+      "description": "Rolling ratio of recall calls that returned at least one match, over a 1-hour window: sum(increase(audittrace_recall_total{hit=\"true\"}[1h])) / sum(increase(audittrace_recall_total[1h])). Rendered with min-interval \u2265 15m and connected-nulls OFF \u2014 gaps (hours with no recalls) render as absence, never interpolated. Companion stat (24h hit-rate + total recall count) is shown as a separate stat panel below. This panel proxies 'the corpus is being used usefully'; token-level causal influence (recall \u2192 output quality) is out of scope. Every ratio exposes its denominator (total recall count). Labels: {source, collection, hit}. No PII.",
       "gridPos": {
         "h": 8,
         "w": 18,
@@ -76,8 +76,8 @@
     {
       "id": 102,
       "type": "stat",
-      "title": "Recall Hit-Rate — 24h summary",
-      "description": "Companion stat for the Recall Hit-Rate timeseries: 24-hour hit-rate + total recall count (denominator). Always shown together so a high hit-rate on n=3 reads as n=3, not as a strong signal. Headline: 24h hit-rate %; secondary: total recall count (denominator). This proxies 'the corpus is being used usefully' — token-level causal influence (recall → output quality) is out of scope. Labels: {source, collection, hit}. No PII.",
+      "title": "Recall Hit-Rate \u2014 24h summary",
+      "description": "Companion stat for the Recall Hit-Rate timeseries: 24-hour hit-rate + total recall count (denominator). Always shown together so a high hit-rate on n=3 reads as n=3, not as a strong signal. Headline: 24h hit-rate %; secondary: total recall count (denominator). This proxies 'the corpus is being used usefully' \u2014 token-level causal influence (recall \u2192 output quality) is out of scope. Labels: {source, collection, hit}. No PII.",
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -147,8 +147,8 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Results per Recall — p50 / p95 by collection",
-      "description": "p50 and p95 of true-candidate count (SearchPage.total) returned per recall call, per collection, from the audittrace_recall_results histogram. Rising p50 with stable hit-rate = richer corpus serving broader queries; p95 pinned at the retrieval cap = the length-cap boundary is being hit. Interpretation: this proxies 'the corpus is serving varied queries' — token-level causal influence (recall → output quality) is out of scope. Source: audittrace_recall_results histogram (histogram_quantile over _bucket). Labels: {source, collection, hit}. No PII.",
+      "title": "Results per Recall \u2014 p50 / p95 by collection",
+      "description": "p50 and p95 of true-candidate count (SearchPage.total) returned per recall call, per collection, from the audittrace_recall_results histogram. Rising p50 with stable hit-rate = richer corpus serving broader queries; p95 pinned at the retrieval cap = the length-cap boundary is being hit. Interpretation: this proxies 'the corpus is serving varied queries' \u2014 token-level causal influence (recall \u2192 output quality) is out of scope. Source: audittrace_recall_results histogram (histogram_quantile over _bucket). Labels: {source, collection, hit}. No PII.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -187,8 +187,8 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Recall Calls by Collection — 24h counts (governance view)",
-      "description": "Stacked 24-hour recall counts by collection, not ops/s — governance wants 'which collections were consulted and how often', not per-second rates that render as invisible spikes. Uses increase(...[24h]) for cumulative counts. The source label (tool vs backoffice) is available as a second grouping: tool recalls are agent in-process reads (e.g. via the recall_* tool), backoffice recalls are human reads via the REST API. Every recall call left an audited tool_calls row (ADR-029 end-to-end traceability). Labels: {source, collection, hit}. No PII.",
+      "title": "Recall Calls by Collection \u2014 24h counts (governance view)",
+      "description": "Stacked 24-hour recall counts by collection, not ops/s \u2014 governance wants 'which collections were consulted and how often', not per-second rates that render as invisible spikes. Uses increase(...[24h]) for cumulative counts. The source label (tool vs backoffice) is available as a second grouping: tool recalls are agent in-process reads (e.g. via the recall_* tool), backoffice recalls are human reads via the REST API. Every recall call left an audited tool_calls row (ADR-029 end-to-end traceability). Labels: {source, collection, hit}. No PII.",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -222,8 +222,8 @@
     {
       "id": 6,
       "type": "row",
-      "title": "Governance & Health — Memory Read REST Calls",
-      "description": "Live HTTP metrics for memory read routes (GET requests). Zeros stay visible — an episodic read count of 0 is a finding (agents not consulting episodic memory via REST), not noise. This row is the boundary where the learning dashboard ends and the security/audit view begins.",
+      "title": "Governance & Health \u2014 Memory Read REST Calls",
+      "description": "Live HTTP metrics for memory read routes (GET requests). Zeros stay visible \u2014 an episodic read count of 0 is a finding (agents not consulting episodic memory via REST), not noise. This row is the boundary where the learning dashboard ends and the security/audit view begins.",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -236,8 +236,8 @@
     {
       "id": 8,
       "type": "table",
-      "title": "Memory Reads by Route — 24h total (GET)",
-      "description": "24-hour totals for GET requests to memory read routes. Zeros stay visible — an episodic read count of 0 is a governance finding (agents not consulting episodic memory via REST), not noise. Before v2 ships, confirm the /memory/episodic* zero is real usage (not a route-label mismatch). If real, that's a legitimate item for the agent-charter loop (why do agents never read episodic via REST?). Source: http_server_request_duration_seconds_count. No PII.",
+      "title": "Memory Reads by Route \u2014 24h total (GET)",
+      "description": "24-hour totals for GET requests to memory read routes. Zeros stay visible \u2014 an episodic read count of 0 is a governance finding (agents not consulting episodic memory via REST), not noise. Before v2 ships, confirm the /memory/episodic* zero is real usage (not a route-label mismatch). If real, that's a legitimate item for the agent-charter loop (why do agents never read episodic via REST?). Source: http_server_request_duration_seconds_count. No PII.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -252,7 +252,10 @@
         {
           "refId": "A",
           "expr": "sum by (http_route) (increase(http_server_request_duration_seconds_count{http_route=~\"/memory/(semantic|episodic|procedural|conversational).*\", http_request_method=\"GET\"}[24h]))",
-          "legendFormat": "{{http_route}}"
+          "legendFormat": "{{http_route}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
         }
       ],
       "fieldConfig": {
@@ -283,14 +286,25 @@
         {
           "id": "labelsToFields",
           "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "24h count"
+            }
+          }
         }
       ]
     },
     {
       "id": 9,
       "type": "table",
-      "title": "Memory Read Status — by response code (GET)",
-      "description": "24-hour counts of HTTP response codes for GET requests to memory read routes. Expected 401 sources: expired tokens from scheduled probes, stale JWTs from previous sessions. A sudden spike in 401/403 is a security/governance signal — cross-reference with the (future) security dashboard. This panel is the boundary where the learning dashboard ends and the security/audit view begins. Source: http_server_request_duration_seconds_count grouped by http_response_status_code. No PII.",
+      "title": "Memory Read Status \u2014 by response code (GET)",
+      "description": "24-hour counts of HTTP response codes for GET requests to memory read routes. Expected 401 sources: expired tokens from scheduled probes, stale JWTs from previous sessions. A sudden spike in 401/403 is a security/governance signal \u2014 cross-reference with the (future) security dashboard. This panel is the boundary where the learning dashboard ends and the security/audit view begins. Source: http_server_request_duration_seconds_count grouped by http_response_status_code. No PII.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -305,7 +319,10 @@
         {
           "refId": "A",
           "expr": "sum by (http_response_status_code) (increase(http_server_request_duration_seconds_count{http_route=~\"/memory/(semantic|episodic|procedural|conversational).*\", http_request_method=\"GET\"}[24h]))",
-          "legendFormat": "{{http_response_status_code}}"
+          "legendFormat": "{{http_response_status_code}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
         }
       ],
       "fieldConfig": {
@@ -339,6 +356,17 @@
         {
           "id": "labelsToFields",
           "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "24h count"
+            }
+          }
         }
       ]
     }
@@ -361,7 +389,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "AuditTrace-AI — Agents Learning (v2)",
+  "title": "AuditTrace-AI \u2014 Agents Learning (v2)",
   "uid": "audittrace-agents-learning",
   "version": 3
 }
