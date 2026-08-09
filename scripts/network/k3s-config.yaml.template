@@ -1,0 +1,64 @@
+# AuditTrace-AI — SPEC #443 (2026-08-09), k3s node-IP decoupling.
+#
+# Root cause (SPEC #443 s2, evidenced 2026-08-09): with NO
+# /etc/rancher/k3s/config.yaml present, k3s runs bare `k3s server` and
+# auto-detects its node IP from whichever interface currently holds the
+# default route. A wifi<->wired switch changes the default route, which
+# changes the node IP, which breaks the pod->ClusterIP path (istiod loses its
+# route to 10.43.0.1:443, goes Unauthenticated mesh-wide — the #307 family).
+#
+# This file pins the node IP + the flannel overlay to the persistent `k3s0`
+# dummy interface (scripts/network/audittrace-k3s0-dummy.service.template),
+# so the cluster-internal network no longer depends on which physical NIC is
+# active. SPEC #443 s7 risk: pinning node-ip changes the apiserver's
+# advertised IP — `tls-san` below MUST include the new IP AND every existing
+# SAN, or internal/external TLS breaks. Front-door ingress (the Gateway /
+# LoadBalancer) stays on the physical IP — only the cluster-internal node IP
+# moves to k3s0 (SPEC #443 s7: "must validate both planes").
+#
+# ── Apply (operator-gated, SPEC #443 s6 — never the fleet's to run) ─────────
+#   1. Install + enable audittrace-k3s0-dummy.service FIRST (k3s0 must exist
+#      before k3s reads this file):
+#        sudo cp scripts/network/audittrace-k3s0-dummy-up.sh /usr/local/sbin/
+#        sudo chmod 0755 /usr/local/sbin/audittrace-k3s0-dummy-up.sh
+#        sudo cp scripts/network/audittrace-k3s0-dummy.service.template \
+#                /etc/systemd/system/audittrace-k3s0-dummy.service
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now audittrace-k3s0-dummy.service
+#        ip -4 addr show k3s0   # confirm 10.10.10.1/32 is up
+#
+#   2. Install the NM unmanaged-devices extension (k3s0 must never be
+#      NM-managed — see scripts/network/99-audittrace-k3s0-unmanaged.conf.template
+#      for why an NM connection profile is NOT used for k3s0):
+#        sudo cp scripts/network/99-audittrace-k3s0-unmanaged.conf.template \
+#                /etc/NetworkManager/conf.d/99-audittrace-k3s0-unmanaged.conf
+#        sudo nmcli general reload
+#
+#   3. Install THIS file:
+#        sudo cp scripts/network/k3s-config.yaml.template \
+#                /etc/rancher/k3s/config.yaml
+#
+#   4. Restart k3s ONCE to adopt (the one-time, operator-only restart SPEC
+#      #443 s6 calls for — after this, no further restarts should ever be
+#      needed for a wifi<->wired switch):
+#        sudo systemctl restart k3s
+#        kubectl get node -o wide   # INTERNAL-IP must now read 10.10.10.1
+#
+#   5. Validate with the neuterable guard:
+#        python scripts/network/verify_clusterip_resilience.py --insecure
+#
+# ── Rollback ─────────────────────────────────────────────────────────────────
+#   sudo rm /etc/rancher/k3s/config.yaml
+#   sudo systemctl restart k3s   # reverts to auto-detected node IP (pre-fix
+#                                 # behaviour — the #307-class exposure returns)
+
+node-ip: 10.10.10.1
+flannel-iface: k3s0
+
+# tls-san: keep every EXISTING SAN (apiserver + Gateway certs must still
+# validate for current clients) and ADD the pinned dummy IP so the apiserver's
+# new advertised address is itself covered.
+tls-san:
+  - 10.10.10.1
+  - audittrace.local
+  - 127.0.0.1

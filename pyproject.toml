@@ -184,8 +184,12 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # everything else. `scripts/release` (#398, the deterministic release-cut
 # runner) joins the same way for the same reason. `scripts/curator`
 # (SDLC-ADR-002, the tier-aware Memory Curator runner) joins the same way too.
+# `scripts/network` (#443, the mesh network-switch resilience guard) joins the
+# same way: its `verify-clusterip-resilience.py` neuterable guard is a
+# host-networking operator tool, not shipped `src/`, but is a real
+# decision-logic module and gets the same ≥90% floor as everything else.
 # No other `scripts/*` module is dragged into the gate.
-source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release", "scripts/curator"]
+source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release", "scripts/curator", "scripts/network"]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet

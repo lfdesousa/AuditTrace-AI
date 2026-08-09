@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# NN-k3s-clusterip-guard — SPEC #443 s3 "defense-in-depth: NetworkManager
+# dispatcher auto-heal".
+#
+# NetworkManager dispatcher hook (see nm-dispatcher(8)): fires on every
+# `up`/`down`/`connectivity-change` event, called by NM itself as ROOT with
+# ($1=interface, $2=action). This is the belt-and-braces safety net alongside
+# the structural fix (the pinned k3s0 dummy interface, SPEC #443 s3): it
+# checks the ClusterIP path's health via the neuterable guard
+# (verify_clusterip_resilience.py) and, ONLY if broken, repairs it — never
+# fires a restart on a healthy mesh, never loops unbounded.
+#
+# ── Bounded repair (mirrors scripts/deploy/mesh.py's
+#    HOST_RESETTLE_WHITELIST / PrivilegedHealer discipline) ─────────────────
+# Step 1 (cheap, always safe): re-run audittrace-k3s0-dummy-up.sh. Idempotent
+#   — if k3s0 already exists/is up/has its address, this is a clean no-op. It
+#   only does anything if k3s0 itself somehow disappeared (should never
+#   happen in normal operation; defensive only).
+# Step 2: re-run the guard. If healthy now, DONE — no restart needed.
+# Step 3 (last resort, bounded to ONE attempt per COOLDOWN_SECONDS window):
+#   `systemctl restart k3s` — the same proven, bounded #307 remediation
+#   `scripts/deploy/mesh.py`'s `HOST_RESETTLE_WHITELIST` already uses for the
+#   `istiod-api-unreachable` signal. A cooldown file prevents a restart storm
+#   if NM fires the dispatcher several times for one physical event (common:
+#   one down + one up per interface change) or the network keeps flapping.
+# Step 4: re-run the guard once more; log the outcome either way. NEVER
+#   claims "healed" without re-verifying — a still-broken mesh after the
+#   bounded repair is logged loudly, not papered over.
+#
+# ── Out-of-band install (NOT in the Helm chart, host infra) ─────────────────
+#   sudo cp scripts/network/NN-k3s-clusterip-guard \
+#           /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
+#   sudo chmod 0755 /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
+#
+# NM requires dispatcher scripts to be root-owned and not group/world
+# writable; `nmcli` reloads dispatcher.d automatically (no daemon restart
+# needed for a new script to take effect on the NEXT event).
+#
+# Testing: set CLUSTERIP_GUARD_DRY_RUN=1 to log every decision WITHOUT
+# executing the repair steps (no `ip`/`systemctl` calls) — mirrors
+# `audittrace-mesh-resettle.sh`'s `MESH_RESETTLE_DRY_RUN`.
+
+set -euo pipefail
+
+INTERFACE="${1:-}"
+ACTION="${2:-}"
+
+REPO_DIR="/home/lfdesousa/work/AuditTrace-AI"
+VERIFY_SCRIPT="$REPO_DIR/scripts/network/verify_clusterip_resilience.py"
+DUMMY_UP_SCRIPT="/usr/local/sbin/audittrace-k3s0-dummy-up.sh"
+STATE_DIR="${CLUSTERIP_GUARD_STATE_DIR:-/var/lib/audittrace/k3s0-guard}"
+COOLDOWN_FILE="$STATE_DIR/last-restart"
+COOLDOWN_SECONDS="${CLUSTERIP_GUARD_COOLDOWN_SECONDS:-120}"
+DRY_RUN="${CLUSTERIP_GUARD_DRY_RUN:-0}"
+PYTHON_BIN="${CLUSTERIP_GUARD_PYTHON:-python3}"
+
+log() { printf '%s [k3s-clusterip-guard] %s\n' "$(date -Iseconds)" "$*" >&2; }
+
+# Only act on the three events SPEC #443 s3 names — ignore everything else
+# (dhcp4-change, hostname, vpn-*, ...) so this hook does not fire on churn
+# unrelated to which interface currently owns the default route.
+case "$ACTION" in
+  up | down | connectivity-change) ;;
+  *)
+    exit 0
+    ;;
+esac
+
+# The guard itself is READ-ONLY (never mutates anything — SPEC #443 s5:
+# "deterministic, exit-coded, re-runnable pre/post switch") so it always runs
+# for real, even under DRY_RUN; only the REPAIR steps below (dummy-up,
+# systemctl restart) are gated by DRY_RUN.
+run_guard() {
+  "$PYTHON_BIN" "$VERIFY_SCRIPT" --insecure
+}
+
+cooldown_active() {
+  [[ -f "$COOLDOWN_FILE" ]] || return 1
+  local last now
+  last="$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [[ "$((now - last))" -lt "$COOLDOWN_SECONDS" ]]
+}
+
+record_restart() {
+  mkdir -p "$STATE_DIR"
+  date +%s >"$COOLDOWN_FILE"
+}
+
+main() {
+  log "event: interface=$INTERFACE action=$ACTION"
+
+  if run_guard; then
+    log "OK — ClusterIP path healthy, nothing to do"
+    exit 0
+  fi
+  log "DEGRADED — ClusterIP path check failed; starting bounded repair"
+
+  # Step 1: re-assert k3s0 (idempotent; a no-op if already correct).
+  if [[ -x "$DUMMY_UP_SCRIPT" ]]; then
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "DRY-RUN would run: $DUMMY_UP_SCRIPT"
+    else
+      log "re-asserting k3s0 via $DUMMY_UP_SCRIPT"
+      "$DUMMY_UP_SCRIPT" || log "WARNING $DUMMY_UP_SCRIPT exited non-zero"
+    fi
+  else
+    log "WARNING $DUMMY_UP_SCRIPT not installed or not executable — skipping step 1"
+  fi
+
+  # Step 2: re-check. If step 1 alone fixed it, stop here (no restart).
+  if run_guard; then
+    log "HEALED by re-asserting k3s0 — no k3s restart needed"
+    exit 0
+  fi
+
+  # Step 3: last resort, bounded to one attempt per COOLDOWN_SECONDS window.
+  if cooldown_active; then
+    log "REFUSED — still degraded but a k3s restart already ran within the last ${COOLDOWN_SECONDS}s; refusing to restart-storm"
+    exit 1
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY-RUN would run: systemctl restart k3s"
+  else
+    log "still degraded after k3s0 re-assert — restarting k3s (bounded, one attempt)"
+    record_restart
+    systemctl restart k3s || log "WARNING systemctl restart k3s exited non-zero"
+  fi
+
+  # Step 4: final verdict, always re-checked, never assumed.
+  if run_guard; then
+    log "HEALED after k3s restart"
+    exit 0
+  fi
+  log "STILL DEGRADED after bounded repair — manual operator intervention needed"
+  exit 1
+}
+
+main
