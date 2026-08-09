@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# NN-k3s-clusterip-guard — SPEC #443 v2 s3, the SAFE NetworkManager dispatcher.
+#
+# NetworkManager dispatcher hook (see nm-dispatcher(8)): fires on every
+# `up`/`down`/`connectivity-change` event, called by NM itself as ROOT with
+# ($1=interface, $2=action). This file is the THIN, no-op-by-default shell
+# wrapper NM actually executes; ALL decision logic (debounce, lock, the
+# only-restart-when-genuinely-broken policy) lives in the testable Python
+# module `scripts/network/k3s_clusterip_dispatcher.py` — see that module's
+# docstring for the full safety design and for why the v1 dispatcher
+# (removed 2026-08-09 as part of the #443 revert) was harmful: it "repaired
+# routes" using logic tied to a structural fix (a pinned k3s0 dummy
+# interface) that itself broke the mesh on live apply. This dispatcher does
+# ONE thing when the guard proves the pod->ClusterIP path is broken:
+# `systemctl restart k3s` — the proven, bounded recovery from SPEC #443 v2 s2.
+# It does NOTHING at steady state, and NOTHING when the guard is healthy.
+#
+# Filename note: NO extension, matching the v1 precedent — NetworkManager's
+# dispatcher.d loader ignores files with certain extensions
+# (.rpmsave/.rpmorig/.rpmnew/.swp/.bak/"~") and files without the executable
+# bit; an extension-free, executable, root-owned file is the safest match to
+# that contract.
+#
+# ── Out-of-band install (NOT in the Helm chart, host infra; operator-run) ──
+#   sudo cp scripts/network/NN-k3s-clusterip-guard \
+#           /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
+#   sudo chmod 0755 /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
+#
+# NM requires dispatcher scripts to be root-owned and not group/world
+# writable; `nmcli` reloads dispatcher.d automatically (no daemon restart
+# needed for a new script to take effect on the NEXT event).
+#
+# ── Rollback (SPEC #443 v2 s5 point 5 — "one file") ────────────────────────
+#   sudo rm /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
+#
+# ── Testing ─────────────────────────────────────────────────────────────────
+# Set CLUSTERIP_GUARD_DRY_RUN=1 to log every decision WITHOUT running
+# `systemctl restart k3s` (the guard itself is READ-ONLY and always runs for
+# real; only the repair step is gated by DRY_RUN) — mirrors
+# `audittrace-mesh-resettle.sh`'s `MESH_RESETTLE_DRY_RUN` convention.
+#   CLUSTERIP_GUARD_DRY_RUN=1 ./NN-k3s-clusterip-guard wlan0 up
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+DISPATCHER_MODULE="$REPO_DIR/scripts/network/k3s_clusterip_dispatcher.py"
+PYTHON_BIN="${CLUSTERIP_GUARD_PYTHON:-python3}"
+
+exec "$PYTHON_BIN" "$DISPATCHER_MODULE" "${1:-}" "${2:-}"
