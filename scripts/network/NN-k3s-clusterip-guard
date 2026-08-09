@@ -30,6 +30,18 @@
 # writable; `nmcli` reloads dispatcher.d automatically (no daemon restart
 # needed for a new script to take effect on the NEXT event).
 #
+# INSTALL IS A COPY, NOT A SYMLINK — the installed file at
+# `/etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard` is therefore no
+# longer inside this repo checkout, so this script MUST locate the Python
+# dispatcher module WITHOUT relying on its own on-disk location (an
+# `readlink -f "${BASH_SOURCE[0]}"` + `../..` walk-up resolves into `/etc`
+# under the documented `cp` install, never the repo — the 2026-08-09 REJECT
+# finding: every NM event ran a wrapper that could not find its module and
+# silently did nothing). See "Locate the repo" below for the fix: an
+# explicit, portability-invariant env-var override with a laptop-reference
+# default, the SAME override-with-default shape as `AUDITTRACE_FRONT_DOOR`
+# elsewhere in this repo (`scripts/deploy/frontdoor.py`).
+#
 # ── Rollback (SPEC #443 v2 s5 point 5 — "one file") ────────────────────────
 #   sudo rm /etc/NetworkManager/dispatcher.d/90-k3s-clusterip-guard
 #
@@ -39,11 +51,35 @@
 # real; only the repair step is gated by DRY_RUN) — mirrors
 # `audittrace-mesh-resettle.sh`'s `MESH_RESETTLE_DRY_RUN` convention.
 #   CLUSTERIP_GUARD_DRY_RUN=1 ./NN-k3s-clusterip-guard wlan0 up
+#
+# Set AUDITTRACE_REPO_DIR to point this wrapper at a checkout other than the
+# laptop-reference default below — e.g. when running the wrapper directly
+# from a worktree/clone for testing, or when installing on a host whose
+# checkout lives somewhere else (a NetworkManager.service systemd drop-in
+# — `systemctl edit NetworkManager` — can set `Environment=
+# AUDITTRACE_REPO_DIR=/path/to/AuditTrace-AI` so the DAEMON, and therefore
+# every dispatcher script it execs, sees the override):
+#   AUDITTRACE_REPO_DIR=/path/to/AuditTrace-AI ./NN-k3s-clusterip-guard wlan0 up
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+# ── Locate the repo (independent of cp vs symlink install; see header) ────
+# Precedence: AUDITTRACE_REPO_DIR env var (fresh at call time) > hardcoded
+# laptop-reference default. This is a DEFAULT, not the only path — the same
+# "environment-parameterized, laptop is one profile" shape used throughout
+# this repo (portability invariant).
+REPO_DIR="${AUDITTRACE_REPO_DIR:-/home/lfdesousa/work/AuditTrace-AI}"
 DISPATCHER_MODULE="$REPO_DIR/scripts/network/k3s_clusterip_dispatcher.py"
 PYTHON_BIN="${CLUSTERIP_GUARD_PYTHON:-python3}"
+
+if [[ ! -f "$DISPATCHER_MODULE" ]]; then
+  # Fail LOUD (journald captures dispatcher stderr) but fail CLOSED: never
+  # block/fail the NM event itself over a misconfigured guard — matches the
+  # guard's own "does nothing when it cannot prove breakage" philosophy.
+  echo "k3s-clusterip-guard: dispatcher module not found at" \
+       "'$DISPATCHER_MODULE' (set AUDITTRACE_REPO_DIR if this repo is not" \
+       "checked out at the default location) — no action taken" >&2
+  exit 0
+fi
 
 exec "$PYTHON_BIN" "$DISPATCHER_MODULE" "${1:-}" "${2:-}"
