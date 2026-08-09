@@ -290,7 +290,7 @@ async def recall_decisions(
         sort=sort,
         order=order,
     )
-    emit_recall_telemetry("tool", "decisions", page.total)
+    emit_recall_telemetry("tool", "decisions", page.total, cache="miss")
     return {
         "matches": [
             {
@@ -399,7 +399,7 @@ async def recall_skills(
         sort=sort,
         order=order,
     )
-    emit_recall_telemetry("tool", "skills", page.total)
+    emit_recall_telemetry("tool", "skills", page.total, cache="miss")
     return {
         "matches": [
             {
@@ -517,7 +517,7 @@ async def recall_recent_sessions(
     # minimal SearchPage carrying only the page fields telemetry needs
     # (``total``); ``matches=[]`` is fine, ``emit_recall_telemetry`` never
     # reads it.
-    emit_recall_telemetry("tool", "sessions", total)
+    emit_recall_telemetry("tool", "sessions", total, cache="miss")
 
     matches: list[dict[str, Any]] = []
     for s in page_sessions:
@@ -624,7 +624,7 @@ async def recall_semantic(
     page = await semantic.search_page(
         user_context, query, k=k, offset=offset, sort=sort, order=order
     )
-    emit_recall_telemetry("tool", "semantic", page.total)
+    emit_recall_telemetry("tool", "semantic", page.total, cache="miss")
     return {
         "matches": [
             {

@@ -95,6 +95,7 @@ from audittrace.services.memory_manifest import ManifestEntry
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.recall_telemetry import emit_recall_telemetry
+from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
@@ -628,6 +629,9 @@ async def upload_memory_file(
         ) from exc
 
     await _write_layer_private(layer, user, target_filename, text_content)
+
+    # M2 — write-telemetry counter (layer label, no PII).
+    emit_memory_write(layer=layer.value)
 
     private_bucket = (
         settings.aws_private_bucket
@@ -1168,6 +1172,9 @@ async def index_memory(
 
         results[col_name] = chunk_count
         total_chunks += chunk_count
+        # M2 — emit per-collection chunk-indexed counter (no PII).
+        if chunk_count > 0:
+            emit_chunks_indexed(collection=col_name, chunk_count=chunk_count)
         logger.info("Indexed %s: %d chunks", col_name, chunk_count)
 
     # Backlog #15, R3: after a real (non-dry-run) index seed, invalidate the
@@ -1567,7 +1574,7 @@ async def list_episodic(
     # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
     # services/memory_audit.py module docstring).
     schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
-    emit_recall_telemetry("backoffice", "episodic", total)
+    emit_recall_telemetry("backoffice", "episodic", total, cache="n/a")
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1598,7 +1605,7 @@ async def read_episodic(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="episodic", key=filename
     )
-    emit_recall_telemetry("backoffice", "episodic", 1)
+    emit_recall_telemetry("backoffice", "episodic", 1, cache="n/a")
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1788,7 +1795,7 @@ async def list_procedural(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
     schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
-    emit_recall_telemetry("backoffice", "procedural", total)
+    emit_recall_telemetry("backoffice", "procedural", total, cache="n/a")
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1814,7 +1821,7 @@ async def read_procedural(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="procedural", key=filename
     )
-    emit_recall_telemetry("backoffice", "procedural", 1)
+    emit_recall_telemetry("backoffice", "procedural", 1, cache="n/a")
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -2292,7 +2299,7 @@ async def list_semantic(
         layer="semantic",
         collection=collection,
     )
-    emit_recall_telemetry("backoffice", collection or "semantic", total)
+    emit_recall_telemetry("backoffice", collection or "semantic", total, cache="n/a")
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -2332,7 +2339,7 @@ async def read_semantic(
         collection=collection,
         key=document_id,
     )
-    emit_recall_telemetry("backoffice", collection, 1)
+    emit_recall_telemetry("backoffice", collection, 1, cache="n/a")
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,

@@ -317,6 +317,19 @@ def _canonical_cache_id(session_id: str, tool_name: str, args: dict[str, Any]) -
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# Mapping from tool registration name → ChromaDB collection name used by
+# the handler.  Used exclusively for cache-hit telemetry in invoke_tool
+# (the handler itself passes the real collection on the cache-miss path).
+_TOOL_TO_COLLECTION: dict[str, str] = {
+    "recall_decisions": "decisions",
+    "recall_skills": "skills",
+    "recall_semantic": "semantic",
+    "recall_recent_sessions": "sessions",
+    "read_decision": "episodic",
+    "read_skill": "procedural",
+}
+
+
 async def invoke_tool(
     user_context: UserContext,
     tool: MemoryTool,
@@ -356,6 +369,14 @@ async def invoke_tool(
     cached = cache.get(cache_id)
     if cached is not None:
         logger.debug("tool result cache HIT tool=%s session=%s", tool.name, session_id)
+        # M1 — emit cache-hit telemetry here (the handler never runs on hit).
+        # Collection is derived from the tool name; total is extracted from
+        # the cached result's ``total`` field if present.
+        from audittrace.services.recall_telemetry import emit_recall_telemetry
+
+        collection = _TOOL_TO_COLLECTION.get(tool.name, tool.name)
+        total = cached.get("total", 0) if isinstance(cached, dict) else 0
+        emit_recall_telemetry("tool", collection, total, cache="hit")
         return cached, True
 
     try:

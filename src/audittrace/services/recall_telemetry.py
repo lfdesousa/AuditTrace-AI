@@ -10,22 +10,26 @@ this is safe/no-op when ``AUDITTRACE_OTLP_ENDPOINT`` is unset
 Two instruments, shared by both the in-process tool recalls AND the
 REST read routes:
 
-* ``audittrace_recall_total{source, collection, hit}`` — counter
-* ``audittrace_recall_results{source, collection, hit}`` — histogram
+* ``audittrace_recall_total{source, collection, hit, cache}`` — counter
+* ``audittrace_recall_results{source, collection, hit, cache}`` — histogram
 
 One shared ``emit_recall_telemetry`` callable that both surfaces call,
 so coverage cannot drift again (WU-1c, this PR).
 
-**NO PII in metric labels.**  Labels are ``{source, collection, hit}``
+**NO PII in metric labels.**  Labels are ``{source, collection, hit, cache}``
 ONLY.  The ``source`` label distinguishes the calling surface
 (``tool`` for in-process tool recalls, ``backoffice`` for REST routes).
+The ``cache`` label distinguishes Redis-backed cache hits/misses at the
+tool-recall surface (ADR-025 §Decision.8, M1): ``"hit"`` when the result
+was served from the ADR-025 tool-result cache, ``"miss"`` when computed
+fresh, ``"n/a"`` for REST/backoffice reads that do not consult that cache.
 Never includes ``user_id``, ``query``, ``content``, or any other
 identifying field.
 
 Structured ``memory.read`` INFO log line (WU-B) emits the same fields
-plus ``results_returned`` and ``hit``, and leverages the already-
-propagated ``user_id``/``trace_id``/``session_id`` (logs already carry
-these via the ``@log_call`` / context — this is the traceability
+plus ``results_returned``, ``hit``, and ``cache``, and leverages the
+already-propagated ``user_id``/``trace_id``/``session_id`` (logs already
+carry these via the ``@log_call`` / context — this is the traceability
 invariant, NOT new PII in metrics).
 """
 
@@ -65,6 +69,8 @@ def emit_recall_telemetry(
     source: str,
     collection: str,
     results_count: int,
+    *,
+    cache: str = "n/a",
 ) -> None:
     """Emit the two recall-telemetry instruments and a structured log line
     for one memory read.
@@ -82,22 +88,34 @@ def emit_recall_telemetry(
             reads (``"episodic"``, ``"procedural"``).
         results_count: The ``page.total`` / ``total`` field from the
             response — the true-candidate count.
+        cache: Cache-hit signal at the tool-recall surface (M1).
+            ``"hit"`` when the result was served from the ADR-025
+            tool-result cache, ``"miss"`` when computed fresh,
+            ``"n/a"`` for REST/backoffice reads that do not consult
+            that cache.  Labels: ``{source, collection, hit, cache}``.
+            **No PII** — ``cache`` is a fixed enum, not a user field.
     """
     hit = results_count > 0
-    labels = {"source": source, "collection": collection, "hit": str(hit).lower()}
+    labels = {
+        "source": source,
+        "collection": collection,
+        "hit": str(hit).lower(),
+        "cache": cache,
+    }
 
     # Metric side-effects (pure, no response-shape mutation).
     _recall_counter.add(1, labels)
     _recall_results_histogram.record(results_count, labels)
 
     # Structured log line (WU-B) — greppable in Loki, visible on laptop.
-    # Fields: surface, collection, results_returned, hit.
+    # Fields: surface, collection, results_returned, hit, cache.
     # user_id/trace_id/session_id are already propagated via the
     # logging-context machinery (no new PII in labels).
     logger.info(
-        "memory.read | surface=%s collection=%s results_returned=%d hit=%s",
+        "memory.read | surface=%s collection=%s results_returned=%d hit=%s cache=%s",
         source,
         collection,
         results_count,
         hit,
+        cache,
     )

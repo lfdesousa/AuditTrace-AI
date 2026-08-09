@@ -129,6 +129,108 @@ def _all_target_exprs(dash: dict) -> list[str]:
     return exprs
 
 
+# PromQL keywords / label VALUES (not metric names) that legitimately show up
+# when the identifier regex below tokenises an expr. Case-insensitive.
+# Shared by every "no unknown metric names" drift-guard so Wave A and Wave B
+# can never silently diverge on what counts as "known" (a prior version had
+# two independently-maintained copies of this set; the Wave B copy was
+# missing the M1 ``cache=~"hit|miss"`` label value, which failed the guard
+# it was supposed to enforce).
+_PROMQL_ALLOWED_LOWER = frozenset(
+    {
+        "histogram_quantile",
+        "sum",
+        "increase",
+        "rate",
+        "by",
+        "le",
+        "collection",
+        "source",
+        "layer",
+        "hit",
+        "miss",
+        "true",
+        "false",
+        "cache",
+        "memory",
+        "http_route",
+        "http_response_status_code",
+        "http_request_method",
+        "http_server_request_duration_seconds_count",
+        # Route path segments extracted from regex literals in PromQL
+        # (e.g. "/memory/(semantic|episodic|...)"):
+        "semantic",
+        "episodic",
+        "procedural",
+        "conversational",
+        "get",
+        "post",
+        "put",
+        "delete",
+        "normal",
+        "area",
+        "none",
+        "multi",
+        "single",
+    }
+)
+
+
+def _assert_exprs_reference_known_metrics(
+    exprs: list[str], known_metrics: frozenset[str]
+) -> None:
+    """Assert every PromQL identifier in ``exprs`` is either a known metric
+    name (base, with histogram-suffix stripping) or a recognised PromQL
+    keyword / label value from :data:`_PROMQL_ALLOWED_LOWER`.
+
+    Shared implementation for the Wave A and Wave B "no unknown metric
+    names" drift-guards — see :data:`_PROMQL_ALLOWED_LOWER` docstring for
+    why this must NOT be duplicated per-test-class.
+    """
+    for expr in exprs:
+        # Extract metric names from the expression (simplified: look for
+        # identifiers that look like metric names: alphanumeric + underscore).
+        metrics_in_expr = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr)
+        for metric in metrics_in_expr:
+            # Skip Grafana template variables (e.g. $__rate_interval,
+            # $__interval, $range, $timeFrom, etc.) — extracted without
+            # the '$' by the identifier regex. Also skip double-underscore
+            # prefixed names (Grafana internal templates).
+            if re.match(r"^\$__?\w+", metric) or metric.startswith("__"):
+                continue
+            # Skip PromQL window suffixes (1h, 24h, 7d, etc.) and single-char
+            # window units extracted from expressions like [1h] → 'h'.
+            if metric in ("h", "d", "w", "y", "s", "m") or re.fullmatch(
+                r"^\d+[smhdwy]$", metric
+            ):
+                continue
+            # Strip histogram suffixes to get the base metric name.
+            base = metric
+            for suffix in ("_bucket", "_sum", "_count"):
+                if metric.endswith(suffix):
+                    base = metric[: -len(suffix)]
+                    break
+            # The base (e.g. 'audittrace_recall_results') is a valid
+            # reference if any suffixed variant is in known_metrics.
+            is_known_base = base in known_metrics
+            if not is_known_base:
+                for variant in (f"{base}_bucket", f"{base}_sum", f"{base}_count"):
+                    if variant in known_metrics:
+                        is_known_base = True
+                        break
+            assert (
+                base in known_metrics
+                or is_known_base
+                or base.lower() in _PROMQL_ALLOWED_LOWER
+                or (base.startswith("http_") and base.isidentifier())
+            ), (
+                f"expr {expr!r} references metric/base "
+                f"{metric!r} which is NOT in the known-metric set "
+                f"({known_metrics}). The dashboard must not "
+                "reference unknown metrics."
+            )
+
+
 class TestAgentsLearningDashboardRecallMetrics:
     """WU-2.2 non-vacuous proof (#423): the drift-guard must fail if the
     recall-hit-rate panel, or the ``audittrace_recall_*`` metrics it plots,
@@ -262,23 +364,27 @@ class TestRecallRestCallPanels:
 
 
 class TestAgentsLearningWaveAPanels:
-    """Wave A (v2) — panels 4.2, 4.3, 4.5, 4.6, 4.7 only (dashboard-only,
-    existing metrics). Spec §6.7: extended to assert each new panel's
-    PromQL parses and references ONLY existing metric names:
+    """Wave A (v2) — panels 4.2, 4.3, 4.5, 4.6, 4.7 (dashboard-only,
+    existing metrics). Wave B (M1/M2) adds:
 
-      - audittrace_recall_total       (counter: source, collection, hit)
+      - 4.1 Memory Writes — daily (Accumulation row, uses M2 metric)
+      - 4.4 Knowledge-Base Growth (Accumulation row, uses M2 metric)
+      - 4.NEW Cache-hit share (Effectiveness row, uses M1 cache label)
+
+    Spec §6.7: extended to assert each new panel's PromQL parses and
+    references ONLY existing or newly-added metric names:
+
+      - audittrace_recall_total       (counter: source, collection, hit, cache)
       - audittrace_recall_results     (histogram: _bucket / _sum / _count)
+      - audittrace_memory_writes_total       (M2 counter: layer)
+      - audittrace_memory_chunks_indexed_total (M2 counter: collection)
       - http_server_request_duration_seconds_count  (HTTP counter)
-
-    Panels 4.1/4.4 (writes/day, chunks-indexed) and 4.NEW (cache-hit)
-    are gated on M2/M1 — not present in Wave A. The Accumulation row
-    is intentionally empty (collapsed, zero child panels) per the
-    RATIFICATION ADDENDUM.
     """
 
     # Known-existing metric names — any NEW expr that references a name
     # outside this set is a drift indicator (the dashboard should NOT
     # reference metrics that don't exist yet).
+    # Wave A + Wave B metrics.
     EXISTING_METRICS = frozenset(
         [
             "audittrace_recall_total",
@@ -286,6 +392,9 @@ class TestAgentsLearningWaveAPanels:
             "audittrace_recall_results_sum",
             "audittrace_recall_results_count",
             "http_server_request_duration_seconds_count",
+            # Wave B (M2) — new counters added by this PR.
+            "audittrace_memory_writes_total",
+            "audittrace_memory_chunks_indexed_total",
         ]
     )
 
@@ -312,27 +421,46 @@ class TestAgentsLearningWaveAPanels:
                 f"{expected!r} (spec §4.{expected.split()[0].lower()})"
             )
 
-    def test_accumulation_row_empty_wave_a(self) -> None:
-        """Wave A: the Accumulation row (4.1/4.4 gated on M2) must exist
-        as an empty, collapsed row — not a phantom panel with stale
-        queries that reference non-existent metrics."""
+    def test_accumulation_row_populated_wave_b(self) -> None:
+        """Wave B: the Accumulation row (4.1 Memory Writes + 4.4
+        Knowledge-Base Growth) must have 2 child panels — the M2
+        instrumentation now exists. Previously empty in Wave A.
+
+        Grafana only renders a non-collapsed row's (``collapsed: false``)
+        children from the FLAT top-level ``dash["panels"]`` array — a
+        nested ``row["panels"]`` array is only honoured while the row is
+        collapsed. Children are therefore identified by title, matching
+        the pre-existing "Governance & Health" row (id 6), whose children
+        (the 4.6/4.7 tables) also live as flat top-level entries — not by
+        a nested array, which would have silently failed to render (the
+        live-render bug class 478a7ea fixed for those same 4.6/4.7
+        tables)."""
         dash = _load(AGENTS_LEARNING_FILE)
+        panels = dash.get("panels", [])
         acc_rows = [
             p
-            for p in dash.get("panels", [])
+            for p in panels
             if p.get("type") == "row" and "Accumulation" in p.get("title", "")
         ]
         assert acc_rows, (
             f"{AGENTS_LEARNING_FILE} missing the 'Accumulation' row (Wave A)."
         )
         acc_row = acc_rows[0]
-        assert len(acc_row.get("panels", [])) == 0, (
-            f"{AGENTS_LEARNING_FILE} Accumulation row must have zero child "
-            "panels in Wave A (M2 not yet implemented)."
+        assert acc_row.get("panels", []) == [], (
+            f"{AGENTS_LEARNING_FILE} Accumulation row must not carry a nested "
+            "'panels' array while collapsed=false — Grafana ignores it, so any "
+            "children living only there would silently fail to render."
         )
-        assert acc_row.get("collapsed", False), (
-            f"{AGENTS_LEARNING_FILE} Accumulation row should be collapsed "
-            "in Wave A (M2 not yet implemented)."
+        children = [
+            p
+            for p in panels
+            if "Memory Writes" in p.get("title", "")
+            or "Knowledge-Base" in p.get("title", "")
+        ]
+        assert len(children) == 2, (
+            f"{AGENTS_LEARNING_FILE} Accumulation row must have 2 child panels "
+            "(4.1 Memory Writes + 4.4 Knowledge-Base Growth, Wave B), flat in "
+            "the top-level panels array."
         )
 
     def test_recall_hit_rate_panel_wave_a(self) -> None:
@@ -364,6 +492,71 @@ class TestAgentsLearningWaveAPanels:
                 "Hit-rate timeseries must disable null interpolation "
                 "(connected-nulls OFF) so gaps stay visible per D1/D2."
             )
+
+    def test_recall_hit_rate_24h_summary_denominator_not_percent(self) -> None:
+        """4.2 companion stat 'Recall Hit-Rate — 24h summary' plots TWO
+        series: a percentage (hit-rate) and a raw count (the denominator,
+        'total recalls (denominator)'). The panel default unit is
+        ``percent`` for the hit-rate series' sake — without a per-series
+        override, the denominator's raw count (e.g. 26) renders as
+        '26.0%' and picks up the hit-rate thresholds (red/yellow/green),
+        i.e. a small-n denominator can render RED even though the value
+        is correct — value right, render wrong (live-render bug caught
+        by the operator on the deployed dashboard, 2026-08-09)."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        panels = [
+            p
+            for p in dash.get("panels", [])
+            if p.get("title") == "Recall Hit-Rate — 24h summary"
+        ]
+        assert panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Recall Hit-Rate — 24h summary' panel."
+        )
+        panel = panels[0]
+
+        # The panel default stays percent — that's correct for the
+        # hit-rate series, which carries no override.
+        assert panel.get("fieldConfig", {}).get("defaults", {}).get("unit") == (
+            "percent"
+        ), "24h-summary panel default unit must remain 'percent' (hit-rate series)."
+
+        # The denominator target's legend/display name must be the exact
+        # string a byName override matches on.
+        denominator_targets = [
+            t
+            for t in panel.get("targets", [])
+            if t.get("legendFormat") == "total recalls (denominator)"
+        ]
+        assert denominator_targets, (
+            "24h-summary panel missing the 'total recalls (denominator)' target."
+        )
+
+        overrides = panel.get("fieldConfig", {}).get("overrides", [])
+        denominator_overrides = [
+            o
+            for o in overrides
+            if o.get("matcher", {}).get("id") == "byName"
+            and o.get("matcher", {}).get("options") == "total recalls (denominator)"
+        ]
+        assert denominator_overrides, (
+            "24h-summary panel must carry a byName override for "
+            "'total recalls (denominator)' — otherwise the raw count "
+            "inherits the panel's percent unit + hit-rate thresholds."
+        )
+        override_props = {
+            p["id"]: p["value"] for p in denominator_overrides[0].get("properties", [])
+        }
+        assert override_props.get("unit") != "percent", (
+            "Denominator override must NOT use 'percent' — it is a raw count."
+        )
+        assert override_props.get("unit") == "short", (
+            "Denominator override should render as a plain number (unit=short)."
+        )
+        color = override_props.get("color", {})
+        assert color.get("mode") == "fixed", (
+            "Denominator override must fix the colour so it does not inherit "
+            "the hit-rate RED/yellow/green thresholds on a small-n count."
+        )
 
     def test_results_per_recall_panel_wave_a(self) -> None:
         """4.3: Results per Recall — p50/p95 from histogram_quantile.
@@ -432,6 +625,14 @@ class TestAgentsLearningWaveAPanels:
             "total' panel (Wave A v2 restructure)."
         )
         assert panels[0].get("type") == "table"
+        # Must be an INSTANT query: a range query renders one row per scrape
+        # step (the "Time | 0 | /memory/episodic" list), not the intended
+        # single 24h-total row per route. Live-render bug caught 2026-08-09.
+        for tgt in panels[0].get("targets", []):
+            assert tgt.get("instant") is True, (
+                "24h-totals table target must set instant:true (range query "
+                "renders a per-scrape time series, not the 24h total per route)."
+            )
         exprs = " ".join(_all_target_exprs({"panels": panels}))
         assert "http_server_request_duration_seconds_count" in exprs
         assert "http_request_method" in exprs
@@ -451,6 +652,13 @@ class TestAgentsLearningWaveAPanels:
             f"{AGENTS_LEARNING_FILE} missing 'Memory Read Status — by "
             "response code' panel (Wave A v2 restructure)."
         )
+        # Must be an INSTANT query (same 24h-total-per-code rendering rule as
+        # the by-route table; range query would list a row per scrape).
+        for tgt in panels[0].get("targets", []):
+            assert tgt.get("instant") is True, (
+                "status-by-code table target must set instant:true (range "
+                "query renders a per-scrape time series, not 24h totals)."
+            )
         # Must reference http_response_status_code in the expr.
         exprs = " ".join(_all_target_exprs({"panels": panels}))
         assert "http_response_status_code" in exprs
@@ -465,97 +673,15 @@ class TestAgentsLearningWaveAPanels:
             "the learning dashboard ends and the security/audit view begins."
         )
 
-    def test_no_new_metric_names_wave_a(self) -> None:
-        """Wave A: ALL PromQL exprs in the dashboard must reference ONLY
-        existing metric names (audittrace_recall_total,
-        audittrace_recall_results, http_server_request_duration_seconds).
-        No new metric references — that is Wave B (M1/M2)."""
+    def test_no_new_metric_names_wave_b(self) -> None:
+        """ALL PromQL exprs in the dashboard must reference ONLY the
+        known metric set (Wave A + Wave B M1/M2 counters).
+        No unknown metric references — that would indicate a
+        hallucinated or drifting panel query."""
         dash = _load(AGENTS_LEARNING_FILE)
-        exprs = _all_target_exprs(dash)
-        for expr in exprs:
-            # Extract metric names from the expression (simplified: look for
-            # identifiers that look like metric names: alphanumeric + underscore).
-            metrics_in_expr = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr)
-            for metric in metrics_in_expr:
-                # histogram_bucket/sum/count suffixes are OK (they are parts
-                # of the same base histogram).
-                base = metric
-                for suffix in ("_bucket", "_sum", "_count"):
-                    if metric.endswith(suffix):
-                        base = metric[: -len(suffix)]
-                        break
-                # Skip Grafana template variables (e.g. $__rate_interval,
-                # $__interval, $range, $timeFrom, etc.) — extracted without
-                # the '$' by the identifier regex. Also skip double-underscore
-                # prefixed names (Grafana internal templates).
-                if re.match(r"^\$__?\w+", metric) or metric.startswith("__"):
-                    continue
-                # Skip PromQL window suffixes (1h, 24h, 7d, etc.) and single-char
-                # window units extracted from expressions like [1h] → 'h'.
-                if metric in ("h", "d", "w", "y", "s", "m") or re.fullmatch(
-                    r"^\d+[smhdwy]$", metric
-                ):
-                    continue
-                # Strip histogram suffixes to get the base metric name.
-                base = metric
-                for suffix in ("_bucket", "_sum", "_count"):
-                    if metric.endswith(suffix):
-                        base = metric[: -len(suffix)]
-                        break
-                # The base (e.g. 'audittrace_recall_results') is a valid
-                # reference if any suffixed variant is in EXISTING_METRICS.
-                is_known_base = base in self.EXISTING_METRICS
-                if not is_known_base:
-                    for variant in (
-                        f"{base}_bucket",
-                        f"{base}_sum",
-                        f"{base}_count",
-                    ):
-                        if variant in self.EXISTING_METRICS:
-                            is_known_base = True
-                            break
-                # Convert base to lowercase for case-insensitive comparison
-                # (PromQL label values like "GET" should match the lowercase
-                # allowed set).
-                allowed_lower = {
-                    "histogram_quantile",
-                    "sum",
-                    "increase",
-                    "rate",
-                    "by",
-                    "le",
-                    "collection",
-                    "source",
-                    "hit",
-                    "true",
-                    "false",
-                    "http_route",
-                    "http_response_status_code",
-                    "http_request_method",
-                    "http_server_request_duration_seconds_count",
-                    # Route path segments extracted from regex literals
-                    # in PromQL (e.g. "/memory/(semantic|episodic|...)"):
-                    "memory",
-                    "semantic",
-                    "episodic",
-                    "procedural",
-                    "conversational",
-                    "get",
-                    "post",
-                    "put",
-                    "delete",
-                }
-                assert (
-                    base in self.EXISTING_METRICS
-                    or is_known_base
-                    or base.lower() in allowed_lower
-                    or (base.startswith("http_") and base.isidentifier())
-                ), (
-                    f"Wave A expr {expr!r} references metric/base "
-                    f"{metric!r} which is NOT in the existing-metric set "
-                    f"({self.EXISTING_METRICS}). Wave A must not reference "
-                    "new metrics (M1/M2)."
-                )
+        _assert_exprs_reference_known_metrics(
+            _all_target_exprs(dash), self.EXISTING_METRICS
+        )
 
     def test_panel_descriptions_use_proxy_language(self) -> None:
         """Spec §1 claim discipline: panel descriptions must use 'recalled
@@ -574,3 +700,111 @@ class TestAgentsLearningWaveAPanels:
                 f"Panel {panel.get('title', '')!r} description uses "
                 "forbidden causal language — spec §1."
             )
+
+
+class TestAgentsLearningWaveBPanels:
+    """Wave B (M1 + M2) — panels 4.1, 4.4, 4.NEW cache-hit share.
+    These panels use the NEW M1/M2 instruments introduced by this PR."""
+
+    def test_panel_4_1_memory_writes_present(self) -> None:
+        """4.1: Memory Writes — daily must be present inside the
+        Accumulation row, using the M2 audittrace_memory_writes_total
+        counter."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        # Panel presence + position is looked up flat in dash["panels"] —
+        # NOT via a nested row["panels"] array. Grafana only honours a
+        # non-collapsed row's nested "panels" while collapsed; a
+        # non-collapsed row's children live as flat top-level entries
+        # (see test_accumulation_row_populated_wave_b for the full
+        # rationale — this is the live-render-bug class 478a7ea fixed for
+        # 4.6/4.7).
+        memory_writes_panels = [
+            p for p in dash.get("panels", []) if "Memory Writes" in p.get("title", "")
+        ]
+        assert memory_writes_panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Memory Writes — daily' panel "
+            "(4.1, Wave B / M2)."
+        )
+        panel = memory_writes_panels[0]
+        exprs = " ".join(t.get("expr", "") for t in panel.get("targets", []))
+        assert "audittrace_memory_writes_total" in exprs, (
+            "4.1 Memory Writes must reference audittrace_memory_writes_total."
+        )
+
+    def test_panel_4_4_knowledge_base_growth_present(self) -> None:
+        """4.4: Knowledge-Base Growth — cumulative by collection must be
+        present inside the Accumulation row, using the M2
+        audittrace_memory_chunks_indexed_total counter, stacked by
+        collection (fixes D2 flat-1s)."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        # Flat top-level lookup — see test_panel_4_1_memory_writes_present
+        # for why (Grafana non-collapsed-row rendering rule).
+        kb_panels = [
+            p for p in dash.get("panels", []) if "Knowledge-Base" in p.get("title", "")
+        ]
+        assert kb_panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Knowledge-Base Growth' panel "
+            "(4.4, Wave B / M2, fixes D2)."
+        )
+        panel = kb_panels[0]
+        exprs = " ".join(t.get("expr", "") for t in panel.get("targets", []))
+        assert "audittrace_memory_chunks_indexed_total" in exprs, (
+            "4.4 Knowledge-Base Growth must reference "
+            "audittrace_memory_chunks_indexed_total."
+        )
+        # D2 fix: must be cumulative (increase over $__range) not per-event.
+        assert "increase" in exprs or "sum(" in exprs, (
+            "4.4 Knowledge-Base Growth must use increase()/sum() for cumulative "
+            "plotting — the old flat-1s plotted per-event increments (D2)."
+        )
+        # Stacking: the fieldConfig must have stacking mode set.
+        stacking = (
+            panel.get("fieldConfig", {})
+            .get("defaults", {})
+            .get("custom", {})
+            .get("stacking", {})
+        )
+        assert stacking.get("mode") == "normal", (
+            "4.4 Knowledge-Base Growth must stack by collection (stacking.mode=normal) "
+            "to show WHERE knowledge accumulates."
+        )
+
+    def test_panel_4_new_cache_hit_share_present(self) -> None:
+        """4.NEW: Cache-hit share must be present in the Effectiveness row,
+        using the M1 cache label on audittrace_recall_total."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        cache_panels = [
+            p for p in dash.get("panels", []) if "Cache-hit" in p.get("title", "")
+        ]
+        assert cache_panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Cache-hit share' panel "
+            "(4.NEW, Wave B / M1)."
+        )
+        panel = cache_panels[0]
+        exprs = " ".join(t.get("expr", "") for t in panel.get("targets", []))
+        assert 'cache="hit"' in exprs, (
+            '4.NEW Cache-hit share numerator must filter on cache="hit".'
+        )
+        assert 'cache=~"hit|miss"' in exprs, (
+            '4.NEW Cache-hit share denominator must use cache=~"hit|miss" '
+            "to include only tool-surface recalls."
+        )
+        # Must use the recall_total counter (not a different metric).
+        assert "audittrace_recall_total" in exprs, (
+            "4.NEW must reference audittrace_recall_total (M1 label, not a new metric)."
+        )
+
+    def test_no_panel_references_unknown_metrics_wave_b(self) -> None:
+        """Every panel's PromQL expr must reference a KNOWN metric (from
+        EXISTING_METRICS). No hallucinated metric names.
+
+        Uses the SAME shared guard as
+        ``TestAgentsLearningWaveAPanels.test_no_new_metric_names_wave_b`` —
+        a previous version of this test re-implemented the check without
+        the PromQL-keyword/label-value allow-list, so it flagged legitimate
+        tokens like ``sum`` and the M1 ``cache=~"hit|miss"`` label value
+        ``miss`` as unknown metrics."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        _assert_exprs_reference_known_metrics(
+            _all_target_exprs(dash), TestAgentsLearningWaveAPanels.EXISTING_METRICS
+        )
