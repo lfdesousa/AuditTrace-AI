@@ -1072,12 +1072,25 @@ class TestRecallTelemetry:
         )
         assert result["total"] >= 1
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "decisions", "hit": "true"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "decisions",
+                    "hit": "true",
+                    "cache": "miss",
+                },
+            )
         ]
         assert histogram.calls == [
             (
                 result["total"],
-                {"source": "tool", "collection": "decisions", "hit": "true"},
+                {
+                    "source": "tool",
+                    "collection": "decisions",
+                    "hit": "true",
+                    "cache": "miss",
+                },
             )
         ]
 
@@ -1093,10 +1106,26 @@ class TestRecallTelemetry:
         )
         assert result["total"] == 0
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "decisions", "hit": "false"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "decisions",
+                    "hit": "false",
+                    "cache": "miss",
+                },
+            )
         ]
         assert histogram.calls == [
-            (0, {"source": "tool", "collection": "decisions", "hit": "false"})
+            (
+                0,
+                {
+                    "source": "tool",
+                    "collection": "decisions",
+                    "hit": "false",
+                    "cache": "miss",
+                },
+            )
         ]
 
     @pytest.mark.asyncio
@@ -1109,7 +1138,15 @@ class TestRecallTelemetry:
         result, _ = await invoke_tool(user, tool, {"query": "OAuth2"}, "sess-1")
         assert result["total"] >= 1
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "skills", "hit": "true"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "skills",
+                    "hit": "true",
+                    "cache": "miss",
+                },
+            )
         ]
 
     @pytest.mark.asyncio
@@ -1124,7 +1161,15 @@ class TestRecallTelemetry:
         )
         assert result["total"] == 0
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "semantic", "hit": "false"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "semantic",
+                    "hit": "false",
+                    "cache": "miss",
+                },
+            )
         ]
 
     @pytest.mark.asyncio
@@ -1139,12 +1184,25 @@ class TestRecallTelemetry:
         )
         assert result["total"] >= 1
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "sessions", "hit": "true"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "sessions",
+                    "hit": "true",
+                    "cache": "miss",
+                },
+            )
         ]
         assert histogram.calls == [
             (
                 result["total"],
-                {"source": "tool", "collection": "sessions", "hit": "true"},
+                {
+                    "source": "tool",
+                    "collection": "sessions",
+                    "hit": "true",
+                    "cache": "miss",
+                },
             )
         ]
 
@@ -1167,29 +1225,104 @@ class TestRecallTelemetry:
             dependencies.container = prior
         assert result["total"] == 0
         assert counter.calls == [
-            (1, {"source": "tool", "collection": "sessions", "hit": "false"})
+            (
+                1,
+                {
+                    "source": "tool",
+                    "collection": "sessions",
+                    "hit": "false",
+                    "cache": "miss",
+                },
+            )
         ]
         assert histogram.calls == [
-            (0, {"source": "tool", "collection": "sessions", "hit": "false"})
+            (
+                0,
+                {
+                    "source": "tool",
+                    "collection": "sessions",
+                    "hit": "false",
+                    "cache": "miss",
+                },
+            )
         ]
 
     @pytest.mark.asyncio
     async def test_no_pii_in_labels(
         self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
     ):
-        """Labels are ``source`` + ``collection`` + ``hit`` ONLY — no
-        user_id, no query text, matching the spec's non-negotiable
+        """Labels are ``source`` + ``collection`` + ``hit`` + ``cache`` ONLY —
+        no user_id, no query text, matching the spec's non-negotiable
         NO-PII-in-labels rule."""
         counter, histogram = _recall_telemetry_spy
         user = sentinel_user_context()
         tool = get_tool_by_name("recall_decisions")
         await invoke_tool(user, tool, {"query": "a secret query about alice"}, "sess-1")
         for _amount, labels in counter.calls + histogram.calls:
-            assert set(labels.keys()) == {"source", "collection", "hit"}
+            assert set(labels.keys()) == {"source", "collection", "hit", "cache"}
             assert "source" in labels
             assert labels["source"] == "tool"
             assert user.user_id not in labels.values()
             assert "secret" not in str(labels.values())
+
+    @pytest.mark.asyncio
+    async def test_invoke_tool_cache_hit_emits_cache_hit_label(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        """M1: a cache-hit (second invoke_tool call with same args) must emit
+        telemetry with ``cache="hit"`` — the handler is NOT called on hit,
+        so the telemetry comes from invoke_tool itself. The collection is
+        derived from the tool name."""
+        counter, histogram = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+
+        # First call — cache miss, handler runs, emits cache="miss"
+        result1, hit1 = await invoke_tool(
+            user, tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert hit1 is False
+        # One miss emission from the handler
+        miss_calls = [c for c in counter.calls if c[1].get("cache") == "miss"]
+        assert len(miss_calls) == 1
+        assert miss_calls[0][1]["collection"] == "decisions"
+
+        # Second call — cache hit, handler NOT called, invoke_tool emits cache="hit"
+        result2, hit2 = await invoke_tool(
+            user, tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert hit2 is True
+        assert result2 == result1
+        # Now we should have one miss + one hit
+        hit_calls = [c for c in counter.calls if c[1].get("cache") == "hit"]
+        assert len(hit_calls) == 1
+        assert hit_calls[0][1]["collection"] == "decisions"
+        assert hit_calls[0][1]["source"] == "tool"
+        # Total from cache hit should match the cached result
+        assert hit_calls[0][0] == result1.get("total", 0)
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_and_miss_both_counted(
+        self, _populated_container, _fakeredis_cache, _recall_telemetry_spy
+    ):
+        """M1: the recall total counter must include BOTH cache=hit and cache=miss
+        entries so the panel query (cache=~"hit|miss") has data to work with."""
+        counter, _ = _recall_telemetry_spy
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_decisions")
+
+        # Two cache-miss calls (different args → different cache keys)
+        await invoke_tool(user, tool, {"query": "cache compression"}, "sess-1")
+        await invoke_tool(user, tool, {"query": "OAuth2 OIDC"}, "sess-2")
+        # One cache-hit call
+        await invoke_tool(user, tool, {"query": "cache compression"}, "sess-1")
+
+        total_calls = len(counter.calls)
+        assert total_calls == 3
+        cache_values = {c[1]["cache"] for c in counter.calls}
+        assert cache_values == {"miss", "hit"}, (
+            f"Expected both 'miss' and 'hit' in cache values, got {cache_values}"
+        )
 
 
 # ── Pagination (backlog #15 residual, #375 / RECALL-PAGINATION-20260803) ────

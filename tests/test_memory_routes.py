@@ -8468,7 +8468,7 @@ class TestRecallTelemetryRestRoutes:
     def test_no_pii_in_rest_metric_labels(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REST route metric labels are {source, collection, hit} ONLY —
+        """REST route metric labels are {source, collection, hit, cache} ONLY —
         no user_id, no query, no content."""
         from audittrace.services import recall_telemetry as telemetry_mod
 
@@ -8484,8 +8484,12 @@ class TestRecallTelemetryRestRoutes:
             r = client.get("/memory/semantic")
             assert r.status_code == 200
             for _amount, labels in counter_spy:
-                assert set(labels.keys()) == {"source", "collection", "hit"}, (
+                assert set(labels.keys()) == {"source", "collection", "hit", "cache"}, (
                     f"REST metric labels contain unexpected keys: {labels.keys()}"
+                )
+                # REST/backoffice reads must have cache="n/a".
+                assert labels.get("cache") == "n/a", (
+                    f"REST route cache label must be 'n/a', got {labels.get('cache')}"
                 )
         finally:
             telemetry_mod._recall_counter = real_counter

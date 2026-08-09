@@ -12,7 +12,7 @@
       "id": 101,
       "type": "row",
       "title": "Accumulation \u2014 the corpus grows",
-      "description": "Wave B: memory-write and chunks-indexed counters (M2) must exist before this row is populated. Currently empty \u2014 accumulation panels gated on new OTel instrumentation.",
+      "description": "M2 Wave B: memory-write and chunks-indexed counters. 4.1 shows daily writes by layer; 4.4 shows cumulative knowledge-base growth stacked by collection (fixes D2 flat-1s \u2014 plots the real chunk count, not HTTP call counts).",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -20,7 +20,115 @@
         "y": 0
       },
       "panels": [],
-      "collapsed": true
+      "collapsed": false
+    },
+    {
+      "id": 111,
+      "type": "stat",
+      "title": "Memory Writes \u2014 daily",
+      "description": "Daily memory-corpus writes by layer (episodic | procedural). Query: sum(increase(audittrace_memory_writes_total[24h])) grouped by layer. Includes a 7-day trend stat (average daily writes). Neutral colouring \u2014 writes are context, not a KPI to maximise. Source: audittrace_memory_writes_total counter (M2, Wave B). Labels: {layer}. No PII.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (layer) (increase(audittrace_memory_writes_total[24h]))",
+          "legendFormat": "{{layer}} writes/day"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(audittrace_memory_writes_total[7d])) / 7",
+          "legendFormat": "7-day avg writes/day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "showLabels": true,
+        "showValues": true,
+        "text": {}
+      }
+    },
+    {
+      "id": 112,
+      "type": "timeseries",
+      "title": "Knowledge-Base Growth \u2014 cumulative by collection (fixes D2)",
+      "description": "Cumulative chunks indexed per collection, presented as a rising line (the library gets bigger over time). Uses increase(...[$__range]) to accumulate, stacked by collection so you can see WHERE knowledge accumulates (semantic vs episodic vs decisions). Fixes D2: the old flat-1s plotted the HTTP call counter; this plots the REAL chunk count. Secondary stat: chunks added in the last 24h. Source: audittrace_memory_chunks_indexed_total counter (M2, Wave B). Labels: {collection}. No PII.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (collection) (increase(audittrace_memory_chunks_indexed_total[$__range]))",
+          "legendFormat": "{{collection}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "drawStyle": "lines",
+            "lineWidth": 1,
+            "pointSize": "off",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "id": 2,
@@ -31,7 +139,7 @@
         "h": 8,
         "w": 18,
         "x": 0,
-        "y": 1
+        "y": 9
       },
       "datasource": {
         "type": "prometheus",
@@ -82,7 +190,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 1
+        "y": 9
       },
       "datasource": {
         "type": "prometheus",
@@ -153,7 +261,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "datasource": {
         "type": "prometheus",
@@ -185,6 +293,57 @@
       }
     },
     {
+      "id": 113,
+      "type": "timeseries",
+      "title": "Cache-hit share \u2014 reuse proxy (M1, 4.NEW)",
+      "description": "Fraction of tool recalls served from the ADR-025 Redis result cache: sum(increase(audittrace_recall_total{cache=\"hit\"}[24h])) / sum(increase(audittrace_recall_total{cache=~\"hit|miss\"}[24h])). A memory recalled again is evidence of repeated reliance on the same memory \u2014 the strongest single 'learning' proxy. Still NOT a causal claim (does not prove recalled content caused better output). Denominator uses cache=~\"hit|miss\" to include only tool-surface recalls (backoffice reads are cache=n/a and excluded). Labels: {source, collection, hit, cache}. No PII.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(audittrace_recall_total{cache=\"hit\"}[24h])) / sum(increase(audittrace_recall_total{cache=~\"hit|miss\"}[24h])) * 100",
+          "legendFormat": "cache-hit share %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "fillOpacity": 10,
+            "drawStyle": "lines",
+            "lineWidth": 1,
+            "pointSize": "off",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
       "id": 5,
       "type": "timeseries",
       "title": "Recall Calls by Collection \u2014 24h counts (governance view)",
@@ -193,7 +352,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "datasource": {
         "type": "prometheus",
@@ -228,7 +387,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 33
       },
       "panels": [],
       "collapsed": false
@@ -242,7 +401,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "datasource": {
         "type": "prometheus",
@@ -309,7 +468,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "datasource": {
         "type": "prometheus",
@@ -391,5 +550,5 @@
   "timezone": "browser",
   "title": "AuditTrace-AI \u2014 Agents Learning (v2)",
   "uid": "audittrace-agents-learning",
-  "version": 3
+  "version": 4
 }
