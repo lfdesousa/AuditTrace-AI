@@ -455,6 +455,19 @@ class TestBootstrapScanPipeline:
             "audittrace.services.scan_audit_consumer.ScanAuditConsumer",
             _make_task_cls("audit"),
         )
+        # SPEC #387 Phase 1 (WU-1/WU-2/WU-3) — the auto-index outbox worker
+        # + janitor are wired in the same bootstrap alongside the four
+        # scan-pipeline tasks above; mock them the same way so this test
+        # stays a pure "does bootstrap fail open + create every task"
+        # check, not a real-DI-dependent one.
+        monkeypatch.setattr(
+            "audittrace.services.index_worker.IndexWorker",
+            _make_task_cls("index-worker"),
+        )
+        monkeypatch.setattr(
+            "audittrace.services.index_janitor.IndexJanitor",
+            _make_task_cls("index-janitor"),
+        )
         fake_factory = MagicMock()
         fake_factory.get_session_factory.return_value = MagicMock()
         monkeypatch.setattr(
@@ -471,7 +484,16 @@ class TestBootstrapScanPipeline:
         try:
             # Fail-open: queue is live so /memory/upload can enqueue.
             assert isinstance(app.state.scan_queue, asyncio.Queue)
-            # All four background tasks were created despite the dead broker.
-            assert sorted(started) == ["audit", "janitor", "publisher", "verdict"]
+            # All six background tasks were created despite the dead broker
+            # (the original four scan-pipeline tasks + SPEC #387's
+            # index-worker + index-janitor).
+            assert sorted(started) == [
+                "audit",
+                "index-janitor",
+                "index-worker",
+                "janitor",
+                "publisher",
+                "verdict",
+            ]
         finally:
             await stack.aclose()  # cancels tasks + runs aclose callbacks

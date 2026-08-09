@@ -283,6 +283,75 @@ class TestMigration018AddTierToMemoryItems:
             }
 
 
+class TestMigration019AddIndexedAtMsToMemoryItems:
+    """SPEC #387 Phase 1 (WU-1) — migration 019 adds
+    ``memory_items.indexed_at_ms``, the place→index outbox marker one hop
+    after ``published_at_ms`` (migration 013)."""
+
+    def test_upgrade_adds_indexed_at_ms_column_nullable(self, alembic_cfg, engine):
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+            inspector = inspect(conn)
+            columns = {c["name"]: c for c in inspector.get_columns("memory_items")}
+            assert "indexed_at_ms" in columns
+            assert columns["indexed_at_ms"]["nullable"] is True
+
+    def test_upgrade_creates_index_pending_composite_index(self, alembic_cfg, engine):
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+            inspector = inspect(conn)
+            indexes = inspector.get_indexes("memory_items")
+            names = {idx["name"] for idx in indexes}
+            assert "ix_memory_items_index_pending" in names
+
+    def test_pre_migration_019_row_reads_indexed_at_ms_null(self, alembic_cfg, engine):
+        """A row inserted WITHOUT ``indexed_at_ms`` (every pre-migration
+        row, and every row outside the scan pipeline) reads back NULL —
+        never a stray default that would make it look already-indexed."""
+        import sqlalchemy as sa
+
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+
+            memory_items = sa.Table("memory_items", sa.MetaData(), autoload_with=conn)
+            conn.execute(
+                memory_items.insert().values(
+                    id="legacy-row-2",
+                    layer="episodic",
+                    key="ADR-legacy-2.md",
+                    created_at_ms=1,
+                    modified_at_ms=1,
+                    created_by_user_id="legacy-user",
+                    modified_by_user_id="legacy-user",
+                    # indexed_at_ms intentionally omitted.
+                )
+            )
+            row = conn.execute(
+                sa.select(memory_items.c.indexed_at_ms).where(
+                    memory_items.c.id == "legacy-row-2"
+                )
+            ).scalar_one()
+            assert row is None
+
+    def test_downgrade_removes_indexed_at_ms_column(self, alembic_cfg, engine):
+        with engine.begin() as conn:
+            alembic_cfg.attributes["connection"] = conn
+            command.upgrade(alembic_cfg, "head")
+            inspector = inspect(conn)
+            assert "indexed_at_ms" in {
+                c["name"] for c in inspector.get_columns("memory_items")
+            }
+
+            command.downgrade(alembic_cfg, "e1c2b4d6a859")  # migration 018 (pre-019)
+            inspector = inspect(conn)
+            assert "indexed_at_ms" not in {
+                c["name"] for c in inspector.get_columns("memory_items")
+            }
+
+
 class TestEnvPyDoesNotDisableOtherLoggers:
     """Regression guard for a session-wide footgun found building #411 v2.
 

@@ -85,6 +85,7 @@ from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
+from audittrace.services.index_routing import collection_for_key
 from audittrace.services.layer_listing import list_layer_objects
 from audittrace.services.memory_audit import (
     MemoryOp,
@@ -958,7 +959,19 @@ async def index_memory(
     target_collections = (
         [c.strip() for c in collections.split(",") if c.strip()]
         if collections
-        else list(_DEFAULT_COLLECTIONS)
+        # SPEC #387 (WU-4, GAP-2 closure) — single-file mode with no
+        # explicit ``?collections=`` auto-routes by content type
+        # instead of falling through to the bulk-mode 3-collection
+        # default (which is ``.md``-only and either 400s here on the
+        # "requires exactly one collection" check below, or — for a
+        # caller who *did* pick one of those three — silently accepts
+        # 0 chunks for a PDF). A promoted PDF's default index now
+        # lands in ``ai_research_papers``, not a no-op.
+        else (
+            [collection_for_key(file)]
+            if file is not None
+            else list(_DEFAULT_COLLECTIONS)
+        )
     )
 
     unknown = [c for c in target_collections if c not in _KNOWN_COLLECTIONS]

@@ -1,8 +1,12 @@
 """Tests for services/scan_verdict_consumer.py — ADR-048 PR-B4
-verdict-side memory_items.scan_status updater."""
+verdict-side memory_items.scan_status updater.
+
+Also covers SPEC #387 Phase 1 (WU-1) — the auto-index outbox enqueue on a
+clean verdict (``TestAutoIndexOutbox`` below)."""
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,8 +15,10 @@ import pytest
 
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.routes.memory_upload import manifest as manifest_mod
+from audittrace.services.index_worker import IndexRequestEnvelope
 from audittrace.services.scan_verdict_consumer import (
     ScanVerdictConsumer,
+    _episodic_bare_key,
     _episodic_uri,
 )
 
@@ -84,6 +90,36 @@ class TestEpisodicUri:
         )
 
 
+class TestEpisodicBareKey:
+    """SPEC #387 (WU-1) — the bucket-relative form ``_episodic_uri`` is
+    now built FROM, and that the auto-index enqueue uses directly."""
+
+    def test_basic_layout(self) -> None:
+        assert (
+            _episodic_bare_key(
+                prefix="episodic/papers/",
+                scan_id="sid-1",
+                quarantine_key="s3://memory-shared/quarantine/alice/sid-1/foo.pdf",
+            )
+            == "episodic/papers/sid-1/foo.pdf"
+        )
+
+    def test_episodic_uri_is_built_from_bare_key(self) -> None:
+        # Falsifiability: _episodic_uri must be exactly
+        # f"s3://{bucket}/{bare_key}" — not an independently maintained
+        # string, so the two can never drift apart.
+        bare = _episodic_bare_key(
+            prefix="p/", scan_id="s", quarantine_key="s3://b/quarantine/u/s/f.pdf"
+        )
+        uri = _episodic_uri(
+            bucket="b",
+            prefix="p/",
+            scan_id="s",
+            quarantine_key="s3://b/quarantine/u/s/f.pdf",
+        )
+        assert uri == f"s3://b/{bare}"
+
+
 class TestApplyVerdict:
     async def test_clean_promotes_key_and_sets_scanned_clean(self) -> None:
         _f = InMemoryPostgresFactory()
@@ -112,6 +148,8 @@ class TestApplyVerdict:
         assert row.scan_status == "scanned_clean"
         # Promoted to episodic/papers/<scan_id>/<filename>.
         assert row.key == "s3://memory-shared/episodic/papers/scan-1/paper.pdf"
+        # SPEC #387 (WU-1) — the auto-index outbox marker.
+        assert row.indexed_at_ms is None
 
     async def test_rejected_sets_rejected_malware_and_keeps_quarantine_key(
         self,
@@ -198,6 +236,119 @@ class TestApplyVerdict:
         assert "scan_verdict_consumer.row_missing" in warn_messages
         async with factory() as session:
             assert await manifest_mod.get_by_scan_id(session, "ghost") is None
+
+
+class TestAutoIndexOutbox:
+    """SPEC #387 Phase 1 (WU-1) — a clean verdict resets the outbox marker
+    AND enqueues an ``IndexRequestEnvelope`` with the deterministic
+    collection route, closing GAP-1 (nothing previously triggered
+    indexing after a clean verdict)."""
+
+    async def test_clean_verdict_enqueues_envelope_with_ai_research_papers(
+        self,
+    ) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-1", user_id="bob")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(),
+            session_factory=factory,
+            episodic_bucket="memory-shared",
+            episodic_prefix="episodic/papers/",
+            index_queue=index_queue,
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-1", "kind": "clean", "scanner": "clamav"}
+        )
+
+        assert index_queue.qsize() == 1
+        env = index_queue.get_nowait()
+        assert env.scan_id == "scan-idx-1"
+        assert env.key == "episodic/papers/scan-idx-1/paper.pdf"
+        # RED PROOF: a .pdf key must route to ai_research_papers, not the
+        # .md-only default — this is the WU-1 half of GAP-2's closure.
+        assert env.collection == "ai_research_papers"
+        assert env.user_id == "bob"
+        assert env.trace_id == "trace-abc"
+
+    async def test_reset_of_already_set_indexed_at_ms_on_reverdict(self) -> None:
+        # Idempotent outbox reset: a duplicate clean verdict for an
+        # already-indexed row must re-arm the marker (and re-enqueue),
+        # rather than trusting a stale timestamp from before this
+        # delivery.
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-2")
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-2")
+            assert row is not None
+            row.indexed_at_ms = 42
+            await session.commit()
+
+        consumer = ScanVerdictConsumer(settings=_settings(), session_factory=factory)
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-2", "kind": "clean", "scanner": "clamav"}
+        )
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-2")
+        assert row is not None
+        assert row.indexed_at_ms is None
+
+    async def test_rejected_verdict_does_not_enqueue(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-3")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(), session_factory=factory, index_queue=index_queue
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-3", "kind": "rejected", "scanner": "clamav"}
+        )
+
+        assert index_queue.empty()
+
+    async def test_scan_failed_verdict_does_not_enqueue(self) -> None:
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-4")
+        index_queue: asyncio.Queue[IndexRequestEnvelope] = asyncio.Queue()
+        consumer = ScanVerdictConsumer(
+            settings=_settings(), session_factory=factory, index_queue=index_queue
+        )
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-4", "kind": "scan_failed", "scanner": "clamav"}
+        )
+
+        assert index_queue.empty()
+
+    async def test_no_index_queue_configured_does_not_raise(self) -> None:
+        # index_queue defaults to None — a consumer used standalone
+        # (existing tests, or the index pipeline disabled) must not
+        # crash on a clean verdict.
+        _f = InMemoryPostgresFactory()
+        await _f.create_schema()
+        factory = _f.get_session_factory()
+        await _seed_pending(factory, "scan-idx-5")
+        consumer = ScanVerdictConsumer(settings=_settings(), session_factory=factory)
+
+        await consumer._apply_verdict(
+            {"scan_id": "scan-idx-5", "kind": "clean", "scanner": "clamav"}
+        )
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-idx-5")
+        assert row is not None
+        assert row.scan_status == "scanned_clean"
 
 
 class TestEnsureConnected:
