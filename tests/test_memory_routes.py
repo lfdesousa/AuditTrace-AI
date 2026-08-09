@@ -1525,6 +1525,135 @@ class TestIndexZeroChunksLoud:
         mock_collection.upsert.assert_not_called()
 
 
+class TestIndexGap2AutoRoutePdf:
+    """SPEC #387 Phase 1 (WU-4) — GAP-2 closure: a single-file
+    ``/memory/index?file=`` call with NO ``?collections=`` auto-routes by
+    content type instead of falling through to the bulk-mode ``.md``-only
+    default (which either 400s here, since that default has 3 collections
+    and single-file mode requires exactly 1, or — for a caller who *did*
+    pick one of the three — silently accepts 0 chunks for a PDF).
+
+    Neuter: revert the ``collection_for_key(file)`` branch in
+    ``index_memory`` back to unconditionally defaulting to
+    ``list(_DEFAULT_COLLECTIONS)`` -> both tests below go RED (400,
+    "requires exactly one collection in ?collections=")."""
+
+    @staticmethod
+    def _mock_chroma() -> tuple[MagicMock, AsyncMock]:
+        mock_collection = AsyncMock()
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=mock_collection)
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+        return mock_chroma, mock_collection
+
+    def test_promoted_pdf_default_index_routes_to_ai_research_papers(
+        self, client: TestClient
+    ) -> None:
+        """The exact zero-manual-touch shape: a promoted, scanned-clean
+        PDF's key posted to ``/memory/index?file=...`` with NO
+        ``?collections=`` at all — the plain operator default call."""
+        from unittest.mock import MagicMock, patch
+
+        raw_bytes = b"%PDF-1.4 fake-content"
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw_bytes
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        rect_mock = MagicMock(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+        fake_page = MagicMock()
+        fake_page.get_text.return_value = "Body text of a promoted paper."
+        fake_page.rect = rect_mock
+        fake_page.widgets.return_value = []
+        fake_page.get_images.return_value = []
+
+        fake_doc = MagicMock()
+        fake_doc.__iter__.return_value = iter([fake_page])
+        fake_doc.__enter__.return_value = fake_doc
+        fake_doc.__exit__.return_value = None
+        fake_doc.page_count = 1
+        fake_doc.xref_length.return_value = 10
+        fake_doc.is_encrypted = False
+        fake_doc.needs_pass = False
+        fake_doc.embfile_count.return_value = 0
+
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        mock_manifest = MagicMock()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+            patch(
+                "audittrace.routes.memory.get_memory_manifest_service",
+                return_value=mock_manifest,
+            ),
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"file": "episodic/papers/scan-1/report.pdf"},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # Routed to ai_research_papers — NOT the .md-only default set —
+        # and it actually wrote chunks (not the silent 0-chunk no-op).
+        assert body["collections"] == {"ai_research_papers": 1}
+        assert body["total_chunks"] == 1
+        mock_collection.upsert.assert_called_once()
+        mock_manifest.upsert_pdf_metadata.assert_called_once()
+
+    def test_md_file_default_index_still_routes_to_semantic(
+        self, client: TestClient
+    ) -> None:
+        """The same auto-routing fix for a non-PDF key: falls to
+        ``semantic`` (the general ``.md`` collection), not the 3-item
+        bulk default — single-file mode requires exactly one collection
+        either way, so this must 200, not 400."""
+        from unittest.mock import MagicMock, patch
+
+        mock_minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = b"# A note\n\nSome content."
+        response_obj.__enter__.return_value = response_obj
+        mock_minio.get_object.return_value = response_obj
+
+        mock_chroma, mock_collection = self._mock_chroma()
+
+        with (
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=mock_minio,
+            ),
+            patch(
+                "audittrace.routes.memory.get_chromadb",
+                return_value=mock_chroma,
+            ),
+        ):
+            response = client.post(
+                "/memory/index",
+                params={"file": "episodic/note.md"},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert set(body["collections"]) == {"semantic"}
+        assert body["total_chunks"] >= 1
+        mock_collection.upsert.assert_called_once()
+
+
 class TestIndexPrivateTier:
     """POST /memory/index single-file mode accepts private-tier keys
     (ADR-062 Phase B regression, #426).

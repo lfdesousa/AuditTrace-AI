@@ -303,6 +303,23 @@ class MemoryItem(Base):
         String(16), nullable=False, server_default="corpus"
     )
 
+    # ── SPEC #387 Phase 1 (WU-1, migration 019) — auto-index outbox ────
+    # ``indexed_at_ms`` NULL = the manifest row's promoted, scanned-clean
+    # bytes have NOT yet been embedded + upserted into ChromaDB — the
+    # place→index leg of the pipeline is still pending. Mirrors
+    # ``published_at_ms`` 1:1 (same Hohpe Transactional Outbox shape, one
+    # hop later): ``ScanVerdictConsumer`` stamps it NULL and enqueues an
+    # ``IndexRequestEnvelope`` on every ``scanned_clean`` verdict;
+    # ``IndexWorker`` sets it on success (idempotent ``WHERE
+    # indexed_at_ms IS NULL``); ``IndexJanitor`` re-drives any row still
+    # NULL past the grace window — closes GAP-1 (no auto-index trigger)
+    # with the same durability guarantee already proven for
+    # place→publish. Nullable so every pre-migration-019 row (and every
+    # non-PDF / non-scanned row, which never populates ``scan_status``
+    # either) reads NULL forever, which is correct — nothing outside the
+    # scan pipeline claims to have been auto-indexed.
+    indexed_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )
