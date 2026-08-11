@@ -222,14 +222,21 @@ class CurationLogError(RuntimeError):
 
 
 def _login_show(login_script: Path) -> str:  # pragma: no cover - subprocess boundary
-    """Run ``audittrace-login --show`` and return its stdout (the access token).
+    """Run ``audittrace-login --show-unsafe`` and return its stdout (the access token).
 
     The SOLE session-auth egress. Monkeypatched in tests so no subprocess runs. A
     non-zero exit becomes an empty return so C0 treats it as "no session"; the
     stdout (which carries the token) is handed straight to C0 and is NEVER logged.
+
+    ``--show-unsafe`` (not ``--show``) is required: since TOKEN-GUARD
+    (2026-08-11), plain ``--show`` prints a redacted fingerprint, not the raw
+    JWT this curator needs as a real Bearer credential. The raw value is
+    captured straight into a Python string here and never printed/logged —
+    this function is the exact "rare script that truly needs it" case the
+    escape hatch exists for.
     """
     proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [str(login_script), "--show"],
+        [str(login_script), "--show-unsafe"],
         capture_output=True,
         text=True,
         check=False,
