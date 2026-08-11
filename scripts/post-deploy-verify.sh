@@ -453,9 +453,24 @@ security-admin-console"
                               <(printf '%s\n%s\n' "$clients" "$KC_BUILTIN_CLIENTS" \
                                 | grep -v '^$' | sort -u) || true)
 
-        # Rank by blast radius: a shadow client holding admin or audit as a
-        # DEFAULT scope is a different incident from one holding neither, and
-        # an operator triaging a red gate needs that distinction up front.
+        # Rank by blast radius: a shadow client holding admin/audit, or a
+        # granular corpus-write scope (#371, ADR-062 §4 — the guard "must
+        # learn the granular corpus scopes so an undeclared holder is
+        # flagged"), as a DEFAULT scope is a different incident from one
+        # holding neither, and an operator triaging a red gate needs that
+        # distinction up front.
+        #
+        # The corpus-write glob `memory:corpus:*:write` is the SINGLE SOURCE
+        # OF TRUTH mirrored verbatim from `CORPUS_WRITE_SCOPE_GLOB` in
+        # `src/audittrace/identity.py` (cross-checked by
+        # tests/test_chart_drift_guards.py so the two cannot drift apart).
+        #
+        # Ranked PER-SCOPE (splitting `sc` on its comma delimiter), not on
+        # the whole comma-joined string: a `case ",$sc," in *,memory:corpus:*
+        # :write,*)` pattern would let the middle `*` wildcard greedily span
+        # ACROSS two unrelated scope names in the joined list (e.g.
+        # "memory:corpus:decisions:read,other:write" would falsely match),
+        # so each scope name is matched against the glob in isolation.
         shadow_report=""
         for cid in $undeclared; do
             u=$(kc_curl -H "Authorization: Bearer $kc_token" \
@@ -464,12 +479,19 @@ security-admin-console"
             sc=$(kc_curl -H "Authorization: Bearer $kc_token" \
                 "${KC_SVC}/admin/realms/${KC_REALM}/clients/${u}/default-client-scopes" \
                 | jq -r '[.[].name]|join(",")' 2>/dev/null || echo "")
-            case ",$sc," in
-                *,audittrace:admin,*|*,audittrace:audit,*)
-                    shadow_report="${shadow_report}!! ${cid}: UNDECLARED and holds a privileged default scope [${sc}]"$'\n' ;;
-                *)
-                    shadow_report="${shadow_report}${cid}: UNDECLARED (default scopes: ${sc:-none})"$'\n' ;;
-            esac
+            privileged=""
+            IFS=',' read -ra _shadow_scopes <<< "$sc"
+            for s in "${_shadow_scopes[@]}"; do
+                case "$s" in
+                    audittrace:admin|audittrace:audit|memory:corpus:*:write)
+                        privileged="$s" ;;
+                esac
+            done
+            if [ -n "$privileged" ]; then
+                shadow_report="${shadow_report}!! ${cid}: UNDECLARED and holds a privileged default scope [${sc}]"$'\n'
+            else
+                shadow_report="${shadow_report}${cid}: UNDECLARED (default scopes: ${sc:-none})"$'\n'
+            fi
         done
 
         if [ "$checked" -eq 0 ]; then

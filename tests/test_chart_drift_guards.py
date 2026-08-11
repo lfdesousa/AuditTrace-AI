@@ -1418,6 +1418,117 @@ class TestPostDeployVerifyShadowClientCheck:
         )
 
 
+class TestPrivilegedCorpusScopeSingleSourceOfTruth:
+    """#371 — the granular-corpus-scope residual gap named in ADR-062 §4:
+    "the scope-drift guard must learn the granular corpus scopes so an
+    undeclared holder is flagged." The app classifier
+    (``identity.is_privileged_scope``) and Check 11's shadow-client ranking
+    must never drift apart.
+
+    Unlike the string-shape pins in ``TestPostDeployVerifyShadowClientCheck``
+    above, the ranking tests here actually EXECUTE the extracted shell
+    snippet in a real ``bash`` subprocess against synthetic comma-joined
+    default-scope lists — a genuinely falsifiable test, not a text search:
+    delete the ``memory:corpus:*:write`` case arm (or shrink the glob) and
+    every "ranked privileged" assertion below goes RED because the real
+    shell evaluates to no match.
+    """
+
+    @staticmethod
+    def _script() -> str:
+        return (REPO_ROOT / "scripts" / "post-deploy-verify.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def _extract_ranking_snippet(self) -> str:
+        """Pull the exact per-scope ranking block (the ``IFS=','`` split +
+        ``case`` loop) out of Check 11 so it can be executed standalone."""
+        script = self._script()
+        start_marker = "IFS=',' read -ra _shadow_scopes <<< \"$sc\""
+        start = script.index(start_marker)
+        end_marker = "esac\n            done\n"
+        end = script.index(end_marker, start) + len(end_marker)
+        return script[start:end]
+
+    def _rank(self, sc: str) -> str:
+        """Run the extracted ranking snippet in a real bash subshell against
+        a synthetic comma-joined ``sc`` (default-client-scopes) string and
+        return the ``$privileged`` value it computes."""
+        snippet = self._extract_ranking_snippet()
+        shell_script = (
+            f'sc="{sc}"\nprivileged=""\n{snippet}\nprintf "%s" "$privileged"\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", shell_script], capture_output=True, text=True
+        )
+        assert result.returncode == 0, (
+            f"extracted ranking snippet failed to run: {result.stderr}"
+        )
+        return result.stdout
+
+    def test_glob_literal_matches_python_constant(self) -> None:
+        """The shell guard's ``case`` pattern mirrors
+        ``identity.CORPUS_WRITE_SCOPE_GLOB`` VERBATIM — checked inside the
+        EXECUTABLE ranking snippet itself (not just anywhere in the file, so
+        a copy left behind in a comment cannot mask the literal being
+        dropped from the actual ``case`` arm). A change to one without the
+        other is exactly how #370/#371-class drift happens; this test is
+        the single source-of-truth enforcement point."""
+        from audittrace.identity import CORPUS_WRITE_SCOPE_GLOB
+
+        assert CORPUS_WRITE_SCOPE_GLOB in self._extract_ranking_snippet(), (
+            "the shell guard's corpus-write glob pattern has drifted from "
+            f"identity.CORPUS_WRITE_SCOPE_GLOB ({CORPUS_WRITE_SCOPE_GLOB!r}) "
+            "— they must be the exact same literal string inside the "
+            "ranking `case` arm, or the app classifier and the shell guard "
+            "can silently disagree."
+        )
+
+    def test_undeclared_corpus_writer_is_ranked_privileged(self) -> None:
+        """A synthetic UNDECLARED client holding
+        ``memory:corpus:decisions:write`` must rank ``!!`` privileged — the
+        exact scenario ADR-062 §4 names and #371 exists to close."""
+        assert (
+            self._rank("memory:corpus:decisions:write")
+            == "memory:corpus:decisions:write"
+        )
+
+    @pytest.mark.parametrize("collection", ["decisions", "skills", "semantic"])
+    def test_every_declared_collection_is_ranked_privileged(
+        self, collection: str
+    ) -> None:
+        """ADR-062 §4's granular collections — every one, not just
+        ``decisions``, must be recognised."""
+        sc = f"memory:corpus:{collection}:write"
+        assert self._rank(sc) == sc
+
+    def test_corpus_read_scope_is_not_ranked_privileged(self) -> None:
+        assert self._rank("memory:corpus:decisions:read") == ""
+
+    def test_plain_layer_write_scope_is_not_ranked_privileged(self) -> None:
+        """Regression lock: an ordinary per-user writer scope
+        (``memory:episodic:write``) must NOT be flagged, or the guard cries
+        wolf on every legitimate opencode/webui deployment."""
+        assert self._rank("memory:episodic:write") == ""
+
+    def test_admin_and_audit_ranking_unchanged(self) -> None:
+        """No new false positives / no lost coverage on a correct cluster:
+        the pre-#371 admin/audit ranking still works after the corpus-write
+        extension."""
+        assert self._rank("audittrace:admin") == "audittrace:admin"
+        assert self._rank("audittrace:audit") == "audittrace:audit"
+
+    def test_mixed_scope_list_does_not_bleed_across_tokens(self) -> None:
+        """Regression for the glob-bleed bug this rewrite fixes: a
+        comma-joined list containing a corpus-READ scope and an unrelated
+        write scope must not falsely match ``memory:corpus:*:write`` by the
+        middle ``*`` wildcard spanning across two unrelated scope tokens."""
+        assert self._rank("memory:corpus:decisions:read,other:write") == ""
+
+    def test_no_privileged_scope_ranks_empty(self) -> None:
+        assert self._rank("memory:read,session:read-own") == ""
+
+
 class TestChromaDBPersistPathMatchesMount:
     """The PVC must be mounted where ChromaDB actually persists (#372).
 
