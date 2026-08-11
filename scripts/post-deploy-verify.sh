@@ -59,7 +59,7 @@ echo "[verify] === audittrace post-deploy verification ==="
 echo "[verify] namespace=$NAMESPACE release=$RELEASE"
 
 # ── 1. All chart pods Ready ──────────────────────────────────────────────────
-header "(1/13) Pod readiness"
+header "(1/14) Pod readiness"
 not_ready=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '{
         split($2, ready, "/")
@@ -73,7 +73,7 @@ else
 fi
 
 # ── 2. No CrashLoopBackOff or Error pods ────────────────────────────────────
-header "(2/13) No crashing pods"
+header "(2/14) No crashing pods"
 crashing=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
     | awk '$3 == "CrashLoopBackOff" || $3 == "Error" || $3 == "ErrImagePull" {print}')
 if [ -z "$crashing" ]; then
@@ -84,7 +84,7 @@ else
 fi
 
 # ── 3. Helm release status `deployed` ───────────────────────────────────────
-header "(3/13) Helm release status"
+header "(3/14) Helm release status"
 release_status=$(helm $KUBECONFIG_FLAG status "$RELEASE" -n "$NAMESPACE" \
     -o json 2>/dev/null | jq -r '.info.status // "unknown"')
 if [ "$release_status" = "deployed" ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 # ── 4. Memory-server /health returns 200 ────────────────────────────────────
-header "(4/13) Memory-server /health"
+header "(4/14) Memory-server /health"
 ms_pod=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get pod \
     -l app.kubernetes.io/component=memory-server \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -109,7 +109,7 @@ else
 fi
 
 # ── 5. Memory-server /metrics reachable ─────────────────────────────────────
-header "(5/13) Memory-server /metrics"
+header "(5/14) Memory-server /metrics"
 if [ -n "$ms_pod" ] && kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
         -c memory-server \
         -- curl -s -o /dev/null -w "%{http_code}" http://localhost:8765/metrics 2>/dev/null \
@@ -121,7 +121,7 @@ else
 fi
 
 # ── 6. Postgres reachable (pg_isready from inside the pg pod) ───────────────
-header "(6/13) Postgres reachability"
+header "(6/14) Postgres reachability"
 if kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec audittrace-postgresql-0 \
         -c postgresql -- pg_isready -U postgres -d audittrace 2>&1 \
         | grep -q "accepting connections"; then
@@ -131,7 +131,7 @@ else
 fi
 
 # ── 7. Recent Tempo trace activity for audittrace-server ────────────────────
-header "(7/13) Tempo: recent traces for audittrace-server"
+header "(7/14) Tempo: recent traces for audittrace-server"
 # 30-min window; if nothing is using the system, this can legitimately be
 # empty — flag that as SKIP rather than FAIL so a quiet cluster passes.
 if ! curl --silent --connect-timeout 3 --max-time 10 \
@@ -151,7 +151,7 @@ else
 fi
 
 # ── 8. Loki: ERROR-level audittrace lines below threshold ───────────────────
-header "(8/13) Loki: audittrace ERROR rate"
+header "(8/14) Loki: audittrace ERROR rate"
 if ! curl --silent --connect-timeout 3 --max-time 10 \
         "${LOKI_URL}/ready" >/dev/null 2>&1; then
     skip "Loki unreachable at ${LOKI_URL}"
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 9. Vault drift guard (ConfigMap policies/roles ⊆ actual Vault state) ───
-header "(9/13) Vault drift guard (ConfigMap ⊆ Vault)"
+header "(9/14) Vault drift guard (ConfigMap ⊆ Vault)"
 # Catches the 2026-05-03 drift class: chart adds a policy/role to
 # templates/vault/configmap-policies.yaml, operator forgets to re-run
 # `make k8s-bootstrap-secrets`, vault-agent fails authn at the next pod
@@ -247,7 +247,7 @@ else
 fi
 
 # ── 10. Vault ↔ k8s Redis password alignment (closes 2026-05-04 drift) ─────
-header "(10/13) Vault Redis-password sync"
+header "(10/14) Vault Redis-password sync"
 # v1.0.9 ADR-046 live test surfaced this drift class: Bitnami Redis
 # subchart auto-generates the password into the k8s secret
 # '${RELEASE}-redis' on first install; setup-vault.sh independently
@@ -283,7 +283,7 @@ else
 fi
 
 # ── 11. Keycloak realm scope drift (ConfigMap declared == live realm) ──────
-header "(11/13) Keycloak client-scope drift (declared == live)"
+header "(11/14) Keycloak client-scope drift (declared == live)"
 # Catches the 2026-07-20 drift class (#370): the live realm granted
 # `memory:episodic:write` as a DEFAULT scope on audittrace-opencode, while
 # every declared source (both realm JSON files, both provisioning scripts,
@@ -496,8 +496,98 @@ security-admin-console"
 fi
 unset kc_admin_pw
 
-# ── 12. ChromaDB persists to the PVC, not to the container overlay ─────────
-header "(12/13) ChromaDB persistence is durable"
+# ── 12. Keycloak identity-provider (IdP) drift — declared == live ──────────
+header "(12/14) Keycloak identity-provider drift (declared == live)"
+# Catches the #403 drift class: a live external IdP broker (e.g. the
+# `google-test` OIDC broker the mini UI's `kc_idp_hint` depends on —
+# webui/index.html) is added out-of-band via
+# scripts/setup-idp-federation.sh (per ADR-044 §1: "Keycloak is the broker,
+# not the source-of-truth") and never lands in the committed realm JSON.
+# --import-realm runs on FIRST BOOT ONLY (same footgun as Check 11), so a
+# cold reimport / disaster-recovery rebuild silently WIPES the live broker
+# and breaks federated login with no error anywhere in the deploy path.
+#
+# The set-comparison itself lives in scripts/idp-drift-check.sh, kept
+# free of kubectl/kcadm calls so it is unit-testable against mocked
+# declared/live alias lists without a cluster — see
+# tests/test_idp_drift_guard.py. This check supplies only the live +
+# declared data and reports the result.
+#
+# SKIPped when: the realm ConfigMap is absent, no memory-server pod to
+# reach Keycloak from, the comparison library is missing, or no admin
+# credential is available — same discipline as Check 11. Read-only: this
+# check only GETs identity-provider/instances, never writes.
+IDP_DRIFT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/idp-drift-check.sh"
+if ! kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap "$REALM_CM" \
+        >/dev/null 2>&1; then
+    skip "ConfigMap $REALM_CM not present (keycloak.enabled=false?)"
+elif [ -z "$ms_pod" ]; then
+    skip "no memory-server pod to reach Keycloak from"
+elif [ ! -f "$IDP_DRIFT_LIB" ]; then
+    skip "scripts/idp-drift-check.sh not found — cannot compare IdP drift"
+else
+    kc_admin_pw="${KEYCLOAK_ADMIN_PASSWORD:-}"
+    if [ -z "$kc_admin_pw" ]; then
+        kc_admin_pw=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get secret \
+            "${RELEASE}-keycloak-secret" -o jsonpath='{.data.admin-password}' \
+            2>/dev/null | base64 -d 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$kc_admin_pw" ]; then
+        skip "no Keycloak admin credential (set KEYCLOAK_ADMIN_PASSWORD)"
+    else
+        # Credential on STDIN, never argv — same discipline as Check 11.
+        kc_idp_token=$(printf '%s' "$kc_admin_pw" \
+            | kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec -i "$ms_pod" \
+                -c memory-server -- sh -c "read -r PW; curl -s --max-time 15 \
+                  -X POST '${KC_SVC}/realms/master/protocol/openid-connect/token' \
+                  -d grant_type=password -d client_id=admin-cli -d username=admin \
+                  --data-urlencode \"password=\$PW\"" 2>/dev/null \
+            | jq -r '.access_token // empty' 2>/dev/null || echo "")
+        unset kc_admin_pw
+
+        if [ -z "$kc_idp_token" ]; then
+            skip "Keycloak admin auth failed (bad credential, or Keycloak not ready)"
+        else
+            realm_json_idp=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" get configmap \
+                "$REALM_CM" -o jsonpath='{.data.realm\.json}' 2>/dev/null || echo "")
+            declared_idp_aliases=$(echo "$realm_json_idp" \
+                | jq -r '.identityProviders[]?.alias' 2>/dev/null | sort -u || echo "")
+            live_idp_aliases=$(kubectl $KUBECONFIG_FLAG -n "$NAMESPACE" exec "$ms_pod" \
+                -c memory-server -- curl -s --max-time 15 \
+                -H "Authorization: Bearer $kc_idp_token" \
+                "${KC_SVC}/admin/realms/${KC_REALM}/identity-provider/instances" \
+                2>/dev/null | jq -r '.[].alias' 2>/dev/null | sort -u || echo "")
+            unset kc_idp_token
+
+            # shellcheck source=idp-drift-check.sh
+            . "$IDP_DRIFT_LIB"
+            if idp_drift_output=$(idp_drift_report "$declared_idp_aliases" "$live_idp_aliases"); then
+                idp_drift_rc=0
+            else
+                idp_drift_rc=$?
+            fi
+
+            if [ -z "$declared_idp_aliases" ] && [ -z "$live_idp_aliases" ]; then
+                pass "no identity providers declared or live — nothing to drift"
+            elif [ "$idp_drift_rc" -eq 0 ]; then
+                pass "Keycloak identity providers match $REALM_CM (${declared_idp_aliases:-none})"
+            else
+                fail "Keycloak identity-provider drift — live realm != $REALM_CM:"
+                echo "$idp_drift_output" | sed 's/^/[verify]      - /' >&2
+                echo "[verify]      NOTE: --import-realm runs on FIRST BOOT ONLY, so" >&2
+                echo "[verify]      editing realm-audittrace.json will NOT restore a" >&2
+                echo "[verify]      wiped live broker. Re-run" >&2
+                echo "[verify]      scripts/setup-idp-federation.sh for each missing IdP," >&2
+                echo "[verify]      or scripts/export-idp-federation.sh to capture a live" >&2
+                echo "[verify]      IdP that is not yet committed." >&2
+            fi
+        fi
+    fi
+fi
+
+# ── 13. ChromaDB persists to the PVC, not to the container overlay ─────────
+header "(13/14) ChromaDB persistence is durable"
 # Catches the 2026-07-21 class (#372), which nothing else could see:
 # ChromaDB's /config.yaml said `persist_path: /data` while the chart mounted
 # the PVC at /chroma/chroma (the 0.x convention, never updated when the image
@@ -548,7 +638,7 @@ else
 fi
 
 # ── 13. Memory layers hold REAL DATA (not merely reachable) ────────────────
-header "(13/13) Memory layers hold real data"
+header "(14/14) Memory layers hold real data"
 # Added 2026-07-21 after #372. Every E2E assertion we had was satisfiable by
 # an EMPTY semantic layer, so ChromaDB ran empty through 160 pod restarts and
 # nothing went red:
