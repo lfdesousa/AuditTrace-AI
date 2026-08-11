@@ -21,7 +21,7 @@
 
 3. **Fire one warm-up probe** so Tempo's service-map has fresh edges.
    ```bash
-   BEARER=$(scripts/audittrace-login --show)
+   BEARER=$(scripts/audittrace-login --show-unsafe)
    curl -sk -H "Authorization: Bearer $BEARER" -H "X-Project: warmup" \
      -H "Content-Type: application/json" \
      -X POST https://audittrace.local:30952/v1/chat/completions \

@@ -83,8 +83,10 @@ code=$(/usr/bin/curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://local
 
 # ── 6. the real chat ─────────────────────────────────────────────────
 step "6. POST /v1/chat/completions — full path"
-BEARER=$(KEYCLOAK_BASE=https://audittrace.local scripts/audittrace-login --show 2>/dev/null)
-[[ -n "$BEARER" ]] || fail "no bearer token — audittrace-login --show returned empty"
+# --show-unsafe: this test needs the real Bearer to hit /v1/chat/completions
+# below; plain --show now prints a redacted fingerprint (TOKEN-GUARD, 2026-08-11).
+BEARER=$(KEYCLOAK_BASE=https://audittrace.local scripts/audittrace-login --show-unsafe 2>/dev/null)
+[[ -n "$BEARER" ]] || fail "no bearer token — audittrace-login --show-unsafe returned empty"
 SESSION_ID="phase4-airplane-$(date +%s)"
 echo "session_id: $SESSION_ID"
 body=$(/usr/bin/curl -sk -X POST "https://audittrace.local/v1/chat/completions" \
