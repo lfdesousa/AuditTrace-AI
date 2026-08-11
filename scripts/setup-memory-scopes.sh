@@ -113,6 +113,19 @@ kcadm config credentials \
   --password "${KEYCLOAK_ADMIN_PASSWORD}" >/dev/null
 echo "  ✓ authenticated"
 
+# #370 RATIFIED 2026-08-11 — this array (bound to `admin-client` as a
+# DEFAULT scope below, via CLIENT_KIND) is WHY the live realm's
+# `admin-client` carries more default scopes than
+# `keycloak/realm-audittrace.json` declares for it. That JSON-vs-live
+# delta is intentional, not drift: `admin-client` is meant to hold
+# every corpus-write default this Job binds, and
+# `scripts/post-deploy-verify.sh` Check 11 compares the live realm
+# against the declared realm ConfigMap UNION this script's/the
+# in-cluster Job's intent for exactly this reason. Do NOT narrow this
+# array to "fix" a Check 11 false-positive read of the raw JSON file —
+# the JSON was never meant to be the whole picture for admin-client.
+# See `docs/architecture/sequence-oauth2-flow.md` (client → scope
+# matrix) for the written rationale.
 SCOPES=(
   "memory:episodic:write"
   "memory:procedural:write"
