@@ -49,15 +49,37 @@ _SECRET_CONFIG_KEYS: tuple[str, ...] = ("clientSecret",)
 def externalize_idp_secrets(
     identity_providers: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return a deep copy of ``identity_providers`` with every client secret
+    """Return a copy of ``identity_providers`` with every client secret
     replaced by its Vault-substitution placeholder.
 
     ``identity_providers`` is the shape kcadm's
     ``GET identity-provider/instances`` returns: a list of Keycloak IdP
     instance objects, each with an ``alias`` and a ``config`` map. Any
-    ``config`` key listed in :data:`_SECRET_CONFIG_KEYS` that carries a
-    non-empty value is replaced; every other field passes through
-    unmodified so the export stays faithful to the live config.
+    ``config`` key listed in :data:`_SECRET_CONFIG_KEYS`, when PRESENT
+    (unconditionally — not gated on the source value being truthy, so an
+    empty-string secret cannot silently survive), is replaced; every other
+    field passes through unmodified so the export stays faithful to the
+    live config.
+
+    **Structural sanitization, not a value-level overwrite.** The returned
+    ``config`` map is built FRESH via a dict comprehension that EXCLUDES
+    every key in :data:`_SECRET_CONFIG_KEYS` from ``source_config.items()``
+    — the source secret VALUE is never read into a variable, never copied,
+    and never assigned anywhere in the returned structure. The placeholder
+    that replaces it is a brand-new string literal built ONLY from
+    ``alias`` (:data:`_VAULT_PLACEHOLDER_TEMPLATE`.format), which carries
+    no data derived from the source secret. No SSA path in this function
+    carries the source ``clientSecret`` value into ``externalized`` — this
+    is a real dataflow barrier (not a suppression), and it is what makes
+    CodeQL's ``py/clear-text-logging-sensitive-data`` /
+    ``py/clear-text-storage-sensitive-data`` taint trackers see a genuine
+    sanitizer here instead of the false-positive flagged on the prior
+    "deepcopy-then-conditionally-overwrite-in-place" shape (#403 PR
+    review): that shape deep-copied the WHOLE source object — secret value
+    included — into the returned structure before mutating one field of
+    it in place, which is exactly the pattern taint-tracking treats as
+    "value observed, then merely reassigned" rather than "value never
+    entered the returned object."
 
     Raises:
         ValueError: an entry has no ``alias`` — a Vault path cannot be
@@ -66,18 +88,30 @@ def externalize_idp_secrets(
     """
     externalized: list[dict[str, Any]] = []
     for idp in identity_providers:
-        idp_copy = copy.deepcopy(idp)
-        alias = idp_copy.get("alias")
+        alias = idp.get("alias")
         if not alias:
             raise ValueError(
                 "identity provider entry has no 'alias' — refusing to "
                 "export it (cannot build a Vault path or verify secret "
                 "externalization without one)"
             )
-        config = idp_copy.setdefault("config", {})
+        source_config = idp.get("config") or {}
+        # Every non-secret config field is deep-copied through unmodified.
+        # Every secret field is DROPPED from this comprehension — its
+        # source value is filtered out by the `if` clause and never
+        # yielded, so it never flows into `safe_config`.
+        safe_config: dict[str, Any] = {
+            key: copy.deepcopy(value)
+            for key, value in source_config.items()
+            if key not in _SECRET_CONFIG_KEYS
+        }
         for key in _SECRET_CONFIG_KEYS:
-            if config.get(key):
-                config[key] = _VAULT_PLACEHOLDER_TEMPLATE.format(alias=alias)
+            if key in source_config:  # presence check only — never reads the value
+                safe_config[key] = _VAULT_PLACEHOLDER_TEMPLATE.format(alias=alias)
+        idp_copy = {
+            key: copy.deepcopy(value) for key, value in idp.items() if key != "config"
+        }
+        idp_copy["config"] = safe_config
         externalized.append(idp_copy)
     return externalized
 

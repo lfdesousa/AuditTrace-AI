@@ -102,6 +102,44 @@ def test_externalize_idp_secrets_skips_entries_with_no_secret():
     assert "clientSecret" not in result[0]["config"]
 
 
+def test_externalize_idp_secrets_unconditionally_replaces_empty_string_secret():
+    """The scrub is UNCONDITIONAL on presence, not gated on the source value
+    being truthy — an empty-string `clientSecret` (falsy, but still a
+    present secret field kcadm could plausibly emit) must still come out
+    as the Vault placeholder, not survive untouched. This is exactly the
+    class of bug a `if config.get(key):` truthy-check would reintroduce.
+    """
+    entry = [
+        {
+            "alias": "empty-secret-idp",
+            "providerId": "oidc",
+            "config": {"clientId": "x", "clientSecret": ""},
+        }
+    ]
+    result = idp_export.externalize_idp_secrets(entry)
+    assert (
+        result[0]["config"]["clientSecret"]
+        == "${vault:idp/empty-secret-idp/client_secret}"
+    )
+
+
+def test_externalize_idp_secrets_neutered_truthy_gate_would_leak_empty_secret_bypass():
+    """Falsifiability demo for the unconditional-scrub guard: a neutered
+    transform that gates the replacement on `if config.get(key):` (truthy,
+    the pre-fix shape) leaves an empty-string secret field UNREPLACED —
+    proving the unconditional-presence assertion above is not vacuous.
+    """
+    entry = {
+        "alias": "empty-secret-idp",
+        "config": {"clientId": "x", "clientSecret": ""},
+    }
+    neutered_config = dict(entry["config"])
+    for key in idp_export._SECRET_CONFIG_KEYS:
+        if neutered_config.get(key):  # truthy gate — the neutered (buggy) shape
+            neutered_config[key] = "${vault:idp/empty-secret-idp/client_secret}"
+    assert neutered_config["clientSecret"] == ""  # unreplaced — the leak this guards
+
+
 def test_externalize_idp_secrets_missing_alias_raises():
     with pytest.raises(ValueError, match="no 'alias'"):
         idp_export.externalize_idp_secrets(
@@ -302,6 +340,53 @@ def test_write_output_to_file(tmp_path):
     dest = tmp_path / "out.json"
     idp_export._write_output({"a": 1}, str(dest))
     assert json.loads(dest.read_text(encoding="utf-8")) == {"a": 1}
+
+
+def test_write_output_to_file_text_has_no_raw_secret_and_carries_placeholder(
+    tmp_path,
+):
+    """The regression this guards: CodeQL flagged `fh.write(text)` in
+    `_write_output` as `py/clear-text-storage-sensitive-data` (#403 PR).
+    Asserts the actual WRITTEN FILE TEXT — not just the returned payload
+    object — contains no raw secret and does carry the required
+    `config.clientSecret` placeholder (a cold `--import-realm` needs the
+    field present, just not the raw value).
+    """
+    dest = tmp_path / "export.json"
+    payload = idp_export.build_export_payload(FIXTURE_KCADM_IDP, FIXTURE_MAPPERS)
+    idp_export._write_output(payload, str(dest))
+    written_text = dest.read_text(encoding="utf-8")
+    assert PLAINTEXT_SECRET not in written_text
+    assert '"clientSecret": "${vault:idp/google-test/client_secret}"' in written_text
+
+
+def test_write_output_to_stdout_text_has_no_raw_secret_and_carries_placeholder(
+    capsys,
+):
+    """Same guard as the file-write test above, for the OTHER CodeQL-flagged
+    sink: `sys.stdout.write(text)` (`py/clear-text-logging-sensitive-data`,
+    #403 PR). Asserts the actual bytes written to stdout, not the payload
+    object alone.
+    """
+    payload = idp_export.build_export_payload(FIXTURE_KCADM_IDP, FIXTURE_MAPPERS)
+    idp_export._write_output(payload, "-")
+    written_text = capsys.readouterr().out
+    assert PLAINTEXT_SECRET not in written_text
+    assert '"clientSecret": "${vault:idp/google-test/client_secret}"' in written_text
+
+
+def test_patch_realm_document_written_text_has_no_raw_secret_and_carries_placeholder():
+    """The regression this guards, for the third callsite that produces
+    committable text: `patch_realm_document`'s returned string is what
+    `scripts/export-idp-federation.sh` ultimately writes back into the two
+    committed realm JSON files. Same two assertions as the `_write_output`
+    guards above, against the text `patch_realm_document` actually
+    returns.
+    """
+    payload = idp_export.build_export_payload(FIXTURE_KCADM_IDP, FIXTURE_MAPPERS)
+    patched_text = idp_export.patch_realm_document(PLAIN_JSON_DOCUMENT, payload)
+    assert PLAINTEXT_SECRET not in patched_text
+    assert '"clientSecret": "${vault:idp/google-test/client_secret}"' in patched_text
 
 
 def test_main_end_to_end_file_to_file(tmp_path):
