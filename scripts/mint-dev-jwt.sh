@@ -2,11 +2,26 @@
 # DESIGN §16 Phase 7 — mint a dev JWT against the running Keycloak.
 #
 # Fetches an access token via the OAuth2 client_credentials grant
-# using the `audittrace-dev` client. The token carries all the
-# scopes the memory-server needs (legacy audittrace:* + Phase 3
-# memory:*), a hardcoded audience claim `audittrace-ai`
-# for the JWT validation path, and a real Keycloak `sub` that
-# threads through as the UserContext user_id.
+# using the `audittrace-dev` client. The token carries an EXPLICIT
+# minimal read-only scope set (see SCOPE below), a hardcoded audience
+# claim `audittrace-ai` for the JWT validation path, and a real
+# Keycloak `sub` that threads through as the UserContext user_id.
+#
+# **#370 silent-admin lock.** This script used to send NO `scope`
+# parameter, so a minted token inherited whatever DEFAULT scopes the
+# `audittrace-dev` client happened to carry live — which is exactly
+# how #370 went undetected: the live realm drifted to hold
+# `audittrace:admin` as a client default while the committed JSON
+# never declared it, so every dev token silently carried admin. The
+# committed `keycloak/realm-audittrace.json` definition for
+# `audittrace-dev` is already read-only-correct (no admin scope; see
+# `docs/architecture/sequence-oauth2-flow.md`), but relying on "the
+# client's current defaults happen to be safe" is not a lock — a
+# future re-provision could add one back. Requesting an EXPLICIT
+# `scope=` here closes that gap: Keycloak only grants what is BOTH
+# requested AND assigned to the client, so an admin scope silently
+# added to the client's live defaults tomorrow still would not reach
+# a token minted by this script.
 #
 # **This script is designed to run INSIDE the audittrace-net
 # docker network** so the JWT's ``iss`` claim matches the memory-
@@ -45,6 +60,22 @@
 #                          from `secrets/dev_client_secret.txt` as a
 #                          fallback (create the file the first time
 #                          via `kcadm get clients/$ID/client-secret`)
+#   SCOPE                 — explicit space-separated scope list sent
+#                          as the OAuth2 `scope` request parameter
+#                          (#370). Defaults to a minimal READ-ONLY
+#                          subset of the scopes `audittrace-dev`
+#                          actually carries: every declared default
+#                          scope EXCEPT `audittrace:index` (a
+#                          write-triggering reindex scope — see
+#                          `audittrace.auth.ALL_SCOPES`). Never
+#                          widen the default past what
+#                          `keycloak/realm-audittrace.json`'s
+#                          `audittrace-dev` client declares — the
+#                          whole point of requesting a scope
+#                          explicitly is that this token cannot pick
+#                          up more than what is enumerated here, no
+#                          matter what the client's live defaults
+#                          drift to.
 #
 # Output: the raw `access_token` on stdout, nothing else, so the
 # script composes cleanly into ``$(./scripts/mint-dev-jwt.sh)``.
@@ -56,6 +87,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak:8080}"
 REALM="${REALM:-audittrace}"
 CLIENT_ID="${CLIENT_ID:-audittrace-dev}"
+
+# #370 silent-admin lock: explicit minimal read-only scope. Requesting
+# this instead of omitting `scope` entirely means the minted token can
+# never silently inherit a scope the client was NOT asked for — even
+# one added to the client's live defaults after this script was
+# written. Keeps every scope `audittrace-dev` currently declares as a
+# default EXCEPT `audittrace:index` (write-triggering reindex; see
+# `audittrace.auth.ALL_SCOPES`).
+SCOPE="${SCOPE:-audittrace:query audittrace:context audittrace:audit memory:episodic:read memory:procedural:read memory:conversational:read-own memory:semantic:read}"
 
 # Secret: env var wins, falls back to ${SECRETS_DIR}/dev_client_secret.txt.
 # SECRETS_DIR override matches setup-vault.sh — operator points at
@@ -92,6 +132,7 @@ RESPONSE=$(curl -sS --fail-with-body \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -d "grant_type=client_credentials" \
     -d "client_id=${CLIENT_ID}" \
-    -d "client_secret=${CLIENT_SECRET}")
+    -d "client_secret=${CLIENT_SECRET}" \
+    -d "scope=${SCOPE}")
 
 echo "${RESPONSE}" | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])"
