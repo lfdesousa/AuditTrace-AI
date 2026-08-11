@@ -58,8 +58,9 @@ security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#38
 	  src/ tests/ scripts/; \
 	echo "✅ Security-lint passed"
 
-token-guard: ## TOKEN-GUARD agent-def drift guard (ADR-059 layer 3, SPEC token-guard-kill-show-20260811). Fails if any agent def teaches the raw `audittrace-login --show` form or a direct tokens.json read. Scans the operator's real (gitignored) .claude/agents/*.md + .claude/settings.local.json, and the private sdlc/agents/** fleet defs if present. Best-effort — never fails when no targets are found (e.g. CI has no private checkout). Wired into pre-commit (id token-guard, always_run) so it's mechanically enforced, not prose (feedback_policies_must_be_mechanically_inviolable).
-	@.venv/bin/python scripts/check-agent-def-token-guard.py
+token-guard: ## TOKEN-GUARD agent-def drift guard (ADR-059 layer 3, SPEC token-guard-kill-show-20260811). Fails if any agent def teaches the raw `audittrace-login --show` form or a direct tokens.json read. Scans the operator's real (gitignored) .claude/agents/*.md + .claude/settings.local.json, and the private sdlc/agents/** fleet defs if present. Best-effort — never fails when no targets are found (e.g. CI has no private checkout). Wired into pre-commit (id token-guard, always_run) so it's mechanically enforced, not prose (feedback_policies_must_be_mechanically_inviolable). Python resolution is PORTABLE (laptop .venv/ vs CI hostedtoolcache with no repo-local .venv/) — same fallback idiom as security-lint's semgrep lookup.
+	@TG_PYTHON="$$( [ -x .venv/bin/python ] && echo .venv/bin/python || command -v python3 )"; \
+	"$$TG_PYTHON" scripts/check-agent-def-token-guard.py
 
 format: ## Run code formatting
 	@echo "📝 Running code formatter..."
