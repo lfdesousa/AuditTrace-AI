@@ -20,10 +20,13 @@ the guard is what makes the other tests RED, not an unrelated assertion.
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _GUARD_PATH = (
     Path(__file__).parent.parent / "scripts" / "check-agent-def-token-guard.py"
@@ -254,6 +257,77 @@ class TestDefaultScanTargets:
         )
         assert targets == []
 
+    def test_settings_local_json_included_when_present_alongside_public_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """``settings.local.json`` is scanned too (2026-08-11 REJECT fix,
+        FIX item 1) — it defaults to sitting alongside ``public_agents_dir``
+        (its parent), not the real machine's file, so tests stay isolated."""
+        public_dir = tmp_path / ".claude" / "agents"
+        public_dir.mkdir(parents=True)
+        (public_dir / "audittrace-builder.md").write_text("x")
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.write_text('{"permissions": {}}')
+
+        targets = guard.default_scan_targets(
+            public_agents_dir=public_dir, private_dir=tmp_path / "no-private"
+        )
+
+        assert settings in targets
+
+    def test_settings_local_json_absent_contributes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        public_dir = tmp_path / ".claude" / "agents"
+        public_dir.mkdir(parents=True)
+        (public_dir / "audittrace-builder.md").write_text("x")
+
+        targets = guard.default_scan_targets(
+            public_agents_dir=public_dir, private_dir=tmp_path / "no-private"
+        )
+
+        assert all(p.name != "settings.local.json" for p in targets)
+
+    def test_explicit_settings_file_override(self, tmp_path: Path) -> None:
+        settings = tmp_path / "custom-settings.json"
+        settings.write_text("{}")
+
+        targets = guard.default_scan_targets(
+            public_agents_dir=tmp_path / "no-agents",
+            private_dir=tmp_path / "no-private",
+            settings_file=settings,
+        )
+
+        assert targets == [settings]
+
+    def test_settings_local_json_violation_is_caught_by_scan_paths(
+        self, tmp_path: Path
+    ) -> None:
+        settings = tmp_path / "settings.local.json"
+        settings.write_text(
+            'notes: "TOKEN=$(../../scripts/audittrace-login --show 2>/dev/null | tail -1)"'
+        )
+        results = guard.scan_paths([settings])
+        assert settings in results
+
+    def test_default_repo_root_env_var_is_honoured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``AUDITTRACE_REPO_ROOT`` (not ``__file__``-relative) drives where
+        the guard looks for the REAL operator checkout — proves the module
+        constant, not just the parameter default, is env-overridable."""
+        repo_root = tmp_path / "some-checkout"
+        agents_dir = repo_root / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "x.md").write_text("clean")
+
+        monkeypatch.setattr(guard, "DEFAULT_REPO_ROOT", repo_root)
+        monkeypatch.setattr(guard, "DEFAULT_PRIVATE_DIR", tmp_path / "no-private")
+
+        targets = guard.default_scan_targets()
+
+        assert (agents_dir / "x.md") in targets
+
 
 # ── main(): CLI entrypoint ─────────────────────────────────────────────────
 
@@ -309,3 +383,117 @@ class TestMain:
 
         monkeypatch.setattr(guard, "find_violations", lambda text: [])
         assert guard.main(["--paths", str(bad)]) == 0  # neutered: silently GREEN
+
+
+# ── mechanical wiring: is the guard actually EXECUTED, or merely present? ──
+#
+# The 2026-08-11 REJECT: a correctly-written, well-tested guard that nothing
+# ever runs automatically is functionally equivalent to prose
+# (`feedback_policies_must_be_mechanically_inviolable`). Every test below
+# proves ENFORCEMENT, not just detection — each one is written so that
+# reverting the wiring (removing the Makefile target, removing/softening the
+# pre-commit hook) makes THIS test fail, independent of `find_violations`
+# ever being touched.
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestMakefileWiring:
+    def test_makefile_declares_a_token_guard_target_that_invokes_the_script(
+        self,
+    ) -> None:
+        makefile = (_REPO_ROOT / "Makefile").read_text()
+        assert "\ntoken-guard:" in makefile, (
+            "Makefile must declare a `token-guard` target — remove it (the "
+            "neuter case) and this assertion is what goes RED."
+        )
+        target_body = makefile.split("\ntoken-guard:", 1)[1].split("\n\n", 1)[0]
+        assert "check-agent-def-token-guard.py" in target_body
+
+    def test_token_guard_is_declared_phony(self) -> None:
+        makefile = (_REPO_ROOT / "Makefile").read_text()
+        # .PHONY is a backslash-continued block; join continuation lines so
+        # a target added on a later line is still found.
+        phony_block_lines: list[str] = []
+        capturing = False
+        for line in makefile.splitlines():
+            if line.startswith(".PHONY"):
+                capturing = True
+            if capturing:
+                phony_block_lines.append(line)
+                if not line.rstrip().endswith("\\"):
+                    break
+        assert "token-guard" in " ".join(phony_block_lines)
+
+
+class TestPreCommitWiring:
+    def _token_guard_hook(self) -> dict:
+        config = yaml.safe_load((_REPO_ROOT / ".pre-commit-config.yaml").read_text())
+        local_repo = next(repo for repo in config["repos"] if repo["repo"] == "local")
+        hook = next((h for h in local_repo["hooks"] if h["id"] == "token-guard"), None)
+        assert hook is not None, (
+            "the `token-guard` local pre-commit hook must be declared — "
+            "remove it (the neuter case) and this assertion goes RED"
+        )
+        return hook
+
+    def test_hook_runs_on_every_commit_regardless_of_staged_files(self) -> None:
+        hook = self._token_guard_hook()
+        # MUST be always_run + pass_filenames:false — the real targets
+        # (.claude/, the private sdlc/agents/**) are gitignored/foreign-repo,
+        # so `git diff --cached` never lists them; a staged-files-only hook
+        # would silently never fire on the files that matter.
+        assert hook.get("always_run") is True
+        assert hook.get("pass_filenames") is False
+
+    def test_hook_is_a_system_language_local_hook_invoking_the_guard(self) -> None:
+        hook = self._token_guard_hook()
+        assert hook.get("language") == "system"
+        entry = hook.get("entry", "")
+        assert "token-guard" in entry or "check-agent-def-token-guard.py" in entry
+
+
+class TestEndToEndEnforcement:
+    """Actually RUN `make token-guard` (the real Makefile invoking the real
+    script) against a synthetic bad def via `AUDITTRACE_REPO_ROOT` — the
+    closest thing to what the pre-commit hook does on every real commit.
+    """
+
+    def _run_make_token_guard(self, repo_root: Path) -> subprocess.CompletedProcess:
+        env = {
+            **os.environ,
+            "AUDITTRACE_REPO_ROOT": str(repo_root),
+            "AUDITTRACE_PRIVATE_DIR": str(repo_root / "no-such-private-dir"),
+        }
+        return subprocess.run(
+            ["make", "token-guard"],
+            cwd=_REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_fails_end_to_end_on_a_synthetic_bad_def(self, tmp_path: Path) -> None:
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "bad-def.md").write_text(
+            "TOKEN=$(../../scripts/audittrace-login --show 2>/dev/null | tail -1)\n"
+        )
+
+        result = self._run_make_token_guard(tmp_path)
+
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "FAIL" in result.stdout
+
+    def test_passes_end_to_end_on_clean_defs(self, tmp_path: Path) -> None:
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "good-def.md").write_text(
+            "python -c 'from scripts.deploy.memory import recall_deploy_lessons'\n"
+        )
+
+        result = self._run_make_token_guard(tmp_path)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "clean" in result.stdout

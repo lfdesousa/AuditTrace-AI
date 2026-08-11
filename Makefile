@@ -1,6 +1,7 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
-       deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body
+       deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
+       token-guard
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -56,6 +57,9 @@ security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#38
 	  --config ci/semgrep/rules.yml \
 	  src/ tests/ scripts/; \
 	echo "✅ Security-lint passed"
+
+token-guard: ## TOKEN-GUARD agent-def drift guard (ADR-059 layer 3, SPEC token-guard-kill-show-20260811). Fails if any agent def teaches the raw `audittrace-login --show` form or a direct tokens.json read. Scans the operator's real (gitignored) .claude/agents/*.md + .claude/settings.local.json, and the private sdlc/agents/** fleet defs if present. Best-effort — never fails when no targets are found (e.g. CI has no private checkout). Wired into pre-commit (id token-guard, always_run) so it's mechanically enforced, not prose (feedback_policies_must_be_mechanically_inviolable).
+	@.venv/bin/python scripts/check-agent-def-token-guard.py
 
 format: ## Run code formatting
 	@echo "📝 Running code formatter..."

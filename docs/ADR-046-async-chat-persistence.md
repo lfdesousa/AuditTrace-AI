@@ -371,7 +371,7 @@ Highlights:
   increment.
 
 - **Full LLM round-trip via Keycloak-authenticated `curl`**. With a
-  device-flow-issued JWT (`scripts/audittrace-login --show`) and
+  device-flow-issued JWT (`scripts/audittrace-login --show-unsafe`) and
   `X-Persist-Mode: async`, the request landed at `/v1/chat/completions`,
   passed JWT validation, ran the memory tool loop, hit the Qwen3.6
   LLM, returned 200 in 4359 ms, and the resulting `interactions` row

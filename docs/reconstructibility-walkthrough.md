@@ -53,7 +53,7 @@ A user fires one chat request against `POST /v1/chat/completions`. The prompt de
 **The request:**
 
 ```bash
-BEARER=$(scripts/audittrace-login --show)     # OAuth2 Device Flow, ADR-032
+BEARER=$(scripts/audittrace-login --show-unsafe)     # OAuth2 Device Flow, ADR-032
 curl -sk \
   -H "Authorization: Bearer $BEARER" \
   -H "Content-Type: application/json" \
@@ -457,7 +457,7 @@ This is not a gap to close; it's an honest trust boundary. The memory-server aud
 
 ```bash
 # 1. Fire the probe.
-BEARER=$(scripts/audittrace-login --show)
+BEARER=$(scripts/audittrace-login --show-unsafe)
 RESPONSE=$(curl -sk -H "Authorization: Bearer $BEARER" \
   -H "X-Project: reconstructibility-demo" \
   -H "X-Source: cli-reconstructibility" \

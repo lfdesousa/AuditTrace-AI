@@ -94,6 +94,26 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # TOKEN-GUARD layer 3 (SEC / mechanical-inviolability, SPEC
+      # token-guard-kill-show-20260811). Fails any agent def still teaching
+      # the raw `audittrace-login --show` form or a direct tokens.json read.
+      # always_run + pass_filenames: false is DELIBERATE and load-bearing:
+      # the real targets (.claude/agents/*.md, .claude/settings.local.json,
+      # the private sdlc/agents/** fleet defs) are gitignored or a foreign
+      # repo entirely, so `git diff --cached` never lists any of them — a
+      # staged-files hook would silently never fire on the files that
+      # matter. Runs on EVERY commit instead, scanning the fixed
+      # absolute/config locations (see scripts/check-agent-def-token-guard.py
+      # module docstring). A guard nothing ever runs automatically is
+      # equivalent to prose, not a gate — this closed the 2026-08-11 REJECT
+      # (`feedback_policies_must_be_mechanically_inviolable`).
+      - id: token-guard
+        name: TOKEN-GUARD agent-def drift guard (ADR-059 layer 3)
+        entry: make token-guard
+        language: system
+        always_run: true
+        pass_filenames: false
+
       # ADR-049 — Test, Evidence, and Reconstructibility Gate.
       # Refuses commits to src/audittrace/routes/** or
       # src/audittrace/services/** that lack an evidence reference

@@ -1,0 +1,18 @@
+# CODEOWNERS — guard-critical files (TOKEN-GUARD, SPEC token-guard-kill-show-20260811)
+#
+# Defense-in-depth for the files that close and mechanically enforce the
+# raw-JWT-in-agent-transcript leak (`feedback_never_materialize_tokens_in_fleet_defs`,
+# `feedback_policies_must_be_mechanically_inviolable`). A silent revert of
+# any of these re-opens the leak (scripts/audittrace-login), disables its
+# drift detector (scripts/check-agent-def-token-guard.py), or removes the
+# mechanical wiring that makes the detector actually run
+# (.pre-commit-config.yaml, Makefile). Required-review branch protection
+# for these paths is a repo-settings follow-up; this file is the mechanism
+# GitHub reads to know WHO must review.
+
+# Layer 1 — the real fix: the raw-token-print source.
+/scripts/audittrace-login                @lfdesousa
+
+# Layer 3 — the mechanical drift guard, and its wiring.
+/scripts/check-agent-def-token-guard.py  @lfdesousa
+/.pre-commit-config.yaml                 @lfdesousa
