@@ -16,7 +16,7 @@ document is the protocol they implement.
 
 | Script | Role |
 |---|---|
-| `scripts/audittrace-login` | User-facing login: interactive Device Flow (default), `--show` (print access_token, silent refresh), `--ensure` (refresh-if-needed, exit 0 on valid), `--logout` (delete tokens). Tokens land in `~/.config/audittrace/tokens.json` mode 0600. |
+| `scripts/audittrace-login` | User-facing login: interactive Device Flow (default), `--show` (print a **redacted** `token_fingerprint=<8 hex> exp=<epoch>` by default since TOKEN-GUARD 2026-08-11, silent refresh), `--show-unsafe` (explicit escape hatch — prints the raw access_token; for humans/scripts that genuinely need it, never taught to an agent def), `--ensure` (refresh-if-needed, exit 0 on valid, no token value at all), `--logout` (delete tokens). Tokens land in `~/.config/audittrace/tokens.json` mode 0600. |
 | `scripts/opencode-wrapper.sh` | Canonical OpenCode launcher. Runs `--ensure`, merges `Authorization: Bearer <token>` into every provider in `~/.config/opencode/config.json`, execs `opencode`. One-command session start. |
 | `scripts/setup-human-user.sh` | Realm provisioner for already-running Keycloak instances that pre-date ADR-032. Uses the master-realm admin API to create the `audittrace-opencode` public client + `luis` realm user. Idempotent. |
 
@@ -63,21 +63,24 @@ sequenceDiagram
 
 ## Token refresh (silent, inside the SSO session lifetime)
 
-`audittrace-login --show` and `--ensure` check the saved
-`access_expires_at` against now. If the access token is within
-`REFRESH_THRESHOLD_SECONDS` (default 60) of expiry, the CLI silently
-posts a `refresh_token` grant, overwrites `tokens.json` with the new
-pair, and returns. Callers (wrappers, ad-hoc scripts) never see a
-401 from expired tokens while the refresh chain still holds.
+`audittrace-login --show` (and `--show-unsafe`) and `--ensure` all check
+the saved `access_expires_at` against now — the refresh check is shared;
+only what gets PRINTED afterward differs (`--show` → redacted fingerprint,
+`--show-unsafe` → raw token, `--ensure` → nothing, just an exit code). If
+the access token is within `REFRESH_THRESHOLD_SECONDS` (default 60) of
+expiry, the CLI silently posts a `refresh_token` grant, overwrites
+`tokens.json` with the new pair, and returns. Callers (wrappers, ad-hoc
+scripts) never see a 401 from expired tokens while the refresh chain
+still holds.
 
 ```mermaid
 sequenceDiagram
-    participant Caller as opencode-wrapper.sh\nor BEARER=$(audittrace-login --show)
+    participant Caller as opencode-wrapper.sh\nor BEARER=$(audittrace-login --show-unsafe)
     participant CLI as audittrace-login
     participant FS as ~/.config/audittrace/tokens.json
     participant KC as Keycloak
 
-    Caller->>CLI: --show (or --ensure)
+    Caller->>CLI: --show-unsafe (or --ensure)
     CLI->>FS: read access_expires_at, refresh_token
     alt access_expires_at - now > 60s (REFRESH_THRESHOLD_SECONDS)
         Note over CLI: plenty of life left — return current access_token as-is
@@ -373,16 +376,17 @@ truth: `keycloak/realm-audittrace.json`):
 | Client | Flow | Default scopes |
 |---|---|---|
 | `audittrace-opencode` (ADR-032, humans) | Device Flow | `audittrace:query`, `:context`, `:audit`, all four `memory:*` |
-| `audittrace-dev` (dev tooling, `mint-dev-jwt.sh`) | client_credentials | READ-ONLY: `audittrace:query`, `:context`, `:audit`, `:index`, plus `memory:{episodic,procedural,semantic}:read` and `memory:conversational:read-own`. **No write scope and no `audittrace:admin`.** |
+| `audittrace-dev` (dev tooling, `mint-dev-jwt.sh`) | client_credentials | READ-ONLY, EXPLICITLY REQUESTED (#370): `audittrace:query`, `:context`, `:audit`, plus `memory:{episodic,procedural,semantic}:read` and `memory:conversational:read-own`. **No write scope and no `audittrace:admin`.** The client's committed default set additionally includes `audittrace:index` (a write-triggering reindex scope), but `mint-dev-jwt.sh` deliberately does not request it — see the silent-admin-lock note below. |
 | `audittrace-restricted` (adversarial verification, SC-09) | Device Flow | `audittrace:query`, `:context`, `memory:conversational:read-own`. Holds **no audit or admin scope in either scope set** — deliberately, so its token cannot be widened by asking. |
 | `opencode-agent`, `continue-agent`, `roocode-agent` | client-JWT client_credentials | `audittrace:query` only (legacy, pre-ADR-032) |
 | `inject-memory` | client-JWT | `audittrace:context`, `:index` |
+| `admin-client` | client-JWT | `audittrace:admin`, `:audit`, plus `memory:{episodic,procedural,semantic}:{read,write}`. The `ensure-memory-scopes` Job (`scripts/setup-memory-scopes.sh`) additionally binds `audittrace:assessment:ingest`, `memory:decisions:write` and `memory:skills:write` as defaults — see the ACCEPT note below for why that's by design. |
 
 > **Corrected 2026-07-21.** This table previously said `audittrace-dev` was
 > *"identical to `audittrace-opencode`"*. It was not, in the direction that
 > mattered: `audittrace-dev` held `audittrace:admin` as a **default** scope
 > while `audittrace-opencode` holds it as *optional*. Because
-> `scripts/mint-dev-jwt.sh` sends no `scope` parameter, every dev token
+> `scripts/mint-dev-jwt.sh` sent no `scope` parameter, every dev token
 > silently carried admin. Corrected on the live realm (#370) and the claim
 > rewritten here.
 >
@@ -394,7 +398,34 @@ truth: `keycloak/realm-audittrace.json`):
 > **(2)** A client is defined by its scope sets, not by a prose comparison to
 > another client. "Identical to X" ages badly and cannot be verified; list the
 > scopes.
-| `admin-client` | client-JWT | `audittrace:admin`, `:audit`, plus `memory:{episodic,procedural,semantic}:{read,write}`. The `ensure-memory-scopes` Job additionally binds `audittrace:assessment:ingest`, `memory:decisions:write` and `memory:skills:write` as defaults. |
+>
+> **RATIFIED 2026-08-11 — `admin-client` scope surface: ACCEPT, don't narrow
+> (#370 follow-up).** `admin-client`'s *committed* `defaultClientScopes` in
+> `keycloak/realm-audittrace.json` (`audittrace:admin`, `:audit`) is
+> deliberately a subset of what the client holds live. The remainder —
+> every `memory:*:write` scope plus `audittrace:assessment:ingest` — is
+> bound as a DEFAULT by `scripts/setup-memory-scopes.sh` / the in-cluster
+> `ensure-memory-scopes` Job, because `--import-realm` only runs on first
+> boot and this Job is how the corpus-write scope set actually reaches the
+> client on every install/upgrade. `post-deploy-verify.sh` Check 11
+> compares the live realm against the declared realm **UNION** this Job's
+> intent for exactly that reason. The JSON-vs-live delta on `admin-client`
+> is BY DESIGN, not drift — do not "fix" it by narrowing the Job's `SCOPES`
+> array or by adding the scopes to the committed JSON (the JSON is the
+> first-boot-only bootstrap; the Job is the reconciler). If Check 11 ever
+> reports `admin-client` over-privileged for a scope this Job does not
+> bind, THAT is the real drift to chase.
+>
+> **RATIFIED 2026-08-11 — `mint-dev-jwt.sh` requests an explicit scope
+> (#370 follow-up).** The corrected `audittrace-dev` live/declared parity
+> above closed the immediate #370 finding, but the *script* still sent no
+> `scope` parameter — so a *future* re-provision that re-adds an admin
+> default to `audittrace-dev` would silently widen every dev token again
+> with no code change to notice. `scripts/mint-dev-jwt.sh` now requests an
+> explicit, minimal, read-only `scope=` (see the script's own header
+> comment for the exact list). Keycloak only grants what is both requested
+> AND assigned to the client, so this closes the class of bug rather than
+> just the one instance of it.
 
 `is_admin` in the resolved `UserContext` is derived programmatically
 via `is_admin_scope()` — true when the `audittrace:admin` scope is

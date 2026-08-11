@@ -229,6 +229,17 @@ select = [
 ]
 ignore = ["E501"]  # Line length handled by black
 
+[tool.ruff.lint.per-file-ignores]
+# scripts/ deliberately uses hyphenated CLI-style names (check-per-file-coverage.py,
+# check-no-skipped-tests.py, audittrace-login, index-chromadb.py, ...) — a repo-wide
+# convention `make lint` already scopes around (it only lints src/ + tests/). N999
+# (invalid module name) only matters for importable package modules; these are
+# standalone entrypoints, never `import`ed by name. Without this, the pre-commit
+# ruff hook (which lints staged scripts/ files too) fails on the PRE-EXISTING
+# convention the moment any scripts/*.py file is touched — TOKEN-GUARD hit this on
+# scripts/check-agent-def-token-guard.py + scripts/index-chromadb.py (2026-08-11).
+"scripts/*.py" = ["N999"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["audittrace"]
 

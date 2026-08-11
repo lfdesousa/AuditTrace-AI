@@ -122,7 +122,7 @@ def _resolve_token(args: argparse.Namespace) -> str:
         return env_token
     logger.error(
         "No auth token. Pass --token, set AUDITTRACE_TOKEN, "
-        "or run: TOKEN=$(scripts/audittrace-login --show)"
+        "or run: TOKEN=$(scripts/audittrace-login --show-unsafe)"
     )
     sys.exit(1)
 

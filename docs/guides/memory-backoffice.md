@@ -126,7 +126,7 @@ a pod restart.
 ### Add an ADR
 
 ```sh
-TOKEN=$(scripts/audittrace-login --show)
+TOKEN=$(scripts/audittrace-login --show-unsafe)
 curl -X POST https://<your-host>:30952/memory/episodic \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \

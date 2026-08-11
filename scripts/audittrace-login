@@ -8,16 +8,34 @@
 #
 # then subsequently in scripts / wrappers:
 #
-#   BEARER=$(scripts/audittrace-login --show)     # refresh if needed, print access_token
-#   scripts/audittrace-login --ensure              # refresh if needed, exit 0 if token valid
-#   scripts/audittrace-login --logout              # delete the saved token pair
+#   scripts/audittrace-login --show                # refresh if needed, print a
+#                                                    # REDACTED fingerprint (no JWT)
+#   scripts/audittrace-login --show-unsafe          # refresh if needed, print the
+#                                                    # RAW access_token (escape hatch;
+#                                                    # never teach this to an agent def)
+#   scripts/audittrace-login --ensure               # refresh if needed, exit 0 if token valid
+#   scripts/audittrace-login --logout               # delete the saved token pair
 #
 # Tokens land in ~/.config/audittrace/tokens.json (mode 600). The
 # file holds {access_token, refresh_token, access_expires_at,
-# refresh_expires_at, realm_issuer, client_id}. ``--show`` transparently
-# refreshes the access_token if it's within ``REFRESH_THRESHOLD_SECONDS``
-# of expiry so long-lived scripts don't have to know about the
-# refresh dance.
+# refresh_expires_at, realm_issuer, client_id}. ``--show``/``--show-unsafe``
+# transparently refresh the access_token if it's within
+# ``REFRESH_THRESHOLD_SECONDS`` of expiry so long-lived scripts don't have to
+# know about the refresh dance.
+#
+# TOKEN-GUARD (2026-08-11): ``--show`` used to print the raw access_token —
+# any agent invoking it got a live JWT in its own transcript, entirely
+# outside the Read-tool token deny. It now prints a redacted
+# ``sha256(token)[:8]`` fingerprint + the ``exp`` epoch instead: enough to
+# answer "am I logged in, and until when?" without exposing the credential.
+# The raw value is still available, but only via the explicit
+# ``--show-unsafe`` flag or ``AUDITTRACE_SHOW_RAW=1`` env var — an escape
+# hatch for scripts that need a real Bearer value (e.g. writing it into a
+# proxy config), never for anything an LLM agent reads. The SANCTIONED
+# in-process path for scripts/agents (never prints, never touches argv) is
+# ``scripts/deploy/memory.py::_resolve_token`` / ``scripts/release/memory.py``
+# — prefer that over shelling out to this script at all where Python is
+# already in the loop.
 #
 # Why Device Flow:
 #   - OpenCode + Continue + Roo Code have no browser of their own.
@@ -75,6 +93,7 @@ require() {
 
 require curl
 require jq
+require sha256sum
 
 # Self-signed mkcert TLS is the dev default; auto-bypass for local dev
 # hostnames unless the operator opts in via CURL_VERIFY=1. Covers both
@@ -263,9 +282,31 @@ action_refresh_if_needed() {
   chmod 600 "$TOKENS_FILE"
 }
 
+# Redacted "am I logged in?" signal: a short SHA-256 fingerprint of the
+# access_token plus its expiry epoch — never the token itself. This is the
+# TOKEN-GUARD fix (2026-08-11): the previous unconditional raw print was the
+# single most direct token-leak path (any agent invoking --show got a live
+# JWT in its own transcript). Kept as a standalone function so both
+# action_show (default) and the --show-unsafe / AUDITTRACE_SHOW_RAW=1 escape
+# hatch can share the refresh step while diverging on what gets printed.
+show_token_fingerprint() {
+  local token exp fp
+  token="$(jq -r '.access_token' "$TOKENS_FILE")"
+  exp="$(jq -r '.access_expires_at // 0' "$TOKENS_FILE")"
+  fp="$(printf '%s' "$token" | sha256sum | cut -c1-8)"
+  echo "token_fingerprint=${fp} exp=${exp}"
+}
+
 action_show() {
   action_refresh_if_needed
-  jq -r '.access_token' "$TOKENS_FILE"
+  if [[ "$SHOW_RAW" == "1" || "${AUDITTRACE_SHOW_RAW:-0}" == "1" ]]; then
+    # Explicit escape hatch only — see the TOKEN-GUARD header note. No agent
+    # def should ever be taught this flag/env var; it is for the rare human
+    # or script that genuinely needs the raw Bearer value.
+    jq -r '.access_token' "$TOKENS_FILE"
+    return
+  fi
+  show_token_fingerprint
 }
 
 action_ensure() {
@@ -279,12 +320,14 @@ action_ensure() {
 # request. Refreshes preserve the original grant, so admin/write scopes
 # require a fresh login with `--scope` set.
 ACTION="login"
+SHOW_RAW="0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    login)        ACTION="login"; shift ;;
-    --show)       ACTION="show"; shift ;;
-    --ensure)     ACTION="ensure"; shift ;;
-    --logout)     ACTION="logout"; shift ;;
+    login)          ACTION="login"; shift ;;
+    --show)         ACTION="show"; shift ;;
+    --show-unsafe)  ACTION="show"; SHOW_RAW="1"; shift ;;
+    --ensure)       ACTION="ensure"; shift ;;
+    --logout)       ACTION="logout"; shift ;;
     --scope)
       if [[ $# -lt 2 ]]; then
         echo "error: --scope requires a value (e.g. --scope audittrace:admin)" >&2
@@ -300,7 +343,9 @@ audittrace-login — OAuth2 Device Flow helper (ADR-032)
 Usage:
   audittrace-login                       Interactive login (Device Flow)
   audittrace-login --scope <scopes>      Request extra scopes (e.g. audittrace:admin) at login
-  audittrace-login --show                Print access_token to stdout (refresh if needed)
+  audittrace-login --show                Print a REDACTED token fingerprint + exp (refresh if needed)
+  audittrace-login --show-unsafe         Print the RAW access_token (escape hatch; never teach
+                                          this to an agent def — see TOKEN-GUARD note up top)
   audittrace-login --ensure              Refresh if needed, exit 0 if token valid
   audittrace-login --logout              Delete the saved token pair
 
@@ -311,6 +356,9 @@ Environment overrides:
   AUDITTRACE_TOKENS_DIR    (default ~/.config/audittrace)
   AUDITTRACE_EXTRA_SCOPES  (space-separated; same effect as --scope)
   REFRESH_THRESHOLD_SECONDS (default 60 — refresh if expires within this window)
+  AUDITTRACE_SHOW_RAW      (1 = --show also prints the raw token; same escape
+                            hatch as --show-unsafe, exists for callers that
+                            can't easily pass a flag)
 EOF
       exit 0
       ;;

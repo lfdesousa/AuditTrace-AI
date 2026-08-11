@@ -114,8 +114,14 @@ Three scripts, each doing one thing:
 - **`scripts/audittrace-login`** — user-facing CLI:
   - `audittrace-login` → initiate Device Flow, block on polling,
     persist tokens.
-  - `audittrace-login --show` → print the current access_token to
-    stdout; refresh silently if near expiry.
+  - `audittrace-login --show` → print a **redacted** fingerprint
+    (`token_fingerprint=<sha256[:8]> exp=<epoch>`) to stdout; refresh
+    silently if near expiry. Since TOKEN-GUARD (2026-08-11) this no
+    longer prints the raw `access_token` by default — that was the
+    single most direct path for an agent invoking `--show` to leak a
+    live JWT into its own transcript. The raw value is still
+    reachable via the explicit `--show-unsafe` escape hatch (or
+    `AUDITTRACE_SHOW_RAW=1`), never taught to an agent def.
   - `audittrace-login --ensure` → refresh if needed, exit 0 when a
     valid token is available. For scripts that just need to know
     "am I authed?".
@@ -123,7 +129,8 @@ Three scripts, each doing one thing:
   - Stdlib-only (`curl` + `jq` only). ~250 LOC of bash.
 
 - **`scripts/opencode-wrapper.sh`** — the launcher. Runs
-  `--ensure`, falls back to `--show`, merges
+  `--ensure`, then `--show-unsafe` (it needs the real Bearer value
+  to write into the config, not the redacted fingerprint), merges
   `Authorization: Bearer <token>` into every provider's
   `options.headers` in `~/.config/opencode/config.json` (backups
   alongside, atomic via mktemp+mv), then execs `opencode`. One

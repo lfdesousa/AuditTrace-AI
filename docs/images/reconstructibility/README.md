@@ -12,7 +12,7 @@ These screenshots are embedded in `docs/reconstructibility-walkthrough.md`. The 
 Run this probe first so every screenshot is of the same request:
 
 ```bash
-BEARER=$(scripts/audittrace-login --show)
+BEARER=$(scripts/audittrace-login --show-unsafe)
 curl -sk \
   -H "Authorization: Bearer $BEARER" \
   -H "Content-Type: application/json" \

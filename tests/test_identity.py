@@ -22,12 +22,14 @@ import fakeredis
 import pytest
 
 from audittrace.identity import (
+    CORPUS_WRITE_SCOPE_GLOB,
     SENTINEL_SUBJECT,
     SENTINEL_USERNAME,
     TokenCache,
     UserContext,
     hash_token,
     is_admin_scope,
+    is_privileged_scope,
     sentinel_user_context,
 )
 
@@ -131,6 +133,73 @@ class TestIsAdminScope:
 
     def test_empty_scopes_is_not_admin(self):
         assert is_admin_scope([]) is False
+
+
+class TestIsPrivilegedScope:
+    """#371 — the residual gap: ``memory:corpus:*:write`` must rank as
+    privileged (ADR-062 §4), but MUST NOT be folded into ``is_admin_scope``
+    (app-layer authz stays untouched by this change).
+
+    Each corpus-write case below is written to be individually falsifiable:
+    delete the ``fnmatch`` clause (or shrink ``CORPUS_WRITE_SCOPE_GLOB`` to
+    something that no longer matches) and every ``is True`` assertion here
+    goes RED, because ``is_privileged_scope`` would fall back to
+    ``is_admin_scope`` alone.
+    """
+
+    @pytest.mark.parametrize(
+        "collection", ["decisions", "skills", "semantic", "some-future-collection"]
+    )
+    def test_corpus_write_scope_is_privileged(self, collection):
+        assert is_privileged_scope([f"memory:corpus:{collection}:write"]) is True
+
+    @pytest.mark.parametrize(
+        "collection", ["decisions", "skills", "semantic", "some-future-collection"]
+    )
+    def test_corpus_read_scope_is_not_privileged(self, collection):
+        assert is_privileged_scope([f"memory:corpus:{collection}:read"]) is False
+
+    def test_plain_layer_write_scope_is_not_privileged(self):
+        """``memory:episodic:write`` etc. are ordinary per-user writer
+        scopes every legitimate client holds (webui, opencode) — folding
+        them in here would make the shadow-client guard cry wolf on every
+        normal deployment (ADR-062 §4 distinguishes granular corpus scopes
+        from the per-user ``memory:<layer>:*`` scopes)."""
+        assert is_privileged_scope(["memory:episodic:write"]) is False
+        assert is_privileged_scope(["memory:semantic:write"]) is False
+
+    def test_admin_scope_is_also_privileged(self):
+        """``is_privileged_scope`` is a superset of ``is_admin_scope``."""
+        assert is_privileged_scope(["audittrace:admin"]) is True
+        assert is_privileged_scope(["memory:admin"]) is True
+
+    def test_mixed_scopes_any_privileged_wins(self):
+        assert (
+            is_privileged_scope(["memory:read", "memory:corpus:decisions:write"])
+            is True
+        )
+
+    def test_empty_scopes_is_not_privileged(self):
+        assert is_privileged_scope([]) is False
+
+    def test_read_scopes_alone_are_not_privileged(self):
+        assert is_privileged_scope(["memory:read", "session:read-own"]) is False
+
+    def test_corpus_write_does_not_become_admin_scope(self):
+        """Kept SEPARATE from ``is_admin_scope`` on purpose (ADR-062 §4:
+        corpus write is operator/curator-tier, not app-admin-tier) —
+        a corpus-write holder must rank privileged for shadow-client
+        ranking WITHOUT gaining ``is_admin_scope`` / the RLS bypass."""
+        scopes = ["memory:corpus:decisions:write"]
+        assert is_privileged_scope(scopes) is True
+        assert is_admin_scope(scopes) is False
+
+    def test_glob_constant_shape(self):
+        """Pin the exact literal the shell guard mirrors verbatim — a
+        change here without updating ``post-deploy-verify.sh`` is caught by
+        ``TestPrivilegedCorpusScopeSingleSourceOfTruth`` in
+        ``tests/test_chart_drift_guards.py``."""
+        assert CORPUS_WRITE_SCOPE_GLOB == "memory:corpus:*:write"
 
 
 class TestSentinelUserContext:
