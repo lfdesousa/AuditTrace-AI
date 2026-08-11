@@ -16,7 +16,7 @@ document is the protocol they implement.
 
 | Script | Role |
 |---|---|
-| `scripts/audittrace-login` | User-facing login: interactive Device Flow (default), `--show` (print access_token, silent refresh), `--ensure` (refresh-if-needed, exit 0 on valid), `--logout` (delete tokens). Tokens land in `~/.config/audittrace/tokens.json` mode 0600. |
+| `scripts/audittrace-login` | User-facing login: interactive Device Flow (default), `--show` (print a **redacted** `token_fingerprint=<8 hex> exp=<epoch>` by default since TOKEN-GUARD 2026-08-11, silent refresh), `--show-unsafe` (explicit escape hatch — prints the raw access_token; for humans/scripts that genuinely need it, never taught to an agent def), `--ensure` (refresh-if-needed, exit 0 on valid, no token value at all), `--logout` (delete tokens). Tokens land in `~/.config/audittrace/tokens.json` mode 0600. |
 | `scripts/opencode-wrapper.sh` | Canonical OpenCode launcher. Runs `--ensure`, merges `Authorization: Bearer <token>` into every provider in `~/.config/opencode/config.json`, execs `opencode`. One-command session start. |
 | `scripts/setup-human-user.sh` | Realm provisioner for already-running Keycloak instances that pre-date ADR-032. Uses the master-realm admin API to create the `audittrace-opencode` public client + `luis` realm user. Idempotent. |
 
@@ -63,21 +63,24 @@ sequenceDiagram
 
 ## Token refresh (silent, inside the SSO session lifetime)
 
-`audittrace-login --show` and `--ensure` check the saved
-`access_expires_at` against now. If the access token is within
-`REFRESH_THRESHOLD_SECONDS` (default 60) of expiry, the CLI silently
-posts a `refresh_token` grant, overwrites `tokens.json` with the new
-pair, and returns. Callers (wrappers, ad-hoc scripts) never see a
-401 from expired tokens while the refresh chain still holds.
+`audittrace-login --show` (and `--show-unsafe`) and `--ensure` all check
+the saved `access_expires_at` against now — the refresh check is shared;
+only what gets PRINTED afterward differs (`--show` → redacted fingerprint,
+`--show-unsafe` → raw token, `--ensure` → nothing, just an exit code). If
+the access token is within `REFRESH_THRESHOLD_SECONDS` (default 60) of
+expiry, the CLI silently posts a `refresh_token` grant, overwrites
+`tokens.json` with the new pair, and returns. Callers (wrappers, ad-hoc
+scripts) never see a 401 from expired tokens while the refresh chain
+still holds.
 
 ```mermaid
 sequenceDiagram
-    participant Caller as opencode-wrapper.sh\nor BEARER=$(audittrace-login --show)
+    participant Caller as opencode-wrapper.sh\nor BEARER=$(audittrace-login --show-unsafe)
     participant CLI as audittrace-login
     participant FS as ~/.config/audittrace/tokens.json
     participant KC as Keycloak
 
-    Caller->>CLI: --show (or --ensure)
+    Caller->>CLI: --show-unsafe (or --ensure)
     CLI->>FS: read access_expires_at, refresh_token
     alt access_expires_at - now > 60s (REFRESH_THRESHOLD_SECONDS)
         Note over CLI: plenty of life left — return current access_token as-is
