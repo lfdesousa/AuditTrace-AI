@@ -15,6 +15,14 @@ This module exports:
 - ``hash_token`` — sha256 hex helper. Used as the cache key so the
   raw token never reaches Redis, logs, or memory dumps.
 - ``is_admin_scope`` — checks whether a scope tuple grants admin.
+- ``is_privileged_scope`` — checks whether a scope tuple grants admin
+  OR a granular ``memory:corpus:*:write`` scope (ADR-062 §4). Used for
+  shadow-client blast-radius ranking, deliberately distinct from
+  ``is_admin_scope`` (app-layer authz).
+- ``CORPUS_WRITE_SCOPE_GLOB`` — the single-source-of-truth glob string
+  for a corpus-write scope, mirrored verbatim in
+  ``scripts/post-deploy-verify.sh`` Check 11 and cross-checked by
+  ``tests/test_chart_drift_guards.py``.
 - ``sentinel_user_context`` — bypass-mode UserContext for the
   ``AUDITTRACE_AUTH_REQUIRED=false`` migration window.
 - ``TokenCache`` — Redis-backed sha256→UserContext store with TTL.
@@ -32,6 +40,7 @@ with other users of the same Redis instance.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
@@ -131,6 +140,52 @@ def is_admin_scope(scopes: Iterable[str]) -> bool:
     return any(
         s in ("audittrace:admin", "memory:admin") or s.startswith("admin:")
         for s in scopes
+    )
+
+
+# The single source of truth for "what is a corpus-write scope" (#371,
+# ADR-062 §4: "memory:corpus:<collection>:write" per recall collection,
+# {decisions, skills, semantic}). This EXACT string is mirrored verbatim in
+# the shell `case` pattern in `scripts/post-deploy-verify.sh` Check 11
+# (shell glob syntax happens to be `fnmatch`-compatible), and
+# `tests/test_chart_drift_guards.py::TestPrivilegedCorpusScopeSingleSourceOfTruth`
+# reads both files and asserts they still agree — so the app classifier and
+# the shell guard cannot silently drift apart the way #370/#371 drifted.
+CORPUS_WRITE_SCOPE_GLOB = "memory:corpus:*:write"
+
+
+def is_privileged_scope(scopes: Iterable[str]) -> bool:
+    """True iff any scope is admin OR a granular corpus-write scope.
+
+    Recognises everything ``is_admin_scope`` does, PLUS the granular
+    ``memory:corpus:<collection>:write`` scopes named in ADR-062 §4
+    (``docs/ADR-062-five-layer-memory-model.md:266-269``): "the scope-drift
+    guard must learn the granular corpus scopes so an undeclared holder is
+    flagged." Corpus write is operator/curator-tier access to the shared
+    corpus (Layer 5) — an UNDECLARED client holding one is exactly the
+    shadow-writer threat #371 exists to catch, so it is ranked ``!!``
+    (privileged blast radius) by ``scripts/post-deploy-verify.sh`` Check 11.
+
+    Deliberately does **not** fold plain ``memory:<layer>:write`` (e.g.
+    ``memory:episodic:write``) in here — that is the ordinary per-user
+    writer scope every legitimate client (webui, opencode) holds, and
+    flagging it would make the shadow-client guard cry wolf on every normal
+    deployment. Only the granular ``memory:corpus:*:write`` form counts.
+    Read scopes (``memory:corpus:<collection>:read``) are likewise never
+    privileged — read access to the shared corpus is not the elevation this
+    guards against.
+
+    Kept SEPARATE from ``is_admin_scope`` on purpose: this function drives
+    shadow-client blast-radius RANKING only. Folding a corpus-write scope
+    into ``is_admin_scope`` would silently grant a Layer-5 writer the RLS
+    bypass and every other admin-gated app capability via
+    ``UserContext.is_admin`` — ADR-062 §4 calls corpus write
+    "operator/curator-tier", not app-admin-tier, so ``is_admin_scope``
+    (and therefore ``UserContext.is_admin``) must stay untouched by this
+    change.
+    """
+    return is_admin_scope(scopes) or any(
+        fnmatch.fnmatchcase(s, CORPUS_WRITE_SCOPE_GLOB) for s in scopes
     )
 
 
