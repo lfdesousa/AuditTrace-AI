@@ -23,11 +23,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from fastapi import Request
 
+from audittrace.services.recall_telemetry import classify_recall_source_from_request
 from scripts.deploy import memory
 from scripts.deploy.memory import (
     DeployLogError,
     _ensure_md,
+    _fleet_headers,
     _multipart_body,
     _normalize_front_door,
     _record_bytes_and_name,
@@ -200,6 +203,158 @@ def test_recall_passes_insecure_context(monkeypatch):
     )
     recall_deploy_lessons("q", front_door=FRONT, token=TOKEN, insecure=True)
     assert fake.calls[0]["context"] is not None  # unverified SSL context selected
+
+
+# ── recall: fleet attribution headers (RECALL-METRIC-COVERAGE crux #4a) ──────
+#
+# The independent review of ``ef49935`` found the server-side classifier
+# (``classify_recall_source_from_request``) was fully wired but INERT on real
+# fleet traffic: ``recall_deploy_lessons`` never sent the ``X-Source`` /
+# ``X-Agent-Role`` headers it keys on, so a genuine fleet recall was always
+# classified ``"backoffice"``. ``recall_deploy_lessons`` is the SHARED recall
+# path for BOTH the local OpenCode/Qwen fleet AND the Sonnet cloud fleet, so
+# ``X-Agent-Role`` (always sent, runtime-agnostic) is the LOAD-BEARING
+# classification signal for both, while ``X-Source`` stays runtime-honest via
+# ``AUDITTRACE_AGENT_RUNTIME`` — never a hardcoded ``"opencode-"`` prefix,
+# which would mislabel Sonnet-fleet recalls as OpenCode. These tests are the
+# falsifiable proof the two halves now connect: (1) the outbound request
+# carries the headers, and (2) a request built with those exact headers is
+# classified ``"fleet"`` by the REAL server-side classifier (not a
+# re-implementation of its logic).
+
+
+def _request_with_headers(headers: dict[str, str]) -> Request:
+    """Bare Starlette ``Request`` from a raw ASGI scope carrying ``headers``
+    — same idiom as ``tests/test_recall_telemetry.py::_make_request`` — used
+    to feed the REAL server-side classifier the exact headers
+    ``recall_deploy_lessons`` sends, proving the two halves connect."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/memory/semantic",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    }
+    return Request(scope)
+
+
+def _clear_agent_env(monkeypatch):
+    monkeypatch.delenv("AUDITTRACE_AGENT_ROLE", raising=False)
+    monkeypatch.delenv("AUDITTRACE_AGENT_RUNTIME", raising=False)
+
+
+def test_recall_always_sends_x_agent_role_header(monkeypatch):
+    """``X-Agent-Role`` is the UNIVERSAL, runtime-agnostic fleet marker and
+    must be present on every outbound recall GET regardless of runtime.
+    Neuter: stop sending the header (or send it empty) -> RED."""
+    _clear_env_token(monkeypatch)
+    monkeypatch.setenv("AUDITTRACE_AGENT_ROLE", "reviewer")
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    headers = fake.calls[0]["headers"]
+    assert headers["X-Agent-Role"] == "reviewer"
+    # the bearer token must still be present alongside the new headers
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_recall_sends_fleet_default_x_agent_role_when_unset(monkeypatch):
+    """``recall_deploy_lessons`` is BY DEFINITION the fleet/agent recall path
+    (never a human front-door read) — an unset ``AUDITTRACE_AGENT_ROLE`` must
+    still default to the fleet marker, NEVER ``backoffice``/empty. Neuter:
+    change the default to omit ``X-Agent-Role`` -> RED."""
+    _clear_agent_env(monkeypatch)
+    _clear_env_token(monkeypatch)
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    headers = fake.calls[0]["headers"]
+    assert headers["X-Agent-Role"] == "fleet"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "role", "expected_x_source"),
+    [
+        ("opencode", "builder", "opencode-builder"),
+        ("sonnet", "reviewer", "sonnet-reviewer"),
+        ("", "builder", "builder"),  # no runtime known -> bare role, no prefix
+        ("", "", "fleet"),  # nothing configured -> plain fleet marker
+    ],
+)
+def test_recall_x_source_is_runtime_honest_not_hardcoded_opencode(
+    monkeypatch, runtime, role, expected_x_source
+):
+    """``X-Source`` must reflect the ACTUAL calling runtime (OpenCode vs
+    Sonnet), never a hardcoded ``"opencode-"`` prefix that would mislabel
+    Sonnet-fleet recalls as OpenCode. Neuter: hardcode the ``opencode-``
+    prefix back in -> the ``sonnet``/``""`` cases go RED."""
+    _clear_env_token(monkeypatch)
+    _clear_agent_env(monkeypatch)
+    if runtime:
+        monkeypatch.setenv("AUDITTRACE_AGENT_RUNTIME", runtime)
+    if role:
+        monkeypatch.setenv("AUDITTRACE_AGENT_ROLE", role)
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    headers = fake.calls[0]["headers"]
+    assert headers["X-Source"] == expected_x_source
+
+
+def test_fleet_headers_role_and_runtime_from_env_directly(monkeypatch):
+    monkeypatch.setenv("AUDITTRACE_AGENT_ROLE", "builder")
+    monkeypatch.setenv("AUDITTRACE_AGENT_RUNTIME", "sonnet")
+    assert _fleet_headers() == {
+        "X-Source": "sonnet-builder",
+        "X-Agent-Role": "builder",
+    }
+
+
+def test_fleet_headers_defaults_when_env_blank(monkeypatch):
+    monkeypatch.setenv("AUDITTRACE_AGENT_ROLE", "   ")
+    monkeypatch.delenv("AUDITTRACE_AGENT_RUNTIME", raising=False)
+    assert _fleet_headers() == {
+        "X-Source": "fleet",
+        "X-Agent-Role": "fleet",
+    }
+
+
+@pytest.mark.parametrize(
+    ("runtime", "role"),
+    [
+        ("opencode", "builder"),
+        ("sonnet", "reviewer"),
+        ("sonnet", "deployer"),
+        ("", "verifier"),
+        ("", ""),  # nothing configured -> still classifies fleet
+    ],
+)
+def test_recall_headers_classify_as_fleet_by_the_real_server_classifier(
+    monkeypatch, runtime, role
+):
+    """End-to-end connection proof: feed the REAL
+    ``classify_recall_source_from_request`` a request carrying the EXACT
+    headers ``recall_deploy_lessons`` sends — for BOTH the OpenCode runtime
+    and the Sonnet runtime, and the fully-unconfigured default. This must
+    classify ``"fleet"`` in every case — never ``"backoffice"``. Neuter
+    either the header-sending side (drop ``_fleet_headers()`` from the
+    outbound call, or drop ``X-Agent-Role`` from it) or the classifier's own
+    logic -> RED."""
+    _clear_env_token(monkeypatch)
+    _clear_agent_env(monkeypatch)
+    if runtime:
+        monkeypatch.setenv("AUDITTRACE_AGENT_RUNTIME", runtime)
+    if role:
+        monkeypatch.setenv("AUDITTRACE_AGENT_ROLE", role)
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    sent_headers = fake.calls[0]["headers"]
+    request = _request_with_headers(sent_headers)
+    assert classify_recall_source_from_request(request) == "fleet"
 
 
 # ── log: happy path ─────────────────────────────────────────────────────────────
