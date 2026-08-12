@@ -30,6 +30,14 @@ Two public functions with DELIBERATELY ASYMMETRIC failure contracts:
   scheme/host checks — never a substring membership test on the raw URL string
   (the CodeQL ``py/incomplete-url-substring`` class that tripped WS2; the lesson
   "never substring-match URLs" is logged in the decisions layer).
+* Every outbound recall GET carries :func:`_fleet_headers` — a UNIVERSAL,
+  runtime-agnostic ``X-Agent-Role`` (``AUDITTRACE_AGENT_ROLE``, default
+  ``"fleet"``) that the server-side ``classify_recall_source_from_request``
+  classifier alone is enough to label ``source="fleet"`` for BOTH the local
+  OpenCode fleet AND the Sonnet cloud fleet, plus a runtime-honest
+  ``X-Source`` (``AUDITTRACE_AGENT_RUNTIME``-``AUDITTRACE_AGENT_ROLE``, e.g.
+  ``opencode-builder`` / ``sonnet-reviewer``) for the audit trail
+  (RECALL-METRIC-COVERAGE crux #4a, 2026-08-12).
 """
 
 from __future__ import annotations
@@ -192,6 +200,57 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+# The fleet marker sent when no per-agent role is configured. NEVER
+# "backoffice" — a caller of this module is, BY DEFINITION, a fleet/agent
+# recall (never a human front-door read); see :func:`_fleet_headers`.
+_FLEET_DEFAULT_ROLE = "fleet"
+
+
+def _fleet_headers() -> dict[str, str]:
+    """Attribution headers stamped on EVERY outbound fleet recall GET.
+
+    RECALL-METRIC-COVERAGE crux #4a (2026-08-12, independent review of
+    ``ef49935``): the server-side classifier
+    ``audittrace.services.recall_telemetry.classify_recall_source_from_request``
+    labels a recall ``source="fleet"`` when the request carries an
+    ``X-Source`` header starting ``"opencode-"`` (case-insensitive) OR a
+    non-empty ``X-Agent-Role`` header — the SAME attribution
+    ``routes/chat.py::_detect_source`` keys on for ``interactions.source``
+    (SDLC-ADR-004 / #429-b). :func:`recall_deploy_lessons` never sent either
+    header, so a genuine fleet recall was indistinguishable from a human
+    front-door read and ``audittrace_recall_total{source="fleet"}`` read
+    persistent zero from real fleet traffic. This is the wiring that closes
+    that gap.
+
+    ``recall_deploy_lessons`` is the SHARED recall path for BOTH the local
+    OpenCode/Qwen fleet AND the Sonnet cloud fleet (the audittrace-builder /
+    audittrace-reviewer subagents call this exact helper too) — so the two
+    headers carry deliberately DIFFERENT jobs, never a hardcoded runtime:
+
+    * ``X-Agent-Role`` is the UNIVERSAL, runtime-agnostic fleet marker.
+      Always sent, non-empty (``AUDITTRACE_AGENT_ROLE``, e.g. ``builder``/
+      ``reviewer``/``deployer``/``verifier``; default ``"fleet"`` — never
+      ``"backoffice"``, since a caller of this module is BY DEFINITION a
+      fleet/agent recall, never a human front-door read). This is the
+      RELIABLE classification signal — the server counts ``source="fleet"``
+      for BOTH fleets off this header alone, with no per-runtime cardinality.
+    * ``X-Source`` stays RUNTIME-HONEST for the audit trail (``interactions
+      .source``-style granularity, not the metric label): ``"<runtime>-
+      <role>"`` where runtime comes from ``AUDITTRACE_AGENT_RUNTIME`` (e.g.
+      ``"opencode"`` for the local Qwen fleet, ``"sonnet"`` for the cloud
+      fleet). When the runtime is unset, ``X-Source`` degrades to the bare
+      role (or the plain ``"fleet"`` marker when neither env var is set) —
+      NEVER a hardcoded ``"opencode-"`` prefix, which would mislabel
+      Sonnet-fleet recalls as OpenCode.
+    """
+    role = (
+        os.environ.get("AUDITTRACE_AGENT_ROLE") or ""
+    ).strip() or _FLEET_DEFAULT_ROLE
+    runtime = (os.environ.get("AUDITTRACE_AGENT_RUNTIME") or "").strip()
+    x_source = f"{runtime}-{role}" if runtime else role
+    return {"X-Source": x_source, "X-Agent-Role": role}
+
+
 def _parse_json(body: bytes) -> Any:
     try:
         return json.loads(body)
@@ -292,11 +351,12 @@ def recall_deploy_lessons(
         {"collection": DECISIONS_COLLECTION, "limit": limit, "sort": "created_at"}
     )
     url = f"{base}/memory/semantic?{params}"
+    request_headers = {**_bearer(resolved), **_fleet_headers()}
     try:
         status, _headers, body = _http_request(
             "GET",
             url,
-            _bearer(resolved),
+            request_headers,
             timeout=timeout,
             context=ssl_context(insecure),
         )
