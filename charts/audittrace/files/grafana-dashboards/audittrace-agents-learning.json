@@ -367,7 +367,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Recall Calls by Collection \u2014 24h counts (governance view)",
-      "description": "Stacked 24-hour recall counts by collection, not ops/s \u2014 governance wants 'which collections were consulted and how often', not per-second rates that render as invisible spikes. Uses increase(...[24h]) for cumulative counts. The source label (tool vs backoffice) is available as a second grouping: tool recalls are agent in-process reads (e.g. via the recall_* tool), backoffice recalls are human reads via the REST API. Every recall call left an audited tool_calls row (ADR-029 end-to-end traceability). Labels: {source, collection, hit}. No PII.",
+      "description": "Stacked 24-hour recall counts by collection, not ops/s \u2014 governance wants 'which collections were consulted and how often', not per-second rates that render as invisible spikes. Uses increase(...[24h]) for cumulative counts. The source label (tool | fleet | backoffice) is available as a second grouping (see the 'Recall Calls by Source' panel below): tool recalls are in-process chat-tool reads (e.g. via the recall_* tool), fleet recalls are REST-route reads issued by an OpenCode fleet agent (RECALL-METRIC-COVERAGE, X-Source: opencode-* or X-Agent-Role), backoffice recalls are every other REST-route read (the human front-door default). Every recall call left an audited tool_calls row (ADR-029 end-to-end traceability). Labels: {source, collection, hit}. No PII.",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -399,6 +399,146 @@
       }
     },
     {
+      "id": 114,
+      "type": "timeseries",
+      "title": "Recall Calls by Source \u2014 24h counts (fleet vs backoffice vs tool)",
+      "description": "RECALL-METRIC-COVERAGE (2026-08-12): the 'agents learning' claim is unprovable if the fleet's own recalls (via scripts/deploy/memory.py -> GET /memory/semantic|episodic|procedural) are indistinguishable from a human front-door read. This panel is the direct answer to 'is the fleet recalling?' \u2014 stacked 24-hour recall counts grouped BY source. Before this PR, every REST-route recall hardcoded source=\"backoffice\"; fleet recalls (X-Source: opencode-* or X-Agent-Role) are now classified as source=\"fleet\" at the emit site (classify_recall_source_from_request). Source: audittrace_recall_total counter. Labels: {source, collection, hit, cache}. No PII.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (source) (increase(audittrace_recall_total[24h]))",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "drawStyle": "lines",
+            "lineWidth": 1,
+            "pointSize": "off",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 115,
+      "type": "stat",
+      "title": "Fleet Recall Hit-Rate \u2014 24h",
+      "description": "RECALL-METRIC-COVERAGE (2026-08-12): the fleet-only companion to 'Recall Hit-Rate \u2014 24h summary' (#446 low-n-denominator polish applied identically here \u2014 a high hit-rate on a small fleet-recall count reads as small-n, not as a strong signal). Headline: 24h hit-rate % restricted to source=\"fleet\"; secondary: total fleet-recall count (denominator). Zero here is a real finding (the fleet path is instrumented but not yet exercised), not noise. Source: audittrace_recall_total{source=\"fleet\"}. Labels: {source, collection, hit, cache}. No PII.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(audittrace_recall_total{source=\"fleet\", hit=\"true\"}[24h])) / sum(increase(audittrace_recall_total{source=\"fleet\"}[24h])) * 100",
+          "legendFormat": "fleet 24h hit-rate %"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(audittrace_recall_total{source=\"fleet\"}[24h]))",
+          "legendFormat": "fleet recalls (denominator)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "green",
+                "value": 60
+              }
+            ]
+          },
+          "custom": {
+            "align": "auto",
+            "mode": "basic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fleet recalls (denominator)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "showLabels": true,
+        "showValues": true,
+        "text": {}
+      }
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Governance & Health \u2014 Memory Read REST Calls",
@@ -407,7 +547,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 41
       },
       "panels": [],
       "collapsed": false
@@ -421,7 +561,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "datasource": {
         "type": "prometheus",
@@ -488,7 +628,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 42
       },
       "datasource": {
         "type": "prometheus",
@@ -570,5 +710,5 @@
   "timezone": "browser",
   "title": "AuditTrace-AI \u2014 Agents Learning (v2)",
   "uid": "audittrace-agents-learning",
-  "version": 4
+  "version": 5
 }

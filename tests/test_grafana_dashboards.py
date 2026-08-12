@@ -135,7 +135,9 @@ def _all_target_exprs(dash: dict) -> list[str]:
 # can never silently diverge on what counts as "known" (a prior version had
 # two independently-maintained copies of this set; the Wave B copy was
 # missing the M1 ``cache=~"hit|miss"`` label value, which failed the guard
-# it was supposed to enforce).
+# it was supposed to enforce). RECALL-METRIC-COVERAGE (2026-08-12) added
+# "fleet"/"backoffice"/"tool" — the ``source`` label's value set, not
+# metric names — for the same reason ``hit``/``miss`` are here.
 _PROMQL_ALLOWED_LOWER = frozenset(
     {
         "histogram_quantile",
@@ -153,6 +155,9 @@ _PROMQL_ALLOWED_LOWER = frozenset(
         "false",
         "cache",
         "memory",
+        "fleet",
+        "backoffice",
+        "tool",
         "http_route",
         "http_response_status_code",
         "http_request_method",
@@ -807,4 +812,113 @@ class TestAgentsLearningWaveBPanels:
         dash = _load(AGENTS_LEARNING_FILE)
         _assert_exprs_reference_known_metrics(
             _all_target_exprs(dash), TestAgentsLearningWaveAPanels.EXISTING_METRICS
+        )
+
+
+class TestAgentsLearningFleetSourcePanels:
+    """RECALL-METRIC-COVERAGE (2026-08-12) — the fleet's own recalls hit the
+    same REST routes a human front-door caller uses; before this PR every
+    REST-route emit site hardcoded ``source="backoffice"``, so the fleet
+    series was invisible on this dashboard even though the fleet path was
+    fully instrumented (audittrace_recall_total was already emitted, just
+    mislabeled). Non-vacuous proof (#423): remove the fleet series/query
+    from the JSON -> these tests go RED."""
+
+    def test_fleet_recall_series_query_present(self) -> None:
+        """A panel query grouping recall counts BY source (so a "fleet"
+        series renders when data exists) must be present."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        exprs = _all_target_exprs(dash)
+        by_source_exprs = [e for e in exprs if "by (source)" in e or "by(source)" in e]
+        assert by_source_exprs, (
+            f"{AGENTS_LEARNING_FILE} is missing a panel query grouping "
+            "audittrace_recall_total BY source — the fleet series has no "
+            "way to render (RECALL-METRIC-COVERAGE)."
+        )
+        assert any("audittrace_recall_total" in e for e in by_source_exprs), (
+            "the by-source grouping must reference audittrace_recall_total."
+        )
+
+    def test_fleet_only_hit_rate_query_present(self) -> None:
+        """An explicit ``source="fleet"``-filtered query must exist — the
+        direct answer to the Decision section's 'is the fleet recalling
+        and hitting?'. A dashboard that only groups by source (without an
+        explicit fleet filter anywhere) could still silently drop the
+        fleet series behind a legend toggle; this asserts the literal
+        filter is present."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        exprs = _all_target_exprs(dash)
+        fleet_filtered = [e for e in exprs if 'source="fleet"' in e]
+        assert fleet_filtered, (
+            f"{AGENTS_LEARNING_FILE} is missing a panel query explicitly "
+            'filtered on source="fleet" (RECALL-METRIC-COVERAGE).'
+        )
+        assert any("audittrace_recall_total" in e for e in fleet_filtered), (
+            'the source="fleet" filter must reference audittrace_recall_total.'
+        )
+        assert any('hit="true"' in e for e in fleet_filtered), (
+            'the fleet-only query must compute a hit-rate (hit="true" numerator), '
+            "not just a raw count — otherwise it cannot answer 'is the fleet "
+            "recalling AND hitting?'."
+        )
+
+    def test_recall_hit_rate_money_panel_semantics_unchanged(self) -> None:
+        """This dashboard PR must not regress the existing (non-fleet-
+        specific) hit-rate money panel: connected-nulls stays OFF and the
+        24h summary still exposes its denominator (the #446 polish) —
+        see ``test_recall_hit_rate_panel_wave_a`` /
+        ``test_recall_hit_rate_24h_summary_denominator_not_percent`` for
+        the full assertions this mirrors at panel granularity."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        hit_rate_panels = [
+            p for p in dash.get("panels", []) if p.get("title") == "Recall Hit-Rate"
+        ]
+        assert hit_rate_panels, f"{AGENTS_LEARNING_FILE} missing 'Recall Hit-Rate'."
+        custom = (
+            hit_rate_panels[0]
+            .get("fieldConfig", {})
+            .get("defaults", {})
+            .get("custom", {})
+        )
+        assert custom.get("spanNulls") is False, (
+            "Recall Hit-Rate must keep connected-nulls OFF (spanNulls=False) "
+            "after the fleet-source dashboard change."
+        )
+        summary_panels = [
+            p
+            for p in dash.get("panels", [])
+            if p.get("title") == "Recall Hit-Rate — 24h summary"
+        ]
+        assert summary_panels, (
+            f"{AGENTS_LEARNING_FILE} missing 'Recall Hit-Rate — 24h summary'."
+        )
+        legend_formats = {
+            t.get("legendFormat") for t in summary_panels[0].get("targets", [])
+        }
+        assert "total recalls (denominator)" in legend_formats, (
+            "24h summary must still expose its denominator (#446 low-n polish) "
+            "after the fleet-source dashboard change."
+        )
+
+    def test_fleet_stat_panel_also_exposes_denominator(self) -> None:
+        """The new fleet-only companion stat panel follows the SAME #446
+        low-n-denominator polish as the existing money panel — a high
+        fleet hit-rate on n=1 must render alongside its denominator, not
+        as a bare percentage."""
+        dash = _load(AGENTS_LEARNING_FILE)
+        fleet_stat_panels = [
+            p
+            for p in dash.get("panels", [])
+            if p.get("type") == "stat"
+            and any('source="fleet"' in t.get("expr", "") for t in p.get("targets", []))
+        ]
+        assert fleet_stat_panels, (
+            f"{AGENTS_LEARNING_FILE} is missing a fleet-only stat panel "
+            '(source="fleet") that exposes a hit-rate + denominator pair.'
+        )
+        panel = fleet_stat_panels[0]
+        legend_formats = {t.get("legendFormat", "") for t in panel.get("targets", [])}
+        assert any("denominator" in lf for lf in legend_formats), (
+            "fleet-only stat panel must expose its denominator (#446 low-n polish), "
+            f"got legends: {legend_formats}"
         )
