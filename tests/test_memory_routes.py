@@ -4697,14 +4697,23 @@ class TestBackofficeOwnerScopedManifest:
         try:
             import asyncio
 
-            from fastapi import BackgroundTasks
+            from fastapi import BackgroundTasks, Request
 
+            bare_request = Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/memory/episodic/collide.md",
+                    "headers": [],
+                }
+            )
             result = asyncio.run(
                 m.read_episodic(
                     "collide.md",
                     _auth={},
                     user=bob,
                     background_tasks=BackgroundTasks(),
+                    request=bare_request,
                 )
             )
         finally:
@@ -8719,3 +8728,163 @@ class TestRecallTelemetryRestRoutes:
                 )
         finally:
             telemetry_mod._recall_counter = real_counter
+
+
+# ─────── RECALL-METRIC-COVERAGE (2026-08-12) — fleet-vs-backoffice flip ──────
+
+
+class TestRecallTelemetryFleetSourceFlip:
+    """The fleet's own recalls hit these SAME REST routes (via
+    ``scripts/deploy/memory.py::recall_deploy_lessons`` -> ``GET
+    /memory/semantic`` and siblings) but were hardcoded ``source="backoffice"``
+    at every ``emit_recall_telemetry`` call site — indistinguishable from a
+    human front-door read, invisible on the fleet panels.
+
+    Non-vacuous proof (#423): each test below asserts the label FLIPS to
+    ``"fleet"`` when the request carries fleet attribution (``X-Source:
+    opencode-*`` or ``X-Agent-Role``), and STAYS ``"backoffice"`` with no
+    fleet header. Neuter any of the 6 emit sites back to the literal
+    ``"backoffice"`` (undoing the ``classify_recall_source_from_request(...)``
+    call) -> the fleet-header assertion below goes RED."""
+
+    @staticmethod
+    def _spy_counter(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, dict]]:
+        from audittrace.services import recall_telemetry as telemetry_mod
+
+        counter_spy: list[tuple[float, dict[str, Any]]] = []
+
+        class _SpyCounter:
+            def add(self, amount: float, labels: dict[str, Any] | None = None) -> None:
+                counter_spy.append((amount, dict(labels or {})))
+
+        monkeypatch.setattr(telemetry_mod, "_recall_counter", _SpyCounter())
+        return counter_spy
+
+    def test_get_memory_semantic_with_opencode_x_source_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/semantic", headers={"X-Source": "opencode-builder"})
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_semantic_with_x_agent_role_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/semantic", headers={"X-Agent-Role": "reviewer"})
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_semantic_with_no_fleet_header_stays_backoffice(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control: no fleet header -> unchanged human front-door
+        default. This is what goes RED if the classifier is neutered to
+        always return "fleet" (the flip side of the falsifiability proof)."""
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/semantic")
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "backoffice"
+
+    def test_get_memory_semantic_read_with_fleet_header_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The single-document read site (:2377, was :2355)."""
+        client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "fleet-read-doc",
+                "text": "fleet read probe",
+            },
+        )
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get(
+            "/memory/semantic/decisions/fleet-read-doc",
+            headers={"X-Source": "opencode-deployer"},
+        )
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_episodic_list_with_fleet_header_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/episodic", headers={"X-Source": "opencode-builder"})
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_episodic_read_with_fleet_header_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client.post(
+            "/memory/episodic",
+            json={"filename": "ADR-fleet-read.md", "content": "fleet read probe"},
+        )
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get(
+            "/memory/episodic/ADR-fleet-read.md",
+            headers={"X-Agent-Role": "builder"},
+        )
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_procedural_list_with_fleet_header_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/procedural", headers={"X-Source": "opencode-reviewer"})
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_get_memory_procedural_read_with_fleet_header_is_fleet(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client.post(
+            "/memory/procedural",
+            json={"filename": "SKILL-fleet-read.md", "content": "fleet read probe"},
+        )
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get(
+            "/memory/procedural/SKILL-fleet-read.md",
+            headers={"X-Agent-Role": "curator"},
+        )
+        assert r.status_code == 200
+        assert counter_spy
+        assert counter_spy[-1][1].get("source") == "fleet"
+
+    def test_no_pii_in_fleet_labels_either(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fleet flip is a new VALUE of the existing ``source`` label
+        only — label KEYS stay exactly {source, collection, hit, cache},
+        same invariant as the backoffice path."""
+        counter_spy = self._spy_counter(monkeypatch)
+        r = client.get("/memory/semantic", headers={"X-Source": "opencode-builder"})
+        assert r.status_code == 200
+        for _amount, labels in counter_spy:
+            assert set(labels.keys()) == {"source", "collection", "hit", "cache"}
+        assert counter_spy[-1][1].get("cache") == "n/a"
+
+    def test_chat_tool_recall_source_still_tool_unaffected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The chat-tool surface (memory_handlers.py) never calls
+        ``classify_recall_source_from_request`` — it stamps ``source="tool"``
+        directly and is untouched by this change. Regression guard: emit
+        the helper directly with source="tool" and confirm it passes the
+        label through unchanged (the REST classifier is additive, not a
+        replacement for the tool-surface literal)."""
+        from audittrace.services.recall_telemetry import emit_recall_telemetry
+
+        counter_spy = self._spy_counter(monkeypatch)
+        emit_recall_telemetry("tool", "decisions", 3, cache="miss")
+        assert counter_spy[-1][1].get("source") == "tool"

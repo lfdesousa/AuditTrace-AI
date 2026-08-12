@@ -17,9 +17,13 @@ One shared ``emit_recall_telemetry`` callable that both surfaces call,
 so coverage cannot drift again (WU-1c, this PR).
 
 **NO PII in metric labels.**  Labels are ``{source, collection, hit, cache}``
-ONLY.  The ``source`` label distinguishes the calling surface
-(``tool`` for in-process tool recalls, ``backoffice`` for REST routes).
-The ``cache`` label distinguishes Redis-backed cache hits/misses at the
+ONLY.  The ``source`` label distinguishes the calling surface: ``tool``
+for in-process chat-tool recalls, ``fleet`` for REST-route recalls issued
+by an OpenCode fleet agent (``X-Source: opencode-*`` or ``X-Agent-Role``
+present — see :func:`classify_recall_source_from_request`), and
+``backoffice`` for every other REST-route recall (the human front-door
+default).  The ``cache`` label distinguishes Redis-backed cache hits/misses
+at the
 tool-recall surface (ADR-025 §Decision.8, M1): ``"hit"`` when the result
 was served from the ADR-025 tool-result cache, ``"miss"`` when computed
 fresh, ``"n/a"`` for REST/backoffice reads that do not consult that cache.
@@ -37,6 +41,7 @@ from __future__ import annotations
 
 import logging
 
+from fastapi import Request
 from opentelemetry import metrics
 
 logger = logging.getLogger(__name__)
@@ -52,8 +57,8 @@ _recall_counter = _recall_meter.create_counter(
     name="audittrace_recall_total",
     description=(
         "Recall-tool invocations by surface and collection, and whether "
-        "the call hit (page.total > 0). Labels: source (tool|backoffice), "
-        "collection, hit."
+        "the call hit (page.total > 0). Labels: "
+        "source (tool|fleet|backoffice), collection, hit."
     ),
 )
 _recall_results_histogram = _recall_meter.create_histogram(
@@ -82,7 +87,9 @@ def emit_recall_telemetry(
 
     Args:
         source: Calling surface — ``"tool"`` for in-process tool recalls,
-            ``"backoffice"`` for REST routes.
+            ``"fleet"`` for REST-route recalls issued by an OpenCode fleet
+            agent, ``"backoffice"`` for every other REST-route recall (see
+            :func:`classify_recall_source_from_request`).
         collection: ChromaDB collection name (e.g. ``"decisions"``,
             ``"semantic"``, ``"sessions"``) or layer name for S3-backed
             reads (``"episodic"``, ``"procedural"``).
@@ -119,3 +126,52 @@ def emit_recall_telemetry(
         hit,
         cache,
     )
+
+
+def classify_recall_source_from_request(
+    # ``Request[Any]`` would satisfy pre-commit mypy 1.8 (which can't see
+    # starlette's generic default), but FastAPI's Pydantic field
+    # introspection rejects it at route registration for the routes that
+    # call this helper. Bare ``Request`` matches every route in this
+    # codebase (see routes/memory.py's ``upload_memory_file`` docstring);
+    # we silence the pre-commit-only error class explicitly.
+    request: Request,  # type: ignore[type-arg, unused-ignore]
+) -> str:
+    """Classify a REST recall request as ``"fleet"`` or ``"backoffice"``.
+
+    RECALL-METRIC-COVERAGE (2026-08-12): the fleet's own recalls hit the
+    same REST routes (``GET /memory/episodic|procedural|semantic``) as a
+    human front-door caller — those routes hardcoded ``source="backoffice"``
+    at every ``emit_recall_telemetry`` call site, so the fleet's recalls
+    were counted but mislabeled, making the "agents learning" dashboard
+    panels read ~0 even though the fleet path was fully instrumented.
+
+    This reuses the SAME attribution the fleet already sends per
+    SDLC-ADR-004 / #429-b — ``X-Source: opencode-<role>`` (+
+    ``X-Agent-Role``) — and that ``routes/chat.py::_detect_source`` keys
+    on for ``interactions.source``. It is NOT a second attribution path;
+    it is the same signal read at a second call site (the REST recall
+    routes, not just ``/v1/chat/completions``).
+
+    Deliberately coarse: returns the single value ``"fleet"`` regardless
+    of *which* role sent the request (builder/reviewer/deployer/...),
+    never a per-role value. Per-role cardinality on a Prometheus counter
+    is a cost without a consumer — the dashboard only needs "is the fleet
+    recalling and hitting?" — and ``X-Agent-Role`` remains available on
+    the request (and in ``interactions.source``) for anyone who needs the
+    per-role split.
+
+    Args:
+        request: The incoming FastAPI request for a recall REST route.
+
+    Returns:
+        ``"fleet"`` when ``X-Source`` starts with ``"opencode-"``
+        (case-insensitive) or ``X-Agent-Role`` is present with a non-empty
+        value; ``"backoffice"`` otherwise (the human front-door default).
+    """
+    x_source = (request.headers.get("x-source") or "").strip().lower()
+    if x_source.startswith("opencode-"):
+        return "fleet"
+    if (request.headers.get("x-agent-role") or "").strip():
+        return "fleet"
+    return "backoffice"

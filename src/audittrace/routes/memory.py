@@ -95,7 +95,10 @@ from audittrace.services.memory_audit import (
 from audittrace.services.memory_manifest import ManifestEntry
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
-from audittrace.services.recall_telemetry import emit_recall_telemetry
+from audittrace.services.recall_telemetry import (
+    classify_recall_source_from_request,
+    emit_recall_telemetry,
+)
 from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
@@ -1558,6 +1561,7 @@ async def list_episodic(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List ADRs / decision records. Merges manifest rows with S3 objects so
     content uploaded via /memory/upload or seeded via index-chromadb surfaces
@@ -1587,7 +1591,9 @@ async def list_episodic(
     # ADR-062 §5 (WU-A4) — read path, fail-open background emit (see
     # services/memory_audit.py module docstring).
     schedule_read_audit(background_tasks, user=user, op="list", layer="episodic")
-    emit_recall_telemetry("backoffice", "episodic", total, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "episodic", total, cache="n/a"
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1598,6 +1604,7 @@ async def read_episodic(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """Read ADR content + manifest metadata.
 
@@ -1618,7 +1625,9 @@ async def read_episodic(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="episodic", key=filename
     )
-    emit_recall_telemetry("backoffice", "episodic", 1, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "episodic", 1, cache="n/a"
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -1792,6 +1801,7 @@ async def list_procedural(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List SKILLs. Same merge-with-S3 + sort/paginate semantics as
     `/memory/episodic` so all ``.md`` items appear alongside
@@ -1808,7 +1818,9 @@ async def list_procedural(
         items, sort=sort, order=order, limit=limit, offset=offset
     )
     schedule_read_audit(background_tasks, user=user, op="list", layer="procedural")
-    emit_recall_telemetry("backoffice", "procedural", total, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "procedural", total, cache="n/a"
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1819,6 +1831,7 @@ async def read_procedural(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
     ``read_episodic`` — see its docstring."""
@@ -1834,7 +1847,9 @@ async def read_procedural(
     schedule_read_audit(
         background_tasks, user=user, op="read", layer="procedural", key=filename
     )
-    emit_recall_telemetry("backoffice", "procedural", 1, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), "procedural", 1, cache="n/a"
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
@@ -2270,6 +2285,7 @@ async def list_semantic(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """List semantic-layer items. Merges the manifest with ChromaDB
     discovery so pre-PR-A vectors (seeded via index-chromadb.py) surface
@@ -2312,7 +2328,12 @@ async def list_semantic(
         layer="semantic",
         collection=collection,
     )
-    emit_recall_telemetry("backoffice", collection or "semantic", total, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request),
+        collection or "semantic",
+        total,
+        cache="n/a",
+    )
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
@@ -2324,6 +2345,7 @@ async def read_semantic(
     user: UserContext = Depends(require_user),
     *,
     background_tasks: BackgroundTasks,
+    request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """ADR-062 Phase B: ``service.get_document`` already applies the
     owner-or-corpus predicate (WU-B3 §3 hole 1) — a cross-user private
@@ -2352,7 +2374,9 @@ async def read_semantic(
         collection=collection,
         key=document_id,
     )
-    emit_recall_telemetry("backoffice", collection, 1, cache="n/a")
+    emit_recall_telemetry(
+        classify_recall_source_from_request(request), collection, 1, cache="n/a"
+    )
     return {
         "content": doc.page_content,
         "metadata": doc.metadata,
