@@ -60,3 +60,79 @@ rules:
               - metavariable-regex:
                   metavariable: $HOST
                   regex: (?i)^(host|hostname|domain|expected_host|allowed_host|trusted_host)$
+
+  - id: audittrace-secret-field-truthy-gated-overwrite
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A secret/password/token-named dict field is read via a TRUTHY check
+      (`if $D.get($KEY):` / `if $D[$KEY]:`) and then conditionally
+      overwritten IN PLACE on the SAME dict. This shape has two problems:
+      (1) a falsy-but-present source value (e.g. an empty-string secret)
+      silently survives unscrubbed because the truthy gate never fires;
+      (2) to a taint-tracking scanner (GitHub Advanced Security / CodeQL
+      py/clear-text-logging-sensitive-data and
+      py/clear-text-storage-sensitive-data), a whole-object copy that
+      carries the secret value into the returned/serialized structure
+      BEFORE this in-place reassignment looks like "the source value was
+      observed, then merely reassigned" rather than "the source value
+      never entered the returned structure" — a real dataflow path to any
+      downstream log/write sink, not a false positive on the scanner's
+      part. Rebuild the containing structure FRESH instead: exclude the
+      secret key from a dict/list comprehension over the untouched
+      source, then set the replacement value UNCONDITIONALLY on key
+      PRESENCE (`if $KEY in $D:` — a membership test never reads the
+      value) using a value built ONLY from non-secret data (e.g. an
+      alias-derived placeholder). This mirrors the AuditTrace-AI #403 PR
+      CodeQL finding this rule exists to catch locally, before CI
+      (#390 — the local-gate gap that let #403 reach CI in the first
+      place).
+    metadata:
+      category: security
+      cwe: "CWE-312: Cleartext Storage of Sensitive Information"
+      confidence: HIGH
+      references:
+        - https://codeql.github.com/codeql-query-help/python/py-clear-text-storage-sensitive-data/
+        - https://codeql.github.com/codeql-query-help/python/py-clear-text-logging-sensitive-data/
+      origin: "AuditTrace-AI #403 PR CodeQL finding (2 HIGH alerts) / #390 local-gate gap"
+    patterns:
+      - pattern-either:
+          # Shape A — the exact #403 finding: iterate a secret-key TUPLE/LIST
+          # (identified by NAME, mirroring CodeQL's own name-based sensitive-
+          # data heuristic — e.g. `_SECRET_CONFIG_KEYS`), truthy-read via
+          # `.get()`, then overwrite the SAME key on the SAME dict.
+          - patterns:
+              - pattern: |
+                  for $KEY in $SRC:
+                      if $D.get($KEY):
+                          $D[$KEY] = ...
+              - metavariable-regex:
+                  metavariable: $SRC
+                  regex: (?i).*(secret|password|passwd|token|credential).*
+          # Shape B — same anti-pattern with a bracket-subscript truthy read
+          # instead of `.get()`.
+          - patterns:
+              - pattern: |
+                  for $KEY in $SRC:
+                      if $D[$KEY]:
+                          $D[$KEY] = ...
+              - metavariable-regex:
+                  metavariable: $SRC
+                  regex: (?i).*(secret|password|passwd|token|credential).*
+          # Shape C — a literal secret-shaped key name used directly (no
+          # loop), e.g. `if config.get("clientSecret"): config["clientSecret"]
+          # = ...` — generalizes the guard beyond the loop shape above.
+          - patterns:
+              - pattern: |
+                  if $D.get($KEY):
+                      $D[$KEY] = ...
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: (?i)^['"].*(secret|password|passwd|token|credential)[^'"]*['"]$
+          - patterns:
+              - pattern: |
+                  if $D[$KEY]:
+                      $D[$KEY] = ...
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: (?i)^['"].*(secret|password|passwd|token|credential)[^'"]*['"]$

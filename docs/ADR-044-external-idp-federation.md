@@ -339,6 +339,15 @@ For each scenario, the live evidence captured is:
   any future realm-replace operation would wipe the brokered IdPs.
   Document this in the provisioner script's header so operators
   know to re-run setup-idp-federation.sh after a realm wipe.
+  **Partially mitigated by #403** (see Follow-ups): a drift guard
+  (`post-deploy-verify.sh` Check 12) now FAILs post-deploy if a live
+  IdP isn't committed, and `scripts/export-idp-federation.sh` closes
+  the one-way gap by capturing live IdP config back into version
+  control. The cold-reimport DoD itself — wipe, reimport from the
+  committed JSON, confirm `google-test` login works again — still
+  needs the deploy-time secret-resolution step below; #403 is
+  reconstructibility (the config isn't only in the DB anymore), not
+  yet full disaster-recovery automation.
 
 ## Architecture documentation impact
 
@@ -380,6 +389,34 @@ rule, this ADR's PR includes:
   Entra-specific JWKS rotation cadence quirk would be a
   `feedback_entra_jwks_rotation.md` durable rule. Captured here so
   the postmortem channel exists.
+- **#403 capture + drift-guard tooling (this follow-up).** Closes the
+  export-only-in-the-DB gap identified 2026-08-11:
+  `scripts/export-idp-federation.sh` fetches the live realm's
+  `identity-provider/instances` + their `mappers`, pipes them through
+  `scripts/deploy/idp_export.py`, and commits the result into BOTH
+  realm JSONs with every `config.clientSecret` replaced by the
+  `${vault:idp/<alias>/client_secret}` placeholder already documented
+  in §3 above — never plaintext. `post-deploy-verify.sh` Check 12
+  compares live `identity-provider/instances` aliases against the
+  committed baseline and FAILs on drift in either direction (an
+  undeclared live IdP, or a committed IdP missing live), mirroring
+  Check 11's client-scope drift guard (#370).
+
+  **Still open — the deploy-time placeholder resolution.** Nothing in
+  the chart today resolves `${vault:idp/<alias>/client_secret}` back
+  into a real secret before Keycloak's `--import-realm` runs. The
+  intended mechanism (not yet implemented): an init step ahead of the
+  Keycloak container — using the same Vault-Agent-authenticated path
+  already used to materialise other `AUDITTRACE_*` secrets via
+  `vault.hashicorp.com/agent-inject-template` annotations — reads
+  `kv/audittrace/idp/<alias>/client_secret` for every alias the
+  realm ConfigMap declares and substitutes it into the realm JSON on
+  the ephemeral volume Keycloak imports from. Until that lands, a
+  committed `${vault:...}` placeholder is captured and
+  drift-guarded, but a cold `--import-realm` will import the
+  placeholder STRING as the literal client secret, not a working
+  broker — this is the operator/verifier gap #403's build explicitly
+  could not close (no live cluster available to the builder).
 
 ## Live evidence (2026-05-02)
 
