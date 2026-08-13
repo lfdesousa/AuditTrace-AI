@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -49,6 +50,37 @@ def _aio_pika_mock() -> MagicMock:
     aio_pika.exceptions = _real_aio_pika.exceptions
     sys.modules.setdefault("aio_pika.exceptions", _real_aio_pika.exceptions)
     return aio_pika
+
+
+async def _poll_until(
+    condition: Callable[[], Awaitable[bool]],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> None:
+    """Poll an async ``condition`` until it returns ``True``, raising
+    ``AssertionError`` once ``timeout`` elapses.
+
+    Deterministic replacement for a fixed-duration ``asyncio.sleep(N)``
+    race window (the #254/#357 flake class): the caller proceeds the
+    instant the observable side-effect lands instead of gambling on a
+    wall-clock budget that a loaded CI host can blow through.
+
+    FALSIFIABILITY: if the awaited side-effect never happens (e.g. the
+    consumer's DB-write were neutered), this raises ``AssertionError``
+    after ``timeout`` seconds — it never returns while the condition is
+    still false, so it cannot mask a genuine regression.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await condition():
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"condition not met within {timeout}s (polled every {interval}s)"
+            )
+        await asyncio.sleep(interval)
 
 
 async def _seed_pending(factory, scan_id: str, *, user_id: str = "alice") -> None:
@@ -725,14 +757,26 @@ class TestRunLoop:
         await _f.create_schema()
         factory = _f.get_session_factory()
         await _seed_pending(factory, "scan-run")
+
+        async def _row_scanned_clean() -> bool:
+            async with factory() as session:
+                row = await manifest_mod.get_by_scan_id(session, "scan-run")
+            return row is not None and row.scan_status == "scanned_clean"
+
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanVerdictConsumer(
                 settings=_settings(),
                 session_factory=factory,
             )
             task = _asyncio.create_task(consumer.run())
-            # Yield to let the loop pull the one message.
-            await _asyncio.sleep(0.05)
+            # Deterministic wait: poll until the run loop has pulled the
+            # one queued message, processed it, and committed
+            # scanned_clean — load-independent (was a fixed
+            # asyncio.sleep(0.05) race window that could lose under host
+            # contention, the #254/#357 flake class; nearly bit v1.24.0's
+            # release gate). Times out (AssertionError) — never passes
+            # vacuously — if the consumer never reaches the write.
+            await _poll_until(_row_scanned_clean)
             task.cancel()
             with pytest.raises(_asyncio.CancelledError):
                 await task
