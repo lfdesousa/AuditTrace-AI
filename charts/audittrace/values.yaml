@@ -402,6 +402,20 @@ istio:
       - "localhost"
     credentialName: audittrace-tls
     port: 443
+    # workloadSelector label on the ingress-gateway pod (verified live via
+    # `kubectl get pod -n audittrace -l istio=audittrace-gateway`). Used by
+    # the EnvoyFilter below to target the gateway's HTTP connection manager.
+    workloadSelectorLabel: audittrace-gateway
+    # Envoy's stream_idle_timeout on the gateway HTTP connection manager.
+    # Envoy defaults this to 300s and a VirtualService `timeout:` does NOT
+    # override it. The memory tool-loop's non-streaming reasoning turns can
+    # sit silent for minutes, so the gateway must tolerate idle streams up
+    # to the same ceiling as the /v1/chat/completions route timeout (1800s).
+    # 2026-08-12: applied live as a manual EnvoyFilter after the audited
+    # /v1 path dropped long reasoning builds with a Transport error at the
+    # Envoy default 300s; this value codifies that live fix into the chart
+    # (feedback_no_more_drifts).
+    streamIdleTimeout: "1800s"
   mtls:
     mode: STRICT
   defaultDenyAll: true
