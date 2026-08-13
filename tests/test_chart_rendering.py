@@ -904,3 +904,94 @@ class TestPodReaperComponent:
                 if d.get("kind") == kind
             ]
             assert "audittrace-pod-reaper" not in names
+
+
+class TestGatewayStreamIdleTimeoutEnvoyFilter:
+    """Codifies the 2026-08-12 live-applied fix (feedback_no_more_drifts) —
+    an EnvoyFilter on the ingress gateway raising ``stream_idle_timeout``
+    from Envoy's 300s default to 1800s.
+
+    Root cause it closes: the ingress gateway's HTTP connection manager had
+    no explicit ``stream_idle_timeout``, so Envoy's 300s default applied.
+    A VirtualService route ``timeout:`` does NOT override
+    ``stream_idle_timeout`` — the memory tool-loop runs non-streaming, so a
+    long silent reasoning turn produced zero bytes on the wire and Envoy
+    reset the stream at 5 minutes (``{"type":"error","message":"Transport"}``).
+    An operator applied the fix live via ``kubectl apply``; these tests
+    prove the chart now renders the *same* resource, so a chart reinstall
+    reproduces it instead of depending on manual drift."""
+
+    def test_envoyfilter_renders_with_live_applied_shape(self) -> None:
+        """Field-for-field match against the manifest that was applied
+        live and confirmed to fix the Transport drop (see
+        ~/work/audittrace-private/specs/2026-08-12-envoyfilter-stream-idle.yaml).
+        Falsifiable: delete the template (or null out any field below) and
+        this test fails."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        assert doc["apiVersion"] == "networking.istio.io/v1alpha3"
+        assert doc["metadata"]["namespace"] == "audittrace"
+        assert doc["spec"]["workloadSelector"]["labels"] == {
+            "istio": "audittrace-gateway"
+        }
+        patch = doc["spec"]["configPatches"][0]
+        assert patch["applyTo"] == "NETWORK_FILTER"
+        assert patch["match"]["context"] == "GATEWAY"
+        assert (
+            patch["match"]["listener"]["filterChain"]["filter"]["name"]
+            == "envoy.filters.network.http_connection_manager"
+        )
+        assert patch["patch"]["operation"] == "MERGE"
+        typed_config = patch["patch"]["value"]["typed_config"]
+        assert typed_config["@type"] == (
+            "type.googleapis.com/envoy.extensions.filters.network."
+            "http_connection_manager.v3.HttpConnectionManager"
+        )
+        assert typed_config["stream_idle_timeout"] == "1800s"
+
+    def test_default_timeout_matches_the_live_applied_value(self) -> None:
+        """Default MUST equal what is live (1800s) — no silent divergence
+        between the chart default and the manually-applied fix it
+        replaces."""
+        out = _render(["--set", "istio.enabled=true"])
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "1800s"
+
+    def test_timeout_is_operator_configurable(self) -> None:
+        """An operator on a different infra profile may need a different
+        ceiling; the value must not be hardcoded in the template."""
+        out = _render(
+            [
+                "--set",
+                "istio.enabled=true",
+                "--set",
+                "istio.gateway.streamIdleTimeout=900s",
+            ]
+        )
+        doc = _find_workload(
+            out, "EnvoyFilter", "audittrace-long-reasoning-stream-idle"
+        )
+        stream_idle = doc["spec"]["configPatches"][0]["patch"]["value"]["typed_config"][
+            "stream_idle_timeout"
+        ]
+        assert stream_idle == "900s"
+
+    def test_absent_when_istio_disabled(self) -> None:
+        """Additive/default-safe: with istio.enabled=false the chart must
+        render NO EnvoyFilter at all — this is mesh-only infra config and
+        must not leak into a non-Istio install."""
+        out = _render(["--set", "istio.enabled=false"])
+        assert "audittrace-long-reasoning-stream-idle" not in out
+        names = [
+            d.get("metadata", {}).get("name")
+            for d in _docs(out)
+            if d.get("kind") == "EnvoyFilter"
+        ]
+        assert "audittrace-long-reasoning-stream-idle" not in names

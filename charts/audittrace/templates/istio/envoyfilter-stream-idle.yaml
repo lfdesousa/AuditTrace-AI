@@ -1,0 +1,42 @@
+{{- if .Values.istio.enabled }}
+# Codifies the 2026-08-12 live fix (feedback_no_more_drifts) — see
+# ~/work/audittrace-private/runbooks/2026-08-12-fix-audited-v1-stream-idle-timeout.md.
+#
+# Root cause: the ingress gateway had NO stream_idle_timeout, so Envoy's
+# default 300s applied to the HTTP connection manager. A VirtualService
+# route `timeout:` (e.g. the 1800s on /v1/chat/completions in
+# virtualservice-memory.yaml) does NOT override stream_idle_timeout — it
+# bounds the whole request, not the between-bytes idle window. The memory
+# tool-loop runs non-streaming, so a long silent reasoning turn produces
+# zero bytes on the wire and Envoy resets the stream at 5 minutes with
+# `{"type":"error","message":"Transport"}`.
+#
+# This EnvoyFilter MERGE-patches stream_idle_timeout onto the gateway's
+# HTTP connection manager to match the route timeout ceiling, so idle
+# reasoning is tolerated instead of killed.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: audittrace-long-reasoning-stream-idle
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      istio: {{ .Values.istio.gateway.workloadSelectorLabel }}
+  configPatches:
+    - applyTo: NETWORK_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: MERGE
+        value:
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            stream_idle_timeout: {{ .Values.istio.gateway.streamIdleTimeout }}
+{{- end }}
