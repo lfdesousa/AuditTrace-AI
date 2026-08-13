@@ -3,8 +3,10 @@ security-audit row writer."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +22,39 @@ async def _make_factory():
     _f = InMemoryPostgresFactory()
     await _f.create_schema()
     return _f.get_session_factory()
+
+
+async def _poll_until(
+    condition: Callable[[], Awaitable[bool]],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> None:
+    """Poll an async ``condition`` until it returns ``True``, raising
+    ``AssertionError`` once ``timeout`` elapses.
+
+    Deterministic replacement for a fixed-duration ``asyncio.sleep(N)``
+    race window (the #254/#357 flake class; see
+    ``tests/test_scan_verdict_consumer.py::_poll_until`` for the twin
+    this mirrors): the caller proceeds the instant the observable
+    side-effect lands instead of gambling on a wall-clock budget that a
+    loaded CI host can blow through.
+
+    FALSIFIABILITY: if the awaited side-effect never happens (e.g. the
+    consumer's DB-write were neutered), this raises ``AssertionError``
+    after ``timeout`` seconds — it never returns while the condition is
+    still false, so it cannot mask a genuine regression.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await condition():
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"condition not met within {timeout}s (polled every {interval}s)"
+            )
+        await asyncio.sleep(interval)
 
 
 def _settings(url: str = "amqp://x:y@audittrace-rabbitmq:5672/") -> MagicMock:
@@ -541,10 +576,34 @@ class TestRunLoop:
         _f = InMemoryPostgresFactory()
         await _f.create_schema()
         factory = _f.get_session_factory()
+
+        async def _security_row_persisted() -> bool:
+            async with factory() as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(InteractionRecord).where(
+                                InteractionRecord.event_class == "security"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            return len(rows) == 1
+
         with patch.dict(sys.modules, {"aio_pika": aio_pika}):
             consumer = ScanAuditConsumer(settings=_settings(), session_factory=factory)
             task = _asyncio.create_task(consumer.run())
-            await _asyncio.sleep(0.05)
+            # Deterministic wait: poll until the run loop has pulled the
+            # one queued message, processed it, and committed the
+            # security-audit row — load-independent (was a fixed
+            # asyncio.sleep(0.05) race window that could lose under host
+            # contention, the #254/#357 flake class shared with
+            # ScanVerdictConsumer's identical race). Times out
+            # (AssertionError) — never passes vacuously — if the
+            # consumer never reaches the write.
+            await _poll_until(_security_row_persisted)
             task.cancel()
             with pytest.raises(_asyncio.CancelledError):
                 await task
