@@ -37,6 +37,7 @@ async def _seed(
     scan_status: str | None = "scanned_clean",
     indexed_at_ms: int | None = None,
     deleted: bool = False,
+    index_failed_at_ms: int | None = None,
 ) -> None:
     """Insert a manifest row simulating a scan-pipeline promotion, with
     ``created_at_ms`` back-dated by ``age_seconds`` and the outbox/status
@@ -56,6 +57,7 @@ async def _seed(
         row.scan_status = scan_status
         row.key = f"s3://memory-shared/episodic/papers/{scan_id}/x.pdf"
         row.indexed_at_ms = indexed_at_ms
+        row.index_failed_at_ms = index_failed_at_ms
         if deleted:
             row.deleted_at_ms = int(time.time() * 1000)
         await session.commit()
@@ -110,6 +112,28 @@ class TestScanOrphans:
 
     async def test_skips_soft_deleted_rows(self, factory) -> None:
         await _seed(factory, scan_id="del-1", age_seconds=200, deleted=True)
+        janitor = IndexJanitor(
+            settings=_settings(grace=60),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+        )
+        assert await janitor._scan_orphans() == []
+
+    async def test_skips_dead_lettered_rows(self, factory) -> None:
+        # SPEC #450 WU-4 — a permanently-unindexable row (terminal
+        # dead-letter, index_failed_at_ms set) is otherwise a PERFECT
+        # match for the pre-existing predicate (scanned_clean, past
+        # grace, indexed_at_ms still NULL — the worker never marks
+        # ``indexed_at_ms`` on a dead-lettered row, only the terminal
+        # columns). Neutering the new ``.where(index_failed_at_ms.is_(
+        # None))`` predicate makes it reappear here — RED PROOF this
+        # guard is load-bearing, not vacuous.
+        await _seed(
+            factory,
+            scan_id="dead-1",
+            age_seconds=200,
+            index_failed_at_ms=1_700_000_000_000,
+        )
         janitor = IndexJanitor(
             settings=_settings(grace=60),
             session_factory=factory,

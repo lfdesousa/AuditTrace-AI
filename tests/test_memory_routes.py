@@ -5423,6 +5423,26 @@ class TestExtractionWarningCodes:
         }
         assert _PDF_WARNING_CODES == expected
 
+    def test_permanent_index_failure_codes_are_subset_of_closed_set(self) -> None:
+        # SPEC #450 WU-2 — PERMANENT_INDEX_FAILURE_CODES is the closed
+        # subset of tier-C structural codes that raise identically on
+        # every retry (dead-letters IndexWorker on attempt 1). Every
+        # value it names must ALSO be a member of the audit-pinned
+        # _PDF_WARNING_CODES vocabulary — a permanent code that drifted
+        # out of the closed set would silently stop matching the
+        # pipeline's actual warnings. Neutering either set's contents
+        # (or the subset relationship) must fail this assertion.
+        from audittrace.routes.memory import _PDF_WARNING_CODES
+        from audittrace.routes.memory_pdf.classification import (
+            PERMANENT_INDEX_FAILURE_CODES,
+        )
+
+        assert PERMANENT_INDEX_FAILURE_CODES == {
+            "pdf_corrupted_structure",
+            "pdf_corrupted_xref",
+        }
+        assert PERMANENT_INDEX_FAILURE_CODES <= _PDF_WARNING_CODES
+
 
 class TestSignatureStatusCodes:
     """Closed-set discipline on the ``signature_status`` taxonomy

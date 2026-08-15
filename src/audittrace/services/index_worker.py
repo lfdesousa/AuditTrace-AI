@@ -19,6 +19,15 @@ Failure semantics mirror the scan-request outbox 1:1: a broker/embed
 hiccup leaves ``indexed_at_ms`` NULL; the janitor's grace-window
 re-enqueue is the durability guarantee, not this worker's happy path.
 
+SPEC #450 adds a THIRD outcome for the case above never modelled: a
+failure that will never resolve no matter how many times the janitor
+re-drives it (a structurally-corrupt PDF). ``_record_failure`` decides,
+on every failed attempt, whether to dead-letter the row
+(``index_failed_at_ms`` + ``index_failure_code``) — permanent-code
+failures dead-letter on attempt 1, everything else dead-letters once
+``Settings.index_max_attempts`` is reached. ``IndexJanitor`` excludes
+dead-lettered rows from re-enqueue.
+
 The actual "index this object" work is behind an injectable ``indexer``
 callable — mirrors ``ScanRequestPublisher``'s injected ``amqp_client`` —
 so the outbox semantics (mark-on-success / leave-NULL-on-failure) are
@@ -38,9 +47,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from audittrace.db.models import MemoryItem
+from audittrace.routes.memory_pdf.classification import (
+    PERMANENT_INDEX_FAILURE_CODES,
+)
 from audittrace.services.index_routing import AI_RESEARCH_PAPERS_COLLECTION
 
 if TYPE_CHECKING:
@@ -173,6 +185,86 @@ class IndexWorker:
                 extra={"scan_id": scan_id, "reason": str(exc)},
             )
 
+    async def _record_failure(self, envelope: IndexRequestEnvelope) -> None:
+        """Terminal-state decision on a failed attempt (SPEC #450 WU-3).
+
+        One session, mirroring ``_mark_indexed``'s single-session
+        pattern: reads the row's ``extraction_warnings`` + current
+        ``index_attempts``, increments the counter, and decides whether
+        this failure is terminal:
+
+          * any warning code in ``extraction_warnings`` is a member of
+            ``PERMANENT_INDEX_FAILURE_CODES`` → dead-letter NOW, stamping
+            ``index_failed_at_ms`` + that code (attempt 1 is enough — the
+            pipeline classifies this exact failure identically on every
+            retry, so retrying is pure waste).
+          * otherwise, once ``index_attempts`` reaches
+            ``settings.index_max_attempts`` → dead-letter with
+            ``"max_attempts_exceeded"``.
+          * otherwise → leave the terminal columns NULL; the row stays
+            eligible for ``IndexJanitor`` re-enqueue (current behaviour).
+
+        Reads the row **after** the pipeline's manifest flush
+        (``routes/memory_pdf/pipeline.py``), which commits
+        ``extraction_warnings`` in its own session before
+        ``default_indexer`` returns ``ok=False`` — so this read always
+        sees the current attempt's warnings, not a stale value.
+        """
+        try:
+            async with self._session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(MemoryItem).where(MemoryItem.id == envelope.scan_id)
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    logger.error(
+                        "index_worker.outbox_update_failed",
+                        extra={
+                            "scan_id": envelope.scan_id,
+                            "reason": "row_missing",
+                        },
+                    )
+                    return
+                attempts = (row.index_attempts or 0) + 1
+                warning_codes: set[str] = {
+                    w["code"]
+                    for w in (row.extraction_warnings or [])
+                    if w.get("code") is not None
+                }
+                permanent_hits = warning_codes & PERMANENT_INDEX_FAILURE_CODES
+                code: str | None = None
+                if permanent_hits:
+                    code = min(permanent_hits)
+                elif attempts >= self._settings.index_max_attempts:
+                    code = "max_attempts_exceeded"
+                await session.execute(
+                    update(MemoryItem)
+                    .where(MemoryItem.id == envelope.scan_id)
+                    .values(
+                        index_attempts=attempts,
+                        index_failed_at_ms=_now_ms() if code else None,
+                        index_failure_code=code,
+                    )
+                )
+                await session.commit()
+        except Exception as exc:  # DB outage while recording — logged, not raised
+            logger.error(
+                "index_worker.outbox_update_failed",
+                extra={"scan_id": envelope.scan_id, "reason": str(exc)},
+            )
+            return
+        if code:
+            logger.warning(
+                "index_worker.index_dead_lettered",
+                extra={
+                    "scan_id": envelope.scan_id,
+                    "key": envelope.key,
+                    "code": code,
+                    "attempts": attempts,
+                },
+            )
+
     async def _index_one(self, envelope: IndexRequestEnvelope) -> None:
         """Index one object; mark ``indexed_at_ms`` ONLY on success.
 
@@ -180,9 +272,13 @@ class IndexWorker:
         — or the indexer simply returning ``False`` (the PDF pipeline
         itself rejected the object: bomb-defense, encrypted, extension
         mismatch) — is caught/observed here and logged; the run loop
-        continues with the next envelope, and the row's un-marked
-        ``indexed_at_ms`` is the durability hook ``IndexJanitor`` reads.
-        Never swallowed silently: every failure logs
+        continues with the next envelope. Every failure ALSO runs the
+        SPEC #450 terminal-state decision (``_record_failure``): a
+        permanently-unindexable object (or one that has exhausted the
+        attempt cap) is dead-lettered and excluded from
+        ``IndexJanitor`` re-enqueue; anything else keeps the row's
+        un-marked ``indexed_at_ms`` as the durability hook the janitor
+        reads. Never swallowed silently: every failure logs
         ``index_worker.index_failed`` with the reason (SPEC #387 WU-2 —
         "an embed/index failure must surface … leave the row un-marked
         for retry, do not swallow").
@@ -198,6 +294,7 @@ class IndexWorker:
                     "reason": str(exc),
                 },
             )
+            await self._record_failure(envelope)
             return
         if not ok:
             logger.warning(
@@ -208,6 +305,7 @@ class IndexWorker:
                     "reason": "indexer returned ok=False",
                 },
             )
+            await self._record_failure(envelope)
             return
         await self._mark_indexed(envelope.scan_id)
 
