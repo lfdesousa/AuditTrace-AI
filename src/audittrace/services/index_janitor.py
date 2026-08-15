@@ -66,8 +66,11 @@ class IndexJanitor:
     async def _scan_orphans(self) -> list[IndexRequestEnvelope]:
         """One DB poll. Returns up to ``_JANITOR_BATCH_SIZE`` envelopes
         ready to re-enqueue. Only rows that are ``scanned_clean``,
-        un-indexed, past the grace window, and not soft-deleted qualify —
-        the same closed-set predicate SPEC #387 §4 (Durability) names."""
+        un-indexed, past the grace window, not soft-deleted, and not
+        already dead-lettered qualify — the same closed-set predicate
+        SPEC #387 §4 (Durability) names, plus SPEC #450's terminal-state
+        exclusion so a permanently-unindexable row (``index_failed_at_ms``
+        set) never re-enqueues again."""
         cutoff = _now_ms() - (self._settings.index_janitor_grace_seconds * 1000)
         envelopes: list[IndexRequestEnvelope] = []
         async with self._session_factory() as session:
@@ -77,6 +80,7 @@ class IndexJanitor:
                 .where(MemoryItem.indexed_at_ms.is_(None))
                 .where(MemoryItem.created_at_ms < cutoff)
                 .where(MemoryItem.deleted_at_ms.is_(None))
+                .where(MemoryItem.index_failed_at_ms.is_(None))
                 .limit(_JANITOR_BATCH_SIZE)
             )
             for row in (await session.execute(stmt)).scalars():

@@ -501,6 +501,12 @@ class Settings(BaseSettings):
     # but redundant work is still redundant work).
     index_janitor_interval_seconds: int = 30
     index_janitor_grace_seconds: int = 60
+    # SPEC #450 — attempt cap before a non-permanent-code failure is
+    # dead-lettered as ``max_attempts_exceeded``. Mirrors
+    # ``async_persist_max_deliveries`` and the scan-side
+    # ``x-delivery-limit=5`` (same "stop looping forever" shape, one
+    # hop later in the pipeline).
+    index_max_attempts: int = 5
 
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]

@@ -40,6 +40,22 @@ _PDF_WARNING_CODES: frozenset[str] = frozenset(
     }
 )
 
+# SPEC #450 — the closed subset of ``_PDF_WARNING_CODES`` that raises
+# IDENTICALLY on every retry (ADR-056 Tier-C structural-parse failures).
+# ``pdf_metadata_parse_error`` and every Tier-B code (``encrypted``,
+# ``no_text_layer``, …) are deliberately EXCLUDED — those warn on a
+# possibly-successful index, not a futile one, so they fall through to
+# the attempt-cap backstop (``Settings.index_max_attempts``) instead of
+# dead-lettering on the first attempt. Single source of truth for
+# ``IndexWorker._record_failure`` (services/index_worker.py) AND its
+# tests (#371 guard/app-lockstep lesson — never duplicate the set).
+PERMANENT_INDEX_FAILURE_CODES: frozenset[str] = frozenset(
+    {
+        "pdf_corrupted_structure",
+        "pdf_corrupted_xref",
+    }
+)
+
 
 def _classify_pdf_extraction_error(exc: Exception) -> str:
     """Map a pymupdf raise to a closed-set ``extraction_warnings`` code.

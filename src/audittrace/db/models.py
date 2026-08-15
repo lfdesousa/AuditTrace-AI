@@ -320,6 +320,28 @@ class MemoryItem(Base):
     # scan pipeline claims to have been auto-indexed.
     indexed_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
+    # ── SPEC #450 (WU-1, migration 020) — index dead-letter state ──────
+    # Adds the THIRD state the ``indexed_at_ms`` outbox above never had:
+    # "will never succeed" — a corrupt/unindexable PDF must stop being
+    # re-enqueued by ``IndexJanitor`` forever. ``index_attempts`` counts
+    # every failed ``IndexWorker`` pass (0 = never attempted or never
+    # failed); ``index_failed_at_ms`` NULL = still retryable, a
+    # timestamp = terminally dead-lettered; ``index_failure_code`` names
+    # WHY — either a permanent structural code from
+    # ``PERMANENT_INDEX_FAILURE_CODES`` (routes/memory_pdf/classification.py)
+    # or ``"max_attempts_exceeded"`` once ``index_attempts`` reaches
+    # ``Settings.index_max_attempts``. All three nullable/defaulted so
+    # every pre-migration-020 row reads NULL/0 — additive, backward
+    # compatible, no backfill. Mirrors the two terminal patterns already
+    # proven elsewhere in this codebase: ``async_persist.py``
+    # max-deliveries→DLQ and ``scan_verdict_consumer.py`` DLX +
+    # ``row_missing`` no-requeue.
+    index_attempts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0"
+    )
+    index_failed_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    index_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )

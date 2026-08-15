@@ -37,9 +37,20 @@ def _envelope(scan_id: str = "scan-1") -> IndexRequestEnvelope:
     )
 
 
-async def _seed_clean_row(factory, *, scan_id: str, user_id: str = "alice") -> None:
+async def _seed_clean_row(
+    factory,
+    *,
+    scan_id: str,
+    user_id: str = "alice",
+    extraction_warnings: list[dict[str, object]] | None = None,
+    index_attempts: int = 0,
+) -> None:
     """Insert a scanned-clean manifest row with indexed_at_ms NULL — the
-    exact state ScanVerdictConsumer leaves behind on a clean verdict."""
+    exact state ScanVerdictConsumer leaves behind on a clean verdict.
+    ``extraction_warnings`` / ``index_attempts`` simulate the pipeline
+    manifest flush having already run for a prior failed attempt (SPEC
+    #450 §"hinge": the flush commits before ``default_indexer`` returns
+    ``ok=False``, so ``_record_failure`` always reads a populated row)."""
     async with factory() as session:
         row = await manifest_mod.insert_pending_scan(
             session,
@@ -54,14 +65,17 @@ async def _seed_clean_row(factory, *, scan_id: str, user_id: str = "alice") -> N
         row.scan_status = "scanned_clean"
         row.key = f"s3://memory-shared/episodic/papers/{scan_id}/paper.pdf"
         row.indexed_at_ms = None
+        row.extraction_warnings = extraction_warnings
+        row.index_attempts = index_attempts
         await session.commit()
 
 
-def _settings() -> SimpleNamespace:
+def _settings(index_max_attempts: int = 5) -> SimpleNamespace:
     return SimpleNamespace(
         aws_bucket="",
         object_storage_backend="minio",
         minio_shared_bucket="memory-shared",
+        index_max_attempts=index_max_attempts,
     )
 
 
@@ -73,7 +87,10 @@ class TestIndexOneOutboxSemantics:
         return f.get_session_factory()
 
     async def test_success_marks_indexed_at_ms(self, factory) -> None:
-        await _seed_clean_row(factory, scan_id="scan-ok")
+        # SPEC #450 (c) — success still marks indexed_at_ms AND never
+        # touches the new terminal columns, even when a prior failed
+        # attempt left index_attempts > 0 on the row.
+        await _seed_clean_row(factory, scan_id="scan-ok", index_attempts=2)
         indexer = AsyncMock(return_value=True)
         worker = IndexWorker(
             settings=_settings(),
@@ -90,6 +107,9 @@ class TestIndexOneOutboxSemantics:
         assert row is not None
         assert row.indexed_at_ms is not None
         assert row.indexed_at_ms > 0
+        assert row.index_attempts == 2  # untouched by the success path
+        assert row.index_failed_at_ms is None
+        assert row.index_failure_code is None
 
     async def test_indexer_exception_leaves_indexed_at_ms_null(self, factory) -> None:
         # RED PROOF: an embed-server outage (or any indexer exception)
@@ -169,6 +189,165 @@ class TestIndexOneOutboxSemantics:
         # Must not raise — a DB outage while marking is logged, never
         # crashes the worker's run loop.
         await worker._index_one(_envelope("scan-db-down"))
+
+
+class TestRecordFailure:
+    """SPEC #450 WU-3 — the terminal/dead-letter decision on a failed
+    attempt. Falsifiability anchor: neutering the permanent-code branch,
+    the attempt-cap branch, or the exclusion in ``_index_janitor.py``
+    each has its own dedicated RED proof; these tests pin
+    ``_record_failure``'s own column values."""
+
+    @pytest.fixture
+    async def factory(self):
+        f = InMemoryPostgresFactory()
+        await f.create_schema()
+        return f.get_session_factory()
+
+    async def test_permanent_code_dead_letters_on_attempt_one(self, factory) -> None:
+        # (a) — a failure carrying a permanent structural code
+        # dead-letters IMMEDIATELY, on the very first attempt; retrying
+        # would be pure waste since the classifier raises the same code
+        # every time.
+        await _seed_clean_row(
+            factory,
+            scan_id="scan-perm",
+            extraction_warnings=[{"code": "pdf_corrupted_structure", "page": None}],
+        )
+        indexer = AsyncMock(return_value=False)
+        worker = IndexWorker(
+            settings=_settings(),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+            indexer=indexer,
+        )
+
+        await worker._index_one(_envelope("scan-perm"))
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-perm")
+        assert row is not None
+        assert row.index_attempts == 1
+        assert row.index_failed_at_ms is not None
+        assert row.index_failed_at_ms > 0
+        assert row.index_failure_code == "pdf_corrupted_structure"
+        # Dead-lettered, never marked "succeeded".
+        assert row.indexed_at_ms is None
+
+    async def test_permanent_xref_code_dead_letters_on_attempt_one(
+        self, factory
+    ) -> None:
+        # The OTHER permanent code — proves the decision reads the
+        # PERMANENT_INDEX_FAILURE_CODES set, not a hardcoded string.
+        await _seed_clean_row(
+            factory,
+            scan_id="scan-xref",
+            extraction_warnings=[{"code": "pdf_corrupted_xref", "page": None}],
+        )
+        worker = IndexWorker(
+            settings=_settings(),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+            indexer=AsyncMock(return_value=False),
+        )
+
+        await worker._index_one(_envelope("scan-xref"))
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-xref")
+        assert row is not None
+        assert row.index_failure_code == "pdf_corrupted_xref"
+        assert row.index_failed_at_ms is not None
+
+    async def test_non_permanent_failure_retries_then_hits_attempt_cap(
+        self, factory
+    ) -> None:
+        # (b) — a failure whose extraction_warnings carry no permanent
+        # code (e.g. a transient embed-server outage: no warning at
+        # all) must NOT dead-letter until index_attempts reaches the
+        # cap (5). Attempts 1-4: terminal columns stay NULL, the row
+        # remains eligible for IndexJanitor re-enqueue. Attempt 5:
+        # dead-lettered as "max_attempts_exceeded".
+        await _seed_clean_row(factory, scan_id="scan-cap")
+        worker = IndexWorker(
+            settings=_settings(index_max_attempts=5),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+            indexer=AsyncMock(return_value=False),
+        )
+
+        for attempt in range(1, 5):
+            await worker._index_one(_envelope("scan-cap"))
+            async with factory() as session:
+                row = await manifest_mod.get_by_scan_id(session, "scan-cap")
+            assert row is not None
+            assert row.index_attempts == attempt
+            assert row.index_failed_at_ms is None, (
+                f"attempt {attempt}/5 must still be retryable"
+            )
+            assert row.index_failure_code is None
+
+        # 5th attempt: cap reached, dead-letter.
+        await worker._index_one(_envelope("scan-cap"))
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-cap")
+        assert row is not None
+        assert row.index_attempts == 5
+        assert row.index_failed_at_ms is not None
+        assert row.index_failure_code == "max_attempts_exceeded"
+
+    async def test_non_permanent_warning_code_also_uses_attempt_cap(
+        self, factory
+    ) -> None:
+        # A Tier-B warning code (e.g. "encrypted") is deliberately
+        # EXCLUDED from PERMANENT_INDEX_FAILURE_CODES (it warns on a
+        # possibly-successful index, not a futile one) — it must fall
+        # through to the attempt-cap path, not dead-letter on attempt 1.
+        await _seed_clean_row(
+            factory,
+            scan_id="scan-tier-b",
+            extraction_warnings=[{"code": "encrypted", "page": None}],
+        )
+        worker = IndexWorker(
+            settings=_settings(index_max_attempts=5),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+            indexer=AsyncMock(return_value=False),
+        )
+
+        await worker._index_one(_envelope("scan-tier-b"))
+
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "scan-tier-b")
+        assert row is not None
+        assert row.index_attempts == 1
+        assert row.index_failed_at_ms is None
+        assert row.index_failure_code is None
+
+    async def test_record_failure_db_failure_is_logged_not_raised(self) -> None:
+        broken_factory = MagicMock(side_effect=RuntimeError("db down"))
+        worker = IndexWorker(
+            settings=_settings(),
+            session_factory=broken_factory,
+            queue=asyncio.Queue(),
+            indexer=AsyncMock(return_value=False),
+        )
+        # Must not raise — a DB outage while recording the failure is
+        # logged, never crashes the worker's run loop.
+        await worker._index_one(_envelope("scan-db-down"))
+
+    async def test_record_failure_row_missing_is_logged_not_raised(
+        self, factory
+    ) -> None:
+        # Envelope names a scan_id with no manifest row at all (e.g. a
+        # race with a hard-delete) — must not raise.
+        worker = IndexWorker(
+            settings=_settings(),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+            indexer=AsyncMock(return_value=False),
+        )
+        await worker._index_one(_envelope("scan-does-not-exist"))
 
 
 class TestDefaultIndexerRouting:
