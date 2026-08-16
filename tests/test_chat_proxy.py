@@ -3152,6 +3152,129 @@ class _HeaderDelayedStreamClient(_FakeAsyncClient):
         return _HeaderDelayedStreamCtx(self._lines, self._delay)
 
 
+# ───────── aclose() spies — resource-cleanup guard #5 (review REJECT) ────────
+#
+# 2026-08-16 independent review (WU-1, #458): ``async with
+# contextlib.aclosing(resp):`` at BOTH streaming call sites was replaced by a
+# no-op ``contextlib.AsyncExitStack()`` and all 124 pre-existing streaming
+# tests stayed green — none of them ever asserted the resolved upstream
+# response's ``.aclose()`` was actually invoked. ``_FakeStreamResponse`` and
+# ``_SeqStreamResponse``'s own ``aclose()`` methods are explicit no-ops (see
+# their docstrings) present only so the wrapper "has something to call" —
+# proving nothing. These subclasses turn that into an assertable fact.
+
+
+class _AcloseSpyResponse(_FakeStreamResponse):
+    """``_FakeStreamResponse`` (non-tool-loop call site,
+    ``chat.py:~2008``) whose ``.aclose()`` records that it fired, and which
+    can also be made to fail ``raise_for_status()`` (a 4xx/5xx upstream) so
+    the spy covers the error exit path too, not just the happy path."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        super().__init__(lines)
+        self.status_code = status_code
+        self.aclose_called = False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx as _httpx
+
+            raise _httpx.HTTPStatusError(
+                "upstream error", request=MagicMock(), response=self
+            )
+        return None
+
+    async def aread(self) -> bytes:
+        return b""
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyCtx:
+    """Async context manager that always resolves to the *response* it was
+    built with — lets a test hold a direct reference to the exact object the
+    route will (or won't) close."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _AcloseSpyResponse:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _AcloseSpyClient(_FakeAsyncClient):
+    """Client whose ``.stream()`` always resolves to the single *response*
+    supplied at construction — the non-tool-loop streaming call site,
+    ``chat.py:~2008``."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        super().__init__()
+        self._response = response
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        return _AcloseSpyCtx(self._response)
+
+
+class _AcloseSpyStreamResponse(_SeqStreamResponse):
+    """``_SeqStreamResponse`` (tools-loop call site,
+    ``_stream_memory_tool_loop``, ``chat.py:~1214``) whose ``.aclose()``
+    records that it fired."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.aclose_called = False
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyStreamCtx(_SeqStreamCtx):
+    """``_SeqStreamCtx`` that builds an ``_AcloseSpyStreamResponse`` and
+    stashes it on ``self.response`` so the owning client (and, through it,
+    the test) can reach the exact resolved object after the request
+    completes."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.response: _AcloseSpyStreamResponse | None = None
+
+    async def __aenter__(self) -> _AcloseSpyStreamResponse:
+        self.response = _AcloseSpyStreamResponse(self._lines, self._status, self._body)
+        return self.response
+
+
+class _AcloseSpyStreamClient(_SequencedStreamClient):
+    """``_SequencedStreamClient`` whose per-turn ``.stream()`` calls return
+    aclose-spying responses, one ``_AcloseSpyStreamCtx`` per turn, recorded
+    on ``self.stream_ctxs`` — covers the tools-loop call site across its
+    three exit shapes: normal completion, the tool-parse-500 buffered
+    fallback (reuses the base class's ``.post()``), and a non-parse
+    4xx/5xx (``raise_for_status()`` failure)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.stream_ctxs: list[_AcloseSpyStreamCtx] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        lines = self._turns[idx]
+        status = self._stream_status[idx] if idx < len(self._stream_status) else 200
+        body = self._stream_bodies[idx] if idx < len(self._stream_bodies) else None
+        self._si += 1
+        ctx = _AcloseSpyStreamCtx(lines, status, body)
+        self.stream_ctxs.append(ctx)
+        return ctx
+
+
 class TestKeepaliveFromT0AcrossHeaderAwait:
     """WU-1 falsifiable acceptance (spec 2026-08-16-SPEC-sse-keepalive-
     upstream-window.md, #458), exercised through the full route on BOTH
@@ -3491,3 +3614,182 @@ class TestToolsModeMetadataOnlyTurn:
         assert row.model == "qwen3.5-35b"
         assert row.user_id == SENTINEL_SUBJECT
         assert row.prompt_tokens == 0
+
+
+class TestUpstreamResponseClosedOnAllExitPaths:
+    """WU-1 guard #5 (resource cleanup, #458 review REJECT 2026-08-16): the
+    resolved upstream ``httpx.Response`` must actually be closed — not just
+    wrapped in something that LOOKS like ``contextlib.aclosing(resp)`` —
+    at BOTH streaming call sites, on every exit path (normal completion,
+    the tool-parse-500 buffered fallback, and a plain ``raise_for_status()``
+    failure). The prior suite never asserted this: swapping
+    ``contextlib.aclosing(resp)`` for a no-op ``contextlib.AsyncExitStack()``
+    at both call sites left all 124 streaming tests green, because the fakes'
+    own ``aclose()`` were no-ops nobody polled afterwards
+    (``feedback_vacuous_neuter_test_antipattern``). These tests spy on
+    ``.aclose()`` directly and go RED under that exact neuter — proven by
+    hand during this build (neuter → RED, restore → GREEN, see build
+    record)."""
+
+    @pytest.fixture
+    def _tools_mode(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    # ── non-tool-loop call site — chat.py:~2008 ───────────────────────────
+
+    def test_inject_mode_normal_completion_closes_upstream_response(self, client):
+        """Happy path: streaming completes normally, the resolved response
+        must still be closed once the ``async with`` body exits."""
+        response_obj = _AcloseSpyResponse(
+            [
+                'data: {"id":"cmpl-a","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"hi"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "hi" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_inject_mode_error_response_closes_upstream_response(self, client):
+        """Error path: ``resp.raise_for_status()`` raises on a 4xx/5xx —
+        the response must be closed even though the ``async with`` body
+        exits via exception, not a normal return."""
+        response_obj = _AcloseSpyResponse([], status_code=503)
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "503" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
+
+    # ── tools-loop call site — _stream_memory_tool_loop, chat.py:~1214 ────
+
+    def test_tools_mode_normal_completion_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """Happy path on the OTHER call site: a single streamed turn with
+        no tool calls — proves the guard is wired into both sites, not
+        just the simpler non-tool-loop one."""
+        fake = _AcloseSpyStreamClient([_sse_content_lines(["done"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "done" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_tools_mode_tool_parse_500_fallback_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """The tool-parse-500 branch: the errored streamed response that
+        triggers the buffered retry/no-tools fallback must ITSELF be
+        closed — it is read via ``resp.aread()`` then discarded, never
+        iterated, so this is the exit path most likely to leak if
+        ``contextlib.aclosing(resp)`` were ever dropped."""
+        parse_err_body = {
+            "error": {
+                "code": 500,
+                "type": "server_error",
+                "message": (
+                    "Failed to parse tool call arguments as JSON: "
+                    "[json.exception.parse_error.101]"
+                ),
+            }
+        }
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],  # short-circuited by status 500
+            stream_status=[500],
+            stream_bodies=[parse_err_body],
+            post_responses=[_tools_mode_response_text("Recovered answer.")],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "trigger parse error"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "Recovered answer." in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "the tool-parse-500 response was never closed before falling"
+            " back to the buffered retry path"
+        )
+
+    def test_tools_mode_non_parse_500_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """A non-tool-parse 500 falls through to ``resp.raise_for_status()``
+        — the response must be closed even though the ``async with`` body
+        exits via exception (no buffered fallback for this shape)."""
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],
+            stream_status=[500],
+            stream_bodies=[{"error": {"message": "CUDA OOM"}}],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "status 500" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
