@@ -96,6 +96,34 @@ class _FakeAsyncClient:
         self.last_stream_json = json
         return _FakeStreamCtx(self._stream_lines)
 
+    # ── build_request / send (WU-1, #458) ──────────────────────────────────
+    #
+    # The keep-alive-from-t=0 race (``_stream_upstream_with_keepalive_from_t0``)
+    # sends via ``client.build_request(...)`` + ``client.send(req,
+    # stream=True)`` instead of ``client.stream(...)`` — real
+    # ``httpx.AsyncClient.stream()`` is itself sugar over exactly those two
+    # calls. Delegating ``send()`` to ``self.stream(...)`` means every
+    # subclass below, which only overrides ``.stream()``, keeps working
+    # unchanged (their ``last_stream_json`` / ``stream_calls`` bookkeeping
+    # still fires) while production code exercises the new call shape.
+    def build_request(self, method, url, json=None, **kwargs):
+        return _FakeHttpxRequest(method, url, json)
+
+    async def send(self, request, *, stream=False, **kwargs):
+        cm = self.stream(request.method, request.url, json=request.json)
+        return await cm.__aenter__()
+
+
+class _FakeHttpxRequest:
+    """Minimal stand-in for ``httpx.Request`` — only the attributes
+    ``_FakeAsyncClient.send`` reads. (Distinct from ``_FakeRequest``
+    elsewhere in this module, which stands in for ``fastapi.Request``.)"""
+
+    def __init__(self, method: str, url: str, json: dict | None) -> None:
+        self.method = method
+        self.url = url
+        self.json = json
+
 
 class _FakeStreamCtx:
     def __init__(self, lines: list[str]) -> None:
@@ -118,6 +146,11 @@ class _FakeStreamResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
 
 
 def _patch_async_client(fake: _FakeAsyncClient):
@@ -299,6 +332,11 @@ class _SeqStreamResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
 
 
 class _SeqStreamCtx:
@@ -3065,6 +3103,213 @@ class _DelayedSeqStreamClient(_SequencedStreamClient):
         idx = min(self._si, len(self._turns) - 1)
         self._si += 1
         return _DelayedSeqStreamCtx(self._turns[idx], self._delay)
+
+
+# ────────── keep-alive from t=0 across the upstream header-await (#458) ──────
+#
+# Unlike the ``_Delayed*`` fakes above (which stall ``aiter_lines`` — a quiet
+# period AFTER headers already arrived), these stall the STREAM CONTEXT
+# MANAGER'S ``__aenter__`` itself, i.e. header arrival — the exact shape of
+# llama.cpp withholding HTTP headers until the first token (prompt-eval).
+# ``_FakeAsyncClient.send()`` (added for WU-1) delegates to
+# ``self.stream(...).__aenter__()``, so delaying ``__aenter__`` here delays
+# the race helper's ``client.send(..., stream=True)`` exactly the same way a
+# slow-first-token upstream would.
+
+
+class _HeaderDelayedStreamCtx:
+    def __init__(self, lines, delay: float, status: int = 200, body=None) -> None:
+        self._lines = lines
+        self._delay = delay
+        self._status = status
+        self._body = body
+
+    async def __aenter__(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        return _SeqStreamResponse(self._lines, self._status, self._body)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _HeaderDelayedStreamClient(_FakeAsyncClient):
+    """Client whose header arrival (``__aenter__``, reached via the new
+    ``send()`` → ``stream().__aenter__()`` path) stalls *delay* seconds
+    before the response object exists — models llama.cpp withholding HTTP
+    headers until the first token, i.e. the full prompt-eval window."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__()
+        self._lines = lines
+        self._delay = delay
+        self.stream_calls: list[dict] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        return _HeaderDelayedStreamCtx(self._lines, self._delay)
+
+
+class TestKeepaliveFromT0AcrossHeaderAwait:
+    """WU-1 falsifiable acceptance (spec 2026-08-16-SPEC-sse-keepalive-
+    upstream-window.md, #458), exercised through the full route on BOTH
+    streaming call sites — ``_stream_memory_tool_loop`` (tools mode) and the
+    non-tool-loop streaming branch (inject mode, default). Covers the exact
+    regression the MoE could never catch: a slow-first-token upstream must
+    not leave the client byte-starved before ``_iter_with_idle_timeout``'s
+    existing (post-header) keep-alive loop ever starts."""
+
+    @pytest.fixture
+    def _fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _tools_mode_fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_inject_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _fast_keepalive
+    ):
+        """Non-tool-loop streaming path (``chat.py:~1927``). Headers
+        delayed past the keepalive interval (1.4s > 1s) must yield ≥1
+        ``: keep-alive`` frame BEFORE the first upstream ``data:`` byte.
+
+        Neuter the t=0 ticker and this goes RED — before WU-1 the client
+        got zero bytes for the full 1.4s header-await; only the
+        POST-header ``_iter_with_idle_timeout`` loop ever emitted
+        keep-alives, too late for a header-await this long.
+        """
+        fake = _HeaderDelayedStreamClient(
+            [
+                'data: {"id":"cmpl-h","created":9,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"slow-first-token"}}]}',
+                "data: [DONE]",
+            ],
+            delay=1.4,
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_tools_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _tools_mode_fast_keepalive
+    ):
+        """Tools-loop streaming path (``_stream_memory_tool_loop``,
+        ``chat.py:~1146``). Same guarantee, same neuter-to-RED contract as
+        the inject-mode sibling above, on the OTHER call site — proves the
+        single factored helper is actually wired into both."""
+        fake = _HeaderDelayedStreamClient(
+            _sse_content_lines(["slow-first-token"]),
+            delay=1.4,
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_inject_mode_fast_path_no_spurious_keepalive_frame(self, client):
+        """Spec sub-decision #4: when the upstream returns headers before
+        the first keepalive tick (the MoE, the overwhelming common case),
+        output must be byte-identical to today — no early keep-alive frame
+        just because the race helper is now in the path.
+
+        Neuter the fast-path guard (e.g. always emit a frame regardless of
+        timing) and this goes RED.
+        """
+        fake = _FakeAsyncClient(
+            stream_lines=[
+                'data: {"id":"cmpl-f","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"fast"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
+
+    def test_tools_mode_fast_path_no_spurious_keepalive_frame(
+        self, client, monkeypatch
+    ):
+        """Sub-decision #4 on the tools-loop call site."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        fake = _SequencedStreamClient([_sse_content_lines(["fast"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+        config_mod.get_settings.cache_clear()
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
 
 
 class TestStreamingQuietPeriodsAndTermination:
