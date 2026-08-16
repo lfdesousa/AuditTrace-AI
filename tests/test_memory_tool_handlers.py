@@ -1744,3 +1744,303 @@ class TestRecallDecisionsPaginationEndToEnd:
         assert not any("MARKER" in m["snippet"] for m in page0["matches"])
         assert page0["has_more"] is True
         assert any("MARKER" in m["snippet"] for m in page1["matches"])
+
+
+# ═════════════════ SPEC #374 — recall corpus-incompleteness signal ═════════
+
+
+class TestDocTokens374:
+    """``_doc_tokens`` — SPEC #374 WU-3, pure token extraction (sub-decision
+    #5). FALSIFIABLE: loosen the regex quantifier (``{2,}`` → ``{0,}``) and
+    ``test_short_tokens_excluded`` goes RED (2-char noise would leak in);
+    drop the quoted-phrase branch and ``test_quoted_phrase_kept_whole``
+    goes RED (the phrase fragments into separate single-word tokens)."""
+
+    def test_extracts_letter_led_identifier_tokens(self) -> None:
+        from audittrace.tools.memory_handlers import _doc_tokens
+
+        tokens = _doc_tokens("what does ADR-058 say about outages?")
+        assert "adr-058" in tokens
+        assert "outages" in tokens
+
+    def test_short_tokens_excluded(self) -> None:
+        from audittrace.tools.memory_handlers import _doc_tokens
+
+        tokens = _doc_tokens("is 12 ok or 42?")
+        # Digit-led "12"/"42" never match (the regex is letter-LED);
+        # "ok" is too short (< 3 chars).
+        assert "12" not in tokens
+        assert "42" not in tokens
+        assert "ok" not in tokens
+
+    def test_quoted_phrase_kept_whole(self) -> None:
+        from audittrace.tools.memory_handlers import _doc_tokens
+
+        tokens = _doc_tokens('find "quarterly outage report" please')
+        assert "quarterly outage report" in tokens
+
+    def test_lowercased_and_deduplicated(self) -> None:
+        from audittrace.tools.memory_handlers import _doc_tokens
+
+        tokens = _doc_tokens("ADR-058 adr-058 ADR-058")
+        assert tokens.count("adr-058") == 1
+
+    def test_bounded_to_max_tokens(self) -> None:
+        from audittrace.tools.memory_handlers import _MAX_DOC_TOKENS, _doc_tokens
+
+        query = " ".join(f"word{i}" for i in range(20))
+        tokens = _doc_tokens(query)
+        assert len(tokens) == _MAX_DOC_TOKENS
+
+    def test_empty_query_returns_no_tokens(self) -> None:
+        from audittrace.tools.memory_handlers import _doc_tokens
+
+        assert _doc_tokens("") == []
+
+
+class TestCorpusStatusEnrichment374:
+    """SPEC #374 WU-2 — ``corpus_status`` on an empty recall, wired into
+    all three ChromaDB-backed recall tools at their single return site.
+
+    FALSIFIABLE: comment out the ``if page.total == 0: ...`` block in any
+    of ``recall_decisions``/``recall_skills``/``recall_semantic`` and its
+    ``test_*_attaches_corpus_status_when_empty`` goes RED (key absent);
+    neuter the ``total_incomplete == 0`` guard in ``_maybe_corpus_status``
+    (drop the early return) and ``test_fully_indexed_corpus_stays_silent``
+    goes RED (the key wrongly appears on a genuinely-empty, fully-indexed
+    corpus); neuter the token-match wiring and
+    ``test_recall_decisions_matched_unindexed_names_the_doc`` goes RED
+    (``matched_unindexed`` comes back empty).
+    """
+
+    @pytest.mark.asyncio
+    async def test_recall_semantic_attaches_corpus_status_when_empty(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic", "decisions/pending.pdf", None, 1, user.user_id, tier="corpus"
+        )
+        await manifest.record_create(
+            "semantic",
+            "decisions/ADR-058-dead.pdf",
+            None,
+            1,
+            user.user_id,
+            tier="corpus",
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/ADR-058-dead.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        # Additive-only (per the module CHANGELOG note): the existing
+        # empty-page contract stays byte-identical.
+        assert result["total"] == 0
+        assert result["matches"] == []
+        assert "corpus_status" in result
+        assert result["corpus_status"]["pending_index"] == 1
+        assert result["corpus_status"]["dead_lettered"] == 1
+        assert result["corpus_status"]["matched_unindexed"] == []
+        assert "may be incomplete" in result["corpus_status"]["note"]
+
+    @pytest.mark.asyncio
+    async def test_recall_decisions_matched_unindexed_names_the_doc(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            None,
+            1,
+            user.user_id,
+            tier="corpus",
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "what does ADR-058 say"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert result["corpus_status"]["matched_unindexed"] == [
+            {
+                "key": "decisions/ADR-058-outage.pdf",
+                "state": "dead_lettered",
+                "code": "pdf_corrupted_structure",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_attaches_corpus_status_when_empty(
+        self, _populated_container, _fakeredis_cache
+    ):
+        user = sentinel_user_context()
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "procedural", "skills/SKILL-374.md", None, 1, user.user_id, tier="corpus"
+        )
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert result["corpus_status"]["pending_index"] == 1
+        assert result["corpus_status"]["dead_lettered"] == 0
+
+    @pytest.mark.asyncio
+    async def test_recall_skills_fully_indexed_corpus_stays_silent(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Sub-decision #2 — "don't cry wolf": nothing accessible is
+        un-indexed/dead-lettered, so a genuinely-empty result stays
+        silent (no ``corpus_status`` key at all)."""
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_skills")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert "corpus_status" not in result
+
+    @pytest.mark.asyncio
+    async def test_non_empty_recall_never_attaches_corpus_status(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Sub-decision #1 — empty-only: a non-empty recall already
+        carries content, so the enrichment never fires even when the
+        caller has plenty of accessible un-indexed docs."""
+        user = sentinel_user_context()
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic", "decisions/pending.pdf", None, 1, user.user_id, tier="corpus"
+        )
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert result["total"] >= 1
+        assert "corpus_status" not in result
+
+    @pytest.mark.asyncio
+    async def test_corpus_status_enrichment_failure_is_swallowed(
+        self, _populated_container, _fakeredis_cache, monkeypatch
+    ):
+        """Sub-decision #6 — best-effort: a manifest-service failure never
+        breaks recall; it just omits ``corpus_status`` and logs."""
+
+        async def _boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("manifest unreachable")
+
+        monkeypatch.setattr(
+            _populated_container._instances["memory_manifest"],
+            "index_status_summary",
+            _boom,
+        )
+        user = sentinel_user_context()
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
+        )
+        assert result["total"] == 0
+        assert result["matches"] == []
+        assert "corpus_status" not in result
+
+
+class TestCorpusStatusTenancy374:
+    """The load-bearing correctness property (SPEC #374 sub-decision #4,
+    ``feedback_unit_tests_miss_rls``): a caller's ``corpus_status`` counts
+    and named matches must be scoped to what THEY can access — never
+    another tenant's private un-indexed/dead-lettered items. Exercises
+    two REAL non-admin ``UserContext``s (not the admin-by-default
+    ``sentinel_user_context()``) through the full handler → helper →
+    ``MemoryManifestService.index_status_summary`` chain, so the tenancy
+    predicate is actually exercised rather than vacuously passing.
+
+    FALSIFIABLE: neuter ``MemoryManifestService.index_status_summary``'s
+    (or the Mock's) tenancy filter — e.g. drop the ``if not
+    user_context.is_admin: ...`` branch so every query is unfiltered —
+    and ``test_non_admin_user_b_never_sees_user_a_private_counts`` goes
+    RED: bob's result would carry alice's dead-lettered count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_admin_user_b_never_sees_user_a_private_counts(
+        self, _populated_container, _fakeredis_cache
+    ):
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic",
+            "decisions/alice-private.pdf",
+            None,
+            1,
+            "user-alice",
+            tier="private",
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/alice-private.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+
+        alice = replace(
+            sentinel_user_context(),
+            user_id="user-alice",
+            is_admin=False,
+            scopes=("memory:semantic:read",),
+        )
+        bob = replace(
+            sentinel_user_context(),
+            user_id="user-bob",
+            is_admin=False,
+            scopes=("memory:semantic:read",),
+        )
+        tool = get_tool_by_name("recall_semantic")
+
+        alice_result, _ = await invoke_tool(
+            alice, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-alice"
+        )
+        bob_result, _ = await invoke_tool(
+            bob, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-bob"
+        )
+
+        assert alice_result["corpus_status"]["dead_lettered"] == 1
+        assert "corpus_status" not in bob_result, (
+            f"leaked alice's private dead-lettered count to bob: {bob_result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_corpus_tier_doc_visible_to_every_caller(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """The non-leak counterpart: a CORPUS-tier (shared) un-indexed
+        doc must still surface for a non-admin caller who didn't create
+        it — the predicate is owner-OR-corpus, not owner-only."""
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic", "decisions/shared.pdf", None, 1, "curator", tier="corpus"
+        )
+        bob = replace(
+            sentinel_user_context(),
+            user_id="user-bob",
+            is_admin=False,
+            scopes=("memory:semantic:read",),
+        )
+        tool = get_tool_by_name("recall_semantic")
+        result, _ = await invoke_tool(
+            bob, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-bob"
+        )
+        assert result["corpus_status"]["pending_index"] == 1

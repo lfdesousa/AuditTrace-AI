@@ -32,6 +32,20 @@ Handler contract (observed by every handler in this file):
     ``{"error": "..."}``. Unexpected exceptions propagate to
     ``tools.invoke_tool`` which wraps them as ``{"error": ...}``.
 
+CHANGELOG (SPEC #374 / recall-not-indexed-signal, 2026-08-16):
+``recall_decisions``/``recall_skills``/``recall_semantic`` (the three
+ChromaDB-backed recall tools — NOT ``recall_recent_sessions``, which is
+Postgres-session-backed and index-status-irrelevant) now attach an
+OPTIONAL ``corpus_status`` block when, and only when, ``total == 0`` AND
+the caller has at least one accessible un-indexed/dead-lettered document
+(``_maybe_corpus_status`` — best-effort, never breaks recall on failure).
+It closes the gap where an empty result was indistinguishable from "this
+topic doesn't exist" even when a matching document exists but was never
+indexed or was dead-lettered (#450). Purely additive to the existing
+empty-result shape above; a caller that never sees a non-empty
+``pending_index + dead_lettered`` accessible to it observes byte-identical
+behaviour to before this change.
+
 CHANGELOG (backlog #15 residual, #375 / RECALL-PAGINATION-20260803,
 2026-08-03): recall_decisions/recall_skills/recall_semantic/
 recall_recent_sessions gained ``offset`` (all four) and ``sort``/``order``
@@ -58,11 +72,13 @@ registered import it explicitly.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from audittrace.dependencies import (
     get_conversational_service,
     get_episodic_service,
+    get_memory_manifest_service,
     get_procedural_service,
     get_semantic_service,
 )
@@ -153,6 +169,110 @@ def _page_fields(page: SearchPage) -> dict[str, Any]:
         "order": page.order,
         "has_more": page.has_more,
         "truncated": page.has_more,
+    }
+
+
+# ── SPEC #374 — recall corpus-incompleteness signal ──────────────────────
+# An empty recall on ChromaDB alone is indistinguishable from "the topic
+# genuinely doesn't exist" — the vector store is blind to un-indexed /
+# dead-lettered docs by definition (no vectors were ever written for them).
+# ``_maybe_corpus_status`` closes that gap with a best-effort health signal
+# (see the module docstring's callers below); ``_doc_tokens`` is its pure
+# token-extraction half (sub-decision #5).
+
+# Doc-like token: a letter-led run of 3+ letters/digits/hyphens — catches
+# identifiers such as "ADR-058" or "SPEC-374" without matching short noise
+# words. Ratified regex, sub-decision #5.
+_DOC_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{2,}")
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'')
+# Bounds the number of ILIKE clauses ``index_status_summary`` builds per
+# call — a best-effort name-match input, not an exhaustive index.
+_MAX_DOC_TOKENS = 8
+
+
+def _doc_tokens(query: str) -> list[str]:
+    """Extract doc-like tokens from a recall query (SPEC #374, sub-decision
+    #5): every quoted phrase (taken whole), plus every ``_DOC_TOKEN_RE``
+    match. Lower-cased and de-duplicated (order-preserving; quoted phrases
+    win the earlier slot when a phrase and one of its own words would
+    otherwise collide), bounded to :data:`_MAX_DOC_TOKENS`.
+
+    Pure function — deterministic, no I/O. The SQL ``%token%`` ILIKE
+    wrapping happens in ``MemoryManifestService.index_status_summary``
+    (WU-1); this function only decides WHICH substrings are worth
+    matching on, keeping the extraction RULE and the query MECHANICS in
+    their own single-responsibility homes.
+    """
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        token = raw.strip().lower()
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+
+    for match in _QUOTED_PHRASE_RE.finditer(query):
+        _add(match.group(1) or match.group(2) or "")
+    for match in _DOC_TOKEN_RE.finditer(query):
+        _add(match.group(0))
+
+    return tokens[:_MAX_DOC_TOKENS]
+
+
+async def _maybe_corpus_status(
+    user_context: UserContext, query: str
+) -> dict[str, Any] | None:
+    """Best-effort ``corpus_status`` enrichment for an EMPTY recall (SPEC
+    #374, sub-decisions #1/#2/#6) — the single choke point wired into all
+    three ChromaDB-backed recall tools (sub-decision #3) so an empty
+    result carries an honest signal that the corpus may be incomplete
+    instead of silently reading as "this topic doesn't exist".
+
+    Returns ``None`` (attach nothing) when:
+      - there is nothing accessible to the caller to report
+        (``pending + dead_lettered == 0`` — sub-decision #2, "don't cry
+        wolf": a fully-indexed corpus genuinely returning empty is the
+        CORRECT answer, and adding noise there would erode trust in the
+        signal), or
+      - the lookup itself fails for any reason (sub-decision #6 — this
+        enrichment must NEVER break recall; the caller falls back to its
+        normal empty page).
+
+    Tenancy: ``index_status_summary`` is threaded the caller's
+    ``user_context`` and applies the owner-or-corpus predicate itself —
+    see that method's docstring for why (``memory_items`` carries no
+    Postgres RLS policy). This function never re-derives or overrides
+    that scoping.
+    """
+    try:
+        manifest = get_memory_manifest_service()
+        tokens = _doc_tokens(query)
+        summary = await manifest.index_status_summary(user_context, tokens)
+    except Exception:
+        logger.warning(
+            "corpus_status enrichment failed; omitting from recall result",
+            exc_info=True,
+        )
+        return None
+
+    total_incomplete = summary.pending + summary.dead_lettered
+    if total_incomplete == 0:
+        return None
+
+    return {
+        "pending_index": summary.pending,
+        "dead_lettered": summary.dead_lettered,
+        "matched_unindexed": [
+            {"key": m.key, "state": m.state, "code": m.index_failure_code}
+            for m in summary.matched
+        ],
+        "note": (
+            f"Corpus may be incomplete: {total_incomplete} accessible "
+            "document(s) are not yet indexed and cannot be found by "
+            "search. Do not conclude a topic is absent from an empty "
+            "result alone."
+        ),
     }
 
 
@@ -291,7 +411,7 @@ async def recall_decisions(
         order=order,
     )
     emit_recall_telemetry("tool", "decisions", page.total, cache="miss")
-    return {
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -314,6 +434,12 @@ async def recall_decisions(
         ],
         **_page_fields(page),
     }
+    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
+    if page.total == 0:
+        corpus_status = await _maybe_corpus_status(user_context, query)
+        if corpus_status is not None:
+            result["corpus_status"] = corpus_status
+    return result
 
 
 # ─────────────────────────────── recall_skills ──────────────────────────────
@@ -400,7 +526,7 @@ async def recall_skills(
         order=order,
     )
     emit_recall_telemetry("tool", "skills", page.total, cache="miss")
-    return {
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -422,6 +548,12 @@ async def recall_skills(
         ],
         **_page_fields(page),
     }
+    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
+    if page.total == 0:
+        corpus_status = await _maybe_corpus_status(user_context, query)
+        if corpus_status is not None:
+            result["corpus_status"] = corpus_status
+    return result
 
 
 # ───────────────────────── recall_recent_sessions ──────────────────────────
@@ -625,7 +757,7 @@ async def recall_semantic(
         user_context, query, k=k, offset=offset, sort=sort, order=order
     )
     emit_recall_telemetry("tool", "semantic", page.total, cache="miss")
-    return {
+    result: dict[str, Any] = {
         "matches": [
             {
                 **_recall_identity_fields(d.metadata),
@@ -637,6 +769,12 @@ async def recall_semantic(
         ],
         **_page_fields(page),
     }
+    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
+    if page.total == 0:
+        corpus_status = await _maybe_corpus_status(user_context, query)
+        if corpus_status is not None:
+            result["corpus_status"] = corpus_status
+    return result
 
 
 # ────────────────────────────── read_decision ──────────────────────────────
