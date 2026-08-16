@@ -46,6 +46,7 @@ import httpx
 from opentelemetry import trace
 
 from audittrace.identity import UserContext
+from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
 from audittrace.routes._model_route import upstream_host
 from audittrace.tools import get_tool_by_name, invoke_tool
 
@@ -477,7 +478,8 @@ async def run_memory_tool_loop(
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
-                )
+                ),
+                limits=LLAMA_HTTPX_LIMITS,
             ) as client:
                 response = await _post_with_tool_parse_retry(
                     client, llama_url, proxy_payload

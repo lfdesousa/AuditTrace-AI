@@ -43,6 +43,7 @@ from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call, reset_langgraph_step
+from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     _execute_memory_tool,
@@ -1190,7 +1191,8 @@ async def _stream_memory_tool_loop(
     last_sigs: frozenset[tuple[str, str]] | None = None
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+        limits=LLAMA_HTTPX_LIMITS,
     ) as client:
         for iteration in range(max_iterations):
             turn_payload = dict(loop_payload)
@@ -1358,7 +1360,7 @@ async def list_models(
     )
     models_url = upstream.rstrip("/") + "/models"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, limits=LLAMA_HTTPX_LIMITS) as client:
             response = await client.get(models_url)
             return response.json()
     except httpx.ConnectError as exc:
@@ -1986,7 +1988,8 @@ async def chat_completions(
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(
                         connect=10.0, read=None, write=30.0, pool=10.0
-                    )
+                    ),
+                    limits=LLAMA_HTTPX_LIMITS,
                 ) as client:
                     resp: httpx.Response | None = None
                     async for item in _stream_upstream_with_keepalive_from_t0(
@@ -2222,7 +2225,8 @@ async def chat_completions(
                     read=settings.llama_chunk_timeout,
                     write=30.0,
                     pool=10.0,
-                )
+                ),
+                limits=LLAMA_HTTPX_LIMITS,
             ) as client:
                 response = await client.post(llama_url, json=proxy_payload)
             body = response.json()

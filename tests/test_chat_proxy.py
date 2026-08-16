@@ -3793,3 +3793,176 @@ class TestUpstreamResponseClosedOnAllExitPaths:
             "resolved upstream response was never closed on the"
             " raise_for_status() error exit path"
         )
+
+
+# ──────────────── llama httpx keep-alive-race fix (SPEC 2026-08-16) ─────────
+#
+# llama.cpp FIN-closes an idle connection after ``Keep-Alive: timeout=5``
+# (confirmed live via tcpdump); httpx's own default pool keepalive (~5 s)
+# races that close and reuses the dead socket, raising
+# ``httpx.RemoteProtocolError: Server disconnected`` on the next call. The
+# fix caps every llama-facing ``httpx.AsyncClient``'s ``limits=`` at
+# ``keepalive_expiry=2.0`` (well under llama's 5 s) via one shared
+# ``LLAMA_HTTPX_LIMITS`` constant (#371 single-source-of-truth lockstep).
+#
+# These tests assert the ACTUAL kwarg passed to the ``httpx.AsyncClient``
+# constructor at each llama-facing call site — not just that the shared
+# constant has the right value — so dropping ``limits=`` at any ONE site
+# regresses that site's test to RED even though the constant itself is
+# still correct everywhere else (non-vacuous per site).
+
+
+class TestLlamaHttpxKeepaliveLimits:
+    """Every llama-facing ``httpx.AsyncClient`` caps keepalive below llama's
+    5 s server-side close, via the single shared ``LLAMA_HTTPX_LIMITS``."""
+
+    @pytest.fixture
+    def _tools_mode_fixture(self, monkeypatch):
+        """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test.
+
+        Mirrors ``TestToolsModeIntegration._tools_mode`` (not reused
+        directly — that fixture is scoped to its own class)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_shared_constant_caps_keepalive_below_llama_five_seconds(self):
+        """The single source of truth itself: below llama's 5 s Keep-Alive,
+        so httpx discards an idle pooled connection before llama can."""
+        from audittrace.routes import _llama_client, _memory_tool_loop, chat
+
+        limits = _llama_client.LLAMA_HTTPX_LIMITS
+        assert limits.keepalive_expiry is not None
+        assert limits.keepalive_expiry < 5.0
+        assert limits.keepalive_expiry == 2.0
+        # No per-site literals (#371 lockstep) — every consumer imports the
+        # exact SAME object, not a copy with the same value.
+        assert chat.LLAMA_HTTPX_LIMITS is limits
+        assert _memory_tool_loop.LLAMA_HTTPX_LIMITS is limits
+
+    def test_non_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode non-streaming branch (``chat_completions``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode streaming branch (``_iter_and_capture``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_models_endpoint_client_capped(self, client):
+        """``GET /v1/models`` proxy client."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.get("/v1/models")
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_streaming_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode streaming turn (``_stream_memory_tool_loop``) — this
+        client is constructed in ``chat.py`` itself, so only
+        ``_patch_async_client`` is needed (see the buffered-loop test above
+        for why stacking both patches would be misleading — they resolve to
+        the SAME underlying ``httpx.AsyncClient`` attribute)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedStreamClient([_sse_content_lines(["Hi"])])
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_buffered_loop_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode buffered turn (``_memory_tool_loop.run_memory_tool_loop``)
+        — the client is constructed in a DIFFERENT module
+        (``_memory_tool_loop.py``) than the streaming site above, proving the
+        fix reached that module too, not just ``chat.py``'s own call sites.
+
+        Patches ONLY ``_memory_tool_loop.httpx.AsyncClient`` (not also
+        ``chat.httpx.AsyncClient``) — both dotted paths resolve to the SAME
+        underlying ``httpx.AsyncClient`` attribute (a single shared ``httpx``
+        module), so stacking both patches would just have the second one
+        silently clobber the first's mock, making this assertion vacuously
+        pass against whichever one survived. Langfuse ingestion — the only
+        other ``httpx.AsyncClient()`` construction on this path — is a no-op
+        here (Langfuse disabled in tests, ``_record_langfuse_output`` returns
+        early), so exactly one call reaches this mock.
+        """
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_langfuse_ingestion_client_left_alone(self, client):
+        """The Langfuse ingestion client (``_record_langfuse_output``) is
+        NOT llama-facing — it must keep using plain ``httpx.AsyncClient()``
+        defaults, not ``LLAMA_HTTPX_LIMITS``. Proves the fix is targeted,
+        not a blanket change to every AsyncClient in the module."""
+        import inspect
+
+        from audittrace.routes import chat as chat_mod
+
+        source = inspect.getsource(chat_mod._record_langfuse_output)
+        assert "httpx.AsyncClient(timeout=5)" in source
+        assert "LLAMA_HTTPX_LIMITS" not in source
