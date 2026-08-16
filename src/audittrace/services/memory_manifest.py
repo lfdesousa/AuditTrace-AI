@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.db.models import MemoryItem
@@ -163,6 +163,38 @@ def _validate_layer(layer: str) -> None:
         raise ValueError(
             f"Invalid memory layer {layer!r}; expected one of {sorted(_VALID_LAYERS)}"
         )
+
+
+# ── SPEC #374 (WU-1) — read-path index-status query ──────────────────────
+# Caps the best-effort named-match list (sub-decision #5, ratified
+# 2026-08-16): a recall tool result is not the place for an unbounded list.
+_MAX_MATCHED_UNINDEXED = 5
+
+
+@dataclass(frozen=True, slots=True)
+class MatchedUnindexed:
+    """One accessible un-indexed/dead-lettered ``memory_items`` row whose
+    ``key``/``title`` matched a query-derived token (SPEC #374, sub-decision
+    #5). ``state`` is derived, never stored: ``"dead_lettered"`` when
+    ``index_failed_at_ms IS NOT NULL``, else ``"pending"``."""
+
+    key: str
+    state: str
+    index_failure_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexStatusSummary:
+    """Tenancy-scoped read-path answer to "how incomplete is the corpus
+    the caller can see, and does any of it name what they just asked
+    about?" (SPEC #374 / #374-recall-not-indexed-signal). ``pending`` +
+    ``dead_lettered`` are corpus-wide counts (sub-decision #4); ``matched``
+    is the bounded, best-effort name match (sub-decision #5, capped at
+    :data:`_MAX_MATCHED_UNINDEXED`)."""
+
+    pending: int
+    dead_lettered: int
+    matched: list[MatchedUnindexed]
 
 
 class MemoryManifestService:
@@ -447,6 +479,133 @@ class MemoryManifestService:
             return ManifestEntry.from_row(row) if row is not None else None
 
     @log_call(logger=logger)
+    async def index_status_summary(
+        self, user_context: UserContext, tokens: Sequence[str]
+    ) -> IndexStatusSummary:
+        """Tenancy-scoped read-path index-status query (SPEC #374 WU-1).
+
+        Answers "for this caller, how many accessible docs are un-indexed
+        / dead-lettered, and which of them match these tokens?" — the
+        capability the read path (recall) has never had; only
+        ``IndexJanitor._scan_orphans`` read ``indexed_at_ms`` /
+        ``index_failed_at_ms`` before this, as an unscoped batch poll.
+
+        ``tokens`` are pre-extracted, lower-cased doc-like tokens (see
+        ``tools.memory_handlers._doc_tokens``, sub-decision #5) — this
+        method owns the SQL query construction (the ``%token%`` ILIKE
+        wrapping) so the token-extraction RULE and the query MECHANICS
+        stay in their own single-responsibility homes, per the module
+        CHANGELOG precedent elsewhere in this codebase.
+
+        Tenancy (sub-decision #4, the load-bearing correctness property):
+        ``memory_items`` carries **no Postgres RLS policy** — the model's
+        own docstring is explicit that the manifest is operator-global,
+        not RLS'd, and access is gated in the application layer. So this
+        method reuses the SAME owner-or-corpus predicate ``list_for_layer
+        (caller=...)`` already applies (ADR-062 Phase B, WU-B4): a
+        non-admin caller only ever counts/matches a row where
+        ``created_by_user_id == user_context.user_id`` OR ``tier ==
+        "corpus"``; admins are unfiltered. The predicate is derived from
+        the AUTHENTICATED ``user_context`` (token-derived), never from
+        caller-supplied request data, per
+        ``feedback_never_trust_caller_metadata_for_security_fields``.
+
+        Two bounded queries, both scoped ``deleted_at_ms IS NULL``:
+          - counts: ``pending`` (``indexed_at_ms IS NULL AND
+            index_failed_at_ms IS NULL``) and ``dead_lettered``
+            (``index_failed_at_ms IS NOT NULL``);
+          - match (only when ``tokens`` is non-empty): un-indexed OR
+            dead-lettered rows whose ``key`` or ``title`` ILIKE-matches
+            any token, capped at :data:`_MAX_MATCHED_UNINDEXED`, ordered
+            by ``key`` for determinism (sub-decision #5: "deterministic +
+            testable").
+
+        Deviation from the spec's illustrative predicate: the spec names
+        ``key ILIKE ANY(tokens) OR source ILIKE ANY(tokens))`` — but
+        ``MemoryItem`` has no ``source`` column (that field lives on the
+        ChromaDB vector-store metadata the *other* three recall tools
+        read, not this Postgres manifest table). ``title`` is this
+        table's equivalent human-readable name field, so the match
+        predicate uses ``key``/``title`` instead — least-surprising
+        reading of an otherwise-nonexistent column reference.
+        """
+        async with self._session_factory() as session:
+            filters: list[Any] = [MemoryItem.deleted_at_ms.is_(None)]
+            if not user_context.is_admin:
+                filters.append(
+                    or_(
+                        MemoryItem.tier == "corpus",
+                        MemoryItem.created_by_user_id == user_context.user_id,
+                    )
+                )
+
+            pending_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MemoryItem)
+                    .where(
+                        *filters,
+                        MemoryItem.indexed_at_ms.is_(None),
+                        MemoryItem.index_failed_at_ms.is_(None),
+                    )
+                )
+            ).scalar_one()
+            dead_lettered_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MemoryItem)
+                    .where(*filters, MemoryItem.index_failed_at_ms.is_not(None))
+                )
+            ).scalar_one()
+
+            matched: list[MatchedUnindexed] = []
+            if tokens:
+                token_clauses = [
+                    or_(
+                        MemoryItem.key.ilike(f"%{token}%"),
+                        MemoryItem.title.ilike(f"%{token}%"),
+                    )
+                    for token in tokens
+                ]
+                rows = (
+                    (
+                        await session.execute(
+                            select(MemoryItem)
+                            .where(
+                                *filters,
+                                or_(
+                                    MemoryItem.indexed_at_ms.is_(None),
+                                    MemoryItem.index_failed_at_ms.is_not(None),
+                                ),
+                                or_(*token_clauses),
+                            )
+                            .order_by(MemoryItem.key)
+                            .limit(_MAX_MATCHED_UNINDEXED)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                matched = [
+                    MatchedUnindexed(
+                        key=row.key,
+                        state=(
+                            "dead_lettered"
+                            if row.index_failed_at_ms is not None
+                            else "pending"
+                        ),
+                        index_failure_code=row.index_failure_code,
+                    )
+                    for row in rows
+                ]
+
+            return IndexStatusSummary(
+                pending=pending_count,
+                dead_lettered=dead_lettered_count,
+                matched=matched,
+            )
+
+    @log_call(logger=logger)
     async def get_deleted_keys(self, layer: str, keys: Iterable[str]) -> set[str]:
         """Return the subset of ``keys`` that are soft-deleted for ``layer``.
 
@@ -617,6 +776,82 @@ class MockMemoryManifestService(MemoryManifestService):
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         return self._to_entry(existing) if existing is not None else None
+
+    def set_index_state(
+        self,
+        layer: str,
+        key: str,
+        *,
+        indexed_at_ms: int | None = None,
+        index_failed_at_ms: int | None = None,
+        index_failure_code: str | None = None,
+    ) -> None:
+        """Test-only seam (SPEC #374 WU-4). The mock's ``_rows`` dict has
+        no schema, so ``record_create``/``upsert_pdf_metadata`` never
+        populate the migration-019/020 index-outbox / dead-letter columns
+        — tests that need a row in a specific index-status state call
+        this directly after creating the row via ``record_create``."""
+        row = self._rows.get((layer, key))
+        if row is None:
+            raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
+        row["indexed_at_ms"] = indexed_at_ms
+        row["index_failed_at_ms"] = index_failed_at_ms
+        row["index_failure_code"] = index_failure_code
+
+    async def index_status_summary(
+        self, user_context: UserContext, tokens: Sequence[str]
+    ) -> IndexStatusSummary:
+        """Mirrors ``MemoryManifestService.index_status_summary`` — same
+        owner-or-corpus tenancy predicate, same corpus-wide (no
+        per-layer filter) scope, same ``_MAX_MATCHED_UNINDEXED`` cap."""
+        rows = [row for row in self._rows.values() if row.get("deleted_at_ms") is None]
+        if not user_context.is_admin:
+            rows = [
+                r
+                for r in rows
+                if r.get("created_by_user_id") == user_context.user_id
+                or r.get("tier", "corpus") == "corpus"
+            ]
+
+        pending = sum(
+            1
+            for r in rows
+            if r.get("indexed_at_ms") is None and r.get("index_failed_at_ms") is None
+        )
+        dead_lettered = sum(1 for r in rows if r.get("index_failed_at_ms") is not None)
+
+        matched: list[MatchedUnindexed] = []
+        if tokens:
+            lowered_tokens = [t.lower() for t in tokens]
+            candidates = sorted(
+                (
+                    r
+                    for r in rows
+                    if r.get("indexed_at_ms") is None
+                    or r.get("index_failed_at_ms") is not None
+                ),
+                key=lambda r: r["key"],
+            )
+            for r in candidates:
+                haystacks = (r["key"].lower(), (r.get("title") or "").lower())
+                if any(token in h for token in lowered_tokens for h in haystacks):
+                    matched.append(
+                        MatchedUnindexed(
+                            key=r["key"],
+                            state=(
+                                "dead_lettered"
+                                if r.get("index_failed_at_ms") is not None
+                                else "pending"
+                            ),
+                            index_failure_code=r.get("index_failure_code"),
+                        )
+                    )
+                if len(matched) >= _MAX_MATCHED_UNINDEXED:
+                    break
+
+        return IndexStatusSummary(
+            pending=pending, dead_lettered=dead_lettered, matched=matched
+        )
 
     async def get_deleted_keys(self, layer: str, keys: Iterable[str]) -> set[str]:
         _validate_layer(layer)
