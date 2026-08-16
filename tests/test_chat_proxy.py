@@ -96,6 +96,34 @@ class _FakeAsyncClient:
         self.last_stream_json = json
         return _FakeStreamCtx(self._stream_lines)
 
+    # ── build_request / send (WU-1, #458) ──────────────────────────────────
+    #
+    # The keep-alive-from-t=0 race (``_stream_upstream_with_keepalive_from_t0``)
+    # sends via ``client.build_request(...)`` + ``client.send(req,
+    # stream=True)`` instead of ``client.stream(...)`` — real
+    # ``httpx.AsyncClient.stream()`` is itself sugar over exactly those two
+    # calls. Delegating ``send()`` to ``self.stream(...)`` means every
+    # subclass below, which only overrides ``.stream()``, keeps working
+    # unchanged (their ``last_stream_json`` / ``stream_calls`` bookkeeping
+    # still fires) while production code exercises the new call shape.
+    def build_request(self, method, url, json=None, **kwargs):
+        return _FakeHttpxRequest(method, url, json)
+
+    async def send(self, request, *, stream=False, **kwargs):
+        cm = self.stream(request.method, request.url, json=request.json)
+        return await cm.__aenter__()
+
+
+class _FakeHttpxRequest:
+    """Minimal stand-in for ``httpx.Request`` — only the attributes
+    ``_FakeAsyncClient.send`` reads. (Distinct from ``_FakeRequest``
+    elsewhere in this module, which stands in for ``fastapi.Request``.)"""
+
+    def __init__(self, method: str, url: str, json: dict | None) -> None:
+        self.method = method
+        self.url = url
+        self.json = json
+
 
 class _FakeStreamCtx:
     def __init__(self, lines: list[str]) -> None:
@@ -118,6 +146,11 @@ class _FakeStreamResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
 
 
 def _patch_async_client(fake: _FakeAsyncClient):
@@ -299,6 +332,11 @@ class _SeqStreamResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+    async def aclose(self):
+        """No-op — the fake holds no real socket. Present so production's
+        ``contextlib.aclosing(resp)`` (WU-1) has something to call."""
+        return None
 
 
 class _SeqStreamCtx:
@@ -3067,6 +3105,336 @@ class _DelayedSeqStreamClient(_SequencedStreamClient):
         return _DelayedSeqStreamCtx(self._turns[idx], self._delay)
 
 
+# ────────── keep-alive from t=0 across the upstream header-await (#458) ──────
+#
+# Unlike the ``_Delayed*`` fakes above (which stall ``aiter_lines`` — a quiet
+# period AFTER headers already arrived), these stall the STREAM CONTEXT
+# MANAGER'S ``__aenter__`` itself, i.e. header arrival — the exact shape of
+# llama.cpp withholding HTTP headers until the first token (prompt-eval).
+# ``_FakeAsyncClient.send()`` (added for WU-1) delegates to
+# ``self.stream(...).__aenter__()``, so delaying ``__aenter__`` here delays
+# the race helper's ``client.send(..., stream=True)`` exactly the same way a
+# slow-first-token upstream would.
+
+
+class _HeaderDelayedStreamCtx:
+    def __init__(self, lines, delay: float, status: int = 200, body=None) -> None:
+        self._lines = lines
+        self._delay = delay
+        self._status = status
+        self._body = body
+
+    async def __aenter__(self):
+        import asyncio as _a
+
+        await _a.sleep(self._delay)
+        return _SeqStreamResponse(self._lines, self._status, self._body)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _HeaderDelayedStreamClient(_FakeAsyncClient):
+    """Client whose header arrival (``__aenter__``, reached via the new
+    ``send()`` → ``stream().__aenter__()`` path) stalls *delay* seconds
+    before the response object exists — models llama.cpp withholding HTTP
+    headers until the first token, i.e. the full prompt-eval window."""
+
+    def __init__(self, lines: list[str], delay: float) -> None:
+        super().__init__()
+        self._lines = lines
+        self._delay = delay
+        self.stream_calls: list[dict] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        return _HeaderDelayedStreamCtx(self._lines, self._delay)
+
+
+# ───────── aclose() spies — resource-cleanup guard #5 (review REJECT) ────────
+#
+# 2026-08-16 independent review (WU-1, #458): ``async with
+# contextlib.aclosing(resp):`` at BOTH streaming call sites was replaced by a
+# no-op ``contextlib.AsyncExitStack()`` and all 124 pre-existing streaming
+# tests stayed green — none of them ever asserted the resolved upstream
+# response's ``.aclose()`` was actually invoked. ``_FakeStreamResponse`` and
+# ``_SeqStreamResponse``'s own ``aclose()`` methods are explicit no-ops (see
+# their docstrings) present only so the wrapper "has something to call" —
+# proving nothing. These subclasses turn that into an assertable fact.
+
+
+class _AcloseSpyResponse(_FakeStreamResponse):
+    """``_FakeStreamResponse`` (non-tool-loop call site,
+    ``chat.py:~2008``) whose ``.aclose()`` records that it fired, and which
+    can also be made to fail ``raise_for_status()`` (a 4xx/5xx upstream) so
+    the spy covers the error exit path too, not just the happy path."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        super().__init__(lines)
+        self.status_code = status_code
+        self.aclose_called = False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx as _httpx
+
+            raise _httpx.HTTPStatusError(
+                "upstream error", request=MagicMock(), response=self
+            )
+        return None
+
+    async def aread(self) -> bytes:
+        return b""
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyCtx:
+    """Async context manager that always resolves to the *response* it was
+    built with — lets a test hold a direct reference to the exact object the
+    route will (or won't) close."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _AcloseSpyResponse:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _AcloseSpyClient(_FakeAsyncClient):
+    """Client whose ``.stream()`` always resolves to the single *response*
+    supplied at construction — the non-tool-loop streaming call site,
+    ``chat.py:~2008``."""
+
+    def __init__(self, response: _AcloseSpyResponse) -> None:
+        super().__init__()
+        self._response = response
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        return _AcloseSpyCtx(self._response)
+
+
+class _AcloseSpyStreamResponse(_SeqStreamResponse):
+    """``_SeqStreamResponse`` (tools-loop call site,
+    ``_stream_memory_tool_loop``, ``chat.py:~1214``) whose ``.aclose()``
+    records that it fired."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.aclose_called = False
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        await super().aclose()
+
+
+class _AcloseSpyStreamCtx(_SeqStreamCtx):
+    """``_SeqStreamCtx`` that builds an ``_AcloseSpyStreamResponse`` and
+    stashes it on ``self.response`` so the owning client (and, through it,
+    the test) can reach the exact resolved object after the request
+    completes."""
+
+    def __init__(self, lines, status: int = 200, body: dict | None = None) -> None:
+        super().__init__(lines, status, body)
+        self.response: _AcloseSpyStreamResponse | None = None
+
+    async def __aenter__(self) -> _AcloseSpyStreamResponse:
+        self.response = _AcloseSpyStreamResponse(self._lines, self._status, self._body)
+        return self.response
+
+
+class _AcloseSpyStreamClient(_SequencedStreamClient):
+    """``_SequencedStreamClient`` whose per-turn ``.stream()`` calls return
+    aclose-spying responses, one ``_AcloseSpyStreamCtx`` per turn, recorded
+    on ``self.stream_ctxs`` — covers the tools-loop call site across its
+    three exit shapes: normal completion, the tool-parse-500 buffered
+    fallback (reuses the base class's ``.post()``), and a non-parse
+    4xx/5xx (``raise_for_status()`` failure)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.stream_ctxs: list[_AcloseSpyStreamCtx] = []
+
+    def stream(self, method, url, json=None, **kwargs):
+        self.last_stream_json = json
+        self.stream_calls.append({"url": url, "json": json})
+        idx = min(self._si, len(self._turns) - 1)
+        lines = self._turns[idx]
+        status = self._stream_status[idx] if idx < len(self._stream_status) else 200
+        body = self._stream_bodies[idx] if idx < len(self._stream_bodies) else None
+        self._si += 1
+        ctx = _AcloseSpyStreamCtx(lines, status, body)
+        self.stream_ctxs.append(ctx)
+        return ctx
+
+
+class TestKeepaliveFromT0AcrossHeaderAwait:
+    """WU-1 falsifiable acceptance (spec 2026-08-16-SPEC-sse-keepalive-
+    upstream-window.md, #458), exercised through the full route on BOTH
+    streaming call sites — ``_stream_memory_tool_loop`` (tools mode) and the
+    non-tool-loop streaming branch (inject mode, default). Covers the exact
+    regression the MoE could never catch: a slow-first-token upstream must
+    not leave the client byte-starved before ``_iter_with_idle_timeout``'s
+    existing (post-header) keep-alive loop ever starts."""
+
+    @pytest.fixture
+    def _fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    @pytest.fixture
+    def _tools_mode_fast_keepalive(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        monkeypatch.setenv("AUDITTRACE_SSE_KEEPALIVE_INTERVAL", "1")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_inject_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _fast_keepalive
+    ):
+        """Non-tool-loop streaming path (``chat.py:~1927``). Headers
+        delayed past the keepalive interval (1.4s > 1s) must yield ≥1
+        ``: keep-alive`` frame BEFORE the first upstream ``data:`` byte.
+
+        Neuter the t=0 ticker and this goes RED — before WU-1 the client
+        got zero bytes for the full 1.4s header-await; only the
+        POST-header ``_iter_with_idle_timeout`` loop ever emitted
+        keep-alives, too late for a header-await this long.
+        """
+        fake = _HeaderDelayedStreamClient(
+            [
+                'data: {"id":"cmpl-h","created":9,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"slow-first-token"}}]}',
+                "data: [DONE]",
+            ],
+            delay=1.4,
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_tools_mode_emits_keepalive_before_first_upstream_byte(
+        self, client, _tools_mode_fast_keepalive
+    ):
+        """Tools-loop streaming path (``_stream_memory_tool_loop``,
+        ``chat.py:~1146``). Same guarantee, same neuter-to-RED contract as
+        the inject-mode sibling above, on the OTHER call site — proves the
+        single factored helper is actually wired into both."""
+        fake = _HeaderDelayedStreamClient(
+            _sse_content_lines(["slow-first-token"]),
+            delay=1.4,
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "think very hard"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        keepalive_pos = raw.find(": keep-alive")
+        data_pos = raw.find("data: ")
+        assert keepalive_pos != -1, "no keep-alive frame emitted at all"
+        assert data_pos != -1, "no data frame emitted"
+        assert keepalive_pos < data_pos, (
+            "keep-alive must precede the first upstream data byte — this is"
+            " the t=0 window WU-1 closes"
+        )
+        assert "slow-first-token" in raw
+
+    def test_inject_mode_fast_path_no_spurious_keepalive_frame(self, client):
+        """Spec sub-decision #4: when the upstream returns headers before
+        the first keepalive tick (the MoE, the overwhelming common case),
+        output must be byte-identical to today — no early keep-alive frame
+        just because the race helper is now in the path.
+
+        Neuter the fast-path guard (e.g. always emit a frame regardless of
+        timing) and this goes RED.
+        """
+        fake = _FakeAsyncClient(
+            stream_lines=[
+                'data: {"id":"cmpl-f","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"fast"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
+
+    def test_tools_mode_fast_path_no_spurious_keepalive_frame(
+        self, client, monkeypatch
+    ):
+        """Sub-decision #4 on the tools-loop call site."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        fake = _SequencedStreamClient([_sse_content_lines(["fast"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "fast"}],
+                    "stream": True,
+                },
+            )
+        config_mod.get_settings.cache_clear()
+
+        assert response.status_code == 200
+        raw = response.content.decode()
+        assert ": keep-alive" not in raw
+        assert "fast" in raw
+
+
 class TestStreamingQuietPeriodsAndTermination:
     """ADR-034: a reasoning model can go quiet for minutes inside
     ``<think>``. Intermediate proxies (Istio, Caddy, corporate egress) drop
@@ -3246,3 +3614,355 @@ class TestToolsModeMetadataOnlyTurn:
         assert row.model == "qwen3.5-35b"
         assert row.user_id == SENTINEL_SUBJECT
         assert row.prompt_tokens == 0
+
+
+class TestUpstreamResponseClosedOnAllExitPaths:
+    """WU-1 guard #5 (resource cleanup, #458 review REJECT 2026-08-16): the
+    resolved upstream ``httpx.Response`` must actually be closed — not just
+    wrapped in something that LOOKS like ``contextlib.aclosing(resp)`` —
+    at BOTH streaming call sites, on every exit path (normal completion,
+    the tool-parse-500 buffered fallback, and a plain ``raise_for_status()``
+    failure). The prior suite never asserted this: swapping
+    ``contextlib.aclosing(resp)`` for a no-op ``contextlib.AsyncExitStack()``
+    at both call sites left all 124 streaming tests green, because the fakes'
+    own ``aclose()`` were no-ops nobody polled afterwards
+    (``feedback_vacuous_neuter_test_antipattern``). These tests spy on
+    ``.aclose()`` directly and go RED under that exact neuter — proven by
+    hand during this build (neuter → RED, restore → GREEN, see build
+    record)."""
+
+    @pytest.fixture
+    def _tools_mode(self, monkeypatch):
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    # ── non-tool-loop call site — chat.py:~2008 ───────────────────────────
+
+    def test_inject_mode_normal_completion_closes_upstream_response(self, client):
+        """Happy path: streaming completes normally, the resolved response
+        must still be closed once the ``async with`` body exits."""
+        response_obj = _AcloseSpyResponse(
+            [
+                'data: {"id":"cmpl-a","created":1,"model":"qwen3.5-35b",'
+                '"choices":[{"index":0,"delta":{"content":"hi"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "hi" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_inject_mode_error_response_closes_upstream_response(self, client):
+        """Error path: ``resp.raise_for_status()`` raises on a 4xx/5xx —
+        the response must be closed even though the ``async with`` body
+        exits via exception, not a normal return."""
+        response_obj = _AcloseSpyResponse([], status_code=503)
+        fake = _AcloseSpyClient(response_obj)
+        with _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "503" in response.content.decode()
+        assert response_obj.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
+
+    # ── tools-loop call site — _stream_memory_tool_loop, chat.py:~1214 ────
+
+    def test_tools_mode_normal_completion_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """Happy path on the OTHER call site: a single streamed turn with
+        no tool calls — proves the guard is wired into both sites, not
+        just the simpler non-tool-loop one."""
+        fake = _AcloseSpyStreamClient([_sse_content_lines(["done"])])
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "done" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed — a real"
+            " httpx.AsyncClient would leak the open stream"
+        )
+
+    def test_tools_mode_tool_parse_500_fallback_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """The tool-parse-500 branch: the errored streamed response that
+        triggers the buffered retry/no-tools fallback must ITSELF be
+        closed — it is read via ``resp.aread()`` then discarded, never
+        iterated, so this is the exit path most likely to leak if
+        ``contextlib.aclosing(resp)`` were ever dropped."""
+        parse_err_body = {
+            "error": {
+                "code": 500,
+                "type": "server_error",
+                "message": (
+                    "Failed to parse tool call arguments as JSON: "
+                    "[json.exception.parse_error.101]"
+                ),
+            }
+        }
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],  # short-circuited by status 500
+            stream_status=[500],
+            stream_bodies=[parse_err_body],
+            post_responses=[_tools_mode_response_text("Recovered answer.")],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "trigger parse error"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "Recovered answer." in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "the tool-parse-500 response was never closed before falling"
+            " back to the buffered retry path"
+        )
+
+    def test_tools_mode_non_parse_500_closes_upstream_response(
+        self, client, _tools_mode
+    ):
+        """A non-tool-parse 500 falls through to ``resp.raise_for_status()``
+        — the response must be closed even though the ``async with`` body
+        exits via exception (no buffered fallback for this shape)."""
+        fake = _AcloseSpyStreamClient(
+            stream_turns=[["unused"]],
+            stream_status=[500],
+            stream_bodies=[{"error": {"message": "CUDA OOM"}}],
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "status 500" in response.content.decode()
+        assert len(fake.stream_ctxs) == 1
+        assert fake.stream_ctxs[0].response is not None
+        assert fake.stream_ctxs[0].response.aclose_called is True, (
+            "resolved upstream response was never closed on the"
+            " raise_for_status() error exit path"
+        )
+
+
+# ──────────────── llama httpx keep-alive-race fix (SPEC 2026-08-16) ─────────
+#
+# llama.cpp FIN-closes an idle connection after ``Keep-Alive: timeout=5``
+# (confirmed live via tcpdump); httpx's own default pool keepalive (~5 s)
+# races that close and reuses the dead socket, raising
+# ``httpx.RemoteProtocolError: Server disconnected`` on the next call. The
+# fix caps every llama-facing ``httpx.AsyncClient``'s ``limits=`` at
+# ``keepalive_expiry=2.0`` (well under llama's 5 s) via one shared
+# ``LLAMA_HTTPX_LIMITS`` constant (#371 single-source-of-truth lockstep).
+#
+# These tests assert the ACTUAL kwarg passed to the ``httpx.AsyncClient``
+# constructor at each llama-facing call site — not just that the shared
+# constant has the right value — so dropping ``limits=`` at any ONE site
+# regresses that site's test to RED even though the constant itself is
+# still correct everywhere else (non-vacuous per site).
+
+
+class TestLlamaHttpxKeepaliveLimits:
+    """Every llama-facing ``httpx.AsyncClient`` caps keepalive below llama's
+    5 s server-side close, via the single shared ``LLAMA_HTTPX_LIMITS``."""
+
+    @pytest.fixture
+    def _tools_mode_fixture(self, monkeypatch):
+        """Flip AUDITTRACE_MEMORY_MODE=tools for the duration of a test.
+
+        Mirrors ``TestToolsModeIntegration._tools_mode`` (not reused
+        directly — that fixture is scoped to its own class)."""
+        from audittrace import config as config_mod
+
+        config_mod.get_settings.cache_clear()
+        monkeypatch.setenv("AUDITTRACE_MEMORY_MODE", "tools")
+        yield
+        config_mod.get_settings.cache_clear()
+
+    def test_shared_constant_caps_keepalive_below_llama_five_seconds(self):
+        """The single source of truth itself: below llama's 5 s Keep-Alive,
+        so httpx discards an idle pooled connection before llama can."""
+        from audittrace.routes import _llama_client, _memory_tool_loop, chat
+
+        limits = _llama_client.LLAMA_HTTPX_LIMITS
+        assert limits.keepalive_expiry is not None
+        assert limits.keepalive_expiry < 5.0
+        assert limits.keepalive_expiry == 2.0
+        # No per-site literals (#371 lockstep) — every consumer imports the
+        # exact SAME object, not a copy with the same value.
+        assert chat.LLAMA_HTTPX_LIMITS is limits
+        assert _memory_tool_loop.LLAMA_HTTPX_LIMITS is limits
+
+    def test_non_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode non-streaming branch (``chat_completions``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(post_json=_ok_chat_response("ok"))
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_streaming_chat_completions_client_capped(self, client):
+        """Inject-mode streaming branch (``_iter_and_capture``)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        stream_lines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        fake = _FakeAsyncClient(stream_lines=stream_lines)
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_models_endpoint_client_capped(self, client):
+        """``GET /v1/models`` proxy client."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _FakeAsyncClient(get_json={"object": "list", "data": []})
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.get("/v1/models")
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_streaming_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode streaming turn (``_stream_memory_tool_loop``) — this
+        client is constructed in ``chat.py`` itself, so only
+        ``_patch_async_client`` is needed (see the buffered-loop test above
+        for why stacking both patches would be misleading — they resolve to
+        the SAME underlying ``httpx.AsyncClient`` attribute)."""
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedStreamClient([_sse_content_lines(["Hi"])])
+        with _patch_async_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_tools_mode_buffered_loop_client_capped(self, client, _tools_mode_fixture):
+        """Tools-mode buffered turn (``_memory_tool_loop.run_memory_tool_loop``)
+        — the client is constructed in a DIFFERENT module
+        (``_memory_tool_loop.py``) than the streaming site above, proving the
+        fix reached that module too, not just ``chat.py``'s own call sites.
+
+        Patches ONLY ``_memory_tool_loop.httpx.AsyncClient`` (not also
+        ``chat.httpx.AsyncClient``) — both dotted paths resolve to the SAME
+        underlying ``httpx.AsyncClient`` attribute (a single shared ``httpx``
+        module), so stacking both patches would just have the second one
+        silently clobber the first's mock, making this assertion vacuously
+        pass against whichever one survived. Langfuse ingestion — the only
+        other ``httpx.AsyncClient()`` construction on this path — is a no-op
+        here (Langfuse disabled in tests, ``_record_langfuse_output`` returns
+        early), so exactly one call reaches this mock.
+        """
+        from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+
+        fake = _SequencedClient([_tools_mode_response_text("Just text.")])
+        with _patch_tool_loop_client(fake) as mock_ctor:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "project": "AuditTrace",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_ctor.call_args is not None
+        assert mock_ctor.call_args.kwargs.get("limits") is LLAMA_HTTPX_LIMITS
+
+    def test_langfuse_ingestion_client_left_alone(self, client):
+        """The Langfuse ingestion client (``_record_langfuse_output``) is
+        NOT llama-facing — it must keep using plain ``httpx.AsyncClient()``
+        defaults, not ``LLAMA_HTTPX_LIMITS``. Proves the fix is targeted,
+        not a blanket change to every AsyncClient in the module."""
+        import inspect
+
+        from audittrace.routes import chat as chat_mod
+
+        source = inspect.getsource(chat_mod._record_langfuse_output)
+        assert "httpx.AsyncClient(timeout=5)" in source
+        assert "LLAMA_HTTPX_LIMITS" not in source

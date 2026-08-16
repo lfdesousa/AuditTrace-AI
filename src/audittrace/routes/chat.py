@@ -16,6 +16,7 @@ ingestion API with the captured ``trace_id`` once the stream ends.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -42,6 +43,7 @@ from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_context_builder, get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call, reset_langgraph_step
+from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
 from audittrace.routes._memory_tool_loop import (
     PendingToolCall,
     _execute_memory_tool,
@@ -443,6 +445,60 @@ async def _iter_with_idle_timeout(
     finally:
         if pending_next is not None and not pending_next.done():
             pending_next.cancel()
+
+
+async def _stream_upstream_with_keepalive_from_t0(
+    client: httpx.AsyncClient,
+    url: str,
+    json_payload: dict[str, Any],
+    keepalive_interval: float,
+) -> AsyncIterator[bytes | httpx.Response]:
+    """Race the upstream POST against an SSE keep-alive ticker from t=0.
+
+    llama.cpp withholds HTTP response headers until the FIRST TOKEN — i.e.
+    until prompt-eval completes. A bare
+    ``async with client.stream(...) as resp:`` therefore blocks with ZERO
+    bytes reaching the client from request-accept to first-token, and this
+    module's existing keep-alive loop (``_iter_with_idle_timeout``) only
+    starts once ``resp`` already exists — too late for a slow-first-token
+    model (dense/long-context, prompt-eval exceeding the client's own
+    body-read timeout), which disconnects before that loop ever runs.
+
+    This generator keeps the client fed from t=0: it sends the request in
+    the background (the same ``build_request`` + ``send(..., stream=True)``
+    steps ``client.stream()`` performs internally — see
+    ``httpx.AsyncClient.stream``) and races it against a
+    *keepalive_interval*-second ticker, yielding ``b": keep-alive\\n\\n"``
+    SSE comment frames on every tick that elapses before response headers
+    arrive.
+
+    The FINAL item yielded is always the resolved ``httpx.Response``.
+    Callers MUST exhaust the generator to obtain it, and own closing the
+    response themselves (e.g. ``contextlib.aclosing(resp)``) — this helper
+    only owns the send race, not the response lifetime, so the existing
+    ``_iter_with_idle_timeout`` body-read loop is unaffected.
+
+    Fast path (spec sub-decision #4): when headers arrive before the first
+    tick, NO keep-alive frame is yielded — behavior is byte-identical to a
+    bare ``client.send``.
+    """
+    request = client.build_request("POST", url, json=json_payload)
+    send_task: asyncio.Task[httpx.Response] = asyncio.ensure_future(
+        client.send(request, stream=True)
+    )
+    try:
+        while True:
+            done, _ = await asyncio.wait({send_task}, timeout=keepalive_interval)
+            if done:
+                break
+            yield b": keep-alive\n\n"
+        yield send_task.result()
+    except BaseException:
+        if not send_task.done():
+            send_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await send_task
+        raise
 
 
 def _current_trace_id_hex() -> str | None:
@@ -1135,7 +1191,8 @@ async def _stream_memory_tool_loop(
     last_sigs: frozenset[tuple[str, str]] | None = None
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+        limits=LLAMA_HTTPX_LIMITS,
     ) as client:
         for iteration in range(max_iterations):
             turn_payload = dict(loop_payload)
@@ -1143,7 +1200,20 @@ async def _stream_memory_tool_loop(
             turn_payload["stream"] = True
             turn = _StreamState()
 
-            async with client.stream("POST", llama_url, json=turn_payload) as resp:
+            resp: httpx.Response | None = None
+            async for item in _stream_upstream_with_keepalive_from_t0(
+                client, llama_url, turn_payload, keepalive
+            ):
+                if isinstance(item, bytes):
+                    yield item
+                    continue
+                resp = item
+                break
+            if resp is None:  # pragma: no cover - unreachable
+                raise RuntimeError(
+                    "keep-alive race helper exhausted without an upstream response"
+                )
+            async with contextlib.aclosing(resp):
                 if resp.status_code >= 400:
                     await resp.aread()
                     if _is_tool_parse_error_500(resp):
@@ -1290,7 +1360,7 @@ async def list_models(
     )
     models_url = upstream.rstrip("/") + "/models"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, limits=LLAMA_HTTPX_LIMITS) as client:
             response = await client.get(models_url)
             return response.json()
     except httpx.ConnectError as exc:
@@ -1918,11 +1988,27 @@ async def chat_completions(
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(
                         connect=10.0, read=None, write=30.0, pool=10.0
-                    )
+                    ),
+                    limits=LLAMA_HTTPX_LIMITS,
                 ) as client:
-                    async with client.stream(
-                        "POST", llama_url, json=proxy_payload
-                    ) as resp:
+                    resp: httpx.Response | None = None
+                    async for item in _stream_upstream_with_keepalive_from_t0(
+                        client,
+                        llama_url,
+                        proxy_payload,
+                        settings.sse_keepalive_interval,
+                    ):
+                        if isinstance(item, bytes):
+                            yield item
+                            continue
+                        resp = item
+                        break
+                    if resp is None:  # pragma: no cover - unreachable
+                        raise RuntimeError(
+                            "keep-alive race helper exhausted without an"
+                            " upstream response"
+                        )
+                    async with contextlib.aclosing(resp):
                         resp.raise_for_status()
                         async for line in _iter_with_idle_timeout(
                             resp,
@@ -2139,7 +2225,8 @@ async def chat_completions(
                     read=settings.llama_chunk_timeout,
                     write=30.0,
                     pool=10.0,
-                )
+                ),
+                limits=LLAMA_HTTPX_LIMITS,
             ) as client:
                 response = await client.post(llama_url, json=proxy_payload)
             body = response.json()
