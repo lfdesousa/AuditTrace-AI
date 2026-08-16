@@ -16,10 +16,15 @@ import time
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 
+from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
 from audittrace.services.memory_manifest import (
+    IndexStatusSummary,
     ManifestEntry,
+    MatchedUnindexed,
+    MemoryManifestService,
     MockMemoryManifestService,
     _now_ms,
     _validate_layer,
@@ -309,6 +314,331 @@ class TestListForLayerCallerPredicate:
             "episodic", caller=_user("ops", is_admin=True)
         )
         assert {r.key for r in rows} == {"alice-private.md", "bob-private.md"}
+
+
+# ── SPEC #374 WU-1: index_status_summary (Mock) ─────────────────────────────
+
+
+class TestIndexStatusSummaryMock:
+    """``MockMemoryManifestService.index_status_summary`` — SPEC #374 WU-1.
+
+    FALSIFIABLE: neuter a count predicate (e.g. drop the
+    ``index_failed_at_ms is None`` arm from the pending count) and
+    ``test_counts_pending_and_dead_lettered_separately`` goes RED; neuter
+    the token-match predicate (e.g. hardcode ``True``) and
+    ``test_matched_names_only_the_matching_doc`` goes RED (an unrelated
+    pending doc would wrongly appear); drop the tenancy filter (mirrors
+    ``TestListForLayerCallerPredicate``) and
+    ``test_non_admin_never_sees_another_users_private_counts`` goes RED.
+    """
+
+    async def test_counts_pending_and_dead_lettered_separately(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/pending.md", None, 1, "alice", tier="corpus"
+        )
+        await manifest.record_create(
+            "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/dead.md",
+            index_failed_at_ms=123,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 1
+        assert summary.dead_lettered == 1
+
+    async def test_indexed_doc_counts_as_neither(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/done.md", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state("semantic", "decisions/done.md", indexed_at_ms=999)
+        summary = await manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+
+    async def test_soft_deleted_doc_excluded_from_counts(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
+        )
+        await manifest.record_delete("semantic", "decisions/gone.md", "alice")
+        summary = await manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+
+    async def test_no_tokens_returns_counts_without_matching(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/ADR-058.pdf", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/ADR-058.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await manifest.index_status_summary(_user("alice"), [])
+        assert summary.dead_lettered == 1
+        assert summary.matched == []
+
+    async def test_matched_names_only_the_matching_doc(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            None,
+            1,
+            "alice",
+            tier="corpus",
+        )
+        await manifest.record_create(
+            "semantic", "decisions/unrelated.pdf", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        manifest.set_index_state("semantic", "decisions/unrelated.pdf")
+        summary = await manifest.index_status_summary(_user("alice"), ["adr-058"])
+        assert [m.key for m in summary.matched] == ["decisions/ADR-058-outage.pdf"]
+        assert summary.matched[0].state == "dead_lettered"
+        assert summary.matched[0].index_failure_code == "pdf_corrupted_structure"
+
+    async def test_matched_caps_at_five(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        for i in range(7):
+            key = f"decisions/adr-{i}.pdf"
+            await manifest.record_create(
+                "semantic", key, None, 1, "alice", tier="corpus"
+            )
+            manifest.set_index_state("semantic", key)
+        summary = await manifest.index_status_summary(_user("alice"), ["adr"])
+        assert len(summary.matched) == 5
+
+    async def test_pending_and_dead_lettered_both_match(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/adr-pending.pdf", None, 1, "alice", tier="corpus"
+        )
+        await manifest.record_create(
+            "semantic", "decisions/adr-dead.pdf", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state("semantic", "decisions/adr-pending.pdf")
+        manifest.set_index_state(
+            "semantic",
+            "decisions/adr-dead.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="max_attempts_exceeded",
+        )
+        summary = await manifest.index_status_summary(_user("alice"), ["adr"])
+        states = {m.key: m.state for m in summary.matched}
+        assert states == {
+            "decisions/adr-pending.pdf": "pending",
+            "decisions/adr-dead.pdf": "dead_lettered",
+        }
+
+    async def test_non_admin_never_sees_another_users_private_counts(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/bob-private.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await manifest.index_status_summary(_user("alice"), ["private"])
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+        assert summary.matched == []
+
+    async def test_corpus_tier_doc_counted_for_every_caller(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared.pdf", None, 1, "curator", tier="corpus"
+        )
+        summary = await manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 1
+
+    async def test_admin_bypasses_tenancy_predicate(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
+        )
+        summary = await manifest.index_status_summary(_user("ops", is_admin=True), [])
+        assert summary.pending == 1
+
+    async def test_set_index_state_missing_row_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        with pytest.raises(LookupError):
+            manifest.set_index_state("semantic", "never.pdf")
+
+    def test_dataclasses_are_frozen_plain_data(self) -> None:
+        """Round-trip the two SPEC #374 dataclasses directly — pins the
+        field names/shape a serialiser (``tools.memory_handlers.
+        _maybe_corpus_status``) depends on."""
+        matched = MatchedUnindexed(
+            key="decisions/ADR-058.pdf",
+            state="dead_lettered",
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = IndexStatusSummary(pending=2, dead_lettered=4, matched=[matched])
+        assert summary.pending == 2
+        assert summary.dead_lettered == 4
+        assert summary.matched[0].key == "decisions/ADR-058.pdf"
+        assert summary.matched[0].state == "dead_lettered"
+        assert summary.matched[0].index_failure_code == "pdf_corrupted_structure"
+        with pytest.raises(AttributeError):
+            matched.key = "mutated"  # type: ignore[misc]
+
+
+# ── SPEC #374 WU-1: index_status_summary (real Postgres-backed) ────────────
+
+
+class TestIndexStatusSummaryPostgres:
+    """Same contract as ``TestIndexStatusSummaryMock``, exercised against
+    the real SQL query construction (``pg_manifest``, async in-memory
+    SQLite) — proves the ``ilike``/``LIMIT``/tenancy-``WHERE`` actually
+    compile and run, not just the dict-filtering mock."""
+
+    async def _stamp(
+        self,
+        pg_manifest: MemoryManifestService,
+        layer: str,
+        key: str,
+        *,
+        indexed_at_ms: int | None = None,
+        index_failed_at_ms: int | None = None,
+        index_failure_code: str | None = None,
+    ) -> None:
+        """Directly UPDATE the migration-019/020 columns ``record_create``
+        never touches — mirrors how ``IndexWorker``/``ScanVerdictConsumer``
+        stamp them in production, without pulling that machinery into a
+        service-level unit test."""
+        async with pg_manifest._session_factory() as session:
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.layer == layer, MemoryItem.key == key)
+                .values(
+                    indexed_at_ms=indexed_at_ms,
+                    index_failed_at_ms=index_failed_at_ms,
+                    index_failure_code=index_failure_code,
+                )
+            )
+            await session.commit()
+
+    async def test_counts_pending_and_dead_lettered_separately(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/pending.md", None, 1, "alice", tier="corpus"
+        )
+        await pg_manifest.record_create(
+            "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        await self._stamp(
+            pg_manifest,
+            "semantic",
+            "decisions/dead.md",
+            index_failed_at_ms=123,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await pg_manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 1
+        assert summary.dead_lettered == 1
+
+    async def test_matched_case_insensitive_on_key_and_title(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            "Outage report",
+            1,
+            "alice",
+            tier="corpus",
+        )
+        await self._stamp(
+            pg_manifest,
+            "semantic",
+            "decisions/ADR-058-outage.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await pg_manifest.index_status_summary(_user("alice"), ["adr-058"])
+        assert [m.key for m in summary.matched] == ["decisions/ADR-058-outage.pdf"]
+        assert summary.matched[0].state == "dead_lettered"
+        assert summary.matched[0].index_failure_code == "pdf_corrupted_structure"
+
+    async def test_matched_caps_at_five(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        for i in range(7):
+            key = f"decisions/adr-{i}.pdf"
+            await pg_manifest.record_create(
+                "semantic", key, None, 1, "alice", tier="corpus"
+            )
+            await self._stamp(pg_manifest, "semantic", key)
+        summary = await pg_manifest.index_status_summary(_user("alice"), ["adr"])
+        assert len(summary.matched) == 5
+
+    async def test_non_admin_never_sees_another_users_private_row(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
+        )
+        await self._stamp(
+            pg_manifest,
+            "semantic",
+            "decisions/bob-private.pdf",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        summary = await pg_manifest.index_status_summary(_user("alice"), ["private"])
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+        assert summary.matched == []
+
+    async def test_admin_bypasses_tenancy_predicate(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/bob-private.pdf", None, 1, "bob", tier="private"
+        )
+        summary = await pg_manifest.index_status_summary(
+            _user("ops", is_admin=True), []
+        )
+        assert summary.pending == 1
+
+    async def test_soft_deleted_row_excluded(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
+        )
+        await pg_manifest.record_delete("semantic", "decisions/gone.md", "alice")
+        summary = await pg_manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
 
 
 class TestManifestEntryRoundTrip:
@@ -652,6 +982,7 @@ class TestTelemetryCoverage:
             "record_delete",
             "list_for_layer",
             "get",
+            "index_status_summary",
         ):
             method = getattr(MemoryManifestService, method_name)
             # The @log_call decorator wraps with a function that has
