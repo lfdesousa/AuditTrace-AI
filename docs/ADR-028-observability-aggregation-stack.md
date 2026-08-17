@@ -114,6 +114,16 @@ Auto-provisioned on first boot:
 - Infrastructure: Traefik RPS, llama-server tokens/sec, MinIO operations
 - Logs panel: Loki query for `{compose_service=~".+"} |= "ERROR"`
 
+**Single source of truth (SPEC #441, 2026-08-17).** The dashboard JSON is maintained canonically in
+the AuditTrace chart at `charts/audittrace/files/grafana-dashboards/` (post-rename `audittrace-*`
+identity). The sibling stack's `grafana/dashboards/` directory — the file-provider mount above — is a
+**synced mirror** of that canonical set, not an independent copy: `make sync-dashboards` reconciles it
+(copies new, updates drifted, prunes stale pre-rename files such as `sovereign-overview.json`, `chmod
+0644` for the file-provider), and `make check-dashboard-drift` guards that the two stay byte-identical
+(CI-safe: it skips with exit 0 when the obs-stack directory is absent). This realises the b7-plan
+single-source-of-truth intent for dashboards. Edit dashboards in the chart, then run
+`make sync-dashboards`; never hand-edit the mirror.
+
 ### §6. Port allocation
 
 | Service | Port | Notes |
