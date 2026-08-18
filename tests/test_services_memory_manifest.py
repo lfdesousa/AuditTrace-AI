@@ -389,6 +389,32 @@ class TestIndexStatusSummaryMock:
         assert summary.dead_lettered == 1
         assert summary.matched == []
 
+    async def test_skip_counts_if_no_match_skips_counts(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        # real pending + dead-lettered rows present
+        await manifest.record_create(
+            "semantic", "decisions/pending.md", None, 1, "alice", tier="corpus"
+        )
+        await manifest.record_create(
+            "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        manifest.set_index_state(
+            "semantic",
+            "decisions/dead.md",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+        # query token-matches NOTHING, hot-path short-circuit on
+        summary = await manifest.index_status_summary(
+            _user("alice"), ["zzznomatchxyz"], skip_counts_if_no_match=True
+        )
+        assert summary.matched == []
+        # counts SKIPPED (uncomputed) → 0 despite the real pending(1)+dead(1) rows.
+        # Neuter proof: drop the short-circuit and these become 1/1 → RED.
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+
     async def test_matched_names_only_the_matching_doc(
         self, manifest: MockMemoryManifestService
     ) -> None:
@@ -562,6 +588,48 @@ class TestIndexStatusSummaryPostgres:
             index_failure_code="pdf_corrupted_structure",
         )
         summary = await pg_manifest.index_status_summary(_user("alice"), [])
+        assert summary.pending == 1
+        assert summary.dead_lettered == 1
+
+    async def _seed_pending_and_dead(self, pg_manifest: MemoryManifestService) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/pending.md", None, 1, "alice", tier="corpus"
+        )
+        await pg_manifest.record_create(
+            "semantic", "decisions/dead.md", None, 1, "alice", tier="corpus"
+        )
+        await self._stamp(
+            pg_manifest,
+            "semantic",
+            "decisions/dead.md",
+            index_failed_at_ms=1,
+            index_failure_code="pdf_corrupted_structure",
+        )
+
+    async def test_skip_counts_if_no_match_returns_zero_counts(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await self._seed_pending_and_dead(pg_manifest)
+        # query token-matches NOTHING, hot-path short-circuit on
+        summary = await pg_manifest.index_status_summary(
+            _user("alice"), ["zzznomatchxyz"], skip_counts_if_no_match=True
+        )
+        assert summary.matched == []
+        # counts SKIPPED (the two COUNT queries never ran) → 0 despite the real
+        # pending(1)+dead(1) rows. Neuter proof: remove the short-circuit → 1/1 → RED.
+        assert summary.pending == 0
+        assert summary.dead_lettered == 0
+
+    async def test_default_computes_counts_even_without_match(
+        self, pg_manifest: MemoryManifestService
+    ) -> None:
+        await self._seed_pending_and_dead(pg_manifest)
+        # DEFAULT (skip_counts_if_no_match=False): the general contract is preserved —
+        # counts stay honest even when nothing token-matches.
+        summary = await pg_manifest.index_status_summary(
+            _user("alice"), ["zzznomatchxyz"]
+        )
+        assert summary.matched == []
         assert summary.pending == 1
         assert summary.dead_lettered == 1
 

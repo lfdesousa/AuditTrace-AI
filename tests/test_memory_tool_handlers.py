@@ -1799,24 +1799,34 @@ class TestDocTokens374:
 
 
 class TestCorpusStatusEnrichment374:
-    """SPEC #374 WU-2 — ``corpus_status`` on an empty recall, wired into
+    """SPEC #374 (reshaped 2026-08-18) — ``corpus_status`` attaches iff a
+    query-matched UN-INDEXED doc is accessible to the caller, wired into
     all three ChromaDB-backed recall tools at their single return site.
+    Recall emptiness is IRRELEVANT: ChromaDB ANN never returns an empty
+    page, which is why the old ``page.total == 0`` gate could never fire.
 
-    FALSIFIABLE: comment out the ``if page.total == 0: ...`` block in any
-    of ``recall_decisions``/``recall_skills``/``recall_semantic`` and its
-    ``test_*_attaches_corpus_status_when_empty`` goes RED (key absent);
-    neuter the ``total_incomplete == 0`` guard in ``_maybe_corpus_status``
-    (drop the early return) and ``test_fully_indexed_corpus_stays_silent``
-    goes RED (the key wrongly appears on a genuinely-empty, fully-indexed
-    corpus); neuter the token-match wiring and
+    FALSIFIABLE: delete the ``corpus_status = await
+    _maybe_corpus_status(...)`` wiring in any of
+    ``recall_decisions``/``recall_skills``/``recall_semantic`` and its
+    matched-doc attachment test goes RED (key absent); neuter the
+    ``if not summary.matched: return None`` guard in
+    ``_maybe_corpus_status`` (drop the early return) and
+    ``test_recall_semantic_empty_recall_unrelated_pending_stays_silent``
+    goes RED (the key wrongly appears when no query-matched doc is
+    un-indexed); neuter the token-match wiring and
     ``test_recall_decisions_matched_unindexed_names_the_doc`` goes RED
     (``matched_unindexed`` comes back empty).
     """
 
     @pytest.mark.asyncio
-    async def test_recall_semantic_attaches_corpus_status_when_empty(
+    async def test_recall_semantic_empty_recall_unrelated_pending_stays_silent(
         self, _populated_container, _fakeredis_cache
     ):
+        """Reshaped rule (2026-08-18) — DELIBERATE BEHAVIOR CHANGE: an
+        empty recall with only UNRELATED pending/dead-lettered docs (no
+        query token matches their key/title → ``matched`` empty) now stays
+        SILENT. The old gate fired on ANY pending doc; the unified rule
+        requires a query-MATCHED un-indexed doc."""
         user = sentinel_user_context()
         manifest = _populated_container._instances["memory_manifest"]
         await manifest.record_create(
@@ -1844,16 +1854,15 @@ class TestCorpusStatusEnrichment374:
         # empty-page contract stays byte-identical.
         assert result["total"] == 0
         assert result["matches"] == []
-        assert "corpus_status" in result
-        assert result["corpus_status"]["pending_index"] == 1
-        assert result["corpus_status"]["dead_lettered"] == 1
-        assert result["corpus_status"]["matched_unindexed"] == []
-        assert "may be incomplete" in result["corpus_status"]["note"]
+        assert "corpus_status" not in result
 
     @pytest.mark.asyncio
     async def test_recall_decisions_matched_unindexed_names_the_doc(
         self, _populated_container, _fakeredis_cache
     ):
+        """Empty recall + query-matched un-indexed doc → STILL ATTACHES
+        (the unified rule does not require recall emptiness, but the
+        empty case must keep working)."""
         user = sentinel_user_context()
         manifest = _populated_container._instances["memory_manifest"]
         await manifest.record_create(
@@ -1875,6 +1884,7 @@ class TestCorpusStatusEnrichment374:
             user, tool, {"query": "what does ADR-058 say"}, "sess-1"
         )
         assert result["total"] == 0
+        assert "corpus_status" in result
         assert result["corpus_status"]["matched_unindexed"] == [
             {
                 "key": "decisions/ADR-058-outage.pdf",
@@ -1882,11 +1892,17 @@ class TestCorpusStatusEnrichment374:
                 "code": "pdf_corrupted_structure",
             }
         ]
+        assert result["corpus_status"]["dead_lettered"] == 1
+        assert result["corpus_status"]["pending_index"] == 0
+        assert "matching your query" in result["corpus_status"]["note"]
 
     @pytest.mark.asyncio
-    async def test_recall_skills_attaches_corpus_status_when_empty(
+    async def test_recall_skills_empty_recall_unrelated_pending_stays_silent(
         self, _populated_container, _fakeredis_cache
     ):
+        """Reshaped rule (2026-08-18) — DELIBERATE BEHAVIOR CHANGE: empty
+        recall + only UNRELATED pending (``matched`` empty) now stays
+        SILENT (the old gate fired on any pending doc)."""
         user = sentinel_user_context()
         manifest = _populated_container._instances["memory_manifest"]
         await manifest.record_create(
@@ -1897,8 +1913,7 @@ class TestCorpusStatusEnrichment374:
             user, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-1"
         )
         assert result["total"] == 0
-        assert result["corpus_status"]["pending_index"] == 1
-        assert result["corpus_status"]["dead_lettered"] == 0
+        assert "corpus_status" not in result
 
     @pytest.mark.asyncio
     async def test_recall_skills_fully_indexed_corpus_stays_silent(
@@ -1916,12 +1931,13 @@ class TestCorpusStatusEnrichment374:
         assert "corpus_status" not in result
 
     @pytest.mark.asyncio
-    async def test_non_empty_recall_never_attaches_corpus_status(
+    async def test_non_empty_recall_no_matched_unindexed_stays_silent(
         self, _populated_container, _fakeredis_cache
     ):
-        """Sub-decision #1 — empty-only: a non-empty recall already
-        carries content, so the enrichment never fires even when the
-        caller has plenty of accessible un-indexed docs."""
+        """Reshaped rule (2026-08-18): a non-empty recall with no
+        query-matched un-indexed doc stays SILENT — the enrichment needs a
+        matched un-indexed doc, not recall emptiness (the pending doc
+        below is UNRELATED to the query tokens)."""
         user = sentinel_user_context()
         manifest = _populated_container._instances["memory_manifest"]
         await manifest.record_create(
@@ -1933,6 +1949,42 @@ class TestCorpusStatusEnrichment374:
         )
         assert result["total"] >= 1
         assert "corpus_status" not in result
+
+    @pytest.mark.asyncio
+    async def test_non_empty_recall_matched_unindexed_attaches_corpus_status(
+        self, _populated_container, _fakeredis_cache
+    ):
+        """Reshaped rule (2026-08-18) — THE CASE THE OLD GATE MISSED: a
+        NON-EMPTY recall (total >= 1) still carries ``corpus_status`` when
+        a query-matched doc exists in the manifest but is un-indexed
+        (present on disk, absent from the vector store — search cannot
+        find it)."""
+        user = sentinel_user_context()
+        manifest = _populated_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic",
+            "decisions/ADR-009-cache-compression.pdf",
+            None,
+            1,
+            user.user_id,
+            tier="corpus",
+        )
+        tool = get_tool_by_name("recall_decisions")
+        result, _ = await invoke_tool(
+            user, tool, {"query": "cache compression"}, "sess-1"
+        )
+        assert result["total"] >= 1
+        assert "corpus_status" in result
+        assert result["corpus_status"]["matched_unindexed"] == [
+            {
+                "key": "decisions/ADR-009-cache-compression.pdf",
+                "state": "pending",
+                "code": None,
+            }
+        ]
+        assert result["corpus_status"]["pending_index"] == 1
+        assert result["corpus_status"]["dead_lettered"] == 0
+        assert "matching your query" in result["corpus_status"]["note"]
 
     @pytest.mark.asyncio
     async def test_corpus_status_enrichment_failure_is_swallowed(
@@ -2009,14 +2061,19 @@ class TestCorpusStatusTenancy374:
             scopes=("memory:semantic:read",),
         )
         tool = get_tool_by_name("recall_semantic")
-
+        # Reshaped rule (2026-08-18): the query must token-match the
+        # private doc's KEY ("alice-private") so alice's ``matched`` is
+        # non-empty and the enrichment attaches for her — bob, for whom
+        # the row is tenancy-filtered out, stays SILENT (matched empty),
+        # which is what must not leak.
         alice_result, _ = await invoke_tool(
-            alice, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-alice"
+            alice, tool, {"query": "alice private outage"}, "sess-alice"
         )
         bob_result, _ = await invoke_tool(
-            bob, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-bob"
+            bob, tool, {"query": "alice private outage"}, "sess-bob"
         )
 
+        assert alice_result["total"] == 0
         assert alice_result["corpus_status"]["dead_lettered"] == 1
         assert "corpus_status" not in bob_result, (
             f"leaked alice's private dead-lettered count to bob: {bob_result}"
@@ -2040,7 +2097,13 @@ class TestCorpusStatusTenancy374:
             scopes=("memory:semantic:read",),
         )
         tool = get_tool_by_name("recall_semantic")
+        # Reshaped rule (2026-08-18): the query must token-match the
+        # corpus doc's KEY ("shared") so ``matched`` is non-empty.
         result, _ = await invoke_tool(
-            bob, tool, {"query": "zzz-no-keyword-matches-anything"}, "sess-bob"
+            bob, tool, {"query": "shared corpus doc"}, "sess-bob"
         )
+        assert result["total"] == 0
         assert result["corpus_status"]["pending_index"] == 1
+        assert result["corpus_status"]["matched_unindexed"] == [
+            {"key": "decisions/shared.pdf", "state": "pending", "code": None}
+        ]

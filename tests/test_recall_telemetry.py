@@ -16,10 +16,15 @@ wired into the 6 REST emit sites) is covered separately in
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi import Request
 
-from audittrace.services.recall_telemetry import classify_recall_source_from_request
+from audittrace.services.recall_telemetry import (
+    classify_recall_source_from_request,
+    emit_recall_telemetry,
+)
 
 
 def _make_request(headers: dict[str, str]) -> Request:
@@ -111,3 +116,37 @@ class TestClassifyRecallSourceFromRequest:
         if x_agent_role:
             headers["X-Agent-Role"] = x_agent_role
         assert classify_recall_source_from_request(_make_request(headers)) == expected
+
+
+class TestEmitRecallTelemetryBestMatchDistance:
+    """WU-2: the best-match distance is surfaced on the ``memory.read`` log line
+    (log-only, for triage / future threshold calibration), value-asserted."""
+
+    def _read_lines(self, caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records if "memory.read" in r.getMessage()
+        ]
+
+    def test_distance_value_appears_on_the_log_line(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(
+            logging.INFO, logger="audittrace.services.recall_telemetry"
+        ):
+            emit_recall_telemetry(
+                "tool", "decisions", 3, cache="miss", best_match_distance=0.42
+            )
+        lines = self._read_lines(caplog)
+        assert any("best_match_distance=0.42" in m for m in lines), lines
+
+    def test_distance_is_none_when_no_match(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(
+            logging.INFO, logger="audittrace.services.recall_telemetry"
+        ):
+            emit_recall_telemetry(
+                "tool", "decisions", 0, cache="miss", best_match_distance=None
+            )
+        lines = self._read_lines(caplog)
+        assert any("best_match_distance=None" in m for m in lines), lines

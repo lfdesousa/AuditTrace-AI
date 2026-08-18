@@ -32,6 +32,19 @@ Handler contract (observed by every handler in this file):
     ``{"error": "..."}``. Unexpected exceptions propagate to
     ``tools.invoke_tool`` which wraps them as ``{"error": ...}``.
 
+CHANGELOG (SPEC #374 RESHAPE, 2026-08-18): the ``corpus_status`` gate is
+reshaped from "``total == 0`` AND any accessible un-indexed doc" to
+"``summary.matched`` non-empty" — i.e. the block attaches iff at least one
+accessible doc whose key/title matches a query token is un-indexed or
+dead-lettered, INDEPENDENT of the recall result. ChromaDB ANN never
+returns an empty page, so the old gate could never fire (the bug the
+reshape fixes), and a non-empty recall with a matched un-indexed doc
+still deserves the signal (the doc exists but cannot be found by search).
+DELIBERATE BEHAVIOR CHANGE: an empty recall with only UNRELATED
+pending/dead-lettered docs now stays SILENT (the old gate fired on ANY
+pending doc). The enrichment stays best-effort (``_maybe_corpus_status``
+never breaks recall on failure) and tenancy-scoped.
+
 CHANGELOG (SPEC #374 / recall-not-indexed-signal, 2026-08-16):
 ``recall_decisions``/``recall_skills``/``recall_semantic`` (the three
 ChromaDB-backed recall tools — NOT ``recall_recent_sessions``, which is
@@ -44,7 +57,7 @@ topic doesn't exist" even when a matching document exists but was never
 indexed or was dead-lettered (#450). Purely additive to the existing
 empty-result shape above; a caller that never sees a non-empty
 ``pending_index + dead_lettered`` accessible to it observes byte-identical
-behaviour to before this change.
+behaviour to before this change. (Superseded by the RESHAPE entry above.)
 
 CHANGELOG (backlog #15 residual, #375 / RECALL-PAGINATION-20260803,
 2026-08-03): recall_decisions/recall_skills/recall_semantic/
@@ -173,12 +186,14 @@ def _page_fields(page: SearchPage) -> dict[str, Any]:
 
 
 # ── SPEC #374 — recall corpus-incompleteness signal ──────────────────────
-# An empty recall on ChromaDB alone is indistinguishable from "the topic
-# genuinely doesn't exist" — the vector store is blind to un-indexed /
-# dead-lettered docs by definition (no vectors were ever written for them).
+# A recall on ChromaDB alone is blind to un-indexed / dead-lettered docs
+# by definition (no vectors were ever written for them), so "no match" is
+# indistinguishable from "the topic genuinely doesn't exist".
 # ``_maybe_corpus_status`` closes that gap with a best-effort health signal
 # (see the module docstring's callers below); ``_doc_tokens`` is its pure
-# token-extraction half (sub-decision #5).
+# token-extraction half (sub-decision #5). Reshaped 2026-08-18: the signal
+# fires on a query-matched UN-INDEXED doc, independent of the recall
+# result (ANN never returns empty, so the old empty-only gate never fired).
 
 # Doc-like token: a letter-led run of 3+ letters/digits/hyphens — catches
 # identifiers such as "ADR-058" or "SPEC-374" without matching short noise
@@ -223,21 +238,33 @@ def _doc_tokens(query: str) -> list[str]:
 async def _maybe_corpus_status(
     user_context: UserContext, query: str
 ) -> dict[str, Any] | None:
-    """Best-effort ``corpus_status`` enrichment for an EMPTY recall (SPEC
-    #374, sub-decisions #1/#2/#6) — the single choke point wired into all
-    three ChromaDB-backed recall tools (sub-decision #3) so an empty
-    result carries an honest signal that the corpus may be incomplete
-    instead of silently reading as "this topic doesn't exist".
+    """Best-effort ``corpus_status`` enrichment for recall (SPEC #374,
+    sub-decisions #2/#3/#6; RESHAPED 2026-08-18) — the single choke point
+    wired into all three ChromaDB-backed recall tools (sub-decision #3)
+    so a query-matched UN-INDEXED doc carries an honest signal that the
+    corpus may be incomplete instead of silently reading as "this topic
+    doesn't exist".
+
+    Unified rule: the enrichment attaches iff ``summary.matched`` is
+    non-empty — at least one accessible doc whose key/title matches a
+    query token is un-indexed or dead-lettered. Recall emptiness is
+    IRRELEVANT: ChromaDB ANN never returns an empty page, so the old
+    ``page.total == 0`` gate could not fire at all (the bug the reshape
+    fixes), and a NON-empty recall with a matched un-indexed doc still
+    deserves the signal (the doc exists but cannot be found by search).
+    Only-UNRELATED pending/dead-lettered docs (``matched`` empty) stay
+    SILENT — sub-decision #2's "don't cry wolf", now keyed on the match
+    instead of the corpus-wide total (a deliberate behavior change: the
+    old gate fired on ANY pending doc).
 
     Returns ``None`` (attach nothing) when:
-      - there is nothing accessible to the caller to report
-        (``pending + dead_lettered == 0`` — sub-decision #2, "don't cry
-        wolf": a fully-indexed corpus genuinely returning empty is the
-        CORRECT answer, and adding noise there would erode trust in the
-        signal), or
+      - no query-matched un-indexed doc is accessible to the caller
+        (``summary.matched`` empty — sub-decision #2, "don't cry wolf":
+        a fully-indexed corpus, or unrelated pending noise, is the
+        CORRECT answer and adding it would erode trust in the signal), or
       - the lookup itself fails for any reason (sub-decision #6 — this
         enrichment must NEVER break recall; the caller falls back to its
-        normal empty page).
+        normal page).
 
     Tenancy: ``index_status_summary`` is threaded the caller's
     ``user_context`` and applies the owner-or-corpus predicate itself —
@@ -248,7 +275,12 @@ async def _maybe_corpus_status(
     try:
         manifest = get_memory_manifest_service()
         tokens = _doc_tokens(query)
-        summary = await manifest.index_status_summary(user_context, tokens)
+        # skip_counts_if_no_match: this runs on EVERY recall now (the reshape dropped
+        # the page.total==0 gate); when nothing matched we return None below without
+        # reading the counts, so skip the two COUNT queries on that hot path.
+        summary = await manifest.index_status_summary(
+            user_context, tokens, skip_counts_if_no_match=True
+        )
     except Exception:
         logger.warning(
             "corpus_status enrichment failed; omitting from recall result",
@@ -256,8 +288,7 @@ async def _maybe_corpus_status(
         )
         return None
 
-    total_incomplete = summary.pending + summary.dead_lettered
-    if total_incomplete == 0:
+    if not summary.matched:
         return None
 
     return {
@@ -268,10 +299,9 @@ async def _maybe_corpus_status(
             for m in summary.matched
         ],
         "note": (
-            f"Corpus may be incomplete: {total_incomplete} accessible "
-            "document(s) are not yet indexed and cannot be found by "
-            "search. Do not conclude a topic is absent from an empty "
-            "result alone."
+            f"{len(summary.matched)} document(s) matching your query are "
+            "not yet indexed and cannot be found by search; do not "
+            "conclude the topic is absent."
         ),
     }
 
@@ -410,7 +440,15 @@ async def recall_decisions(
         sort=sort,
         order=order,
     )
-    emit_recall_telemetry("tool", "decisions", page.total, cache="miss")
+    emit_recall_telemetry(
+        "tool",
+        "decisions",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
     result: dict[str, Any] = {
         "matches": [
             {
@@ -434,11 +472,14 @@ async def recall_decisions(
         ],
         **_page_fields(page),
     }
-    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
-    if page.total == 0:
-        corpus_status = await _maybe_corpus_status(user_context, query)
-        if corpus_status is not None:
-            result["corpus_status"] = corpus_status
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
     return result
 
 
@@ -525,7 +566,15 @@ async def recall_skills(
         sort=sort,
         order=order,
     )
-    emit_recall_telemetry("tool", "skills", page.total, cache="miss")
+    emit_recall_telemetry(
+        "tool",
+        "skills",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
     result: dict[str, Any] = {
         "matches": [
             {
@@ -548,11 +597,14 @@ async def recall_skills(
         ],
         **_page_fields(page),
     }
-    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
-    if page.total == 0:
-        corpus_status = await _maybe_corpus_status(user_context, query)
-        if corpus_status is not None:
-            result["corpus_status"] = corpus_status
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
     return result
 
 
@@ -756,7 +808,15 @@ async def recall_semantic(
     page = await semantic.search_page(
         user_context, query, k=k, offset=offset, sort=sort, order=order
     )
-    emit_recall_telemetry("tool", "semantic", page.total, cache="miss")
+    emit_recall_telemetry(
+        "tool",
+        "semantic",
+        page.total,
+        cache="miss",
+        best_match_distance=page.matches[0].metadata.get("distance")
+        if page.matches
+        else None,
+    )
     result: dict[str, Any] = {
         "matches": [
             {
@@ -769,11 +829,14 @@ async def recall_semantic(
         ],
         **_page_fields(page),
     }
-    # SPEC #374 sub-decision #1: only an EMPTY recall gets the enrichment.
-    if page.total == 0:
-        corpus_status = await _maybe_corpus_status(user_context, query)
-        if corpus_status is not None:
-            result["corpus_status"] = corpus_status
+    # SPEC #374 (reshaped 2026-08-18): always evaluate — the enrichment
+    # fires on a query-matched UN-INDEXED doc, independent of the recall
+    # result (ChromaDB ANN never returns empty, so the old
+    # ``page.total == 0`` gate never fired); ``_maybe_corpus_status``
+    # returns None when nothing matched.
+    corpus_status = await _maybe_corpus_status(user_context, query)
+    if corpus_status is not None:
+        result["corpus_status"] = corpus_status
     return result
 
 
