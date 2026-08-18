@@ -68,6 +68,40 @@ def reset_langgraph_step() -> None:
     _LANGGRAPH_STEP.set(itertools.count(1))
 
 
+# Standard LogRecord attributes (CPython) + derived + already-renamed OTel fields —
+# excluded when merging user-supplied ``extra=`` keys into the structured log (SPEC #457).
+_RESERVED_LOGRECORD_ATTRS = frozenset(
+    {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "taskName",
+        "message",
+        "asctime",
+        "otelTraceID",
+        "otelSpanID",
+        "otelServiceName",
+    }
+)
+
+
 class StructuredFormatter(logging.Formatter):
     """JSON formatter for structured logging to stdout.
 
@@ -99,9 +133,9 @@ class StructuredFormatter(logging.Formatter):
             value = getattr(record, src, None)
             if value:
                 log_data[dst] = value
-        for attr in ("request_id", "duration", "operation"):
-            if hasattr(record, attr):
-                log_data[attr] = getattr(record, attr)
+        for attr, value in record.__dict__.items():
+            if attr not in _RESERVED_LOGRECORD_ATTRS and attr not in log_data:
+                log_data[attr] = value
         # Preserve exception tracebacks. logger.exception()/exc_info=True sets
         # record.exc_info; without this the JSON line carried only the message
         # and the stack was lost — which masked the summariser poison-pill root
@@ -110,7 +144,7 @@ class StructuredFormatter(logging.Formatter):
             log_data["exception"] = self.formatException(record.exc_info)
         if record.stack_info:
             log_data["stack_info"] = self.formatStack(record.stack_info)
-        return json.dumps(log_data)
+        return json.dumps(log_data, default=str)
 
 
 def setup_logging(
