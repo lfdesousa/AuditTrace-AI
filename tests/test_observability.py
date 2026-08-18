@@ -962,6 +962,104 @@ def test_structured_formatter_emits_json():
     assert "exception" not in data
 
 
+def test_structured_formatter_merges_all_extra_keys():
+    """User-supplied ``extra=`` keys must all reach the JSON line (SPEC #457).
+
+    Regression: the formatter previously copied only a hardcoded 3-name
+    allowlist (request_id/duration/operation), so dead-letter fields like
+    scan_id/code/attempts (#450) never reached Loki.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.workers.pdf_ingest",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="dead-lettered",
+        args=(),
+        exc_info=None,
+    )
+    record.scan_id = "s1"
+    record.code = "pdf_corrupted_structure"
+    record.attempts = 3
+
+    data = _json.loads(fmt.format(record))
+    assert data["scan_id"] == "s1"
+    assert data["code"] == "pdf_corrupted_structure"
+    assert data["attempts"] == 3
+
+
+def test_structured_formatter_excludes_reserved_logrecord_attrs():
+    """Standard LogRecord attributes must not leak into the JSON line.
+
+    Neuter proof: if the ``_RESERVED_LOGRECORD_ATTRS`` exclusion is dropped,
+    pathname/lineno/args/funcName/levelno/process all appear in the output
+    and this test goes RED.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.routes.chat",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=42,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+    record.scan_id = "s1"  # an extra= key, proving the merge still runs
+
+    data = _json.loads(fmt.format(record))
+    assert data["scan_id"] == "s1"
+    for reserved in (
+        "pathname",
+        "lineno",
+        "args",
+        "funcName",
+        "levelno",
+        "process",
+    ):
+        assert reserved not in data, f"reserved attr {reserved!r} leaked into JSON"
+
+
+def test_structured_formatter_degrades_unserializable_extra_to_str():
+    """A non-JSON-serializable ``extra=`` value must not crash the log call.
+
+    It degrades to its ``str()`` via ``json.dumps(..., default=str)`` so one
+    odd value can never break the logging path for the whole process.
+    """
+    import json as _json
+
+    from audittrace.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord(
+        name="audittrace.workers.pdf_ingest",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="weird extra",
+        args=(),
+        exc_info=None,
+    )
+
+    class _Opaque:
+        def __str__(self) -> str:
+            return "opaque-value"
+
+    record.odd = _Opaque()
+
+    data = _json.loads(fmt.format(record))
+    assert data["odd"] == "opaque-value"
+
+
 def test_structured_formatter_preserves_exception_traceback():
     """logger.exception()/exc_info=True must survive into the JSON line.
 
