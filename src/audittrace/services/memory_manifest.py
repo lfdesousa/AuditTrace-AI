@@ -480,7 +480,11 @@ class MemoryManifestService:
 
     @log_call(logger=logger)
     async def index_status_summary(
-        self, user_context: UserContext, tokens: Sequence[str]
+        self,
+        user_context: UserContext,
+        tokens: Sequence[str],
+        *,
+        skip_counts_if_no_match: bool = False,
     ) -> IndexStatusSummary:
         """Tenancy-scoped read-path index-status query (SPEC #374 WU-1).
 
@@ -539,25 +543,12 @@ class MemoryManifestService:
                     )
                 )
 
-            pending_count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(MemoryItem)
-                    .where(
-                        *filters,
-                        MemoryItem.indexed_at_ms.is_(None),
-                        MemoryItem.index_failed_at_ms.is_(None),
-                    )
-                )
-            ).scalar_one()
-            dead_lettered_count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(MemoryItem)
-                    .where(*filters, MemoryItem.index_failed_at_ms.is_not(None))
-                )
-            ).scalar_one()
-
+            # Match query FIRST. The read-path hot caller (``_maybe_corpus_status``,
+            # now on EVERY recall since the reshape dropped the ``page.total == 0``
+            # gate) only surfaces ``corpus_status`` when a doc matched, and discards
+            # the summary otherwise. So with ``skip_counts_if_no_match`` set and no
+            # match we short-circuit BEFORE the two COUNT round-trips (the caller
+            # never reads the counts in that case). General callers keep honest counts.
             matched: list[MatchedUnindexed] = []
             if tokens:
                 token_clauses = [
@@ -598,6 +589,29 @@ class MemoryManifestService:
                     )
                     for row in rows
                 ]
+
+            if skip_counts_if_no_match and not matched:
+                # counts uncomputed (0) — the sole hot caller discards on empty match
+                return IndexStatusSummary(pending=0, dead_lettered=0, matched=[])
+
+            pending_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MemoryItem)
+                    .where(
+                        *filters,
+                        MemoryItem.indexed_at_ms.is_(None),
+                        MemoryItem.index_failed_at_ms.is_(None),
+                    )
+                )
+            ).scalar_one()
+            dead_lettered_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MemoryItem)
+                    .where(*filters, MemoryItem.index_failed_at_ms.is_not(None))
+                )
+            ).scalar_one()
 
             return IndexStatusSummary(
                 pending=pending_count,
@@ -799,11 +813,16 @@ class MockMemoryManifestService(MemoryManifestService):
         row["index_failure_code"] = index_failure_code
 
     async def index_status_summary(
-        self, user_context: UserContext, tokens: Sequence[str]
+        self,
+        user_context: UserContext,
+        tokens: Sequence[str],
+        *,
+        skip_counts_if_no_match: bool = False,
     ) -> IndexStatusSummary:
         """Mirrors ``MemoryManifestService.index_status_summary`` — same
         owner-or-corpus tenancy predicate, same corpus-wide (no
-        per-layer filter) scope, same ``_MAX_MATCHED_UNINDEXED`` cap."""
+        per-layer filter) scope, same ``_MAX_MATCHED_UNINDEXED`` cap, same
+        ``skip_counts_if_no_match`` short-circuit."""
         rows = [row for row in self._rows.values() if row.get("deleted_at_ms") is None]
         if not user_context.is_admin:
             rows = [
@@ -812,13 +831,6 @@ class MockMemoryManifestService(MemoryManifestService):
                 if r.get("created_by_user_id") == user_context.user_id
                 or r.get("tier", "corpus") == "corpus"
             ]
-
-        pending = sum(
-            1
-            for r in rows
-            if r.get("indexed_at_ms") is None and r.get("index_failed_at_ms") is None
-        )
-        dead_lettered = sum(1 for r in rows if r.get("index_failed_at_ms") is not None)
 
         matched: list[MatchedUnindexed] = []
         if tokens:
@@ -848,6 +860,16 @@ class MockMemoryManifestService(MemoryManifestService):
                     )
                 if len(matched) >= _MAX_MATCHED_UNINDEXED:
                     break
+
+        if skip_counts_if_no_match and not matched:
+            return IndexStatusSummary(pending=0, dead_lettered=0, matched=[])
+
+        pending = sum(
+            1
+            for r in rows
+            if r.get("indexed_at_ms") is None and r.get("index_failed_at_ms") is None
+        )
+        dead_lettered = sum(1 for r in rows if r.get("index_failed_at_ms") is not None)
 
         return IndexStatusSummary(
             pending=pending, dead_lettered=dead_lettered, matched=matched

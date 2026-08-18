@@ -275,7 +275,12 @@ async def _maybe_corpus_status(
     try:
         manifest = get_memory_manifest_service()
         tokens = _doc_tokens(query)
-        summary = await manifest.index_status_summary(user_context, tokens)
+        # skip_counts_if_no_match: this runs on EVERY recall now (the reshape dropped
+        # the page.total==0 gate); when nothing matched we return None below without
+        # reading the counts, so skip the two COUNT queries on that hot path.
+        summary = await manifest.index_status_summary(
+            user_context, tokens, skip_counts_if_no_match=True
+        )
     except Exception:
         logger.warning(
             "corpus_status enrichment failed; omitting from recall result",
