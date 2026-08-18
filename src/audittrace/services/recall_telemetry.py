@@ -76,6 +76,7 @@ def emit_recall_telemetry(
     results_count: int,
     *,
     cache: str = "n/a",
+    best_match_distance: float | None = None,
 ) -> None:
     """Emit the two recall-telemetry instruments and a structured log line
     for one memory read.
@@ -101,6 +102,13 @@ def emit_recall_telemetry(
             ``"n/a"`` for REST/backoffice reads that do not consult
             that cache.  Labels: ``{source, collection, hit, cache}``.
             **No PII** — ``cache`` is a fixed enum, not a user field.
+        best_match_distance: The RAW ChromaDB distance of the
+            best (relevance-first) match —
+            ``page.matches[0].metadata.get("distance")`` when there is a
+            match, ``None`` when the page is empty or the surface has no
+            vector distance (S3-backed reads, cache hits).  LOG ONLY:
+            appended to the ``memory.read`` line for triage, never a
+            metric label (cardinality) and never a gate.
     """
     hit = results_count > 0
     labels = {
@@ -115,16 +123,18 @@ def emit_recall_telemetry(
     _recall_results_histogram.record(results_count, labels)
 
     # Structured log line (WU-B) — greppable in Loki, visible on laptop.
-    # Fields: surface, collection, results_returned, hit, cache.
-    # user_id/trace_id/session_id are already propagated via the
-    # logging-context machinery (no new PII in labels).
+    # Fields: surface, collection, results_returned, hit, cache,
+    # best_match_distance. user_id/trace_id/session_id are already
+    # propagated via the logging-context machinery (no new PII in labels).
     logger.info(
-        "memory.read | surface=%s collection=%s results_returned=%d hit=%s cache=%s",
+        "memory.read | surface=%s collection=%s results_returned=%d "
+        "hit=%s cache=%s best_match_distance=%s",
         source,
         collection,
         results_count,
         hit,
         cache,
+        best_match_distance,
     )
 
 
