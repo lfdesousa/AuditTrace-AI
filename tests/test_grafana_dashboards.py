@@ -1,8 +1,11 @@
 """Drift-guards for the Grafana dashboards vendored alongside the chart.
 
-Both dashboards (Operations + Call Flow Tempo) ship as JSON files
-in ``charts/audittrace/files/grafana-dashboards/`` so they travel
-with the chart release. Pre-rename (ADR-035) the operations
+The chart's ``files/grafana-dashboards/`` is the canonical (SSOT) set of
+dashboards (SPEC #441) — the obs-stack's Grafana file-provider dir is a
+synced mirror of it (``make sync-dashboards`` / ``make check-dashboard-drift``).
+Every dashboard ships as a JSON file in
+``charts/audittrace/files/grafana-dashboards/`` so it travels with the
+chart release. Pre-rename (ADR-035) the operations
 dashboard was named ``sovereign-overview`` with uid + title +
 tag ``sovereign-*``. The other dashboard had a stale
 ``sovereign-ai`` tag. These tests pin the post-rename invariants.
@@ -44,6 +47,12 @@ EXPECTED_DASHBOARDS: dict[str, dict[str, str]] = {
     },
     "audittrace-agents-learning.json": {
         "uid": "audittrace-agents-learning",
+        "title_prefix": "AuditTrace-AI",
+    },
+    # SPEC #441 (WU-0): adopted from the obs-stack into the chart — the
+    # canonical set is now 5 dashboards (Loki logs view, uid `loki`).
+    "audittrace-logs.json": {
+        "uid": "audittrace-logs",
         "title_prefix": "AuditTrace-AI",
     },
 }
@@ -293,7 +302,8 @@ class TestAgentsLearningDashboardRecallMetrics:
 
 
 class TestDashboardSetCompleteness:
-    """The chart packages BOTH dashboards (no accidental drop)."""
+    """The chart packages the full canonical set of 5 dashboards (no
+    accidental drop — SPEC #441 SSOT)."""
 
     def test_no_unexpected_dashboard_files(self) -> None:
         present = sorted(p.name for p in DASH_DIR.glob("*.json"))

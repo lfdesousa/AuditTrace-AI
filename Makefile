@@ -1,7 +1,13 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
-       token-guard
+       token-guard sync-dashboards check-dashboard-drift
+
+# SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
+# sibling checkout, not part of this repo. Its Grafana file-provider dir is a
+# synced mirror of the chart's canonical dashboard set; the path is
+# env-parameterized so every target here stays safe where no obs-stack exists.
+OBS_STACK_DIR ?= $(HOME)/work/observability-stack
 
 help: ## Show this help message
 	@echo 'Usage: make <target>'
@@ -231,6 +237,74 @@ helm-lint: ## Mirror the CI helm-lint job locally (both vault.enabled={false,tru
 	    exit 1; \
 	  fi; \
 	  echo "✅ vaultSecretFileGuard present in $$guards workloads"
+
+sync-dashboards: ## SPEC #441 SSOT: reconcile $(OBS_STACK_DIR)/grafana/dashboards/ to the chart's canonical set — copy new, update drifted, prune stale (pre-rename `sovereign-*` etc.), chmod 0644 (Grafana file-provider perms). Idempotent; prints added/updated/pruned. Skips gracefully (exit 0) when the obs-stack dir is absent.
+	@SRC=$(CHART_DIR)/files/grafana-dashboards; \
+	if [ ! -d "$(OBS_STACK_DIR)" ]; then \
+	  echo "obs-stack not present, skipping ($(OBS_STACK_DIR))"; \
+	  exit 0; \
+	fi; \
+	DEST="$(OBS_STACK_DIR)/grafana/dashboards"; \
+	mkdir -p "$$DEST"; \
+	added=""; updated=""; \
+	for f in "$$SRC"/*.json; do \
+	  [ -e "$$f" ] || continue; \
+	  base=$$(basename "$$f"); \
+	  if cmp -s "$$f" "$$DEST/$$base"; then :; \
+	  elif [ -e "$$DEST/$$base" ]; then updated="$$updated $$base"; \
+	  else added="$$added $$base"; fi; \
+	  cp "$$f" "$$DEST/$$base" && chmod 0644 "$$DEST/$$base"; \
+	done; \
+	pruned=""; \
+	for f in "$$DEST"/*.json; do \
+	  [ -e "$$f" ] || continue; \
+	  base=$$(basename "$$f"); \
+	  if [ ! -e "$$SRC/$$base" ]; then \
+	    rm -f "$$f"; \
+	    pruned="$$pruned $$base"; \
+	  fi; \
+	done; \
+	echo "sync-dashboards: $$SRC -> $$DEST"; \
+	echo "  added:   $$added"; \
+	echo "  updated: $$updated"; \
+	echo "  pruned:  $$pruned"; \
+	if [ -z "$$added$$updated$$pruned" ]; then echo "  (already in sync — no changes)"; fi
+
+check-dashboard-drift: ## SPEC #441 drift guard: $(OBS_STACK_DIR)/grafana/dashboards/ must be an EXACT mirror of the chart's canonical set (file set AND content). exit 1 with a clear message on ANY divergence, exit 0 when identical. Skips gracefully (exit 0) when the obs-stack dir is absent (CI-safe).
+	@SRC=$(CHART_DIR)/files/grafana-dashboards; \
+	if [ ! -d "$(OBS_STACK_DIR)" ]; then \
+	  echo "obs-stack not present, skipping dashboard drift check ($(OBS_STACK_DIR))"; \
+	  exit 0; \
+	fi; \
+	DEST="$(OBS_STACK_DIR)/grafana/dashboards"; \
+	if [ ! -d "$$DEST" ]; then \
+	  echo "dashboard drift: $$DEST does not exist — run 'make sync-dashboards'"; \
+	  exit 1; \
+	fi; \
+	status=0; \
+	for f in "$$SRC"/*.json; do \
+	  [ -e "$$f" ] || continue; \
+	  base=$$(basename "$$f"); \
+	  if [ ! -e "$$DEST/$$base" ]; then \
+	    echo "dashboard drift: MISSING in obs-stack: $$base"; \
+	    status=1; \
+	  elif ! cmp -s "$$f" "$$DEST/$$base"; then \
+	    echo "dashboard drift: CONTENT differs: $$base (chart vs $$DEST)"; \
+	    status=1; \
+	  fi; \
+	done; \
+	for f in "$$DEST"/*.json; do \
+	  [ -e "$$f" ] || continue; \
+	  base=$$(basename "$$f"); \
+	  if [ ! -e "$$SRC/$$base" ]; then \
+	    echo "dashboard drift: EXTRA in obs-stack (not in chart canonical set): $$base"; \
+	    status=1; \
+	  fi; \
+	done; \
+	if [ "$$status" -eq 0 ]; then \
+	  echo "no dashboard drift: $$DEST == $$SRC (file set + content)"; \
+	fi; \
+	exit $$status
 
 deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + Vault injector probe (REQUIRED before any cluster mutation)
 	@TAG="$(TAG)" CHART_DIR=$(CHART_DIR) RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) \
