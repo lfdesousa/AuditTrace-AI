@@ -291,6 +291,20 @@ def _multipart_body(
     return preamble + content + epilogue, f"multipart/form-data; boundary={boundary}"
 
 
+def _is_existing_file(candidate: str) -> bool:
+    """True iff ``candidate`` names an existing file.
+
+    A candidate too long (or otherwise un-stat-able) to probe — e.g. literal
+    record text raising ``OSError``/ENAMETOOLONG when its first path segment
+    exceeds 255 bytes — is NOT a file; return ``False`` so the caller treats
+    it as text rather than crashing.
+    """
+    try:
+        return Path(candidate).is_file()
+    except OSError:
+        return False
+
+
 def _record_bytes_and_name(
     path_or_text: str | Path, filename: str | None
 ) -> tuple[bytes, str]:
@@ -303,7 +317,7 @@ def _record_bytes_and_name(
     synchronous non-PDF path (HTTP 200) rather than the PDF scan flow.
     """
     if isinstance(path_or_text, Path) or (
-        isinstance(path_or_text, str) and Path(path_or_text).is_file()
+        isinstance(path_or_text, str) and _is_existing_file(path_or_text)
     ):
         p = Path(path_or_text)
         return p.read_bytes(), _ensure_md(filename or p.name)
