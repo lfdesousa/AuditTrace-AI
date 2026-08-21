@@ -28,13 +28,17 @@ from fastapi import Request
 from audittrace.services.recall_telemetry import classify_recall_source_from_request
 from scripts.deploy import memory
 from scripts.deploy.memory import (
+    BUILD_OUTCOMES,
+    RECALL_QUARANTINED_OUTCOMES,
     DeployLogError,
     _ensure_md,
     _fleet_headers,
+    _is_recall_quarantined,
     _multipart_body,
     _normalize_front_door,
     _record_bytes_and_name,
     _resolve_token,
+    _tag_outcome,
     log_deploy_record,
     recall_deploy_lessons,
     ssl_context,
@@ -654,3 +658,154 @@ def test_log_read_timeout_raises_clean_deploy_log_error(monkeypatch):
         log_deploy_record("t", front_door=FRONT, token=TOKEN, filename="z.md")
     assert exc.value.step == "upload"
     assert exc.value.status == 0
+
+
+# ── build-outcome tagging + recall quarantine (2026-08-21 corpus-hygiene guard) ──
+#
+# A stalled/failed build trajectory is "gold to STUDY, poison to RECALL". The
+# guard tags the record filename with `.outcome-<value>` on write and drops the
+# quarantined outcomes (stalled/failed) from recall by default — while keeping
+# `pass`, `reject`, and every legacy (untagged) record. Each test below neuters
+# to RED if the guard is removed.
+
+
+def test_tag_outcome_none_is_noop():
+    """No outcome → the historical filename is untouched (backward compatible)."""
+    assert _tag_outcome("rec.md", None) == "rec.md"
+
+
+def test_tag_outcome_inserts_infix_before_md():
+    assert _tag_outcome("2026-08-21-BUILD-456.md", "stalled") == (
+        "2026-08-21-BUILD-456.outcome-stalled.md"
+    )
+    # tolerates a leaf without .md too (still lands a .md record)
+    assert _tag_outcome("plain", "pass") == "plain.outcome-pass.md"
+
+
+def test_tag_outcome_is_idempotent():
+    once = _tag_outcome("rec.md", "failed")
+    assert _tag_outcome(once, "failed") == once  # never double-tags
+    assert once.count(".outcome-") == 1
+
+
+def test_tag_outcome_rejects_unknown_value():
+    with pytest.raises(ValueError, match="outcome must be one of"):
+        _tag_outcome("rec.md", "bogus")
+
+
+def test_log_tags_outcome_into_upload_and_index_filenames(monkeypatch):
+    """The write half of the guard: outcome rides in the recall-visible filename
+    (upload ``filename`` + index ``file``), so recall can see it WITHOUT a content
+    fetch. Neuter (drop the ``leaf = _tag_outcome(...)`` line) → RED."""
+    _clear_env_token(monkeypatch)
+    fake = _install(
+        monkeypatch,
+        {"/memory/upload": (200, b"{}"), "/memory/index": (200, b"{}")},
+    )
+    out = log_deploy_record(
+        "build stalled, zero code",
+        front_door=FRONT,
+        token=TOKEN,
+        filename="2026-08-21-BUILD-456.md",
+        outcome="stalled",
+    )
+    assert out["key"] == "episodic/2026-08-21-BUILD-456.outcome-stalled.md"
+    upload = next(c for c in fake.calls if c["path"] == "/memory/upload")
+    index = next(c for c in fake.calls if c["path"] == "/memory/index")
+    assert upload["query"]["filename"] == ["2026-08-21-BUILD-456.outcome-stalled.md"]
+    assert index["query"]["file"] == [
+        "episodic/2026-08-21-BUILD-456.outcome-stalled.md"
+    ]
+
+
+def test_log_without_outcome_is_untagged(monkeypatch):
+    """Every existing caller (no ``outcome=``) keeps its exact filename."""
+    _clear_env_token(monkeypatch)
+    fake = _install(
+        monkeypatch,
+        {"/memory/upload": (200, b"{}"), "/memory/index": (200, b"{}")},
+    )
+    log_deploy_record("text", front_door=FRONT, token=TOKEN, filename="rec.md")
+    upload = next(c for c in fake.calls if c["path"] == "/memory/upload")
+    assert upload["query"]["filename"] == ["rec.md"]
+    assert ".outcome-" not in upload["query"]["filename"][0]
+
+
+def test_log_rejects_unknown_outcome_raises(monkeypatch):
+    """A mistagged outcome is LOUD (the log path is reliable) — never silently
+    written untagged."""
+    _clear_env_token(monkeypatch)
+    _install(
+        monkeypatch,
+        {"/memory/upload": (200, b"{}"), "/memory/index": (200, b"{}")},
+    )
+    with pytest.raises(ValueError, match="outcome must be one of"):
+        log_deploy_record(
+            "text", front_door=FRONT, token=TOKEN, filename="x.md", outcome="green"
+        )
+
+
+def _semantic(items):
+    return {"/memory/semantic": (200, json.dumps({"items": items}).encode())}
+
+
+def test_recall_quarantines_stalled_and_failed_by_default(monkeypatch):
+    """The read half: recall drops stalled/failed build-records so an agent never
+    recalls a drift trajectory as precedent. Neuter (remove the quarantine block)
+    → this returns all four → RED."""
+    _clear_env_token(monkeypatch)
+    items = [
+        {"key": "decisions/a", "title": "2026-08-21-BUILD-456.outcome-pass.md"},
+        {"key": "decisions/b", "title": "2026-08-21-BUILD-456.outcome-stalled.md"},
+        {"key": "decisions/c", "title": "2026-08-20-BUILD-402.outcome-failed.md"},
+        {"key": "decisions/d", "title": "2026-08-19-BUILD-441.outcome-reject.md"},
+    ]
+    _install(monkeypatch, _semantic(items))
+    out = recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    titles = {i["title"] for i in out}
+    assert "2026-08-21-BUILD-456.outcome-stalled.md" not in titles
+    assert "2026-08-20-BUILD-402.outcome-failed.md" not in titles
+    # pass + reject survive
+    assert "2026-08-21-BUILD-456.outcome-pass.md" in titles
+    assert "2026-08-19-BUILD-441.outcome-reject.md" in titles
+
+
+def test_recall_keeps_legacy_untagged_records(monkeypatch):
+    """Non-regressive: records with no outcome infix (every historical spec /
+    park / deploy / verify record) are NEVER quarantined."""
+    _clear_env_token(monkeypatch)
+    items = [
+        {"key": "decisions/1", "title": "2026-08-19-SPEC-456-RATIFIED-A1.txt.md"},
+        {"key": "decisions/2", "title": "deploy-v1.24.4-20260818.json.md"},
+    ]
+    _install(monkeypatch, _semantic(items))
+    out = recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    assert len(out) == 2
+
+
+def test_recall_include_quarantined_returns_all(monkeypatch):
+    """The escape hatch for a curator/study query returns the drift too."""
+    _clear_env_token(monkeypatch)
+    items = [
+        {"key": "decisions/a", "title": "b.outcome-pass.md"},
+        {"key": "decisions/b", "title": "b.outcome-stalled.md"},
+    ]
+    _install(monkeypatch, _semantic(items))
+    out = recall_deploy_lessons(
+        "q", front_door=FRONT, token=TOKEN, include_quarantined=True
+    )
+    assert len(out) == 2
+
+
+def test_is_recall_quarantined_keys_on_identity_fields_only():
+    assert _is_recall_quarantined({"title": "x.outcome-stalled.md"}) is True
+    assert _is_recall_quarantined({"key": "decisions/x.outcome-failed.md"}) is True
+    assert _is_recall_quarantined({"source": "x.outcome-failed.md"}) is True
+    assert _is_recall_quarantined({"title": "x.outcome-pass.md"}) is False
+    assert _is_recall_quarantined({"title": "legacy-spec.md"}) is False
+
+
+def test_quarantine_set_is_subset_of_known_outcomes():
+    """Guard against a typo drifting the two constants apart."""
+    assert RECALL_QUARANTINED_OUTCOMES <= set(BUILD_OUTCOMES)
+    assert RECALL_QUARANTINED_OUTCOMES == {"stalled", "failed"}

@@ -71,6 +71,20 @@ DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 DECISIONS_COLLECTION = "decisions"
 DEFAULT_RECALL_LIMIT = 25
 
+# ── build-outcome tagging (corpus-hygiene guard, 2026-08-21) ──────────────────
+# A build / review / deploy record MAY carry an explicit outcome so that recall
+# can QUARANTINE drift trajectories (a stalled or failed build) from being
+# recalled as if it were valid precedent — "gold to study, poison to recall".
+# The tag rides in the record FILENAME as an ``.outcome-<value>`` infix
+# (``2026-08-21-BUILD-456.outcome-stalled.md``) so it is visible in the recall
+# listing's ``title`` / ``key`` / ``source`` WITHOUT fetching content.
+BUILD_OUTCOMES = ("pass", "reject", "stalled", "failed")
+# Outcomes dropped from recall by default. ``pass`` is a precedent; ``reject`` is
+# a genuine lesson (the reviewer's mandate-to-fail verdict IS the value of the
+# loop); only the incomplete/aborted trajectories are quarantined.
+RECALL_QUARANTINED_OUTCOMES = frozenset({"stalled", "failed"})
+_OUTCOME_INFIX = ".outcome-"
+
 # Multipart field name MUST be ``file`` — the upload endpoint binds
 # ``file: UploadFile = File(...)``.
 _UPLOAD_FIELD = "file"
@@ -303,6 +317,36 @@ def _ensure_md(name: str) -> str:
     return name if name.endswith(".md") else f"{name}.md"
 
 
+def _tag_outcome(leaf: str, outcome: str | None) -> str:
+    """Insert an ``.outcome-<value>`` infix before ``.md`` so recall can see it.
+
+    Idempotent: a leaf that already carries an outcome infix is returned
+    unchanged (never double-tags). ``outcome=None`` is a no-op (backward
+    compatible with every existing caller). An unknown ``outcome`` raises
+    :class:`ValueError` — the log path is RELIABLE, so a bad tag is loud, not
+    silently dropped.
+    """
+    if outcome is None:
+        return leaf
+    if outcome not in BUILD_OUTCOMES:
+        raise ValueError(f"outcome must be one of {BUILD_OUTCOMES}, got {outcome!r}")
+    if _OUTCOME_INFIX in leaf:
+        return leaf
+    stem = leaf[:-3] if leaf.endswith(".md") else leaf
+    return f"{stem}{_OUTCOME_INFIX}{outcome}.md"
+
+
+def _is_recall_quarantined(item: dict[str, Any]) -> bool:
+    """True if a recall item is tagged with a quarantined build outcome.
+
+    Keys on the recall-visible identity fields only (``title`` / ``key`` /
+    ``source`` / ``name``) — no content fetch. A legacy record with no outcome
+    infix is never quarantined, so the filter is non-regressive.
+    """
+    hay = " ".join(str(item.get(k, "")) for k in ("title", "key", "source", "name"))
+    return any(f"{_OUTCOME_INFIX}{o}" in hay for o in RECALL_QUARANTINED_OUTCOMES)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
@@ -314,6 +358,7 @@ def recall_deploy_lessons(
     insecure: bool = False,
     limit: int = DEFAULT_RECALL_LIMIT,
     timeout: int = 30,
+    include_quarantined: bool = False,
 ) -> list[dict[str, Any]]:
     """BEST-EFFORT recall of deploy lessons from the decisions layer.
 
@@ -380,10 +425,22 @@ def recall_deploy_lessons(
             query,
         )
         return []
+    dicts = [i for i in items if isinstance(i, dict)]
+    if not include_quarantined:
+        kept = [i for i in dicts if not _is_recall_quarantined(i)]
+        dropped = len(dicts) - len(kept)
+        if dropped:
+            logger.info(
+                "recall for %r quarantined %d stalled/failed build-record(s) "
+                "(study-objects, not precedent; pass include_quarantined=True to include them)",
+                query,
+                dropped,
+            )
+        dicts = kept
     logger.info(
-        "recall for %r returned %d decisions-layer lesson(s)", query, len(items)
+        "recall for %r returned %d decisions-layer lesson(s)", query, len(dicts)
     )
-    return [i for i in items if isinstance(i, dict)]
+    return dicts
 
 
 def log_deploy_record(
@@ -394,6 +451,7 @@ def log_deploy_record(
     layer: str = "episodic",
     collections: tuple[str, ...] = (DECISIONS_COLLECTION,),
     filename: str | None = None,
+    outcome: str | None = None,
     insecure: bool = False,
     timeout: int = 60,
 ) -> dict[str, Any]:
@@ -403,6 +461,13 @@ def log_deploy_record(
     single ``file`` field) and then indexes it via
     ``POST /memory/index?file=<layer>/<name>&collections=...``. Returns
     ``{"status", "key", "index_status"}``.
+
+    ``outcome`` (one of :data:`BUILD_OUTCOMES`) tags the record filename with an
+    ``.outcome-<value>`` infix so recall can quarantine drift trajectories
+    (``stalled`` / ``failed``) from being recalled as precedent — see
+    :func:`recall_deploy_lessons`. A bad ``outcome`` raises :class:`ValueError`
+    (the log path is reliable, so a mistag is loud, not silent). ``None`` keeps
+    the historical, untagged filename (backward compatible).
 
     Logging is the ADR-059 contract, so — unlike recall — a failure here is LOUD:
     a missing token, a non-200 upload, or a non-200 index all raise
@@ -416,6 +481,7 @@ def log_deploy_record(
             "auth", 0, "no scoped JWT available to log the deploy record"
         )
     content, leaf = _record_bytes_and_name(path_or_text, filename)
+    leaf = _tag_outcome(leaf, outcome)
 
     # -- upload (multipart, non-PDF synchronous path → HTTP 200) --
     up_params = urlencode({"layer": layer, "filename": leaf})
