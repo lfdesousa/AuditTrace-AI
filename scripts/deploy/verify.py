@@ -26,7 +26,11 @@ evidence it stands on):
   (``maxSurge=0`` / ``maxUnavailable=1``). Catches a WS1 regression or a stray
   live ``kubectl patch``.
 * **health-version**         — front-door ``GET /health`` reports ``status=ok`` and
-  ``version`` == the intended target version.
+  ``version`` == the intended target version. ``--skip-version-check`` (#412)
+  turns this probe advisory (reported ``SKIPPED``, never a FAIL) for a
+  dev-tagged build (image tag isn't a release ``vX.Y.Z``) that can only be
+  certified on ``digest-matches-published`` alone; every other probe, INCLUDING
+  the digest anchor, is unaffected and still gates normally.
 * **recall-e2e**             — a REAL front-door recall through the audit plane:
   ``POST /v1/chat/completions`` (scoped JWT, real model) that triggers a
   ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
@@ -173,6 +177,18 @@ EXPECTED_MAX_UNAVAILABLE = "1"
 
 PASS = "PASS"
 FAIL = "FAIL"
+# A probe that was deliberately not evaluated -- currently only health-version
+# under --skip-version-check (#412). Distinct from FAIL: it carries no evidence
+# about whether the underlying condition holds, so it must never move the
+# verdict either way. Distinct from PASS: it must never manufacture a green
+# result the runner did not actually check.
+SKIPPED = "SKIPPED"
+
+# The fixed advisory reason recorded on health-version when --skip-version-check
+# is set. A literal, not a computed string: the probe is skipped UNCONDITIONALLY
+# (it never even queries the front door) so the reason can never depend on an
+# outcome that was never observed.
+SKIP_VERSION_CHECK_REASON = "skipped (--skip-version-check)"
 
 # ── #384 WS2 mesh-health probe constants ─────────────────────────────────────
 # The mesh probes RE-DERIVE their signal from INDEPENDENT read-only cluster reads
@@ -411,6 +427,12 @@ class VerifyConfig:
     # E2E_CHAT_TIMEOUT_DEFAULT for the calibration rationale. Every other probe
     # (fast HTTP + kubectl/helm) is untouched by this field.
     e2e_timeout: int = E2E_CHAT_TIMEOUT_DEFAULT
+    # STRICT by default: health-version gates normally. --skip-version-check
+    # (#412) is an explicit opt-in for a dev-tagged build (image tag isn't a
+    # release vX.Y.Z) that verifies on digest-matches-published alone — see
+    # SKIP_VERSION_CHECK_REASON. Additive, backward-compatible: default False
+    # leaves every existing caller's behaviour byte-for-byte unchanged.
+    skip_version_check: bool = False
 
     def __post_init__(self) -> None:
         # Resolve None → the environment-dynamic default (env var > fallback).
@@ -433,7 +455,7 @@ class VerifyConfig:
 @dataclass
 class ProbeResult:
     name: str
-    status: str  # PASS | FAIL
+    status: str  # PASS | FAIL | SKIPPED
     detail: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     checked_at: str = ""
@@ -1041,6 +1063,17 @@ class VerifyRunner:
     # -- probe 4: health-version --
 
     def probe_health_version(self) -> ProbeResult:
+        if self.cfg.skip_version_check:
+            # Unconditional skip -- the probe never even queries the front door,
+            # so the reported reason is a fixed literal, never an observed
+            # outcome (#412). digest-matches-published (probe 2) and every
+            # other probe are untouched and still gate normally.
+            return self._record(
+                PROBES[3],
+                SKIPPED,
+                SKIP_VERSION_CHECK_REASON,
+                {"target_version": self.cfg.image_tag},
+            )
         status_code, body = self._front_get("/health", token=None)
         if status_code != 200 or not isinstance(body, dict):
             return self._record(
@@ -1335,10 +1368,19 @@ class VerifyRunner:
 
     @property
     def verdict(self) -> str:
-        """PASS iff every probe passed; ANY FAIL → FAIL (the mandate-to-fail)."""
-        if not self.results:
+        """PASS iff every COUNTED probe passed; ANY FAIL → FAIL (the mandate-to-fail).
+
+        SKIPPED probes (currently only health-version under
+        ``--skip-version-check``, #412) are EXCLUDED from the tally — they carry
+        no evidence either way, so they can neither manufacture a PASS nor block
+        one. A result set with no counted probes (empty, or every probe SKIPPED)
+        is fail-closed FAIL: a verdict must stand on at least one probe that was
+        actually evaluated.
+        """
+        counted = [r for r in self.results if r.status != SKIPPED]
+        if not counted:
             return FAIL
-        return PASS if all(r.passed for r in self.results) else FAIL
+        return PASS if all(r.passed for r in counted) else FAIL
 
     def run(self) -> dict[str, Any]:
         self.probe_pods_ready()
@@ -1363,6 +1405,7 @@ class VerifyRunner:
             "registry": self.cfg.registry,
             "front_door": self.cfg.front_door,
             "insecure_tls": self.cfg.insecure,
+            "skip_version_check": self.cfg.skip_version_check,
             # ── the independence contract: DERIVED + transparent ──
             "evidence_sources": self.evidence_sources(),
             "reads_deploy_report": self.reads_deploy_report,
@@ -1459,6 +1502,18 @@ def build_parser() -> argparse.ArgumentParser:
             f"via this flag or the {E2E_TIMEOUT_ENV_VAR} env var."
         ),
     )
+    parser.add_argument(
+        "--skip-version-check",
+        action="store_true",
+        help=(
+            "treat health-version as advisory (reported SKIPPED, never a FAIL) "
+            "instead of gating the verdict -- for a dev-tagged build (image tag "
+            "isn't a release vX.Y.Z) that can only be certified on "
+            "digest-matches-published alone. Default is STRICT: health-version "
+            "gates normally. Every other probe, INCLUDING digest-matches-"
+            "published, is unaffected."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
     return parser
 
@@ -1475,6 +1530,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         insecure=args.insecure,
         out_dir=args.out_dir,
         e2e_timeout=args.e2e_timeout,
+        skip_version_check=args.skip_version_check,
     )
 
 

@@ -559,6 +559,29 @@ def test_health_version_fail_wrong_version(tmp_path, monkeypatch):
     assert res.status == FAIL and "does NOT match" in res.detail
 
 
+# ── --skip-version-check (#412 digest-only mode) ─────────────────────────────
+
+
+def test_health_version_skipped_when_flag_set(tmp_path, monkeypatch):
+    """A version mismatch that WOULD fail is reported SKIPPED, not FAIL, under
+    the flag -- and the probe never even queries the front door (unconditional
+    skip, fixed literal reason)."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    res = VerifyRunner(_cfg(tmp_path, skip_version_check=True)).probe_health_version()
+    assert res.status == verify.SKIPPED
+    assert res.detail == verify.SKIP_VERSION_CHECK_REASON
+    assert http.calls == []
+
+
+def test_health_version_not_skipped_by_default(tmp_path, monkeypatch):
+    """Default (flag unset) is byte-for-byte unchanged: same mismatch still FAILs."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == FAIL
+
+
 # ── probe 5: recall-e2e (PASS + FAIL) ────────────────────────────────────────
 
 
@@ -832,6 +855,89 @@ def test_verdict_is_fail_with_no_results(tmp_path):
     assert VerifyRunner(_cfg(tmp_path)).verdict == FAIL
 
 
+# ── --skip-version-check (#412): run()-level, non-vacuous ────────────────────
+
+
+def _digest_only_runner(
+    tmp_path, monkeypatch, *, version="0.0.1", rules=None, **cfg_kw
+):
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
+    monkeypatch.setattr(
+        verify,
+        "_run",
+        _KubeDispatcher(rules=rules if rules is not None else _healthy_kube_rules()),
+    )
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (200, {"status": "ok", "version": version}),
+                **_recall_routes(),
+            }
+        ),
+    )
+    return VerifyRunner(_cfg(tmp_path, **cfg_kw))
+
+
+def test_skip_version_check_flag_turns_a_version_fail_into_a_pass_verdict(
+    tmp_path, monkeypatch
+):
+    """Digest matches and health-version WOULD fail (running version != target)
+    -- with the flag, health-version is SKIPPED (not FAILed) and the overall
+    verdict is PASS. Neuter (count SKIPPED as a fail) -> this test goes RED."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="0.0.1", skip_version_check=True
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert statuses["digest-matches-published"] == PASS
+    assert report["verdict"] == PASS
+
+
+def test_without_the_flag_the_same_scenario_fails(tmp_path, monkeypatch):
+    """Proves the flag -- not a vacuous pass -- is what changes the outcome:
+    identical inputs, flag unset, health-version FAILs and the verdict FAILs."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="0.0.1", skip_version_check=False
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == FAIL
+    assert report["verdict"] == FAIL
+
+
+def test_skip_version_check_does_not_weaken_the_digest_anchor(tmp_path, monkeypatch):
+    """--skip-version-check must NOT skip digest-matches-published: a live digest
+    mismatch STILL fails the verdict even with the flag set. Neuter (skip-version
+    also skips digest) -> this test goes RED."""
+    rules = _healthy_kube_rules()
+    rules[0] = ("imageID", _proc(0, "repo@sha256:DIFFERENT"))
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="9.9.9", rules=rules, skip_version_check=True
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert statuses["digest-matches-published"] == FAIL
+    assert report["verdict"] == FAIL
+
+
+def test_skip_version_check_preserves_the_fixed_nine_probe_order(tmp_path, monkeypatch):
+    """Determinism contract: all 9 identifiers, fixed order, health-version
+    present with SKIPPED status -- the flag never changes probe count or order."""
+    r = _digest_only_runner(
+        tmp_path, monkeypatch, version="9.9.9", skip_version_check=True
+    )
+    report = r.run()
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["health-version"] == verify.SKIPPED
+    assert report["verdict"] == PASS
+
+
 def test_report_declares_independence_derived_from_sources(tmp_path, monkeypatch):
     report = _all_pass_runner(tmp_path, monkeypatch).run()
     # reads_deploy_report is DERIVED from the enumerated evidence sources, not a
@@ -996,6 +1102,24 @@ def test_cli_insecure_flag_sets_config(tmp_path):
         ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
     )
     assert verify.config_from_args(args2).insecure is False
+
+
+def test_cli_skip_version_check_flag_sets_config(tmp_path):
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+            "--skip-version-check",
+        ]
+    )
+    assert verify.config_from_args(args).skip_version_check is True
+    # and the default (flag omitted) is False
+    args2 = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
+    )
+    assert verify.config_from_args(args2).skip_version_check is False
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
