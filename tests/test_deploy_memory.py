@@ -33,6 +33,7 @@ from scripts.deploy.memory import (
     DeployLogError,
     _ensure_md,
     _fleet_headers,
+    _is_existing_file,
     _is_recall_quarantined,
     _multipart_body,
     _normalize_front_door,
@@ -591,6 +592,51 @@ def test_record_bytes_and_name_forces_md_on_file(tmp_path):
     content, name = _record_bytes_and_name(p, None)
     assert content == b"x"
     assert name == "note.txt.md"
+
+
+# ── regression: literal text long enough to raise ENAMETOOLONG on stat ────────
+#
+# A literal record whose first line (no "/") exceeds the 255-byte path-segment
+# limit makes ``Path(text).is_file()`` raise ``OSError`` (errno 36,
+# ENAMETOOLONG) instead of returning False. Falsifiable: inline the raw
+# ``Path(path_or_text).is_file()`` call (removing the try/except guard) and
+# this test goes RED with an unhandled ``OSError``.
+
+_LONG_FIRST_LINE_TEXT = ("word " * 60).strip() + "\nsecond line of the record"
+
+
+def test_is_existing_file_true_for_real_file(tmp_path):
+    p = tmp_path / "real.md"
+    p.write_text("x")
+    assert _is_existing_file(str(p)) is True
+
+
+def test_is_existing_file_false_for_too_long_candidate():
+    too_long = "definitely not a path " * 40
+    assert len(too_long.split("/", 1)[0]) > 255
+    assert _is_existing_file(too_long) is False
+
+
+def test_record_bytes_and_name_survives_long_literal_text_no_slash():
+    assert len(_LONG_FIRST_LINE_TEXT.split("/", 1)[0]) > 255
+    content, name = _record_bytes_and_name(_LONG_FIRST_LINE_TEXT, "rec.md")
+    assert content == _LONG_FIRST_LINE_TEXT.encode()
+    assert name == "rec.md"
+
+
+def test_log_deploy_record_survives_long_literal_text_no_slash(monkeypatch):
+    """End-to-end via the public entry point: the crash is gone, not just at
+    the helper level — upload + index both complete cleanly."""
+    _clear_env_token(monkeypatch)
+    _install(
+        monkeypatch,
+        {"/memory/upload": (200, b"{}"), "/memory/index": (200, b"{}")},
+    )
+    out = log_deploy_record(
+        _LONG_FIRST_LINE_TEXT, front_door=FRONT, token=TOKEN, filename="x.md"
+    )
+    assert out["status"] == "logged"
+    assert out["key"] == "episodic/x.md"
 
 
 def test_ssl_context():
