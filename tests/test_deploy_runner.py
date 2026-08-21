@@ -9,6 +9,7 @@ the preflight abort paths are exercised in both directions.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -22,6 +23,22 @@ from scripts.deploy.runner import (
     max_concurrent_running,
     within_surge_bound,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kubeconfig():
+    """DeployRunner.__init__ may mutate ``os.environ["KUBECONFIG"]`` directly
+    (#456, Part B) — a plain global write, not a ``monkeypatch.setenv`` call,
+    so it would otherwise leak across every other test in the suite. Snapshot
+    and restore around EVERY test in this module (not just the KUBECONFIG
+    tests), since any ``DeployRunner(...)`` construction can trigger it."""
+    saved = os.environ.get("KUBECONFIG")
+    yield
+    if saved is None:
+        os.environ.pop("KUBECONFIG", None)
+    else:
+        os.environ["KUBECONFIG"] = saved
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -477,6 +494,182 @@ def test_chart_apply_flags_helm_failure(tmp_path, monkeypatch):
     assert r.records[0].status == "flagged"
 
 
+# ── P2 Option A1: reactive adopt of out-of-band Helm objects (#456) ─────────
+
+_OWNERSHIP_STDERR = (
+    'Error: INSTALLATION FAILED: Deployment "audittrace-memory-server" in namespace '
+    '"audittrace" exists and cannot be imported into the current release: '
+    "invalid ownership metadata; annotation validation error: "
+    '"meta.helm.sh/release-name" annotation must be "audittrace"\n'
+    'ClusterRole "audittrace" exists and cannot be imported into the current '
+    "release: invalid ownership metadata"
+)
+
+
+def test_parse_ownership_conflicts_extracts_namespaced_and_cluster_scoped():
+    conflicts = runner.parse_ownership_conflicts(_OWNERSHIP_STDERR)
+    assert conflicts == [
+        ("Deployment", "audittrace-memory-server", "audittrace"),
+        ("ClusterRole", "audittrace", None),
+    ]
+
+
+def test_parse_ownership_conflicts_empty_without_marker():
+    # Neuter-guard check: a quoted `Kind "name"` substring alone must NOT
+    # trigger an adopt — only the tight "invalid ownership metadata" marker.
+    assert runner.parse_ownership_conflicts('Deployment "x" in namespace "y"') == []
+
+
+def test_chart_apply_a1_adopts_both_objects_and_retries_once(tmp_path, monkeypatch):
+    helm_calls: list[str] = []
+    kubectl_calls: list[list[str]] = []
+
+    def fake_run(cmd, *, env=None):
+        joined = " ".join(cmd)
+        if "imageID" in joined:
+            return _proc(0, "repo@sha256:OLD")
+        if "helm upgrade" in joined:
+            helm_calls.append(joined)
+            if len(helm_calls) == 1:
+                return _proc(returncode=1, stderr=_OWNERSHIP_STDERR)
+            return _proc(0, "Release has been upgraded")
+        if "helm status" in joined:
+            return _proc(0, json.dumps({"version": 9}))
+        if cmd[0] == "kubectl":
+            kubectl_calls.append(cmd)
+            return _proc(0)
+        return _proc(0)
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:NEW")
+    r.phase_chart_apply()
+
+    assert len(helm_calls) == 2  # exactly one bounded retry
+    assert kubectl_calls == [
+        [
+            "kubectl",
+            "label",
+            "deployment",
+            "audittrace-memory-server",
+            "-n",
+            "audittrace",
+            "app.kubernetes.io/managed-by=Helm",
+            "--overwrite",
+        ],
+        [
+            "kubectl",
+            "annotate",
+            "deployment",
+            "audittrace-memory-server",
+            "-n",
+            "audittrace",
+            "meta.helm.sh/release-name=audittrace",
+            "--overwrite",
+        ],
+        [
+            "kubectl",
+            "annotate",
+            "deployment",
+            "audittrace-memory-server",
+            "-n",
+            "audittrace",
+            "meta.helm.sh/release-namespace=audittrace",
+            "--overwrite",
+        ],
+        [
+            "kubectl",
+            "label",
+            "clusterrole",
+            "audittrace",
+            "app.kubernetes.io/managed-by=Helm",
+            "--overwrite",
+        ],
+        [
+            "kubectl",
+            "annotate",
+            "clusterrole",
+            "audittrace",
+            "meta.helm.sh/release-name=audittrace",
+            "--overwrite",
+        ],
+        [
+            "kubectl",
+            "annotate",
+            "clusterrole",
+            "audittrace",
+            "meta.helm.sh/release-namespace=audittrace",
+            "--overwrite",
+        ],
+    ]
+    assert r.records[0].status == "ok"
+    assert r.records[0].evidence["adopted"] == [
+        {
+            "kind": "Deployment",
+            "name": "audittrace-memory-server",
+            "namespace": "audittrace",
+        },
+        {"kind": "ClusterRole", "name": "audittrace", "namespace": None},
+    ]
+
+
+def test_chart_apply_a1_bounded_single_retry_then_flagged(tmp_path, monkeypatch):
+    helm_calls: list[str] = []
+    kubectl_calls: list[list[str]] = []
+
+    def fake_run(cmd, *, env=None):
+        joined = " ".join(cmd)
+        if "imageID" in joined:
+            return _proc(0, "repo@sha256:OLD")
+        if "helm upgrade" in joined:
+            helm_calls.append(joined)
+            return _proc(returncode=1, stderr=_OWNERSHIP_STDERR)  # fails BOTH times
+        if cmd[0] == "kubectl":
+            kubectl_calls.append(cmd)
+            return _proc(0)
+        return _proc(0)
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:NEW")
+    r.phase_chart_apply()
+
+    assert len(helm_calls) == 2  # bounded: retried once, never looped
+    assert len(kubectl_calls) == 6  # adopt fired exactly once (not a second time)
+    assert r.records[0].status == "flagged"
+    assert len(r.records[0].evidence["adopted"]) == 2
+    assert "adopted 2 out-of-band object(s)" in r.records[0].detail
+
+
+def test_chart_apply_a1_no_match_on_unrelated_error(tmp_path, monkeypatch):
+    helm_calls: list[str] = []
+    kubectl_calls: list[list[str]] = []
+
+    def fake_run(cmd, *, env=None):
+        joined = " ".join(cmd)
+        if "imageID" in joined:
+            return _proc(0, "repo@sha256:OLD")
+        if "helm upgrade" in joined:
+            helm_calls.append(joined)
+            return _proc(
+                returncode=1, stderr="Error: timed out waiting for the condition"
+            )
+        if cmd[0] == "kubectl":
+            kubectl_calls.append(cmd)
+            return _proc(0)
+        return _proc(0)
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:NEW")
+    r.phase_chart_apply()
+
+    assert len(helm_calls) == 1  # no retry — unrelated failure, behaves as today
+    assert kubectl_calls == []  # no adopt attempted
+    assert r.records[0].status == "flagged"
+    assert "adopted" not in r.records[0].evidence
+
+
 def test_chart_apply_dry_run(tmp_path):
     r = DeployRunner(_cfg(tmp_path, dry_run=True))
     r.image_ref = _hub_ref("sha256:abc")
@@ -700,3 +893,34 @@ def test_run_executes_real_subprocess():
 def test_sleep_and_now_iso():
     runner._sleep(0.0)
     assert "T" in runner._now_iso()
+
+
+# ── __init__ KUBECONFIG default (#456, Part B) ────────────────────────────────
+
+
+def test_init_seeds_kubeconfig_when_unset_and_file_present(tmp_path, monkeypatch):
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+    fake_home = tmp_path / "home"
+    (fake_home / ".kube").mkdir(parents=True)
+    (fake_home / ".kube" / "config").write_text("apiVersion: v1\n")
+    monkeypatch.setattr(runner.Path, "home", classmethod(lambda cls: fake_home))
+    DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
+    assert os.environ["KUBECONFIG"] == str(fake_home / ".kube" / "config")
+
+
+def test_init_does_not_overwrite_already_set_kubeconfig(tmp_path, monkeypatch):
+    monkeypatch.setenv("KUBECONFIG", "/custom/kubeconfig")
+    fake_home = tmp_path / "home"
+    (fake_home / ".kube").mkdir(parents=True)
+    (fake_home / ".kube" / "config").write_text("apiVersion: v1\n")
+    monkeypatch.setattr(runner.Path, "home", classmethod(lambda cls: fake_home))
+    DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
+    assert os.environ["KUBECONFIG"] == "/custom/kubeconfig"
+
+
+def test_init_leaves_kubeconfig_unset_when_no_file_present(tmp_path, monkeypatch):
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+    fake_home = tmp_path / "home-without-kube"
+    monkeypatch.setattr(runner.Path, "home", classmethod(lambda cls: fake_home))
+    DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
+    assert "KUBECONFIG" not in os.environ

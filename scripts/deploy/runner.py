@@ -35,6 +35,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess  # noqa: S404 - the runner is the operator; it shells out to helm/kubectl/make
 import sys
 from dataclasses import asdict, dataclass, field
@@ -245,6 +246,47 @@ def extract_digest(image_id: str | None) -> str | None:
     return candidate if candidate.startswith("sha256:") else None
 
 
+# ── Option A1: reactive adopt of out-of-band Helm objects (#456) ─────────────
+#
+# When ``helm upgrade`` meets an object that already exists in the cluster but
+# was never created by THIS release (e.g. applied out-of-band, or left behind
+# by a prior non-Helm bootstrap), it refuses to import it and fails with an
+# "invalid ownership metadata" error. Option A1 is REACTIVE: on that specific
+# failure, stamp the three Helm ownership fields onto each named object and
+# retry the upgrade EXACTLY ONCE (bounded — never loop). Option A2 (a
+# proactive pre-scan of the rendered manifest) was REJECTED as over-scoped;
+# do not build it here.
+
+# The tight marker that must be present before ANY adopt is attempted — an
+# unrelated helm failure (timeout, chart error, ...) must never trigger one.
+_OWNERSHIP_MARKER_RE = re.compile(r"invalid ownership metadata")
+
+# Each conflicting object is named on stderr as:
+#     <Kind> "<name>" in namespace "<ns>" ...
+# Cluster-scoped objects omit the ` in namespace "<ns>"` segment.
+_OWNERSHIP_OBJECT_RE = re.compile(
+    r'([A-Z][A-Za-z0-9]*) "([^"]+)"(?: in namespace "([^"]+)")?'
+)
+
+
+def parse_ownership_conflicts(stderr: str) -> list[tuple[str, str, str | None]]:
+    """Extract ``(kind, name, namespace | None)`` triples from a helm
+    ownership-metadata conflict error (Option A1, #456).
+
+    Returns an empty list unless the tight ``invalid ownership metadata``
+    marker is present, so an unrelated helm failure can never trigger an
+    adopt. Falsifiable: drop the marker check and a stderr that merely
+    contains a quoted ``Kind "name"``-shaped substring (with no ownership
+    conflict at all) would wrongly be treated as one.
+    """
+    if not _OWNERSHIP_MARKER_RE.search(stderr):
+        return []
+    return [
+        (kind, name, ns or None)
+        for kind, name, ns in _OWNERSHIP_OBJECT_RE.findall(stderr)
+    ]
+
+
 # ── the runner ────────────────────────────────────────────────────────────────
 
 
@@ -261,6 +303,15 @@ class DeployRunner:
         self.converged: bool = False
         self.surge: dict[str, Any] = {}
         self.aborted: bool = False
+        # #456 — default KUBECONFIG to ~/.kube/config when unset and the file
+        # exists. A bare k3s `kubectl` otherwise falls back to the root-only
+        # /etc/rancher/k3s/k3s.yaml (permission denied) and false-aborts P0.
+        # _run() (~106) merges os.environ into every subprocess env, so seeding
+        # it here propagates to every kubectl/helm exec this runner makes.
+        if not os.environ.get("KUBECONFIG"):
+            default_kubeconfig = Path.home() / ".kube" / "config"
+            if default_kubeconfig.is_file():
+                os.environ["KUBECONFIG"] = str(default_kubeconfig)
         # Injected so tests drive it without a cluster. The default gate now ships
         # the WS5 PrivilegedHealer: ``available`` reflects kubectl reachability, so
         # the safe RBAC-tier istiod restart works on ANY reachable cluster; the
@@ -489,6 +540,46 @@ class DeployRunner:
 
     # -- P2 --
 
+    def _adopt_object(self, kind: str, name: str, namespace: str | None) -> None:
+        """Stamp Helm's ownership fields onto an out-of-band object so the next
+        ``helm upgrade`` imports it into THIS release (Option A1, #456).
+
+        ``--overwrite`` keeps the operation idempotent. A failed kubectl call
+        here is not raised — it simply means the retried helm upgrade still
+        fails, which is recorded as "flagged" exactly as an unrelated helm
+        failure would be (no special-casing of the adopt-step failure mode).
+        """
+        target: list[str] = [kind.lower(), name]
+        if namespace is not None:
+            target += ["-n", namespace]
+        _run(
+            [
+                "kubectl",
+                "label",
+                *target,
+                "app.kubernetes.io/managed-by=Helm",
+                "--overwrite",
+            ]
+        )
+        _run(
+            [
+                "kubectl",
+                "annotate",
+                *target,
+                f"meta.helm.sh/release-name={self.cfg.release}",
+                "--overwrite",
+            ]
+        )
+        _run(
+            [
+                "kubectl",
+                "annotate",
+                *target,
+                f"meta.helm.sh/release-namespace={self.cfg.namespace}",
+                "--overwrite",
+            ]
+        )
+
     def phase_chart_apply(self) -> None:
         assert self.image_ref is not None
         cmd = _helm_apply_cmd(self.cfg, self.image_ref)
@@ -516,15 +607,37 @@ class DeployRunner:
 
         started = _now_iso()
         proc = _run(cmd)
+        # Option A1 (#456): react to an ownership-metadata conflict by adopting
+        # the named out-of-band objects and retrying EXACTLY ONCE — bounded, no
+        # loop, no second adopt attempt even if the retry also fails.
+        adopted: list[dict[str, Any]] = []
+        if proc.returncode != 0:
+            conflicts = parse_ownership_conflicts(proc.stderr)
+            if conflicts:
+                for kind, name, ns in conflicts:
+                    self._adopt_object(kind, name, ns)
+                    adopted.append({"kind": kind, "name": name, "namespace": ns})
+                logger.info(
+                    "adopted %d out-of-band object(s) into release %r; retrying helm upgrade once",
+                    len(adopted),
+                    self.cfg.release,
+                )
+                proc = _run(cmd)
         if proc.returncode != 0:
             self._record(
                 PHASES[2],
                 "flagged",
                 command=" ".join(cmd),
-                detail="helm upgrade returned non-zero (no --atomic → no rollback; Verify Agent decides)",
+                detail="helm upgrade returned non-zero (no --atomic → no rollback; Verify Agent decides)"
+                + (
+                    f"; adopted {len(adopted)} out-of-band object(s) before retry"
+                    if adopted
+                    else ""
+                ),
                 evidence={
                     "exit_code": proc.returncode,
                     "stderr_tail": proc.stderr[-2000:],
+                    **({"adopted": adopted} if adopted else {}),
                 },
                 started_at=started,
                 ended_at=_now_iso(),
@@ -535,10 +648,16 @@ class DeployRunner:
             PHASES[2],
             "ok",
             command=" ".join(cmd),
-            detail=f"chart applied; helm revision {self.helm_revision}",
+            detail=f"chart applied; helm revision {self.helm_revision}"
+            + (
+                f" (after adopting {len(adopted)} out-of-band object(s))"
+                if adopted
+                else ""
+            ),
             evidence={
                 "helm_revision": self.helm_revision,
                 "stdout_tail": proc.stdout[-2000:],
+                **({"adopted": adopted} if adopted else {}),
             },
             started_at=started,
             ended_at=_now_iso(),
