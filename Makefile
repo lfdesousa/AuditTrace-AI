@@ -390,6 +390,9 @@ k8s-rolling-image: ## Image-only roll via the CD runner (preflight + repo-pin + 
 	@# repository via --registry local (closing the #394 footgun), runs the mesh gate,
 	@# and emits a non-self-certifying report. No Make-level deploy-preflight prereq here:
 	@# the runner owns preflight, so keeping it would run preflight twice.
+	@# Contract (#451): the runner bounds helm via --timeout (default 300s) itself —
+	@# callers MUST NOT wrap this target in a short outer `timeout`; that truncation
+	@# is what filed #451 (a killed helm apply left the release in a stuck state).
 	@python -m scripts.deploy.runner \
 	  --target-version $(TAG) \
 	  --release $(RELEASE) \

@@ -175,6 +175,30 @@ class PhaseRecord:
     ended_at: str = ""
 
 
+# The ONLY Helm release status that counts as "converged" (#451). Anything
+# else — failed / pending-install / pending-upgrade / pending-rollback / an
+# unreadable-or-unknown status — must NOT be recorded as noop, or a release
+# stuck mid-way stays stuck across every re-run (the #451 root cause).
+_HELM_DEPLOYED_STATUS = "deployed"
+
+
+@dataclass(frozen=True)
+class ConvergenceCheck:
+    """Result of :meth:`DeployRunner._is_converged` (#451).
+
+    ``digest_matched`` is carried separately from ``converged`` so the caller
+    can tell "digest matches but the Helm release itself is not `deployed`"
+    (re-converge — gets a DISTINCT record detail explaining why an upgrade
+    ran on a digest-matched release) apart from an ordinary digest mismatch
+    (unchanged re-deploy path, no such note needed).
+    """
+
+    converged: bool
+    basis: str
+    helm_status: str | None
+    digest_matched: bool
+
+
 # ── pure helpers (unit-tested directly) ──────────────────────────────────────
 
 
@@ -523,20 +547,47 @@ class DeployRunner:
                 return digest
         return None
 
-    def _is_converged(self) -> tuple[bool, str]:
-        """Converged when the LIVE digest equals the resolved digest.
+    def _is_converged(self) -> ConvergenceCheck:
+        """Converged when the LIVE digest equals the resolved digest AND the
+        Helm release itself is ``deployed`` (#451).
 
-        Keys on the digest (or live pod ``imageID``), never the mutable
-        ``repository:tag`` — a re-pushed tag is therefore never falsely seen as
-        converged. Falls back to tag-string comparison only when the digest is
-        unresolved (local registry, soft-fail).
+        Digest match alone is NOT sufficient: a release stuck in ``failed`` /
+        ``pending-install`` / ``pending-upgrade`` / ``pending-rollback`` — e.g.
+        a prior ``helm upgrade`` timed out, and with no ``--atomic`` there is
+        no rollback — can still have rolled its pods to the target image.
+        Recording that as ``noop`` would skip the very ``helm upgrade`` that
+        reconciles the release back to ``deployed``, leaving it stuck across
+        every re-run (the #451 root cause). An unreadable/unknown Helm status
+        is likewise treated as NOT converged — fail-safe: ``helm upgrade
+        --install`` is idempotent, so a redundant upgrade is cheap and a false
+        noop is not.
+
+        Keys the digest comparison on the digest (or live pod ``imageID``),
+        never the mutable ``repository:tag`` — a re-pushed tag is therefore
+        never falsely seen as converged. Falls back to tag-string comparison
+        only when the digest is unresolved (local registry, soft-fail); the
+        Helm-status requirement still applies on that path.
+
+        Only reads Helm status when the digest already matches — a digest
+        mismatch runs ``helm upgrade`` unconditionally, so there is nothing to
+        gain from an extra ``helm status`` call in that case.
         """
         assert self.image_ref is not None
         if self.image_ref.digest:
             running = self._running_image_digest()
-            return running == self.image_ref.digest, f"digest {self.image_ref.digest}"
-        intended = f"{self.image_ref.repository}:{self.cfg.image_tag}"
-        return self._running_image() == intended, f"tag {intended}"
+            digest_matched = running == self.image_ref.digest
+            basis = f"digest {self.image_ref.digest}"
+        else:
+            intended = f"{self.image_ref.repository}:{self.cfg.image_tag}"
+            digest_matched = self._running_image() == intended
+            basis = f"tag {intended}"
+
+        if not digest_matched:
+            return ConvergenceCheck(False, basis, None, False)
+
+        revision, status = self._helm_status_info()
+        self.helm_revision = revision
+        return ConvergenceCheck(status == _HELM_DEPLOYED_STATUS, basis, status, True)
 
     # -- P2 --
 
@@ -592,18 +643,35 @@ class DeployRunner:
             )
             return
 
-        converged, basis = self._is_converged()
-        if converged:
+        check = self._is_converged()
+        if check.converged:
             self.converged = True
-            self.helm_revision = self._helm_revision()
             self._record(
                 PHASES[2],
                 "noop",
                 command=" ".join(cmd),
-                detail=f"already converged on {basis}; skipping helm upgrade (idempotent no-op)",
-                evidence={"converged_on": basis, "helm_revision": self.helm_revision},
+                detail=(
+                    f"already converged on {check.basis} + helm status={check.helm_status}; "
+                    "skipping helm upgrade (idempotent no-op)"
+                ),
+                evidence={
+                    "converged_on": check.basis,
+                    "helm_revision": self.helm_revision,
+                    "helm_status": check.helm_status,
+                },
             )
             return
+
+        # #451 — the digest already matches but the release itself is not
+        # `deployed`; explain WHY an upgrade runs despite the digest match so
+        # the report and the independent verifier can see the reconcile
+        # reason. A plain digest mismatch gets no such note (unchanged path).
+        reconcile_note = (
+            f"digest matches but helm release status={check.helm_status!r} "
+            "→ re-running helm upgrade to reconcile release state; "
+            if check.digest_matched
+            else ""
+        )
 
         started = _now_iso()
         proc = _run(cmd)
@@ -628,7 +696,8 @@ class DeployRunner:
                 PHASES[2],
                 "flagged",
                 command=" ".join(cmd),
-                detail="helm upgrade returned non-zero (no --atomic → no rollback; Verify Agent decides)"
+                detail=reconcile_note
+                + "helm upgrade returned non-zero (no --atomic → no rollback; Verify Agent decides)"
                 + (
                     f"; adopted {len(adopted)} out-of-band object(s) before retry"
                     if adopted
@@ -648,7 +717,8 @@ class DeployRunner:
             PHASES[2],
             "ok",
             command=" ".join(cmd),
-            detail=f"chart applied; helm revision {self.helm_revision}"
+            detail=reconcile_note
+            + f"chart applied; helm revision {self.helm_revision}"
             + (
                 f" (after adopting {len(adopted)} out-of-band object(s))"
                 if adopted
@@ -663,16 +733,37 @@ class DeployRunner:
             ended_at=_now_iso(),
         )
 
-    def _helm_revision(self) -> int | None:
+    def _helm_status_info(self) -> tuple[int | None, str | None]:
+        """Single ``helm status -o json`` read -> ``(revision, release status)``.
+
+        Serves both P2's revision bookkeeping AND the #451 convergence check
+        from the SAME subprocess call — the runner never issues a second
+        ``helm status`` call to read a snapshot of cluster state it already
+        has.
+        """
         proc = _run(
             ["helm", "status", self.cfg.release, "-n", self.cfg.namespace, "-o", "json"]
         )
         if proc.returncode != 0:
-            return None
+            return None, None
         try:
-            return int(json.loads(proc.stdout).get("version"))
+            parsed = json.loads(proc.stdout)
         except (ValueError, TypeError, json.JSONDecodeError):
-            return None
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        try:
+            revision = int(parsed.get("version"))
+        except (ValueError, TypeError):
+            revision = None
+        info = parsed.get("info")
+        status = info.get("status") if isinstance(info, dict) else None
+        return revision, status if isinstance(status, str) else None
+
+    def _helm_revision(self) -> int | None:
+        """Thin, independently-testable accessor: revision only."""
+        revision, _status = self._helm_status_info()
+        return revision
 
     # -- P3 --
 

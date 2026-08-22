@@ -421,11 +421,16 @@ def _hub_ref(digest="sha256:x"):
 
 
 def test_chart_apply_noop_when_digest_converged(tmp_path, monkeypatch):
+    # digest match + helm release status "deployed" -> the unchanged control
+    # case from the #451 falsifiable acceptance list.
     disp = _Dispatcher(
         rules=[
             # live pod imageID carries the SAME digest -> converged
             ("imageID", _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x")),
-            ("helm status", _proc(0, json.dumps({"version": 7}))),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 7, "info": {"status": "deployed"}})),
+            ),
         ]
     )
     monkeypatch.setattr(runner, "_run", disp)
@@ -434,6 +439,7 @@ def test_chart_apply_noop_when_digest_converged(tmp_path, monkeypatch):
     r.phase_chart_apply()
     assert r.converged is True and r.records[0].status == "noop"
     assert not any("helm upgrade" in " ".join(c) for c in disp.calls)
+    assert "helm status=deployed" in r.records[0].detail
 
 
 def test_chart_apply_upgrades_when_digest_differs(tmp_path, monkeypatch):
@@ -460,7 +466,10 @@ def test_chart_apply_local_unpinned_uses_tag_convergence(tmp_path, monkeypatch):
     disp = _Dispatcher(
         rules=[
             ("get deployment", _proc(0, intended)),  # tag-string convergence path
-            ("helm status", _proc(0, json.dumps({"version": 3}))),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 3, "info": {"status": "deployed"}})),
+            ),
         ]
     )
     monkeypatch.setattr(runner, "_run", disp)
@@ -470,6 +479,147 @@ def test_chart_apply_local_unpinned_uses_tag_convergence(tmp_path, monkeypatch):
     )
     r.phase_chart_apply()
     assert r.converged is True and r.records[0].status == "noop"
+
+
+# ── #451: helm-status-aware re-convergence (digest match alone insufficient) ─
+
+
+def test_chart_apply_reconverges_when_status_failed(tmp_path, monkeypatch):
+    """Digest already matches, but the Helm release is stuck `failed` — the
+    runner must run `helm upgrade` to reconcile, NOT record `noop`.
+
+    Falsifiable: neuter `_is_converged` back to digest-only convergence and
+    this test goes RED (records[0].status becomes "noop", no helm upgrade
+    call is made).
+    """
+    disp = _Dispatcher(
+        rules=[
+            ("imageID", _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 7, "info": {"status": "failed"}})),
+            ),
+            ("helm upgrade", _proc(0, "deployed")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is False
+    assert r.records[0].status in ("ok", "flagged")
+    assert r.records[0].status != "noop"
+    assert any("helm upgrade" in " ".join(c) for c in disp.calls)
+    assert (
+        "digest matches but helm release status='failed' "
+        "→ re-running helm upgrade to reconcile release state" in r.records[0].detail
+    )
+
+
+def test_chart_apply_reconverges_when_status_pending_upgrade(tmp_path, monkeypatch):
+    """Digest matches, status `pending-upgrade` -> helm upgrade RUNS."""
+    disp = _Dispatcher(
+        rules=[
+            ("imageID", _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x")),
+            (
+                "helm status",
+                _proc(
+                    0, json.dumps({"version": 7, "info": {"status": "pending-upgrade"}})
+                ),
+            ),
+            ("helm upgrade", _proc(0, "deployed")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is False
+    assert r.records[0].status == "ok"
+    assert any("helm upgrade" in " ".join(c) for c in disp.calls)
+    assert "status='pending-upgrade'" in r.records[0].detail
+
+
+def test_chart_apply_reconverges_when_status_unreadable(tmp_path, monkeypatch):
+    """Digest matches but `helm status` itself is unreadable (non-zero exit)
+    -> fail-safe NOT converged, helm upgrade RUNS.
+
+    Falsifiable: neuter the fail-safe (treat an unreadable/None status as
+    converged) and this test goes RED.
+    """
+    disp = _Dispatcher(
+        rules=[
+            ("imageID", _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x")),
+            ("helm status", _proc(returncode=1, stderr="Error: release: not found")),
+            ("helm upgrade", _proc(0, "deployed")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is False
+    assert r.records[0].status != "noop"
+    assert any("helm upgrade" in " ".join(c) for c in disp.calls)
+    assert "digest matches but helm release status=None" in r.records[0].detail
+
+
+def test_chart_apply_upgrade_runs_on_digest_mismatch_no_reconcile_note(
+    tmp_path, monkeypatch
+):
+    """Digest MISMATCH -> helm upgrade runs (unchanged); no reconcile note is
+    added since the reason is an ordinary digest mismatch, not a stale
+    release status."""
+    disp = _Dispatcher(
+        rules=[
+            ("imageID", _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:OLD")),
+            ("helm upgrade", _proc(0, "deployed")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 8, "info": {"status": "deployed"}})),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:NEW")
+    r.phase_chart_apply()
+    assert r.converged is False and r.records[0].status == "ok"
+    assert "reconcile release state" not in r.records[0].detail
+
+
+def test_helm_status_info_parsers(tmp_path, monkeypatch):
+    r = DeployRunner(_cfg(tmp_path))
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda *a, **k: _proc(
+            0, json.dumps({"version": 3, "info": {"status": "deployed"}})
+        ),
+    )
+    assert r._helm_status_info() == (3, "deployed")
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0, "not json"))
+    assert r._helm_status_info() == (None, None)
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(returncode=1))
+    assert r._helm_status_info() == (None, None)
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0, json.dumps([1, 2])))
+    assert r._helm_status_info() == (None, None)
+    monkeypatch.setattr(
+        runner, "_run", lambda *a, **k: _proc(0, json.dumps({"version": "x"}))
+    )
+    assert r._helm_status_info() == (None, None)
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda *a, **k: _proc(0, json.dumps({"version": 3, "info": "not-a-dict"})),
+    )
+    assert r._helm_status_info() == (3, None)
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda *a, **k: _proc(0, json.dumps({"version": 3, "info": {"status": 42}})),
+    )
+    assert r._helm_status_info() == (3, None)
 
 
 def test_apply_image_tag_pins_by_digest_and_local_plain():
