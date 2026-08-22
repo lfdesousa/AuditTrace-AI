@@ -1,0 +1,106 @@
+name: Test Count Badge
+
+# Publishes the live collected-test-count as a shields.io *endpoint* badge
+# JSON file to a generated, never-merged, orphan `badges` branch (like
+# `gh-pages`). README.md's tests badge reads it from
+# raw.githubusercontent.com/lfdesousa/AuditTrace-AI/badges/test-count.json.
+#
+# Why: the count used to be a hand-committed integer in two README prose
+# sites, refreshed via `make readme-export`. Two branches in flight both
+# bumping the same integer meant every add/remove-a-test change conflicted
+# on rebase/merge (#456, #412 — see ADR spec 2026-08-22-SPEC-readme-count-ci-derived).
+# CI now owns the number; nothing numeric is ever committed to a code
+# branch, so there is zero conflict surface. tests/test_readme_drift.py's
+# `test_readme_has_no_hardcoded_test_count` is the in-repo regression guard
+# that stops the integer from creeping back into README.md.
+#
+# push-to-main only (not PRs, not forks) — the `badges` branch write needs
+# `contents: write`, which a fork's pull_request run never gets by default;
+# scoping the trigger this way keeps the token grant minimal and avoids a
+# badge update racing an in-flight PR's own collection count.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-count-badge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  badge:
+    name: Compute + publish test-count badge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Compute live test count
+        id: count
+        # SAME invocation tests/test_readme_drift.py's own drift-guard
+        # helper used historically (`_live_collected_count`): a fresh
+        # --collect-only, no coverage addopts, no cache. Kept as a shell
+        # step (not a new coverage-bearing Python module) per spec WU-2.
+        run: |
+          set -euo pipefail
+          output="$(pytest tests --collect-only -q -p no:cacheprovider -o addopts= 2>&1)"
+          echo "${output}"
+          count="$(grep -oP '\d+(?= tests? collected)' <<<"${output}" | tail -n1)"
+          if [ -z "${count}" ]; then
+            echo "::error::could not parse '(\\d+) tests? collected' from --collect-only output"
+            exit 1
+          fi
+          echo "Parsed live test count: ${count}"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Write shields endpoint JSON
+        run: |
+          set -euo pipefail
+          cat > test-count.json <<JSON
+          {"schemaVersion":1,"label":"tests","message":"${{ steps.count.outputs.count }}","color":"informational"}
+          JSON
+          cat test-count.json
+
+      - name: Publish to badges branch (idempotent — commit only on change)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges:refs/remotes/origin/badges
+            git worktree add badges-publish origin/badges
+          else
+            # First run ever: no `badges` branch upstream yet. Detach a
+            # worktree at current HEAD, flip it to a fresh orphan branch,
+            # then clear every tracked file so `badges` starts truly empty
+            # (mirrors the gh-pages orphan-branch idiom).
+            git worktree add --detach badges-publish
+            git -C badges-publish checkout --orphan badges
+            git -C badges-publish rm -rf . >/dev/null
+          fi
+
+          cp test-count.json badges-publish/test-count.json
+
+          git -C badges-publish add test-count.json
+          if git -C badges-publish diff --cached --quiet; then
+            echo "test-count.json unchanged on badges branch — nothing to publish."
+          else
+            git -C badges-publish commit -m "chore(badges): update test-count.json"
+            git -C badges-publish push origin HEAD:badges
+          fi
+
+          git worktree remove badges-publish --force

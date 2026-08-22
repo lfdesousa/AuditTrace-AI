@@ -340,11 +340,6 @@ openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fix
 	@echo "   docs/reference/audittrace/openapi.yaml"
 	@echo "Commit both alongside the API change so reviewers see the diff."
 
-readme-export: ## Refresh the README test-count figure from the live collected count (mirrors openapi-export). Regenerates the drift-guarded number in place.
-	@README_STATS_UPDATE=1 .venv/bin/pytest tests/test_readme_drift.py::test_readme_count_export -q --no-cov -p no:cacheprovider
-	@echo "✅ Refreshed README.md test-count figure from live collection."
-	@echo "Review the diff, then commit README.md alongside the change that moved the count."
-
 release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate OpenAPI snapshot + run drift gate. Usage: make release VERSION=1.0.14. (ADR-055)
 	@if [ -z "$(VERSION)" ]; then \
 		echo "❌ usage: make release VERSION=1.0.14"; \
@@ -360,8 +355,6 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@sed -i 's/^appVersion: ".*"/appVersion: "$(VERSION)"/' charts/audittrace/Chart.yaml
 	@echo "📝 regenerating OpenAPI snapshot ..."
 	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov >/dev/null
-	@echo "📝 refreshing README test-count figure ..."
-	@README_STATS_UPDATE=1 .venv/bin/pytest tests/test_readme_drift.py::test_readme_count_export -q --no-cov -p no:cacheprovider >/dev/null
 	@echo "🚦 running drift gate ..."
 	@.venv/bin/pytest tests/test_version_drift.py -q --no-cov
 	@echo
