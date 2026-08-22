@@ -188,8 +188,22 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # same way: its `verify-clusterip-resilience.py` neuterable guard is a
 # host-networking operator tool, not shipped `src/`, but is a real
 # decision-logic module and gets the same ≥90% floor as everything else.
-# No other `scripts/*` module is dragged into the gate.
-source = ["audittrace", "scripts/deploy", "scripts/hooks", "scripts/release", "scripts/curator", "scripts/network"]
+# `scripts/replay_dead_lettered_index.py` (SPEC #387 P2a) joins the same way:
+# deliberately OFF-surface operator tooling (kept out of
+# `src/audittrace/services/**` so it never trips the ADR-049 heavy gate), but
+# it is real decision logic (scope selection, dry-run/apply, the reset
+# predicate) and gets the same ≥90% floor — a single-file entry, not a
+# directory, since this tool lives at the `scripts/` top level rather than a
+# dedicated subpackage. No other `scripts/*` module is dragged into the gate.
+source = [
+    "audittrace",
+    "scripts/deploy",
+    "scripts/hooks",
+    "scripts/release",
+    "scripts/curator",
+    "scripts/network",
+    "scripts/replay_dead_lettered_index.py",
+]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
 # SQLAlchemy's asyncio layer bridges sync<->async with greenlet
