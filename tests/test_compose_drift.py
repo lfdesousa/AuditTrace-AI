@@ -608,6 +608,71 @@ class TestObsConfigFiles:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 2026-08-22 — compose demo default ↔ Chart appVersion drift guard
+# ─────────────────────────────────────────────────────────────────────
+
+CHART_YAML_PATH = REPO_ROOT / "charts" / "audittrace" / "Chart.yaml"
+
+
+class TestComposeDefaultImageTagMatchesChartAppversion:
+    """`make release` (ADR-055) bumps `charts/audittrace/Chart.yaml::appVersion`
+    and, since 2026-08-22, also seds `docker-compose.yml`'s
+    `${AUDITTRACE_IMAGE_TAG:-X}` default (both occurrences — the memory-server
+    image tag and the OTEL `service.version` default) to match. Before that
+    fix the demo compose default drifted 14 minor versions stale (fixed by
+    hand in #283). This guard fails the moment the two values diverge again.
+
+    Anchors:
+      - `docs/ADR-055-*.md` (the two-pin-site release model)
+      - `specs/2026-08-22-SPEC-make-release-bump-compose-demo.md`
+    """
+
+    COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+
+    def _compose_default_image_tag(self) -> str:
+        """Parse the `${AUDITTRACE_IMAGE_TAG:-X}` default from the
+        memory-server image line (the line with `docker.io/lfds/
+        audittrace-memory-server:`), not the OTEL service.version line —
+        both must stay in sync, but this is the primary source."""
+        text = self.COMPOSE_FILE.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "audittrace-memory-server:${AUDITTRACE_IMAGE_TAG" not in line:
+                continue
+            match = re.search(r"\$\{AUDITTRACE_IMAGE_TAG:-([^}]*)\}", line)
+            assert match, (
+                f"docker-compose.yml memory-server image line does not "
+                f"match the expected ${{AUDITTRACE_IMAGE_TAG:-X}} shape: "
+                f"{line!r}"
+            )
+            return match.group(1)
+        raise AssertionError(
+            "docker-compose.yml has no memory-server image line containing "
+            "'audittrace-memory-server:${AUDITTRACE_IMAGE_TAG'. Has the "
+            "image reference moved or been renamed?"
+        )
+
+    def _chart_app_version(self) -> str:
+        text = CHART_YAML_PATH.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("appVersion:"):
+                return line.split(":", 1)[1].strip().strip('"')
+        raise AssertionError(f"{CHART_YAML_PATH} has no top-level `appVersion:` key.")
+
+    def test_compose_default_image_tag_matches_chart_appversion(self) -> None:
+        compose_default = self._compose_default_image_tag()
+        chart_app_version = self._chart_app_version()
+        assert compose_default == chart_app_version, (
+            "docker-compose.yml's ${AUDITTRACE_IMAGE_TAG:-"
+            f"{compose_default}}} demo default has drifted from "
+            f"charts/audittrace/Chart.yaml::appVersion ({chart_app_version!r}). "
+            "`make release VERSION=X.Y.Z` bumps both together — re-run it, "
+            "or if this ran outside `make release`, sync the compose "
+            "default by hand (both the memory-server image line AND the "
+            "OTEL service.version default)."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
 # B7 step 9 — content-control fixtures
 # ─────────────────────────────────────────────────────────────────────
 
