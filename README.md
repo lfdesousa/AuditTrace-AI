@@ -22,6 +22,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lfdesousa/AuditTrace-AI/badges/test-count.json)](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)
 
 ## Features
 
@@ -41,7 +42,7 @@ This work formalises the *Sovereignty-Reconstructibility Gap* and provides an au
 - 🇪🇺 **GDPR-Compliant** -- Data never leaves your infrastructure.
 - 🔌 **OpenAI-Compatible** -- `/v1/chat/completions` API.
 - 🐳 **Two runtimes, one image** -- k3s + Istio + Helm chart for production ZTA; Docker Compose for development. Same image, same env-var contract.
-- ✅ **Comprehensive Test Suite** -- 3312 tests, 98% coverage, 90% per-file gate enforced in CI ([latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
+- ✅ **Comprehensive Test Suite** -- 98% coverage, 90% per-file gate enforced in CI (live suite size in the tests badge above; [latest run](https://github.com/lfdesousa/AuditTrace-AI/actions/workflows/ci.yml)).
 
 ## Quick Start
 
@@ -130,7 +131,7 @@ The same script works for both runtimes — only the in-runtime shippers (OTel C
 # or
 make install
 
-# Run tests (90% per-file coverage enforced; full suite is 3312 tests / 98% total)
+# Run tests (90% per-file coverage enforced; see the tests badge for the live suite size)
 make test
 
 # Run RLS integration tests against an ephemeral docker postgres on :15432
