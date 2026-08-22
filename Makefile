@@ -353,6 +353,10 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@echo "🔖 bumping charts/audittrace/Chart.yaml::version + appVersion → $(VERSION)"
 	@sed -i 's/^version: .*/version: $(VERSION)/' charts/audittrace/Chart.yaml
 	@sed -i 's/^appVersion: ".*"/appVersion: "$(VERSION)"/' charts/audittrace/Chart.yaml
+	@echo "🔖 bumping docker-compose.yml demo default → $(VERSION)"
+	@sed -i 's/$${AUDITTRACE_IMAGE_TAG:-[^}]*}/$${AUDITTRACE_IMAGE_TAG:-$(VERSION)}/g' docker-compose.yml
+	@echo "🔖 bumping .env.ci + .env.dev-real-llm.example AUDITTRACE_IMAGE_TAG → $(VERSION)"
+	@sed -i 's/^AUDITTRACE_IMAGE_TAG=.*/AUDITTRACE_IMAGE_TAG=$(VERSION)/' .env.ci .env.dev-real-llm.example
 	@echo "📝 regenerating OpenAPI snapshot ..."
 	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov >/dev/null
 	@echo "🚦 running drift gate ..."
@@ -360,12 +364,14 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@echo
 	@echo "✅ release-prep done for v$(VERSION). Diff:"
 	@git diff --stat pyproject.toml charts/audittrace/Chart.yaml \
-	    docs/reference/audittrace/openapi.yaml tests/fixtures/openapi.snapshot.yaml README.md
+	    docs/reference/audittrace/openapi.yaml tests/fixtures/openapi.snapshot.yaml README.md \
+	    docker-compose.yml .env.ci .env.dev-real-llm.example
 	@echo
 	@echo "Next steps:"
 	@echo "  1. git add pyproject.toml charts/audittrace/Chart.yaml \\"
 	@echo "         docs/reference/audittrace/openapi.yaml \\"
-	@echo "         tests/fixtures/openapi.snapshot.yaml"
+	@echo "         tests/fixtures/openapi.snapshot.yaml \\"
+	@echo "         docker-compose.yml .env.ci .env.dev-real-llm.example"
 	@echo "  2. git commit -m 'chore(release): v$(VERSION)'"
 	@echo "  3. open release PR; after merge, tag v$(VERSION) on main"
 	@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"
