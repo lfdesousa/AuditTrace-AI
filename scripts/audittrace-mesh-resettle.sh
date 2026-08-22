@@ -31,23 +31,32 @@
 # This script + its two units are HOST infra, like audittrace-vault-auto-unseal.
 # They are installed out-of-band on the laptop, NOT shipped in charts/. Install:
 #
+#   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/audittrace/mesh-heal
 #   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/audittrace/mesh-heal/requests
 #   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/audittrace/mesh-heal/results
 #   sudo cp scripts/audittrace-mesh-healer.{path,service} /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now audittrace-mesh-healer.path
 #
-# The requests/ + results/ dirs are chown'd to the invoking runner's own
-# user/group (portability invariant — never hardcode a username) so the
-# unprivileged runner can write requests and read results; root writes results.
+# The top-level mesh-heal/ dir + the requests/ + results/ dirs under it are
+# ALL chown'd to the invoking runner's own user/group (portability invariant
+# — never hardcode a username) so the unprivileged runner can write requests
+# (including its atomic-rename tmp file, written to the TOP-LEVEL dir — see
+# `PrivilegedHealer._publish_request` in scripts/deploy/mesh.py) and read
+# results; root writes results. The top-level `install -d` must run BEFORE
+# the two subdirs (parent first) so a fresh install never leaves it
+# root-owned.
 #
-# ── #411 v2: the DURABLE guarantee (survives reboots) ───────────────────────
+# ── #411 v2 / MESH-HEAL-DIR: the DURABLE guarantee (survives reboots) ───────
 # The `install -d` above only sets ownership ONCE, at install time. #411 was
 # exactly this ownership NOT being durable — a reboot / manual `mkdir` / a
-# drifted install silently re-creates the dir root-owned, and the runner can
-# no longer write into the ONE dir `audittrace-mesh-healer.path`'s
-# `DirectoryNotEmpty=` watches. `scripts/audittrace-mesh-heal.tmpfiles.conf`
-# is the durable fix: a systemd-tmpfiles(5) rule that recreates BOTH dirs,
+# drifted install silently re-creates a dir root-owned, and the runner can no
+# longer write into it. `scripts/audittrace-mesh-heal.tmpfiles.conf`
+# is the durable fix: a systemd-tmpfiles(5) rule that recreates ALL THREE
+# dirs — the top-level mesh-heal/ parent (MESH-HEAL-DIR, 2026-08-22, closing
+# the gap where the parent was runner-owned only at install time and a
+# tmpfiles-driven recreation put it back root-owned, PermissionError'ing the
+# runner's atomic-rename tmp write) plus requests/ and results/ — all
 # runner-owned + mode 0775, on EVERY BOOT. Render it with the invoking
 # runner's user/group substituted (its shipped copy carries the
 # @RUNNER_USER@ / @RUNNER_GROUP@ placeholders — portability invariant, never
