@@ -31,7 +31,7 @@ services:
     # which re-introduces `build: .` + bind-mounts /src for hot
     # reload. Override the tag for local dev builds with:
     #   AUDITTRACE_IMAGE_TAG=dev docker compose up -d
-    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.0.22}
+    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.24.4}
     container_name: audittrace-server
     entrypoint: ["/app/scripts/entrypoint.sh"]
     depends_on:
@@ -85,7 +85,7 @@ services:
       # otel-collector service is in a future B7 step.
       - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-}
       - OTEL_SERVICE_NAME=audittrace-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.0.22},deployment.environment=${AUDITTRACE_ENV:-local}
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.24.4},deployment.environment=${AUDITTRACE_ENV:-local}
       - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
       - AUDITTRACE_METRICS_ENABLED=${AUDITTRACE_METRICS_ENABLED:-true}
       - AUDITTRACE_LANGFUSE_HOST=${AUDITTRACE_LANGFUSE_HOST:-http://langfuse-web:3000}
@@ -514,7 +514,7 @@ services:
   # ─── B7 step 9 — Content-control sibling (profile: content-control) ─
   # cc-control-plane consumes scan.requests from RabbitMQ, scans via
   # clamd, publishes verdicts back. Same image the chart deploys at
-  # docker.io/lfds/audittrace-content-control:0.0.9 (multi-arch from
+  # docker.io/lfds/audittrace-content-control:0.1.5 (multi-arch from
   # cc-side PR-A14). clamd is the malware scanner — ≥1 GB RAM floor
   # per the PR-A11 OOMKill forensic; profile-only because of cost.
   cc-clamd:
@@ -532,7 +532,7 @@ services:
     restart: unless-stopped
 
   cc-control-plane:
-    image: docker.io/lfds/audittrace-content-control:0.0.9
+    image: docker.io/lfds/audittrace-content-control:0.1.5
     container_name: audittrace-cc-control-plane
     profiles: ["content-control"]
     depends_on:
