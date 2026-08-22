@@ -1200,8 +1200,20 @@ def test_executor_noop_when_no_requests(tmp_path):
 # drives the REAL root executor script against that SAME dir (never a
 # monkeypatched result-drop into an unwatched location); G3 proves an
 # unwritable watched dir produces a loud ERROR + UNSAFE, never a false
-# "healed"; G4 proves the shipped tmpfiles.d rule targets that SAME dir with
-# runner ownership + 0775, so the rule cannot silently drift from the unit.
+# "healed"; G4 proves the shipped tmpfiles.d rule targets that SAME dir (AND
+# its top-level parent — MESH-HEAL-DIR, 2026-08-22, see below) with runner
+# ownership + 0775, so the rule cannot silently drift from the unit.
+#
+# MESH-HEAL-DIR (2026-08-22): G4 additionally covers the TOP-LEVEL heal_dir —
+# `PrivilegedHealer._publish_request` writes its atomic-rename tmp file there
+# (deliberately outside requests/, see #411 v2 above), but the ORIGINAL G4
+# only asserted `d` lines for requests/ and results/. A tmpfiles-driven
+# recreation of the top-level parent (e.g. after a reboot, if it didn't
+# already exist) left it root-owned by systemd's default, PermissionError'ing
+# the runner's tmp write before it ever reached `os.replace`. The guard below
+# is non-vacuous: with the top-level `d` line present it is GREEN; delete
+# that one line from the shipped tmpfiles.conf and it goes RED, naming the
+# missing top-level dir.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -1445,7 +1457,9 @@ def _tmpfiles_rule_entries() -> dict[str, list[str]]:
 def test_g4_tmpfiles_rule_targets_the_watched_dirs_with_0775():
     watched_requests = _path_unit_watched_dir()
     watched_results = watched_requests.parent / "results"
+    watched_toplevel = watched_requests.parent
     entries = _tmpfiles_rule_entries()
+    assert str(watched_toplevel) in entries
     assert str(watched_requests) in entries
     assert str(watched_results) in entries
     for fields in entries.values():
@@ -1467,10 +1481,20 @@ def test_g4_tmpfiles_rule_owner_is_parameterised_not_hardcoded():
 
 def test_g4_tmpfiles_rule_cannot_drift_from_env_default():
     # Ties the rule back to the SAME DEFAULT_MESH_HEAL_DIR the code and the
-    # .service key off — a future edit to any ONE of the three without the
-    # others goes red here.
+    # .service key off — a future edit to any ONE of the four (top-level +
+    # requests + results + the code default) without the others goes red
+    # here. The top-level assertion is the MESH-HEAL-DIR guard (2026-08-22):
+    # `_publish_request`'s atomic-rename tmp write targets this exact dir
+    # (see scripts/deploy/mesh.py), so it must be a durably runner-owned `d`
+    # line here too, not just its requests/ and results/ children.
     entries = _tmpfiles_rule_entries()
     default_dir = Path(mesh.DEFAULT_MESH_HEAL_DIR)
+    assert str(default_dir) in entries, (
+        f"top-level heal_dir {default_dir} missing a tmpfiles `d` line — "
+        "PrivilegedHealer._publish_request's atomic-rename tmp write "
+        "targets this exact dir and will PermissionError on a "
+        "tmpfiles-driven recreation that leaves it root-owned"
+    )
     assert str(default_dir / "requests") in entries
     assert str(default_dir / "results") in entries
 
