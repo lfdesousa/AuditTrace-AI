@@ -126,6 +126,7 @@ jobs:
             --cov=scripts/release \
             --cov=scripts/migrate \
             --cov=scripts/curator \
+            --cov=scripts.replay_dead_lettered_index \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html:htmlcov \
