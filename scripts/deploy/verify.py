@@ -190,6 +190,19 @@ SKIPPED = "SKIPPED"
 # outcome that was never observed.
 SKIP_VERSION_CHECK_REASON = "skipped (--skip-version-check)"
 
+# The per-status log level for ``_record`` (#412-nit). SKIPPED maps to WARNING,
+# not INFO or ERROR: an intentional skip is worth surfacing ("heads up, a check
+# was skipped") without alarming an ERROR-level dashboard/log query as if the
+# run had failed. Falsifiable: neuter this map back to a two-way PASS/else
+# ternary (SKIPPED collapses onto ERROR) and the SKIPPED-logs-at-WARNING test
+# goes RED. FAIL and any unrecognised status fall through the ``.get`` default
+# to ERROR — a real failure must stay loud.
+_LOG_LEVEL_BY_STATUS: dict[str, int] = {
+    PASS: logging.INFO,
+    SKIPPED: logging.WARNING,
+    FAIL: logging.ERROR,
+}
+
 # ── #384 WS2 mesh-health probe constants ─────────────────────────────────────
 # The mesh probes RE-DERIVE their signal from INDEPENDENT read-only cluster reads
 # gathered by THIS runner. Where the fault SIGNATURE (the #307 log patterns,
@@ -775,7 +788,7 @@ class VerifyRunner:
             checked_at=_now_iso(),
         )
         self.results.append(rec)
-        level = logging.INFO if status == PASS else logging.ERROR
+        level = _LOG_LEVEL_BY_STATUS.get(status, logging.ERROR)
         logger.log(level, "[%s] %s — %s", name, status, detail)
         return rec
 

@@ -15,6 +15,7 @@ tripped).
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import subprocess
 from pathlib import Path
@@ -580,6 +581,58 @@ def test_health_version_not_skipped_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(verify, "_http_request", http)
     res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
     assert res.status == FAIL
+
+
+# ── _record log level by status (#412-nit) ───────────────────────────────────
+# ``VerifyRunner._record`` (verify.py:~778) maps status -> logging level. Each
+# test below drives a REAL probe (never calls ``_record`` directly) so the
+# assertion proves the level a live verify run would actually emit, not a
+# level some other call site chose to pass in.
+
+
+def test_record_logs_skipped_at_warning(tmp_path, monkeypatch, caplog):
+    """SKIPPED (health-version under --skip-version-check) logs at WARNING --
+    visible without alarming an ERROR-level dashboard for an intentional skip.
+
+    NEUTER PROOF: reverting ``_record`` to the two-way
+    ``logging.INFO if status == PASS else logging.ERROR`` ternary collapses
+    SKIPPED onto ERROR and turns this assertion RED.
+    """
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "1.2.3"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(
+            _cfg(tmp_path, skip_version_check=True)
+        ).probe_health_version()
+    assert res.status == verify.SKIPPED
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+
+
+def test_record_logs_pass_at_info(tmp_path, monkeypatch, caplog):
+    """Regression control: PASS still logs at INFO (unchanged)."""
+    http = _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == PASS
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+
+
+def test_record_logs_fail_at_error(tmp_path, monkeypatch, caplog):
+    """Regression control: FAIL still logs at ERROR (unchanged) -- a real
+    failure must stay loud."""
+    http = _FakeHttp({("GET", "/health"): (503, {})})
+    monkeypatch.setattr(verify, "_http_request", http)
+    with caplog.at_level(logging.INFO, logger="audittrace.deploy.verify"):
+        res = VerifyRunner(_cfg(tmp_path)).probe_health_version()
+    assert res.status == FAIL
+    records = [r for r in caplog.records if "health-version" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
 
 
 # ── probe 5: recall-e2e (PASS + FAIL) ────────────────────────────────────────
