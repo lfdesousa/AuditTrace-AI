@@ -11,6 +11,12 @@ ADR-042 (BFF-first OIDC for UIs — depends on this ADR for the broker
 configuration that lets UIs authenticate against an organisational
 IdP), ADR-043 (Vault — IdP client secrets live there)
 
+**As-built walkthrough:**
+[`docs/architecture/oidc-google-keycloak-brokering.md`](architecture/oidc-google-keycloak-brokering.md)
+traces one Google login end to end through this ADR's brokering mechanism
+to a scoped JWT bound to the audit trail, with a sequence diagram and the
+provisioner/export/drift-guard toolchain named hop-by-hop.
+
 ## Context
 
 ADR-041 names "Identity Provider (OAuth2 / OIDC)" as one of the eight
