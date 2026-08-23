@@ -18,7 +18,7 @@ from audittrace.dependencies import (
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
-from audittrace.routes import admin, audit, chat, context, health, memory, session
+from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_summarizer import SessionSummarizer
 
@@ -601,6 +601,23 @@ OPENAPI_TAGS: list[dict[str, str]] = [
             "state alongside the standard component checks."
         ),
     },
+    {
+        "name": "mcp",
+        "description": (
+            "ADR-063 Phase 1 — the read/recall memory tools exposed over a "
+            "standard MCP transport (streamable-HTTP, JSON-RPC 2.0 on "
+            "``POST /mcp``) so any MCP-speaking agent can use the audited "
+            "tool backend without giving up the audit trail. Purely "
+            "additive to ``/v1/chat/completions``. Every ``tools/call`` is "
+            "authorized per-tool against the caller's Keycloak scopes, "
+            "executed under the caller's isolated RLS context, and recorded "
+            "through the SAME tamper-evident audit path the chat tool loop "
+            "uses (ADR-037/058) — one interaction + one tool_calls row per "
+            "call. No write/curation tools are ever listed or callable "
+            "here, regardless of caller privilege; later phases add those "
+            "under operator-tier scopes."
+        ),
+    },
 ]
 
 
@@ -681,6 +698,10 @@ def create_app() -> FastAPI:
     # operator-admin endpoints.
     app.include_router(admin.router, prefix="/system", tags=["system"])
     app.include_router(health.router, tags=["health"])
+    # ADR-063 Phase 1 — additive MCP entry-interface. Owns its own path
+    # (POST /mcp) alongside /v1/chat/completions, never inside it
+    # (feedback_openai_schema_inviolate). Read/recall tools only.
+    app.include_router(mcp.router, tags=["mcp"])
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(  # pyright: ignore[reportUnusedFunction]

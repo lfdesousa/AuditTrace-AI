@@ -97,7 +97,21 @@ carried from a single-developer, consumer-hardware expression to a multi-user, r
 
 ## Status of implementation
 
-The decision is accepted; implementation is phased and pending. Phase 1 exposes the read/recall tools
-over MCP with per-tool scopes and a first-class audit event per call. Later phases add write/curation
-tools and an additive endpoint that lets Anthropic-Messages-style harnesses use this system as their
-audited backend.
+The decision is accepted; implementation is phased. **Phase 1 shipped in code 2026-08-23**
+(`src/audittrace/routes/mcp.py` + `src/audittrace/services/mcp_bridge.py`, spec
+`2026-08-23-SPEC-mcp-entry-interface-phase1.md`): a `POST /mcp` streamable-HTTP JSON-RPC 2.0
+endpoint exposes the six read/recall tools from `MEMORY_TOOL_REGISTRY`
+(`recall_decisions`, `recall_skills`, `recall_recent_sessions`, `recall_semantic`,
+`read_decision`, `read_skill`) — no write/curation tools, enforced at both the manifest and
+the dispatch edge with no admin bypass. Every `tools/call` is authorized per-tool against the
+caller's Keycloak scopes (identity token-derived via the same `require_user` dependency
+`routes/chat.py` uses, binding the RLS `app.current_user_id` ContextVar), executed, and
+recorded through the SAME tamper-evident `_persist_interaction` / `_flush_pending_tool_calls`
+path the chat tool loop uses (ADR-037/058) — one `InteractionRecord` (`source="mcp"`) + one
+`ToolCall` row per call. `/v1/chat/completions` is unchanged (OpenAPI drift gate green,
+additive-only diff). Live E2E through a real MCP client against a deployed image is DEFERRED
+to the next candidate deploy per the ADR-049 heavy gate — local unit + HTTP-level tests are
+green (`tests/test_mcp_bridge.py`, `tests/test_mcp_routes.py`) but this has not yet been
+independent-reviewer-certified or deploy-verified. Later phases add write/curation tools
+(operator-tier scopes) and an additive endpoint that lets Anthropic-Messages-style harnesses
+use this system as their audited backend.
