@@ -645,6 +645,15 @@ async def _flush_pending_tool_calls(
                         started_at=rec.started_at,
                         duration_ms=rec.duration_ms,
                         granted_scope=rec.granted_scope,
+                        # ADR-063 Phase 2 Track B (migration 021): None on
+                        # every Phase 1 own-tool call — only
+                        # ``services.mcp_broker`` ever sets these.
+                        provenance=rec.provenance,
+                        phase=rec.phase,
+                        downstream_server=rec.downstream_server,
+                        downstream_tool=rec.downstream_tool,
+                        args_digest=rec.args_digest,
+                        result_digest=rec.result_digest,
                     )
                 )
             await db.commit()

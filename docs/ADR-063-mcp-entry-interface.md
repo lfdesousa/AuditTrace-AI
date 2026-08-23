@@ -95,6 +95,55 @@ carried from a single-developer, consumer-hardware expression to a multi-user, r
   ledger property that would make them safe is worth naming: append-only with per-row hashing lets a
   loop consume its own history without being able to launder it.
 
+## Phase 2 Track B — the tool-broker gateway (ratified 2026-08-23)
+
+**Decision: broker, not federated.** Phase 2 extends the MCP entry-interface from "a server of our
+own tools" into an **audit gateway that fronts arbitrary downstream tools** — ours, other MCP
+servers, third-party tools — so that routing a tool call through AuditTrace makes it a first-class
+tamper-evident audit event, regardless of whose tool it is. Two shapes were on the table:
+
+- **Federated** — AuditTrace's manifest merely *points at* a downstream server (e.g. returns its URL
+  or delegates the connection), and the caller talks to the downstream server directly from then on.
+  Rejected. The moment the caller's traffic leaves AuditTrace's process, the audit trail degrades to
+  "AuditTrace was told this call would happen" — a claim about intent, not a proof of execution. That
+  is exactly the partial-audit failure mode ADR-037 (§Context.3, above) already named and rejected for
+  client-side tool calls; federating would reintroduce it deliberately, in the one place (the gateway
+  itself) where it is cheapest to avoid.
+- **Broker (chosen).** AuditTrace stays in the request path for the entire call: it authorizes, sends
+  the outbound request to the downstream server itself, receives the response itself, and records
+  both ends. The operator quote that settled this: *"Broker, we do not break our own contract."* The
+  "contract" is ADR-037's own claim — audit what we can prove against ground truth — and only the
+  broker model keeps every routed call inside that provable boundary.
+
+**The honesty boundary, restated precisely for Track B (governs the pitch — do not drift from this).**
+AuditTrace audits what it **brokers** — proxies, executes the network hop itself, and can prove both
+the outbound request and the inbound response happened. A tool call the agent makes **directly**,
+without going through this gateway, stays **out of the boundary**, exactly as it did for Phase 1's own
+tools. The precise claim is *"route the tools through the audited gateway → a tamper-evident, provable
+record of every brokered call"* — never *"AuditTrace audits any tool the agent calls"*. The routing is
+the price of the proof, not an implementation detail to gloss over.
+
+**Provenance stays explicit at the row level.** A brokered call is recorded as TWO audit rows sharing
+one ``interaction_id`` (one trace) — an outbound-request row (caller, session, trace, tool, args-digest)
+written before the forward, and a result row (result-digest, status) written after, whether the
+downstream call succeeded, failed, or timed out. Both are tagged ``provenance="brokered"`` with the
+downstream server's identity, so a reviewer can always tell "AuditTrace executed this itself" (Phase 1
+own-tool rows, ``provenance`` NULL) from "AuditTrace brokered this to downstream X" — the two are never
+conflated in the schema, mirroring how they are never conflated in the pitch.
+
+**Downstream registry is operator-configured, not auto-discovered.** Per the portability invariant, the
+set of brokered servers is env-parameterized config (``AUDITTRACE_MCP_BROKER_SERVERS``) — an operator
+adds an entry (URL + the scope that gates every tool on that server) before any of its tools are ever
+listed or callable. No untrusted server is ever auto-registered; the honesty boundary would be
+meaningless if a downstream server could add itself to the audited surface without the operator's
+say-so.
+
+Implementation: `src/audittrace/services/mcp_broker.py` (registry, namespacing, forward, both audit
+records) + `src/audittrace/routes/mcp.py` (merged `tools/list` manifest, `tools/call` dispatch routing)
++ migration 021 (`tool_calls.provenance`/`phase`/`downstream_server`/`downstream_tool`/`args_digest`/
+`result_digest`, all nullable and additive). Track A (write/curation tools over MCP) is sequenced after
+Track B merges, to avoid a manifest/dispatch merge conflict on the same files.
+
 ## Status of implementation
 
 The decision is accepted; implementation is phased. **Phase 1 shipped in code 2026-08-23**
@@ -115,3 +164,19 @@ green (`tests/test_mcp_bridge.py`, `tests/test_mcp_routes.py`) but this has not 
 independent-reviewer-certified or deploy-verified. Later phases add write/curation tools
 (operator-tier scopes) and an additive endpoint that lets Anthropic-Messages-style harnesses
 use this system as their audited backend.
+
+**Phase 2 Track B (the broker, §"Phase 2 Track B" above) shipped in code 2026-08-23**
+(`src/audittrace/services/mcp_broker.py`, `src/audittrace/routes/mcp.py` extended, migration 021,
+spec `2026-08-23-SPEC-mcp-phase2-tool-broker-and-write-tools.md`): `tools/list` merges the
+Phase 1 own-tool manifest with every enabled, scope-authorized, operator-configured downstream
+server's tools (namespaced `broker:<server>:<tool>`); a brokered `tools/call` authorizes against
+the downstream server's `required_scope` BEFORE any forward, writes a `provenance="brokered"`
+request-phase `ToolCall` row, forwards the JSON-RPC call to the downstream server under the
+caller's own identity, and writes a second `provenance="brokered"` result-phase row (success,
+downstream error, or timeout — all three reach this write) — both rows sharing the one
+`InteractionRecord`/trace the call produced. Phase 1's own-tool manifest and dispatch are
+byte-unchanged. Local unit + HTTP-level tests are green (`tests/test_mcp_broker.py`,
+`tests/test_mcp_broker_routes.py`) against a stub downstream MCP server; live E2E against a real
+deployed downstream is DEFERRED to the next candidate deploy per the ADR-049 heavy gate, same as
+Phase 1. Track A (write/curation tools over MCP) and Track C (Bruno collection coverage of the
+full MCP surface) are sequenced after this merges.

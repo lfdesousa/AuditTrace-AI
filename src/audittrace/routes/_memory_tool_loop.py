@@ -75,6 +75,15 @@ class PendingToolCall:
     first, and the parent row is persisted by the chat handler *after*
     the loop returns. The handler is responsible for flushing these
     records to Postgres once it has the interaction id in hand.
+
+    The ``provenance``/``phase``/``downstream_*``/``*_digest`` fields
+    (migration 021, ADR-063 Phase 2 Track B) are ``None`` for every
+    Phase 1 own-tool call (the chat tool loop and ``mcp_bridge`` never
+    set them) — they exist only so ``services.mcp_broker`` can produce
+    the two provenance-tagged rows (``phase="request"`` then
+    ``phase="result"``) a brokered call writes, using the SAME
+    ``PendingToolCall`` → ``_flush_pending_tool_calls`` path rather than
+    a second recorder.
     """
 
     tool_name: str
@@ -87,6 +96,12 @@ class PendingToolCall:
     duration_ms: int | None
     granted_scope: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    provenance: str | None = None
+    phase: str | None = None
+    downstream_server: str | None = None
+    downstream_tool: str | None = None
+    args_digest: str | None = None
+    result_digest: str | None = None
 
 
 # ─────────────────────── Tool-call extraction helpers ──────────────────────
