@@ -47,11 +47,16 @@ realm JSON reconciled.
 Each hop below is labeled with the OAuth2/OIDC construct that RFC 9700
 (the current OAuth 2.0 security BCP) and OIDC Core require: Authorization
 Code grant only (`response_type=code`, never the deprecated implicit
-grant), PKCE with `S256` (never plain), and exact-match redirect URIs.
-Two independent PKCE exchanges happen in this flow: the client
-application's own exchange with Keycloak, and Keycloak's own exchange
-with Google (Keycloak is a PKCE *client* to Google, not just a PKCE
-*server* to the application).
+grant) and PKCE with `S256` (never plain). RFC 9700 and
+[ADR-042 §3](../ADR-042-oidc-authorization-code-pkce.md#3-redirect-uri-discipline)
+also require **exact-match** redirect URIs, no wildcards. The live
+`audittrace-webui` client does not meet that bar today (see
+"[What is not here](#what-is-not-here)" for the honest gap), so the
+diagram below labels `redirect_uri` as "pre-registered" rather than
+claiming exact-match compliance that is not there. Two independent PKCE
+exchanges happen in this flow: the client application's own exchange
+with Keycloak, and Keycloak's own exchange with Google (Keycloak is a
+PKCE *client* to Google, not just a PKCE *server* to the application).
 
 ```mermaid
 sequenceDiagram
@@ -68,7 +73,7 @@ sequenceDiagram
     User->>Browser: open the app / click "Sign in with Google"
     Browser->>App: GET /login
     App->>App: build state, nonce, code_challenge (S256)\nRFC 9700: response_type=code only, never response_type=token
-    App-->>Browser: 302 to Keycloak /authorize\nresponse_type=code, client_id=audittrace-webui,\nredirect_uri=(exact-match, HTTPS, pre-registered),\nscope=openid ..., code_challenge, code_challenge_method=S256,\nstate, kc_idp_hint=<google-alias>
+    App-->>Browser: 302 to Keycloak /authorize\nresponse_type=code, client_id=audittrace-webui,\nredirect_uri=(pre-registered, NOT exact-match live, see What is not here),\nscope=openid ..., code_challenge, code_challenge_method=S256,\nstate, kc_idp_hint=<google-alias>
     Browser->>KC: GET /realms/audittrace/protocol/openid-connect/auth\n?...&kc_idp_hint=<google-alias>
 
     Note over KC: kc_idp_hint skips the IdP chooser,\nroutes straight to the Google broker (ADR-044 par1)
@@ -99,7 +104,7 @@ sequenceDiagram
     KC-->>Browser: 302 to App redirect_uri?code=<realm authz code>&state=...
     Browser->>App: GET /callback?code=...&state=...
 
-    App->>KC: POST /realms/audittrace/protocol/openid-connect/token\ngrant_type=authorization_code, code=<realm authz code>,\ncode_verifier=(App's own), redirect_uri=(exact match)
+    App->>KC: POST /realms/audittrace/protocol/openid-connect/token\ngrant_type=authorization_code, code=<realm authz code>,\ncode_verifier=(App's own), redirect_uri=(pre-registered, not exact-match live)
     KC-->>App: {access_token, id_token, refresh_token}\nsigned by the REALM key, not Google's
 
     Note over App: BFF pattern (ADR-042): tokens stay server-side.\nThe browser holds only an HttpOnly, Secure, SameSite=Strict\nsession cookie, never the JWT itself.
@@ -262,6 +267,31 @@ identity model is required, only a wider set of scoped call sites.
   tracked gap between the target architecture and what is live, not an
   oversight: the harness exists specifically to validate the broker
   wiring before the BFF lands.
+- **Exact-match redirect URIs.** [ADR-042 §3](../ADR-042-oidc-authorization-code-pkce.md#3-redirect-uri-discipline)
+  requires exact-match, HTTPS-only redirect URIs with no wildcards, and
+  RFC 9700 names wildcard redirect URIs as a deprecated pattern behind
+  multiple public-client breaches. The live `audittrace-webui` client's
+  committed `redirectUris` (`keycloak/realm-audittrace.json`) does not
+  meet that bar:
+  ```
+  https://audittrace.local/oauth2/callback
+  https://audittrace.local/*
+  https://audittrace.local:30952/oauth2/callback
+  https://audittrace.local:30952/*
+  http://localhost:8765/*
+  ```
+  Two of the five entries are exact-match HTTPS callbacks; the other
+  three are wildcards, and the last is plain HTTP. The plain-HTTP
+  wildcard is the `webui/` local-dev harness's own origin (per
+  `webui/README.md`, served with `python3 -m http.server` on
+  `localhost:8765`), which is a defensible dev-only entry on its own
+  terms. The two `https://audittrace.local(:30952)/*` wildcards are not
+  defensible the same way; they are real drift against ADR-042 §3, not
+  a documented target-vs-live gap like the public-client one above.
+  Tracked separately for remediation (backlog `OIDC-REDIRECT-URI-DRIFT`);
+  this doc's sequence diagram deliberately labels `redirect_uri` as
+  "pre-registered" rather than "exact-match" for that reason, and does
+  not present the target as if it were live.
 - **Device Flow.** Human CLI/headless login (`scripts/audittrace-login`,
   ADR-032, RFC 8628) is a separate, non-browser grant that does not
   involve Google brokering at all. See
