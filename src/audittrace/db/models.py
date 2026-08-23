@@ -179,6 +179,37 @@ class ToolCall(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     granted_scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Migration 021 (ADR-063 Phase 2 Track B): broker provenance. NULL on
+    # every Phase 1 own-tool row (unchanged, untouched by this migration);
+    # ``"brokered"`` is the ONLY value the broker path ever writes — the
+    # spec's "provenance clearly distinguishable from Phase-1 own-tool
+    # rows" requirement, enforced as a real column rather than a naming
+    # convention on ``tool_name`` (which is namespaced ``broker:<server>:
+    # <tool>`` for readability, not as the provenance signal).
+    provenance: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Which half of the broker's "record(request) → forward → record
+    # (result)" sequence this row is. ``"request"`` rows are written
+    # before the outbound call to the downstream server; ``"result"``
+    # rows (success OR failure/timeout) are written after. Exactly two
+    # rows per brokered call, sharing one ``interaction_id`` (one trace).
+    # NULL on Phase 1 rows.
+    phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The operator-configured downstream server name (the registry key in
+    # ``Settings.mcp_broker_servers``) — the "downstream identity" the
+    # spec requires on every brokered audit row.
+    downstream_server: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The tool name AS KNOWN TO the downstream server (before this
+    # gateway's ``broker:<server>:`` namespacing).
+    downstream_tool: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # SHA-256 hex digest of the canonicalised outbound arguments — set on
+    # BOTH the request and result row (the result row still names what was
+    # asked for), so a reviewer can confirm the two rows describe the same
+    # call without re-parsing ``args``.
+    args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # SHA-256 hex digest of the canonicalised downstream response (or, on
+    # failure, of the error payload) — set on the result row only; NULL on
+    # the request row (the result is not known yet when it is written).
+    result_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MemoryItem(Base):

@@ -508,6 +508,28 @@ class Settings(BaseSettings):
     # hop later in the pipeline).
     index_max_attempts: int = 5
 
+    # ─── ADR-063 Phase 2 Track B — MCP tool-broker gateway ─────────────────
+    # Operator-configured downstream MCP servers AuditTrace brokers (proxies
+    # + records) tool calls to. NO auto-discovery of untrusted servers — an
+    # entry must be added here (portability invariant: env-parameterized,
+    # laptop-default empty) before its tools are ever listed or callable.
+    # Shape: {"<server-name>": {"url": "<downstream /mcp endpoint>",
+    # "required_scope": "<scope gating every tool on this server>",
+    # "timeout_seconds": "<optional, default 10>", "enabled": "<optional,
+    # default true>"}}. Parsed by ``services.mcp_broker.get_downstream_registry``;
+    # a malformed entry (missing url/required_scope) is skipped with a
+    # logged warning rather than failing startup — one bad operator entry
+    # must not take down the whole MCP surface. Populated from env
+    # AUDITTRACE_MCP_BROKER_SERVERS (JSON object), same mechanism as
+    # ``model_routes`` / ``keycloak_issuer_extras`` above. Empty dict (the
+    # default) means Track B brokers nothing — Phase 1's read-tool manifest
+    # is byte-identical until an operator configures a downstream server.
+    mcp_broker_servers: dict[str, dict[str, str]] = {}
+    # Default per-call timeout (seconds) when a server entry omits
+    # "timeout_seconds". Applied to BOTH the discovery (tools/list) and the
+    # dispatch (tools/call) request to that downstream server.
+    mcp_broker_default_timeout_seconds: float = 10.0
+
     # Security
     cors_origins: list[str] = ["http://localhost:8765", "http://localhost:3000"]
     rate_limit_requests: int = 100
