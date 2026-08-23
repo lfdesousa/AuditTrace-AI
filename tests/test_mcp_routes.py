@@ -15,7 +15,17 @@ Falsifiable acceptance criteria covered (spec Rule 1):
      ``TestToolsCallAuthzAndAudit.test_valid_scope_executes_and_writes_exactly_one_audit_row``.
   3. A missing-scope call is denied: no execution, no data, no silent
      success — ``TestToolsCallAuthzAndAudit.test_missing_scope_denied_no_execution_no_data``.
-  4. Tenant isolation — ``TestIdentityBinding.test_cross_tenant_isolation_via_recall_recent_sessions``.
+  4. Tenant isolation — ``TestIdentityBinding.test_cross_tenant_isolation_via_recall_recent_sessions``
+     (request layer, two distinct REAL callers) +
+     ``TestIdentityBinding.test_rls_contextvar_rebinds_per_real_caller_no_stale_leak``
+     (binding correctness, genuine neuter-and-confirm against production
+     ``auth.py``) + ``tests/test_mcp_rls_isolation.py`` (policy
+     sufficiency: Postgres RLS alone, no app-level filter, on the exact
+     ``sessions`` table MCP recall reads). See the reviewer-finding note
+     on ``test_cross_tenant_isolation_via_recall_recent_sessions`` for
+     why this is three tests, not one — two independent, correct guards
+     (the Phase-2 app-level filter and Phase-4 RLS) can't be told apart
+     by breaking just one of them while the other still holds.
   5. Caller-supplied identity is ignored, token ``sub`` wins —
      ``TestIdentityBinding.test_caller_supplied_user_id_argument_is_ignored``.
 """
@@ -23,11 +33,15 @@ Falsifiable acceptance criteria covered (spec Rule 1):
 from __future__ import annotations
 
 import importlib
+import time
 from dataclasses import replace
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization as _crypto_serialization
+from cryptography.hazmat.primitives.asymmetric import rsa as _crypto_rsa
 from fastapi.testclient import TestClient
+from jose import jwt as _jose_jwt
 from sqlalchemy import select
 
 # Side-effect import — running the module is what runs the
@@ -101,6 +115,103 @@ def _rpc(
     if id_ is not None:
         body["id"] = id_
     return body
+
+
+# ───────────────── Real-JWT machinery (reviewer finding fix) ────────────────
+# Self-contained (not imported from test_auth.py — pytest fixtures imported
+# by name only "work" via a shadowing parameter, which ruff correctly flags
+# as an unused import; the codebase's convention is per-file self-contained
+# auth helpers, e.g. test_admin_routes.py / test_memory_routes.py).
+#
+# Why this exists: the independent reviewer found that
+# ``test_cross_tenant_isolation_via_recall_recent_sessions`` used
+# ``client.app.dependency_overrides[require_user] = lambda: identity`` —
+# which REPLACES ``require_user``'s entire body, so ``set_current_user_id``
+# (the RLS ContextVar binding) never runs. The test was non-vacuous for
+# "does the handler thread user_context correctly" but VACUOUS for the
+# specific claim ADR-063 + the spec make ("isolated per tenant by row-level
+# security") — neutering the ContextVar binding left it green. This section
+# drives ``require_user`` for REAL (JWT decode → JWKS verify → UserContext
+# → cache → set_current_user_id) with two DISTINCT signed tokens, so a test
+# built on it is falsifiable for the ContextVar-binding guard specifically.
+
+_JWT_PRIVATE_KEY = _crypto_rsa.generate_private_key(
+    public_exponent=65537, key_size=2048
+)
+_JWT_PRIVATE_PEM = _JWT_PRIVATE_KEY.private_bytes(
+    encoding=_crypto_serialization.Encoding.PEM,
+    format=_crypto_serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=_crypto_serialization.NoEncryption(),
+).decode()
+_JWT_PUBLIC_PEM = (
+    _JWT_PRIVATE_KEY.public_key()
+    .public_bytes(
+        encoding=_crypto_serialization.Encoding.PEM,
+        format=_crypto_serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    .decode()
+)
+_JWT_ISSUER = "http://keycloak:8080/realms/audittrace"
+_JWT_AUDIENCE = "audittrace-server"
+
+
+def _make_real_jwt(*, sub: str, scope: str, jti: str) -> str:
+    """A genuinely signed RS256 JWT — decoded by the REAL
+    ``_decode_jwt_with_allowed_issuers`` inside ``require_user``, not a
+    stand-in. Mirrors ``tests/test_auth.py::_make_user_token``."""
+    now = int(time.time())
+    claims = {
+        "iss": _JWT_ISSUER,
+        "aud": _JWT_AUDIENCE,
+        "sub": sub,
+        "scope": scope,
+        "iat": now,
+        "exp": now + 3600,
+        "jti": jti,
+        "preferred_username": sub,
+    }
+    return _jose_jwt.encode(claims, _JWT_PRIVATE_PEM, algorithm="RS256")
+
+
+@pytest.fixture
+def _real_auth_stack(monkeypatch: pytest.MonkeyPatch):
+    """Flip ``AUDITTRACE_AUTH_REQUIRED=true``, point the issuer/audience at
+    the throwaway test keypair, mock JWKS fetch to return the matching
+    public key, and give ``require_user`` a fakeredis-backed token cache
+    (so its cold path runs fully — JWT verify + ``set_current_user_id`` —
+    without needing a real Redis). Everything reverts on teardown."""
+    import fakeredis
+
+    from audittrace import config as config_mod
+    from audittrace import identity as identity_mod
+    from audittrace.auth import _jwks_cache
+    from audittrace.identity import TokenCache
+
+    config_mod.get_settings.cache_clear()
+    monkeypatch.setenv("AUDITTRACE_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("AUDITTRACE_KEYCLOAK_ISSUER", _JWT_ISSUER)
+    monkeypatch.setenv("AUDITTRACE_KEYCLOAK_JWKS_URL", "http://test/jwks")
+    monkeypatch.setenv("AUDITTRACE_JWT_AUDIENCE", _JWT_AUDIENCE)
+
+    _jwks_cache.clear()
+
+    async def _fake_fetch_jwks_keys(_url: str) -> list[str]:
+        return [_JWT_PUBLIC_PEM]
+
+    monkeypatch.setattr("audittrace.auth._fetch_jwks_keys", _fake_fetch_jwks_keys)
+    monkeypatch.setattr("audittrace.auth._jwks_client", None)
+    monkeypatch.setattr("audittrace.auth._jwks_fetch_lock", None)
+
+    fake_redis = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(
+        identity_mod, "_token_cache", TokenCache(fake_redis, default_ttl_seconds=300)
+    )
+    monkeypatch.setattr(identity_mod, "_redis_client", fake_redis)
+
+    yield
+
+    config_mod.get_settings.cache_clear()
+    _jwks_cache.clear()
 
 
 # ────────────────────────────── initialize ──────────────────────────────────
@@ -345,39 +456,90 @@ class TestIdentityBinding:
 
     @pytest.mark.asyncio
     async def test_cross_tenant_isolation_via_recall_recent_sessions(
-        self, client: TestClient, test_container
+        self, client: TestClient, test_container, _real_auth_stack: None
     ) -> None:
         """Falsifiable acceptance #4. Two identities, two seeded
-        sessions; caller B must see ZERO of caller A's rows. Neuter
-        (e.g. the handler ignoring user_context and querying globally)
-        → this test goes RED because bob would see alice's session."""
-        alice = replace(sentinel_user_context(), user_id="alice", is_admin=False)
+        sessions; caller B must see ZERO of caller A's rows.
+
+        **Reviewer finding fix (2026-08-23, fixture-masked vacuous
+        guard):** this test used to drive identity via
+        ``client.app.dependency_overrides[require_user] = lambda: identity``,
+        which REPLACES ``require_user``'s entire body — ``set_current_user_id``
+        (the RLS ContextVar binding the spec + ADR-063 claim isolation
+        rests on) never ran, so the test was vacuous for that specific
+        guard even though it correctly proved the Phase-2 app-level
+        filter. Rewritten to use TWO DISTINCT, genuinely SIGNED JWTs
+        (``_real_auth_stack`` + ``_make_real_jwt``) with NO
+        ``dependency_overrides`` — ``require_user``'s real cold path
+        (JWT verify → JWKS → UserContext → cache → ``set_current_user_id``)
+        executes for both alice and bob. Neuter (e.g. the handler
+        ignoring ``user_context`` and querying globally) → this test
+        goes RED because bob would see alice's session.
+
+        RLS's OWN independent sufficiency — i.e. that Postgres RLS
+        would still block this leak even if the Phase-2 app-level
+        ``.filter()`` were ever missing or wrong, per the reviewer's
+        "a missing/wrong .filter still cannot leak" framing — is
+        proven separately (live Postgres, no app filter in the query
+        path) in ``tests/test_mcp_rls_isolation.py``, which extends the
+        SAME ``sessions``-table policy proof used generically by
+        ``tests/test_rls_isolation.py``. This test proves the request
+        layer: two distinct real callers, each correctly isolated."""
+        alice_sub = "alice-jwt-user"
+        bob_sub = "bob-jwt-user"
+        alice_seed_ctx = replace(
+            sentinel_user_context(), user_id=alice_sub, is_admin=False
+        )
         await test_container._instances["conversational"].save_session(
-            alice,
+            alice_seed_ctx,
             "AuditTrace",
             "alice's private session",
             [],
             session_id="sess-alice-2",
         )
 
-        _override_identity(client, "bob", scopes=("memory:conversational:read-own",))
-        try:
-            r = client.post(
-                "/mcp",
-                json=_rpc(
-                    "tools/call",
-                    {
-                        "name": "recall_recent_sessions",
-                        "arguments": {"project": "AuditTrace", "n": 5},
-                    },
-                ),
-            )
-        finally:
-            client.app.dependency_overrides.clear()
+        bob_token = _make_real_jwt(
+            sub=bob_sub, scope="memory:conversational:read-own", jti="jti-bob-1"
+        )
+        r = client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "recall_recent_sessions",
+                    "arguments": {"project": "AuditTrace", "n": 5},
+                },
+            ),
+            headers={"Authorization": f"Bearer {bob_token}"},
+        )
 
         body = r.json()["result"]
         assert body["structuredContent"]["total"] == 0
         assert body["structuredContent"]["matches"] == []
+
+        # Sanity: bob is not simply denied outright (which would make the
+        # zero-rows assertion vacuous too) — he genuinely authenticated
+        # and authorized, just sees none of alice's data.
+        assert body["isError"] is False
+
+        # And alice, using her OWN real token, sees her own row — proving
+        # the zero-for-bob result is isolation, not a broken query.
+        alice_token = _make_real_jwt(
+            sub=alice_sub, scope="memory:conversational:read-own", jti="jti-alice-1"
+        )
+        r2 = client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "recall_recent_sessions",
+                    "arguments": {"project": "AuditTrace", "n": 5},
+                },
+            ),
+            headers={"Authorization": f"Bearer {alice_token}"},
+        )
+        body2 = r2.json()["result"]
+        assert body2["structuredContent"]["total"] == 1
 
     def test_rls_contextvar_bound_at_dispatch_time(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -416,3 +578,84 @@ class TestIdentityBinding:
         )
 
         assert seen_user_ids == [sentinel_user_context().user_id]
+
+    def test_rls_contextvar_rebinds_per_real_caller_no_stale_leak(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        _real_auth_stack: None,
+    ) -> None:
+        """Generalises ``test_rls_contextvar_bound_at_dispatch_time`` (one
+        sentinel identity, bypass mode) to TWO DISTINCT REAL callers via
+        genuinely signed JWTs, driven through ``require_user``'s real
+        body with NO override — the reviewer's fix instruction #1.
+
+        Proves the ContextVar REBINDS per request rather than leaking a
+        stale value from the prior caller: alice's request must bind
+        alice's sub, and bob's very next request (same TestClient, same
+        underlying worker) must bind bob's sub, not alice's stale one.
+
+        Non-vacuous per fix instruction #3: monkeypatching
+        ``audittrace.auth.set_current_user_id`` to a no-op — the exact
+        three call sites the reviewer named inside ``require_user`` all
+        route through this one module-level name — must make bob's
+        captured ContextVar value WRONG (not his own sub). Restore →
+        correct again."""
+        import audittrace.routes.mcp as mcp_route
+
+        seen_user_ids: list[str | None] = []
+        real_call_read_tool = mcp_route.call_read_tool
+
+        async def _spy(**kwargs: Any) -> Any:
+            seen_user_ids.append(rls_module.current_user_id())
+            return await real_call_read_tool(**kwargs)
+
+        monkeypatch.setattr(mcp_route, "call_read_tool", _spy)
+
+        alice_token = _make_real_jwt(
+            sub="alice-rebind", scope="memory:episodic:read", jti="jti-rebind-alice"
+        )
+        bob_token = _make_real_jwt(
+            sub="bob-rebind", scope="memory:episodic:read", jti="jti-rebind-bob"
+        )
+
+        client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call", {"name": "recall_decisions", "arguments": {"query": "x"}}
+            ),
+            headers={"Authorization": f"Bearer {alice_token}"},
+        )
+        client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call", {"name": "recall_decisions", "arguments": {"query": "x"}}
+            ),
+            headers={"Authorization": f"Bearer {bob_token}"},
+        )
+
+        assert seen_user_ids == ["alice-rebind", "bob-rebind"]
+
+        # ── Neuter-and-confirm (reviewer fix instruction #3) ──
+        seen_user_ids.clear()
+        rls_module.set_current_user_id(None)  # clear any leftover binding
+
+        def _neutered_set_current_user_id(_user_id: str | None) -> None:
+            pass  # the exact bug class the reviewer's finding is about
+
+        monkeypatch.setattr(
+            "audittrace.auth.set_current_user_id", _neutered_set_current_user_id
+        )
+
+        client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call", {"name": "recall_decisions", "arguments": {"query": "x"}}
+            ),
+            headers={"Authorization": f"Bearer {bob_token}"},
+        )
+
+        assert seen_user_ids == [None], (
+            "neutering set_current_user_id must leave the ContextVar unbound "
+            "(RED) — got a value, meaning something else is still binding it"
+        )
