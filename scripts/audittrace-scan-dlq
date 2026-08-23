@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Operator CLI for the ADR-057 scan-pipeline RabbitMQ DLQ.
+
+**The gap this closes.** The async-persist DLQ has ``scripts/audittrace-dlq``
+(Redis) and the index dead-letter has ``scripts/replay_dead_lettered_index.py``
+(#287, Postgres). The scan-pipeline RabbitMQ DLQ
+(``audittrace.scan.requests.dlq`` — the DLX target of ``audittrace.scan.dlx``,
+quorum queue with ``x-delivery-limit=5``; see
+``charts/audittrace/templates/rabbitmq/job-amqp-topology-bootstrap.yaml``) had
+no operator recovery lever at all. This is that lever — the sibling of the
+other two, over the RabbitMQ/aio_pika seam instead of Redis/Postgres.
+
+Subcommands:
+  inspect [--limit N] [--reason SUBSTR]
+      READ-ONLY listing: for each DLQ message print scan_id, the object_uri
+      SCHEME ONLY (never the full uri — it may carry sensitive content), the
+      death reason (parsed from the standard AMQP ``x-death`` header array
+      RabbitMQ stamps on every DLX'd message), age, attempt count. Every
+      peeked message is fetched via ``basic.get`` and explicitly
+      nack-requeued before the command returns — the DLQ's depth is
+      unchanged. Safe to run repeatedly.
+  replay <scan_id>
+      Re-publish the message to exchange ``Settings.scan_request_exchange``
+      with routing key ``Settings.scan_request_routing_key`` (the same
+      producer seam ``ScanAmqpClient.publish_scan_request`` uses). On a
+      broker-confirmed publish: ACK it off the DLQ. On failure: leave it in
+      place (nack-requeue). For transient failures.
+  replay --all [--max N]
+      Bulk replay; aggregate report (replayed / still_failing).
+  drain <scan_id> --confirm
+      ACK-and-drop — no republish (operator-decided drop, for poison).
+      ``--confirm`` REQUIRED; refuses (non-zero, zero ACKs, no broker
+      connection even opened) without it.
+  drain --all [--reason SUBSTR] [--older-than DAYS] --confirm
+      Bulk ACK-and-drop of every message matching BOTH filters (when given).
+      This is how the pre-existing poison backlog gets cleared.
+
+Auth path: runs from the operator's machine with KUBECONFIG set. RabbitMQ
+access goes via ``kubectl port-forward`` (mirrors ``audittrace-dlq``'s
+Redis/Postgres port-forward pattern) — no HTTP admin endpoint, AMQP only.
+
+Required env vars (read by ``audittrace.config.Settings``, ``AUDITTRACE_``
+prefix — same seam ``health.py::_get_scan_dlq_message_count`` uses):
+  AUDITTRACE_SCAN_AMQP_URL              — e.g. amqp://guest:guest@localhost:15672/
+                                           (operator runs `kubectl port-forward
+                                           svc/audittrace-rabbitmq 15672:5672`,
+                                           creds via Vault / the -rabbitmq secret)
+  AUDITTRACE_SCAN_REQUEST_EXCHANGE      — defaults to audittrace.scan
+  AUDITTRACE_SCAN_REQUEST_ROUTING_KEY   — defaults to scan.requested
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import urlsplit
+
+# Ensure the src package is importable when run from a repo checkout.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.isdir(os.path.join(_REPO_ROOT, "src", "audittrace")):
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("audittrace-scan-dlq")
+
+# SPEC #387 P2b — the scan pipeline's DLQ queue name, per the ADR-057
+# topology bootstrap. Mirrors ``health.py::_SCAN_DLQ_QUEUE_NAME`` exactly
+# (this script deliberately doesn't import ``routes/health.py`` — a
+# standalone operator tool has no other reason to import a route module).
+_SCAN_DLQ_QUEUE_NAME = "audittrace.scan.requests.dlq"
+
+# Generous relative to the health probe's 3s budget (this is an
+# operator-attended CLI, not a readiness probe on the critical path).
+_CONNECT_TIMEOUT_SECONDS = 10.0
+
+# Bounded scans — an operator recovery tool, not a hot loop, but an
+# unbounded walk over a pathological backlog is still worth capping.
+# Mirrors ``replay_dead_lettered_index.py``'s ``DEFAULT_QUERY_LIMIT``.
+_LOOKUP_LIMIT = 10_000
+_DRAIN_ALL_LIMIT = 10_000
+
+
+def _load_settings() -> Any:
+    """Isolated as its own function purely so tests can monkeypatch this
+    seam directly (mirrors how ``_get_scan_dlq_message_count`` is isolated
+    in ``health.py`` for the same reason)."""
+    from audittrace.config import get_settings  # noqa: PLC0415
+
+    return get_settings()
+
+
+@dataclass(frozen=True)
+class DlqRow:
+    """One DLQ message's display-safe fields — never the full object_uri."""
+
+    scan_id: str
+    uri_scheme: str
+    reason: str
+    attempt: str
+    age: str
+
+
+def _parse_payload(body: bytes) -> dict[str, Any]:
+    try:
+        return dict(json.loads(body.decode("utf-8")))
+    except Exception:
+        return {}
+
+
+def _scan_id_of(message: Any) -> str:
+    return str(_parse_payload(message.body).get("scan_id") or "?")
+
+
+def _uri_scheme(object_uri: str) -> str:
+    return urlsplit(object_uri).scheme or "?"
+
+
+def _death_info(headers: dict[str, Any] | None) -> tuple[str, str]:
+    """Parse ``(reason, attempt)`` from the standard AMQP ``x-death``
+    header array RabbitMQ stamps on every DLX'd message. The reason is a
+    small closed vocabulary RabbitMQ itself assigns (``rejected``,
+    ``expired``, ``maxlen``, ``delivery_limit``, ...) — never user-supplied
+    data, so it is always safe to print. Falls back to ``("unknown", "?")``
+    if headers are missing or malformed — a DLQ message must still be
+    listable even when header parsing fails."""
+    if not headers:
+        return "unknown", "?"
+    deaths = headers.get("x-death")
+    if not deaths:
+        return "unknown", "?"
+    try:
+        first = deaths[0]
+        reason = str(first.get("reason") or "unknown")
+        count = first.get("count")
+        attempt = str(count) if count is not None else "?"
+        return reason, attempt
+    except Exception:
+        return "unknown", "?"
+
+
+def _format_age(seconds: float) -> str:
+    if seconds < 0:
+        return "?"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def _message_timestamp(message: Any) -> datetime | None:
+    ts = getattr(message, "timestamp", None)
+    return ts if isinstance(ts, datetime) else None
+
+
+def _message_age_seconds(message: Any) -> float:
+    ts = _message_timestamp(message)
+    if ts is None:
+        return -1.0
+    try:
+        now = datetime.now(UTC) if ts.tzinfo is not None else datetime.now()
+        return (now - ts).total_seconds()
+    except Exception:
+        return -1.0
+
+
+def _older_than(message: Any, days: int) -> bool:
+    """Fail-closed: an unparseable/missing timestamp is NEVER treated as
+    "old enough to drop" — an age-filtered bulk drain must never widen its
+    blast radius because a message's age is unknown."""
+    ts = _message_timestamp(message)
+    if ts is None:
+        return False
+    try:
+        cutoff = (
+            datetime.now(UTC) - timedelta(days=days)
+            if ts.tzinfo is not None
+            else datetime.now() - timedelta(days=days)
+        )
+        return ts < cutoff
+    except Exception:
+        return False
+
+
+def _parse_row(message: Any) -> DlqRow:
+    payload = _parse_payload(message.body)
+    reason, attempt = _death_info(getattr(message, "headers", None))
+    return DlqRow(
+        scan_id=str(payload.get("scan_id") or "?"),
+        uri_scheme=_uri_scheme(str(payload.get("object_uri") or "")),
+        reason=reason,
+        attempt=attempt,
+        age=_format_age(_message_age_seconds(message)),
+    )
+
+
+def _print_table(rows: list[DlqRow]) -> None:
+    cols = ["scan_id", "uri_scheme", "reason", "age", "attempt"]
+    data = [
+        {
+            "scan_id": r.scan_id,
+            "uri_scheme": r.uri_scheme,
+            "reason": r.reason,
+            "age": r.age,
+            "attempt": r.attempt,
+        }
+        for r in rows
+    ]
+    widths = {c: max(len(c), max(len(d[c]) for d in data)) for c in cols}
+    print("  ".join(c.ljust(widths[c]) for c in cols))
+    print("  ".join("-" * widths[c] for c in cols))
+    for d in data:
+        print("  ".join(d[c].ljust(widths[c]) for c in cols))
+
+
+# ──────────────────────────── AMQP plumbing ──────────────────────────────
+
+
+async def _connect(settings: Any) -> Any:
+    import aio_pika  # noqa: PLC0415 — avoid import on paths that never connect
+
+    return await aio_pika.connect(
+        settings.scan_amqp_url, timeout=_CONNECT_TIMEOUT_SECONDS
+    )
+
+
+async def _open_queue(connection: Any) -> tuple[Any, Any]:
+    """Passive declare — mirrors ``health.py::_get_scan_dlq_message_count``.
+    The chart's bootstrap Job owns queue creation; this tool only ever
+    adopts the existing queue, never creates one with the wrong args."""
+    channel = await connection.channel()
+    queue = await channel.declare_queue(_SCAN_DLQ_QUEUE_NAME, passive=True)
+    return channel, queue
+
+
+async def _open_exchange(channel: Any, settings: Any) -> Any:
+    """Active idempotent declare — mirrors ``ScanAmqpClient.ensure_connected``
+    so replay composes safely whichever side (this CLI or the memory-server
+    lifespan) declares the exchange first."""
+    import aio_pika  # noqa: PLC0415
+
+    return await channel.declare_exchange(
+        settings.scan_request_exchange,
+        type=aio_pika.ExchangeType.TOPIC,
+        durable=True,
+    )
+
+
+async def _fetch_batch(queue: Any, limit: int) -> list[Any]:
+    """Fetch up to ``limit`` DISTINCT messages via repeated ``basic.get``,
+    WITHOUT acking or nacking any of them. RabbitMQ never redelivers an
+    unacked message to a subsequent ``get`` on the same channel, so this
+    walks the queue in order without duplicates. The caller MUST resolve
+    every returned message (``ack`` or ``nack(requeue=True)``) before the
+    connection closes."""
+    messages: list[Any] = []
+    for _ in range(max(limit, 0)):
+        message = await queue.get(fail=False)
+        if message is None:
+            break
+        messages.append(message)
+    return messages
+
+
+async def _requeue_all(messages: list[Any]) -> None:
+    for message in messages:
+        await message.nack(requeue=True)
+
+
+def _no_amqp_url_error() -> int:
+    print(
+        "no scan_amqp_url configured (set AUDITTRACE_SCAN_AMQP_URL) — aborting",
+        file=sys.stderr,
+    )
+    return 2
+
+
+# ──────────────────────────── inspect ────────────────────────────
+
+
+async def cmd_inspect(args: argparse.Namespace, settings: Any) -> int:
+    if not settings.scan_amqp_url:
+        return _no_amqp_url_error()
+    connection = await _connect(settings)
+    try:
+        _channel, queue = await _open_queue(connection)
+        messages = await _fetch_batch(queue, args.limit)
+        try:
+            if not messages:
+                print(f"DLQ {_SCAN_DLQ_QUEUE_NAME} is empty.")
+                return 0
+            rows = [_parse_row(m) for m in messages]
+            filtered = [r for r in rows if not args.reason or args.reason in r.reason]
+            if not filtered:
+                print(f"No entries match filter (--reason={args.reason!r}).")
+                return 0
+            _print_table(filtered)
+            print(
+                f"\nTotal: {len(filtered)} entries "
+                f"(of {len(messages)} peeked; DLQ queue: {_SCAN_DLQ_QUEUE_NAME})."
+            )
+            return 0
+        finally:
+            # ALWAYS requeue every peeked message, filtered out or not —
+            # inspect must never lose or drop entries. This is the
+            # non-destructive guarantee.
+            await _requeue_all(messages)
+    finally:
+        await connection.close()
+
+
+# ──────────────────────────── replay ─────────────────────────────
+
+
+async def _republish(exchange: Any, settings: Any, message: Any) -> tuple[bool, str]:
+    import aio_pika  # noqa: PLC0415
+
+    payload = _parse_payload(message.body)
+    scan_id = str(payload.get("scan_id") or "?")
+    out = aio_pika.Message(
+        body=message.body,
+        content_type="application/json",
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        message_id=scan_id,
+        headers={"traceparent": str(payload.get("traceparent") or "")},
+    )
+    try:
+        await exchange.publish(out, routing_key=settings.scan_request_routing_key)
+    except Exception as exc:
+        return False, f"publish failed: {exc}"
+    return True, f"republished to {settings.scan_request_exchange}"
+
+
+async def cmd_replay(args: argparse.Namespace, settings: Any) -> int:
+    if not settings.scan_amqp_url:
+        return _no_amqp_url_error()
+    connection = await _connect(settings)
+    try:
+        channel, queue = await _open_queue(connection)
+        exchange = await _open_exchange(channel, settings)
+        if args.all:
+            messages = await _fetch_batch(queue, args.max)
+            if not messages:
+                print(f"DLQ {_SCAN_DLQ_QUEUE_NAME} is empty — nothing to replay.")
+                return 0
+            replayed = 0
+            failing = 0
+            for message in messages:
+                scan_id = _scan_id_of(message)
+                ok, msg = await _republish(exchange, settings, message)
+                if ok:
+                    await message.ack()
+                    replayed += 1
+                else:
+                    await message.nack(requeue=True)
+                    failing += 1
+                status = "✓ replayed" if ok else "✗ failed"
+                logger.info("[audittrace-scan-dlq] %s %s — %s", status, scan_id, msg)
+            print(
+                f"\nSummary: replayed={replayed} still_failing={failing} "
+                f"total={replayed + failing}."
+            )
+            return 0 if failing == 0 else 1
+
+        # Single scan_id — scan the batch, requeue everything except the
+        # target, then act on the target.
+        messages = await _fetch_batch(queue, _LOOKUP_LIMIT)
+        target: Any = None
+        rest: list[Any] = []
+        for message in messages:
+            if target is None and _scan_id_of(message) == args.dlq_id:
+                target = message
+            else:
+                rest.append(message)
+        await _requeue_all(rest)
+        if target is None:
+            print(
+                f"No entry with scan_id={args.dlq_id} in {_SCAN_DLQ_QUEUE_NAME}.",
+                file=sys.stderr,
+            )
+            return 2
+        ok, msg = await _republish(exchange, settings, target)
+        if ok:
+            await target.ack()
+        else:
+            await target.nack(requeue=True)
+        status = "✓ replayed" if ok else "✗ failed"
+        logger.info("[audittrace-scan-dlq] %s %s — %s", status, args.dlq_id, msg)
+        return 0 if ok else 1
+    finally:
+        await connection.close()
+
+
+# ──────────────────────────── drain ──────────────────────────────
+
+
+async def cmd_drain(args: argparse.Namespace, settings: Any) -> int:
+    # Checked FIRST, before any AMQP connection is even opened — refusing
+    # without --confirm must never touch the broker, let alone ACK.
+    if not args.confirm:
+        print(
+            "Refusing to drain without --confirm (drain is destructive).",
+            file=sys.stderr,
+        )
+        return 2
+    if not settings.scan_amqp_url:
+        return _no_amqp_url_error()
+    connection = await _connect(settings)
+    try:
+        _channel, queue = await _open_queue(connection)
+        if args.all:
+            messages = await _fetch_batch(queue, _DRAIN_ALL_LIMIT)
+            dropped = 0
+            kept = 0
+            for message in messages:
+                reason, _attempt = _death_info(getattr(message, "headers", None))
+                matches_reason = not args.reason or args.reason in reason
+                matches_age = args.older_than is None or _older_than(
+                    message, args.older_than
+                )
+                if matches_reason and matches_age:
+                    await message.ack()
+                    logger.info(
+                        "[audittrace-scan-dlq] drained %s", _scan_id_of(message)
+                    )
+                    dropped += 1
+                else:
+                    await message.nack(requeue=True)
+                    kept += 1
+            print(f"\nDrained {dropped} entries (kept {kept}).")
+            return 0
+
+        # Single scan_id.
+        messages = await _fetch_batch(queue, _LOOKUP_LIMIT)
+        target: Any = None
+        rest: list[Any] = []
+        for message in messages:
+            if target is None and _scan_id_of(message) == args.dlq_id:
+                target = message
+            else:
+                rest.append(message)
+        await _requeue_all(rest)
+        if target is None:
+            print(f"No entry with scan_id={args.dlq_id}.", file=sys.stderr)
+            return 2
+        await target.ack()
+        logger.info("[audittrace-scan-dlq] drained %s", args.dlq_id)
+        return 0
+    finally:
+        await connection.close()
+
+
+# ──────────────────────────── main ───────────────────────────────
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="audittrace-scan-dlq",
+        description="Operator CLI for the ADR-057 scan-pipeline RabbitMQ DLQ.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_inspect = sub.add_parser("inspect", help="List DLQ entries (read-only).")
+    p_inspect.add_argument("--limit", type=int, default=100)
+    p_inspect.add_argument("--reason", default=None)
+    p_inspect.set_defaults(func=cmd_inspect)
+
+    p_replay = sub.add_parser("replay", help="Re-publish a DLQ entry.")
+    p_replay.add_argument("dlq_id", nargs="?", metavar="scan_id")
+    p_replay.add_argument("--all", action="store_true")
+    p_replay.add_argument("--max", type=int, default=100)
+    p_replay.set_defaults(func=cmd_replay)
+
+    p_drain = sub.add_parser("drain", help="ACK-and-drop a DLQ entry (no republish).")
+    p_drain.add_argument("dlq_id", nargs="?", metavar="scan_id")
+    p_drain.add_argument("--all", action="store_true")
+    p_drain.add_argument("--reason", default=None)
+    p_drain.add_argument("--older-than", type=int, default=None, dest="older_than")
+    p_drain.add_argument("--confirm", action="store_true")
+    p_drain.set_defaults(func=cmd_drain)
+
+    return parser
+
+
+async def _amain(args: argparse.Namespace) -> int:
+    settings = _load_settings()
+    rc: int = await args.func(args, settings)
+    return rc
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd == "replay" and not args.all and not args.dlq_id:
+        parser.error("replay requires either <scan_id> or --all")
+    if args.cmd == "drain" and not args.all and not args.dlq_id:
+        parser.error("drain requires either <scan_id> or --all")
+    return asyncio.run(_amain(args))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
