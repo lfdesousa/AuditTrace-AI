@@ -546,10 +546,24 @@ class TestMain:
         )
         assert exit_code == 0
 
-    def test_main_returns_one_on_config_error(self, mod, tmp_path: Path) -> None:
+    def test_main_returns_one_on_missing_config(self, mod, tmp_path: Path) -> None:
         missing = tmp_path / "does-not-exist.yaml"
         exit_code = mod.main(
             ["--config", str(missing), "--obs-stack-dir", str(tmp_path / "absent")]
+        )
+        assert exit_code == 1
+
+    def test_main_returns_one_on_malformed_config_no_traceback(
+        self, mod, tmp_path: Path, capsys
+    ) -> None:
+        """A malformed SSOT config (missing the 'signals' key) must fail
+        GRACEFULLY through the full CLI entry point — a clean exit code 1
+        with a logged message, never an unhandled traceback reaching the
+        caller (a config bug is loud, but not a crash)."""
+        malformed = tmp_path / "retention-windows.yaml"
+        malformed.write_text("not_signals: true\n")
+        exit_code = mod.main(
+            ["--config", str(malformed), "--obs-stack-dir", str(tmp_path / "absent")]
         )
         assert exit_code == 1
 
