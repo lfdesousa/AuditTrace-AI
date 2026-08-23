@@ -173,3 +173,21 @@ net behind the application-layer prefix enforcement.
 ### Neutral
 - `pymupdf` dependency added for PDF text extraction (indexing only)
 - `memory/episodic/` and `memory/procedural/` directories remain in repo as seed sources
+
+## Amendment 2026-08-22 — Explicit no-expiry retention (RETENTION spec)
+
+**Spec:** `2026-08-22-SPEC-retention-per-signal-windows` (operator-ratified 2026-08-22).
+Full witness-at-horizon table + rationale live in ADR-028's own
+2026-08-22 amendment; this note is the MinIO-side cross-reference.
+
+The `memory-private`/`memory-shared` buckets (§1) carry **no-expiry**
+(explicit retain) as a *deliberate, codified* lifecycle rule, not the
+absence of one — the ratified windows table names this signal alongside
+ChromaDB semantic memory and the Postgres `interactions`/`tool_calls`
+audit rows as the durable record obs signals (Tempo/Loki/Prometheus) are
+short-lived corroborating witnesses for. The ratified table is
+version-controlled at `charts/audittrace/files/retention-windows.yaml`
+(env-parameterized `profiles.laptop.minio_buckets` / `profiles.cloud.minio_buckets`,
+the cloud S3 override per #296/#297); applying an explicit no-expiry
+lifecycle rule to the live MinIO/S3 buckets from that config is
+operator-attended, not part of this amendment.

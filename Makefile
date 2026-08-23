@@ -1,12 +1,13 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
-       token-guard sync-dashboards check-dashboard-drift
+       token-guard sync-dashboards check-dashboard-drift check-retention-drift
 
 # SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
 # sibling checkout, not part of this repo. Its Grafana file-provider dir is a
 # synced mirror of the chart's canonical dashboard set; the path is
 # env-parameterized so every target here stays safe where no obs-stack exists.
+# Also the drift-check target for RETENTION (2026-08-22-SPEC-retention-per-signal-windows).
 OBS_STACK_DIR ?= $(HOME)/work/observability-stack
 
 help: ## Show this help message
@@ -305,6 +306,9 @@ check-dashboard-drift: ## SPEC #441 drift guard: $(OBS_STACK_DIR)/grafana/dashbo
 	  echo "no dashboard drift: $$DEST == $$SRC (file set + content)"; \
 	fi; \
 	exit $$status
+
+check-retention-drift: ## RETENTION spec (2026-08-22): prints each signal's EFFECTIVE retention window and exits non-zero on divergence from the ratified table (charts/audittrace/files/retention-windows.yaml). Skips gracefully (exit 0) when the obs-stack dir is absent (CI-safe), same pattern as check-dashboard-drift.
+	@OBS_STACK_DIR=$(OBS_STACK_DIR) .venv/bin/python scripts/retention-drift-check.py
 
 deploy-preflight: ## Pre-deploy gate: helm lint + template + kubectl dry-run + Vault injector probe (REQUIRED before any cluster mutation)
 	@TAG="$(TAG)" CHART_DIR=$(CHART_DIR) RELEASE=$(RELEASE) NAMESPACE=$(NAMESPACE) \
