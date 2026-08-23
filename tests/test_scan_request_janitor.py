@@ -1,17 +1,27 @@
 """Tests for services/scan_request_janitor.py — periodic
-re-enqueue of orphaned outbox rows (ADR-048 PR-B3)."""
+re-enqueue of orphaned outbox rows (ADR-048 PR-B3).
+
+Also covers SCAN-URI-BUG (fixed 2026-08-23): WU-1 proves the
+``scan_status IS NOT NULL`` filter excludes `.md` manifest folds
+(decisions/skills/procedural) from re-enqueue; WU-2 proves the
+defense-in-depth s3:// guard skips + logs any surviving candidate
+whose ``object_uri`` is not an s3:// URI rather than enqueueing it."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 
+from audittrace.db.models import MemoryItem
 from audittrace.db.postgres import InMemoryPostgresFactory
 from audittrace.routes.memory_upload import manifest as manifest_mod
+from audittrace.services.memory_manifest import MemoryManifestService
 from audittrace.services.scan_request_janitor import ScanRequestJanitor
 from audittrace.services.scan_request_publisher import ScanRequestEnvelope
 
@@ -39,6 +49,32 @@ async def _seed_pending(factory, *, scan_id: str, age_seconds: int) -> None:
         )
         row.created_at_ms = int(time.time() * 1000) - (age_seconds * 1000)
         await session.commit()
+
+
+async def _seed_md_manifest_fold(factory, *, key: str, age_seconds: int) -> str:
+    """Insert a `.md` manifest-fold row exactly the way
+    ``MemoryManifestService.record_create`` (the real
+    POST /memory/episodic write path) creates one: ``scan_status`` and
+    ``published_at_ms`` are BOTH left NULL — this row never goes near
+    the scan pipeline. Returns the row's ``id`` (its manifest PK, not
+    a scan_id — `.md` folds don't have one)."""
+    manifest = MemoryManifestService(session_factory=factory)
+    entry = await manifest.record_create(
+        layer="episodic",
+        key=key,
+        title=key,
+        size_bytes=1,
+        user_id="alice",
+    )
+    async with factory() as session:
+        row = (
+            await session.execute(
+                select(MemoryItem).filter_by(layer="episodic", key=key)
+            )
+        ).scalar_one()
+        row.created_at_ms = int(time.time() * 1000) - (age_seconds * 1000)
+        await session.commit()
+    return entry.id
 
 
 class TestScanOrphans:
@@ -102,6 +138,96 @@ class TestScanOrphans:
             queue=asyncio.Queue(),
         )
         assert await janitor._scan_orphans() == []
+
+    async def test_excludes_md_manifest_fold_rows(self, factory) -> None:
+        """SCAN-URI-BUG WU-1 — the confirmed root cause. A genuine
+        UPLOAD row (`scan_status='pending_scan'`, `key='s3://…'`) and a
+        decisions `.md` manifest fold (`scan_status IS NULL`,
+        `key='decisions/<doc_id>'`) both share the
+        `published_at_ms IS NULL` shape past the grace window. Only the
+        UPLOAD row is a genuine scan candidate.
+
+        Falsifiability: neuter this guard by dropping
+        ``.where(MemoryItem.scan_status.is_not(None))`` from
+        ``_scan_orphans`` — the decisions row reappears in the result
+        and this assertion goes RED.
+        """
+        await _seed_pending(factory, scan_id="upload-1", age_seconds=200)
+        await _seed_md_manifest_fold(
+            factory, key="decisions/2026-08-22-some-decision.md", age_seconds=200
+        )
+
+        janitor = ScanRequestJanitor(
+            settings=_settings(grace=60),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+        )
+        envelopes = await janitor._scan_orphans()
+        scan_ids = {e.scan_id for e in envelopes}
+        assert scan_ids == {"upload-1"}
+
+
+class TestObjectUriGuard:
+    """SCAN-URI-BUG WU-2 — defense-in-depth s3:// guard at enqueue.
+
+    Even a row that DID pass the WU-1 ``scan_status IS NOT NULL``
+    filter must never be enqueued if its ``object_uri`` (the manifest
+    row's ``key``) is not an ``s3://`` URI — a future write path could
+    mis-populate a row with a ``scan_status`` set but a non-quarantine
+    key, and this guard is the last line of defense before the scan
+    consumer + DLQ.
+    """
+
+    @pytest_asyncio.fixture
+    async def factory(self) -> object:
+        f = InMemoryPostgresFactory()
+        await f.create_schema()
+        return f.get_session_factory()
+
+    async def test_skips_non_s3_object_uri(self, factory, caplog) -> None:
+        # A row that IS a genuine scan candidate (scan_status set) but
+        # whose key was somehow written as a bare manifest key rather
+        # than an s3:// quarantine URI.
+        await _seed_pending(factory, scan_id="malformed-1", age_seconds=200)
+        async with factory() as session:
+            row = await manifest_mod.get_by_scan_id(session, "malformed-1")
+            assert row is not None
+            row.key = "decisions/not-an-s3-uri.md"
+            await session.commit()
+
+        janitor = ScanRequestJanitor(
+            settings=_settings(grace=60),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+        )
+        with caplog.at_level(logging.WARNING):
+            envelopes = await janitor._scan_orphans()
+
+        # Falsifiability: neuter this guard (remove the scheme check in
+        # `_scan_orphans`) — the malformed candidate reaches the
+        # returned envelope list (and, downstream, the queue + scan
+        # consumer + DLQ) and this assertion goes RED.
+        assert envelopes == []
+        assert any(
+            r.message == "scan_janitor.non_s3_object_uri_skipped"
+            and r.scan_id == "malformed-1"
+            and r.object_uri_scheme == "(none)"
+            for r in caplog.records
+        )
+
+    async def test_still_enqueues_genuine_s3_candidate(self, factory) -> None:
+        # Companion non-vacuous proof: the guard is a filter, not a
+        # blanket skip — a genuine s3:// candidate still passes.
+        await _seed_pending(factory, scan_id="genuine-1", age_seconds=200)
+
+        janitor = ScanRequestJanitor(
+            settings=_settings(grace=60),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+        )
+        envelopes = await janitor._scan_orphans()
+        assert {e.scan_id for e in envelopes} == {"genuine-1"}
+        assert envelopes[0].object_uri.startswith("s3://")
 
 
 class TestTickOnce:
