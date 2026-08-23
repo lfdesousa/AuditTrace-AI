@@ -128,11 +128,23 @@ class FakeQueue:
     ack/nack(requeue): each ``get()`` pops a DISTINCT message (never
     redelivers an outstanding unacked one); ``nack(requeue=True)`` puts
     the message back so ``depth`` reflects it again; ``ack()`` removes it
-    permanently."""
+    permanently.
+
+    **Reviewer finding (2026-08-23, vacuous-neuter reject).** ``depth``
+    alone canNOT distinguish "ACKed" from "fetched-and-never-resolved" —
+    both remove the message from ``_store`` at ``get()`` time, so a code
+    path that forgets to call ``.ack()`` after a successful action looks
+    IDENTICAL to a correct one under a depth-only assertion. ``acked``
+    tracks the ACK explicitly (set only inside the ``_ack`` closure,
+    never inferred from ``_store`` membership) so callers can assert the
+    guarded side-effect itself, not just its depth-shaped shadow.
+    ``acked_messages`` mirrors the same fact at the queue level, for
+    bulk-path assertions that want a single collection to check against."""
 
     def __init__(self, messages: list[FakeMessage]) -> None:
         self._store: list[FakeMessage] = list(messages)
         self.get_calls = 0
+        self.acked_messages: list[FakeMessage] = []
 
     async def get(self, *, fail: bool = True) -> FakeMessage | None:
         self.get_calls += 1
@@ -142,6 +154,7 @@ class FakeQueue:
 
         async def _ack() -> None:
             message.acked = True
+            self.acked_messages.append(message)
 
         async def _nack(*, requeue: bool = False) -> None:
             message.nacked_requeue = requeue
@@ -331,7 +344,14 @@ class TestReplay:
         assert rc == 0
         out = capsys.readouterr().out
         assert "replayed=2 still_failing=0" in out
-        assert queue.depth == 0  # both ACKed off the DLQ
+        assert queue.depth == 0  # both left the DLQ...
+        # ...and THE non-vacuous proof: both were actually ACKed, not just
+        # popped-and-abandoned (which would ALSO show depth == 0 — see
+        # FakeQueue's docstring). Remove ``await message.ack()`` in
+        # ``cmd_replay``'s ``--all`` branch and these two go RED while
+        # ``queue.depth == 0`` stays green.
+        assert all(m.acked for m in messages)
+        assert queue.acked_messages == messages
         assert len(exchange.published) == 2
         assert channel.declared_exchange is not None
         assert channel.declared_exchange[0] == "audittrace.scan"
@@ -351,6 +371,10 @@ class TestReplay:
         assert "replayed=1 still_failing=1" in out
         assert queue.depth == 1  # the failing one stayed
         assert len(exchange.published) == 1
+        ok_msg, bad_msg = messages
+        assert ok_msg.acked is True  # the succeeding publish WAS ACKed
+        assert bad_msg.acked is False  # the failing publish must NOT be
+        assert bad_msg.nacked_requeue is True  # left in place, not lost
 
     async def test_all_empty_queue(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -376,6 +400,14 @@ class TestReplay:
         assert queue.depth == 2  # only the target left the queue
         assert len(exchange.published) == 1
         assert exchange.published[0][0].message_id == "scan-target"
+        # THE non-vacuous proof (single-replay success): the target was
+        # actually ACKed; the requeued siblings were explicitly NOT.
+        assert messages[1].acked is True  # scan-target
+        assert messages[0].acked is False  # scan-1, requeued
+        assert messages[2].acked is False  # scan-3, requeued
+        assert messages[0].nacked_requeue is True
+        assert messages[2].nacked_requeue is True
+        assert queue.acked_messages == [messages[1]]
 
     async def test_single_failure_leaves_message_in_place(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -389,6 +421,9 @@ class TestReplay:
         )
         assert rc == 1
         assert queue.depth == 1  # NOT ACKed — publish failed
+        assert messages[0].acked is False
+        assert messages[0].nacked_requeue is True
+        assert queue.acked_messages == []
 
     async def test_single_not_found_requeues_everything(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -402,6 +437,8 @@ class TestReplay:
         assert "No entry" in capsys.readouterr().err
         assert queue.depth == 2  # nothing lost
         assert exchange.published == []
+        assert not any(m.acked for m in messages)
+        assert all(m.nacked_requeue for m in messages)
 
     async def test_no_amqp_url_refuses_without_connecting(
         self, monkeypatch: pytest.MonkeyPatch
@@ -475,6 +512,13 @@ class TestDrain:
         assert rc == 0
         assert "Drained 2 entries (kept 0)" in capsys.readouterr().out
         assert queue.depth == 0
+        # THE non-vacuous proof (drain bulk-ack): both were actually
+        # ACKed, not merely fetched-and-abandoned (which would ALSO leave
+        # depth == 0 — see FakeQueue's docstring). Remove
+        # ``await message.ack()`` in ``cmd_drain``'s ``--all`` branch and
+        # this goes RED while ``queue.depth == 0`` stays green.
+        assert all(m.acked for m in messages)
+        assert queue.acked_messages == messages
         # drain never opens the exchange at all — no republish path.
         assert channel.declared_exchange is None
         assert exchange.published == []
@@ -500,6 +544,10 @@ class TestDrain:
         assert rc == 0
         assert "Drained 1 entries (kept 1)" in capsys.readouterr().out
         assert queue.depth == 1  # scan-keep survives
+        drop_msg, keep_msg = messages
+        assert drop_msg.acked is True
+        assert keep_msg.acked is False
+        assert keep_msg.nacked_requeue is True
 
     async def test_all_older_than_filter_keeps_recent(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -516,6 +564,10 @@ class TestDrain:
         assert rc == 0
         assert "Drained 1 entries (kept 1)" in capsys.readouterr().out
         assert queue.depth == 1
+        old_msg, recent_msg = messages
+        assert old_msg.acked is True
+        assert recent_msg.acked is False
+        assert recent_msg.nacked_requeue is True
 
     async def test_all_older_than_fail_closed_on_missing_timestamp(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -531,6 +583,8 @@ class TestDrain:
         assert rc == 0
         assert "Drained 0 entries (kept 1)" in capsys.readouterr().out
         assert queue.depth == 1
+        assert messages[0].acked is False
+        assert messages[0].nacked_requeue is True
 
     async def test_single_success(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -552,6 +606,9 @@ class TestDrain:
         )
         assert rc == 0
         assert queue.depth == 1  # only scan-1 remains
+        assert messages[1].acked is True  # scan-target
+        assert messages[0].acked is False  # scan-1, requeued
+        assert messages[0].nacked_requeue is True
 
     async def test_single_not_found(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -571,6 +628,8 @@ class TestDrain:
         assert rc == 2
         assert "No entry" in capsys.readouterr().err
         assert queue.depth == 1  # nothing lost
+        assert messages[0].acked is False
+        assert messages[0].nacked_requeue is True
 
     async def test_no_amqp_url_refuses_without_connecting(
         self, monkeypatch: pytest.MonkeyPatch
