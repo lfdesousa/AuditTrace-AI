@@ -140,21 +140,59 @@ class TestScanOrphans:
         assert await janitor._scan_orphans() == []
 
     async def test_excludes_md_manifest_fold_rows(self, factory) -> None:
-        """SCAN-URI-BUG WU-1 — the confirmed root cause. A genuine
-        UPLOAD row (`scan_status='pending_scan'`, `key='s3://…'`) and a
-        decisions `.md` manifest fold (`scan_status IS NULL`,
-        `key='decisions/<doc_id>'`) both share the
-        `published_at_ms IS NULL` shape past the grace window. Only the
-        UPLOAD row is a genuine scan candidate.
+        """SCAN-URI-BUG WU-1 — the REALISTIC shape of the confirmed root
+        cause. A genuine UPLOAD row (`scan_status='pending_scan'`,
+        `key='s3://…'`) and a decisions `.md` manifest fold
+        (`scan_status IS NULL`, `key='decisions/<doc_id>'` — no s3://
+        scheme, since a `.md` fold's key is never a quarantine URI) both
+        share the `published_at_ms IS NULL` shape past the grace window.
+        Only the UPLOAD row is a genuine scan candidate.
 
-        Falsifiability: neuter this guard by dropping
-        ``.where(MemoryItem.scan_status.is_not(None))`` from
-        ``_scan_orphans`` — the decisions row reappears in the result
-        and this assertion goes RED.
+        NOTE (reviewer finding #1, 2026-08-23): in THIS realistic shape,
+        WU-2's s3:// guard also happens to exclude the `.md` fold (its
+        key has no s3:// scheme), so this test alone cannot prove
+        WU-1's `scan_status IS NOT NULL` predicate is what's doing the
+        work — see
+        ``test_excludes_md_manifest_fold_rows_independent_of_wu2_guard``
+        below for the isolating proof. This test stays because it's the
+        real-world regression case SCAN-URI-BUG was root-caused from.
         """
         await _seed_pending(factory, scan_id="upload-1", age_seconds=200)
         await _seed_md_manifest_fold(
             factory, key="decisions/2026-08-22-some-decision.md", age_seconds=200
+        )
+
+        janitor = ScanRequestJanitor(
+            settings=_settings(grace=60),
+            session_factory=factory,
+            queue=asyncio.Queue(),
+        )
+        envelopes = await janitor._scan_orphans()
+        scan_ids = {e.scan_id for e in envelopes}
+        assert scan_ids == {"upload-1"}
+
+    async def test_excludes_md_manifest_fold_rows_independent_of_wu2_guard(
+        self, factory
+    ) -> None:
+        """SCAN-URI-BUG WU-1 — the ISOLATING proof (reviewer finding #1,
+        2026-08-23). The `.md`-fold fixture here is given a
+        ``key="s3://…"`` — a value that WOULD pass WU-2's s3:// scheme
+        guard — so WU-2 CANNOT be what excludes it from the result.
+        Only the `scan_status IS NOT NULL` predicate can exclude a row
+        whose key already satisfies the s3:// scheme. This is
+        deliberately an UNREALISTIC row shape (a real `.md` fold never
+        carries an s3:// key) — its only purpose is to prove WU-1 is
+        independently load-bearing, not merely redundant with WU-2.
+
+        Falsifiability: with WU-2 still fully in place, drop
+        ``.where(MemoryItem.scan_status.is_not(None))`` from
+        ``_scan_orphans`` — this row reappears in the result (WU-2 would
+        happily pass an s3:// uri through) — RED. Restoring the filter
+        returns this test to green without touching WU-2 at all.
+        """
+        await _seed_pending(factory, scan_id="upload-1", age_seconds=200)
+        await _seed_md_manifest_fold(
+            factory, key="s3://quarantine/decisions-fold.md", age_seconds=200
         )
 
         janitor = ScanRequestJanitor(

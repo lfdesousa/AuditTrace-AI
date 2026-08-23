@@ -164,37 +164,56 @@ async def _scan_index_health_fields() -> dict[str, str]:
         fields["dead_lettered_index_count"] = "unknown"
     else:
         cutoff = _now_ms() - (settings.scan_janitor_grace_seconds * 1000)
-        # #364 session-scope discipline: the three counts are captured
-        # into LOCAL names and folded into `fields` while STILL inside
-        # the `async with` block, never after it closes — `fields`
-        # itself is never assigned-to from a session-bound expression,
-        # so it is safe to keep populating (scan_dlq_depth) and return
-        # once the block has exited.
-        async with session_factory() as session:
-            pending_scan_orphans = await _count_memory_items(
-                session,
-                MemoryItem.scan_status == "pending_scan",
-                MemoryItem.created_at_ms < cutoff,
-                MemoryItem.deleted_at_ms.is_(None),
-                field_name="pending_scan_orphans",
+        try:
+            # #364 session-scope discipline: the three counts are
+            # captured into LOCAL names and folded into `fields` while
+            # STILL inside the `async with` block, never after it
+            # closes — `fields` itself is never assigned-to from a
+            # session-bound expression, so it is safe to keep
+            # populating (scan_dlq_depth) and return once the block
+            # has exited.
+            #
+            # Reviewer finding #2 (2026-08-23): `_count_memory_items`
+            # only guards the QUERY — opening the session itself
+            # (``session_factory().__aenter__``) can also fail (pool
+            # exhaustion, a genuinely unreachable DB despite
+            # SQLAlchemy's lazy-connect usually masking this in dev).
+            # This outer try/except wraps session OPEN + all three
+            # queries + session CLOSE, so a failure at ANY of those
+            # points still degrades all three DB-derived fields to
+            # "unknown" instead of raising out of `/health`.
+            async with session_factory() as session:
+                pending_scan_orphans = await _count_memory_items(
+                    session,
+                    MemoryItem.scan_status == "pending_scan",
+                    MemoryItem.created_at_ms < cutoff,
+                    MemoryItem.deleted_at_ms.is_(None),
+                    field_name="pending_scan_orphans",
+                )
+                unindexed_count = await _count_memory_items(
+                    session,
+                    MemoryItem.scan_status == "scanned_clean",
+                    MemoryItem.indexed_at_ms.is_(None),
+                    MemoryItem.index_failed_at_ms.is_(None),
+                    MemoryItem.deleted_at_ms.is_(None),
+                    field_name="unindexed_count",
+                )
+                dead_lettered_index_count = await _count_memory_items(
+                    session,
+                    MemoryItem.index_failed_at_ms.is_not(None),
+                    MemoryItem.deleted_at_ms.is_(None),
+                    field_name="dead_lettered_index_count",
+                )
+                fields["pending_scan_orphans"] = pending_scan_orphans
+                fields["unindexed_count"] = unindexed_count
+                fields["dead_lettered_index_count"] = dead_lettered_index_count
+        except Exception as exc:
+            logger.warning(
+                "health.scan_index_session_open_failed", extra={"reason": str(exc)}
             )
-            unindexed_count = await _count_memory_items(
-                session,
-                MemoryItem.scan_status == "scanned_clean",
-                MemoryItem.indexed_at_ms.is_(None),
-                MemoryItem.index_failed_at_ms.is_(None),
-                MemoryItem.deleted_at_ms.is_(None),
-                field_name="unindexed_count",
-            )
-            dead_lettered_index_count = await _count_memory_items(
-                session,
-                MemoryItem.index_failed_at_ms.is_not(None),
-                MemoryItem.deleted_at_ms.is_(None),
-                field_name="dead_lettered_index_count",
-            )
-            fields["pending_scan_orphans"] = pending_scan_orphans
-            fields["unindexed_count"] = unindexed_count
-            fields["dead_lettered_index_count"] = dead_lettered_index_count
+            fields.setdefault("pending_scan_orphans", "unknown")
+            fields.setdefault("unindexed_count", "unknown")
+            fields.setdefault("dead_lettered_index_count", "unknown")
 
     fields["scan_dlq_depth"] = await _scan_dlq_depth(settings)
     return fields

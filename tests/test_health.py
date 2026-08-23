@@ -240,6 +240,50 @@ class TestScanIndexHealthFieldsDb:
             "dead_lettered_index_count",
         ]
 
+    async def test_session_open_failure_degrades_all_three_to_unknown(
+        self, monkeypatch
+    ) -> None:
+        """Reviewer finding #2 (2026-08-23): a failure OPENING the
+        session (``session_factory().__aenter__`` — pool exhaustion, a
+        genuinely unreachable DB despite SQLAlchemy's lazy-connect
+        usually masking this in dev) is a DIFFERENT failure mode than a
+        query raising (``_count_memory_items``'s own try/except, proven
+        by ``TestCountMemoryItems`` below) — it must ALSO degrade every
+        DB-derived field to "unknown" rather than propagating out of
+        ``_scan_index_health_fields`` (which would 500 /health).
+
+        Falsifiability: remove the ``try/except`` wrapping the
+        ``async with session_factory() as session:`` block in
+        ``_scan_index_health_fields`` — the ``RuntimeError`` raised by
+        ``__aenter__`` below propagates uncaught and this test errors
+        instead of asserting "unknown" — RED.
+        """
+
+        class _RaisingSessionContext:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                raise RuntimeError("session open failed (pool exhausted)")
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+        class _FakePostgresFactory:
+            def get_session_factory(self):
+                return _RaisingSessionContext()
+
+        dependencies.container._instances["postgres_factory"] = _FakePostgresFactory()
+        monkeypatch.setattr(health_mod, "get_settings", lambda: _settings(grace=60))
+        try:
+            fields = await health_mod._scan_index_health_fields()
+        finally:
+            dependencies.container._instances.pop("postgres_factory", None)
+
+        assert fields["pending_scan_orphans"] == "unknown"
+        assert fields["unindexed_count"] == "unknown"
+        assert fields["dead_lettered_index_count"] == "unknown"
+
 
 class TestCountMemoryItems:
     """Direct unit coverage of ``_count_memory_items``'s own best-effort
@@ -390,3 +434,35 @@ class TestHealthEndpointIntegration:
         response = await health_mod.health_check()
         assert response.status == "ok"
         assert response.components["dead_lettered_index_count"] == "1"
+
+    async def test_health_ok_when_session_open_itself_fails(self) -> None:
+        """Reviewer finding #2 (2026-08-23), end-to-end through the
+        actual route handler: a postgres_factory that's REGISTERED (so
+        ``get_postgres_factory()`` succeeds) but whose session raises on
+        ``__aenter__`` must still leave ``/health`` at ``status="ok"``
+        with the three DB fields degraded — not a 500."""
+
+        class _RaisingSessionContext:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                raise RuntimeError("session open failed (pool exhausted)")
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+        class _FakePostgresFactory:
+            def get_session_factory(self):
+                return _RaisingSessionContext()
+
+        dependencies.container._instances["postgres_factory"] = _FakePostgresFactory()
+        try:
+            response = await health_mod.health_check()
+        finally:
+            dependencies.container._instances.pop("postgres_factory", None)
+
+        assert response.status == "ok"
+        assert response.components["pending_scan_orphans"] == "unknown"
+        assert response.components["unindexed_count"] == "unknown"
+        assert response.components["dead_lettered_index_count"] == "unknown"
