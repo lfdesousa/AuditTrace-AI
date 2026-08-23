@@ -845,7 +845,7 @@ def _istiod_ready_deployment():
 
 
 def _healthy_kube_rules():
-    """The full read-only cluster read set for an all-green deploy (all nine probes).
+    """The full read-only cluster read set for an all-green deploy (all ten probes).
 
     The istiod-specific ``get deployment istiod`` rule MUST precede the generic
     ``get deployment`` rule (first-match-wins), and ``imageID`` MUST precede
@@ -979,7 +979,7 @@ def test_skip_version_check_does_not_weaken_the_digest_anchor(tmp_path, monkeypa
 
 
 def test_skip_version_check_preserves_the_fixed_nine_probe_order(tmp_path, monkeypatch):
-    """Determinism contract: all 9 identifiers, fixed order, health-version
+    """Determinism contract: all 10 identifiers, fixed order, health-version
     present with SKIPPED status -- the flag never changes probe count or order."""
     r = _digest_only_runner(
         tmp_path, monkeypatch, version="9.9.9", skip_version_check=True
@@ -1173,6 +1173,28 @@ def test_cli_skip_version_check_flag_sets_config(tmp_path):
         ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
     )
     assert verify.config_from_args(args2).skip_version_check is False
+
+
+def test_cli_scan_dlq_threshold_flag_sets_config(tmp_path):
+    args = verify.build_parser().parse_args(
+        [
+            "--target-version",
+            "v9.9.9",
+            "--front-door",
+            "https://audittrace.example",
+            "--scan-dlq-threshold",
+            "25",
+        ]
+    )
+    assert verify.config_from_args(args).scan_dlq_threshold == 25
+    # and the default (flag omitted) is the calibrated constant
+    args2 = verify.build_parser().parse_args(
+        ["--target-version", "v9.9.9", "--front-door", "https://audittrace.example"]
+    )
+    assert (
+        verify.config_from_args(args2).scan_dlq_threshold
+        == verify.SCAN_DLQ_DEFAULT_THRESHOLD
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1901,6 +1923,246 @@ def test_no_unhealthy_upstream_fail_closed_logs_unreadable(tmp_path, monkeypatch
     assert res.status == FAIL and "could not read memory-server logs" in res.detail
 
 
+# ── probe 10: scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ─
+#
+# Reads front-door /health `components.scan_dlq_depth` /
+# `components.dead_lettered_index_count` -- FAILs on a numeric depth above the
+# configured threshold (a flood), SKIPs (never FAILs) on absent/"unknown" (a
+# telemetry hiccup, or an older image predating #387 P2b). Each branch is
+# proven falsifiable per the SPEC: dropping the threshold comparison turns the
+# above-threshold FAIL test RED; removing either degrade branch turns the
+# corresponding SKIP test RED.
+
+
+def _health_with_components(**components):
+    return {"status": "ok", "version": "9.9.9", "components": components}
+
+
+def test_scan_dlq_depth_pass_below_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="3", dead_lettered_index_count="1"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == PASS
+    assert res.evidence["scan_dlq_depth"] == "3"
+    assert res.evidence["dead_lettered_index_count"] == "1"
+
+
+def test_scan_dlq_depth_fail_above_threshold(tmp_path, monkeypatch):
+    """NEUTER PROOF: drop the ``depth > threshold`` comparison (e.g. always
+    PASS regardless of depth) and this test goes RED -- a flood must trip
+    certification, closing the SCAN-URI-BUG loop gap."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="42", dead_lettered_index_count="7"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == FAIL
+    assert "42" in res.detail and "exceeds threshold" in res.detail
+    assert res.evidence["scan_dlq_depth"] == "42"
+    assert res.evidence["dead_lettered_index_count"] == "7"
+
+
+def test_scan_dlq_depth_skip_absent(tmp_path, monkeypatch):
+    """NEUTER PROOF: remove the absent-field SKIP branch (e.g. treat a missing
+    field as depth=0) and this test goes RED -- an older image predating
+    #387 P2b must not FAIL certification on a field it never emits."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp({("GET", "/health"): (200, {"status": "ok", "version": "9.9.9"})}),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    assert "absent" in res.detail
+    assert res.evidence["scan_dlq_depth"] is None
+    assert res.evidence["dead_lettered_index_count"] is None
+
+
+def test_scan_dlq_depth_skip_unknown(tmp_path, monkeypatch):
+    """NEUTER PROOF: remove the dedicated ``"unknown"``-value SKIP branch and
+    this test goes RED.
+
+    Isolating, not merely status-checking (memory-server lesson
+    ``lesson-vacuous-neuter-overlapping-guards-20260823``): removing the
+    ``"unknown"`` branch does NOT change ``res.status`` -- the generic
+    non-numeric fallback below it also SKIPs on ``int("unknown")`` raising
+    ``ValueError``, and its message even embeds the string ``"unknown"`` via
+    ``repr(depth_raw)``, so a naive ``"unknown" in res.detail`` assertion
+    would stay green under that neuter (the exact overlapping-guard failure
+    the lesson warns about). Asserting the DEDICATED branch's distinguishing
+    phrase, absent from the fallback message, is what actually isolates it.
+    """
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="unknown", dead_lettered_index_count="unknown"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    # unique to the dedicated "unknown" branch -- the fallback's message says
+    # "is not numeric", never "best-effort telemetry degraded"
+    assert "best-effort telemetry degraded" in res.detail
+    assert res.evidence["scan_dlq_depth"] == "unknown"
+
+
+def test_scan_dlq_depth_skip_non_numeric_garbage(tmp_path, monkeypatch):
+    """A malformed (non-"unknown", non-numeric) value degrades to SKIP too --
+    the probe must never crash the run on an unexpected telemetry shape."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(scan_dlq_depth="not-a-number"),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == verify.SKIPPED
+    assert "not numeric" in res.detail
+
+
+def test_scan_dlq_depth_fail_health_http_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_http_request", _FakeHttp({("GET", "/health"): (503, {})})
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == FAIL and "503" in res.detail
+
+
+def test_scan_dlq_depth_reports_both_values_on_pass(tmp_path, monkeypatch):
+    """SPEC: report both values ALWAYS (visibility at certify), not only on
+    FAIL -- the evidence carries exactly the two telemetry fields + the
+    threshold used, even on a clean PASS."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="0", dead_lettered_index_count="0"
+                    ),
+                )
+            }
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert res.status == PASS
+    assert set(res.evidence) == {
+        "scan_dlq_depth",
+        "dead_lettered_index_count",
+        "scan_dlq_threshold",
+    }
+
+
+def test_scan_dlq_depth_threshold_is_configurable(tmp_path, monkeypatch):
+    """A depth that PASSes under the default threshold FAILs under a stricter
+    configured one -- proves the threshold is actually read from config
+    (--scan-dlq-threshold), not hardcoded."""
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {("GET", "/health"): (200, _health_with_components(scan_dlq_depth="5"))}
+        ),
+    )
+    default_res = VerifyRunner(_cfg(tmp_path)).probe_scan_dlq_depth()
+    assert default_res.status == PASS
+    strict_res = VerifyRunner(
+        _cfg(tmp_path, scan_dlq_threshold=3)
+    ).probe_scan_dlq_depth()
+    assert strict_res.status == FAIL
+
+
+def test_scan_dlq_depth_default_threshold_is_ten(tmp_path):
+    assert verify.SCAN_DLQ_DEFAULT_THRESHOLD == 10
+    assert _cfg(tmp_path).scan_dlq_threshold == 10
+
+
+# ── probe 10: run()-level, additive over the other nine ──────────────────────
+
+
+def test_verdict_scan_dlq_flood_fails_certification_other_probes_unaffected(
+    tmp_path, monkeypatch
+):
+    """The falsifiable acceptance scenario from the SPEC: an otherwise-healthy
+    deploy whose scan DLQ has flooded FAILs certification -- closing the
+    SCAN-URI-BUG loop gap -- while every OTHER probe stays PASS (additive,
+    never changing the other nine probes' verdicts)."""
+    r = _all_pass_runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        verify,
+        "_http_request",
+        _FakeHttp(
+            {
+                ("GET", "/health"): (
+                    200,
+                    _health_with_components(
+                        scan_dlq_depth="99", dead_lettered_index_count="12"
+                    ),
+                ),
+                **_recall_routes(),
+            }
+        ),
+    )
+    report = r.run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert report["verdict"] == FAIL
+    assert statuses["scan-dlq-depth"] == FAIL
+    for name in verify.PROBES:
+        if name != "scan-dlq-depth":
+            assert statuses[name] == PASS
+
+
+def test_verdict_scan_dlq_absent_field_does_not_block_certification(
+    tmp_path, monkeypatch
+):
+    """A deploy on an image predating #387 P2b (no scan_dlq_depth field in
+    /health) still certifies PASS: the new probe reports SKIPPED, not a
+    regression on existing deploys' verdicts."""
+    report = _all_pass_runner(tmp_path, monkeypatch).run()
+    statuses = {p["name"]: p["status"] for p in report["probes"]}
+    assert statuses["scan-dlq-depth"] == verify.SKIPPED
+    assert report["verdict"] == PASS
+    assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
+
+
 # ── CodeQL fix: no raw log content leaks into the verify report ───────────────
 #
 # py/clear-text-logging-of-sensitive-data. memory-server / istiod logs can carry
@@ -2200,6 +2462,6 @@ def test_kubectl_hang_or_missing_fails_closed_and_still_emits_report(
     assert statuses["istiod-api-reachable"] == FAIL
     assert statuses["sidecars-have-certs"] == FAIL
     assert statuses["vault-secret-rendered"] == FAIL
-    # the verdict is complete (all nine probes ran) and a bundle was written
+    # the verdict is complete (all ten probes ran) and a bundle was written
     assert [p["name"] for p in report["probes"]] == list(verify.PROBES)
     assert list((tmp_path / "runs").glob("verify-v9.9.9-*.json"))

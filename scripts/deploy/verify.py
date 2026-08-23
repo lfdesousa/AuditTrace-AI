@@ -13,8 +13,9 @@ the verdict. The deployer decides "it deployed"; this
 runner decides, separately and on evidence it gathered itself, "it works". FAIL
 blocks "done": *up* means complete AND working, not "helm exited 0".
 
-Nine deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) — each
-PASS/FAIL with captured evidence (failures-are-findings, every check declares the
+Ten deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
+AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) — each PASS/FAIL/SKIPPED
+with captured evidence (failures-are-findings, every check declares the
 evidence it stands on):
 
 * **pods-ready**             — every expected app component has ≥1 Ready pod.
@@ -60,6 +61,16 @@ gate's result — the same independence contract the core probes hold):
   CrashLoop — captures container statuses, NEVER secret values.
 * **no-unhealthy-upstream**  — front-door ``/health`` == 200 ``status=ok`` AND no
   "no healthy upstream" 503 signature in the memory-server log window.
+* **scan-dlq-depth**         — front-door ``GET /health`` ``components.scan_dlq_depth``
+  and ``components.dead_lettered_index_count`` (#387 P2b). Both values are ALWAYS
+  captured as evidence, whatever the verdict. FAILs when ``scan_dlq_depth`` is
+  NUMERIC and exceeds ``--scan-dlq-threshold`` (default
+  :data:`SCAN_DLQ_DEFAULT_THRESHOLD`) — closes the SCAN-URI-BUG loop gap: a future
+  regression that re-floods the scan DLQ now trips certification instead of
+  passing silently. SKIPS (never FAILs) when the field is ABSENT (an older image
+  predating #387 P2b) or ``"unknown"`` (the health handler's own best-effort
+  telemetry degraded, same pattern as ``async_persist_dlq_depth``) — certify must
+  not be brittle against a telemetry-field hiccup.
 
 **Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
 ``kubectl exec``, NO root creds, NO scope-skip. Deterministic: no wall-clock
@@ -177,11 +188,12 @@ EXPECTED_MAX_UNAVAILABLE = "1"
 
 PASS = "PASS"
 FAIL = "FAIL"
-# A probe that was deliberately not evaluated -- currently only health-version
-# under --skip-version-check (#412). Distinct from FAIL: it carries no evidence
-# about whether the underlying condition holds, so it must never move the
-# verdict either way. Distinct from PASS: it must never manufacture a green
-# result the runner did not actually check.
+# A probe that was deliberately not evaluated -- health-version under
+# --skip-version-check (#412), or scan-dlq-depth when its telemetry field is
+# absent/"unknown" (spec 2026-08-23). Distinct from FAIL: it carries no
+# evidence about whether the underlying condition holds, so it must never move
+# the verdict either way. Distinct from PASS: it must never manufacture a
+# green result the runner did not actually check.
 SKIPPED = "SKIPPED"
 
 # The fixed advisory reason recorded on health-version when --skip-version-check
@@ -281,8 +293,20 @@ FAST_PROBE_TIMEOUT = 30
 E2E_CHAT_TIMEOUT_DEFAULT = 120
 E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
 
-# The nine probe identifiers — fixed order (determinism contract). The four
-# mesh-health probes are APPENDED so the core five keep their indices.
+# The scan-dlq-depth probe's FAIL threshold (spec 2026-08-23, closes the
+# SCAN-URI-BUG loop gap). A small default: normal steady-state depth for the
+# janitor's scan DLQ is near-zero (a handful of genuinely-poison objects at
+# most), so anything above a low single-to-double-digit count is already a
+# flood signature, not noise. Deliberately NOT zero — a transient blip (one
+# object briefly dead-lettered mid-retry) must not trip certification; only a
+# sustained flood should. Configurable via ``--scan-dlq-threshold`` so a
+# different target/workload can recalibrate without a code change (portability
+# invariant), same posture as E2E_CHAT_TIMEOUT_DEFAULT above.
+SCAN_DLQ_DEFAULT_THRESHOLD = 10
+
+# The ten probe identifiers — fixed order (determinism contract). The four
+# mesh-health probes are APPENDED so the core five keep their indices;
+# scan-dlq-depth is APPENDED last (spec 2026-08-23) for the same reason.
 PROBES = (
     "pods-ready",
     "digest-matches-published",
@@ -293,6 +317,7 @@ PROBES = (
     "sidecars-have-certs",
     "vault-secret-rendered",
     "no-unhealthy-upstream",
+    "scan-dlq-depth",
 )
 
 
@@ -446,6 +471,10 @@ class VerifyConfig:
     # SKIP_VERSION_CHECK_REASON. Additive, backward-compatible: default False
     # leaves every existing caller's behaviour byte-for-byte unchanged.
     skip_version_check: bool = False
+    # The scan-dlq-depth probe's FAIL threshold — see SCAN_DLQ_DEFAULT_THRESHOLD
+    # for the calibration rationale. Additive: default leaves every existing
+    # caller's behaviour byte-for-byte unchanged.
+    scan_dlq_threshold: int = SCAN_DLQ_DEFAULT_THRESHOLD
 
     def __post_init__(self) -> None:
         # Resolve None → the environment-dynamic default (env var > fallback).
@@ -735,7 +764,7 @@ def sanitized_finding(finding: mesh.Finding) -> dict[str, Any]:
 
 
 class VerifyRunner:
-    """Runs the five deploy-health probes and emits an independent PASS/FAIL verdict."""
+    """Runs the ten deploy-health probes and emits an independent PASS/FAIL verdict."""
 
     def __init__(self, cfg: VerifyConfig) -> None:
         self.cfg = cfg
@@ -1377,14 +1406,91 @@ class VerifyRunner:
             {"log_window": MESH_LOG_WINDOW},
         )
 
+    # -- probe 10: scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) --
+
+    def probe_scan_dlq_depth(self) -> ProbeResult:
+        """Front-door ``/health`` scan-DLQ depth — trips certification on a flood.
+
+        Reads ``/health`` the same read-only, front-door way probes 4 and 9
+        already do (no direct AMQP/RabbitMQ management API, no kubectl-exec
+        bypass). Both ``scan_dlq_depth`` and ``dead_lettered_index_count`` are
+        recorded as evidence on EVERY outcome (visibility at certify), not just
+        on FAIL. Degrades gracefully rather than failing on a telemetry
+        hiccup: the field is ABSENT on an older image (pre-#387 P2b) or
+        ``"unknown"`` when the health handler's own best-effort Redis read
+        degraded (``routes/health.py``'s ``except Exception: "unknown"``
+        pattern) — neither is evidence of a flood, so the probe SKIPS rather
+        than FAILing. Only a genuinely NUMERIC depth above
+        :attr:`VerifyConfig.scan_dlq_threshold` FAILs.
+        """
+        status_code, body = self._front_get("/health", token=None)
+        if status_code != 200 or not isinstance(body, dict):
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"front-door /health returned HTTP {status_code} (expected 200 + JSON)",
+                {"http_status": status_code},
+            )
+        components = body.get("components")
+        components = components if isinstance(components, dict) else {}
+        depth_raw = components.get("scan_dlq_depth")
+        dead_lettered_raw = components.get("dead_lettered_index_count")
+        evidence: dict[str, Any] = {
+            "scan_dlq_depth": depth_raw,
+            "dead_lettered_index_count": dead_lettered_raw,
+            "scan_dlq_threshold": self.cfg.scan_dlq_threshold,
+        }
+        if depth_raw is None:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                "scan_dlq_depth absent from /health components (older image, "
+                "predates #387 P2b) — degrading gracefully, not a certification"
+                "-blocking finding",
+                evidence,
+            )
+        if depth_raw == "unknown":
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                'scan_dlq_depth="unknown" (best-effort telemetry degraded) — '
+                "degrading gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        try:
+            depth = int(str(depth_raw))
+        except ValueError:
+            return self._record(
+                PROBES[9],
+                SKIPPED,
+                f"scan_dlq_depth={depth_raw!r} is not numeric — degrading "
+                "gracefully, not a certification-blocking finding",
+                evidence,
+            )
+        if depth > self.cfg.scan_dlq_threshold:
+            return self._record(
+                PROBES[9],
+                FAIL,
+                f"scan_dlq_depth={depth} exceeds threshold "
+                f"{self.cfg.scan_dlq_threshold} (scan-DLQ flood)",
+                evidence,
+            )
+        return self._record(
+            PROBES[9],
+            PASS,
+            f"scan_dlq_depth={depth} within threshold {self.cfg.scan_dlq_threshold}",
+            evidence,
+        )
+
     # -- orchestration + verdict --
 
     @property
     def verdict(self) -> str:
         """PASS iff every COUNTED probe passed; ANY FAIL → FAIL (the mandate-to-fail).
 
-        SKIPPED probes (currently only health-version under
-        ``--skip-version-check``, #412) are EXCLUDED from the tally — they carry
+        SKIPPED probes (health-version under ``--skip-version-check``, #412; or
+        scan-dlq-depth when its telemetry field is absent/"unknown", spec
+        2026-08-23) are EXCLUDED from the tally — they carry
         no evidence either way, so they can neither manufacture a PASS nor block
         one. A result set with no counted probes (empty, or every probe SKIPPED)
         is fail-closed FAIL: a verdict must stand on at least one probe that was
@@ -1406,6 +1512,8 @@ class VerifyRunner:
         self.probe_sidecars_have_certs()
         self.probe_vault_secret_rendered()
         self.probe_no_unhealthy_upstream()
+        # ── scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ──
+        self.probe_scan_dlq_depth()
         return self.write_report()
 
     def build_report(self) -> dict[str, Any]:
@@ -1527,6 +1635,19 @@ def build_parser() -> argparse.ArgumentParser:
             "published, is unaffected."
         ),
     )
+    parser.add_argument(
+        "--scan-dlq-threshold",
+        type=int,
+        default=SCAN_DLQ_DEFAULT_THRESHOLD,
+        help=(
+            "FAIL threshold for the scan-dlq-depth probe's front-door "
+            "/health components.scan_dlq_depth reading -- a numeric depth "
+            "above this trips certification (a scan-DLQ flood); the field "
+            f'being absent or "unknown" always SKIPS, never FAILs. Default '
+            f"{SCAN_DLQ_DEFAULT_THRESHOLD}, portable across targets/workloads "
+            "via this flag."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=VerifyConfig.out_dir)
     return parser
 
@@ -1544,6 +1665,7 @@ def config_from_args(args: argparse.Namespace) -> VerifyConfig:
         out_dir=args.out_dir,
         e2e_timeout=args.e2e_timeout,
         skip_version_check=args.skip_version_check,
+        scan_dlq_threshold=args.scan_dlq_threshold,
     )
 
 
