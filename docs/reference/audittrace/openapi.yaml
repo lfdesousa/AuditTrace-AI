@@ -1299,6 +1299,25 @@ paths:
       summary: List Tool Calls
       tags:
       - audit
+  /mcp:
+    post:
+      description: 'Single streamable-HTTP entry point for the MCP JSON-RPC methods
+
+        Phase 1 supports: ``initialize``, ``notifications/initialized``,
+
+        ``tools/list``, ``tools/call``, ``ping``.'
+      operationId: mcp_endpoint_mcp_post
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      security:
+      - audittrace-oauth2: []
+      summary: Mcp Endpoint
+      tags:
+      - mcp
   /memory/conversational:
     get:
       description: 'List the caller''s own chat sessions, ordered by date DESC.
@@ -2932,3 +2951,10 @@ tags:
 - description: Kubernetes-grade liveness + metrics endpoints. ``/health`` surfaces the summariser ctx-window and async-persist
     runtime state alongside the standard component checks.
   name: health
+- description: ADR-063 Phase 1 — the read/recall memory tools exposed over a standard MCP transport (streamable-HTTP, JSON-RPC
+    2.0 on ``POST /mcp``) so any MCP-speaking agent can use the audited tool backend without giving up the audit trail. Purely
+    additive to ``/v1/chat/completions``. Every ``tools/call`` is authorized per-tool against the caller's Keycloak scopes,
+    executed under the caller's isolated RLS context, and recorded through the SAME tamper-evident audit path the chat tool
+    loop uses (ADR-037/058) — one interaction + one tool_calls row per call. No write/curation tools are ever listed or callable
+    here, regardless of caller privilege; later phases add those under operator-tier scopes.
+  name: mcp

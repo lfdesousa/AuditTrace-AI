@@ -90,6 +90,15 @@ dependencies = [
     # crashing — keeps unit tests green on hosts that don't have
     # tesseract installed locally.
     "pytesseract>=0.3.10",
+    # ADR-063 Phase 1 — official MCP Python SDK. Only ``mcp.types`` is
+    # used (the Pydantic message shapes for the JSON-RPC 2.0 envelope);
+    # the SDK's own server/session-management transport is intentionally
+    # NOT used so the MCP endpoint can be a plain FastAPI route wired
+    # through the existing ``require_user`` auth dependency + RLS
+    # ContextVar binding (routes/mcp.py). Upper-bounded to the current
+    # major so a future SDK 2.x doesn't silently change message shapes
+    # under us.
+    "mcp>=1.9.0,<2.0.0",
     "opentelemetry-api>=1.27.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp>=1.27.0",
@@ -278,6 +287,11 @@ disable_error_code = ["misc", "type-arg"]
 
 [[tool.mypy.overrides]]
 module = "audittrace.auth"
+# FastAPI Request generic requires starlette stubs
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "audittrace.routes.mcp"
 # FastAPI Request generic requires starlette stubs
 disable_error_code = ["type-arg"]
 
