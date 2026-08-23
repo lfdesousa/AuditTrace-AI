@@ -168,3 +168,91 @@ This amendment does not revise the original decision; it records that ADR-028 no
 - One more DaemonSet to reason about per k3s cluster (OTel Collector + Promtail) — counted in the Helm chart resource footprint.
 - Collector self-telemetry on `:8888/metrics` is scraped by the sibling Prometheus via NodePort `:30888` (added in the same change).
 - Nothing in the application code path changes. The OTLP endpoint is still `http://otel-collector:4318`; the name resolves inside whichever runtime is active.
+
+## Amendment 2026-08-22 — Per-signal retention windows (RETENTION spec)
+
+**Spec:** `2026-08-22-SPEC-retention-per-signal-windows` (operator-ratified 2026-08-22,
+flagged "important" 2026-08-21). EU AI Act Art 12 (contemporaneity) anchor.
+
+### Context — retention was accidental
+
+Every backend in §6/§7's defaults grew out of upstream tool defaults, not a
+deliberate audit-horizon decision:
+
+| Signal | Default (pre-ratification) | Meaning |
+|---|---|---|
+| Tempo traces | `compactor.compaction.block_retention: 24h` | traces gone after ~1 day — the ">2-day-old span aged out" finding that motivated this spec |
+| Loki logs | no compactor, filesystem backend, `replication_factor: 1` | **no retention enforcement at all** — grows until disk fills. `reject_old_samples_max_age: 168h` is an *ingestion-age reject*, not a retention window |
+| Prometheus metrics | `--storage.tsdb.retention.time: 15d` | the only signal that was already a deliberate choice |
+| MinIO memory objects (episodic/procedural) | no lifecycle configured | durable, unbounded — correct outcome, but by omission, not decision |
+| ChromaDB semantic | no expiry | durable — same as above |
+| Postgres audit rows (`interactions`/`tool_calls`) | no expiry, append-only + hash-chained (ADR-058) | durable — same as above |
+
+The governing principle (proven 2026-08-21, `AUDITTRACE-TELEMETRY` skill §0):
+**obs signals (traces/logs/metrics) are the EPHEMERAL corroborating
+witness; the memory layers + audit rows are the DURABLE record.** A write
+older than ~2 days is reconstructable from the memory layer, not from
+traces. Obs signals can therefore carry short, deliberate windows; memory
++ audit carry long/explicit windows — no-expiry, in every case examined.
+
+### Decision — the ratified per-signal windows
+
+| Signal | Ratified window | Rationale |
+|---|---|---|
+| Tempo traces | **7d** (from 24h) | enough to debug the last week; corroborating only |
+| Loki logs | **30d** + an S3(MinIO)-backed compactor | audit-adjacent log horizon; kills the unbounded-disk risk |
+| Prometheus metrics | **30d** (from 15d) | one month of trend; cheap |
+| MinIO memory objects (episodic/procedural) | **no-expiry** (explicit lifecycle = retain) | the durable record — never auto-delete |
+| ChromaDB semantic | **no-expiry** | durable |
+| Postgres audit rows (`interactions`/`tool_calls`) | **no-expiry** | EU AI Act Art 12 durable audit trail; append-only (ADR-058) |
+
+### Witness at horizon — what answers "what happened" at each point in time
+
+The retention windows above are only legible together with the question
+they answer: *who can still tell you what happened, T after the event?*
+
+| Horizon | Authoritative witness | Why |
+|---|---|---|
+| T+1 day | Tempo trace, Loki logs, Prometheus metrics, memory layers, audit rows — **all of them** | inside every signal's window; the full observability picture is available |
+| T+7 days | Loki logs, Prometheus metrics, memory layers, audit rows | Tempo traces have just aged out (7d window) — no more span-level call-chain detail |
+| T+30 days | Memory layers (MinIO/ChromaDB), Postgres audit rows | Loki + Prometheus have aged out — no more log lines or metric history |
+| T+1 year | Memory layers (MinIO/ChromaDB), Postgres audit rows | still the only witnesses — obs signals are long gone by any horizon past 30d |
+
+At every horizon past 30 days, **the memory layers and the `interactions`/
+`tool_calls` audit rows are the entire reconstruction story** — which is
+exactly the point of making them no-expiry: they are the durable record
+EU AI Act Art 12 requires, independent of how long the corroborating
+telemetry happens to survive.
+
+### Codification — repo-canonical SSOT, not a hand-applied config
+
+The ratified windows are version-controlled config in **this deployment
+repository**, `charts/audittrace/files/retention-windows.yaml` — the same
+pattern as the SPEC #441 dashboards SSOT (`charts/audittrace/files/grafana-dashboards/`):
+one canonical file in the chart, synced/applied OUTWARD to the sibling
+obs-stack and to MinIO/S3 bucket lifecycle, never hand-authored
+independently in the sibling repo. `scripts/retention-drift-check.py`
+(`make check-retention-drift`) parses this file plus, where the sibling
+obs-stack checkout is present, the live Tempo/Loki/Prometheus configs, and
+prints every signal's EFFECTIVE window — exiting non-zero on any
+divergence from the ratified table, exiting 0 with a clear notice when
+the obs-stack directory is absent (CI-safe, mirrors
+`make check-dashboard-drift`).
+
+**Portability invariant:** the window *values* (7d/30d/30d/no-expiry) are
+identical across the laptop and cloud profiles — they are audit-horizon
+decisions, not environment-shaped. What differs per profile is *where*
+the live config lives: laptop MinIO buckets (`memory-private`/
+`memory-shared`) vs the cloud S3 override, and laptop filesystem-backed
+Loki vs cloud S3-chunks-backed Loki (ADR-027 direction, #313 obs-on-k8s).
+The `profiles` block in `retention-windows.yaml` carries that per-target
+plumbing; the ratified windows never vary by profile.
+
+**Scope of this amendment.** This records the DECISION + the repo-side
+drift-check. Applying the windows to the live sibling obs-stack
+(`~/work/observability-stack`) and to MinIO/S3 bucket lifecycle is
+operator-attended (never a blind fleet edit to a sibling repo) — see the
+spec's Out-of-scope section. Until applied, `make check-retention-drift`
+against a real obs-stack checkout will correctly report DRIFT (the
+Context table above IS today's live state); that is the guard doing its
+job, not a bug.
