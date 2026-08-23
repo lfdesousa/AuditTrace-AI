@@ -220,6 +220,20 @@ swapping to NATS JetStream or pgmq is a new adapter module + a
 factory branch — no business-logic changes. The investment in
 this ADR is the broker choice, not the code coupling.
 
+## Operator recovery lever (added 2026-08-23)
+
+`audittrace.scan.requests.dlq` (the DLX target declared in the AMQP
+topology above) had no operator recovery lever until
+`scripts/audittrace-scan-dlq` — the sibling of `scripts/audittrace-dlq`
+(ADR-046's Redis async-persist DLQ) and `scripts/replay_dead_lettered_index.py`
+(#287, the Postgres index dead-letter). It gives an operator
+`inspect` (read-only peek, requeue-proven non-destructive), `replay`
+(re-publish to `audittrace.scan` / `scan.requested`), and `drain`
+(ACK-and-drop, `--confirm`-gated) over the same `aio_pika` seam
+`health.py::_get_scan_dlq_message_count` already uses to surface
+`scan_dlq_depth` on `/health`. No new HTTP surface — AMQP + operator
+`kubectl port-forward` only, matching the other two DLQ tools' UX.
+
 ## Cross-references
 
 - ADR-048 — content-control trust boundary (the source ADR)
