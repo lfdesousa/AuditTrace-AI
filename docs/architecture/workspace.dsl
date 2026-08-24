@@ -8,6 +8,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         agent = person "Coding Agent" "OpenCode / Roo Code / Continue (OpenAI-compatible)"
         architect = person "Luis Filipe" "Solutions Architect"
         humanUser = person "Human User" "OAuth2 Device Flow login (ADR-032)"
+        mcpAgent = person "External MCP-speaking Agent" "Any MCP client (Claude Desktop, IDE plugin, CLI) speaking JSON-RPC 2.0 (ADR-063)"
 
         // External systems
         vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (ADR-043)" {
@@ -22,7 +23,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         summarizerServer = softwareSystem "Summariser LLM Server" "Background summaries — Mistral 7B, :11437 (ADR-030)" {
             tags "External"
         }
-        langfuse = softwareSystem "Langfuse" "Observability — traces + spans" {
+        langfuse = softwareSystem "Langfuse" "Observability — traces + spans; ephemeral corroborating witness, not the durable record (ADR-028 retention amendment)" {
             tags "External"
         }
         keycloak = softwareSystem "Keycloak" "Identity provider — OIDC JWTs (ADR-022/032)" {
@@ -34,7 +35,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         euLotl = softwareSystem "EU List of Trusted Lists" "EU trust-list registry for PAdES (ADR-052)" {
             tags "External"
         }
-        observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki (ADR-028)" {
+        observability = softwareSystem "Observability Stack" "Prometheus + Grafana + Loki (ADR-028) — Tempo 7d / Loki 30d / Prometheus 30d, ephemeral corroborating witness (2026-08-22 retention amendment)" {
             tags "External"
         }
         opencodeProxy = softwareSystem "OpenCode TLS Proxy" "Caddy loopback → TLS (Bun fetch workaround)" {
@@ -43,14 +44,19 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         contentControl = softwareSystem "audittrace-content-control" "Scans uploads, publishes verdicts (ADR-048)" {
             tags "External"
         }
-        rabbitmq = softwareSystem "RabbitMQ Broker" "Scan-control messaging (ADR-057)" {
+        rabbitmq = softwareSystem "RabbitMQ Broker" "Scan-control messaging (ADR-057) — incl. audittrace.scan.requests.dlq (quorum queue, x-delivery-limit=5), operator-drained via scripts/audittrace-scan-dlq" {
+            tags "External"
+        }
+        downstreamMcpServers = softwareSystem "Downstream MCP Servers" "Operator-configured external MCP servers fronted by the broker (Settings.mcp_broker_servers, ADR-063 Phase 2 Track B)" {
             tags "External"
         }
 
         // The system
         memoryServer = softwareSystem "audittrace-server" "Augmentation proxy — 4-layer memory + delegated identity" {
 
-            api = container "FastAPI Application" "OpenAI-compatible API + /context" "Python / FastAPI" {
+            !adrs adrs
+
+            api = container "FastAPI Application" "OpenAI-compatible API + /context + /mcp" "Python / FastAPI" {
 
                 chatRoute = component "Chat Route" "/v1/chat/completions (inject|tools)" "FastAPI Router"
                 contextRoute = component "Context Route" "/context" "FastAPI Router"
@@ -84,18 +90,37 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                 adminRoute = component "Admin Route" "/admin/trust-store/refresh (ADR-052)" "routes/admin.py"
                 trustStoreProvider = component "TrustStoreProvider" "Where the PEM lives — S3 default (ADR-052)" "S3TrustStoreProvider"
                 trustStoreBuilder = component "TrustStoreBuilder" "Where the PEM comes from — EU LOTL (ADR-052)" "EuLotlTrustStoreBuilder"
+
+                // MCP entry-interface (ADR-063) — Phase 1 read tools + Phase 2
+                // Track A write/curation tools + Phase 2 Track B broker, one
+                // coherent surface over the SAME audit path the chat tool loop
+                // uses. Additive: mounted in this SAME FastAPI process/pod as
+                // /v1/chat/completions, never a separate container.
+                mcpRoute = component "MCP Route" "POST /mcp — stateless JSON-RPC 2.0 entry-interface; require_user gates every method incl. tools/list (ADR-063)" "routes/mcp.py"
+                mcpReadBridge = component "MCP Read Bridge" "Phase 1: authorize (read-scope only, no admin bypass) → execute → record → return over the existing read-tool registry" "services/mcp_bridge.py"
+                mcpWriteRegistry = component "MCP Write Tool Registry" "MCP-only write/curation tool registry — structurally separate from MemoryToolRegistry so /v1/chat/completions is unaffected" "tools/mcp_write_registry.py"
+                mcpWriteHandlers = component "MCP Write/Curation Handlers" "write_decision / write_skill — private-tier-only upsert, per-tool scope, no admin bypass, no cache" "tools/mcp_write_handlers.py"
+                mcpBroker = component "MCP Broker" "Phase 2 Track B: downstream-tool registry + broker:<server>:<tool> dispatch fronting operator-configured external MCP servers; audits request+result either side of the network hop — honesty boundary, audits only what it actually brokers (ADR-037)" "services/mcp_broker.py"
+
+                // Scan-control plane (ADR-057) — lifespan-owned background
+                // tasks in this SAME FastAPI process, Hohpe Transactional
+                // Outbox over RabbitMQ.
+                scanRequestPublisher = component "Scan Request Publisher" "Outbox producer: MinIO quarantine PUT + memory_items INSERT (scan_status=pending_scan) → asyncio.Queue → AMQP publish" "services/scan_request_publisher.py"
+                scanRequestJanitor = component "Scan Request Janitor" "Re-enqueues orphaned outbox rows past the grace window; scan_status IS NOT NULL is the load-bearing discriminator that excludes .md manifest folds from being misrouted as scan candidates (SCAN-URI-BUG fix, 2026-08-23)" "services/scan_request_janitor.py"
+                scanVerdictConsumer = component "Scan Verdict Consumer" "Consumes scan.verdict.*  → scan_status + re-enqueues clean files for auto-index (ADR-048/ADR-057)" "services/scan_verdict_consumer.py"
+                scanAuditConsumer = component "Scan Audit Consumer" "Consumes scan.audit.* → SECURITY audit rows" "services/scan_audit_consumer.py"
             }
 
-            postgresDb = container "PostgreSQL 16" "Audit trail — interactions, sessions, tool_calls" "PostgreSQL" {
+            postgresDb = container "PostgreSQL 16" "Audit trail — interactions, sessions, tool_calls; no-expiry durable record, EU AI Act Art 12 (ADR-028 retention amendment)" "PostgreSQL" {
                 tags "Database"
             }
-            chromaDb = container "ChromaDB Server" "Vector store — token auth" "ChromaDB" {
+            chromaDb = container "ChromaDB Server" "Vector store — token auth; no-expiry durable record (ADR-028 retention amendment)" "ChromaDB" {
                 tags "Database"
             }
             redisCache = container "Redis 7" "Cache + streams — tokens, tool-results, persist" "Redis" {
                 tags "Database"
             }
-            minioStore = container "MinIO" "S3 object storage — shared + per-user (ADR-027)" "MinIO" {
+            minioStore = container "MinIO" "S3 object storage — shared + per-user (ADR-027); no-expiry durable record, explicit lifecycle = retain (ADR-027 retention amendment)" "MinIO" {
                 tags "Database"
             }
         }
@@ -182,13 +207,36 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         asyncPersistConsumer -> postgresDb "_persist_interaction → XACK" "SQLAlchemy"
         asyncPersistConsumer -> redisCache "XADD persist:dlq on poison" "Redis Streams"
 
-        // Ingestion content-control (ADR-048 / ADR-057)
+        // MCP entry-interface (ADR-063) — one audited surface: Phase 1 read
+        // tools + Phase 2 Track A write/curation tools + Phase 2 Track B
+        // broker. Authorize → execute/forward → record → return, through
+        // the SAME tamper-evident path the chat tool loop uses.
+        mcpAgent -> api "MCP entry-interface — audited tool calls (ADR-063)" "HTTP/JSON-RPC POST /mcp"
+        mcpRoute -> requireUser "depends on (every JSON-RPC method incl. tools/list)"
+        mcpRoute -> mcpReadBridge "own-tool dispatch — unnamespaced tool names (Phase 1)"
+        mcpRoute -> mcpWriteRegistry "get_write_tool_by_name — routing check (Phase 2 Track A)"
+        mcpWriteRegistry -> mcpWriteHandlers "call_write_tool(): tool.handler(user, args) on literal per-tool scope grant, no admin bypass"
+        mcpRoute -> mcpBroker "broker:<server>:<tool> dispatch (Phase 2 Track B)"
+        mcpReadBridge -> memoryToolRegistry "call_read_tool(): get_tool_by_name + invoke_tool (read-scope only, no admin bypass on the write boundary)"
+        mcpWriteHandlers -> semanticSvc "upsert write_decision / write_skill — private tier only (ADR-062)"
+        mcpWriteHandlers -> postgresDb "manifest row + tamper-evident memory-audit event (ADR-058)"
+        mcpBroker -> downstreamMcpServers "Forwards tools/call under the caller's resolved identity — never a client-supplied identity; audits request+result either side (honesty boundary, ADR-037)" "HTTP/JSON-RPC"
+        mcpRoute -> postgresDb "INSERT interactions + tool_calls — one trace per call; brokered calls record BOTH request+result (ADR-037/058)"
+
+        // Ingestion content-control (ADR-048 / ADR-057) — Hohpe
+        // Transactional Outbox: route → MinIO + manifest INSERT →
+        // in-process queue → ScanRequestPublisher → AMQP.
         api -> minioStore "PUT quarantine/<user>/<uuid>/<file>" "S3 API"
-        api -> rabbitmq "publish scan.request.* (ADR-057)" "AMQP (mTLS)"
+        scanRequestPublisher -> rabbitmq "publish scan.request.* — durable, outbox pattern (ADR-057)" "AMQP (mTLS)"
+        scanRequestJanitor -> postgresDb "SELECT orphaned rows — published_at_ms IS NULL AND scan_status IS NOT NULL, past the grace window (SCAN-URI-BUG discriminator)" "SQLAlchemy"
+        scanRequestJanitor -> scanRequestPublisher "re-enqueues onto the shared outbox queue"
         rabbitmq -> contentControl "deliver scan requests" "AMQP (mTLS)"
         contentControl -> minioStore "GET quarantine, PUT episodic/papers/" "S3 API"
         contentControl -> rabbitmq "publish verdicts + audit rows" "AMQP (mTLS)"
-        rabbitmq -> api "deliver verdicts → scan_status + security rows" "AMQP (mTLS)"
+        rabbitmq -> scanVerdictConsumer "deliver scan.verdict.*" "AMQP (mTLS)"
+        rabbitmq -> scanAuditConsumer "deliver scan.audit.*" "AMQP (mTLS)"
+        scanVerdictConsumer -> postgresDb "UPDATE memory_items scan_status; re-point key + reset indexed_at_ms on clean verdict (auto-index outbox)" "SQLAlchemy"
+        architect -> rabbitmq "Inspect / replay / drain audittrace.scan.requests.dlq (scripts/audittrace-scan-dlq, ADR-057 operator recovery lever)" "AMQP (kubectl port-forward)"
 
         // DI wiring
         diContainer -> contextBuilder "injects"
