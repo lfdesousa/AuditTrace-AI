@@ -1,0 +1,89 @@
+meta {
+  name: MCP — tools/call write_decision (write/curation tool, operator scope)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+      "name": "write_decision",
+      "arguments": {
+        "document_id": "{{mcpWriteDocId}}",
+        "text": "Bruno MCP Track C interactive-coverage probe document. Safe to leave in place — idempotent upsert, private tier only.",
+        "title": "MCP Track C Bruno probe"
+      }
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("JSON-RPC 2.0 result envelope", function() {
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body.id).to.equal(3);
+    expect(body.result).to.be.an("object");
+  });
+  test("write_decision executed (isError=false) with an operator-scoped caller", function() {
+    const result = res.getBody().result;
+    expect(result.isError).to.equal(false);
+    expect(result.structuredContent).to.be.an("object");
+    expect(result.structuredContent.document_id).to.equal(bru.getEnvVar("mcpWriteDocId"));
+    expect(result.structuredContent.collection).to.equal("decisions");
+    expect(result.structuredContent.tier).to.equal("private");
+    expect(result.structuredContent.manifest_id).to.be.a("string");
+  });
+}
+
+docs {
+  ADR-063 Phase 2 Track A (#297) — a write/curation tool, dispatchable
+  ONLY for a caller holding the tool's own scope
+  (`memory:decisions:write`), NO `is_admin` bypass
+  (`services.mcp_write_bridge`'s module docstring — deliberate
+  deviation from the Phase 1 read-tool convention so the
+  `AUDITTRACE_AUTH_REQUIRED=false` sentinel/dev-mode identity — which
+  IS `is_admin=True` but does NOT literally hold
+  `memory:decisions:write`/`memory:skills:write` — cannot silently
+  gain two mutation tools).
+
+  Requires the collection's default `scope` env var, which already
+  includes `memory:decisions:write memory:skills:write` (added
+  alongside Track A). Against the `local` env
+  (`AUDITTRACE_AUTH_REQUIRED=false`, laptop default) this request is
+  expected to come back `isError: true, "scope denied"` — the sentinel
+  identity's scopes are `("memory:admin", "memory:read",
+  "session:read-own")`, which do NOT include `memory:decisions:write`
+  (`audittrace.identity.sentinel_user_context`). Run against `cluster`
+  (`AUDITTRACE_AUTH_REQUIRED=true`) with a real device-flow token for
+  the certifiable success path.
+
+  Writes into `ChromaSemanticService` at the caller's PRIVATE tier
+  only (`tier="private"` — never caller-supplied), records a manifest
+  row (`layer="semantic"`) and a tamper-evident memory-audit event —
+  the SAME two side effects `POST /memory/semantic` produces, so the
+  document this writes is indistinguishable, downstream, from one
+  written via the REST API (visible to `recall_decisions`/
+  `recall_semantic`, listed in `GET /memory/semantic`).
+
+  Idempotent upsert — safe to re-run this request; it never accumulates
+  duplicate documents. `mcpWriteDocId` is a probe-only identifier,
+  deliberately distinct from `exampleDocId` (used by the
+  `memory/semantic/0N-*.bru` CRUD sequence) so the two probes never
+  collide.
+}

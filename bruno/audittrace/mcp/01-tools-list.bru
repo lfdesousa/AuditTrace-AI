@@ -1,0 +1,101 @@
+meta {
+  name: MCP — tools/list
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {}
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("JSON-RPC 2.0 result envelope", function() {
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body.id).to.equal(1);
+    expect(body.result).to.be.an("object");
+    expect(body.result.tools).to.be.an("array");
+  });
+  test("Phase 1 read/recall tools present (ADR-063 Phase 1, #293)", function() {
+    const names = res.getBody().result.tools.map((t) => t.name);
+    expect(names).to.include("recall_decisions");
+    expect(names).to.include("recall_skills");
+    expect(names).to.include("recall_recent_sessions");
+    expect(names).to.include("recall_semantic");
+    expect(names).to.include("read_decision");
+    expect(names).to.include("read_skill");
+  });
+  test("Phase 2 Track A write/curation tools present (#297)", function() {
+    const names = res.getBody().result.tools.map((t) => t.name);
+    expect(names).to.include("write_decision");
+    expect(names).to.include("write_skill");
+  });
+  test("Phase 2 Track B broker tools — namespaced broker:<server>:<tool>, downstream-gated (#296)", function() {
+    // NOT a "must be non-empty" assertion. The laptop AND the v1.24.8
+    // candidate deploy both run with the portability-invariant laptop
+    // default AUDITTRACE_MCP_BROKER_SERVERS="{}" (no operator-configured
+    // downstream MCP server) — so `brokerTools` is legitimately [] until
+    // an operator wires one up. Whenever it IS non-empty, every entry
+    // must be correctly namespaced (this part IS certifiable today: it
+    // is exercised by seeding `registry` directly in
+    // tests/test_mcp_broker_routes.py, not by this Bruno run).
+    const tools = res.getBody().result.tools;
+    const brokerTools = tools.filter((t) => t.name.startsWith("broker:"));
+    brokerTools.forEach((t) => {
+      const rest = t.name.slice("broker:".length);
+      const parts = rest.split(":");
+      expect(parts.length).to.be.at.least(2);
+      expect(parts[0]).to.not.be.empty;
+      expect(parts.slice(1).join(":")).to.not.be.empty;
+    });
+  });
+}
+
+docs {
+  ADR-063 Phase 1 + Phase 2 Track A + Phase 2 Track B, all in one
+  `tools/list` call — the merged, final MCP surface (Track C spec:
+  "fold read + write + broker + no-auth-401 in one coherent add").
+
+  `result.tools` is the union of three sources
+  (`routes/mcp.py::_handle_tools_list`):
+
+  1. Phase 1 read/recall tools (`services.mcp_bridge.list_read_tools`) —
+     unnamespaced, always present for a caller with the matching
+     `memory:*:read`/`memory:conversational:read-own` scope.
+  2. Phase 2 Track A write/curation tools
+     (`services.mcp_write_bridge.list_write_tools`) — unnamespaced,
+     visible ONLY to a caller literally holding
+     `memory:decisions:write`/`memory:skills:write` (no `is_admin`
+     bypass — see that module's docstring).
+  3. Phase 2 Track B brokered tools
+     (`services.mcp_broker.list_downstream_tools`) — namespaced
+     `broker:<server>:<tool>`, discovered live from every ENABLED,
+     operator-configured downstream MCP server the caller is
+     authorized for. Empty by default (portability invariant: laptop
+     default `AUDITTRACE_MCP_BROKER_SERVERS="{}"`).
+
+  Run against the `cluster` env with a token minted via
+  `auth/01-device-flow-init.bru` → `auth/02-device-flow-poll.bru` using
+  the collection's default `scope` (already includes
+  `memory:decisions:write memory:skills:write`, added alongside Track
+  A). `require_user` gates this endpoint even for `tools/list` — see
+  `routes/mcp.py`'s module docstring, "not just tools/call".
+}
