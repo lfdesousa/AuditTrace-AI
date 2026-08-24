@@ -20,6 +20,13 @@ pattern. This file is the builder-side artefact that stands in for the PR-body
 Validation/Reconstruction sections until a real PR exists (the builder role never
 pushes/opens a PR — SDLC-ADR-000 §invariants).
 
+**Revision note (second pass, same 2026-08-24 date).** The independent reviewer's
+first REJECT identified one real gap: the B5 invariant (trailer is DISPLAY-ONLY,
+never enters `interactions.answer`/Langfuse output) had no automated test and
+this file's Rule-3 capture originally covered the non-streaming path only. §3
+items 6-7 and §4d are new; nothing else in this file was changed, and no shipping
+logic changed — only tests + this evidence file.
+
 ## 1. Full test-suite run (Rule 1 — Verification)
 
 ```
@@ -102,12 +109,28 @@ exactly the intended 2-file diff — no residual neuter markers):
    `assert len(fake.post_calls) == 3` went RED (`assert 4 == 3`), proving the
    upstream-POST-count assertion actually catches a second generation call, not
    just asserting a number nobody would notice drift on.
+6. **B5 audit-leak (streaming) — added after the 2026-08-24 reviewer REJECT.**
+   Inserted `result.answer_text += trailer` right where the trailer SSE frame is
+   yielded (the EXACT regression the reviewer demonstrated slips past every other
+   guard). `TestSourcesTrailerFlagOnGate4::
+   test_streaming_trailer_matches_recorded_audit_row`'s new
+   `assert SOURCES_TRAILER_LABEL not in latest_interaction.answer` went RED
+   (`assert 'Sources consultées' not in '<think>reca...- ADR-009.md'`).
+7. **B5 audit-leak (non-streaming) — same reviewer REJECT.** Inserted the
+   equivalent leak (`answer_text += build_sources_trailer(pending)`) right after
+   `finish_reason` is computed on the non-streaming path —
+   `test_non_streaming_trailer_matches_recorded_audit_rows`'s new
+   `assert SOURCES_TRAILER_LABEL not in latest_interaction.answer` went RED
+   (`assert 'Sources consultées' not in 'Final groun...- ADR-010.md'`).
 
 After each neuter, `git diff` was inspected to confirm ONLY the deliberate,
 single-purpose mutation was present (no accidental co-mutation), the targeted
-test(s) were re-run to confirm RED, the file was restored verbatim, and the full
-`test_sources_trailer.py` suite (19 tests) plus the broader chat/tool-loop/
-openai-compat/config suites (262 tests) were re-run GREEN before proceeding.
+test(s) were re-run to confirm RED, the file was restored verbatim (proofs 6/7:
+`diff` against a pre-neuter `chat.py` backup showed byte-identical restoration),
+and the full `test_sources_trailer.py` suite (19 tests) plus the broader
+chat/tool-loop/openai-compat/config suites (262 tests, real alphabetical suite
+order) were re-run GREEN before proceeding. Full `make test` (3602 tests, real
+suite order) reconfirmed GREEN after proofs 6/7.
 
 ## 4. Local end-to-end capture through the real FastAPI app (Rule 3 shape)
 
@@ -173,6 +196,39 @@ The trailer's bytes are reconstructed directly from the persisted `ToolCall.
 result_summary` column — not compared against a fixture the test also wrote — and
 match exactly. Capture script: `scratchpad/capture_sources_trailer.py`
 (session-local, not committed — the transcript above is the durable artefact).
+
+### 4d. B5 — the trailer is DISPLAY-ONLY, on the STREAMING path too
+
+Added after an independent-reviewer REJECT (2026-08-24, second pass): the B5
+invariant ("the trailer must never enter the persisted audit record") was correct
+by inspection but had NO automated test protecting it, and this evidence file
+originally captured the non-streaming path only. The reviewer proved it was a real
+gap by injecting `result.answer_text += trailer` on the streaming path — the
+entire suite (`test_sources_trailer.py` 19/19 + the broader chat/tool-loop/
+openai-compat suites) stayed green. Fixed by adding explicit
+`InteractionRecord.answer` assertions to both `TestSourcesTrailerFlagOnGate4`
+tests (non-streaming AND streaming) and re-running the SAME class of neuter on
+each path to confirm the new assertions go RED (§3 below), then a real streaming
+capture through `create_app()`:
+
+```
+POST /v1/chat/completions {"model":"qwen3.5-35b","messages":[{"role":"user",
+  "content":"what about KV cache?"}],"stream":true}  (AUDITTRACE_RESPONSE_SOURCES=trailer)
+→ 200, stream_calls: 2 (one tool-call turn + one content turn — unchanged,
+                          the trailer added ZERO upstream calls)
+  client-facing joined SSE content: "<think>recall</think>Based on ADR-009.
+    \n\n**Sources consultées**\n- ADR-009.md"
+  interactions.answer (persisted): "<think>recall</think>Based on ADR-009."
+  "Sources consultées" in client-facing content:            True
+  "Sources consultées" in persisted interactions.answer:    False
+```
+
+The persisted row is exactly what `result.answer_text` accumulated from the
+loop's OWN streamed chunks (both turns' content, including the `<think>` text
+that streams live per #299) — the trailer chunk, yielded on the wire AFTER those
+chunks, never feeds back into `result.answer_text`. Capture script:
+`scratchpad/capture_sources_trailer_streaming.py` (session-local, not committed —
+the transcript above is the durable artefact).
 
 ## 5. Reconstruction chain proven locally
 

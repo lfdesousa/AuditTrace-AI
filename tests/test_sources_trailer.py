@@ -25,7 +25,7 @@ import pytest
 from langchain_core.documents import Document
 from sqlalchemy import select
 
-from audittrace.db.models import ToolCall
+from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import SENTINEL_SUBJECT
 from audittrace.routes import _sources_trailer as trailer_mod
@@ -429,7 +429,20 @@ class TestSourcesTrailerFlagOnGate4:
         pg = get_postgres_factory()
         async with pg.get_session_factory()() as db:
             rows = (await db.execute(select(ToolCall))).scalars().all()
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
         assert len(rows) == 2  # one row per recall_decisions call
+
+        # B5 (LibreChat state is auxiliary, the audit plane is the system
+        # of record) — the trailer is DISPLAY-ONLY. It must NEVER enter the
+        # persisted audit record: the interactions.answer column stays
+        # exactly what the model actually answered, byte-for-byte, with no
+        # trailer suffix. A regression here (e.g. persisting
+        # ``answer_text + trailer``) would silently corrupt the audit trail
+        # with rendering-layer text no model ever produced.
+        latest_interaction = interactions[-1]
+        assert SOURCES_TRAILER_LABEL not in latest_interaction.answer
+        assert latest_interaction.answer == "Final grounded answer."
+
         recorded_refs: list[str] = []
         for row in rows:
             parsed = json.loads(row.result_summary)
@@ -446,7 +459,7 @@ class TestSourcesTrailerFlagOnGate4:
         # rendering of the recorded audit-row source_refs.
         assert content == "Final grounded answer." + expected_trailer
 
-    def test_streaming_trailer_matches_recorded_audit_row(
+    async def test_streaming_trailer_matches_recorded_audit_row(
         self, client, test_container, _tools_mode_with_trailer
     ):
         _seed_decisions(test_container, [("ADR-009.md", "cache compression body")])
@@ -484,6 +497,18 @@ class TestSourcesTrailerFlagOnGate4:
         # byte-compare under test here is the trailer itself, appended
         # exactly once, exactly after the real answer text.
         assert joined == "<think>recall</think>Based on ADR-009." + expected_trailer
+
+        # B5 — the trailer is DISPLAY-ONLY on the STREAMING path too. The
+        # persisted interactions.answer (built from result.answer_text,
+        # which accumulates only the LOOP'S OWN streamed chunks) must
+        # never carry the trailer, even though the trailer chunk was
+        # yielded on the wire after those chunks.
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        latest_interaction = interactions[-1]
+        assert SOURCES_TRAILER_LABEL not in latest_interaction.answer
+        assert latest_interaction.answer == "<think>recall</think>Based on ADR-009."
 
     async def test_trivial_prompt_no_recall_no_trailer(
         self, client, _tools_mode_with_trailer
