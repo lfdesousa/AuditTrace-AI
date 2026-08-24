@@ -84,6 +84,20 @@ class PendingToolCall:
     ``phase="result"``) a brokered call writes, using the SAME
     ``PendingToolCall`` → ``_flush_pending_tool_calls`` path rather than
     a second recorder.
+
+    ``source_refs`` (M3-SOURCES-TRAILER-TRUNCATION-FIX, 2026-08-24) carries
+    the distinct ``source_ref`` values (ADR-060 recall identity) extracted
+    from the FULL tool result BEFORE ``result_summary`` is truncated to
+    1000 chars below. In-memory / per-request only — never persisted to
+    the ``tool_calls`` table (no schema change; the audit column stays
+    truncated as designed). ``routes/_sources_trailer.py`` reads this
+    field directly and MUST NEVER re-derive it by re-parsing
+    ``result_summary`` — a multi-match recall's serialized result
+    routinely exceeds 1000 chars, which corrupts the JSON at the cut and
+    made the trailer inert in production (the bug this field fixes).
+    Empty for tools whose result carries no ``matches`` list
+    (``read_decision``/``read_skill``) or whose matches carry no
+    ``source_ref`` (``recall_recent_sessions``), and for errored calls.
     """
 
     tool_name: str
@@ -102,6 +116,7 @@ class PendingToolCall:
     downstream_tool: str | None = None
     args_digest: str | None = None
     result_digest: str | None = None
+    source_refs: list[str] = field(default_factory=list)
 
 
 # ─────────────────────── Tool-call extraction helpers ──────────────────────
@@ -597,6 +612,35 @@ async def run_memory_tool_loop(
     return last_body, pending
 
 
+def _source_refs_from_result(result: dict[str, Any]) -> list[str]:
+    """Extract distinct ``source_ref`` values from a FULL, pre-truncation
+    memory-tool ``result`` dict, in first-seen order, deduplicated.
+
+    Called BEFORE ``result_summary`` is truncated to 1000 chars for the
+    audit row (see ``PendingToolCall.source_refs`` and the M3-SOURCES-
+    TRAILER-TRUNCATION-FIX finding) so the sources trailer can render
+    regardless of how large the serialized result is. Only a result
+    carrying a ``matches`` list contributes — this is what naturally
+    excludes ``recall_recent_sessions`` (no ``source_ref`` on its match
+    shape) and ``read_decision``/``read_skill`` (single-doc shape, no
+    ``matches`` key at all) without any per-tool special-casing, mirroring
+    ``routes/_sources_trailer.py``'s prior (removed) parsing logic.
+    """
+    matches = result.get("matches")
+    if not isinstance(matches, list):
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        source_ref = match.get("source_ref")
+        if isinstance(source_ref, str) and source_ref and source_ref not in seen:
+            seen.add(source_ref)
+            ordered.append(source_ref)
+    return ordered
+
+
 async def _execute_memory_tool(
     *,
     tc: dict[str, Any],
@@ -718,10 +762,16 @@ async def _execute_memory_tool(
             # no cache_hit column) and the ~1ms duration corroborates.
             cache_error: str | None = None
             cache_summary: str | None = None
+            cache_source_refs: list[str] = []
             if "error" in result:
                 cache_error = str(result.get("error"))
                 span.set_status(trace.StatusCode.ERROR, cache_error)
             else:
+                # Extract source_refs from the FULL result BEFORE the
+                # 1000-char audit truncation below (M3-SOURCES-TRAILER-
+                # TRUNCATION-FIX) — the trailer reads this structural
+                # field, never the truncated JSON string.
+                cache_source_refs = _source_refs_from_result(result)
                 cache_summary = json.dumps({"cache_hit": True, **result})[:1000]
             pending.append(
                 PendingToolCall(
@@ -734,16 +784,23 @@ async def _execute_memory_tool(
                     started_at=started,
                     duration_ms=duration_ms,
                     granted_scope=tool.required_scope,
+                    source_refs=cache_source_refs,
                 )
             )
             return
 
         error_text: str | None = None
         summary: str | None = None
+        source_refs: list[str] = []
         if "error" in result:
             error_text = str(result.get("error"))
             span.set_status(trace.StatusCode.ERROR, error_text)
         else:
+            # Extract source_refs from the FULL result BEFORE the 1000-char
+            # audit truncation (M3-SOURCES-TRAILER-TRUNCATION-FIX) — the
+            # trailer reads this structural field, never the truncated
+            # JSON string.
+            source_refs = _source_refs_from_result(result)
             # Truncated JSON summary for the audit row so the column stays
             # bounded even on huge result sets.
             summary = json.dumps(result)[:1000]
@@ -767,6 +824,7 @@ async def _execute_memory_tool(
                 started_at=started,
                 duration_ms=duration_ms,
                 granted_scope=tool.required_scope,
+                source_refs=source_refs,
             )
         )
 
