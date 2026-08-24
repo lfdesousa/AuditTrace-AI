@@ -57,6 +57,7 @@ from audittrace.routes._memory_tool_loop import (
     run_memory_tool_loop,
 )
 from audittrace.routes._model_route import resolve_chat_upstream, upstream_host
+from audittrace.routes._sources_trailer import build_sources_trailer
 from audittrace.services.context_builder import (
     ContextBuilderService,
     build_ambient_context,
@@ -1540,6 +1541,27 @@ async def _handle_tools_mode(
                     result=result,
                 ):
                     yield frame
+                # M3 slice 1 (spec §4.4): a deterministic, orchestrator-
+                # emitted sources trailer — flag-gated, default off, so
+                # this is a no-op for every existing streaming consumer.
+                # Only on a genuine final answer (``finish_reason=="stop"``)
+                # — an externally-forwarded tool_calls turn has no answer
+                # yet to cite sources for. Built from ``result.pending``,
+                # the SAME records flushed to the ``tool_calls`` audit
+                # table below — never a second, potentially divergent,
+                # read path, and never model-generated.
+                if (
+                    settings.response_sources == "trailer"
+                    and result.finish_reason == "stop"
+                ):
+                    trailer = build_sources_trailer(result.pending)
+                    if trailer is not None:
+                        yield _sse_content_frame(
+                            result.resp_id,
+                            result.created,
+                            result.model or requested_model,
+                            trailer,
+                        )
                 # Trailing frames: finish + synthetic usage + DONE.
                 yield _sse_finish_frame(
                     result.resp_id,
@@ -1857,7 +1879,24 @@ async def _handle_tools_mode(
     except Exception:  # pragma: no cover - defensive attribute write
         pass
 
-    # 6 — Return the final body as JSON. The streaming case returned far
+    # 6 — M3 slice 1 (spec §4.4): append the deterministic sources trailer
+    # to the CLIENT-FACING body only — never to ``answer_text`` above, which
+    # is what got persisted + pushed to Langfuse. The trailer is a
+    # rendering of already-audited data (the ``tool_calls`` rows just
+    # flushed), not new audit data, so it stays out of the audit-record
+    # answer field. Flag-gated, default off (byte-identical for every
+    # existing consumer); only on a genuine final answer, mirroring the
+    # streaming branch's ``finish_reason == "stop"`` guard.
+    if settings.response_sources == "trailer" and finish_reason == "stop":
+        trailer = build_sources_trailer(pending)
+        if trailer is not None:
+            body_choices = final_body.get("choices") or []
+            if body_choices:
+                body_message = body_choices[0].get("message") or {}
+                body_message["content"] = (body_message.get("content") or "") + trailer
+                body_choices[0]["message"] = body_message
+
+    # 7 — Return the final body as JSON. The streaming case returned far
     # earlier via the per-turn streaming branch (#299); by here the request
     # is always non-streaming.
     return final_body
