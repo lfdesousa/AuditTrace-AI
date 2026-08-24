@@ -1,5 +1,6 @@
 """MCP entry-interface — ADR-063 Phase 1 (read/recall tools) + Phase 2
-Track B (the audited tool-broker gateway).
+Track B (the audited tool-broker gateway) + Phase 2 Track A (write/
+curation tools).
 
 **Additive.** Mounts a standard MCP transport (streamable-HTTP,
 JSON-RPC 2.0 over a single ``POST /mcp``) on a NEW path. Nothing about
@@ -33,9 +34,21 @@ Every ``tools/call``:
 
 **Which dispatcher a ``tools/call`` reaches.** ``name`` starting with
 ``broker:`` (``services.mcp_broker.parse_namespaced_tool_name``
-recognises it) routes to ``mcp_broker.broker_tool_call``; every other
-name routes to the Phase 1 ``mcp_bridge.call_read_tool`` path, byte-
-identical to before Track B existed.
+recognises it) routes to ``mcp_broker.broker_tool_call``; a name
+registered in the MCP-only write/curation registry
+(``services.mcp_write_bridge.get_write_tool_by_name``) routes to
+``mcp_write_bridge.call_write_tool``; every other name routes to the
+Phase 1 ``mcp_bridge.call_read_tool`` path, byte-identical to before
+Track A/B existed.
+
+**Track A — write/curation tools.** ``write_decision``/``write_skill``
+are admitted into ``tools/list`` and dispatchable ONLY for a caller
+holding the tool's own ``memory:{decisions,skills}:write`` scope — no
+``is_admin`` bypass (see ``services.mcp_write_bridge``'s module
+docstring). They live in a registry structurally separate from the
+Phase 1 read tools' ``MEMORY_TOOL_REGISTRY``, so neither
+``/v1/chat/completions`` nor Phase 1's own manifest/dispatch is touched
+by their existence.
 
 **Auth scope of this endpoint.** ``require_user`` gates EVERY JSON-RPC
 method on this route, including ``initialize`` and ``tools/list`` —
@@ -91,6 +104,11 @@ from audittrace.services.mcp_broker import (
     broker_tool_call,
     list_downstream_tools,
     parse_namespaced_tool_name,
+)
+from audittrace.services.mcp_write_bridge import (
+    call_write_tool,
+    get_write_tool_by_name,
+    list_write_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -155,6 +173,7 @@ async def _handle_tools_list(
     request_id: Any, user_context: UserContext
 ) -> JSONResponse:
     tools = [to_mcp_tool(t) for t in list_read_tools(user_context)]
+    tools.extend(to_mcp_tool(t) for t in list_write_tools(user_context))
     tools.extend(await list_downstream_tools(user_context))
     result = mcp_types.ListToolsResult(tools=tools)
     return JSONResponse(
@@ -177,6 +196,29 @@ async def _dispatch_own_tool(
         session_id=session_id,
         tool_name=tool_name,
         arguments=arguments,
+    )
+    return (
+        outcome.result,
+        [outcome.pending],
+        outcome.status,
+        outcome.failure_class,
+        outcome.error_detail,
+    )
+
+
+async def _dispatch_write_tool(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    user_context: UserContext,
+) -> tuple[
+    mcp_types.CallToolResult, list[PendingToolCall], str, str | None, str | None
+]:
+    """Phase 2 Track A write/curation dispatch — exactly ONE
+    ``PendingToolCall`` record per call (deny, error, or success), same
+    "one call, one row" invariant as the Phase 1 own-tool path."""
+    outcome = await call_write_tool(
+        user_context=user_context, tool_name=tool_name, arguments=arguments
     )
     return (
         outcome.result,
@@ -236,9 +278,11 @@ async def _handle_tools_call(
         request, _MCP_SOURCE, tool_name, user_context.user_id
     )
 
-    # Dispatch routing (ADR-063 Phase 2 Track B): a ``broker:<server>:
-    # <tool>`` name goes to the broker; every other name keeps the exact
-    # Phase 1 own-tool path.
+    # Dispatch routing (ADR-063 Phase 2 Track A + Track B): a
+    # ``broker:<server>:<tool>`` name goes to the broker; a name
+    # registered in the MCP-only write/curation registry goes to Track
+    # A's write dispatch; every other name keeps the exact Phase 1
+    # own-tool path.
     if parse_namespaced_tool_name(tool_name) is not None:
         (
             result,
@@ -247,6 +291,16 @@ async def _handle_tools_call(
             failure_class,
             error_detail,
         ) = await _dispatch_broker_tool(
+            tool_name=tool_name, arguments=arguments, user_context=user_context
+        )
+    elif get_write_tool_by_name(tool_name) is not None:
+        (
+            result,
+            pending,
+            status,
+            failure_class,
+            error_detail,
+        ) = await _dispatch_write_tool(
             tool_name=tool_name, arguments=arguments, user_context=user_context
         )
     else:
