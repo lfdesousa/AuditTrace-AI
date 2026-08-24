@@ -31,7 +31,7 @@ services:
     # which re-introduces `build: .` + bind-mounts /src for hot
     # reload. Override the tag for local dev builds with:
     #   AUDITTRACE_IMAGE_TAG=dev docker compose up -d
-    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.24.8}
+    image: docker.io/lfds/audittrace-memory-server:${AUDITTRACE_IMAGE_TAG:-1.24.9}
     container_name: audittrace-server
     entrypoint: ["/app/scripts/entrypoint.sh"]
     depends_on:
@@ -85,7 +85,7 @@ services:
       # otel-collector service is in a future B7 step.
       - AUDITTRACE_OTLP_ENDPOINT=${AUDITTRACE_OTLP_ENDPOINT:-}
       - OTEL_SERVICE_NAME=audittrace-server
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.24.8},deployment.environment=${AUDITTRACE_ENV:-local}
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=audittrace,service.version=${AUDITTRACE_IMAGE_TAG:-1.24.9},deployment.environment=${AUDITTRACE_ENV:-local}
       - OTEL_SEMCONV_STABILITY_OPT_IN=${OTEL_SEMCONV_STABILITY_OPT_IN:-http/dup}
       - AUDITTRACE_METRICS_ENABLED=${AUDITTRACE_METRICS_ENABLED:-true}
       - AUDITTRACE_LANGFUSE_HOST=${AUDITTRACE_LANGFUSE_HOST:-http://langfuse-web:3000}
