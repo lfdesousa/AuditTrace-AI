@@ -43,10 +43,33 @@ tests {
     expect(names).to.include("read_decision");
     expect(names).to.include("read_skill");
   });
-  test("Phase 2 Track A write/curation tools present (#297)", function() {
+  test("Phase 2 Track A write/curation tools — present iff auth is enforced (#297)", function() {
+    // Environment-aware, NOT a skip: this asserts the REAL, opposite
+    // behaviour on each env, per services/mcp_write_bridge.py's own
+    // no-is_admin-bypass invariant (list_write_tools checks the literal
+    // scope grant only).
     const names = res.getBody().result.tools.map((t) => t.name);
-    expect(names).to.include("write_decision");
-    expect(names).to.include("write_skill");
+    const authRequired = bru.getEnvVar("authRequired") === "true";
+    if (authRequired) {
+      // cluster (AUDITTRACE_AUTH_REQUIRED=true): a real device-flow token
+      // carrying the collection's default `scope` (which already includes
+      // memory:decisions:write memory:skills:write, added alongside Track
+      // A) makes both tools visible — the certifiable path.
+      expect(names).to.include("write_decision");
+      expect(names).to.include("write_skill");
+    } else {
+      // local (AUDITTRACE_AUTH_REQUIRED=false, laptop default —
+      // ADR-026 §15): require_user's bypass mode returns the sentinel
+      // identity (identity.py:192-208) — is_admin=True but scopes are
+      // ONLY ("memory:admin", "memory:read", "session:read-own"), which
+      // do NOT include memory:decisions:write/memory:skills:write.
+      // services/mcp_write_bridge.py::list_write_tools has NO is_admin
+      // bypass (deliberate — the security property Track A certified), so
+      // both write tools are correctly ABSENT here. Same caveat as
+      // 03-tools-call-write.bru/05-no-auth-401.bru's docs blocks.
+      expect(names).to.not.include("write_decision");
+      expect(names).to.not.include("write_skill");
+    }
   });
   test("Phase 2 Track B broker tools — namespaced broker:<server>:<tool>, downstream-gated (#296)", function() {
     // NOT a "must be non-empty" assertion. The laptop AND the v1.24.8
@@ -98,4 +121,21 @@ docs {
   `memory:decisions:write memory:skills:write`, added alongside Track
   A). `require_user` gates this endpoint even for `tools/list` — see
   `routes/mcp.py`'s module docstring, "not just tools/call".
+
+  **Environment-dependent by design (same caveat as
+  `03-tools-call-write.bru`/`05-no-auth-401.bru`).** Against `local`
+  (`AUDITTRACE_AUTH_REQUIRED=false`, the laptop default — ADR-026 §15)
+  `require_user`'s bypass mode returns the sentinel identity, which is
+  `is_admin=True` but does NOT literally hold
+  `memory:decisions:write`/`memory:skills:write`
+  (`audittrace.identity.sentinel_user_context`). Read tools stay
+  present regardless of env — `services.mcp_bridge.list_read_tools`
+  DOES have an `is_admin` bypass (Phase 1's convention). Write tools do
+  NOT — `services.mcp_write_bridge.list_write_tools` checks the
+  literal scope grant only (no `is_admin` short-circuit), so they are
+  correctly absent on `local` and correctly present on `cluster` with
+  a real, properly-scoped token. The `authRequired` env var
+  (`local`=`false`, `cluster`=`true`) drives which branch the
+  write-tool test above asserts — both branches assert real,
+  non-vacuous behaviour, this is not a skip.
 }
