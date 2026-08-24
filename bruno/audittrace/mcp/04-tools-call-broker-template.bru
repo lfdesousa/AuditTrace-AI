@@ -1,0 +1,88 @@
+meta {
+  name: MCP — tools/call broker:<server>:<tool> (brokered tool, TEMPLATE)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "tools/call",
+    "params": {
+      "name": "broker:{{mcpBrokerServerName}}:{{mcpBrokerToolName}}",
+      "arguments": {}
+    }
+  }
+}
+
+tests {
+  test("returns 200 (JSON-RPC envelope, not an HTTP-level failure)", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("fail-closed when no matching downstream server is configured (deterministic TODAY — laptop and v1.24.8 default AUDITTRACE_MCP_BROKER_SERVERS=\"{}\")", function() {
+    // This IS a certifiable Rule-1 acceptance criterion, not a
+    // placeholder: ADR-063 Phase 2 Track B — "an unrecognised or
+    // unconfigured server denies with no forward attempt". The
+    // placeholder mcpBrokerServerName/mcpBrokerToolName below never
+    // match an operator-configured entry on the laptop OR the v1.24.8
+    // candidate deploy, so the broker MUST deny before forwarding —
+    // no downstream call is made, no data returned. Neuter that
+    // pre-forward check and this test goes RED (see
+    // tests/test_mcp_broker.py::TestBrokerToolCall for the same
+    // guard, unit-level).
+    const result = res.getBody().result;
+    expect(result.isError).to.equal(true);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.error).to.include("unknown or disabled downstream server");
+  });
+}
+
+docs {
+  ADR-063 Phase 2 Track B (#296) — the brokered class of `tools/call`.
+  This request is a TEMPLATE for the "AuditTrace brokers a real
+  downstream MCP server" scenario, which is NOT exercisable at the
+  v1.24.8 candidate deploy — the laptop AND that deploy both run the
+  portability-invariant default `AUDITTRACE_MCP_BROKER_SERVERS="{}"`
+  (no operator-configured downstream). The assertions above are
+  therefore scoped to what IS certifiable today: the pre-forward
+  deny-and-record path (`services.mcp_broker.broker_tool_call`'s
+  "Resolve" + "Authorize" steps) — a well-formed brokered-shaped call
+  against an unconfigured server denies cleanly, writes exactly ONE
+  `PendingToolCall` (`phase="request"`, no `result_pending`), and never
+  reaches the network.
+
+  **To exercise the full brokered path** (forward → two audit rows
+  tagged `brokered` → downstream result), an operator must:
+
+  1. Stand up (or point at) a real downstream MCP server exposing at
+     least one tool over the same JSON-RPC `tools/call` contract this
+     collection uses.
+  2. Set `AUDITTRACE_MCP_BROKER_SERVERS` on the deployment to
+     `{"<server-name>": {"url": "<downstream /mcp endpoint>",
+     "required_scope": "<a scope in the caller's token>"}}`.
+  3. Override this request's `mcpBrokerServerName`/`mcpBrokerToolName`
+     env vars to match `<server-name>`/an actual tool the downstream
+     exposes.
+  4. Re-run `01-tools-list.bru` first — the namespaced `broker:*` tool
+     should now appear in the manifest.
+  5. Re-run this request — expect `result.isError === false`, then
+     confirm the two `brokered` audit rows via
+     `evidence/03-postgres-tool-calls.bru` (filter on
+     `provenance='brokered'`).
+
+  This deferral mirrors the same pattern Track A/B's own build-records
+  used for their live E2E (candidate-deploy-gated, looped back to the
+  memory server once run) — the .bru file is the deliverable now; the
+  live run against a real downstream is a v1.24.8+ exercise.
+}

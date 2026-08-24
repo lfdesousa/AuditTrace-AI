@@ -1,0 +1,51 @@
+meta {
+  name: MCP — no-auth 401
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "tools/list",
+    "params": {}
+  }
+}
+
+tests {
+  test("returns 401 (fail-closed, no Authorization header)", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+  test("no tool manifest leaks in the 401 body", function() {
+    const body = res.getBody();
+    expect(body.result).to.be.undefined;
+    expect(JSON.stringify(body)).to.not.include("recall_semantic");
+    expect(JSON.stringify(body)).to.not.include("write_decision");
+  });
+}
+
+docs {
+  The certified fail-closed negative (ADR-063 module docstring,
+  `routes/mcp.py`: "`require_user` gates EVERY JSON-RPC method on this
+  route, including `initialize` and `tools/list` — not just
+  `tools/call`"). No Bearer token at all → `require_user` raises
+  `HTTPException(401)` before the `/mcp` handler body ever runs — same
+  dependency, same 401 contract every other AuditTrace route uses
+  (`auth.py::require_user`), not a bespoke MCP-only auth path.
+
+  **Environment-dependent by design.** Against `cluster`
+  (`AUDITTRACE_AUTH_REQUIRED=true`) this returns a real 401. Against
+  `local` (`AUDITTRACE_AUTH_REQUIRED=false`, the laptop default —
+  ADR-026 §15 multi-user gate) `require_user`'s bypass mode returns
+  the sentinel identity with NO bearer check at all, so this same
+  request would come back 200 — that is the documented, intentional
+  dev-mode behaviour, not a bug in this probe. Run against `cluster`
+  for the certifiable negative.
+}

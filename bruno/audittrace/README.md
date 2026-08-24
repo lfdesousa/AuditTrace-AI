@@ -12,6 +12,7 @@ bruno/audittrace/
 ├── context/        — /context (memory bundle for a query)
 ├── environments/   — cluster + local
 ├── health/         — /health, /metrics
+├── mcp/            — POST /mcp (JSON-RPC, ADR-063 Phase 1+2 A/B/C)
 ├── memory/         — per-layer CRUD + index/upload (5 ops × 4 layers)
 │   ├── conversational/
 │   ├── episodic/
@@ -66,6 +67,7 @@ minimal.
 | `GET/POST/DELETE/PUT /memory/{layer}/{...}` | memory/{conversational,episodic,procedural,semantic}/01..05 |
 | `GET /system/trust-store` | system/01-trust-store-get.bru ← **NEW 2026-05-09** |
 | `POST /system/trust-store/refresh` | system/02-trust-store-refresh.bru ← **NEW 2026-05-09** |
+| `POST /mcp` (JSON-RPC) | mcp/01-tools-list.bru, mcp/02-tools-call-read.bru, mcp/03-tools-call-write.bru, mcp/04-tools-call-broker-template.bru, mcp/05-no-auth-401.bru ← **NEW 2026-08-24 (ADR-063 Phase 2 Track C, folds read+write+broker+negative)** |
 
 ## Live-validation — 2026-05-09
 

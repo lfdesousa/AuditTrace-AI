@@ -1,0 +1,74 @@
+meta {
+  name: MCP — tools/call recall_semantic (read tool)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "recall_semantic",
+      "arguments": { "query": "{{mcpRecallQuery}}", "k": 3 }
+    }
+  }
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("JSON-RPC 2.0 result envelope", function() {
+    const body = res.getBody();
+    expect(body.jsonrpc).to.equal("2.0");
+    expect(body.id).to.equal(2);
+    expect(body.result).to.be.an("object");
+  });
+  test("recall_semantic executed (isError=false, paginated shape)", function() {
+    const result = res.getBody().result;
+    expect(result.isError).to.equal(false);
+    expect(result.structuredContent).to.be.an("object");
+    expect(result.structuredContent.matches).to.be.an("array");
+    expect(result.structuredContent.total).to.be.a("number");
+    expect(result.structuredContent.has_more).to.be.a("boolean");
+  });
+  test("content[0] mirrors structuredContent (MCP text-content contract)", function() {
+    const result = res.getBody().result;
+    expect(result.content).to.be.an("array");
+    expect(result.content[0].type).to.equal("text");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.matches).to.be.an("array");
+  });
+}
+
+docs {
+  ADR-063 Phase 1 read tool, exercised through the MCP transport
+  (`services.mcp_bridge.call_read_tool` → the SAME
+  `ChromaSemanticService.search_page` the `/v1/chat/completions` tool
+  loop uses). Requires `memory:semantic:read` — present in the
+  collection's default `scope` env var.
+
+  `mcpRecallQuery` defaults to a generic term so this passes on a
+  fresh/empty semantic collection too — `total: 0, matches: []` is a
+  valid, non-error result (ChromaDB ANN degrades to zero-match, not an
+  error, on an empty or non-matching corpus), so the assertions above
+  never require a non-empty hit set.
+
+  Denial/scope-boundary coverage lives in
+  `tests/test_mcp_bridge.py`/`tests/test_mcp_routes.py` (unit +
+  route-level, including the Phase 1 admin-no-bypass falsifiable
+  guard) — this request proves the LIVE, deployed transport, not the
+  authz edge cases.
+}
