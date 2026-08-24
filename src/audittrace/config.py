@@ -223,6 +223,15 @@ class Settings(BaseSettings):
     # "sovereign:tool-result:" — disjoint from the TokenCache namespace.
     memory_tool_cache_ttl_seconds: int = 900
 
+    # ─────────────── M3 slice 1 — sources trailer (spec §3 / §4.4) ──────────
+    # Kill switch, default OFF so /v1/chat/completions is byte-identical for
+    # every existing consumer until an operator opts in for the LibreChat
+    # pilot console. "trailer" appends a deterministic markdown "Sources
+    # consultées" block built from the RECORDED recall matches in the
+    # tool-call row (ADR-060 source_ref) — never model-generated. See
+    # routes/_sources_trailer.py.
+    response_sources: str = "off"  # "trailer" | "off"
+
     # Optional override file for the memory tool registry (§Decision.3).
     # Decorators at import time populate the base registry; this TOML file —
     # if present — overlays per-tool config (disable, retune scope, rename,
