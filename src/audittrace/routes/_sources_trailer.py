@@ -8,15 +8,21 @@ LibreChat-rendered pilot response shows *"chaque réponse cite les
 documents qu'elle a consultés"*.
 
 **This is a RENDERING task over already-audited data, never a data task.**
-The trailer is built exclusively from the ``source_ref`` fields ADR-060
-(``tools/memory_handlers.py::_recall_identity_fields``) already stamps
-into every recall match, which ride into the ``tool_calls.result_summary``
-column verbatim via ``PendingToolCall.result_summary`` (see
-``_memory_tool_loop.py::_execute_memory_tool``). Building the trailer from
-``pending`` — the SAME in-memory records the caller flushes to that column
-— means a byte-compare between the trailer and the persisted audit row is
-a compare against identical source data, not a second, potentially
-divergent, read path.
+The trailer is built exclusively from ``PendingToolCall.source_refs`` --
+the ``source_ref`` fields ADR-060 (``tools/memory_handlers.py::
+_recall_identity_fields``) stamps into every recall match, extracted from
+the FULL tool result BEFORE ``result_summary`` is truncated to 1000 chars
+for the audit row (see ``_memory_tool_loop.py::_source_refs_from_result``
+and the ``PendingToolCall.source_refs`` docstring). This module MUST NEVER
+re-derive source_refs by re-parsing ``result_summary``: a multi-match
+recall's serialized result routinely exceeds 1000 chars, which corrupts
+the JSON at the cut and made the trailer inert for any realistic recall
+in production (M3-SOURCES-TRAILER-TRUNCATION-FIX, 2026-08-24 finding).
+``source_refs`` and ``result_summary`` are populated from the SAME
+in-memory ``pending`` records the caller flushes to the audit table, so a
+byte-compare between the trailer and the recorded recall identity is
+still a compare against identical source data -- just via the structural
+field rather than a second, lossy parse of the truncated column.
 
 **Never LLM-generated.** No function in this module calls a model, an
 HTTP client, or accepts one — a hallucinated citation is worse than none
@@ -32,7 +38,6 @@ support). Do not change the label without re-checking that boundary.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from audittrace.routes._memory_tool_loop import PendingToolCall
@@ -45,46 +50,25 @@ SOURCES_TRAILER_LABEL = "Sources consultées"
 
 def _extract_source_refs(pending: list[PendingToolCall]) -> list[str]:
     """Pull the recorded ``source_ref`` values out of ``pending``, in
-    first-seen order, deduplicated.
+    first-seen order, deduplicated across rows.
 
-    Only rows that actually carry a ``matches`` list contribute — this is
-    what naturally excludes ``recall_recent_sessions`` (no ``source_ref``
-    on its match shape) and ``read_decision``/``read_skill`` (single-doc
-    shape, no ``matches`` key at all) without any per-tool special-casing.
-    Errored tool calls (``error is not None``) contribute nothing — there
-    is no result to cite.
-
-    ``result_summary`` is truncated to 1000 chars at the point it is
-    recorded (``_execute_memory_tool``); a very large match set can in
-    principle produce invalid JSON at the cut. This is a rendering
-    concern, never a reason to break the chat response — malformed rows
-    are logged and skipped, not raised.
+    Reads ``PendingToolCall.source_refs`` -- a structural field captured
+    from the FULL tool result before the 1000-char audit truncation
+    (``_memory_tool_loop.py::_source_refs_from_result``) -- NEVER
+    ``result_summary`` (that column is truncated for the audit row and is
+    not a reliable source for rendering; see the module docstring).
+    Errored tool calls (``error is not None``) contribute nothing -- there
+    is no result to cite; in practice their ``source_refs`` is already
+    empty (the loop never computes it on an error branch), but the
+    explicit check keeps the exclusion intent visible here too.
     """
     seen: set[str] = set()
     ordered: list[str] = []
     for rec in pending:
-        if rec.error is not None or not rec.result_summary:
+        if rec.error is not None:
             continue
-        try:
-            parsed = json.loads(rec.result_summary)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "sources trailer: result_summary for tool=%s is not valid "
-                "JSON (likely truncated at the 1000-char audit cap) — "
-                "omitting its matches from the trailer",
-                rec.tool_name,
-            )
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        matches = parsed.get("matches")
-        if not isinstance(matches, list):
-            continue
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            source_ref = match.get("source_ref")
-            if isinstance(source_ref, str) and source_ref and source_ref not in seen:
+        for source_ref in rec.source_refs:
+            if source_ref and source_ref not in seen:
                 seen.add(source_ref)
                 ordered.append(source_ref)
     return ordered

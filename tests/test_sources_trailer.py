@@ -29,7 +29,10 @@ from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import SENTINEL_SUBJECT
 from audittrace.routes import _sources_trailer as trailer_mod
-from audittrace.routes._memory_tool_loop import PendingToolCall
+from audittrace.routes._memory_tool_loop import (
+    PendingToolCall,
+    _source_refs_from_result,
+)
 from audittrace.routes._sources_trailer import (
     SOURCES_TRAILER_LABEL,
     build_sources_trailer,
@@ -77,9 +80,17 @@ def _pending(
     tool_name: str,
     *,
     result_summary: str | None = None,
+    source_refs: list[str] | None = None,
     error: str | None = None,
     granted_scope: str = "memory:episodic:read",
 ) -> PendingToolCall:
+    """Build a ``PendingToolCall`` fixture. ``source_refs`` is the
+    structural field ``build_sources_trailer`` actually reads (M3-SOURCES-
+    TRAILER-TRUNCATION-FIX); ``result_summary`` is accepted only so a
+    fixture can also carry a realistic (possibly truncated / garbled)
+    audit-column value to prove the trailer never re-parses it. Defaults
+    to ``[]`` — a tool call that never populated the structural field
+    (e.g. an unknown-tool or scope-denied row) contributes nothing."""
     return PendingToolCall(
         tool_name=tool_name,
         user_id=SENTINEL_SUBJECT,
@@ -90,6 +101,7 @@ def _pending(
         started_at=datetime.now(),
         duration_ms=1,
         granted_scope=granted_scope,
+        source_refs=source_refs if source_refs is not None else [],
     )
 
 
@@ -128,21 +140,25 @@ class TestBuildSourcesTrailerUnit:
     def test_empty_pending_returns_none(self):
         assert build_sources_trailer([]) is None
 
-    def test_no_matches_key_returns_none(self):
+    def test_no_source_refs_returns_none(self):
         """``read_decision``/``read_skill``-shaped results (single doc, no
-        ``matches`` list) contribute nothing — no per-tool special-casing
-        needed, the shape alone excludes them."""
+        ``matches`` list) never populate ``source_refs`` — no per-tool
+        special-casing needed here, the empty structural field alone
+        excludes them."""
         pending = [
             _pending(
                 "read_decision",
                 result_summary=json.dumps({"file": "x", "content": "..."}),
+                source_refs=[],
             )
         ]
         assert build_sources_trailer(pending) is None
 
     def test_matches_without_source_ref_returns_none(self):
         """``recall_recent_sessions``-shaped matches carry no ``source_ref``
-        — excluded without special-casing the tool name."""
+        — ``_source_refs_from_result`` never populates the structural
+        field for them, so they are excluded without special-casing the
+        tool name."""
         summary = json.dumps(
             {"matches": [{"title": "session", "snippet": "x", "source": "2026-08-01"}]}
         )
@@ -150,6 +166,7 @@ class TestBuildSourcesTrailerUnit:
             _pending(
                 "recall_recent_sessions",
                 result_summary=summary,
+                source_refs=[],
                 granted_scope="memory:conversational:read-own",
             )
         ]
@@ -157,19 +174,24 @@ class TestBuildSourcesTrailerUnit:
 
     def test_errored_call_contributes_nothing(self):
         """An errored tool call has no result to cite even if a stray
-        ``result_summary`` were present."""
+        ``source_refs`` were present (defence-in-depth — in practice the
+        loop never populates ``source_refs`` on an error branch)."""
         pending = [
             _pending(
                 "recall_decisions",
                 error="scope denied",
-                result_summary=_matches_summary("ADR-009.md"),
+                source_refs=["ADR-009.md"],
             )
         ]
         assert build_sources_trailer(pending) is None
 
     def test_single_match_renders_label_and_bullet(self):
         pending = [
-            _pending("recall_decisions", result_summary=_matches_summary("ADR-009.md"))
+            _pending(
+                "recall_decisions",
+                result_summary=_matches_summary("ADR-009.md"),
+                source_refs=["ADR-009.md"],
+            )
         ]
         trailer = build_sources_trailer(pending)
         assert trailer == f"\n\n**{SOURCES_TRAILER_LABEL}**\n- ADR-009.md"
@@ -181,10 +203,12 @@ class TestBuildSourcesTrailerUnit:
             _pending(
                 "recall_decisions",
                 result_summary=_matches_summary("ADR-009.md", "ADR-010.md"),
+                source_refs=["ADR-009.md", "ADR-010.md"],
             ),
             _pending(
                 "recall_semantic",
                 result_summary=_matches_summary("ADR-010.md", "campagne_2024.md"),
+                source_refs=["ADR-010.md", "campagne_2024.md"],
             ),
         ]
         trailer = build_sources_trailer(pending)
@@ -198,49 +222,57 @@ class TestBuildSourcesTrailerUnit:
     def test_cache_hit_shaped_result_still_contributes(self):
         """A cache-served recall (ADR-060 / #372 D3) still shaped the
         answer — its ``result_summary`` carries ``cache_hit: true`` plus
-        the same ``matches`` shape, and it must still cite."""
+        the same ``matches`` shape, and the loop populates ``source_refs``
+        for it the same way as a fresh call; it must still cite."""
         summary = json.dumps(
             {
                 "cache_hit": True,
                 "matches": [{"id": "ADR-009.md", "source_ref": "ADR-009.md"}],
             }
         )
-        pending = [_pending("recall_decisions", result_summary=summary)]
+        pending = [
+            _pending(
+                "recall_decisions",
+                result_summary=summary,
+                source_refs=["ADR-009.md"],
+            )
+        ]
         trailer = build_sources_trailer(pending)
         assert trailer == f"\n\n**{SOURCES_TRAILER_LABEL}**\n- ADR-009.md"
 
-    def test_malformed_json_is_skipped_not_raised(self, caplog):
-        """A ``result_summary`` truncated mid-JSON at the 1000-char audit
-        cap must never break the chat response — skip and warn."""
+    def test_garbled_result_summary_is_never_reparsed(self, caplog):
+        """THE structural proof at unit scale (M3-SOURCES-TRAILER-
+        TRUNCATION-FIX): ``result_summary`` truncated mid-JSON at the
+        1000-char audit cap — exactly what a realistic multi-match recall
+        produces in production — must have ZERO effect on the trailer.
+        ``build_sources_trailer`` reads ``source_refs`` only; it must
+        never even attempt to parse ``result_summary``, so a row whose
+        column is invalid JSON still renders correctly and logs nothing.
+        Neutering the fix (making ``_extract_source_refs`` re-parse
+        ``result_summary`` again) turns this fixture's ``result_summary``
+        into an unterminated-string JSONDecodeError and the trailer would
+        drop this row's citation — this test would go RED."""
         pending = [
             _pending(
                 "recall_decisions",
                 result_summary='{"matches": [{"source_ref": "ADR-009',
-            ),
-            _pending("recall_semantic", result_summary=_matches_summary("ADR-010.md")),
-        ]
-        with caplog.at_level("WARNING"):
-            trailer = build_sources_trailer(pending)
-        assert trailer == f"\n\n**{SOURCES_TRAILER_LABEL}**\n- ADR-010.md"
-        assert "not valid JSON" in caplog.text
-
-    def test_non_dict_and_non_list_matches_are_tolerated(self):
-        pending = [
-            _pending(
-                "recall_decisions", result_summary=json.dumps(["not", "a", "dict"])
-            ),
-            _pending(
-                "recall_semantic", result_summary=json.dumps({"matches": "not-a-list"})
+                source_refs=["ADR-009.md"],
             ),
             _pending(
                 "recall_semantic",
-                result_summary=json.dumps({"matches": ["not-a-dict"]}),
+                result_summary=_matches_summary("ADR-010.md"),
+                source_refs=["ADR-010.md"],
             ),
         ]
-        assert build_sources_trailer(pending) is None
+        with caplog.at_level("WARNING"):
+            trailer = build_sources_trailer(pending)
+        assert trailer == (
+            f"\n\n**{SOURCES_TRAILER_LABEL}**\n- ADR-009.md\n- ADR-010.md"
+        )
+        assert caplog.text == ""
 
     def test_empty_result_summary_contributes_nothing(self):
-        pending = [_pending("recall_decisions", result_summary=None)]
+        pending = [_pending("recall_decisions", result_summary=None, source_refs=[])]
         assert build_sources_trailer(pending) is None
 
     def test_label_is_exact_french_wording_no_causation(self):
@@ -251,7 +283,9 @@ class TestBuildSourcesTrailerUnit:
         trailer = build_sources_trailer(
             [
                 _pending(
-                    "recall_decisions", result_summary=_matches_summary("ADR-009.md")
+                    "recall_decisions",
+                    result_summary=_matches_summary("ADR-009.md"),
+                    source_refs=["ADR-009.md"],
                 )
             ]
         )
@@ -259,6 +293,45 @@ class TestBuildSourcesTrailerUnit:
         assert "Sources consultées" in trailer
         assert "utilisées pour générer" not in trailer
         assert "générer" not in trailer
+
+
+class TestSourceRefsFromResult:
+    """Unit tests for ``_memory_tool_loop._source_refs_from_result`` — the
+    pure function that extracts ``source_ref`` values from a FULL,
+    pre-truncation tool result. This is where the JSON-shape tolerance
+    that used to live in ``_sources_trailer._extract_source_refs`` (before
+    the truncation fix moved extraction upstream of the 1000-char cut)
+    now lives."""
+
+    def test_no_matches_key_returns_empty(self):
+        assert _source_refs_from_result({"file": "x", "content": "..."}) == []
+
+    def test_matches_without_source_ref_returns_empty(self):
+        result = {
+            "matches": [{"title": "session", "snippet": "x", "source": "2026-08-01"}]
+        }
+        assert _source_refs_from_result(result) == []
+
+    def test_dedup_first_seen_order(self):
+        result = {
+            "matches": [
+                {"source_ref": "ADR-009.md"},
+                {"source_ref": "ADR-010.md"},
+                {"source_ref": "ADR-009.md"},
+            ]
+        }
+        assert _source_refs_from_result(result) == ["ADR-009.md", "ADR-010.md"]
+
+    def test_non_list_matches_tolerated(self):
+        assert _source_refs_from_result({"matches": "not-a-list"}) == []
+
+    def test_non_dict_match_entries_tolerated(self):
+        result = {"matches": ["not-a-dict", {"source_ref": "ADR-010.md"}]}
+        assert _source_refs_from_result(result) == ["ADR-010.md"]
+
+    def test_blank_source_ref_excluded(self):
+        result = {"matches": [{"source_ref": ""}, {"source_ref": "ADR-010.md"}]}
+        assert _source_refs_from_result(result) == ["ADR-010.md"]
 
 
 class TestNotLlmGenerated:
@@ -458,6 +531,91 @@ class TestSourcesTrailerFlagOnGate4:
         # Byte-compare: the trailer appended to the answer is EXACTLY the
         # rendering of the recorded audit-row source_refs.
         assert content == "Final grounded answer." + expected_trailer
+
+    async def test_non_streaming_trailer_survives_over_1000_char_result(
+        self, client, test_container, _tools_mode_with_trailer
+    ):
+        """THE regression test (M3-SOURCES-TRAILER-TRUNCATION-FIX,
+        2026-08-24 finding) — the fixture that would have caught the bug
+        before it shipped live on v1.24.9. A realistic multi-match
+        (3+ matches) recall whose FULL serialized ``result`` exceeds the
+        1000-char audit-row truncation cap (``result_summary =
+        json.dumps(result)[:1000]``, ``_memory_tool_loop.py``). Before the
+        fix, the trailer re-derived ``source_refs`` from that truncated
+        column with strict ``json.loads`` — invalid JSON at the cut,
+        every match skipped, ``source_refs=[]``, trailer ``None``. The
+        trailer must STILL render exactly the recorded ``source_ref``s.
+
+        Ground truth first: assert the recorded audit row genuinely IS
+        truncated to invalid JSON — proving this fixture reflects the
+        real production data shape, not another short fixture that
+        happens to pass either way (the vacuous-neuter-test antipattern
+        this bug's own postmortem calls out).
+
+        Neuter the fix — revert ``_sources_trailer._extract_source_refs``
+        to re-derive from ``rec.result_summary`` via ``json.loads`` (the
+        pre-fix behaviour) — and this test goes RED (trailer disappears
+        from ``content``).
+        """
+        long_body = "cache compression trade-off analysis paragraph. " * 20
+        _seed_decisions(
+            test_container,
+            [
+                ("ADR-101.md", long_body + "variant one."),
+                ("ADR-102.md", long_body + "variant two."),
+                ("ADR-103.md", long_body + "variant three."),
+            ],
+        )
+        fake = _SequencedClient(
+            [
+                _tools_mode_tool_call_response(
+                    "recall_decisions",
+                    '{"query": "cache compression"}',
+                    call_id="call_1",
+                ),
+                _tools_mode_response_text("Final grounded answer."),
+            ]
+        )
+        with _patch_tool_loop_client(fake), _patch_async_client(fake):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3.5-35b",
+                    "messages": [{"role": "user", "content": "what about KV cache?"}],
+                    "project": "AuditTrace",
+                },
+            )
+        assert response.status_code == 200
+        content = response.json()["choices"][0]["message"]["content"]
+
+        pg = get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            rows = (await db.execute(select(ToolCall))).scalars().all()
+            interactions = (await db.execute(select(InteractionRecord))).scalars().all()
+        assert len(rows) == 1
+        row = rows[0]
+
+        # Ground truth: the audit column really is truncated at the
+        # 1000-char cap AND is genuinely invalid JSON at the cut — this is
+        # the exact production data shape the bug needed, not a fixture
+        # that happens to stay under the cap.
+        assert row.result_summary is not None
+        assert len(row.result_summary) == 1000
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(row.result_summary)
+
+        expected_refs = ["ADR-101.md", "ADR-102.md", "ADR-103.md"]
+        expected_trailer = f"\n\n**{SOURCES_TRAILER_LABEL}**\n" + "\n".join(
+            f"- {ref}" for ref in expected_refs
+        )
+        assert content == "Final grounded answer." + expected_trailer
+
+        # B5, now under the REAL >1000-char rendering trailer (not the
+        # trivial no-render case) — the persisted answer stays clean even
+        # though the trailer is the whole point of this test.
+        latest_interaction = interactions[-1]
+        assert SOURCES_TRAILER_LABEL not in latest_interaction.answer
+        assert latest_interaction.answer == "Final grounded answer."
 
     async def test_streaming_trailer_matches_recorded_audit_row(
         self, client, test_container, _tools_mode_with_trailer
