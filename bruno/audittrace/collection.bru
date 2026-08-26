@@ -1,0 +1,22 @@
+script:pre-request {
+  // Bridge dotenv secrets into the request environment for headless `bru run`.
+  //
+  // Bruno auto-loads the gitignored collection `.env` into `process.env`, but
+  // exposes those values only as {{process.env.X}} — it does NOT populate the
+  // {{accessToken}} secret var the requests use. `scripts/audittrace-login`
+  // writes the freshly-obtained token into that `.env` (accessToken +
+  // AUDITTRACE_TOKEN, mode 600); this bridge copies it onto the env var so
+  // every request's `token: {{accessToken}}` resolves without any --env-var
+  // injection and without an agent reading the guarded credential store.
+  // GUI runs (which supply secrets from the keychain) are unaffected: the
+  // bridge only fires when the dotenv value is present.
+  const bridge = (name) => {
+    const v = bru.getProcessEnv(name);
+    if (v && !bru.getEnvVar(name)) {
+      bru.setEnvVar(name, v);
+    }
+  };
+  bridge("accessToken");
+  bridge("refreshToken");
+  bridge("assessmentToken");
+}
