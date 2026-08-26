@@ -14,7 +14,15 @@
 #                                                    # RAW access_token (escape hatch;
 #                                                    # never teach this to an agent def)
 #   scripts/audittrace-login --ensure               # refresh if needed, exit 0 if token valid
+#   scripts/audittrace-login --sync-env             # mirror the current token into the Bruno
+#                                                    # collection .env for `bru run` (no browser)
 #   scripts/audittrace-login --logout               # delete the saved token pair
+#
+# A successful login (and every refresh) also mirrors the raw access_token
+# into the gitignored, mode-600 Bruno collection .env (accessToken +
+# AUDITTRACE_TOKEN) so `bru run` picks it up without any agent reading the
+# guarded tokens.json. The token is still NEVER printed to stdout. Opt out
+# with AUDITTRACE_SYNC_ENV=0. See the AUDITTRACE-MEMORY skill.
 #
 # Tokens land in ~/.config/audittrace/tokens.json (mode 600). The
 # file holds {access_token, refresh_token, access_expires_at,
@@ -65,6 +73,21 @@ CLIENT_ID="${CLIENT_ID:-audittrace-opencode}"
 
 TOKENS_DIR="${AUDITTRACE_TOKENS_DIR:-$HOME/.config/audittrace}"
 TOKENS_FILE="$TOKENS_DIR/tokens.json"
+
+# ─── Bruno .env sync (2026-08-26) ──────────────────────────────────
+# Additively mirror a freshly-obtained access_token into the Bruno CLI
+# collection's gitignored `.env` (mode 600) so `bru run` picks it up as
+# {{accessToken}} without any agent reading the guarded tokens.json. This
+# is the SANCTIONED local Bruno secret store (see AUDITTRACE-MEMORY skill);
+# it is gitignored and the raw token is NEVER printed to stdout. Backward
+# compatible: tokens.json behaviour is unchanged; this is a strictly
+# additional write. Opt out with AUDITTRACE_SYNC_ENV=0; retarget the file
+# with AUDITTRACE_BRUNO_ENV. `auto` (default) syncs whenever the target
+# collection dir exists on disk.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_REPO_ROOT="$(cd "$_SCRIPT_DIR/.." && pwd)"
+BRUNO_ENV_FILE="${AUDITTRACE_BRUNO_ENV:-$_REPO_ROOT/bruno/audittrace/.env}"
+SYNC_ENV="${AUDITTRACE_SYNC_ENV:-auto}"   # auto | 1 | 0
 
 # Default OAuth2 scopes requested at login. The realm declares
 # `audittrace:admin` and the `memory:*:write` scopes as OPTIONAL on
@@ -143,6 +166,55 @@ persist_from_token_response() {
   '
 }
 
+# Upsert KEY=VALUE into an env file WITHOUT printing VALUE. Idempotent:
+# replaces an existing KEY= line in place, otherwise appends. Creates the
+# file mode 600 if missing. Leaves every other line untouched (so operator
+# overrides like baseUrl in the same .env survive).
+upsert_env_var() {
+  local file="$1" key="$2" value="$3"
+  umask 077
+  [[ -f "$file" ]] || : > "$file"
+  chmod 600 "$file" 2>/dev/null || true
+  local tmp
+  tmp="$(mktemp "${file}.XXXXXX")"
+  chmod 600 "$tmp"
+  # keep all lines except a prior assignment to KEY (|| true: grep exits 1
+  # on no match, which is fine under `set -e`)
+  if [[ -s "$file" ]]; then
+    grep -v -E "^[[:space:]]*${key}=" "$file" > "$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv -f "$tmp" "$file"
+  chmod 600 "$file"
+}
+
+# Mirror the currently-saved access_token into the Bruno collection .env so
+# `bru run` picks it up. No-op when disabled or the target dir is absent.
+# Never prints the token; only a redacted confirmation line to stderr.
+sync_bruno_env() {
+  case "$SYNC_ENV" in
+    0|false|no|off) return 0 ;;
+  esac
+  local dir
+  dir="$(dirname "$BRUNO_ENV_FILE")"
+  if [[ ! -d "$dir" ]]; then
+    if [[ "$SYNC_ENV" == "auto" ]]; then
+      return 0   # not in a checkout with the bruno collection — silently skip
+    fi
+    mkdir -p "$dir" 2>/dev/null || {
+      log "warning: cannot create $dir — skipping .env sync"
+      return 0
+    }
+  fi
+  [[ -f "$TOKENS_FILE" ]] || return 0
+  local token
+  token="$(jq -r '.access_token // empty' "$TOKENS_FILE")"
+  [[ -n "$token" ]] || return 0
+  upsert_env_var "$BRUNO_ENV_FILE" "accessToken" "$token"
+  upsert_env_var "$BRUNO_ENV_FILE" "AUDITTRACE_TOKEN" "$token"
+  log "🔗 synced access_token → $BRUNO_ENV_FILE (accessToken + AUDITTRACE_TOKEN, mode 600, gitignored)"
+}
+
 # ───────────────────────────── actions ────────────────────────────
 
 action_login() {
@@ -209,6 +281,7 @@ EOF
         persist_from_token_response "$poll" | (ensure_tokens_dir && umask 077 && cat > "$TOKENS_FILE")
         chmod 600 "$TOKENS_FILE"
         log "✅ logged in — tokens saved to $TOKENS_FILE"
+        sync_bruno_env
         return 0
         ;;
       authorization_pending)
@@ -280,6 +353,20 @@ action_refresh_if_needed() {
   }
   persist_from_token_response "$body" > "$TOKENS_FILE"
   chmod 600 "$TOKENS_FILE"
+  # keep the Bruno .env in step with the refreshed token
+  sync_bruno_env
+}
+
+# Mirror the current (valid) saved token into the Bruno .env without a full
+# interactive login. Refreshes first if near expiry. Handy when the .env got
+# cleared but tokens.json is still good — the common "bru run got a 401"
+# recovery. Offline when the token has life left (refresh is a no-op).
+action_sync_env() {
+  action_refresh_if_needed
+  # force the sync even under AUDITTRACE_SYNC_ENV=auto with a missing dir:
+  # the operator asked for it explicitly by invoking this action
+  if [[ "$SYNC_ENV" == "auto" ]]; then SYNC_ENV="1"; fi
+  sync_bruno_env
 }
 
 # Redacted "am I logged in?" signal: a short SHA-256 fingerprint of the
@@ -327,6 +414,7 @@ while [[ $# -gt 0 ]]; do
     --show)         ACTION="show"; shift ;;
     --show-unsafe)  ACTION="show"; SHOW_RAW="1"; shift ;;
     --ensure)       ACTION="ensure"; shift ;;
+    --sync-env)     ACTION="sync-env"; shift ;;
     --logout)       ACTION="logout"; shift ;;
     --scope)
       if [[ $# -lt 2 ]]; then
@@ -347,6 +435,9 @@ Usage:
   audittrace-login --show-unsafe         Print the RAW access_token (escape hatch; never teach
                                           this to an agent def — see TOKEN-GUARD note up top)
   audittrace-login --ensure              Refresh if needed, exit 0 if token valid
+  audittrace-login --sync-env            Mirror the current (valid) token into the Bruno
+                                          collection .env for `bru run` — no browser needed;
+                                          the "bru got a 401" recovery
   audittrace-login --logout              Delete the saved token pair
 
 Environment overrides:
@@ -359,6 +450,11 @@ Environment overrides:
   AUDITTRACE_SHOW_RAW      (1 = --show also prints the raw token; same escape
                             hatch as --show-unsafe, exists for callers that
                             can't easily pass a flag)
+  AUDITTRACE_SYNC_ENV      (auto|1|0, default auto) mirror fresh tokens into the Bruno
+                            collection .env as accessToken + AUDITTRACE_TOKEN (mode 600,
+                            gitignored, token never printed). auto = sync when the target
+                            collection dir exists; 0 = never.
+  AUDITTRACE_BRUNO_ENV     (default <repo>/bruno/audittrace/.env) target .env for the sync
 EOF
       exit 0
       ;;
@@ -370,8 +466,9 @@ EOF
 done
 
 case "$ACTION" in
-  login)   action_login ;;
-  show)    action_show ;;
-  ensure)  action_ensure ;;
-  logout)  action_logout ;;
+  login)    action_login ;;
+  show)     action_show ;;
+  ensure)   action_ensure ;;
+  sync-env) action_sync_env ;;
+  logout)   action_logout ;;
 esac
