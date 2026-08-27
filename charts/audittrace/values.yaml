@@ -706,18 +706,54 @@ keycloak:
   # webui will be served from (including the operator's own
   # `audittrace.allaboutdata.eu:30952` if applicable). See Phase B.9
   # in the 2026-05-03 stabilisation tail PR for context.
+  #
+  # OIDC-REDIRECT-URI-DRIFT (M3-WU-1, 2026-08-27): RFC 9700 + ADR-042 §3
+  # forbid redirect-URI wildcards — `redirectUris`/`webOrigins` below are
+  # EXACT-match only, no trailing `/*`. The `webui/serve.py` local dev
+  # harness (plain HTTP, localhost-only) is a genuinely different risk
+  # class from the mesh-served `.local` entries, so it lives in the
+  # separate `devRedirectUris`/`devWebOrigins` keys — a distinct, clearly-
+  # marked dev profile per the portability invariant ("a second target is
+  # a profile behind config, not a rewrite"). The realm template concats
+  # both lists so the laptop reference/dev default is unchanged (the
+  # ADR-044 evidence-capture flow through `webui/serve.py` keeps working);
+  # a stricter deployment profile can override `devRedirectUris: []` /
+  # `devWebOrigins: []` to drop the dev entries entirely.
   webui:
     redirectUris:
       - "https://audittrace.local/oauth2/callback"
-      - "https://audittrace.local/*"
       - "https://audittrace.local:30952/oauth2/callback"
-      - "https://audittrace.local:30952/*"
-      - "http://localhost:8765/*"
+    devRedirectUris:
+      - "http://localhost:8765/"
     webOrigins:
       - "https://audittrace.local"
       - "https://audittrace.local:30952"
+    devWebOrigins:
       - "http://localhost:8765"
-    postLogoutRedirectUri: "https://audittrace.local/*"
+    postLogoutRedirectUri: "https://audittrace.local/oauth2/callback"
+  # `audittrace-librechat` Keycloak client config (M3-WU-1) — the M3
+  # LibreChat console's browser-facing public PKCE client. WU-1 scope
+  # only: this client authenticates the browser session; the RFC 8693
+  # token-exchange confidential client the BFF uses to mint the
+  # `aud=audittrace-server` token is WU-2's scope, not this one. Callback
+  # path follows LibreChat's own convention (`/oauth/openid/callback`,
+  # ADR-042 §9) under a `/librechat` prefix on the same `.local` host
+  # pattern as `webui` above, so a future Istio route can disambiguate the
+  # two consoles; WU-3 (compose + `librechat.yaml`) owns standing that
+  # route up. `devRedirectUris`/`devWebOrigins` mirror LibreChat's
+  # upstream default dev port (3080) the same way `webui`'s do for 8765 —
+  # same dev-profile separation, same OIDC-REDIRECT-URI-DRIFT discipline.
+  librechat:
+    redirectUris:
+      - "https://audittrace.local/librechat/oauth/openid/callback"
+      - "https://audittrace.local:30952/librechat/oauth/openid/callback"
+    devRedirectUris:
+      - "http://localhost:3080/oauth/openid/callback"
+    webOrigins:
+      - "https://audittrace.local"
+      - "https://audittrace.local:30952"
+    devWebOrigins:
+      - "http://localhost:3080"
   resources:
     requests:
       cpu: 500m

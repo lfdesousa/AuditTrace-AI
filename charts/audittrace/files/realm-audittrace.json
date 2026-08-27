@@ -483,12 +483,14 @@
       "serviceAccountsEnabled": false,
       "protocol": "openid-connect",
       "redirectUris": [
-{{- range $i, $uri := .Values.keycloak.webui.redirectUris }}{{ if $i }},{{ end }}
+{{- $webuiRedirectUris := concat .Values.keycloak.webui.redirectUris .Values.keycloak.webui.devRedirectUris }}
+{{- range $i, $uri := $webuiRedirectUris }}{{ if $i }},{{ end }}
         "{{ $uri }}"
 {{- end }}
       ],
       "webOrigins": [
-{{- range $i, $origin := .Values.keycloak.webui.webOrigins }}{{ if $i }},{{ end }}
+{{- $webuiWebOrigins := concat .Values.keycloak.webui.webOrigins .Values.keycloak.webui.devWebOrigins }}
+{{- range $i, $origin := $webuiWebOrigins }}{{ if $i }},{{ end }}
         "{{ $origin }}"
 {{- end }}
       ],
@@ -571,6 +573,81 @@
           "config": {
             "user.attribute": "lastName",
             "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Public client for the M3 LibreChat console (read/ask boundary, B2/B3). OAuth2 Authorization Code + PKCE per ADR-042. WU-1 scope only: this client authenticates the browser session; the RFC 8693 token-exchange confidential client the BFF uses to mint an aud=audittrace-server token is WU-2's scope, not this client.",
+      "clientId": "audittrace-librechat",
+      "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+{{- $librechatRedirectUris := concat .Values.keycloak.librechat.redirectUris .Values.keycloak.librechat.devRedirectUris }}
+{{- range $i, $uri := $librechatRedirectUris }}{{ if $i }},{{ end }}
+        "{{ $uri }}"
+{{- end }}
+      ],
+      "webOrigins": [
+{{- $librechatWebOrigins := concat .Values.keycloak.librechat.webOrigins .Values.keycloak.librechat.devWebOrigins }}
+{{- range $i, $origin := $librechatWebOrigins }}{{ if $i }},{{ end }}
+        "{{ $origin }}"
+{{- end }}
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "preferred-username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
             "jsonType.label": "String",
             "id.token.claim": "true",
             "access.token.claim": "true",
