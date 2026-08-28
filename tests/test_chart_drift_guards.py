@@ -1896,3 +1896,54 @@ class TestLibrechatConsoleClient:
                 f"{offenders} — RFC 9700 / ADR-042 §3 forbid redirect-URI/"
                 "webOrigin wildcards."
             )
+
+
+class TestClientDescriptionsWithinKeycloakColumnLimit:
+    """Keycloak's ``CLIENT.DESCRIPTION`` column is ``varchar(255)``. A client
+    ``description`` longer than 255 chars fails realm import at container boot
+    with ``ERROR: value too long for type character varying(255)`` — the
+    keycloak container never turns healthy and the whole stack fails to start.
+
+    This class exists because a JSON-shape check is NOT enough: the file parses
+    as valid JSON with a 314-char description, every other realm guard stays
+    green, ``make test`` passes, and the failure only surfaces in CI's
+    "Build and start stack" step where a real Keycloak imports into a real
+    Postgres (PR #306, 2026-08-28). This guard moves that DB-column constraint
+    into the fast local gate.
+
+    Falsifiable: restore ANY client ``description`` to >255 chars and this turns
+    RED. Applies to BOTH realm files and every client (so WU-2's confidential
+    ``audittrace-librechat-bff`` client is covered from day one).
+    """
+
+    _KEYCLOAK_VARCHAR_LIMIT = 255
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_every_client_description_within_255(self) -> None:
+        for label, realm in self._both_realms():
+            offenders = [
+                (c.get("clientId"), len(c.get("description") or ""))
+                for c in (realm.get("clients") or [])
+                if len(c.get("description") or "") > self._KEYCLOAK_VARCHAR_LIMIT
+            ]
+            assert not offenders, (
+                f"{label}: client description(s) exceed Keycloak's varchar(255) "
+                f"CLIENT.DESCRIPTION limit {offenders} — realm import will fail "
+                "at container boot (the stack never becomes healthy). Shorten "
+                "the description to <=255 chars."
+            )

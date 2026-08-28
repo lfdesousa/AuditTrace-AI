@@ -582,7 +582,7 @@
       ]
     },
     {
-      "description": "Public client for the M3 LibreChat console (read/ask boundary, B2/B3). OAuth2 Authorization Code + PKCE per ADR-042. WU-1 scope only: this client authenticates the browser session; the RFC 8693 token-exchange confidential client the BFF uses to mint an aud=audittrace-server token is WU-2's scope, not this client.",
+      "description": "Public client for the M3 LibreChat console (read/ask boundary B2/B3); OAuth2 Authorization Code + PKCE per ADR-042. WU-1 authenticates the browser session; the BFF's RFC 8693 token-exchange confidential client is WU-2 scope.",
       "clientId": "audittrace-librechat",
       "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
       "enabled": true,
