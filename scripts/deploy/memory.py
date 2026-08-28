@@ -54,6 +54,10 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
+from scripts.deploy.build_record import (
+    BuildRecordValidationError,  # noqa: F401 - re-exported for callers
+    validate_build_record,
+)
 from scripts.deploy.frontdoor import DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR
 from scripts.deploy.frontdoor import resolve_front_door
 
@@ -539,6 +543,53 @@ def log_deploy_record(
         "key": key,
         "index_status": ix_json if ix_json is not None else {"http_status": ix_status},
     }
+
+
+def log_build_record(
+    path_or_text: str | Path,
+    *,
+    front_door: str | None = None,
+    token: str | None = None,
+    layer: str = "episodic",
+    collections: tuple[str, ...] = (DECISIONS_COLLECTION,),
+    filename: str | None = None,
+    outcome: str | None = None,
+    insecure: bool = False,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Layer-0-VALIDATING variant of :func:`log_deploy_record` (SDLC-ADR-005 WU-1).
+
+    ADDITIVE, opt-in entry point for builder/reviewer records that MUST carry
+    the ADR-059 structured front-matter (``spec_ref``, ``spec_hash``,
+    ``recall_evidence``, ``log_key``, ``index_status``, ``branch``, ``commit``,
+    ``gates`` — see :mod:`scripts.deploy.build_record`). Validates the record
+    BEFORE any network call — a malformed record never reaches the memory
+    server, no upload/index HTTP round-trip is wasted on it — then delegates
+    to :func:`log_deploy_record` unchanged for the actual upload + index.
+
+    ``log_deploy_record`` itself is left completely untouched: the deploy /
+    release / curator agents' records do NOT carry this schema, so Layer-0
+    validation is scoped to this dedicated opt-in function rather than gating
+    the shared helper every existing caller depends on — the least-breaking,
+    most fail-closed choice (see the WU-1 build-record's deviation notes).
+
+    Raises :class:`~scripts.deploy.build_record.BuildRecordValidationError` on
+    a missing/empty required field (fail-closed, no network call is made);
+    otherwise raises :class:`DeployLogError` exactly as :func:`log_deploy_record`
+    does on an upload/index failure.
+    """
+    validate_build_record(path_or_text)
+    return log_deploy_record(
+        path_or_text,
+        front_door=front_door,
+        token=token,
+        layer=layer,
+        collections=collections,
+        filename=filename,
+        outcome=outcome,
+        insecure=insecure,
+        timeout=timeout,
+    )
 
 
 def _err_detail(body: bytes) -> str:
