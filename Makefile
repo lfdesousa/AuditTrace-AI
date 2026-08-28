@@ -1,7 +1,7 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
-       token-guard sync-dashboards check-dashboard-drift check-retention-drift
+       token-guard sync-dashboards check-dashboard-drift check-retention-drift integration
 
 # SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
 # sibling checkout, not part of this repo. Its Grafana file-provider dir is a
@@ -82,7 +82,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts.replay_dead_lettered_index --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts.replay_dead_lettered_index --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -136,6 +136,9 @@ test-unit: ## Run unit tests only (fast)
 test-watch: ## Run tests in watch mode
 	@echo "🧪 Running tests in watch mode..."
 	@.venv/bin/ptw --now . -- -v --cov=src --cov-report=term-missing
+
+integration: ## ADR-059 Layer 3 (WU-3) local integration gate: boot the FULL docker-compose stack (mock-llm profile), wait for EVERY service healthy — Keycloak realm-import included, the exact #306 signal (a >255-char client description makes Keycloak unhealthy and the stack never comes up) — run the shared smoke suite (tests/integration/compose/*.sh), then tear down (always, success or failure). Mirrors .github/workflows/e2e-compose.yml so a bad realm/compose change fails HERE, not only in CI (feedback_mirror_every_ci_gate_locally). Override via INTEGRATION_ENV_FILE / INTEGRATION_WAIT_TIMEOUT / AUDITTRACE_BASE_URL.
+	@.venv/bin/python -m scripts.integration_gate
 
 test-integration: docker-build ## Run RLS integration suite as a Helm test Pod inside the k8s cluster (Vault Agent + Istio mTLS path)
 	# Builds + pushes the tests image (FROM the runtime image produced by
