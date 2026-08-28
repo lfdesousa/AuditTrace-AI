@@ -478,10 +478,8 @@
       "protocol": "openid-connect",
       "redirectUris": [
         "https://audittrace.local/oauth2/callback",
-        "https://audittrace.local/*",
         "https://audittrace.local:30952/oauth2/callback",
-        "https://audittrace.local:30952/*",
-        "http://localhost:8765/*"
+        "http://localhost:8765/"
       ],
       "webOrigins": [
         "https://audittrace.local",
@@ -490,7 +488,7 @@
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "https://audittrace.local/*"
+        "post.logout.redirect.uris": "https://audittrace.local/oauth2/callback"
       },
       "defaultClientScopes": [
         "audittrace:query",
@@ -567,6 +565,79 @@
           "config": {
             "user.attribute": "lastName",
             "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Public client for the M3 LibreChat console (read/ask boundary B2/B3); OAuth2 Authorization Code + PKCE per ADR-042. WU-1 authenticates the browser session; the BFF's RFC 8693 token-exchange confidential client is WU-2 scope.",
+      "clientId": "audittrace-librechat",
+      "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "https://audittrace.local/librechat/oauth/openid/callback",
+        "https://audittrace.local:30952/librechat/oauth/openid/callback",
+        "http://localhost:3080/oauth/openid/callback"
+      ],
+      "webOrigins": [
+        "https://audittrace.local",
+        "https://audittrace.local:30952",
+        "http://localhost:3080"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "audittrace:query",
+        "audittrace:context",
+        "audittrace:audit",
+        "memory:episodic:read",
+        "memory:procedural:read",
+        "memory:conversational:read-own",
+        "memory:semantic:read"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "preferred-username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
             "jsonType.label": "String",
             "id.token.claim": "true",
             "access.token.claim": "true",

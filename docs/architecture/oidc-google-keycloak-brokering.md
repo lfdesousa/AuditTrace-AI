@@ -267,31 +267,32 @@ identity model is required, only a wider set of scoped call sites.
   tracked gap between the target architecture and what is live, not an
   oversight: the harness exists specifically to validate the broker
   wiring before the BFF lands.
-- **Exact-match redirect URIs.** [ADR-042 §3](../ADR-042-oidc-authorization-code-pkce.md#3-redirect-uri-discipline)
+- **Exact-match redirect URIs — remediated 2026-08-27 (M3-WU-1).** [ADR-042 §3](../ADR-042-oidc-authorization-code-pkce.md#3-redirect-uri-discipline)
   requires exact-match, HTTPS-only redirect URIs with no wildcards, and
   RFC 9700 names wildcard redirect URIs as a deprecated pattern behind
-  multiple public-client breaches. The live `audittrace-webui` client's
-  committed `redirectUris` (`keycloak/realm-audittrace.json`) does not
-  meet that bar:
-  ```
-  https://audittrace.local/oauth2/callback
-  https://audittrace.local/*
-  https://audittrace.local:30952/oauth2/callback
-  https://audittrace.local:30952/*
-  http://localhost:8765/*
-  ```
-  Two of the five entries are exact-match HTTPS callbacks; the other
-  three are wildcards, and the last is plain HTTP. The plain-HTTP
-  wildcard is the `webui/` local-dev harness's own origin (per
-  `webui/README.md`, served with `python3 -m http.server` on
-  `localhost:8765`), which is a defensible dev-only entry on its own
-  terms. The two `https://audittrace.local(:30952)/*` wildcards are not
-  defensible the same way; they are real drift against ADR-042 §3, not
-  a documented target-vs-live gap like the public-client one above.
-  Tracked separately for remediation (backlog `OIDC-REDIRECT-URI-DRIFT`);
-  this doc's sequence diagram deliberately labels `redirect_uri` as
-  "pre-registered" rather than "exact-match" for that reason, and does
-  not present the target as if it were live.
+  multiple public-client breaches. The `audittrace-webui` client's
+  committed `redirectUris` previously carried two `/*` wildcards
+  (`https://audittrace.local/*`, `https://audittrace.local:30952/*`)
+  alongside their exact-match `/oauth2/callback` siblings and a
+  plain-HTTP `http://localhost:8765/*` entry — real drift against
+  ADR-042 §3 (backlog `OIDC-REDIRECT-URI-DRIFT`). The fix (M3-WU-1):
+  drop both wildcards (nothing is served through the mesh at those
+  paths yet — no route consumes them; a future consumer registers its
+  own exact path, same as `audittrace-librechat` does below), and
+  tighten the local-dev harness's own origin from a wildcard to the
+  one path it actually serves (`http://localhost:8765/`, per
+  `webui/README.md` and `webui/serve.py`). That dev-only entry now
+  lives in a separate `keycloak.webui.devRedirectUris` chart value
+  (concatenated into the rendered client at template time) rather than
+  mixed into the same list as the mesh-served exact-match entries —
+  a distinct, clearly-marked dev profile, droppable per-deployment.
+  `audittrace-librechat` (the M3 LibreChat console's browser client,
+  also introduced in M3-WU-1) follows the same discipline from day
+  one: exact-match `redirectUris`/`webOrigins` plus a
+  `devRedirectUris`/`devWebOrigins` pair for LibreChat's own default
+  dev port. This doc's sequence diagram's "pre-registered" label for
+  `redirect_uri` now also reads as "exact-match" — the drift it
+  flagged is closed.
 - **Device Flow.** Human CLI/headless login (`scripts/audittrace-login`,
   ADR-032, RFC 8628) is a separate, non-browser grant that does not
   involve Google brokering at all. See

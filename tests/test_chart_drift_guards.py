@@ -1707,3 +1707,243 @@ class TestSingleOwnershipKeyInVectorMetadata:
             "writer must change with it in the same commit — a reader/writer "
             "mismatch here produces zero results with no error anywhere."
         )
+
+
+class TestLibrechatConsoleClient:
+    """M3-WU-1 — the ``audittrace-librechat`` OIDC client (the M3 LibreChat
+    console's browser-facing public PKCE client, ADR-064) must exist in
+    BOTH realm files with a read/ask-only scope grant.
+
+    Falsifiable, one assertion per guard:
+
+    * renaming/removing the client from either realm file fails
+      ``test_client_present_in_both_realms``;
+    * its ``defaultClientScopes`` drifting from the exact read/ask set fails
+      ``test_default_scopes_match_expected_read_ask_set``;
+    * granting it ANY ``memory:*:write`` scope (default or optional) fails
+      ``test_no_memory_write_scope_granted`` — console users are read/ask
+      only (M3 boundary B2/B3); a write scope here is a REJECT-worthy
+      defect, not a nice-to-catch;
+    * granting it a ``memory:corpus:*`` scope fails
+      ``test_no_corpus_scope_granted`` (ADR-062 §4 — corpus scopes are
+      operator/curator-tier);
+    * flipping ``publicClient``/enabling implicit/ROPC/service-accounts, or
+      adding a client secret, fails ``test_public_client_no_secret_no_implicit_no_ropc``;
+    * dropping PKCE S256 fails ``test_pkce_s256_enabled``;
+    * dropping the ``aud-audittrace-server`` mapper (or its
+      ``included.custom.audience``) fails ``test_audience_mapper_present`` —
+      without it, issued tokens would not carry ``aud=audittrace-server``
+      and ``/v1`` would reject them;
+    * dropping ``preferred-username``/``email`` mappers fails
+      ``test_identity_mappers_present`` — audit rows/traces would lose the
+      human-legible identity alongside ``sub``;
+    * a wildcard ``redirectUris``/``webOrigins`` entry (the
+      OIDC-REDIRECT-URI-DRIFT regression) fails
+      ``test_no_wildcard_redirect_uris``.
+    """
+
+    _EXPECTED_DEFAULT_SCOPES: frozenset[str] = frozenset(
+        {
+            "audittrace:query",
+            "audittrace:context",
+            "audittrace:audit",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:conversational:read-own",
+            "memory:semantic:read",
+        }
+    )
+
+    @staticmethod
+    def _client(realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == "audittrace-librechat":
+                return c
+        raise AssertionError(
+            "audittrace-librechat is missing from the realm — the M3-WU-1 "
+            "console client was renamed or removed."
+        )
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_client_present_in_both_realms(self) -> None:
+        for _label, realm in self._both_realms():
+            self._client(realm)  # raises AssertionError if missing
+
+    def test_default_scopes_match_expected_read_ask_set(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            default = set(c.get("defaultClientScopes") or [])
+            assert default == self._EXPECTED_DEFAULT_SCOPES, (
+                f"{label}: audittrace-librechat defaultClientScopes drifted "
+                f"from the read/ask boundary. Extra: "
+                f"{sorted(default - self._EXPECTED_DEFAULT_SCOPES)}; missing: "
+                f"{sorted(self._EXPECTED_DEFAULT_SCOPES - default)}."
+            )
+
+    def test_no_memory_write_scope_granted(self) -> None:
+        """Console users are read/ask only (boundary B2/B3). A memory-write
+        scope here — default OR optional — is a REJECT-worthy defect."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            offenders = sorted(
+                s for s in both if s.startswith("memory:") and s.endswith(":write")
+            )
+            assert not offenders, (
+                f"{label}: audittrace-librechat was granted write scope(s) "
+                f"{offenders} — console users are read/ask only (M3 "
+                "boundary B2/B3); this VOIDS the boundary the client exists "
+                "to hold."
+            )
+
+    def test_no_corpus_scope_granted(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            offenders = sorted(s for s in both if s.startswith("memory:corpus:"))
+            assert not offenders, (
+                f"{label}: audittrace-librechat was granted corpus scope(s) "
+                f"{offenders} — corpus scopes are operator/curator-tier "
+                "(ADR-062 §4); end-user clients never get them."
+            )
+
+    def test_public_client_no_secret_no_implicit_no_ropc(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert c.get("publicClient") is True, (
+                f"{label}: audittrace-librechat must be a public client (no "
+                "client secret to hold)."
+            )
+            assert c.get("standardFlowEnabled") is True, (
+                f"{label}: audittrace-librechat must have the Authorization "
+                "Code flow enabled."
+            )
+            assert c.get("implicitFlowEnabled") is not True, (
+                f"{label}: implicit grant is forbidden (RFC 9700)."
+            )
+            assert c.get("directAccessGrantsEnabled") is not True, (
+                f"{label}: Resource Owner Password Credentials is forbidden (RFC 9700)."
+            )
+            assert c.get("serviceAccountsEnabled") is not True, (
+                f"{label}: audittrace-librechat is user-facing only — no "
+                "service account grant."
+            )
+            assert "secret" not in c, (
+                f"{label}: a public client must carry no client secret."
+            )
+
+    def test_pkce_s256_enabled(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert (
+                c.get("attributes", {}).get("pkce.code.challenge.method") == "S256"
+            ), f"{label}: audittrace-librechat must enforce PKCE with S256."
+
+    def test_audience_mapper_present(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            mappers = {m.get("name"): m for m in c.get("protocolMappers", []) or []}
+            assert "aud-audittrace-server" in mappers, (
+                f"{label}: audittrace-librechat is missing the "
+                "aud-audittrace-server audience mapper — issued tokens would "
+                "not carry aud=audittrace-server, and /v1 would reject them."
+            )
+            config = mappers["aud-audittrace-server"].get("config", {})
+            assert config.get("included.custom.audience") == "audittrace-server", (
+                f"{label}: aud-audittrace-server mapper does not target "
+                "audittrace-server."
+            )
+
+    def test_identity_mappers_present(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            mappers = {m.get("name") for m in c.get("protocolMappers", []) or []}
+            assert {"preferred-username", "email"} <= mappers, (
+                f"{label}: audittrace-librechat must carry preferred_username "
+                "+ email protocol mappers so audit rows/traces carry a "
+                "human-legible identity alongside `sub`."
+            )
+
+    def test_no_wildcard_redirect_uris(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            offenders = [
+                u
+                for u in (c.get("redirectUris") or []) + (c.get("webOrigins") or [])
+                if u.endswith("*")
+            ]
+            assert not offenders, (
+                f"{label}: audittrace-librechat carries wildcard URI(s) "
+                f"{offenders} — RFC 9700 / ADR-042 §3 forbid redirect-URI/"
+                "webOrigin wildcards."
+            )
+
+
+class TestClientDescriptionsWithinKeycloakColumnLimit:
+    """Keycloak's ``CLIENT.DESCRIPTION`` column is ``varchar(255)``. A client
+    ``description`` longer than 255 chars fails realm import at container boot
+    with ``ERROR: value too long for type character varying(255)`` — the
+    keycloak container never turns healthy and the whole stack fails to start.
+
+    This class exists because a JSON-shape check is NOT enough: the file parses
+    as valid JSON with a 314-char description, every other realm guard stays
+    green, ``make test`` passes, and the failure only surfaces in CI's
+    "Build and start stack" step where a real Keycloak imports into a real
+    Postgres (PR #306, 2026-08-28). This guard moves that DB-column constraint
+    into the fast local gate.
+
+    Falsifiable: restore ANY client ``description`` to >255 chars and this turns
+    RED. Applies to BOTH realm files and every client (so WU-2's confidential
+    ``audittrace-librechat-bff`` client is covered from day one).
+    """
+
+    _KEYCLOAK_VARCHAR_LIMIT = 255
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_every_client_description_within_255(self) -> None:
+        for label, realm in self._both_realms():
+            offenders = [
+                (c.get("clientId"), len(c.get("description") or ""))
+                for c in (realm.get("clients") or [])
+                if len(c.get("description") or "") > self._KEYCLOAK_VARCHAR_LIMIT
+            ]
+            assert not offenders, (
+                f"{label}: client description(s) exceed Keycloak's varchar(255) "
+                f"CLIENT.DESCRIPTION limit {offenders} — realm import will fail "
+                "at container boot (the stack never becomes healthy). Shorten "
+                "the description to <=255 chars."
+            )
