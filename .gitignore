@@ -124,6 +124,14 @@ charts/audittrace/values-local.yaml
 # WS2 deploy-runner evidence bundles (deploy reports + pod samples)
 scripts/deploy/runs/
 
+# Fault-injection runner evidence bundles (sibling of runs/ above)
+scripts/deploy/faultinject-runs/
+
+# Session scratch — briefs, PR-body drafts, work-start/park memos, build
+# logs, cert artefacts. Local-only working files; some reference private
+# counterparty material and must NEVER reach this public repo.
+scratchpad/
+
 # #398 release-cut runner evidence bundles (release-record JSON + summary)
 scripts/release/runs/
 

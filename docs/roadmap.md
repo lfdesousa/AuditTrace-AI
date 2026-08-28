@@ -113,6 +113,15 @@ The ADR number is reserved with an empty shell at `docs/ADR-038-memory-sync-prot
 - Experimental questions: can the actor degrade reconstructibility without triggering a detectable signal? What failure modes does the audit trail itself have?
 - Target milestone: published `docs/eval-adversarial-reconstructibility.md` with named attack vectors, observed system response, and recommended mitigations. Negative results published as rigorously as positive ones.
 
+## Milestone M3 — First-party console
+
+**Why this next.** A pilot-ready end-user console lets people use the system directly, without a developer harness, and without weakening the audit boundary. The UI stays a thin shell; the orchestrator stays the sole path.
+
+- A thin-shell chat console over the orchestrator: every request still travels `/v1`, so every answer stays grounded, recalled, and traced. No parallel memory, retrieval, or model path lives in the UI.
+- Identity is Keycloak-once (OIDC); the user identity reaching the orchestrator stays token-derived.
+- Answers cite the documents retrieved into context.
+- Target milestone: an end-user reaches a grounded, cited answer through the console via OIDC login, and the interaction is reconstructible end-to-end (`user_id` + `session_id` + `trace_id`) in the audit trail.
+
 ## Research programme (parallel track, not on critical path)
 
 Coordinated with the University of Liverpool Department of Computer Science (initial contact 2023, active discussion 2026-04). Programme resumes in late April 2026 following Liverpool's internal academic-hire process.
