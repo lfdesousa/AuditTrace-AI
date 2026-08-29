@@ -1,0 +1,299 @@
+# M3-WU-3 — the LibreChat console profile (spec:
+# specs/2026-08-29-SPEC-m3-wu3-librechat-console-profile.md, private repo).
+#
+# A SEPARATE, self-contained compose file from docker-compose.yml on
+# purpose: the main file stands up AuditTrace's OWN full stack (its own
+# Keycloak, its own memory-server against mock-llm) for the compose-dev
+# loop; this file's `console` profile does the opposite — it reaches OUT
+# to the EXISTING, already-deployed k3s cluster's front door
+# (`https://audittrace.local`, laptop default — see the portability
+# invariant below) for both Keycloak and `/v1`. Only LibreChat + its
+# Mongo are local-only (D3). Bringing the two files' services onto one
+# compose project would put a real Keycloak realm one profile away from
+# colliding with the demo stack's own throwaway Keycloak on the same
+# ports — a correctness risk this split avoids structurally.
+#
+# Portability invariant: every target-shaped value (front-door host, the
+# BFF confidential-client secret, the local-CA trust anchor) sits behind
+# an env var with a laptop-safe default or an explicit fail-closed
+# require (`${VAR:?...}`) — a cloud target overrides via env, never a
+# rewrite of this file.
+#
+# Bring-up (see bff/README.md + config/compose/librechat/librechat.yaml
+# for the identity-flow detail and the documented spec deviations).
+# `-p audittrace-console` is NOT optional: without an explicit project
+# name, this file and the repo's default `docker-compose.yml` share the
+# SAME implicit project (derived from the directory name) — a later
+# `docker compose down --remove-orphans` on the OTHER file (e.g. `make
+# integration`, run from the same directory) would then treat this
+# stack's containers as orphans of ITS project and tear them down.
+# Verified live (2026-08-29): this happened once during this WU's own
+# build — `make integration`'s teardown silently removed all three
+# console-profile containers a `docker ps` step earlier had shown
+# healthy. Always pass `-p`.
+#
+#   export AUDITTRACE_BFF_CLIENT_SECRET=<kcadm-retrieved, never committed>
+#   docker compose -p audittrace-console -f docker-compose.edge.yml --profile console up -d --build
+#
+# Then open http://localhost:3080 and log in via Keycloak
+# (`audittrace-librechat`, OIDC-only). D4: LibreChat's ONLY route to the
+# audited chat path is the `bff` service on this compose network — it
+# never gets an env var or endpoint config naming `/v1` or Keycloak's
+# admin surface directly (see the config-guard tests). It DOES carry one
+# `extra_hosts` route to the front door for OIDC discovery/JWKS/token
+# exchange — that is D2's own direct-OIDC-relying-party design, a
+# login-time concern distinct from the audited chat path, not a gap in
+# D4 (see the `TestLibreChatRoutesToBffOnly` guards, which assert it is
+# exactly that one route and nothing else).
+
+services:
+
+  # ── D1 — the BFF sidecar (bff/, image from bff/Dockerfile) ───────────
+  #
+  # Deviation from the ratified spec's literal service port (documented,
+  # fail-closed, no frozen-code change): bff/Dockerfile's baked-in
+  # HEALTHCHECK + CMD listen on 8766 (its shipped, tested default —
+  # bff/config.py::Settings.port). The spec's topology diagram and D2's
+  # `baseURL: http://bff:8080/v1` both name port 8080 explicitly. Rather
+  # than re-cutting the already-reviewed WU-2 Dockerfile/Settings default
+  # (frozen, shipped, live-proven #309) to chase a number that appears
+  # only in this WU's topology sketch, this service overrides `command:`
+  # + `healthcheck:` to bind 8080 for the compose network — the image
+  # itself is untouched.
+  bff:
+    build:
+      context: .
+      dockerfile: bff/Dockerfile
+    image: audittrace-librechat-bff:local
+    container_name: audittrace-librechat-bff
+    profiles: ["console"]
+    command:
+      ["uvicorn", "bff.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      - AUDITTRACE_BFF_ENV=local
+      # RFC 8693 token exchange (confidential client) — the secret has
+      # NO default in bff/config.py::Settings (fail-closed at container
+      # startup); operator sources it via kcadm (bff/README.md), NEVER
+      # hardcoded here. `:?` makes a missing shell var a compose-time
+      # error rather than an empty-string silently reaching the
+      # container. Name split deliberately: the operator-facing shell
+      # var (AUDITTRACE_BFF_CLIENT_SECRET) is the short name this WU's
+      # runbooks use to source the secret; the right-hand side is the
+      # ACTUAL Settings-recognized env var
+      # (AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET, env_prefix
+      # `AUDITTRACE_BFF_` + field `exchange_client_secret`).
+      - AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET=${AUDITTRACE_BFF_CLIENT_SECRET:?set AUDITTRACE_BFF_CLIENT_SECRET — retrieve via kcadm, see bff/README.md; never commit it}
+      - AUDITTRACE_BFF_EXCHANGE_CLIENT_ID=${AUDITTRACE_BFF_EXCHANGE_CLIENT_ID:-audittrace-librechat-bff}
+      - AUDITTRACE_BFF_EXCHANGE_AUDIENCE=${AUDITTRACE_BFF_EXCHANGE_AUDIENCE:-audittrace-librechat}
+      # Front door — laptop default is the reference target (portability
+      # invariant); override for a cloud rig via env, never a rewrite.
+      # Routing (JWKS fetch, token endpoint) always goes through the
+      # front door actually reachable + TLS-trusted from this container.
+      - AUDITTRACE_BFF_KEYCLOAK_JWKS_URL=${AUDITTRACE_FRONT_DOOR:-https://audittrace.local}/realms/audittrace/protocol/openid-connect/certs
+      - AUDITTRACE_BFF_KEYCLOAK_TOKEN_URL=${AUDITTRACE_FRONT_DOOR:-https://audittrace.local}/realms/audittrace/protocol/openid-connect/token
+      # The EXPECTED issuer STRING is a separate concern from routing —
+      # verified live (2026-08-29): this cluster's Keycloak stamps every
+      # token's `iss` claim with its `KC_HOSTNAME`-configured canonical
+      # value regardless of which front door issued it (same reality
+      # `AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS` papers over for the
+      # orchestrator itself, ADR-032 — mirrored here with the identical
+      # two values the live memory-server deployment accepts). A cloud
+      # target overrides both env vars, never this file.
+      - AUDITTRACE_BFF_KEYCLOAK_ISSUER=${AUDITTRACE_BFF_KEYCLOAK_CANONICAL_ISSUER:-https://audittrace.allaboutdata.eu:30952/realms/audittrace}
+      - AUDITTRACE_BFF_KEYCLOAK_ISSUER_EXTRAS=${AUDITTRACE_BFF_KEYCLOAK_ISSUER_EXTRAS:-["https://audittrace.local/realms/audittrace"]}
+      - AUDITTRACE_BFF_ORCHESTRATOR_BASE_URL=${AUDITTRACE_FRONT_DOOR:-https://audittrace.local}
+      # Local-CA trust (see bff/config.py::Settings.ca_bundle_path) — the
+      # laptop front door serves a self-signed cert (chart's
+      # secret-tls.yaml); mount the same CA
+      # `scripts/install-audittrace-trust.sh` extracts. Empty this var
+      # (unset AUDITTRACE_BFF_CA_HOST_PATH, drop the volume mount below)
+      # for a cloud target with a real CA — httpx's normal certifi trust
+      # then applies (Settings default, unset ca_bundle_path).
+      - AUDITTRACE_BFF_CA_BUNDLE_PATH=/etc/audittrace/ca.crt
+    volumes:
+      - ${AUDITTRACE_BFF_CA_HOST_PATH:-${HOME}/.config/audittrace/ca.crt}:/etc/audittrace/ca.crt:ro
+    extra_hosts:
+      - "audittrace.local:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - audittrace-console-net
+    restart: unless-stopped
+
+  # ── D3 — MongoDB (pinned, named volume, NO external port) ────────────
+  librechat-mongodb:
+    image: mongo:7.0@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b
+    container_name: audittrace-librechat-mongodb
+    profiles: ["console"]
+    command: ["mongod", "--noauth"]
+    volumes:
+      - librechat_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - audittrace-console-net
+    restart: unless-stopped
+
+  # ── D2 — LibreChat (stock, pinned digest) ─────────────────────────────
+  #
+  # No `extra_hosts` for `audittrace.local` here (D4) — LibreChat's ONLY
+  # backend route is `bff` on the console network; it must never be able
+  # to resolve the cluster's front door directly, so the isolation is
+  # structural, not just a missing route in librechat.yaml.
+  librechat:
+    image: ghcr.io/danny-avila/librechat:v0.7.9@sha256:7d7c54a1daa1feba3185f14a4e16672d3aed11c3b523887c88c10560c0f3a776
+    container_name: audittrace-librechat
+    profiles: ["console"]
+    depends_on:
+      librechat-mongodb:
+        condition: service_healthy
+      bff:
+        condition: service_healthy
+    ports:
+      - "3080:3080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3080
+      - MONGO_URI=mongodb://librechat-mongodb:27017/LibreChat
+      - DOMAIN_CLIENT=http://localhost:3080
+      - DOMAIN_SERVER=http://localhost:3080
+      # Only the AuditTrace custom endpoint is exposed — no default
+      # openAI/google/anthropic/agents/assistants/bedrock endpoints
+      # regardless of any stray provider API-key env var (B4; see
+      # config/compose/librechat/librechat.yaml's header comment + the
+      # config guard test).
+      - ENDPOINTS=custom
+      # ── auth / registration (spec D2) ───────────────────────────────
+      - ALLOW_REGISTRATION=false
+      - ALLOW_EMAIL_LOGIN=false
+      - ALLOW_PASSWORD_RESET=false
+      - ALLOW_SHARED_LINKS=false
+      # "Social login" is stock LibreChat's umbrella term for every
+      # non-email strategy INCLUDING OpenID — must be true or the OIDC
+      # passport routes are never registered at all (verified against
+      # api/server/index.js in the pinned image).
+      - ALLOW_SOCIAL_LOGIN=true
+      # ── OIDC (audittrace-librechat, public client, PKCE) ────────────
+      # Points at the discovery DOCUMENT, not the bare issuer identifier
+      # — verified live (2026-08-29): this cluster's Keycloak reports a
+      # DIFFERENT canonical `issuer` claim
+      # (https://audittrace.allaboutdata.eu:30952/realms/audittrace, the
+      # cloud-rig hostname the box's `KC_HOSTNAME` is pinned to) than the
+      # front door used to reach it (audittrace.local). `openid-client`
+      # (panva) does strict issuer-identifier-vs-discovered-issuer
+      # matching when given a bare issuer URL — 401s with "discovered
+      # metadata issuer does not match the expected issuer". Per its own
+      # documented (non-default, but explicitly supported) behavior:
+      # passing the FULL `.well-known/openid-configuration` URL is
+      # shorthand for a direct fetch and skips that
+      # identifier-vs-discovered-issuer check, while token/ID-token
+      # validation still correctly uses the DISCOVERED issuer (matching
+      # what Keycloak-issued tokens actually carry — proven via a live
+      # RFC 8693 exchange this session). This is the same multi-issuer
+      # reality `AUDITTRACE_KEYCLOAK_ISSUER_EXTRAS` exists to paper over
+      # on the orchestrator side (ADR-032); LibreChat's OIDC client has
+      # no equivalent "accept either" knob, so the discovery-URL form is
+      # the fail-closed, no-source-edit way to point it at the SAME
+      # Keycloak the operator's front door reaches.
+      - OPENID_ISSUER=${AUDITTRACE_FRONT_DOOR:-https://audittrace.local}/realms/audittrace/.well-known/openid-configuration
+      - OPENID_CLIENT_ID=audittrace-librechat
+      # `audittrace-librechat` is a PUBLIC client (PKCE, no secret — WU-1,
+      # frozen). Stock LibreChat's own gate
+      # (api/server/socialLogins.js::configureSocialLogins) will not even
+      # ATTEMPT to configure OIDC unless `OPENID_CLIENT_SECRET` is a
+      # non-empty string — verified live against the pinned image
+      # (2026-08-29): leaving it unset silently skips OIDC setup entirely
+      # (`openidLoginEnabled` stays `false` in `/api/config`, no error
+      # logged). This placeholder value is NEVER a real credential and is
+      # not sent to a client that checks it: Keycloak skips the
+      # client-authentication step entirely for `publicClient: true`
+      # clients, so whatever `openid-client` (panva) sends on the token
+      # request for this client_id is not verified server-side — PKCE
+      # (code_verifier/code_challenge) is what actually authorizes the
+      # exchange. Documented spec deviation (fail-closed choice): making
+      # this client confidential instead (a real secret) would mean
+      # shipping that secret into the browser-served SPA config or adding
+      # a second backend hop, defeating the BFF-pattern rationale WU-1
+      # chose PKCE for in the first place.
+      - OPENID_CLIENT_SECRET=unused-public-client-pkce-see-compose-comment
+      - OPENID_USE_PKCE=true
+      - OPENID_SCOPE=openid profile email
+      - OPENID_CALLBACK_URL=/oauth/openid/callback
+      - OPENID_BUTTON_LABEL=AuditTrace SSO
+      - OPENID_SESSION_SECRET=${AUDITTRACE_LIBRECHAT_OPENID_SESSION_SECRET:-2fecb19c8e88dd3112b7ef883a9328fc4a3bb9c8265ecf2ca066ade1e766c3d5}
+      # Makes LibreChat's OWN session use the Keycloak access token
+      # directly (api/server/middleware/requireJwtAuth.js) instead of
+      # minting a separate LibreChat JWT — reduces the distinct
+      # credential material in play. Does NOT forward that token to the
+      # custom endpoint (see librechat.yaml header comment for the
+      # verified, documented deviation from the spec's D2 assumption).
+      - OPENID_REUSE_TOKENS=true
+      # ── B4 — cloud features OFF, one reason each ────────────────────
+      # No OPENAI_API_KEY/ANTHROPIC_API_KEY/GOOGLE_KEY/... set anywhere
+      # in this file — combined with ENDPOINTS=custom above, the
+      # built-in providers have neither credentials nor an enabled slot.
+      # No web-search: no SERPER_API_KEY/FIRECRAWL_API_KEY/JINA_API_KEY
+      # (webSearch: is also omitted from librechat.yaml) — the feature
+      # is unconfigured, not merely unused.
+      # No external TTS/STT: no STT_API_KEY/TTS_API_KEY/speech: config —
+      # same absence-is-disable pattern.
+      # Telemetry off: no telemetry beacon exists in the pinned image's
+      # server startup path (verified via source inspection,
+      # api/server/services/start/checks.js only pings a `RAG_API_URL`
+      # health endpoint IF RAG is configured, which it is not here) —
+      # nothing to disable.
+      # No plugins/marketplace: `agents`/`assistants`/`gptPlugins` are
+      # all excluded by ENDPOINTS=custom above.
+      # ── session/credential encryption (local demo Mongo only; NOT
+      #    secrets shared with the audited cluster's own credential
+      #    material — rotate freely, no real customer data ever lands
+      #    here) ─────────────────────────────────────────────────────
+      - CREDS_KEY=${AUDITTRACE_LIBRECHAT_CREDS_KEY:-33e9efa647495f80a44d4951062c682c5b803b85922e25f2b8ef5d28d072d5c8}
+      - CREDS_IV=${AUDITTRACE_LIBRECHAT_CREDS_IV:-e928dfaffea5d1a88aeb767323158e4d}
+      - JWT_SECRET=${AUDITTRACE_LIBRECHAT_JWT_SECRET:-6902e4f0db569c68e82335860523e964e4c259351a4740233d38110e538e920f}
+      - JWT_REFRESH_SECRET=${AUDITTRACE_LIBRECHAT_JWT_REFRESH_SECRET:-2fecb19c8e88dd3112b7ef883a9328fc4a3bb9c8265ecf2ca066ade1e766c3d5}
+      # Node's TLS trust for the OIDC discovery/JWKS calls LibreChat's
+      # backend makes directly to the laptop front door's self-signed
+      # cert (server-to-server, not through the browser). Same CA the
+      # `bff` service mounts.
+      - NODE_EXTRA_CA_CERTS=/etc/audittrace/ca.crt
+    extra_hosts:
+      # LibreChat's backend needs to reach the front door directly for
+      # OIDC discovery/JWKS (server-to-server) — this is the ONE route
+      # to `audittrace.local` this service carries; it never gets a
+      # route to Keycloak's admin surface or a second one to `/v1`
+      # (that is `bff`'s job only — D4).
+      - "audittrace.local:host-gateway"
+    volumes:
+      - ./config/compose/librechat/librechat.yaml:/app/librechat.yaml:ro
+      - ${AUDITTRACE_BFF_CA_HOST_PATH:-${HOME}/.config/audittrace/ca.crt}:/etc/audittrace/ca.crt:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - audittrace-console-net
+    restart: unless-stopped
+
+volumes:
+  librechat_mongo_data:
+
+networks:
+  audittrace-console-net:
+    name: audittrace-console-net

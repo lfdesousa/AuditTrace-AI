@@ -15,14 +15,22 @@ proven end-to-end:
 
 from __future__ import annotations
 
+import asyncio
+import datetime
 import time
 
 import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
 
-from bff.app import create_app, get_http_client
+import bff.app as app_module
+from bff.app import create_app, get_http_client, lifespan
 from bff.config import Settings, get_settings
 from tests.bff.conftest import (
     TEST_ISSUER,
@@ -38,6 +46,31 @@ KEYCLOAK_TOKEN_URL = (
     "http://keycloak:8080/realms/audittrace/protocol/openid-connect/token"
 )
 ORCHESTRATOR_BASE = "http://orchestrator:8765"
+
+
+def _make_self_signed_test_ca_pem() -> str:
+    """A throwaway self-signed X.509 cert PEM — real enough for
+    ``ssl.SSLContext.load_verify_locations`` to accept as a trust
+    anchor, not tied to any real cluster CA."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "audittrace-bff-test-ca")]
+    )
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+_SELF_SIGNED_TEST_PEM = _make_self_signed_test_ca_pem()
 
 
 def _settings() -> Settings:
@@ -358,3 +391,64 @@ class TestHttpClientDependency:
             assert get_http_client() is sentinel
         finally:
             app_module._http_client = None
+
+
+class TestLifespanTlsTrust:
+    """The M3-WU-3 CA-mount guard: the lifespan-created pooled client
+    must pass ``Settings.ca_bundle_path`` straight through as httpx's
+    ``verify=`` argument — a mounted local-CA PEM when set, else
+    httpx's normal certifi trust (``True``). Neuter the ``verify=``
+    plumbing in ``bff/app.py::lifespan`` (e.g. hardcode ``verify=True``)
+    and both assertions below go RED."""
+
+    def _run_lifespan_and_capture_verify(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> object:
+        captured: dict[str, object] = {}
+
+        class _CapturingAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                captured["verify"] = kwargs.get("verify")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(app_module.httpx, "AsyncClient", _CapturingAsyncClient)
+
+        async def _drive() -> None:
+            fastapi_app = FastAPI()
+            async with lifespan(fastapi_app):
+                pass
+
+        asyncio.run(_drive())
+        return captured["verify"]
+
+    def test_empty_ca_bundle_path_verifies_with_default_trust(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.delenv("AUDITTRACE_BFF_CA_BUNDLE_PATH", raising=False)
+        get_settings.cache_clear()
+        try:
+            verify = self._run_lifespan_and_capture_verify(monkeypatch)
+            assert verify is True
+        finally:
+            get_settings.cache_clear()
+
+    def test_set_ca_bundle_path_is_passed_as_verify(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # A real (self-signed, arbitrary) PEM on disk — httpx builds a
+        # real ``ssl.SSLContext`` at client construction, so the path
+        # must exist and be a loadable cert bundle for the lifespan to
+        # succeed; a nonexistent path (e.g. a stray literal) would raise
+        # ``FileNotFoundError`` right here, which is itself proof the
+        # value flows all the way to httpx's ``verify=``.
+        ca_file = tmp_path / "ca.crt"
+        ca_file.write_text(_SELF_SIGNED_TEST_PEM)
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.setenv("AUDITTRACE_BFF_CA_BUNDLE_PATH", str(ca_file))
+        get_settings.cache_clear()
+        try:
+            verify = self._run_lifespan_and_capture_verify(monkeypatch)
+            assert verify == str(ca_file)
+        finally:
+            get_settings.cache_clear()

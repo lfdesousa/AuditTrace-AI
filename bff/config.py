@@ -90,6 +90,21 @@ class Settings(BaseSettings):
     # webui/opencode (routes/chat.py::_detect_source).
     proxy_source_label: str = "librechat"
 
+    # ── Outbound TLS trust (M3-WU-3) ──────────────────────────────────────
+    # JWKS fetches, RFC 8693 token-exchange, and the `/v1` proxy all hit
+    # ``orchestrator_base_url`` / ``keycloak_*_url`` over TLS. httpx's
+    # default trust store is the certifi bundle, which does NOT include
+    # the laptop front door's locally-minted cert (chart's
+    # secret-tls.yaml, self-signed). Empty (default) = httpx's normal
+    # certifi trust (correct for a real-CA front door, e.g. the cloud
+    # rig's Let's Encrypt cert). Set to a mounted PEM path to trust an
+    # additional local CA (the laptop's `~/.config/audittrace/ca.crt`,
+    # same cert `scripts/install-audittrace-trust.sh` extracts — see
+    # `bff/app.py::lifespan`). Portability invariant: env-parameterized,
+    # no hardcoded target; mirrors `src/audittrace/ops/pod_reaper.py`'s
+    # ``verify=str(_CA_PATH)`` pattern for the same class of problem.
+    ca_bundle_path: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -23,6 +23,15 @@ class TestSettingsDefaults:
         assert settings.exchange_audience == "audittrace-librechat"
         assert settings.proxy_source_label == "librechat"
         assert settings.keycloak_issuer_extras == []
+        assert settings.ca_bundle_path == ""
+
+    def test_ca_bundle_path_env_override_is_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.setenv("AUDITTRACE_BFF_CA_BUNDLE_PATH", "/etc/audittrace/ca.crt")
+        settings = Settings()
+        assert settings.ca_bundle_path == "/etc/audittrace/ca.crt"
 
     def test_env_override_is_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
