@@ -35,6 +35,25 @@ spec:
         - name: bff
           image: "{{ .Values.console.bff.image.repository }}:{{ .Values.console.bff.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.console.bff.image.pullPolicy }}
+          {{- if .Values.vault.enabled }}
+          # Source the Vault Agent-rendered secret file before exec'ing the
+          # app — WITHOUT this, the injected AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET
+          # never reaches the process (Settings has no default, so
+          # bff/app.py::lifespan's get_settings() raises at startup and the
+          # pod CrashLoops). Mirrors templates/keycloak/deployment.yaml's
+          # inline-shell pattern (the BFF has no dedicated entrypoint.sh the
+          # way memory-server does, so the guard is inlined here rather than
+          # delegated to a script) — same vaultSecretFileGuard fail-fast
+          # (exit 79) as every other Vault-consuming workload in this chart.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              {{ include "audittrace.vaultSecretFileGuard" . | nindent 14 }}
+              set -a
+              . /vault/secrets/env
+              set +a
+              exec uvicorn bff.app:app --host 0.0.0.0 --port {{ .Values.console.bff.port }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.console.bff.port }}

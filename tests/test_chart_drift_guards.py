@@ -1921,6 +1921,111 @@ class TestLibrechatConsoleClient:
             )
 
 
+class TestConsoleRealmScopeReconcile:
+    """M3-WU-3b (D3) — the ``ensure-memory-scopes`` Job's Step 5 kcadm
+    bodies (``PROFILE_BODY``/``EMAIL_BODY``/``OFFLINE_ACCESS_BODY`` in
+    ``configmap-memory-scopes-script.yaml``) are what actually provisions
+    ``profile``/``email``/``offline_access`` onto a PRE-EXISTING realm (the
+    "``--import-realm`` only imports on first run" gap). They must stay in
+    lock-step with the ``clientScopes`` entries declared in BOTH realm
+    files, or a fresh install and an upgraded pre-existing realm would end
+    up with two different scope shapes.
+
+    Falsifiable: change either side (the kcadm body, or a realm file's
+    ``protocol``/``attributes``/``protocolMappers`` for one of these three
+    scopes) without updating the other, and this goes RED. ``description``
+    is deliberately excluded from the comparison — it is realm-file-only
+    documentation kcadm's ``client-scopes`` create endpoint does not even
+    accept a value for in these bodies, not a drift-worthy field.
+    """
+
+    _SCOPE_NAMES = ("profile", "email", "offline_access")
+    _COMPARED_KEYS = ("protocol", "attributes", "protocolMappers")
+
+    @staticmethod
+    def _script_text() -> str:
+        return (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        ).read_text(encoding="utf-8")
+
+    @classmethod
+    def _kcadm_bodies(cls) -> dict[str, dict]:
+        text = cls._script_text()
+        out: dict[str, dict] = {}
+        for var, name in (
+            ("PROFILE_BODY", "profile"),
+            ("EMAIL_BODY", "email"),
+            ("OFFLINE_ACCESS_BODY", "offline_access"),
+        ):
+            m = re.search(rf"{var}='(\{{.*\}})'", text)
+            assert m is not None, (
+                f"configmap-memory-scopes-script.yaml is missing the {var} "
+                "constant Step 5 uses to reconcile the console realm scopes."
+            )
+            body = json.loads(m.group(1))
+            assert body.get("name") == name, (
+                f"{var} declares name={body.get('name')!r}, expected {name!r}."
+            )
+            out[name] = body
+        return out
+
+    @staticmethod
+    def _realm_scope(realm: dict, name: str) -> dict:
+        for s in realm.get("clientScopes", []) or []:
+            if s.get("name") == name:
+                return s
+        raise AssertionError(f"clientScope {name!r} is missing from the realm.")
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_kcadm_bodies_present_for_all_three_scopes(self) -> None:
+        bodies = self._kcadm_bodies()
+        assert set(bodies) == set(self._SCOPE_NAMES)
+
+    def test_kcadm_bodies_match_realm_files_field_for_field(self) -> None:
+        bodies = self._kcadm_bodies()
+        for label, realm in self._both_realms():
+            for scope_name in self._SCOPE_NAMES:
+                realm_scope = self._realm_scope(realm, scope_name)
+                kcadm_body = bodies[scope_name]
+                for key in self._COMPARED_KEYS:
+                    realm_value = realm_scope.get(key)
+                    kcadm_value = kcadm_body.get(key)
+                    assert realm_value == kcadm_value, (
+                        f"{label}: clientScope {scope_name!r}.{key} drifted "
+                        f"from the ensure-memory-scopes Job's kcadm body. "
+                        f"realm={realm_value!r} kcadm={kcadm_value!r} — a "
+                        "fresh install (realm.json) and an upgraded "
+                        "pre-existing realm (Step 5's kcadm reconcile) "
+                        "would end up with different scope shapes."
+                    )
+
+    def test_step5_comment_does_not_reference_a_stale_test_name(self) -> None:
+        """The 2026-08-29 independent-review fix: the comment used to name
+        a test class that did not exist (a false coverage claim). Assert it
+        now names THIS class, so a future rename of either side is caught."""
+        text = self._script_text()
+        assert "TestConsoleRealmScopeReconcile" in text, (
+            "configmap-memory-scopes-script.yaml's Step 5 comment must "
+            "reference tests/test_chart_drift_guards.py::"
+            "TestConsoleRealmScopeReconcile (this class) by name."
+        )
+
+
 class TestLibrechatBffClient:
     """M3-WU-2 — the ``audittrace-librechat-bff`` confidential client
     (RFC 8693 token-exchange edge for the LibreChat BFF sidecar,

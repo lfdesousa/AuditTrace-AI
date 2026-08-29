@@ -147,6 +147,13 @@ def _container_env(deployment: dict, container_name: str) -> dict[str, object]:
     raise AssertionError(f"no container named {container_name!r}")
 
 
+def _container(deployment: dict, container_name: str) -> dict:
+    for c in deployment["spec"]["template"]["spec"]["containers"]:
+        if c["name"] == container_name:
+            return c
+    raise AssertionError(f"no container named {container_name!r}")
+
+
 def _librechat_yaml_configmap_doc(docs: list[dict]) -> dict:
     cm = _find(docs, "ConfigMap", "-librechat-yaml")
     raw = cm["data"]["librechat.yaml"]
@@ -347,6 +354,38 @@ class TestD4BffSecretVaultSourced:
             "vault.enabled=true but the BFF Deployment still carries a "
             "plaintext AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET env var — the "
             "secret must come from /vault/secrets/env only."
+        )
+
+    def test_vault_secret_file_actually_sourced_before_exec(self) -> None:
+        """The annotation-presence guard above stays green even if the
+        injected secret file is never READ by the process (the 2026-08-29
+        independent-review defect: `command`/`args` rendered `None`, so
+        AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET never reached bff/config.py's
+        Settings and the pod CrashLooped at startup). This asserts the
+        container's actual `command`/`args` source `/vault/secrets/env`
+        before exec'ing the app — the thing that makes the secret reach the
+        running process, not just the thing that makes Vault Agent inject
+        it into the filesystem."""
+        docs = _render(console_enabled=True, vault_enabled=True)
+        dep = _find(docs, "Deployment", "-librechat-bff")
+        c = _container(dep, "bff")
+        command = c.get("command")
+        args = c.get("args") or []
+        assert command == ["/bin/sh", "-c"], (
+            f"bff container command={command!r} — vault.enabled=true must "
+            "override the container command to a shell that sources "
+            "/vault/secrets/env before exec'ing the app; the image's "
+            "default CMD never reads that file."
+        )
+        joined_args = "\n".join(str(a) for a in args)
+        assert ". /vault/secrets/env" in joined_args, (
+            f"bff container args do not source /vault/secrets/env "
+            f"(args={args!r}) — the injected AUDITTRACE_BFF_EXCHANGE_"
+            "CLIENT_SECRET would never reach the process."
+        )
+        assert "exec uvicorn" in joined_args, (
+            "bff container args source the Vault secret file but never "
+            f"exec the app (args={args!r})."
         )
 
     def test_secret_env_fallback_present_when_vault_disabled(self) -> None:
