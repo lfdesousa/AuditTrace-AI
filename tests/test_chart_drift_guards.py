@@ -2343,33 +2343,80 @@ class TestKeycloakTokenExchangePermission:
                 f"{name}={expected!r}."
             )
 
+    _SUCCESS_MARKER = "authorized to exchange"
+
     def _step4_snippet(self) -> str:
+        """The FULL Step 4 block: from the ``find_policy_id`` helper (the
+        first thing Step 4 defines) through the final "authorized to
+        exchange" echo — i.e. everything the happy path needs to reach a
+        genuine, successful exit 0, not just the client-lookup guards. A
+        narrower window that stopped before the permission-id
+        grep/sed/policy-attach machinery let a KCADM stub crash for an
+        UNRELATED reason (see ``test_step4_...`` docstrings below) look
+        indistinguishable from a guard correctly firing — this is the
+        2026-08-29 independent-review fix for exactly that vacuous-test
+        defect."""
         text = self._configmap_script_text()
-        start_marker = 'echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT}'
-        start = text.index(start_marker)
-        end_marker = 'echo "  ✓ token-exchange permission id:'
-        end = text.index(end_marker, start)
+        start = text.index("find_policy_id() {")
+        end = text.index('echo "✅ memory-scopes provisioning complete."')
         snippet = text[start:end]
         assert "find_client_id" in snippet, "Step 4 no longer calls find_client_id"
+        assert self._SUCCESS_MARKER in snippet, (
+            "Step 4's final success echo text drifted — update _SUCCESS_MARKER"
+        )
         return snippet
 
-    def _run_step4(self, *, missing: str) -> subprocess.CompletedProcess:
-        """Run the ACTUAL Step 4 snippet in a real bash subprocess with a
-        stub ``find_client_id`` that succeeds (echoes a fake UUID) for
-        every client name EXCEPT ``missing``, for which it fails — proving
-        the specific ``if ! X_UUID=$(find_client_id ...); then exit 1; fi``
-        guard for that one client is what stops the script, not a
-        different guard picking up the slack."""
+    def _run_step4(self, *, missing: str | None) -> subprocess.CompletedProcess:
+        """Run the ACTUAL Step 4 snippet (verbatim, from the rendered
+        ConfigMap source) in a real bash subprocess against a REALISTIC
+        ``kcadm`` stub — ``fake_kcadm`` below returns plausible JSON/CSV
+        for every call Step 4's happy path actually makes (the
+        ``management/permissions`` enable + its ``token-exchange`` id via
+        the same JSON shape a live Keycloak 24 returns — see the Step 4
+        comment block's live-verification note — the policy list/attach
+        calls), so the baseline (``missing=None``) genuinely reaches exit
+        0 by SUCCEEDING, not by the KCADM stub being too dumb to fail.
+
+        ``find_client_id`` is stubbed separately (as before) to fail for
+        exactly one client name (``missing``) — everything else, real
+        Step 4 logic, unmodified."""
         snippet = self._step4_snippet()
+        missing_line = f'MISSING="{missing}"\n' if missing else 'MISSING=""\n'
         harness = (
             "set -euo pipefail\n"
-            'REALM="audittrace"\n'
-            "KCADM=/bin/true\n"
-            f'MISSING="{missing}"\n'
-            "find_client_id() {\n"
-            '  if [[ "$1" == "${MISSING}" ]]; then return 1; fi\n'
+            'REALM="audittrace"\n' + missing_line + "find_client_id() {\n"
+            '  if [[ -n "${MISSING}" && "$1" == "${MISSING}" ]]; then return 1; fi\n'
             '  echo "fake-uuid-$1"\n'
             "}\n"
+            "fake_kcadm() {\n"
+            '  local sub="$1" path="$2"\n'
+            '  case "${sub} ${path}" in\n'
+            '    "update "*"/management/permissions")\n'
+            "      return 0 ;;\n"
+            '    "get "*"/management/permissions")\n'
+            "      cat <<'JSON'\n"
+            "{\n"
+            '  "enabled" : true,\n'
+            '  "resource" : "fake-resource-id",\n'
+            '  "scopePermissions" : {\n'
+            '    "view" : "fake-view-id",\n'
+            '    "token-exchange" : "fake-permission-id"\n'
+            "  }\n"
+            "}\n"
+            "JSON\n"
+            "      ;;\n"
+            '    "get "*"/authz/resource-server/policy")\n'
+            '      echo "fake-policy-id,${TOKEN_EXCHANGE_POLICY_NAME}" ;;\n'
+            '    "create "*"/authz/resource-server/policy/client")\n'
+            "      return 0 ;;\n"
+            '    "update "*"/authz/resource-server/permission/scope/"*)\n'
+            "      return 0 ;;\n"
+            "    *)\n"
+            '      echo "fake_kcadm: unhandled call: $*" >&2\n'
+            "      return 1 ;;\n"
+            "  esac\n"
+            "}\n"
+            "KCADM=fake_kcadm\n"
             'TOKEN_EXCHANGE_TARGET_CLIENT="audittrace-librechat"\n'
             'TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"\n'
             'TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"\n'
@@ -2377,16 +2424,37 @@ class TestKeycloakTokenExchangePermission:
         )
         return subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
 
+    def test_step4_succeeds_when_all_clients_present(self) -> None:
+        """The genuinely-passing BASELINE the fail-closed parametrizations
+        below are measured against: with every client resolvable and a
+        REALISTIC kcadm stub, Step 4 must reach exit 0 and print its final
+        success line. If this test itself is not GREEN, the parametrized
+        fail-closed tests below are meaningless (a script that never
+        succeeds "fails closed" for every input vacuously)."""
+        result = self._run_step4(missing=None)
+        assert result.returncode == 0, (
+            "Step 4's happy path (every client found, realistic kcadm "
+            f"stub) must exit 0. stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert self._SUCCESS_MARKER in result.stdout, (
+            "Step 4's happy path did not reach its final success echo. "
+            f"stdout={result.stdout!r}"
+        )
+
     @pytest.mark.parametrize(
         "missing",
         ["audittrace-librechat", "audittrace-librechat-bff", "realm-management"],
     )
     def test_step4_fails_closed_when_one_client_is_missing(self, missing: str) -> None:
-        """Falsifiable per-guard: neuter ONLY the ``if ! ...; then exit 1;
-        fi`` block for ``missing`` (e.g. swallow it into a ``|| true``) and
-        this specific parametrization goes RED — proving each of the three
-        guards is independently load-bearing, not redundant coverage from
-        a neighbour."""
+        """Falsifiable per-guard, against the genuinely-passing baseline
+        proven above: neuter ONLY the ``if ! ...; then exit 1; fi`` block
+        for ``missing`` (e.g. swallow it into a ``|| true``) and this
+        specific parametrization goes RED — the script now reaches exit 0
+        and prints the success line even though the client Step 4 relies
+        on was never found — proving each of the three guards is
+        independently load-bearing, not redundant coverage from a
+        neighbour, and not a script that merely crashes for an unrelated
+        reason regardless of which guard is intact."""
         result = self._run_step4(missing=missing)
         assert result.returncode != 0, (
             f"Step 4 must fail closed when {missing!r} is not found. It "
@@ -2396,4 +2464,9 @@ class TestKeycloakTokenExchangePermission:
             f"Step 4's fail-closed path for {missing!r} should explain "
             f"which client was missing. Got stdout={result.stdout!r} "
             f"stderr={result.stderr!r}"
+        )
+        assert self._SUCCESS_MARKER not in result.stdout, (
+            f"Step 4 printed its SUCCESS line even though {missing!r} was "
+            "never found — the guard did not actually stop the script "
+            f"(vacuous fail-closed check). stdout={result.stdout!r}"
         )
