@@ -71,8 +71,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Fail fast at container startup, not on the first request, if a
     # required setting (e.g. ``exchange_client_secret``) is unset —
     # pydantic-settings raises ``ValidationError`` from the constructor.
-    get_settings()
-    _http_client = httpx.AsyncClient()
+    settings = get_settings()
+    # ``verify=<path>`` trusts an additional local CA (laptop front
+    # door's self-signed cert); ``verify=True`` (empty setting) keeps
+    # httpx's normal certifi trust store (cloud rig's real cert). See
+    # ``bff/config.py::Settings.ca_bundle_path``.
+    _http_client = httpx.AsyncClient(verify=settings.ca_bundle_path or True)
     try:
         yield
     finally:
@@ -124,7 +128,8 @@ def create_app() -> FastAPI:
         except TokenExchangeError as exc:
             logger.error("token exchange failed for sub=%s: %s", inbound_sub, exc)
             return JSONResponse(
-                status_code=502, content={"detail": "Upstream authentication service error"}
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
             )
 
         raw_body = await request.body()
@@ -135,7 +140,9 @@ def create_app() -> FastAPI:
             )
         except ProxyError as exc:
             logger.error("orchestrator unreachable: %s", exc)
-            return JSONResponse(status_code=502, content={"detail": "Upstream service unavailable"})
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
 
     return app
 

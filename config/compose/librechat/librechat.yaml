@@ -1,0 +1,45 @@
+# M3-WU-3 — the LibreChat console profile's custom-endpoint config.
+#
+# Stock LibreChat, no source edit (the WU-3 spec's non-negotiable). This
+# file is the ONLY endpoint LibreChat exposes: `ENDPOINTS=custom` (set in
+# docker-compose.edge.yml) hides every built-in provider (openAI, google,
+# anthropic, agents, assistants, bedrock) regardless of this file's
+# contents — see the B4 config-guard test
+# (tests/test_console_profile_guards.py) for the falsifiable check.
+#
+# apiKey: "user_provided" — NOT `OPENID_REUSE_TOKENS` auto-forwarding.
+# D2 of the ratified spec assumed a `{{LIBRECHAT_OPENID_TOKEN}}` template
+# variable that forwards the browser's OIDC access token to a custom
+# endpoint's headers on every request. Verified against the pinned image
+# (ghcr.io/danny-avila/librechat:v0.7.9, source-inspected 2026-08-29):
+# `OPENID_REUSE_TOKENS` only changes how LibreChat authenticates INBOUND
+# requests to its OWN API (api/server/middleware/requireJwtAuth.js); the
+# custom-endpoint header templating in
+# api/server/services/Endpoints/custom/initialize.js resolves headers via
+# `resolveHeaders(endpointConfig.headers, req.user)`, and `req.user` only
+# exposes LibreChat's own profile fields (id/email/username/...) — never
+# the raw OIDC access token. No such template variable exists in stock
+# LibreChat. Spec deviation (documented, fail-closed choice): each real
+# Keycloak user pastes THEIR OWN access token as this endpoint's
+# per-user API key (Settings → the AuditTrace endpoint → API key) —
+# LibreChat's native `apiKey: "user_provided"` mechanism, stored
+# per-LibreChat-user (encrypted, with an operator-set expiry), sent as
+# `Authorization: Bearer <that token>`. This still satisfies D4's core
+# invariant — no shared/static credential; identity is always the
+# caller's own token — it is just not literally automatic per the
+# spec's assumed (non-existent) mechanism. See bff/README.md for how an
+# operator retrieves their own token
+# (`scripts/audittrace-login --show-unsafe`).
+version: 1.2.8
+cache: true
+
+endpoints:
+  custom:
+    - name: "AuditTrace"
+      apiKey: "user_provided"
+      baseURL: "http://bff:8080/v1"
+      models:
+        default: ["audittrace-chat"]
+        fetch: false
+      titleConvo: false
+      modelDisplayLabel: "AuditTrace"
