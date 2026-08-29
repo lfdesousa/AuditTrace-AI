@@ -107,7 +107,7 @@ def create_app() -> FastAPI:
             claims = await validate_inbound_token(token, settings, http_client)
         except InboundTokenError as exc:
             logger.warning("rejecting request — inbound token invalid: %s", exc)
-            return JSONResponse(status_code=401, content={"detail": str(exc)})
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # validate_inbound_token raises InboundTokenError for a falsy
         # token (see bff/auth.py), so reaching here means it is non-None
@@ -123,7 +123,9 @@ def create_app() -> FastAPI:
             )
         except TokenExchangeError as exc:
             logger.error("token exchange failed for sub=%s: %s", inbound_sub, exc)
-            return JSONResponse(status_code=502, content={"detail": str(exc)})
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream authentication service error"}
+            )
 
         raw_body = await request.body()
         content_type = request.headers.get("content-type", "application/json")
@@ -133,7 +135,7 @@ def create_app() -> FastAPI:
             )
         except ProxyError as exc:
             logger.error("orchestrator unreachable: %s", exc)
-            return JSONResponse(status_code=502, content={"detail": str(exc)})
+            return JSONResponse(status_code=502, content={"detail": "Upstream service unavailable"})
 
     return app
 
