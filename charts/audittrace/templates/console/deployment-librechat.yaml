@@ -5,19 +5,17 @@
 # (discovery/JWKS/token — D2, via hostAliases below), never a second
 # route to /v1 or Keycloak's admin surface.
 #
-# Subpath caveat (honest, unverified until live E2E): WU-1 registered
-# this client's redirect URIs under a `/librechat` path prefix on the
-# shared `audittrace.local` host (values.yaml keycloak.librechat block) —
-# the VirtualService below strips that prefix before forwarding
-# (`rewrite: uri: /`), so LibreChat itself is unaware of the prefix and
-# DOMAIN_CLIENT/DOMAIN_SERVER below carry it instead (the OIDC redirect
-# URI LibreChat SENDS to Keycloak is DOMAIN_SERVER + OPENID_CALLBACK_URL,
-# which reproduces the WU-1-registered URI exactly). Whether LibreChat's
-# own SPA bundle references purely root-relative asset paths (which would
-# still resolve correctly through the prefix-stripping rewrite) is NOT
-# verified in this build — it needs the live E2E (spec Acceptance §3) to
-# confirm; if it does not, the fallback is serving LibreChat on a
-# dedicated host/port instead of a subpath (see the deploy runbook).
+# M3-WU-3d (D4) — served at ROOT on its own dedicated host
+# (`console.librechat.host`, default `librechat.audittrace.local`), NOT
+# the `/librechat` subpath the WU-3b/3c builds used. Confirmed live on
+# k3s 2026-08-29: the subpath fought LibreChat's own base-href/API
+# routing (blank page; `/api/config` resolved to HTML instead of JSON).
+# DOMAIN_CLIENT/DOMAIN_SERVER below carry the dedicated host at its root
+# (no prefix); the VirtualService (virtualservice-console.yaml) routes
+# that host at `/` with NO rewrite, matching what LibreChat itself
+# expects. The realm's registered redirect URI is DOMAIN_SERVER +
+# OPENID_CALLBACK_URL, which is kept in lock-step with
+# keycloak.librechat.redirectUris (D5, both realm files).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -66,9 +64,9 @@ spec:
             - name: MONGO_URI
               value: "mongodb://{{ .Release.Name }}-librechat-mongodb:27017/LibreChat"
             - name: DOMAIN_CLIENT
-              value: "https://{{ .Values.console.librechat.frontDoorHost }}/librechat"
+              value: "https://{{ .Values.console.librechat.host }}"
             - name: DOMAIN_SERVER
-              value: "https://{{ .Values.console.librechat.frontDoorHost }}/librechat"
+              value: "https://{{ .Values.console.librechat.host }}"
             # B4 — only the AuditTrace custom endpoint is exposed.
             - name: ENDPOINTS
               value: "custom"
@@ -84,15 +82,19 @@ spec:
             - name: ALLOW_SOCIAL_LOGIN
               value: "true"
             # ── OIDC (audittrace-librechat, public client, PKCE) ────────
-            # In-cluster discovery fetch (no self-signed-cert crossing for
-            # THIS call); the discovery DOCUMENT Keycloak returns still
-            # carries KC_HOSTNAME_URL-derived (external) endpoint URLs
-            # regardless of which network path fetched it (D2's "verify
-            # the issuer/hostname" — same finding as the WU-3 compose
-            # deviation, re-verified in-cluster) — those subsequent calls
-            # are what the hostAliases + CA-trust wiring below exist for.
+            # M3-WU-3d (D3) — LibreChat refuses to complete OIDC discovery
+            # over plain HTTP (confirmed live on k3s 2026-08-29: an
+            # in-cluster `http://...:8080` issuer silently failed OIDC
+            # setup). The `.well-known` form below sidesteps the iss-
+            # string mismatch (Keycloak's canonical `iss` differs from the
+            # external front door) the same way the WU-3 compose profile's
+            # issuer did. Reached via the front-door HOST NAME (not the
+            # in-cluster Service) — `frontDoorHostAlias` (hostAliases
+            # above) is what makes that name resolve from inside the
+            # cluster; the CA-trust / insecureTLS wiring below is what
+            # makes the resulting HTTPS call actually validate.
             - name: OPENID_ISSUER
-              value: "http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/.well-known/openid-configuration"
+              value: "https://{{ .Values.console.librechat.frontDoorHost }}/realms/audittrace/.well-known/openid-configuration"
             - name: OPENID_CLIENT_ID
               value: "audittrace-librechat"
             # `audittrace-librechat` is a PUBLIC client (PKCE, no secret —
@@ -146,20 +148,34 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-librechat-secret
                   key: jwt-refresh-secret
-            # Node's TLS trust for the OIDC token/JWKS calls LibreChat's
-            # backend makes directly to the (self-signed, laptop target)
-            # front door — see configmap-ca-trust.yaml.
+            # M3-WU-3d (D3) — Node's TLS trust for the OIDC discovery/
+            # token/JWKS calls LibreChat's backend makes directly to the
+            # (self-signed, laptop target) front door. Default/preferred
+            # path: mount the cluster CA as a trust anchor (see
+            # configmap-ca-trust.yaml) and point NODE_EXTRA_CA_CERTS at
+            # it — Node then validates the front door's certificate
+            # normally. `console.librechat.insecureTLS=true` is a
+            # laptop-only quick path that disables Node's certificate
+            # validation outright instead — never use it against
+            # anything but a throwaway/dev cluster.
+            {{- if .Values.console.librechat.insecureTLS }}
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+            {{- else }}
             - name: NODE_EXTRA_CA_CERTS
               value: "/etc/audittrace/ca.crt"
+            {{- end }}
           volumeMounts:
             - name: librechat-yaml
               mountPath: /app/librechat.yaml
               subPath: librechat.yaml
               readOnly: true
+            {{- if not .Values.console.librechat.insecureTLS }}
             - name: ca-trust
               mountPath: /etc/audittrace/ca.crt
               subPath: ca.crt
               readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.console.librechat.resources | nindent 12 }}
           livenessProbe:
@@ -182,7 +198,9 @@ spec:
         - name: librechat-yaml
           configMap:
             name: {{ .Release.Name }}-librechat-yaml
+        {{- if not .Values.console.librechat.insecureTLS }}
         - name: ca-trust
           configMap:
             name: {{ .Release.Name }}-librechat-ca-trust
+        {{- end }}
 {{- end }}

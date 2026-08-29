@@ -680,13 +680,11 @@
       "serviceAccountsEnabled": false,
       "protocol": "openid-connect",
       "redirectUris": [
-        "https://audittrace.local/librechat/oauth/openid/callback",
-        "https://audittrace.local:30952/librechat/oauth/openid/callback",
+        "https://librechat.audittrace.local/oauth/openid/callback",
         "http://localhost:3080/oauth/openid/callback"
       ],
       "webOrigins": [
-        "https://audittrace.local",
-        "https://audittrace.local:30952",
+        "https://librechat.audittrace.local",
         "http://localhost:3080"
       ],
       "attributes": {

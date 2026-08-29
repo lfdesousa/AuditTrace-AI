@@ -4,6 +4,14 @@
 # WU-3 compose profile: this is LibreChat's own chat-metadata store, not
 # part of the AuditTrace audit trail (interactions/tool_calls stay in
 # Postgres, unaffected by this StatefulSet).
+#
+# M3-WU-3d (D1) — `mongod` defaults to binding 127.0.0.1 only. Istio's
+# sidecar forwards inbound traffic to the pod IP (not loopback), so a
+# loopback-only bind produced ECONNRESET on every LibreChat connection
+# attempt and a permanent CrashLoop — confirmed live on k3s 2026-08-29.
+# `--bind_ip_all` is safe in-mesh: the AuthorizationPolicy below still
+# restricts port 27017 to the librechat SA only, and there is still NO
+# external Service port (D3, WU-3b).
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -29,9 +37,14 @@ spec:
         - name: mongodb
           image: "{{ .Values.console.mongodb.image.repository }}:{{ .Values.console.mongodb.image.tag }}"
           imagePullPolicy: IfNotPresent
-          command: ["mongod", "--noauth"]
+          command: ["mongod", "--noauth", "--bind_ip_all"]
           ports:
-            - name: mongo
+            # M3-WU-3d (D2) — named `tcp-mongodb` (not `mongo`) so Istio
+            # treats this as plain TCP. A port literally named `mongo`
+            # makes Istio apply its own (flaky, protocol-sniffing)
+            # MongoDB filter, which was intermittently resetting the
+            # connection independently of the D1 bind-address fix.
+            - name: tcp-mongodb
               containerPort: 27017
               protocol: TCP
           volumeMounts:

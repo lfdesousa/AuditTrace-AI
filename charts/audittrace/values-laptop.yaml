@@ -22,6 +22,13 @@
 # A more in-cluster-stable resolution — routing via the Istio gateway
 # ClusterIP instead of the node IP — is a noted future improvement, not
 # this work unit (spec non-goals).
+#
+# M3-WU-3d (D4) — `console.librechat.host` is committed here too (even
+# though it equals values.yaml's own default) so this file stays the
+# single reproducible `helm upgrade -f values-laptop.yaml ...` command
+# for the laptop reference target — no value an operator has to remember
+# to also pass on the command line.
 console:
   librechat:
     frontDoorHostAlias: "192.168.1.231"
+    host: "librechat.audittrace.local"

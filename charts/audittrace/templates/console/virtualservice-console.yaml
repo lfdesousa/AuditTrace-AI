@@ -1,28 +1,33 @@
 {{- if and .Values.istio.enabled .Values.console.enabled }}
-# M3-WU-3b (D1) — exposes LibreChat at the WU-1 realm-registered
-# `/librechat` path on the existing gateway. `rewrite.uri: /` strips the
-# prefix before forwarding so LibreChat itself (unaware of any prefix)
-# sees ordinary root-relative requests — see deployment-librechat.yaml's
-# header comment for the DOMAIN_SERVER/OPENID_CALLBACK_URL pairing this
-# depends on, and the honest caveat about SPA asset-path behaviour that
-# still needs live E2E confirmation.
+# M3-WU-3d (D4) — LibreChat served at ROOT on its own dedicated host
+# (`console.librechat.host`, default `librechat.audittrace.local`), not
+# the `/librechat` prefix the WU-3b/3c builds used. Confirmed live on
+# k3s 2026-08-29: `rewrite.uri: /` on a `/librechat` prefix match fought
+# LibreChat's own base-href/API routing (blank page; `/api/config`
+# resolved to HTML instead of JSON) — a dedicated host with NO rewrite is
+# what LibreChat actually expects.
+#
+# Reuses the SAME wildcard-host Gateway (`hosts: ["*"]`,
+# templates/istio/gateway.yaml) rather than a second Gateway object —
+# Istio scopes routing by THIS VirtualService's own `hosts:` list, so one
+# Gateway resource is sufficient; the TLS cert's SAN (secret-tls.yaml) is
+# extended to include this host so a browser's TLS handshake validates
+# cleanly against it.
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
-  name: {{ .Release.Name }}-librechat
+  name: {{ .Release.Name }}-librechat-console
   labels:
     {{- include "audittrace.labels" . | nindent 4 }}
 spec:
   hosts:
-    - "*"
+    - {{ .Values.console.librechat.host | quote }}
   gateways:
     - {{ .Values.istio.gateway.name }}
   http:
     - match:
         - uri:
-            prefix: /librechat
-      rewrite:
-        uri: /
+            prefix: /
       timeout: 1800s
       route:
         - destination:

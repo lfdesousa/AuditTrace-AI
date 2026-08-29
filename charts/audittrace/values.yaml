@@ -743,15 +743,20 @@ keycloak:
   # route up. `devRedirectUris`/`devWebOrigins` mirror LibreChat's
   # upstream default dev port (3080) the same way `webui`'s do for 8765 —
   # same dev-profile separation, same OIDC-REDIRECT-URI-DRIFT discipline.
+  # M3-WU-3d (D5) — points at the D4 dedicated host root
+  # (`console.librechat.host`), NOT the retired `/librechat` subpath.
+  # These are LITERAL strings (values.yaml is not itself a Helm template)
+  # kept in sync with `console.librechat.host`'s default by convention —
+  # same implicit coupling already accepted for `console.librechat.
+  # frontDoorHost` above; an operator overriding `console.librechat.host`
+  # must override these too.
   librechat:
     redirectUris:
-      - "https://audittrace.local/librechat/oauth/openid/callback"
-      - "https://audittrace.local:30952/librechat/oauth/openid/callback"
+      - "https://librechat.audittrace.local/oauth/openid/callback"
     devRedirectUris:
       - "http://localhost:3080/oauth/openid/callback"
     webOrigins:
-      - "https://audittrace.local"
-      - "https://audittrace.local:30952"
+      - "https://librechat.audittrace.local"
     devWebOrigins:
       - "http://localhost:3080"
   resources:
@@ -885,6 +890,30 @@ console:
     # deploy MUST set this (see the deploy runbook's first operator step).
     frontDoorHost: "audittrace.local"
     frontDoorHostAlias: ""
+    # M3-WU-3d (D4) — the BROWSER-facing host LibreChat is served at, at
+    # the ROOT path (no subpath). The earlier `/librechat` prefix fought
+    # LibreChat's own base-href/API routing (blank page; `/api/config`
+    # resolved to HTML instead of JSON) — confirmed live on k3s
+    # 2026-08-29. A dedicated host with NO prefix rewrite is what
+    # LibreChat expects. Distinct from `frontDoorHost` above (which stays
+    # the shared `audittrace.local` host LibreChat's own BACKEND OIDC
+    # calls reach Keycloak/the front door through — D3). The operator adds
+    # one `/etc/hosts` line pointing this host at the gateway IP, the same
+    # one-time pattern already required for `audittrace.local`. Committed
+    # in `values-laptop.yaml` for the laptop reference target; a cloud
+    # profile gets its own `values-<target>.yaml` value, never a hardcode
+    # in the templates (portability invariant).
+    host: "librechat.audittrace.local"
+    # M3-WU-3d (D3) — LibreChat's Node backend refuses to complete OIDC
+    # discovery over plain HTTP, and the default trust store does not
+    # include the laptop target's self-signed front-door cert. The
+    # preferred/default path (false) mounts the cluster CA as a trust
+    # anchor (`NODE_EXTRA_CA_CERTS`, see configmap-ca-trust.yaml) so
+    # Node validates the front door's certificate normally. Flipping this
+    # to `true` is a laptop-only quick path that instead disables Node's
+    # TLS certificate validation outright (`NODE_TLS_REJECT_UNAUTHORIZED=0`)
+    # — never set true against anything but a throwaway/dev cluster.
+    insecureTLS: false
 
   # ── D1 — MongoDB (LibreChat's own store; pinned, no external port) ──────
   mongodb:
