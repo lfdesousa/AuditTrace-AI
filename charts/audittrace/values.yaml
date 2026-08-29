@@ -800,6 +800,17 @@ console:
 
   # ── D1 — the BFF sidecar (bff/, RFC 8693 token-exchange) ────────────────
   bff:
+    # M3-WU-3c (D1) — where the RFC 8693 exchange-client secret comes from.
+    # "vault": WU-3b production posture (unchanged) — sourced via Vault
+    # Agent from kv/audittrace/librechat/bff-secret whenever vault.enabled
+    # is also true (audittrace.vaultAnnotations.librechatBff). "values":
+    # ALWAYS reads the k8s Secret populated by
+    # secrets.console.bffExchangeClientSecret below — even when
+    # vault.enabled=true cluster-wide — so a test deploy can pass the
+    # secret as a value with no Vault root token (the WU-3c unblock). See
+    # audittrace.console.bff.useVault in _helpers.tpl for the single
+    # source of truth this toggle feeds.
+    secretSource: vault
     image:
       # Built from bff/Dockerfile, pushed to the local registry — same
       # convention as memoryServer.image (tag defaults to .Chart.AppVersion
@@ -838,13 +849,13 @@ console:
       # placeholder (LibreChat #9444 / PR #9344, GA v0.8.0) — this is what
       # eliminates the WU-3 paste-token crutch (D2).
       tag: "v0.8.7"
-      # Digest-pin before any real deploy (spec D1: "pinned by digest").
-      # Left empty here deliberately — resolving the live digest needs
-      # registry access this build step does not have; the deploy runbook
-      # covers `docker pull ... && docker inspect` to fill this in as the
-      # FIRST operator step, never a fabricated value. When set, the
+      # M3-WU-3c (D2) — pinned so the deploy is reproducible with no live
+      # `docker pull ... && docker inspect` compute step. This is the
+      # resolved digest for ghcr.io/danny-avila/librechat:v0.8.7. A future
+      # bump moves it, like any pinned digest (Dependabot / operator
+      # verifies via `docker inspect`, never fabricated). When set, the
       # rendered image ref becomes `<repository>:<tag>@<digest>`.
-      digest: ""
+      digest: "sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9"
     replicaCount: 1
     port: 3080
     resources:
