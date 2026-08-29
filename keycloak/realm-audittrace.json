@@ -164,6 +164,101 @@
       "attributes": {
         "include.in.token.scope": "true"
       }
+    },
+    {
+      "name": "profile",
+      "description": "M3-WU-3b (D3) — standard OIDC profile scope. --import-realm won't auto-create built-in profile/email/offline_access when clientScopes is explicit; declared here so a fresh install self-heals (see ensure-memory-scopes.sh Step 5 for existing realms).",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "given name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "family name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "email",
+      "description": "M3-WU-3b (D3) — standard OIDC email scope. See the profile scope's description above for why this is declared explicitly.",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "emailVerified",
+            "claim.name": "email_verified",
+            "jsonType.label": "boolean",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "offline_access",
+      "description": "M3-WU-3b (D3) — standard OIDC offline_access scope (refresh token). Bound only to audittrace-librechat, for LibreChat's OPENID_REUSE_TOKENS session-age refresh (the #1 stale-token-window mitigation).",
+      "protocol": "openid-connect",
+      "attributes": {
+        "display.on.consent.screen": "true"
+      }
     }
   ],
   "clients": [
@@ -605,9 +700,13 @@
         "memory:episodic:read",
         "memory:procedural:read",
         "memory:conversational:read-own",
-        "memory:semantic:read"
+        "memory:semantic:read",
+        "profile",
+        "email"
       ],
-      "optionalClientScopes": [],
+      "optionalClientScopes": [
+        "offline_access"
+      ],
       "protocolMappers": [
         {
           "name": "aud-audittrace-server",

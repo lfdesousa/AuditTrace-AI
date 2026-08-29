@@ -1,0 +1,100 @@
+{{- if .Values.console.enabled }}
+# M3-WU-3b (D1) — the LibreChat BFF sidecar (bff/, ADR-042 §5 Option A).
+# Validates the token LibreChat forwards, RFC 8693 token-exchanges it for
+# an aud=audittrace-server token, proxies /v1/chat/completions byte-
+# identical. Both upstreams it talks to (memory-server, Keycloak) are the
+# in-cluster Services — in-mesh, never the external front door (D1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-librechat-bff
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-bff
+spec:
+  replicas: {{ .Values.console.bff.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: librechat-bff
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: librechat-bff
+        sidecar.istio.io/inject: "true"
+      annotations:
+        {{- if .Values.vault.enabled }}
+        {{- include "audittrace.vaultAnnotations.librechatBff" . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.console.bff.serviceAccount.create }}
+      serviceAccountName: {{ .Values.console.bff.serviceAccount.name }}
+      {{- end }}
+      containers:
+        - name: bff
+          image: "{{ .Values.console.bff.image.repository }}:{{ .Values.console.bff.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.console.bff.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.bff.port }}
+              protocol: TCP
+          env:
+            - name: AUDITTRACE_BFF_ENV
+              value: "production"
+            - name: AUDITTRACE_BFF_HOST
+              value: "0.0.0.0"
+            - name: AUDITTRACE_BFF_PORT
+              value: {{ .Values.console.bff.port | quote }}
+            # ── the frozen /v1 upstream — in-cluster memory-server Service ──
+            - name: AUDITTRACE_BFF_ORCHESTRATOR_BASE_URL
+              value: "http://{{ .Release.Name }}-memory-server:{{ .Values.memoryServer.port }}"
+            # ── inbound-token validation — in-cluster Keycloak JWKS ─────────
+            - name: AUDITTRACE_BFF_KEYCLOAK_ISSUER
+              value: {{ include "audittrace.keycloakIssuer" . | quote }}
+            - name: AUDITTRACE_BFF_KEYCLOAK_ISSUER_EXTRAS
+              value: {{ include "audittrace.keycloakIssuerExtras" . | quote }}
+            - name: AUDITTRACE_BFF_KEYCLOAK_JWKS_URL
+              value: {{ include "audittrace.keycloakJwksUrl" . | quote }}
+            # ── RFC 8693 token-exchange — in-cluster Keycloak token endpoint ─
+            - name: AUDITTRACE_BFF_KEYCLOAK_TOKEN_URL
+              value: {{ include "audittrace.keycloakTokenUrl" . | quote }}
+            - name: AUDITTRACE_BFF_EXCHANGE_CLIENT_ID
+              value: {{ .Values.console.bff.exchangeClientId | quote }}
+            - name: AUDITTRACE_BFF_EXCHANGE_AUDIENCE
+              value: {{ .Values.console.bff.exchangeAudience | quote }}
+            {{- if not .Values.vault.enabled }}
+            # vault.enabled=false branch — K8s Secret (dev fallback, D4).
+            # When vault.enabled=true this lands at runtime via
+            # /vault/secrets/env (audittrace.vaultAnnotations.librechatBff).
+            - name: AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-bff-secret
+                  key: exchange-client-secret
+            {{- end }}
+            # In-cluster Services use HTTP (mesh mTLS handles transport
+            # security — see PeerAuthentication STRICT); no additional CA
+            # trust needed here, unlike the docker-compose profile which
+            # crossed the laptop's self-signed front-door boundary.
+            - name: AUDITTRACE_BFF_CA_BUNDLE_PATH
+              value: ""
+          resources:
+            {{- toYaml .Values.console.bff.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+{{- end }}

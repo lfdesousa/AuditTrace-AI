@@ -1751,8 +1751,18 @@ class TestLibrechatConsoleClient:
             "memory:procedural:read",
             "memory:conversational:read-own",
             "memory:semantic:read",
+            # M3-WU-3b (D3) — standard OIDC scopes the LibreChat console
+            # needs for its own identity claims (LibreChat's
+            # OPENID_SCOPE="openid profile email offline_access").
+            "profile",
+            "email",
         }
     )
+    # M3-WU-3b (D3) — offline_access (refresh token) is deliberately
+    # OPTIONAL, not default: it is the one scope that changes Keycloak's
+    # token-issuance behaviour (a refresh token gets minted), so it stays
+    # an explicit per-request opt-in rather than an always-on grant.
+    _EXPECTED_OPTIONAL_SCOPES: frozenset[str] = frozenset({"offline_access"})
 
     @staticmethod
     def _client(realm: dict) -> dict:
@@ -1793,6 +1803,19 @@ class TestLibrechatConsoleClient:
                 f"from the read/ask boundary. Extra: "
                 f"{sorted(default - self._EXPECTED_DEFAULT_SCOPES)}; missing: "
                 f"{sorted(self._EXPECTED_DEFAULT_SCOPES - default)}."
+            )
+
+    def test_optional_scopes_match_expected_set(self) -> None:
+        """M3-WU-3b (D3) — offline_access is the ONLY optional scope;
+        neutering the D3 realm reconcile (dropping it, or widening the
+        optional set to something else) fails this."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            optional = set(c.get("optionalClientScopes") or [])
+            assert optional == self._EXPECTED_OPTIONAL_SCOPES, (
+                f"{label}: audittrace-librechat optionalClientScopes drifted. "
+                f"Extra: {sorted(optional - self._EXPECTED_OPTIONAL_SCOPES)}; "
+                f"missing: {sorted(self._EXPECTED_OPTIONAL_SCOPES - optional)}."
             )
 
     def test_no_memory_write_scope_granted(self) -> None:

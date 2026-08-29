@@ -124,6 +124,15 @@ http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-conne
 {{- end }}
 
 {{/*
+Internal Keycloak token endpoint URL (M3-WU-3b — the BFF's RFC 8693
+token-exchange target). In-cluster, mirrors keycloakIssuer/keycloakJwksUrl
+above — never the external front door (D1).
+*/}}
+{{- define "audittrace.keycloakTokenUrl" -}}
+http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/protocol/openid-connect/token
+{{- end }}
+
+{{/*
 Accepted token issuers for the memory-server JWT validator (JSON list).
 ALWAYS includes the issuer derived from keycloak.hostnameUrl — tokens
 carry iss=<hostnameUrl>/realms/audittrace — MERGED with the explicit
@@ -350,6 +359,26 @@ vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/chromadb/main"
 vault.hashicorp.com/agent-inject-template-env: |
   {{ "{{ with secret \"kv/data/audittrace/chromadb/main\" }}" }}
   export CHROMA_SERVER_AUTHN_CREDENTIALS='{{ "{{ .Data.data.token }}" }}'
+  {{ "{{ end }}" }}
+{{- end }}
+
+{{/*
+Vault Agent Injector annotations — LibreChat BFF (M3-WU-3b, ADR-043 §4, D4).
+Emits export for AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET sourced from
+kv/audittrace/librechat/bff-secret.secret — the Keycloak-generated
+confidential-client secret for `audittrace-librechat-bff` (WU-2b), seeded
+manually by the operator (it is Keycloak-generated, not operator-chosen, so
+there is no secrets/*.txt file for it — same posture as the Keycloak admin
+password).
+*/}}
+{{- define "audittrace.vaultAnnotations.librechatBff" -}}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "librechat-bff"
+vault.hashicorp.com/agent-inject-status: "update"
+vault.hashicorp.com/agent-inject-secret-env: "kv/data/audittrace/librechat/bff-secret"
+vault.hashicorp.com/agent-inject-template-env: |
+  {{ "{{ with secret \"kv/data/audittrace/librechat/bff-secret\" }}" }}
+  export AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET='{{ "{{ .Data.data.secret }}" }}'
   {{ "{{ end }}" }}
 {{- end }}
 

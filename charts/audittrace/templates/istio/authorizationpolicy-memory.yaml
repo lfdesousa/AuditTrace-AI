@@ -15,6 +15,12 @@ spec:
         - source:
             principals:
               - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+              {{- if .Values.console.enabled }}
+              # M3-WU-3b (D1) — the LibreChat BFF proxies /v1/chat/completions
+              # to the in-cluster memory-server Service directly (in-mesh,
+              # never via the external front door).
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.console.bff.serviceAccount.name }}"
+              {{- end }}
       to:
         - operation:
             ports: ["{{ .Values.memoryServer.port }}"]

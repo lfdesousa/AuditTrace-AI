@@ -1,0 +1,18 @@
+{{- if .Values.console.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-librechat-bff
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-bff
+spec:
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-bff
+  ports:
+    - name: http
+      port: {{ .Values.console.bff.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

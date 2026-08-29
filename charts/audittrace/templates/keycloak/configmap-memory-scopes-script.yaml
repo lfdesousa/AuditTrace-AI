@@ -441,6 +441,58 @@ data:
 
     echo "✅ memory-scopes provisioning complete."
 
+    # ── Step 5: reconcile profile/email/offline_access (M3-WU-3b, D3) ──
+    #
+    # realm-audittrace.json now declares these three standard OIDC
+    # scopes (fresh installs get them for free via --import-realm), but
+    # this Job also runs on every helm upgrade against a PRE-EXISTING
+    # realm — the same "--import-realm only imports on FIRST run" gap
+    # Steps 1-4 above exist to close. Without this step, an already-
+    # running realm (e.g. one deployed before this chart version) would
+    # be missing profile/email/offline_access on audittrace-librechat
+    # forever, and LibreChat's OPENID_SCOPE="openid profile email
+    # offline_access" (D2) would silently drop the unrecognized scopes
+    # from every token — LibreChat's session still logs in (openid is
+    # always granted), but no refresh token, no email/given_name/
+    # family_name claims.
+    #
+    # Bodies mirror the protocolMappers declared in realm-audittrace.json
+    # exactly (kept in lock-step by
+    # tests/test_chart_drift_guards.py::TestConsoleRealmScopeReconcile).
+    echo "▶ reconciling profile/email/offline_access client scopes..."
+
+    ensure_client_scope_with_body() {
+      local NAME="$1" BODY="$2"
+      if EXISTING=$(find_scope_id "${NAME}"); then
+        echo "  ⊝ scope ${NAME}: exists (${EXISTING})"
+        SCOPE_ID["${NAME}"]="${EXISTING}"
+      else
+        printf '%s' "${BODY}" | "${KCADM}" create client-scopes -r "${REALM}" -f - >/dev/null
+        if NEW_ID=$(find_scope_id "${NAME}"); then
+          echo "  ✓ scope ${NAME}: created (${NEW_ID})"
+          SCOPE_ID["${NAME}"]="${NEW_ID}"
+        else
+          echo "❌ scope ${NAME}: created but id not resolvable" >&2
+          exit 1
+        fi
+      fi
+    }
+
+    PROFILE_BODY='{"name":"profile","protocol":"openid-connect","attributes":{"include.in.token.scope":"true","display.on.consent.screen":"true"},"protocolMappers":[{"name":"username","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"username","claim.name":"preferred_username","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}},{"name":"given name","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"firstName","claim.name":"given_name","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}},{"name":"family name","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"lastName","claim.name":"family_name","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}]}'
+    EMAIL_BODY='{"name":"email","protocol":"openid-connect","attributes":{"include.in.token.scope":"true","display.on.consent.screen":"true"},"protocolMappers":[{"name":"email","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"email","claim.name":"email","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}},{"name":"email verified","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"emailVerified","claim.name":"email_verified","jsonType.label":"boolean","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}]}'
+    OFFLINE_ACCESS_BODY='{"name":"offline_access","protocol":"openid-connect","attributes":{"display.on.consent.screen":"true"}}'
+
+    ensure_client_scope_with_body "profile" "${PROFILE_BODY}"
+    ensure_client_scope_with_body "email" "${EMAIL_BODY}"
+    ensure_client_scope_with_body "offline_access" "${OFFLINE_ACCESS_BODY}"
+
+    echo "▶ binding profile/email/offline_access to audittrace-librechat..."
+    bind_scope "audittrace-librechat" "profile" "default"
+    bind_scope "audittrace-librechat" "email" "default"
+    bind_scope "audittrace-librechat" "offline_access" "optional"
+
+    echo "✅ console realm-scope reconcile complete."
+
     # ── Istio sidecar shutdown ────────────────────────────────────
     # Same intent as the summariser-role Job (Phase C.8 root cause):
     # without telling Envoy to quit, istio-proxy keeps the Pod 2/3

@@ -1,0 +1,31 @@
+{{- /* M3-WU-3b — LibreChat's Node backend makes real outbound TLS calls
+       (RFC 8693-style OIDC token/JWKS requests) to the external front
+       door for its OWN OIDC relying-party flow (Keycloak always reports
+       KC_HOSTNAME_URL-derived — i.e. external — endpoint URLs in its
+       discovery document, regardless of which network path fetched it).
+       On the laptop reference target that front door serves a
+       self-signed cert (see templates/secrets/secret-tls.yaml); Node's
+       default trust store does not include it. Rather than mint a
+       SECOND self-signed cert, this ConfigMap re-reads the SAME
+       istio-system `audittrace-tls` Secret the Gateway itself serves
+       (a public server certificate — safe to republish as a trust
+       anchor) via the identical `lookup` pattern secret-tls.yaml uses.
+       `lookup` returns empty outside a live cluster (helm template / CI
+       lint), so this renders an empty ca.crt there — harmless, since
+       nothing consumes it until a real deploy. */ -}}
+{{- if .Values.console.enabled }}
+{{- $secretName := .Values.istio.gateway.credentialName | default "audittrace-tls" }}
+{{- $istioNs := .Values.istio.gateway.namespace | default "istio-system" }}
+{{- $existing := lookup "v1" "Secret" $istioNs $secretName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-librechat-ca-trust
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+    {{- if and $existing $existing.data }}
+    {{- (index $existing.data "tls.crt") | b64dec | nindent 4 }}
+    {{- end }}
+{{- end }}

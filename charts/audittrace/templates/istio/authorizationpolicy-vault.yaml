@@ -49,6 +49,11 @@ spec:
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/default"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-memory-scopes-job"
               - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Release.Name }}-bucket-init"
+              {{- if .Values.console.enabled }}
+              # M3-WU-3b (D4) — the LibreChat BFF reads its RFC 8693
+              # token-exchange confidential-client secret via Vault Agent.
+              - "cluster.local/ns/{{ .Release.Namespace }}/sa/{{ .Values.console.bff.serviceAccount.name }}"
+              {{- end }}
       to:
         - operation:
             ports: ["8200"]

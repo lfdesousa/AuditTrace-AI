@@ -1,0 +1,188 @@
+{{- if .Values.console.enabled }}
+# M3-WU-3b (D1/D2) — LibreChat itself. Stock image (no source edit).
+# Routes to the BFF only (D4 — see authorizationpolicy-console.yaml); the
+# ONE route it holds to the front door is the OIDC relying-party flow
+# (discovery/JWKS/token — D2, via hostAliases below), never a second
+# route to /v1 or Keycloak's admin surface.
+#
+# Subpath caveat (honest, unverified until live E2E): WU-1 registered
+# this client's redirect URIs under a `/librechat` path prefix on the
+# shared `audittrace.local` host (values.yaml keycloak.librechat block) —
+# the VirtualService below strips that prefix before forwarding
+# (`rewrite: uri: /`), so LibreChat itself is unaware of the prefix and
+# DOMAIN_CLIENT/DOMAIN_SERVER below carry it instead (the OIDC redirect
+# URI LibreChat SENDS to Keycloak is DOMAIN_SERVER + OPENID_CALLBACK_URL,
+# which reproduces the WU-1-registered URI exactly). Whether LibreChat's
+# own SPA bundle references purely root-relative asset paths (which would
+# still resolve correctly through the prefix-stripping rewrite) is NOT
+# verified in this build — it needs the live E2E (spec Acceptance §3) to
+# confirm; if it does not, the fallback is serving LibreChat on a
+# dedicated host/port instead of a subpath (see the deploy runbook).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-librechat
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat
+spec:
+  replicas: {{ .Values.console.librechat.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: librechat
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: librechat
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-librechat
+      {{- with .Values.console.librechat.frontDoorHostAlias }}
+      # k8s equivalent of docker-compose's `extra_hosts:
+      # audittrace.local:host-gateway` — see values.yaml
+      # console.librechat.frontDoorHostAlias for why this is needed.
+      # Empty by default so console.enabled=true still renders cleanly;
+      # a real deploy MUST set this (deploy runbook, operator step 1).
+      hostAliases:
+        - ip: {{ . | quote }}
+          hostnames:
+            - {{ $.Values.console.librechat.frontDoorHost | quote }}
+      {{- end }}
+      containers:
+        - name: librechat
+          image: "{{ .Values.console.librechat.image.repository }}:{{ .Values.console.librechat.image.tag }}{{ if .Values.console.librechat.image.digest }}@{{ .Values.console.librechat.image.digest }}{{ end }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.librechat.port }}
+              protocol: TCP
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.console.librechat.port | quote }}
+            - name: MONGO_URI
+              value: "mongodb://{{ .Release.Name }}-librechat-mongodb:27017/LibreChat"
+            - name: DOMAIN_CLIENT
+              value: "https://{{ .Values.console.librechat.frontDoorHost }}/librechat"
+            - name: DOMAIN_SERVER
+              value: "https://{{ .Values.console.librechat.frontDoorHost }}/librechat"
+            # B4 — only the AuditTrace custom endpoint is exposed.
+            - name: ENDPOINTS
+              value: "custom"
+            # ── auth / registration (D2) ────────────────────────────────
+            - name: ALLOW_REGISTRATION
+              value: "false"
+            - name: ALLOW_EMAIL_LOGIN
+              value: "false"
+            - name: ALLOW_PASSWORD_RESET
+              value: "false"
+            - name: ALLOW_SHARED_LINKS
+              value: "false"
+            - name: ALLOW_SOCIAL_LOGIN
+              value: "true"
+            # ── OIDC (audittrace-librechat, public client, PKCE) ────────
+            # In-cluster discovery fetch (no self-signed-cert crossing for
+            # THIS call); the discovery DOCUMENT Keycloak returns still
+            # carries KC_HOSTNAME_URL-derived (external) endpoint URLs
+            # regardless of which network path fetched it (D2's "verify
+            # the issuer/hostname" — same finding as the WU-3 compose
+            # deviation, re-verified in-cluster) — those subsequent calls
+            # are what the hostAliases + CA-trust wiring below exist for.
+            - name: OPENID_ISSUER
+              value: "http://{{ .Release.Name }}-keycloak:8080/realms/audittrace/.well-known/openid-configuration"
+            - name: OPENID_CLIENT_ID
+              value: "audittrace-librechat"
+            # `audittrace-librechat` is a PUBLIC client (PKCE, no secret —
+            # WU-1, frozen). Stock LibreChat will not attempt OIDC setup
+            # at all with an empty OPENID_CLIENT_SECRET (verified live
+            # against the pinned image during WU-3); this placeholder is
+            # never a real credential and is not verified server-side —
+            # Keycloak skips client authentication entirely for
+            # publicClient clients (PKCE is what actually authorizes the
+            # exchange).
+            - name: OPENID_CLIENT_SECRET
+              value: "unused-public-client-pkce-see-values-comment"
+            - name: OPENID_USE_PKCE
+              value: "true"
+            - name: OPENID_SCOPE
+              value: {{ .Values.console.librechat.openidScope | quote }}
+            - name: OPENID_CALLBACK_URL
+              value: "/oauth/openid/callback"
+            - name: OPENID_BUTTON_LABEL
+              value: "AuditTrace SSO"
+            # D2 — the paste-killer. Makes LibreChat's own session reuse
+            # the user's server-side OIDC access token (rather than
+            # minting a separate LibreChat JWT) — the custom-endpoint
+            # header placeholder in librechat.yaml
+            # (configmap-librechat-yaml.yaml, packages/api/src/utils/
+            # oidc.ts) resolves from exactly this token.
+            - name: OPENID_REUSE_TOKENS
+              value: "true"
+            - name: OPENID_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: openid-session-secret
+            - name: CREDS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: creds-key
+            - name: CREDS_IV
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: creds-iv
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: jwt-secret
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: jwt-refresh-secret
+            # Node's TLS trust for the OIDC token/JWKS calls LibreChat's
+            # backend makes directly to the (self-signed, laptop target)
+            # front door — see configmap-ca-trust.yaml.
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/audittrace/ca.crt"
+          volumeMounts:
+            - name: librechat-yaml
+              mountPath: /app/librechat.yaml
+              subPath: librechat.yaml
+              readOnly: true
+            - name: ca-trust
+              mountPath: /etc/audittrace/ca.crt
+              subPath: ca.crt
+              readOnly: true
+          resources:
+            {{- toYaml .Values.console.librechat.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: librechat-yaml
+          configMap:
+            name: {{ .Release.Name }}-librechat-yaml
+        - name: ca-trust
+          configMap:
+            name: {{ .Release.Name }}-librechat-ca-trust
+{{- end }}

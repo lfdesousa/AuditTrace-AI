@@ -1,0 +1,21 @@
+{{- if .Values.console.enabled }}
+# D3 — no external port; ClusterIP only, reachable exclusively from the
+# librechat pod (see authorizationpolicy-console.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-librechat-mongodb
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-mongodb
+spec:
+  clusterIP: None
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-mongodb
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo
+      protocol: TCP
+{{- end }}

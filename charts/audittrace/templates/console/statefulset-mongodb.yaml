@@ -1,0 +1,65 @@
+{{- if .Values.console.enabled }}
+# M3-WU-3b (D1) — MongoDB, LibreChat's own store. Pinned image, in-cluster
+# Service only (D3 — NO external port). `--noauth`, same posture as the
+# WU-3 compose profile: this is LibreChat's own chat-metadata store, not
+# part of the AuditTrace audit trail (interactions/tool_calls stay in
+# Postgres, unaffected by this StatefulSet).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-librechat-mongodb
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-mongodb
+spec:
+  serviceName: {{ .Release.Name }}-librechat-mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: librechat-mongodb
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: librechat-mongodb
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: mongodb
+          image: "{{ .Values.console.mongodb.image.repository }}:{{ .Values.console.mongodb.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          command: ["mongod", "--noauth"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          resources:
+            {{- toYaml .Values.console.mongodb.resources | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.console.mongodb.persistence.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.console.mongodb.persistence.size }}
+{{- end }}
