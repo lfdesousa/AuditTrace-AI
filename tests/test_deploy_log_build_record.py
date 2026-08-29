@@ -64,6 +64,9 @@ def _clear_env_token(monkeypatch):
 
 
 def test_log_build_record_valid_delegates_and_logs(monkeypatch):
+    """D1 two-phase upload: phase 1 persists the record as given (learning the
+    real server key + index result), phase 2 re-persists it with those real
+    values patched in — so TWO upload+index round trips happen, not one."""
     _clear_env_token(monkeypatch)
     fake = _install(
         monkeypatch,
@@ -85,7 +88,12 @@ def test_log_build_record_valid_delegates_and_logs(monkeypatch):
     assert out["key"] == "episodic/build-record.md"
     assert out["index_status"] == {"indexed": 3}
     paths = [c["path"] for c in fake.calls]
-    assert paths == ["/memory/upload", "/memory/index"]
+    assert paths == [
+        "/memory/upload",
+        "/memory/index",
+        "/memory/upload",
+        "/memory/index",
+    ]
 
 
 def test_log_build_record_reads_from_file(monkeypatch, tmp_path):
@@ -104,6 +112,62 @@ def test_log_build_record_reads_from_file(monkeypatch, tmp_path):
     )
     out = log_build_record(record, front_door=FRONT, token=TOKEN)
     assert out["key"] == "episodic/build-record.md"
+
+
+# ── D1 acceptance: the SERVER-PERSISTED copy carries REAL values, never a
+#    placeholder — auto-populate, no caller action required ─────────────────
+
+
+def test_log_build_record_autopopulates_log_key_and_index_status(monkeypatch):
+    """Neuter proof: comment out the phase-2 patch-and-repersist step in
+    ``log_build_record`` and this goes RED — the FINAL uploaded body (what the
+    server actually stores) still carries the literal ``PENDING`` placeholder
+    text instead of the real key/index-status. With the fix in place, the
+    last-uploaded body carries the real values and no placeholder text at
+    all — the closest a monkeypatched-HTTP unit test can get to "an
+    independently re-fetched server copy shows real values" (the live dogfood
+    proof against the real front door is the full end-to-end confirmation)."""
+    _clear_env_token(monkeypatch)
+    fields = {
+        **COMPLETE_FIELDS,
+        "log_key": "PENDING — filled in by log_build_record...",
+        "index_status": "PENDING — filled in by log_build_record...",
+    }
+    lines = [f"{k}: {v!r}" for k, v in fields.items()]
+    text = "---\n" + "\n".join(lines) + "\n---\n\n# Build record\n\nbody.\n"
+
+    uploads: list[bytes] = []
+
+    def fake_http(method, url, headers=None, body=None, timeout=30, context=None):
+        parsed = urlparse(url)
+        if parsed.path == "/memory/upload":
+            uploads.append(body or b"")
+            return (
+                200,
+                {},
+                json.dumps({"key": "0b0cdd4d-abc/episodic/build-record.md"}).encode(),
+            )
+        if parsed.path == "/memory/index":
+            return (
+                200,
+                {},
+                json.dumps({"status": "indexed", "total_chunks": 3}).encode(),
+            )
+        return 404, {}, b'{"detail":"nf"}'
+
+    monkeypatch.setattr(memory, "_http_request", fake_http)
+
+    out = log_build_record(
+        text, front_door=FRONT, token=TOKEN, filename="build-record.md"
+    )
+
+    assert out["status"] == "logged"
+    assert out["key"] == "0b0cdd4d-abc/episodic/build-record.md"
+    assert len(uploads) == 2  # phase 1 (still placeholder) + phase 2 (real)
+    final_body = uploads[-1].decode()
+    assert "pending" not in final_body.lower()
+    assert "0b0cdd4d-abc/episodic/build-record.md" in final_body
+    assert "total_chunks" in final_body
 
 
 # ── log_build_record: an invalid record is refused BEFORE any network call ──
