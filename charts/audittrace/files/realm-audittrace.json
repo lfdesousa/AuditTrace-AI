@@ -655,6 +655,22 @@
           }
         }
       ]
+    },
+    {
+      "description": "Confidential client for the M3 LibreChat BFF (ADR-042 section 5 Option A sidecar). RFC 8693 token-exchange only: mints an aud=audittrace-server token for the caller's own sub via audittrace-librechat's scope profile.",
+      "clientId": "audittrace-librechat-bff",
+      "name": "AuditTrace LibreChat BFF (RFC 8693 token exchange)",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [],
+      "optionalClientScopes": [],
+      "protocolMappers": []
     }
   ],
   "identityProviders": [],

@@ -1898,6 +1898,119 @@ class TestLibrechatConsoleClient:
             )
 
 
+class TestLibrechatBffClient:
+    """M3-WU-2 — the ``audittrace-librechat-bff`` confidential client
+    (RFC 8693 token-exchange edge for the LibreChat BFF sidecar,
+    ADR-042 §5 Option A) must exist in BOTH realm files, be genuinely
+    confidential (never a public client with an inherent secret leak),
+    hold no scope grants of its own (its only job is authenticating the
+    exchange call — the minted token's audience/scope come from the
+    exchange ``audience`` parameter targeting ``audittrace-librechat``,
+    not from this client's own grants), and never gain write/corpus/
+    admin/audit scopes it has no reason to hold.
+
+    Falsifiable, one assertion per guard:
+
+    * renaming/removing the client from either realm file fails
+      ``test_client_present_in_both_realms``;
+    * flipping ``publicClient`` to ``True``, enabling any interactive
+      flow, or committing a literal ``secret`` value fails
+      ``test_confidential_client_no_secret_committed``;
+    * granting it ANY scope (default or optional) fails
+      ``test_no_scopes_granted`` — it needs none, ever;
+    * a description over Keycloak's varchar(255) column fails
+      ``test_description_fits_keycloak_column`` (same DB-column trap as
+      ``TestRestrictedClientStaysRestricted.test_description_fits_keycloak_column``).
+    """
+
+    @staticmethod
+    def _client(realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == "audittrace-librechat-bff":
+                return c
+        raise AssertionError(
+            "audittrace-librechat-bff is missing from the realm — the M3-WU-2 "
+            "BFF token-exchange client was renamed or removed."
+        )
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_client_present_in_both_realms(self) -> None:
+        for _label, realm in self._both_realms():
+            self._client(realm)  # raises AssertionError if missing
+
+    def test_confidential_client_no_secret_committed(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            assert c.get("publicClient") is False, (
+                f"{label}: audittrace-librechat-bff must be confidential "
+                "(publicClient: false) — it authenticates a server-to-"
+                "server token-exchange call, never a browser flow."
+            )
+            assert c.get("clientAuthenticatorType") == "client-secret", (
+                f"{label}: audittrace-librechat-bff must use client-secret "
+                "authentication."
+            )
+            assert c.get("standardFlowEnabled") is not True, (
+                f"{label}: audittrace-librechat-bff must not enable the "
+                "browser Authorization Code flow — it is never a redirect "
+                "target."
+            )
+            assert c.get("implicitFlowEnabled") is not True, (
+                f"{label}: implicit grant is forbidden (RFC 9700)."
+            )
+            assert c.get("directAccessGrantsEnabled") is not True, (
+                f"{label}: Resource Owner Password Credentials is forbidden (RFC 9700)."
+            )
+            assert "secret" not in c, (
+                f"{label}: a client secret must NEVER be committed to the "
+                "realm file — Keycloak generates one on import; the BFF "
+                "reads it from Vault/env at deploy time."
+            )
+
+    def test_no_scopes_granted(self) -> None:
+        """The exchange client needs no scopes of its own — the minted
+        token's audience/scope come from the ``audience=audittrace-
+        librechat`` exchange parameter (that client's own scope profile),
+        not from this client. Any scope grant here would be unused
+        privilege sitting on a confidential client — a REJECT-worthy
+        defect, not a nice-to-catch."""
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            both = set(c.get("defaultClientScopes") or []) | set(
+                c.get("optionalClientScopes") or []
+            )
+            assert not both, (
+                f"{label}: audittrace-librechat-bff was granted scope(s) "
+                f"{sorted(both)} — it should hold none; unused privilege "
+                "on a confidential client is a defect, not a convenience."
+            )
+
+    def test_description_fits_keycloak_column(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._client(realm)
+            desc = c.get("description") or ""
+            assert len(desc) <= 255, (
+                f"{label}: audittrace-librechat-bff description is "
+                f"{len(desc)} chars; Keycloak's CLIENT.DESCRIPTION column "
+                "is varchar(255) — realm import fails at container boot."
+            )
+
+
 class TestClientDescriptionsWithinKeycloakColumnLimit:
     """Keycloak's ``CLIENT.DESCRIPTION`` column is ``varchar(255)``. A client
     ``description`` longer than 255 chars fails realm import at container boot
