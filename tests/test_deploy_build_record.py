@@ -16,11 +16,14 @@ from pathlib import Path
 import pytest
 
 from scripts.deploy.build_record import (
+    PLACEHOLDER_CHECKED_FIELDS,
     REQUIRED_FIELDS,
     BuildRecordValidationError,
     _extract_front_matter,
     _is_empty,
     _is_existing_file,
+    _is_placeholder,
+    patch_front_matter_fields,
     validate_build_record,
 )
 
@@ -169,6 +172,154 @@ def test_validate_build_record_survives_long_literal_text_no_slash():
     with pytest.raises(BuildRecordValidationError) as exc:
         validate_build_record(_LONG_FIRST_SEGMENT_TEXT)
     assert exc.value.missing_fields == list(REQUIRED_FIELDS)
+
+
+# ── D2: placeholder-shaped log_key/index_status are REJECTED (2026-08-29) ───
+
+
+@pytest.mark.parametrize("field", sorted(PLACEHOLDER_CHECKED_FIELDS))
+def test_placeholder_shaped_field_raises_naming_exactly_that_field(field: str):
+    """Neuter proof: if the placeholder-shape check were removed from
+    ``validate_build_record``, this record — every OTHER field real, only
+    ``field`` a PENDING placeholder — would validate cleanly and this test
+    goes RED (no exception at all). With the check in place it is GREEN."""
+    fields = {**COMPLETE_FIELDS, field: "PENDING — filled in by log_build_record..."}
+    with pytest.raises(BuildRecordValidationError) as exc:
+        validate_build_record(_front_matter_block(fields))
+    assert exc.value.missing_fields == [field]
+
+
+@pytest.mark.parametrize("field", sorted(PLACEHOLDER_CHECKED_FIELDS))
+def test_placeholder_check_is_case_insensitive(field: str):
+    fields = {**COMPLETE_FIELDS, field: "pending - value not yet known"}
+    with pytest.raises(BuildRecordValidationError) as exc:
+        validate_build_record(_front_matter_block(fields))
+    assert exc.value.missing_fields == [field]
+
+
+def test_placeholder_shaped_fields_both_named_when_both_bad():
+    fields = {
+        **COMPLETE_FIELDS,
+        "log_key": "PENDING — filled in by log_build_record...",
+        "index_status": "PENDING — filled in by log_build_record...",
+    }
+    with pytest.raises(BuildRecordValidationError) as exc:
+        validate_build_record(_front_matter_block(fields))
+    assert exc.value.missing_fields == ["log_key", "index_status"]
+
+
+def test_placeholder_exempt_fields_allows_pending_values_through():
+    """The ONE legitimate escape hatch: ``log_build_record``'s pre-network
+    checkpoint exempts exactly :data:`PLACEHOLDER_CHECKED_FIELDS` so a
+    caller's still-placeholder ``log_key``/``index_status`` doesn't block the
+    very call about to auto-populate them."""
+    fields = {
+        **COMPLETE_FIELDS,
+        "log_key": "PENDING — filled in by log_build_record...",
+        "index_status": "PENDING — filled in by log_build_record...",
+    }
+    parsed = validate_build_record(
+        _front_matter_block(fields),
+        placeholder_exempt_fields=PLACEHOLDER_CHECKED_FIELDS,
+    )
+    assert parsed["log_key"] == fields["log_key"]
+    assert parsed["index_status"] == fields["index_status"]
+
+
+def test_placeholder_exemption_never_covers_presence():
+    """Exempting a field from the placeholder-shape check does NOT exempt it
+    from presence — an empty ``log_key`` still fails even when exempted."""
+    fields = {**COMPLETE_FIELDS, "log_key": "   "}
+    with pytest.raises(BuildRecordValidationError) as exc:
+        validate_build_record(
+            _front_matter_block(fields),
+            placeholder_exempt_fields=PLACEHOLDER_CHECKED_FIELDS,
+        )
+    assert exc.value.missing_fields == ["log_key"]
+
+
+def test_placeholder_exemption_never_covers_other_fields():
+    """Only :data:`PLACEHOLDER_CHECKED_FIELDS` are ever placeholder-checked;
+    passing an unrelated field name in the exemption set has no effect
+    because a non-checked field (e.g. ``spec_ref``) was never subject to the
+    placeholder-shape rule in the first place."""
+    fields = {**COMPLETE_FIELDS, "spec_ref": "pending review of scope"}
+    parsed = validate_build_record(
+        _front_matter_block(fields), placeholder_exempt_fields=frozenset({"spec_ref"})
+    )
+    assert parsed["spec_ref"] == "pending review of scope"
+
+
+def test_is_placeholder_true_for_pending_shaped_values():
+    assert _is_placeholder("PENDING — filled in by log_build_record...") is True
+    assert _is_placeholder("pending") is True
+    assert _is_placeholder("still Pending review") is True
+
+
+def test_is_placeholder_false_for_real_values_and_non_strings():
+    assert _is_placeholder("0b0cdd4d-.../episodic/build-record.md") is False
+    assert _is_placeholder("indexed: 3 chunks") is False
+    assert _is_placeholder(None) is False
+    assert _is_placeholder(3) is False
+    assert _is_placeholder({"status": "indexed"}) is False
+
+
+# ── patch_front_matter_fields — the D1 auto-populate mechanism ───────────────
+
+
+def test_patch_front_matter_fields_overwrites_only_given_keys():
+    patched = patch_front_matter_fields(
+        _complete_record_text(),
+        {"log_key": "real/episodic/build-record.md", "index_status": "indexed: 5"},
+    )
+    parsed = validate_build_record(patched)
+    assert parsed["log_key"] == "real/episodic/build-record.md"
+    assert parsed["index_status"] == "indexed: 5"
+    # every other field is untouched
+    for field in REQUIRED_FIELDS:
+        if field in ("log_key", "index_status"):
+            continue
+        assert parsed[field] == COMPLETE_FIELDS[field]
+
+
+def test_patch_front_matter_fields_preserves_body_text():
+    patched = patch_front_matter_fields(
+        _complete_record_text(), {"log_key": "real/key.md"}
+    )
+    assert "# Build record" in patched
+    assert "body text." in patched
+
+
+def test_patch_front_matter_fields_accepts_a_path(tmp_path: Path):
+    record = tmp_path / "build-record.md"
+    record.write_text(_complete_record_text())
+    patched = patch_front_matter_fields(record, {"log_key": "real/key.md"})
+    assert validate_build_record(patched)["log_key"] == "real/key.md"
+
+
+def test_patch_front_matter_fields_raises_on_no_front_matter():
+    with pytest.raises(BuildRecordValidationError) as exc:
+        patch_front_matter_fields("no front matter here", {"log_key": "x"})
+    assert exc.value.missing_fields == list(REQUIRED_FIELDS)
+
+
+def test_patch_front_matter_fields_raises_on_unclosed_front_matter():
+    with pytest.raises(BuildRecordValidationError):
+        patch_front_matter_fields(
+            "---\nspec_ref: x\n\nno closing delimiter\n", {"log_key": "x"}
+        )
+
+
+def test_patch_front_matter_fields_raises_on_invalid_yaml():
+    with pytest.raises(BuildRecordValidationError):
+        patch_front_matter_fields(
+            "---\nspec_ref: [unterminated\n---\n\nbody\n", {"log_key": "x"}
+        )
+
+
+def test_patch_front_matter_fields_raises_on_non_mapping_front_matter():
+    with pytest.raises(BuildRecordValidationError):
+        patch_front_matter_fields("---\n- a\n- b\n---\n\nbody\n", {"log_key": "x"})
 
 
 # ── _is_empty helper — the shared emptiness contract ─────────────────────────

@@ -55,7 +55,9 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 
 from scripts.deploy.build_record import (
+    PLACEHOLDER_CHECKED_FIELDS,
     BuildRecordValidationError,  # noqa: F401 - re-exported for callers
+    patch_front_matter_fields,
     validate_build_record,
 )
 from scripts.deploy.frontdoor import DEFAULT_FRONT_DOOR as _DEFAULT_FRONT_DOOR
@@ -545,6 +547,23 @@ def log_deploy_record(
     }
 
 
+def _format_index_status(value: Any) -> str:
+    """Render an index result as a single flat scalar for the front-matter
+    ``index_status`` field.
+
+    ``log_deploy_record`` returns the parsed JSON body of ``POST
+    /memory/index`` — typically a dict carrying ``status``/``collections``/
+    ``total_chunks`` (or ``{"http_status": ...}`` on a non-JSON response).
+    YAML front-matter values are flat scalars, so a dict/list is collapsed to
+    one deterministic line (``json.dumps(..., sort_keys=True)``); anything
+    else is stringified as-is. Never the placeholder text — this is always
+    the REAL index result.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
 def log_build_record(
     path_or_text: str | Path,
     *,
@@ -557,29 +576,58 @@ def log_build_record(
     insecure: bool = False,
     timeout: int = 60,
 ) -> dict[str, Any]:
-    """Layer-0-VALIDATING variant of :func:`log_deploy_record` (SDLC-ADR-005 WU-1).
+    """Layer-0-VALIDATING, SELF-POPULATING variant of :func:`log_deploy_record`
+    (SDLC-ADR-005 WU-1 + the 2026-08-29 auto-populate hardening, D1).
 
     ADDITIVE, opt-in entry point for builder/reviewer records that MUST carry
     the ADR-059 structured front-matter (``spec_ref``, ``spec_hash``,
     ``recall_evidence``, ``log_key``, ``index_status``, ``branch``, ``commit``,
-    ``gates`` — see :mod:`scripts.deploy.build_record`). Validates the record
-    BEFORE any network call — a malformed record never reaches the memory
-    server, no upload/index HTTP round-trip is wasted on it — then delegates
-    to :func:`log_deploy_record` unchanged for the actual upload + index.
+    ``gates`` — see :mod:`scripts.deploy.build_record`).
+
+    **Two-phase upload (D1) — the caller cannot leave placeholders:**
+    ``log_key``/``index_status`` describe the record's OWN upload, so they can
+    only be known once the upload/index round-trip has actually happened. A
+    caller therefore writes them as a placeholder (e.g. ``"PENDING — filled
+    in by log_build_record..."``) — this function makes it mechanically
+    impossible for that placeholder to reach the SERVER-PERSISTED copy:
+
+    1. Validates the record BEFORE any network call, with the two
+       self-referential fields exempted from the placeholder-shape check
+       (:data:`~scripts.deploy.build_record.PLACEHOLDER_CHECKED_FIELDS`) —
+       every OTHER field must already be real; a malformed record never
+       reaches the memory server.
+    2. Phase 1: uploads + indexes the record AS GIVEN via
+       :func:`log_deploy_record`, learning the REAL server key and index
+       result.
+    3. Patches the record's ``log_key``/``index_status`` with those REAL
+       values (:func:`~scripts.deploy.build_record.patch_front_matter_fields`),
+       re-validates the patched text with the FULL (non-exempt) check, then
+       Phase 2: re-persists it under the SAME key (overwrite) via a second
+       :func:`log_deploy_record` call, so the canonical stored copy — and its
+       ChromaDB embedding — reflect reality, not the caller's placeholder.
+
+    Returns the Phase-2 result (the final, real ``key``/``index_status``).
 
     ``log_deploy_record`` itself is left completely untouched: the deploy /
-    release / curator agents' records do NOT carry this schema, so Layer-0
-    validation is scoped to this dedicated opt-in function rather than gating
-    the shared helper every existing caller depends on — the least-breaking,
-    most fail-closed choice (see the WU-1 build-record's deviation notes).
+    release / curator agents' records do NOT carry this schema, so this
+    validation + auto-populate logic is scoped to this dedicated opt-in
+    function rather than gating the shared helper every existing caller
+    depends on — the least-breaking, most fail-closed choice (see the WU-1
+    build-record's deviation notes).
 
     Raises :class:`~scripts.deploy.build_record.BuildRecordValidationError` on
-    a missing/empty required field (fail-closed, no network call is made);
-    otherwise raises :class:`DeployLogError` exactly as :func:`log_deploy_record`
-    does on an upload/index failure.
+    a missing/empty/(non-exempt-placeholder) required field (fail-closed, no
+    network call is made for the Phase-1 rejection case); otherwise raises
+    :class:`DeployLogError` exactly as :func:`log_deploy_record` does on an
+    upload/index failure (from either phase).
     """
-    validate_build_record(path_or_text)
-    return log_deploy_record(
+    validate_build_record(
+        path_or_text, placeholder_exempt_fields=PLACEHOLDER_CHECKED_FIELDS
+    )
+
+    # -- phase 1: persist as given, to learn the REAL server key + index
+    #    result for the two self-referential fields --
+    phase1 = log_deploy_record(
         path_or_text,
         front_door=front_door,
         token=token,
@@ -590,6 +638,35 @@ def log_build_record(
         insecure=insecure,
         timeout=timeout,
     )
+
+    # -- patch log_key + index_status with the REAL phase-1 results, then
+    #    re-validate (full check, no exemption) and re-persist under the SAME
+    #    key so the canonical server copy never carries a placeholder --
+    patched_text = patch_front_matter_fields(
+        path_or_text,
+        {
+            "log_key": phase1["key"],
+            "index_status": _format_index_status(phase1["index_status"]),
+        },
+    )
+    validate_build_record(patched_text)
+    leaf = phase1["key"].rsplit("/", 1)[-1]
+    phase2 = log_deploy_record(
+        patched_text,
+        front_door=front_door,
+        token=token,
+        layer=layer,
+        collections=collections,
+        filename=leaf,
+        outcome=outcome,
+        insecure=insecure,
+        timeout=timeout,
+    )
+    logger.info(
+        "auto-populated build-record %s with real log_key/index_status (D1)",
+        phase2["key"],
+    )
+    return phase2
 
 
 def _err_detail(body: bytes) -> str:
