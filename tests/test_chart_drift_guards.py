@@ -2060,3 +2060,340 @@ class TestClientDescriptionsWithinKeycloakColumnLimit:
                 "at container boot (the stack never becomes healthy). Shorten "
                 "the description to <=255 chars."
             )
+
+
+def _keycloak_container(docs: list[dict]) -> dict:
+    """Return the keycloak container spec from the rendered chart."""
+    name = f"{RELEASE}-keycloak"
+    for d in docs:
+        if d.get("kind") != "Deployment":
+            continue
+        if d.get("metadata", {}).get("name") != name:
+            continue
+        containers = (
+            d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            or []
+        )
+        for c in containers:
+            if c.get("name") == "keycloak":
+                return c
+        raise AssertionError(f"Deployment {name} has no container named 'keycloak'")
+    raise AssertionError(f"Deployment {name} not in render")
+
+
+class TestKeycloakTokenExchangeFeatureFlags:
+    """M3-WU-2b D1 — RFC 8693 token-exchange is an OFF-by-default preview
+    feature in Keycloak 24 (the deployed ``quay.io/keycloak/keycloak:24.0``,
+    ``charts/audittrace/values.yaml``); without ``--features=token-exchange``
+    on the KC start command the BFF's live exchange returns
+    ``HTTP 400 {"error":"unsupported_grant_type"}``. The internal
+    client-to-client exchange authorization model additionally needs
+    ``admin-fine-grained-authz`` (verified live against a throwaway
+    Keycloak 24.0.5 container 2026-08-29 — see
+    ``configmap-memory-scopes-script.yaml`` Step 4 for the full mechanism).
+
+    ``templates/keycloak/deployment.yaml`` has TWO start-command branches
+    (``vault.enabled`` exec-string vs. the plain ``args:`` list) that must
+    stay byte-identical on this flag — a drift between them is exactly the
+    kind of gap ``feedback_no_more_drifts`` exists to catch.
+
+    Falsifiable: drop the ``--features=`` flag (or one of its two
+    comma-joined values) from EITHER branch and the matching test goes RED.
+    """
+
+    _REQUIRED_FEATURES: tuple[str, ...] = ("token-exchange", "admin-fine-grained-authz")
+
+    def test_vault_branch_enables_token_exchange_features(self) -> None:
+        docs = self._render_with(vault_enabled=True)
+        container = _keycloak_container(docs)
+        args = container.get("args") or []
+        assert len(args) == 1, (
+            "vault.enabled=true branch: expected a single shell-string arg "
+            f"(the vaultSecretFileGuard + exec block), got {len(args)}"
+        )
+        shell_cmd = args[0]
+        for feature in self._REQUIRED_FEATURES:
+            assert feature in shell_cmd, (
+                f"vault.enabled=true branch: keycloak exec command is missing "
+                f"'--features={feature}' — RFC 8693 token-exchange will 400 "
+                f"unsupported_grant_type live (M3-WU-2b D1). Command:\n{shell_cmd}"
+            )
+
+    def test_plain_branch_enables_token_exchange_features(self) -> None:
+        docs = self._render_with(vault_enabled=False)
+        container = _keycloak_container(docs)
+        args = container.get("args") or []
+        joined = " ".join(str(a) for a in args)
+        for feature in self._REQUIRED_FEATURES:
+            assert feature in joined, (
+                f"vault.enabled=false branch: keycloak args is missing "
+                f"'--features={feature}' — RFC 8693 token-exchange will 400 "
+                f"unsupported_grant_type live (M3-WU-2b D1). args={args!r}"
+            )
+
+    def test_both_branches_declare_identical_feature_flags(self) -> None:
+        """The two start-arg branches must request the SAME feature set —
+        not just each individually containing the substring, but the same
+        comma-joined ``--features=`` value. Catches a future edit that adds
+        a feature to one branch and forgets the other."""
+        vault_container = _keycloak_container(self._render_with(vault_enabled=True))
+        plain_container = _keycloak_container(self._render_with(vault_enabled=False))
+
+        vault_match = re.search(
+            r"--features=([\w,-]+)", vault_container.get("args", [""])[0]
+        )
+        plain_args = plain_container.get("args") or []
+        plain_flag = next(
+            (a for a in plain_args if str(a).startswith("--features=")), None
+        )
+
+        assert vault_match is not None, (
+            "vault.enabled=true branch has no --features= flag"
+        )
+        assert plain_flag is not None, (
+            "vault.enabled=false branch has no --features= flag"
+        )
+
+        vault_features = set(vault_match.group(1).split(","))
+        plain_features = set(plain_flag.split("=", 1)[1].split(","))
+
+        assert vault_features == plain_features, (
+            "Drift: the vault.enabled=true and vault.enabled=false keycloak "
+            f"start-arg branches request different feature sets. vault="
+            f"{sorted(vault_features)} plain={sorted(plain_features)} — keep "
+            "them in lockstep (deployment.yaml, both branches)."
+        )
+        missing = set(self._REQUIRED_FEATURES) - vault_features
+        assert not missing, f"Both branches are missing required feature(s): {missing}"
+
+    @staticmethod
+    def _render_with(*, vault_enabled: bool) -> list[dict]:
+        cmd = [
+            "helm",
+            "template",
+            RELEASE,
+            str(CHART_DIR),
+            "-n",
+            NAMESPACE,
+            "--set",
+            f"vault.enabled={'true' if vault_enabled else 'false'}",
+            "--set",
+            "istio.enabled=true",
+            *_LINT_SECRETS,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise AssertionError(
+                f"helm template failed (rc={result.returncode}):\n"
+                f"--- stderr ---\n{result.stderr}"
+            )
+        return [
+            d
+            for d in yaml.safe_load_all(result.stdout)
+            if isinstance(d, dict) and d.get("kind")
+        ]
+
+
+class TestKeycloakTokenExchangePermission:
+    """M3-WU-2b D2 — the fine-grained token-exchange permission that
+    authorizes ONLY ``audittrace-librechat-bff``'s service account to
+    exchange a caller's token via ``audittrace-librechat`` (the target
+    client whose own protocol mapper + default-scope grant stamp
+    ``aud=audittrace-server`` + ``scope=audittrace:query`` on the result —
+    ``bff/exchange.py``).
+
+    Three things must never drift apart, each individually falsifiable:
+
+    1. the ``token-exchange.authorized-source-client`` attribute declared
+       on ``audittrace-librechat`` in BOTH realm files (the static,
+       reviewable "who is authorized" declaration — WU-2's
+       ``TestLibrechatBffClient`` already covers the bff client's own
+       shape: confidential, no committed secret, no scope grants of its
+       own, description <=255 chars);
+    2. the in-cluster ``ensure-memory-scopes`` Job's Step 4 kcadm logic
+       (``configmap-memory-scopes-script.yaml``) that ACTUALLY provisions
+       the Keycloak fine-grained admin permission at deploy time — the
+       realm-JSON attribute above is not itself read by Keycloak; per the
+       "realm.json only imports on first run" gap Steps 1-3 close for
+       scope bindings, this Job is the mechanism that survives a
+       fresh ``--import-realm`` AND every subsequent upgrade;
+    3. ``scripts/setup-memory-scopes.sh``, the disaster-recovery backstop
+       that must authorize the exact same (source, target) pair.
+
+    The actual kcadm mechanism (enable ``management/permissions`` on the
+    target client -> find-or-create a Client policy naming the source
+    client -> attach the policy to the auto-created ``token-exchange``
+    scope-permission) was verified live against a throwaway Keycloak
+    24.0.5 container (2026-08-29): running Step 4's exact script text
+    against a fresh realm turned a `access_denied: Client not allowed to
+    exchange` response into a minted token carrying the caller's own
+    `sub`, `aud` including `audittrace-server`, and `scope` including
+    `audittrace:query`; re-running it was a clean no-op (idempotent).
+
+    Falsifiable: rename/remove the realm attribute, the ConfigMap's
+    ``TOKEN_EXCHANGE_*`` constants, or the provisioner script's mirror of
+    them, and the matching test below goes RED.
+    """
+
+    _EXPECTED_TARGET_CLIENT = "audittrace-librechat"
+    _EXPECTED_SOURCE_CLIENT = "audittrace-librechat-bff"
+    _ATTR_KEY = "token-exchange.authorized-source-client"
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    @classmethod
+    def _target_client(cls, realm: dict) -> dict:
+        for c in realm.get("clients", []) or []:
+            if c.get("clientId") == cls._EXPECTED_TARGET_CLIENT:
+                return c
+        raise AssertionError(
+            f"{cls._EXPECTED_TARGET_CLIENT} is missing from the realm."
+        )
+
+    def test_target_client_declares_authorized_source_client(self) -> None:
+        for label, realm in self._both_realms():
+            c = self._target_client(realm)
+            attrs = c.get("attributes") or {}
+            assert attrs.get(self._ATTR_KEY) == self._EXPECTED_SOURCE_CLIENT, (
+                f"{label}: {self._EXPECTED_TARGET_CLIENT}.attributes.'{self._ATTR_KEY}' "
+                f"must equal {self._EXPECTED_SOURCE_CLIENT!r} — this is the "
+                "declared, drift-guarded record of who Step 4's kcadm "
+                "provisioning authorizes to exchange. Got: "
+                f"{attrs.get(self._ATTR_KEY)!r}"
+            )
+
+    def test_declaration_identical_across_both_realm_files(self) -> None:
+        values = {
+            label: (self._target_client(realm).get("attributes") or {}).get(
+                self._ATTR_KEY
+            )
+            for label, realm in self._both_realms()
+        }
+        distinct = set(values.values())
+        assert len(distinct) == 1, (
+            f"Drift: the '{self._ATTR_KEY}' attribute differs between the two "
+            f"realm files: {values}"
+        )
+
+    @staticmethod
+    def _configmap_script_text() -> str:
+        return (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        ).read_text(encoding="utf-8")
+
+    def _configmap_constants(self) -> dict[str, str]:
+        text = self._configmap_script_text()
+        out: dict[str, str] = {}
+        for name in ("TOKEN_EXCHANGE_TARGET_CLIENT", "TOKEN_EXCHANGE_SOURCE_CLIENT"):
+            m = re.search(rf'{name}="([^"]+)"', text)
+            assert m is not None, (
+                f"configmap-memory-scopes-script.yaml is missing the "
+                f"{name} constant used by Step 4 (M3-WU-2b)."
+            )
+            out[name] = m.group(1)
+        return out
+
+    def test_configmap_step4_constants_match_realm_declaration(self) -> None:
+        constants = self._configmap_constants()
+        assert constants["TOKEN_EXCHANGE_TARGET_CLIENT"] == self._EXPECTED_TARGET_CLIENT
+        assert constants["TOKEN_EXCHANGE_SOURCE_CLIENT"] == self._EXPECTED_SOURCE_CLIENT
+        for label, realm in self._both_realms():
+            declared = (self._target_client(realm).get("attributes") or {}).get(
+                self._ATTR_KEY
+            )
+            assert declared == constants["TOKEN_EXCHANGE_SOURCE_CLIENT"], (
+                f"{label}: the realm's declared authorized source client "
+                f"({declared!r}) does not match the in-cluster Job's "
+                f"TOKEN_EXCHANGE_SOURCE_CLIENT ({constants['TOKEN_EXCHANGE_SOURCE_CLIENT']!r})."
+            )
+
+    def test_provisioner_script_mirrors_in_cluster_job(self) -> None:
+        """``scripts/setup-memory-scopes.sh`` (the disaster-recovery
+        backstop, ``feedback_use_bruno_collection_not_curl``-adjacent
+        precedent: a manual re-run must authorize the SAME pair the Job
+        would have, or a DR re-run silently diverges from what a healthy
+        cluster already has."""
+        script_text = (REPO_ROOT / "scripts" / "setup-memory-scopes.sh").read_text(
+            encoding="utf-8"
+        )
+        cm_constants = self._configmap_constants()
+        for name, expected in cm_constants.items():
+            m = re.search(rf'{name}="([^"]+)"', script_text)
+            assert m is not None, (
+                f"scripts/setup-memory-scopes.sh is missing the {name} "
+                "constant — it must mirror the in-cluster Job's Step 4."
+            )
+            assert m.group(1) == expected, (
+                f"Drift: scripts/setup-memory-scopes.sh's {name}={m.group(1)!r} "
+                f"does not match configmap-memory-scopes-script.yaml's "
+                f"{name}={expected!r}."
+            )
+
+    def _step4_snippet(self) -> str:
+        text = self._configmap_script_text()
+        start_marker = 'echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT}'
+        start = text.index(start_marker)
+        end_marker = 'echo "  ✓ token-exchange permission id:'
+        end = text.index(end_marker, start)
+        snippet = text[start:end]
+        assert "find_client_id" in snippet, "Step 4 no longer calls find_client_id"
+        return snippet
+
+    def _run_step4(self, *, missing: str) -> subprocess.CompletedProcess:
+        """Run the ACTUAL Step 4 snippet in a real bash subprocess with a
+        stub ``find_client_id`` that succeeds (echoes a fake UUID) for
+        every client name EXCEPT ``missing``, for which it fails — proving
+        the specific ``if ! X_UUID=$(find_client_id ...); then exit 1; fi``
+        guard for that one client is what stops the script, not a
+        different guard picking up the slack."""
+        snippet = self._step4_snippet()
+        harness = (
+            "set -euo pipefail\n"
+            'REALM="audittrace"\n'
+            "KCADM=/bin/true\n"
+            f'MISSING="{missing}"\n'
+            "find_client_id() {\n"
+            '  if [[ "$1" == "${MISSING}" ]]; then return 1; fi\n'
+            '  echo "fake-uuid-$1"\n'
+            "}\n"
+            'TOKEN_EXCHANGE_TARGET_CLIENT="audittrace-librechat"\n'
+            'TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"\n'
+            'TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"\n'
+            + snippet
+        )
+        return subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["audittrace-librechat", "audittrace-librechat-bff", "realm-management"],
+    )
+    def test_step4_fails_closed_when_one_client_is_missing(self, missing: str) -> None:
+        """Falsifiable per-guard: neuter ONLY the ``if ! ...; then exit 1;
+        fi`` block for ``missing`` (e.g. swallow it into a ``|| true``) and
+        this specific parametrization goes RED — proving each of the three
+        guards is independently load-bearing, not redundant coverage from
+        a neighbour."""
+        result = self._run_step4(missing=missing)
+        assert result.returncode != 0, (
+            f"Step 4 must fail closed when {missing!r} is not found. It "
+            f"exited 0. stdout={result.stdout!r}"
+        )
+        assert "not found" in (result.stdout + result.stderr), (
+            f"Step 4's fail-closed path for {missing!r} should explain "
+            f"which client was missing. Got stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )

@@ -605,7 +605,8 @@
 {{- end }}
       ],
       "attributes": {
-        "pkce.code.challenge.method": "S256"
+        "pkce.code.challenge.method": "S256",
+        "token-exchange.authorized-source-client": "audittrace-librechat-bff"
       },
       "defaultClientScopes": [
         "audittrace:query",
