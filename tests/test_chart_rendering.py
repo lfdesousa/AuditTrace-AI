@@ -563,14 +563,15 @@ class TestRealmLibrechatClientFromValues:
         client = _rendered_realm(
             ["--set", "vault.enabled=true"], client_id="audittrace-librechat"
         )
+        # M3-WU-3d (D4/D5) — the dedicated console.librechat.host root,
+        # NOT the retired `/librechat` subpath.
         expected_redirect_uris = {
             "http://localhost:3080/oauth/openid/callback",
-            "https://audittrace.local/librechat/oauth/openid/callback",
-            "https://audittrace.local:30952/librechat/oauth/openid/callback",
+            "https://librechat.audittrace.local/oauth/openid/callback",
         }
         expected_web_origins = {
             "http://localhost:3080",
-            "https://audittrace.local",
+            "https://librechat.audittrace.local",
         }
         assert expected_redirect_uris <= set(client["redirectUris"])
         assert expected_web_origins <= set(client["webOrigins"])

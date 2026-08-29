@@ -1,0 +1,34 @@
+# M3-WU-3c (D2) — the laptop reference-infra profile for the console.
+#
+# `console.librechat.frontDoorHostAlias` is the k8s equivalent of the
+# docker-compose profile's `extra_hosts: audittrace.local:host-gateway`
+# (see values.yaml's comment on the same field): LibreChat's own
+# server-side OIDC calls (token exchange, JWKS) need to resolve
+# `audittrace.local` to something reachable from inside the cluster, and
+# on the laptop single-node k3s reference target that is the node's own
+# LAN IP (NodePort Services are reachable from in-cluster pods via the
+# node IP by ordinary kube-proxy behaviour — not a special case).
+#
+# Previously this value was resolved LIVE at deploy time via
+# `kubectl get nodes` — not reproducible, and exactly the kind of
+# live-compute step the WU-3c spec (D2) rejects. Pinning it here makes
+# `helm upgrade -f values-laptop.yaml ...` the ONE reproducible deploy
+# command for the laptop reference target (portability invariant —
+# [[project_portability_invariant]]: laptop is the reference profile, not
+# a special case; a cloud target gets its own values-<target>.yaml sibling
+# carrying its own frontDoorHostAlias, never a hardcode in core
+# templates).
+#
+# A more in-cluster-stable resolution — routing via the Istio gateway
+# ClusterIP instead of the node IP — is a noted future improvement, not
+# this work unit (spec non-goals).
+#
+# M3-WU-3d (D4) — `console.librechat.host` is committed here too (even
+# though it equals values.yaml's own default) so this file stays the
+# single reproducible `helm upgrade -f values-laptop.yaml ...` command
+# for the laptop reference target — no value an operator has to remember
+# to also pass on the command line.
+console:
+  librechat:
+    frontDoorHostAlias: "192.168.1.231"
+    host: "librechat.audittrace.local"

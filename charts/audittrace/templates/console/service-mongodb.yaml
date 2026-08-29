@@ -1,0 +1,26 @@
+{{- if .Values.console.enabled }}
+# D3 — no external port; ClusterIP only, reachable exclusively from the
+# librechat pod (see authorizationpolicy-console.yaml).
+#
+# M3-WU-3d (D2) — port named `tcp-mongodb` (not `mongo`) — see the
+# StatefulSet's matching comment; Istio applies its MongoDB protocol
+# filter to a port literally named `mongo`, which is what needs to be
+# avoided here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-librechat-mongodb
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-mongodb
+spec:
+  clusterIP: None
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat-mongodb
+  ports:
+    - name: tcp-mongodb
+      port: 27017
+      targetPort: tcp-mongodb
+      protocol: TCP
+{{- end }}

@@ -743,15 +743,20 @@ keycloak:
   # route up. `devRedirectUris`/`devWebOrigins` mirror LibreChat's
   # upstream default dev port (3080) the same way `webui`'s do for 8765 —
   # same dev-profile separation, same OIDC-REDIRECT-URI-DRIFT discipline.
+  # M3-WU-3d (D5) — points at the D4 dedicated host root
+  # (`console.librechat.host`), NOT the retired `/librechat` subpath.
+  # These are LITERAL strings (values.yaml is not itself a Helm template)
+  # kept in sync with `console.librechat.host`'s default by convention —
+  # same implicit coupling already accepted for `console.librechat.
+  # frontDoorHost` above; an operator overriding `console.librechat.host`
+  # must override these too.
   librechat:
     redirectUris:
-      - "https://audittrace.local/librechat/oauth/openid/callback"
-      - "https://audittrace.local:30952/librechat/oauth/openid/callback"
+      - "https://librechat.audittrace.local/oauth/openid/callback"
     devRedirectUris:
       - "http://localhost:3080/oauth/openid/callback"
     webOrigins:
-      - "https://audittrace.local"
-      - "https://audittrace.local:30952"
+      - "https://librechat.audittrace.local"
     devWebOrigins:
       - "http://localhost:3080"
   resources:
@@ -788,6 +793,143 @@ chromadb:
     limits:
       cpu: 1000m
       memory: 2Gi
+
+# -- M3-WU-3b — LibreChat console on k3s (BFF + LibreChat + MongoDB) ---------
+# Gated on `console.enabled` (default false — a plain `helm upgrade` never
+# brings these resources up). Supersedes the docker-compose `console`
+# profile (WU-3, #310) for production: LibreChat runs behind the BFF in the
+# same mesh as everything else, and the user's OIDC access token forwards
+# automatically (D2) instead of being pasted per-user.
+console:
+  enabled: false
+
+  # ── D1 — the BFF sidecar (bff/, RFC 8693 token-exchange) ────────────────
+  bff:
+    # M3-WU-3c (D1) — where the RFC 8693 exchange-client secret comes from.
+    # "vault": WU-3b production posture (unchanged) — sourced via Vault
+    # Agent from kv/audittrace/librechat/bff-secret whenever vault.enabled
+    # is also true (audittrace.vaultAnnotations.librechatBff). "values":
+    # ALWAYS reads the k8s Secret populated by
+    # secrets.console.bffExchangeClientSecret below — even when
+    # vault.enabled=true cluster-wide — so a test deploy can pass the
+    # secret as a value with no Vault root token (the WU-3c unblock). See
+    # audittrace.console.bff.useVault in _helpers.tpl for the single
+    # source of truth this toggle feeds.
+    secretSource: vault
+    image:
+      # Built from bff/Dockerfile, pushed to the local registry — same
+      # convention as memoryServer.image (tag defaults to .Chart.AppVersion
+      # when unset, see templates/console/deployment-bff.yaml).
+      repository: localhost:5000/audittrace/librechat-bff
+      tag: ""
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    port: 8766
+    serviceAccount:
+      create: true
+      name: audittrace-librechat-bff
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    # RFC 8693 token-exchange identity — matches the WU-2b confidential
+    # client + the `audittrace-librechat` target profile declared in
+    # realm-audittrace.json. `exchangeClientSecret` below is Vault-sourced
+    # ONLY when vault.enabled=true (D4); the plaintext fallback
+    # (secrets.console.bffExchangeClientSecret) exists for laptop
+    # vault.enabled=false dev installs only — never committed with a real
+    # value.
+    exchangeClientId: audittrace-librechat-bff
+    exchangeAudience: audittrace-librechat
+
+  # ── D1 — LibreChat itself (stock image, no source edit) ─────────────────
+  librechat:
+    image:
+      repository: ghcr.io/danny-avila/librechat
+      # v0.8.7 is the first stable release carrying the native
+      # `{{LIBRECHAT_OPENID_ACCESS_TOKEN}}` custom-endpoint header
+      # placeholder (LibreChat #9444 / PR #9344, GA v0.8.0) — this is what
+      # eliminates the WU-3 paste-token crutch (D2).
+      tag: "v0.8.7"
+      # M3-WU-3c (D2) — pinned so the deploy is reproducible with no live
+      # `docker pull ... && docker inspect` compute step. This is the
+      # resolved digest for ghcr.io/danny-avila/librechat:v0.8.7. A future
+      # bump moves it, like any pinned digest (Dependabot / operator
+      # verifies via `docker inspect`, never fabricated). When set, the
+      # rendered image ref becomes `<repository>:<tag>@<digest>`.
+      digest: "sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9"
+    replicaCount: 1
+    port: 3080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    # D2 — OIDC token-forwarding config. `openidScope` MUST carry
+    # `offline_access` (refresh token — the #1 stale-token risk mitigation)
+    # alongside the standard `profile`/`email` scopes the D3 realm reconcile
+    # adds to `audittrace-librechat`.
+    openidScope: "openid profile email offline_access"
+    # k8s equivalent of the compose profile's `extra_hosts:
+    # audittrace.local:host-gateway` — Keycloak's discovery document always
+    # carries KC_HOSTNAME_URL-derived (external front-door) endpoint URLs
+    # regardless of which network path fetched it, so LibreChat's own
+    # server-side OIDC calls (token exchange, JWKS) still need to reach the
+    # external front door by name. `hostAlias` is the operator-supplied IP
+    # a NodePort-reachable front door resolves to from inside the cluster
+    # (the k3s node's own IP on the laptop reference target — NodePort
+    # Services are reachable from in-cluster pods via the node IP by
+    # ordinary kube-proxy behaviour, not a special case). Left empty by
+    # default so `console.enabled=true` still renders cleanly (helm-lint /
+    # CI); the hostAliases block is only emitted when non-empty — a real
+    # deploy MUST set this (see the deploy runbook's first operator step).
+    frontDoorHost: "audittrace.local"
+    frontDoorHostAlias: ""
+    # M3-WU-3d (D4) — the BROWSER-facing host LibreChat is served at, at
+    # the ROOT path (no subpath). The earlier `/librechat` prefix fought
+    # LibreChat's own base-href/API routing (blank page; `/api/config`
+    # resolved to HTML instead of JSON) — confirmed live on k3s
+    # 2026-08-29. A dedicated host with NO prefix rewrite is what
+    # LibreChat expects. Distinct from `frontDoorHost` above (which stays
+    # the shared `audittrace.local` host LibreChat's own BACKEND OIDC
+    # calls reach Keycloak/the front door through — D3). The operator adds
+    # one `/etc/hosts` line pointing this host at the gateway IP, the same
+    # one-time pattern already required for `audittrace.local`. Committed
+    # in `values-laptop.yaml` for the laptop reference target; a cloud
+    # profile gets its own `values-<target>.yaml` value, never a hardcode
+    # in the templates (portability invariant).
+    host: "librechat.audittrace.local"
+    # M3-WU-3d (D3) — LibreChat's Node backend refuses to complete OIDC
+    # discovery over plain HTTP, and the default trust store does not
+    # include the laptop target's self-signed front-door cert. The
+    # preferred/default path (false) mounts the cluster CA as a trust
+    # anchor (`NODE_EXTRA_CA_CERTS`, see configmap-ca-trust.yaml) so
+    # Node validates the front door's certificate normally. Flipping this
+    # to `true` is a laptop-only quick path that instead disables Node's
+    # TLS certificate validation outright (`NODE_TLS_REJECT_UNAUTHORIZED=0`)
+    # — never set true against anything but a throwaway/dev cluster.
+    insecureTLS: false
+
+  # ── D1 — MongoDB (LibreChat's own store; pinned, no external port) ──────
+  mongodb:
+    image:
+      repository: mongo
+      tag: "7"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    persistence:
+      size: 5Gi
+      storageClass: local-path
 
 # -- Tests (helm test) -------------------------------------------------------
 # Chart-managed `helm test` hook. Runs the RLS integration suite inside
@@ -862,6 +1004,27 @@ secrets:
     contentControlPassword: ""
   keycloak:
     adminPassword: "admin"
+  # ── M3-WU-3b — LibreChat console secrets (vault.enabled=false fallback) ──
+  # When vault.enabled=true these are sourced instead via Vault Agent (D4,
+  # audittrace.vaultAnnotations.librechatBff) from
+  # kv/audittrace/librechat/bff-secret — the operator retrieves the
+  # Keycloak-generated confidential-client secret for
+  # audittrace-librechat-bff (kcadm / admin console; it is NOT operator-
+  # chosen, so unlike the other secrets.* fields above there is no
+  # `secrets/*.txt` seed file for it) and `vault kv put`s it manually, same
+  # posture as `secrets.keycloak.adminPassword` above. LibreChat's own
+  # session/credential-encryption material (creds/JWT/session secrets) has
+  # NO literal dev default here (unlike the docker-compose console profile,
+  # which ships laptop-only literal defaults) — left blank so a chart
+  # render never carries so much as a placeholder secret; an operator MUST
+  # supply real values before `console.enabled=true` goes live.
+  console:
+    bffExchangeClientSecret: ""
+    credsKey: ""
+    credsIv: ""
+    jwtSecret: ""
+    jwtRefreshSecret: ""
+    openidSessionSecret: ""
   # ── ADR-048 PR-B2 — Docker Hub Pro pull credentials ────────────────
   # Used to render `audittrace-dockerhub-pull` Secret of type
   # kubernetes.io/dockerconfigjson so the cluster can pull

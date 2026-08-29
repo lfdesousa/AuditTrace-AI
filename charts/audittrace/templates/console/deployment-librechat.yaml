@@ -1,0 +1,206 @@
+{{- if .Values.console.enabled }}
+# M3-WU-3b (D1/D2) — LibreChat itself. Stock image (no source edit).
+# Routes to the BFF only (D4 — see authorizationpolicy-console.yaml); the
+# ONE route it holds to the front door is the OIDC relying-party flow
+# (discovery/JWKS/token — D2, via hostAliases below), never a second
+# route to /v1 or Keycloak's admin surface.
+#
+# M3-WU-3d (D4) — served at ROOT on its own dedicated host
+# (`console.librechat.host`, default `librechat.audittrace.local`), NOT
+# the `/librechat` subpath the WU-3b/3c builds used. Confirmed live on
+# k3s 2026-08-29: the subpath fought LibreChat's own base-href/API
+# routing (blank page; `/api/config` resolved to HTML instead of JSON).
+# DOMAIN_CLIENT/DOMAIN_SERVER below carry the dedicated host at its root
+# (no prefix); the VirtualService (virtualservice-console.yaml) routes
+# that host at `/` with NO rewrite, matching what LibreChat itself
+# expects. The realm's registered redirect URI is DOMAIN_SERVER +
+# OPENID_CALLBACK_URL, which is kept in lock-step with
+# keycloak.librechat.redirectUris (D5, both realm files).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-librechat
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat
+spec:
+  replicas: {{ .Values.console.librechat.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "audittrace.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: librechat
+  template:
+    metadata:
+      labels:
+        {{- include "audittrace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: librechat
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-librechat
+      {{- with .Values.console.librechat.frontDoorHostAlias }}
+      # k8s equivalent of docker-compose's `extra_hosts:
+      # audittrace.local:host-gateway` — see values.yaml
+      # console.librechat.frontDoorHostAlias for why this is needed.
+      # Empty by default so console.enabled=true still renders cleanly;
+      # a real deploy MUST set this (deploy runbook, operator step 1).
+      hostAliases:
+        - ip: {{ . | quote }}
+          hostnames:
+            - {{ $.Values.console.librechat.frontDoorHost | quote }}
+      {{- end }}
+      containers:
+        - name: librechat
+          image: "{{ .Values.console.librechat.image.repository }}:{{ .Values.console.librechat.image.tag }}{{ if .Values.console.librechat.image.digest }}@{{ .Values.console.librechat.image.digest }}{{ end }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.librechat.port }}
+              protocol: TCP
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.console.librechat.port | quote }}
+            - name: MONGO_URI
+              value: "mongodb://{{ .Release.Name }}-librechat-mongodb:27017/LibreChat"
+            - name: DOMAIN_CLIENT
+              value: "https://{{ .Values.console.librechat.host }}"
+            - name: DOMAIN_SERVER
+              value: "https://{{ .Values.console.librechat.host }}"
+            # B4 — only the AuditTrace custom endpoint is exposed.
+            - name: ENDPOINTS
+              value: "custom"
+            # ── auth / registration (D2) ────────────────────────────────
+            - name: ALLOW_REGISTRATION
+              value: "false"
+            - name: ALLOW_EMAIL_LOGIN
+              value: "false"
+            - name: ALLOW_PASSWORD_RESET
+              value: "false"
+            - name: ALLOW_SHARED_LINKS
+              value: "false"
+            - name: ALLOW_SOCIAL_LOGIN
+              value: "true"
+            # ── OIDC (audittrace-librechat, public client, PKCE) ────────
+            # M3-WU-3d (D3) — LibreChat refuses to complete OIDC discovery
+            # over plain HTTP (confirmed live on k3s 2026-08-29: an
+            # in-cluster `http://...:8080` issuer silently failed OIDC
+            # setup). The `.well-known` form below sidesteps the iss-
+            # string mismatch (Keycloak's canonical `iss` differs from the
+            # external front door) the same way the WU-3 compose profile's
+            # issuer did. Reached via the front-door HOST NAME (not the
+            # in-cluster Service) — `frontDoorHostAlias` (hostAliases
+            # above) is what makes that name resolve from inside the
+            # cluster; the CA-trust / insecureTLS wiring below is what
+            # makes the resulting HTTPS call actually validate.
+            - name: OPENID_ISSUER
+              value: "https://{{ .Values.console.librechat.frontDoorHost }}/realms/audittrace/.well-known/openid-configuration"
+            - name: OPENID_CLIENT_ID
+              value: "audittrace-librechat"
+            # `audittrace-librechat` is a PUBLIC client (PKCE, no secret —
+            # WU-1, frozen). Stock LibreChat will not attempt OIDC setup
+            # at all with an empty OPENID_CLIENT_SECRET (verified live
+            # against the pinned image during WU-3); this placeholder is
+            # never a real credential and is not verified server-side —
+            # Keycloak skips client authentication entirely for
+            # publicClient clients (PKCE is what actually authorizes the
+            # exchange).
+            - name: OPENID_CLIENT_SECRET
+              value: "unused-public-client-pkce-see-values-comment"
+            - name: OPENID_USE_PKCE
+              value: "true"
+            - name: OPENID_SCOPE
+              value: {{ .Values.console.librechat.openidScope | quote }}
+            - name: OPENID_CALLBACK_URL
+              value: "/oauth/openid/callback"
+            - name: OPENID_BUTTON_LABEL
+              value: "AuditTrace SSO"
+            # D2 — the paste-killer. Makes LibreChat's own session reuse
+            # the user's server-side OIDC access token (rather than
+            # minting a separate LibreChat JWT) — the custom-endpoint
+            # header placeholder in librechat.yaml
+            # (configmap-librechat-yaml.yaml, packages/api/src/utils/
+            # oidc.ts) resolves from exactly this token.
+            - name: OPENID_REUSE_TOKENS
+              value: "true"
+            - name: OPENID_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: openid-session-secret
+            - name: CREDS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: creds-key
+            - name: CREDS_IV
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: creds-iv
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: jwt-secret
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-librechat-secret
+                  key: jwt-refresh-secret
+            # M3-WU-3d (D3) — Node's TLS trust for the OIDC discovery/
+            # token/JWKS calls LibreChat's backend makes directly to the
+            # (self-signed, laptop target) front door. Default/preferred
+            # path: mount the cluster CA as a trust anchor (see
+            # configmap-ca-trust.yaml) and point NODE_EXTRA_CA_CERTS at
+            # it — Node then validates the front door's certificate
+            # normally. `console.librechat.insecureTLS=true` is a
+            # laptop-only quick path that disables Node's certificate
+            # validation outright instead — never use it against
+            # anything but a throwaway/dev cluster.
+            {{- if .Values.console.librechat.insecureTLS }}
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+            {{- else }}
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/audittrace/ca.crt"
+            {{- end }}
+          volumeMounts:
+            - name: librechat-yaml
+              mountPath: /app/librechat.yaml
+              subPath: librechat.yaml
+              readOnly: true
+            {{- if not .Values.console.librechat.insecureTLS }}
+            - name: ca-trust
+              mountPath: /etc/audittrace/ca.crt
+              subPath: ca.crt
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.console.librechat.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: librechat-yaml
+          configMap:
+            name: {{ .Release.Name }}-librechat-yaml
+        {{- if not .Values.console.librechat.insecureTLS }}
+        - name: ca-trust
+          configMap:
+            name: {{ .Release.Name }}-librechat-ca-trust
+        {{- end }}
+{{- end }}

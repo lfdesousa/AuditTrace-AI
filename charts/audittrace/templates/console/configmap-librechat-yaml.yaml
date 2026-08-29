@@ -1,0 +1,41 @@
+{{- if .Values.console.enabled }}
+# M3-WU-3b (D2) — the LibreChat console's custom-endpoint config, mounted
+# into the LibreChat container at /app/librechat.yaml. Stock LibreChat, no
+# source edit. `ENDPOINTS=custom` (deployment-librechat.yaml env) hides
+# every built-in provider (openAI, google, anthropic, agents, assistants,
+# bedrock) regardless of this file's contents (B4).
+#
+# apiKey: 'dummy' + the Authorization header below is the D2 paste-killer:
+# LibreChat v0.8.x resolves the OIDC-access-token custom-endpoint header
+# placeholder (see the `headers:` block below) in admin-defined
+# custom-endpoint headers from the user's
+# server-side OIDC token (packages/api/src/utils/{env,oidc}.ts,
+# OPENID_TOKEN_FIELDS) — GA in v0.8.0 (LibreChat PR #9344 / #9444),
+# superseding the WU-3 compose profile's `apiKey: user_provided`
+# paste-per-user workaround (v0.7.9 lacked this mechanism). NO
+# `user_provided` here — the whole point of this work unit is that the
+# user never sees or handles a token.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-librechat-yaml
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  librechat.yaml: |
+    version: 1.2.8
+    cache: true
+
+    endpoints:
+      custom:
+        - name: "AuditTrace"
+          apiKey: 'dummy'
+          baseURL: "http://{{ .Release.Name }}-librechat-bff:{{ .Values.console.bff.port }}/v1"
+          headers:
+            Authorization: 'Bearer {{ "{{LIBRECHAT_OPENID_ACCESS_TOKEN}}" }}'
+          models:
+            default: ["audittrace-chat"]
+            fetch: false
+          titleConvo: false
+          modelDisplayLabel: "AuditTrace"
+{{- end }}

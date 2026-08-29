@@ -1,0 +1,18 @@
+{{- if .Values.console.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-librechat
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat
+spec:
+  selector:
+    {{- include "audittrace.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: librechat
+  ports:
+    - name: http
+      port: {{ .Values.console.librechat.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
