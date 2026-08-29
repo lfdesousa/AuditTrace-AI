@@ -282,4 +282,69 @@ for CLIENT_ID in audittrace-opencode audittrace-webui; do
   ensure_mapper "${CLIENT_ID}" family-name lastName family_name
 done
 
+# ----- RFC 8693 token-exchange permission (M3-WU-2b) -----
+# Mirrors Step 4 of the in-cluster ensure-memory-scopes Job
+# (configmap-memory-scopes-script.yaml) VERBATIM in client-name/policy
+# choice — this backstop script and the in-cluster Job must authorize
+# the exact same (source, target) pair or a disaster-recovery re-run
+# from this script would silently diverge from what the Job would have
+# provisioned. See that ConfigMap for the full kcadm-mechanism
+# rationale + the live-verification note.
+TOKEN_EXCHANGE_TARGET_CLIENT="audittrace-librechat"
+TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"
+TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"
+
+find_client_id() {
+  kcadm get clients -r "${REALM}" \
+    -q "clientId=$1" \
+    --fields id --format csv --noquotes 2>/dev/null \
+  | tr -d '"' | head -1
+}
+
+find_policy_id() {
+  local target="$1" client_uuid="$2"
+  kcadm get "clients/${client_uuid}/authz/resource-server/policy" \
+    -r "${REALM}" --fields id,name --format csv --noquotes 2>/dev/null \
+  | awk -F, -v n="${target}" '$2 == n {print $1; exit}'
+}
+
+echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT} to exchange for ${TOKEN_EXCHANGE_TARGET_CLIENT}..."
+TARGET_UUID=$(find_client_id "${TOKEN_EXCHANGE_TARGET_CLIENT}")
+SOURCE_UUID=$(find_client_id "${TOKEN_EXCHANGE_SOURCE_CLIENT}")
+REALM_MGMT_UUID=$(find_client_id "realm-management")
+if [[ -z "${TARGET_UUID}" || -z "${SOURCE_UUID}" || -z "${REALM_MGMT_UUID}" ]]; then
+  echo "❌ one of ${TOKEN_EXCHANGE_TARGET_CLIENT} / ${TOKEN_EXCHANGE_SOURCE_CLIENT} / realm-management not found — cannot authorize exchange." >&2
+  exit 1
+fi
+
+kcadm update "clients/${TARGET_UUID}/management/permissions" \
+  -r "${REALM}" -s enabled=true >/dev/null
+TOKEN_EXCHANGE_PERM_ID=$(kcadm get "clients/${TARGET_UUID}/management/permissions" -r "${REALM}" \
+  | grep '"token-exchange"' | sed -E 's/.*"token-exchange" *: *"([^"]+)".*/\1/')
+if [[ -z "${TOKEN_EXCHANGE_PERM_ID}" ]]; then
+  echo "❌ could not resolve the token-exchange scope-permission id for ${TOKEN_EXCHANGE_TARGET_CLIENT}." >&2
+  exit 1
+fi
+echo "  ✓ token-exchange permission id: ${TOKEN_EXCHANGE_PERM_ID}"
+
+TOKEN_EXCHANGE_POLICY_ID=$(find_policy_id "${TOKEN_EXCHANGE_POLICY_NAME}" "${REALM_MGMT_UUID}")
+if [[ -n "${TOKEN_EXCHANGE_POLICY_ID}" ]]; then
+  echo "  ⊝ policy ${TOKEN_EXCHANGE_POLICY_NAME}: exists (${TOKEN_EXCHANGE_POLICY_ID})"
+else
+  kcadm create "clients/${REALM_MGMT_UUID}/authz/resource-server/policy/client" \
+    -r "${REALM}" \
+    -s "name=${TOKEN_EXCHANGE_POLICY_NAME}" \
+    -s "clients=[\"${SOURCE_UUID}\"]" >/dev/null
+  TOKEN_EXCHANGE_POLICY_ID=$(find_policy_id "${TOKEN_EXCHANGE_POLICY_NAME}" "${REALM_MGMT_UUID}")
+  if [[ -z "${TOKEN_EXCHANGE_POLICY_ID}" ]]; then
+    echo "❌ policy ${TOKEN_EXCHANGE_POLICY_NAME}: created but id not resolvable" >&2
+    exit 1
+  fi
+  echo "  ✓ policy ${TOKEN_EXCHANGE_POLICY_NAME}: created (${TOKEN_EXCHANGE_POLICY_ID})"
+fi
+
+kcadm update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_PERM_ID}" \
+  -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
+echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_TARGET_CLIENT}"
+
 echo "✅ memory-scopes provisioning complete."

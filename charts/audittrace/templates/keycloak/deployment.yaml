@@ -43,7 +43,7 @@ spec:
               set -a
               . /vault/secrets/env
               set +a
-              exec /opt/keycloak/bin/kc.sh start-dev --import-realm --health-enabled=true
+              exec /opt/keycloak/bin/kc.sh start-dev --import-realm --health-enabled=true --features=token-exchange,admin-fine-grained-authz
           {{- else }}
           command:
             - /opt/keycloak/bin/kc.sh
@@ -51,6 +51,22 @@ spec:
             - start-dev
             - --import-realm
             - --health-enabled=true
+            # M3-WU-2b: RFC 8693 token-exchange is an OFF-by-default preview
+            # feature in KC 24 (root cause of the BFF's live
+            # `unsupported_grant_type`). `admin-fine-grained-authz` is the
+            # companion feature the internal client-to-client exchange
+            # authorization model needs (the `management/permissions`
+            # `token-exchange` scope-permission the ensure-memory-scopes Job
+            # wires up — see configmap-memory-scopes-script.yaml Step 4).
+            # Verified live against a throwaway Keycloak 24.0.5 container
+            # (2026-08-29): without these two flags the exchange grant type
+            # itself is rejected; with them + Step 4's permission wiring the
+            # exchange mints a token carrying the caller's own `sub`. Kept
+            # byte-identical with the vault.enabled branch above — a drift
+            # between the two branches is exactly the gap
+            # `tests/test_chart_drift_guards.py::TestKeycloakTokenExchangeFeatureFlags`
+            # exists to catch.
+            - --features=token-exchange,admin-fine-grained-authz
           {{- end }}
           env:
             - name: KC_DB

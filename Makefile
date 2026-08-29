@@ -38,10 +38,10 @@ install-hooks: ## Install the tracked pre-push hook (.githooks/pre-push -> git h
 
 lint: security-lint ## Run linting and formatting (includes the offline security-lint gate)
 	@echo "🔍 Running linter..."
-	@.venv/bin/ruff check src/ tests/
+	@.venv/bin/ruff check src/ bff/ tests/
 	@echo "✅ Linting passed"
 	@echo "📝 Running formatter check..."
-	@.venv/bin/ruff format --check src/ tests/
+	@.venv/bin/ruff format --check src/ bff/ tests/
 	@echo "✅ Formatting passed"
 
 security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#382, ADR-059 WS1). GATEKEEPER tooling — install first with `pip install -e '.[gate]'` (kept OUT of the image on purpose). Vendored rules only — no network, no `--config auto`. Composable: slots into the unified local CI-Agent gate.
@@ -62,7 +62,7 @@ security-lint: ## Run the OFFLINE, deterministic semgrep security-lint gate (#38
 	  --disable-version-check \
 	  --metrics=off \
 	  --config ci/semgrep/rules.yml \
-	  src/ tests/ scripts/; \
+	  src/ bff/ tests/ scripts/; \
 	echo "✅ Security-lint passed"
 
 token-guard: ## TOKEN-GUARD agent-def drift guard (ADR-059 layer 3, SPEC token-guard-kill-show-20260811). Fails if any agent def teaches the raw `audittrace-login --show` form or a direct tokens.json read. Scans the operator's real (gitignored) .claude/agents/*.md + .claude/settings.local.json, and the private sdlc/agents/** fleet defs if present. Best-effort — never fails when no targets are found (e.g. CI has no private checkout). Wired into pre-commit (id token-guard, always_run) so it's mechanically enforced, not prose (feedback_policies_must_be_mechanically_inviolable). Python resolution is PORTABLE (laptop .venv/ vs CI hostedtoolcache with no repo-local .venv/) — same fallback idiom as security-lint's semgrep lookup.
@@ -82,7 +82,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts.replay_dead_lettered_index --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts.replay_dead_lettered_index --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -120,7 +120,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/network --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/network --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "✅ Tests passed"

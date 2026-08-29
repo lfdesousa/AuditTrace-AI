@@ -204,6 +204,13 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # predicate) and gets the same ≥90% floor — a single-file entry, not a
 # directory, since this tool lives at the `scripts/` top level rather than a
 # dedicated subpackage. No other `scripts/*` module is dragged into the gate.
+# `bff` (M3-WU-2, the LibreChat BFF sidecar — ADR-042 §5 Option A) joins the
+# same way for the same reason: a genuinely separate top-level deployable
+# (own image, own tests under `tests/bff/`), not under `src/audittrace/`, so
+# without this entry the report-generation filter (this `source` list) would
+# silently drop it from `coverage.xml` even though `--cov=bff` in `make test`
+# instruments it during the run — the per-file gate script
+# (`scripts/check-per-file-coverage.py`) only ever sees what's IN the XML.
 source = [
     "audittrace",
     "scripts/deploy",
@@ -212,6 +219,7 @@ source = [
     "scripts/curator",
     "scripts/network",
     "scripts/replay_dead_lettered_index.py",
+    "bff",
 ]
 branch = true
 omit = ["tests/*", "*/migrations/*"]
@@ -293,6 +301,14 @@ disable_error_code = ["type-arg"]
 [[tool.mypy.overrides]]
 module = "audittrace.routes.mcp"
 # FastAPI Request generic requires starlette stubs
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "bff.app"
+# FastAPI Request generic requires starlette stubs — same class of finding
+# as audittrace.auth / audittrace.routes.mcp above, surfaced by the
+# pre-commit mypy hook's pinned v1.8.0 + additional_dependencies set
+# (which differs from this repo's own .venv mypy/stub versions).
 disable_error_code = ["type-arg"]
 
 [[tool.mypy.overrides]]
