@@ -451,11 +451,34 @@ class MemoryManifestService:
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(
+        self,
+        layer: str,
+        key: str,
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> ManifestEntry:
         """Soft-delete: set ``deleted_at_ms`` + ``deleted_by_user_id``.
         Idempotent — calling on an already-deleted row is a no-op
         that returns the existing entry. Raises ``LookupError`` if
         the row does not exist at all.
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — the SAME fail-closed (default ``False``)
+        shared-write authorization ``record_create``/``record_update``/
+        ``upsert_pdf_metadata`` take. This is the LAST of the four
+        manifest mutation methods to gain it — the M3-WU-D2-2 reviewer's
+        second REJECT: a caller holding only base ``memory:<layer>:write``
+        could soft-delete (tombstone -> hidden from recall) an existing
+        **corpus**-tier row it doesn't own, stamping
+        ``deleted_by_user_id`` as itself with no ownership/tier check at
+        all. Raises :class:`ManifestAuthorizationError` — BEFORE touching
+        any field — when the row is corpus-tier and the caller lacks
+        authorization; a caller deleting their own PRIVATE-tier item is
+        unaffected. Idempotent-no-op path (already deleted) is likewise
+        gated: an unauthorized caller must not be able to confirm/observe
+        a corpus row's deleted state via a no-op call either.
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
@@ -466,6 +489,12 @@ class MemoryManifestService:
             ).scalar_one_or_none()
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
+            if _tier_write_unauthorized(row.tier, caller_can_write_shared):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to delete "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             if row.deleted_at_ms is None:
                 row.deleted_at_ms = _now_ms()
                 row.deleted_by_user_id = user_id
@@ -941,11 +970,26 @@ class MockMemoryManifestService(MemoryManifestService):
         existing["modified_by_user_id"] = user_id
         return self._to_entry(existing)
 
-    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(
+        self,
+        layer: str,
+        key: str,
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> ManifestEntry:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         if existing is None:
             raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
+        if _tier_write_unauthorized(
+            existing.get("tier", "corpus"), caller_can_write_shared
+        ):
+            raise ManifestAuthorizationError(
+                f"caller lacks shared-write authorization to delete "
+                f"existing corpus-tier manifest row layer={layer!r} "
+                f"key={key!r}"
+            )
         if existing.get("deleted_at_ms") is None:
             existing["deleted_at_ms"] = _now_ms()
             existing["deleted_by_user_id"] = user_id

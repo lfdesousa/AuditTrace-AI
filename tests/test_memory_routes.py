@@ -4606,6 +4606,188 @@ class TestEpisodicManifestCorpusOverwriteGuard:
         assert after.created_by_user_id == "curator"
 
 
+class TestManifestCorpusDeleteGuard:
+    """SPEC security-memory-manifest-tier-authz (2026-08-30) — the LAST of
+    the four manifest mutation methods (create/update/upsert_pdf_metadata
+    already fixed): ``MemoryManifestService.record_delete`` had NO
+    ``caller_can_write_shared`` param, and ``delete_episodic``/
+    ``delete_procedural``/``delete_semantic`` gated on base
+    ``memory:<layer>:write`` only. A caller holding only base write scope
+    could soft-delete (tombstone -> hidden from recall) a curator's
+    corpus-tier item it doesn't own — 200 OK, ``deleted_by_user_id`` stamped
+    as the attacker.
+
+    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
+    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
+    and ``test_base_scope_delete_over_corpus_is_denied_and_row_unchanged``
+    (both semantic and episodic variants below) go RED (the base-scope
+    caller's delete succeeds and tombstones the corpus row); restore it and
+    they go GREEN. ``test_corpus_scope_caller_can_delete_corpus_item`` /
+    ``test_admin_can_delete_corpus_item`` / ``test_own_private_item_delete_
+    unaffected_by_guard`` pin the "should still work" arms.
+    """
+
+    @staticmethod
+    def _seed_corpus_doc(client: TestClient, *, document_id: str) -> None:
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": document_id,
+                "text": "shared decision",
+                "title": "Shared",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    @staticmethod
+    def _get_row(document_id: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(
+            get_memory_manifest_service().get("semantic", f"decisions/{document_id}")
+        )
+
+    def test_base_scope_delete_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="delete-hijack")
+        before = self._get_row("delete-hijack")
+        assert before is not None
+        assert before.tier == "corpus"
+        assert before.deleted_at_ms is None
+
+        _override_identity(client, "attacker-delete", ("memory:semantic:write",))
+        try:
+            r = client.delete("/memory/semantic/decisions/delete-hijack")
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("delete-hijack")
+        assert after is not None
+        # No tombstone at all — tier, ownership, and delete state untouched.
+        assert after.tier == "corpus"
+        assert after.deleted_at_ms is None
+        assert after.deleted_by_user_id is None
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_corpus_scope_caller_can_delete_corpus_item(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="delete-authorized")
+        _override_identity(
+            client,
+            "curator-delete",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.delete("/memory/semantic/decisions/delete-authorized")
+            assert r.status_code == 200, r.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("delete-authorized")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+        assert after.deleted_by_user_id == "curator-delete"
+
+    def test_admin_can_delete_corpus_item(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_doc(client, document_id="delete-admin")
+        r = client.delete("/memory/semantic/decisions/delete-admin")
+        assert r.status_code == 200, r.text
+        after = self._get_row("delete-admin")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+
+    def test_own_private_item_delete_unaffected_by_guard(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(client, "writer-own-delete", ("memory:semantic:write",))
+        try:
+            r1 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "own-delete",
+                    "text": "mine",
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = client.delete("/memory/semantic/decisions/own-delete")
+            assert r2.status_code == 200, r2.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestEpisodicManifestCorpusDeleteGuard:
+    """Episodic twin of ``TestManifestCorpusDeleteGuard`` — episodic has NO
+    ``memory:corpus:episodic:write`` scope declared (ADR-062 §4), so only
+    admin/``audittrace:admin`` can ever satisfy the shared-write
+    authorization for a corpus-tier delete here."""
+
+    @staticmethod
+    def _seed_corpus_row(filename: str, *, created_by: str = "curator") -> None:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic",
+                filename,
+                "Shared ADR",
+                10,
+                created_by,
+                tier="corpus",
+            )
+        )
+
+    @staticmethod
+    def _get_row(filename: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(get_memory_manifest_service().get("episodic", filename))
+
+    def test_base_scope_delete_over_corpus_episodic_is_denied(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_row("ADR-delete-hijack.md")
+        before = self._get_row("ADR-delete-hijack.md")
+        assert before is not None and before.tier == "corpus"
+
+        _override_identity(
+            client, "attacker-episodic-delete", ("memory:episodic:write",)
+        )
+        try:
+            r = client.delete("/memory/episodic/ADR-delete-hijack.md")
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("ADR-delete-hijack.md")
+        assert after is not None
+        assert after.deleted_at_ms is None
+        assert after.deleted_by_user_id is None
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_admin_can_delete_corpus_episodic_row(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_row("ADR-delete-admin.md")
+        r = client.delete("/memory/episodic/ADR-delete-admin.md")
+        assert r.status_code == 200, r.text
+        after = self._get_row("ADR-delete-admin.md")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+
+
 class TestSemanticCorpusReadGate:
     """ADR-062 Phase B (WU-B4, D3) — reading CORPUS content through the
     ``/memory/semantic`` backoffice requires

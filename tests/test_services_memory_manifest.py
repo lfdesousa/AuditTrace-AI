@@ -339,6 +339,51 @@ class TestRecordDelete:
         with pytest.raises(LookupError):
             await manifest.record_delete("episodic", "missing.md", "u")
 
+    # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
+    # The LAST of the four manifest mutation methods to gain the guard —
+    # the M3-WU-D2-2 reviewer's third REJECT. FALSIFIABLE: neuter
+    # ``_tier_write_unauthorized`` and
+    # ``test_unauthorized_delete_over_corpus_row_raises`` goes RED (no
+    # exception, the corpus row gets silently tombstoned); restore it and
+    # it goes GREEN.
+
+    async def test_unauthorized_delete_over_corpus_row_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared-d", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await manifest.record_delete("semantic", "decisions/shared-d", "attacker")
+        row = await manifest.get("semantic", "decisions/shared-d")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.deleted_at_ms is None
+        assert row.deleted_by_user_id is None
+        assert row.created_by_user_id == "curator"
+
+    async def test_authorized_delete_over_corpus_row_succeeds(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared-d2", "Shared", 10, "curator", tier="corpus"
+        )
+        d = await manifest.record_delete(
+            "semantic", "decisions/shared-d2", "curator-2", caller_can_write_shared=True
+        )
+        assert d.deleted_at_ms is not None
+        assert d.deleted_by_user_id == "curator-2"
+
+    async def test_own_private_item_delete_unaffected_by_guard(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/own-d", "Mine", 10, "alice", tier="private"
+        )
+        d = await manifest.record_delete("semantic", "decisions/own-d", "alice")
+        assert d.deleted_at_ms is not None
+        assert d.deleted_by_user_id == "alice"
+
 
 class TestListForLayer:
     async def test_excludes_deleted_by_default(
@@ -494,7 +539,13 @@ class TestIndexStatusSummaryMock:
         await manifest.record_create(
             "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
         )
-        await manifest.record_delete("semantic", "decisions/gone.md", "alice")
+        # SPEC security-memory-manifest-tier-authz (2026-08-30): deleting a
+        # corpus-tier row (even one's own) now requires
+        # ``caller_can_write_shared=True`` — corpus rows are shared, not
+        # owned, same strict model ``record_create``/``record_update`` use.
+        await manifest.record_delete(
+            "semantic", "decisions/gone.md", "alice", caller_can_write_shared=True
+        )
         summary = await manifest.index_status_summary(_user("alice"), [])
         assert summary.pending == 0
         assert summary.dead_lettered == 0
@@ -829,7 +880,12 @@ class TestIndexStatusSummaryPostgres:
         await pg_manifest.record_create(
             "semantic", "decisions/gone.md", None, 1, "alice", tier="corpus"
         )
-        await pg_manifest.record_delete("semantic", "decisions/gone.md", "alice")
+        # SPEC security-memory-manifest-tier-authz (2026-08-30): deleting a
+        # corpus-tier row (even one's own) now requires
+        # ``caller_can_write_shared=True``.
+        await pg_manifest.record_delete(
+            "semantic", "decisions/gone.md", "alice", caller_can_write_shared=True
+        )
         summary = await pg_manifest.index_status_summary(_user("alice"), [])
         assert summary.pending == 0
         assert summary.dead_lettered == 0
@@ -1193,6 +1249,47 @@ class TestPostgresMemoryManifestService:
     async def test_delete_missing_raises(self, pg_manifest) -> None:
         with pytest.raises(LookupError):
             await pg_manifest.record_delete("episodic", "missing.md", "u")
+
+    async def test_unauthorized_delete_over_corpus_row_raises(
+        self, pg_manifest
+    ) -> None:
+        """Real Postgres-backed twin of the Mock guard test — proves the
+        PRODUCTION code path (not just the in-memory test double) raises."""
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared-d", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await pg_manifest.record_delete(
+                "semantic", "decisions/shared-d", "attacker"
+            )
+        row = await pg_manifest.get("semantic", "decisions/shared-d")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.deleted_at_ms is None
+        assert row.deleted_by_user_id is None
+        assert row.created_by_user_id == "curator"
+
+    async def test_authorized_delete_over_corpus_row_succeeds(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared-d2", "Shared", 10, "curator", tier="corpus"
+        )
+        d = await pg_manifest.record_delete(
+            "semantic", "decisions/shared-d2", "curator-2", caller_can_write_shared=True
+        )
+        assert d.deleted_at_ms is not None
+        assert d.deleted_by_user_id == "curator-2"
+
+    async def test_own_private_item_delete_unaffected_by_guard(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/own-d", "Mine", 10, "alice", tier="private"
+        )
+        d = await pg_manifest.record_delete("semantic", "decisions/own-d", "alice")
+        assert d.deleted_at_ms is not None
+        assert d.deleted_by_user_id == "alice"
 
     async def test_list_excludes_deleted_by_default(self, pg_manifest) -> None:
         await pg_manifest.record_create("episodic", "live.md", None, 1, "u")

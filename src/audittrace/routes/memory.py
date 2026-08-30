@@ -1808,10 +1808,15 @@ async def delete_episodic(
     manifest = get_memory_manifest_service()
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "episodic", filename, user.user_id
+            "episodic",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
@@ -2023,10 +2028,15 @@ async def delete_procedural(
     manifest = get_memory_manifest_service()
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "procedural", filename, user.user_id
+            "procedural",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
@@ -2575,10 +2585,15 @@ async def delete_semantic(
     key = _semantic_key(collection, document_id)
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "semantic", key, user.user_id
+            "semantic",
+            key,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)
