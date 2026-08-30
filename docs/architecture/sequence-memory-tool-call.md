@@ -14,7 +14,7 @@
 
 ## What makes tools-mode different
 
-The default (`memory_mode=inject`) path builds a full 4-layer memory
+The default (`memory_mode=inject`) path builds a full five-layer memory
 context on every request and injects it into the system message.
 Trivial prompts pay the same cost as memory-hungry ones — 4 memory
 searches, 4 Langfuse spans, hundreds of prompt tokens — regardless of

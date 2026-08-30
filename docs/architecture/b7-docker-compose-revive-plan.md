@@ -1,5 +1,13 @@
 # B7 — docker-compose revival plan (GHA-runnable, LLM-swappable)
 
+> ## ⚠️ OBSOLETE / WITHDRAWN (2026-08-30)
+>
+> **This plan is withdrawn and not being pursued.** k3s + Helm
+> (`charts/audittrace/`) is the sole application-deploy path; docker-compose
+> as an app runtime was stopped. This file is retained only as a historical
+> record of the revival idea. Do not implement it. For the live deploy path
+> see the deployment runbook and `charts/audittrace/`.
+
 > Status: **PLAN ONLY** — drafted 2026-05-15 on branch
 > `feat/b7-compose-revive-plan`. No code, no workflow files, no
 > existing compose files touched. Awaiting Luis sign-off on the

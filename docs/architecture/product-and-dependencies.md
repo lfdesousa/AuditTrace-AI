@@ -9,7 +9,7 @@ It is written because the temptation in LLM tooling is to let the product bounda
 **AuditTrace-AI is one process, one container image, one Helm chart.** It is a FastAPI-based memory-server that:
 
 - exposes a drop-in OpenAI-compatible `/v1/chat/completions` endpoint plus the `/interactions`, `/sessions`, `/memory`, `/health`, `/metrics` auxiliary endpoints;
-- owns the four-layer memory architecture (episodic / procedural / conversational / semantic) exposed to the LLM via the *memory-as-tools* pattern;
+- owns the five-layer memory architecture (four per-user layers — episodic / procedural / conversational / semantic — plus one shared corpus, per ADR-062) exposed to the LLM via the *memory-as-tools* pattern;
 - enforces per-user identity propagation, Row-Level-Security gating, and end-to-end audit-trail emission;
 - ships as a single versioned container image plus an authoritative Helm chart that declares every dependency interface and default;
 - is accompanied by forty-odd numbered Architecture Decision Records that document every commitment the codebase makes.
@@ -21,7 +21,7 @@ It is written because the temptation in LLM tooling is to let the product bounda
 ```mermaid
 flowchart LR
     subgraph Product["AuditTrace-AI (the product)"]
-        MS["memory-server<br/>FastAPI + tool loop<br/>4-layer memory<br/>audit emission"]
+        MS["memory-server<br/>FastAPI + tool loop<br/>five-layer memory<br/>audit emission"]
     end
     subgraph Dependencies["Market-standard infrastructure (bring your own)"]
         IDP["1. Identity Provider<br/>OAuth2 / OIDC"]
@@ -131,7 +131,7 @@ For each dependency we state the *role* (what we need it for), the *interface* (
 |---|---|
 | **Role** | Language-model inference for chat completions, embeddings generation, and session summarisation. Three distinct model endpoints today. |
 | **Interface** | OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` (or equivalent) — the same contract the memory-server exposes outward, consumed inward from upstream. |
-| **Default (dev)** | Three llama-server (llama.cpp) instances on the host, OS-managed systemd services: Qwen 3.6-27B-Q4_K_M for chat (swapped from 35B-A3B 2026-04-24 — the Q8_0 variant fails to load on gfx1151), nomic-embed-text v1.5 for embeddings, Mistral 7B Instruct v0.3 for session summarisation. |
+| **Default (dev)** | Three llama-server (llama.cpp) instances on the host, OS-managed systemd services: Qwen 3.8-27B dense + MTP (Q4_K_M) for chat (the MoE 35B-A3B was retired 2026-08-16), nomic-embed-text v1.5 for embeddings, Mistral 7B Instruct v0.3 for session summarisation. |
 | **Production alternatives** | vLLM for high-throughput serving, NVIDIA Triton Inference Server, TGI (Text Generation Inference), Ollama, or any OpenAI-compatible cloud provider *if the sovereignty constraint permits external inference* (it usually does not for regulated customers). |
 | **Minimum security posture** | No internet egress for the sovereignty story. TLS in transit. Token-authenticated inbound (when the inference stack supports it — llama.cpp does not by default; vLLM does). |
 | **Current gap** | Hardware-profile validation matrix is limited to AMD Ryzen AI MAX+ on Linux. Apple Silicon and NVIDIA laptop profiles claimed as hardware-agnostic but empirically unproven. *Addressed by roadmap Phase 1.4, target 2026-05-16.* |

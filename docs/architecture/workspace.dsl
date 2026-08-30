@@ -1,4 +1,4 @@
-workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs" {
+workspace "audittrace-server" "Five-Layer Memory Augmentation Proxy for Local LLMs" {
 
     !impliedRelationships true
 
@@ -14,7 +14,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         vault = softwareSystem "HashiCorp Vault" "In-cluster secret store (ADR-043)" {
             tags "External"
         }
-        llamaServer = softwareSystem "Chat LLM Server" "Reasoning — Qwen 3.6-35B-A3B MoE, :11435 (GPU)" {
+        llamaServer = softwareSystem "Chat LLM Server" "Reasoning — Qwen 3.8-27B dense+MTP, :11435 (GPU)" {
             tags "External"
         }
         embedServer = softwareSystem "Embedding Server (nomic)" "Embeddings — nomic-embed-text v1.5, :11436 (live, ADR-047)" {
@@ -52,7 +52,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         }
 
         // The system
-        memoryServer = softwareSystem "audittrace-server" "Augmentation proxy — 4-layer memory + delegated identity" {
+        memoryServer = softwareSystem "audittrace-server" "Augmentation proxy — five-layer memory + delegated identity" {
 
             !adrs adrs
 
@@ -174,7 +174,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
         memoryHandlers -> conversationalSvc "recall_recent_sessions"
         memoryHandlers -> semanticSvc "recall_semantic"
 
-        // 4-layer retrieval (inject path)
+        // five-layer retrieval (inject path)
         contextBuilder -> episodicSvc "search()"
         contextBuilder -> proceduralSvc "search()"
         contextBuilder -> conversationalSvc "as_context()"
@@ -303,10 +303,10 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
                 }
             }
 
-            deploymentNode "Host Machine" "Bare-metal GPU — three model processes" "Linux / ROCm" {
-                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.6-35B-A3B MoE, :11435 (GPU)" "llama.cpp / ROCm"
+            deploymentNode "Host Machine" "Bare-metal GPU — three model processes" "Linux / Vulkan" {
+                llamaInstance = infrastructureNode "chat-llama-server" "Qwen 3.8-27B dense+MTP, :11435 (GPU)" "llama.cpp / Vulkan"
                 embedInstance = infrastructureNode "embed-server (nomic)" "nomic-embed-text v1.5, :11436 (CPU) — live embedder (ADR-047)" "llama.cpp / CPU"
-                summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B, :11437 (GPU, ADR-030)" "llama.cpp / ROCm"
+                summarizerInstance = infrastructureNode "summariser-llama-server" "Mistral 7B, :11437 (GPU, ADR-030)" "llama.cpp / Vulkan"
                 opencodeProxyInstance = infrastructureNode "audittrace-opencode-proxy" "Caddy loopback → TLS (systemd)" "Caddy 2.6"
                 vaultUnsealInstance = infrastructureNode "audittrace-vault-auto-unseal" "Boot-time Vault unseal (systemd)" "systemd + bash"
             }
@@ -343,7 +343,7 @@ workspace "audittrace-server" "4-Layer Memory Augmentation Proxy for Local LLMs"
             autolayout lr
         }
 
-        component api "Components" "FastAPI application — 4-layer memory + identity" {
+        component api "Components" "FastAPI application — five-layer memory + identity" {
             include *
             autolayout tb
         }
