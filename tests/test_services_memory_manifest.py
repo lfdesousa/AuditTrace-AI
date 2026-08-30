@@ -29,6 +29,7 @@ from audittrace.services.memory_manifest import (
     MockMemoryManifestService,
     _now_ms,
     _validate_layer,
+    authorize_write,
 )
 
 
@@ -37,13 +38,15 @@ def manifest() -> MockMemoryManifestService:
     return MockMemoryManifestService()
 
 
-def _user(user_id: str, *, is_admin: bool = False) -> UserContext:
+def _user(
+    user_id: str, *, is_admin: bool = False, scopes: tuple[str, ...] = ()
+) -> UserContext:
     """Minimal non-admin UserContext for the WU-B4 caller-predicate tests."""
     return UserContext(
         user_id=user_id,
         username=user_id,
         agent_type="test",
-        scopes=(),
+        scopes=scopes,
         is_admin=is_admin,
     )
 
@@ -67,6 +70,113 @@ class TestValidateLayer:
         for bad in ("conversational", "EPISODIC", "", "anything"):
             with pytest.raises(ValueError, match="Invalid memory layer"):
                 _validate_layer(bad)
+
+
+class TestAuthorizeWrite:
+    """SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    PRIMARY pre-write choke, unit-tested directly (independent of any
+    route/pipeline call site) so every branch is exercised in isolation."""
+
+    async def test_new_private_item_passes(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await authorize_write(manifest, _user("writer"), "semantic", "decisions/new")
+
+    async def test_new_item_requested_corpus_unauthorized_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        with pytest.raises(ManifestAuthorizationError):
+            await authorize_write(
+                manifest,
+                _user("writer", scopes=("memory:semantic:write",)),
+                "semantic",
+                "decisions/new-corpus",
+                requested_tier="corpus",
+            )
+
+    async def test_new_item_requested_corpus_authorized_passes(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await authorize_write(
+            manifest,
+            _user("curator", scopes=("memory:corpus:decisions:write",)),
+            "semantic",
+            "decisions/new-corpus-ok",
+            requested_tier="corpus",
+        )
+
+    async def test_existing_corpus_row_unauthorized_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await authorize_write(
+                manifest,
+                _user("attacker", scopes=("memory:semantic:write",)),
+                "semantic",
+                "decisions/shared",
+            )
+
+    async def test_existing_corpus_row_authorized_passes(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared2", "Shared", 10, "curator", tier="corpus"
+        )
+        await authorize_write(
+            manifest,
+            _user("curator2", scopes=("memory:corpus:decisions:write",)),
+            "semantic",
+            "decisions/shared2",
+        )
+
+    async def test_admin_always_passes(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared3", "Shared", 10, "curator", tier="corpus"
+        )
+        await authorize_write(
+            manifest, _user("ops", is_admin=True), "semantic", "decisions/shared3"
+        )
+
+    async def test_existing_private_row_unaffected_by_guard(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "own.md", "Mine", 10, "alice", tier="private"
+        )
+        # bob has no scope at all — still allowed, since private-tier
+        # cross-owner collisions are a separate, already-flagged follow-up.
+        await authorize_write(manifest, _user("bob"), "episodic", "own.md")
+
+    async def test_owner_exempt_true_lets_owner_touch_own_corpus_row(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "shared.pdf", "Shared", 10, "alice", tier="corpus"
+        )
+        # No shared-write scope at all — owner_exempt is what saves it.
+        await authorize_write(
+            manifest, _user("alice"), "episodic", "shared.pdf", owner_exempt=True
+        )
+
+    async def test_owner_exempt_true_still_blocks_non_owner(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "episodic", "shared2.pdf", "Shared", 10, "alice", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await authorize_write(
+                manifest,
+                _user("attacker"),
+                "episodic",
+                "shared2.pdf",
+                owner_exempt=True,
+            )
 
 
 class TestRecordCreate:

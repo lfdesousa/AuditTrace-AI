@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Any
 
 from audittrace.config import get_settings
+from audittrace.identity import UserContext
 from audittrace.routes.memory_pdf.classification import (
     _classify_pdf_extraction_error,
 )
@@ -57,6 +58,7 @@ from audittrace.routes.memory_pdf.redactions import (
 )
 from audittrace.routes.memory_pdf.signature import _pdf_signature_status
 from audittrace.routes.memory_pdf.toc import _build_toc_index
+from audittrace.services.memory_manifest import authorize_write
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,7 @@ async def _index_pdf_objects(
     layer_prefix: str,
     user_id: str,
     ingestion_ts_ms: int,
+    user: UserContext,
     manifest_service: Any | None = None,
     details_log: list[dict[str, Any]] | None = None,
     dry_run: bool = False,
@@ -114,15 +117,22 @@ async def _index_pdf_objects(
     loud-422 guard reads — unconditionally available, unlike
     ``details_log`` which is only surfaced when ``?details=true``.
 
-    *caller_can_write_shared* (SPEC security-memory-manifest-tier-authz,
-    2026-08-30) — forwarded verbatim to every ``_flush_pdf_manifest`` call
-    below, which forwards it to ``MemoryManifestService.upsert_pdf_metadata``
-    as its fail-closed shared-write authorization. Defaults ``False``: an
-    unauthorized caller landing on an EXISTING **corpus**-tier PDF manifest
-    row is denied (no tier change, no title/signature/hash overwrite, no
-    re-authorship) — best-effort, same swallow contract as any other
-    manifest-write failure in this pipeline (the ChromaDB chunks already
-    written are not rolled back).
+    *caller_can_write_shared* — forwarded verbatim to every
+    ``_flush_pdf_manifest`` call below, which forwards it to
+    ``MemoryManifestService.upsert_pdf_metadata`` as its fail-closed
+    shared-write authorization. The manifest-layer DEFENSE-IN-DEPTH guard,
+    behind *user* below.
+
+    *user* (SPEC security-memory-write-authorization-choke, 2026-08-30 —
+    SUPERSEDES relying on the manifest-layer guard alone) — the PRIMARY
+    enforcement. Checked via ``authorize_write(manifest_service, user,
+    manifest_layer, obj["key"])`` ONCE per file, right after the file's
+    bytes are read and BEFORE any manifest mutation or ChromaDB write for
+    that file (bomb-defense/encryption rejections included — no manifest
+    write of ANY kind, rejection or success, happens before authorization).
+    Raises (propagates — this function never catches its own
+    ``ManifestAuthorizationError``, callers map it to 403) before a single
+    byte of this file's chunks reaches ChromaDB.
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
@@ -164,6 +174,25 @@ async def _index_pdf_objects(
         if raw is None:
             _record_outcome(False)
             continue
+
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRE-WRITE choke, ONCE per file, BEFORE any manifest mutation
+        # (rejection-path flushes below included) or ChromaDB write for
+        # this file. ``manifest_service is None`` only ever happens in a
+        # unit test that deliberately omits it — production always
+        # resolves a real manifest service (mirrors ``_index_md_objects``'s
+        # identical None-skip contract). ``owner_exempt=True`` mirrors
+        # ``upsert_pdf_metadata``'s own looser guard (every PDF row
+        # defaults tier="corpus"; the row's own creator must keep being
+        # able to re-index it — see ``authorize_write``'s docstring).
+        if manifest_service is not None:
+            await authorize_write(
+                manifest_service,
+                user,
+                manifest_layer,
+                obj["key"],
+                owner_exempt=True,
+            )
 
         # Per-document state — accumulated through the per-page loop
         # and flushed to the manifest at end-of-file. Reset per file

@@ -391,6 +391,7 @@ class TestDefaultIndexerRouting:
             layer_prefix,
             user_id,
             ingestion_ts_ms,
+            user,
             manifest_service,
             outcomes=None,
             caller_can_write_shared=False,
@@ -412,6 +413,12 @@ class TestDefaultIndexerRouting:
             # (never gains a demote bypass — see ``default_indexer``'s
             # inline comment).
             assert caller_can_write_shared is True
+            # SPEC security-memory-write-authorization-choke (2026-08-30):
+            # the PRIMARY enforcement — the system worker passes a
+            # trusted, always-authorized identity into the pre-write
+            # choke rather than bypassing it.
+            assert user.is_admin is True
+            assert user.user_id == "alice"
             if outcomes is not None:
                 outcomes.append(True)
             return 3

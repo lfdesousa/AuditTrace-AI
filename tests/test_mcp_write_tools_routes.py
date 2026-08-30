@@ -55,7 +55,7 @@ from sqlalchemy import select
 import audittrace.tools.memory_handlers as memory_handlers_mod
 from audittrace.db.models import InteractionRecord, ToolCall
 from audittrace.dependencies import get_postgres_factory
-from audittrace.identity import sentinel_user_context
+from audittrace.identity import UserContext, sentinel_user_context
 from audittrace.tools import mcp_write_handlers as write_handlers_mod
 from audittrace.tools import reset_registry_for_tests
 from audittrace.tools.mcp_write_registry import reset_mcp_write_registry_for_tests
@@ -415,19 +415,23 @@ class TestValidScopeWritesDocumentAndAudit:
 
 
 class TestMcpWriteNoBypassOfCorpusGuard:
-    """SPEC security-memory-manifest-tier-authz (2026-08-30) — ``mcp_write``
-    is documented as PRIVATE-tier only (``write_decision``/``write_skill``
-    never accept a caller-supplied tier). This proves the bridge gains NO
-    bypass of the manifest's corpus-overwrite guard: a caller who happens
-    to pick a ``document_id`` that collides with an EXISTING corpus item
-    must not be able to silently overwrite its title/ownership via MCP,
-    same as the REST ``POST /memory/semantic`` path.
+    """SPEC security-memory-write-authorization-choke (2026-08-30) —
+    SUPERSEDES the manifest-only fix. ``mcp_write`` is documented as
+    PRIVATE-tier only (``write_decision``/``write_skill`` never accept a
+    caller-supplied tier). This proves the bridge gains NO bypass of the
+    pre-write choke: a caller who happens to pick a ``document_id`` that
+    collides with an EXISTING corpus item must not be able to overwrite
+    its title/ownership OR its underlying ChromaDB content via MCP, same
+    as the REST ``POST /memory/semantic`` path — and, per the third-review
+    finding, the ChromaDB write must never land AT ALL (not "land then
+    get reported as an error").
 
-    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
-    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
-    and ``test_write_decision_denied_over_existing_corpus_row`` goes RED
-    (the corpus row's title/owner silently changes to the attacker's);
-    restore it and it goes GREEN.
+    FALSIFIABLE: neuter ``authorize_write`` in
+    ``services/memory_manifest.py`` (e.g. make it return immediately
+    without ever raising) and
+    ``test_write_decision_denied_over_existing_corpus_row`` goes RED (the
+    corpus row's title/owner AND its ChromaDB content silently change to
+    the attacker's); restore it and it goes GREEN.
     """
 
     @pytest.mark.asyncio
@@ -441,6 +445,15 @@ class TestMcpWriteNoBypassOfCorpusGuard:
             "Shared ADR",
             10,
             "curator-orig",
+            tier="corpus",
+        )
+        semantic = test_container._instances["semantic"]
+        await semantic.upsert(
+            None,
+            "decisions",
+            "adr-999",
+            "shared corpus content",
+            {"tier": "corpus", "user_id": "curator-orig"},
             tier="corpus",
         )
 
@@ -467,6 +480,71 @@ class TestMcpWriteNoBypassOfCorpusGuard:
         assert body["isError"] is True
 
         row = manifest._rows[("semantic", "decisions/adr-999")]
+        assert row["tier"] == "corpus"
+        assert row["title"] == "Shared ADR"
+        assert row["created_by_user_id"] == "curator-orig"
+        assert row["modified_by_user_id"] == "curator-orig"
+
+        # SPEC security-memory-write-authorization-choke: the ChromaDB
+        # content is byte-unchanged — the write never landed at all, not
+        # "landed then got reported as an error" (the third-review gap).
+        docs = [
+            d
+            for d in semantic._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "adr-999"
+        ]
+        assert len(docs) == 1
+        assert docs[0].page_content == "shared corpus content"
+        assert docs[0].metadata.get("user_id") == "curator-orig"
+
+    @pytest.mark.asyncio
+    async def test_manifest_layer_guard_still_protects_if_choke_is_bypassed(
+        self, client: TestClient, test_container
+    ) -> None:
+        """Defense-in-depth, proven independently: even if the PRIMARY
+        ``authorize_write`` choke were bypassed (patched to a no-op here,
+        simulating a bug/gap in it), ``record_create``'s OWN guard still
+        denies the write — the manifest-layer guards this branch stays
+        kept for are not decorative. ``client`` is depended on (unused
+        directly) so the ``app`` fixture's DI-container swap runs before
+        ``write_decision`` resolves its services — mirrors every other
+        test in this class."""
+        from unittest.mock import AsyncMock, patch
+
+        from audittrace.tools.mcp_write_handlers import write_decision
+
+        manifest = test_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic",
+            "decisions/adr-defense-in-depth",
+            "Shared ADR",
+            10,
+            "curator-orig",
+            tier="corpus",
+        )
+        attacker = UserContext(
+            user_id="attacker-defense-in-depth",
+            username="attacker-defense-in-depth",
+            agent_type="test",
+            scopes=("memory:decisions:write",),
+            is_admin=False,
+        )
+
+        with patch(
+            "audittrace.tools.mcp_write_handlers.authorize_write",
+            AsyncMock(return_value=None),
+        ):
+            result = await write_decision(
+                attacker,
+                {
+                    "document_id": "adr-defense-in-depth",
+                    "text": "attacker content",
+                    "title": "pwned",
+                },
+            )
+        assert "error" in result
+
+        row = manifest._rows[("semantic", "decisions/adr-defense-in-depth")]
         assert row["tier"] == "corpus"
         assert row["title"] == "Shared ADR"
         assert row["created_by_user_id"] == "curator-orig"

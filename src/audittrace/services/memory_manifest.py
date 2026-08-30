@@ -239,6 +239,117 @@ def _validate_layer(layer: str) -> None:
         )
 
 
+async def authorize_write(
+    manifest: MemoryManifestService,
+    user: UserContext,
+    layer: str,
+    key: str,
+    *,
+    requested_tier: str = "private",
+    owner_exempt: bool = False,
+) -> None:
+    """The PRE-WRITE authorization choke (SPEC security-memory-write-
+    authorization-choke, 2026-08-30) — SUPERSEDES the manifest-only fix
+    (SPEC security-memory-manifest-tier-authz) that three independent
+    reviews proved insufficient.
+
+    **Why this exists.** The manifest-layer guards
+    (``_tier_write_unauthorized``/``_pdf_metadata_write_unauthorized``,
+    applied inside ``record_create``/``record_update``/``record_delete``/
+    ``upsert_pdf_metadata``) authorize the Postgres AUDIT row. On the
+    index paths (the ``.md``/PDF fold, ``mcp_write``) the ChromaDB content
+    write happens BEFORE that audit-row check, and the flush helpers used
+    to swallow the resulting ``ManifestAuthorizationError`` in a broad
+    ``except Exception`` (WARNING only) — so an unauthorized caller's
+    content landed anyway and the response was a silent 200. The
+    third-review reviewer live-demonstrated this: a caller holding only
+    base ``memory:episodic:write`` (no corpus scope) named their private
+    ``.md`` identically to a curator-seeded corpus document; the ChromaDB
+    row was overwritten with the attacker's payload and its
+    ``tier``/``user_id`` metadata flipped to the attacker's — hijack AND
+    hide, achieved with LESS privilege than the exploits the manifest-only
+    fix closed.
+
+    **What this does.** Call this FIRST, before ANY content write
+    (ChromaDB upsert, S3 write) OR manifest mutation, at every write entry
+    point. It resolves the target's CURRENT state via ``manifest.get()`` —
+    a FRESH read, independent of and prior to whatever the eventual
+    manifest write's own internal check does — and enforces the SAME
+    invariant the four manifest guards enforce, just BEFORE instead of
+    AFTER the content lands: a caller may write only (a) a NEW item
+    requested at a tier it's authorized for, or (b) an EXISTING item
+    whose current tier it's authorized to touch. Raises
+    :class:`ManifestAuthorizationError` — routes/callers MUST map that to
+    HTTP 403, and MUST NOT catch-and-swallow it on any content-write path
+    (see ``memory_md_manifest.py``/``memory_pdf/manifest.py``, which no
+    longer do).
+
+    ``requested_tier`` is the tier the WRITE is targeting (``"private"``
+    by default; ``"corpus"`` when the caller explicitly promotes, or when
+    a fold/index path resolved the destination to the shared prefix) —
+    checked against the caller's corpus-write authorization REGARDLESS of
+    whether the target is new or existing, so a promote-into-corpus
+    attempt on a brand-new key is refused just as reliably as an
+    overwrite of an existing corpus row.
+
+    ``owner_exempt`` (default ``False`` — the STRICT rule
+    ``record_create``/``record_update``/``record_delete`` already use: an
+    existing corpus-tier row requires shared-write authorization
+    regardless of who created it) — set ``True`` ONLY for the PDF fold
+    path, whose downstream manifest write (``upsert_pdf_metadata``) uses
+    the LOOSER ``_pdf_metadata_write_unauthorized`` predicate: every
+    PDF-indexed row defaults ``tier="corpus"`` server-side (this writer
+    has no ``tier`` parameter at all), and a routine, DOCUMENTED
+    idempotent re-index of one's OWN just-uploaded PDF must keep working
+    without a corpus scope. When ``True``, an existing row the caller
+    already owns (``existing.created_by_user_id == user.user_id``) is
+    exempt from the corpus-tier check — mirrors
+    ``_pdf_metadata_write_unauthorized`` exactly, so this pre-write choke
+    never rejects a write the downstream manifest guard would have
+    allowed (only ever the reverse: blocking earlier what the manifest
+    guard would also have blocked, before any content lands).
+
+    The corpus-write authorization check itself is
+    ``routes.memory._corpus_write_authorized`` — imported LAZILY
+    (function-scoped) to avoid a circular import: ``routes.memory``
+    already imports ``ManifestAuthorizationError``/``ManifestEntry`` from
+    THIS module at module load time, so a module-level import the other
+    way round would deadlock the import graph. This mirrors the existing
+    precedent in ``routes/memory_pdf/pipeline.py::_index_pdf_objects``,
+    which lazily imports shared helpers from ``routes.memory`` for the
+    identical reason (see that function's docstring).
+    """
+    _validate_layer(layer)
+    from audittrace.routes.memory import (  # noqa: PLC0415 - lazy, avoids a circular import (see docstring)
+        _corpus_write_authorized,
+    )
+
+    collection = key.split("/", 1)[0] if layer == "semantic" else None
+    caller_can_write_shared = _corpus_write_authorized(user, collection)
+
+    if requested_tier == "corpus" and not caller_can_write_shared:
+        raise ManifestAuthorizationError(
+            f"caller lacks shared-write authorization to write a corpus-tier "
+            f"target layer={layer!r} key={key!r}"
+        )
+
+    existing = await manifest.get(layer, key)
+    if existing is None:
+        return
+    if (
+        owner_exempt
+        and not caller_can_write_shared
+        and existing.tier == "corpus"
+        and existing.created_by_user_id == user.user_id
+    ):
+        return
+    if _tier_write_unauthorized(existing.tier, caller_can_write_shared):
+        raise ManifestAuthorizationError(
+            f"caller lacks shared-write authorization to write over an "
+            f"existing corpus-tier target layer={layer!r} key={key!r}"
+        )
+
+
 # ── SPEC #374 (WU-1) — read-path index-status query ──────────────────────
 # Caps the best-effort named-match list (sub-decision #5, ratified
 # 2026-08-16): a recall tool result is not the place for an unbounded list.

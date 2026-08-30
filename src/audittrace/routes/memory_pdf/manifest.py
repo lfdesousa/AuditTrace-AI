@@ -22,6 +22,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from audittrace.services.memory_manifest import ManifestAuthorizationError
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,13 +58,20 @@ async def _flush_pdf_manifest(
 
     Skips manifest write silently when ``manifest_service is None``
     (pre-tier-B callers, unit tests that patch out the manifest path).
-    Logs but does not re-raise on Postgres failure — INCLUDING a
-    ``ManifestAuthorizationError`` (SPEC security-memory-manifest-tier-
-    authz, 2026-08-30): an unauthorized re-index landing on an EXISTING
-    corpus-tier row is denied at the manifest choke and swallowed here
-    exactly like any other manifest-write failure — the ChromaDB chunks
-    already written are not rolled back, but the row's tier / title /
-    signature_status / document_sha256 / owner are left untouched.
+    Logs but does not re-raise on an ORDINARY Postgres failure — the
+    ChromaDB chunks already written are not rolled back either way.
+
+    **``ManifestAuthorizationError`` is NOT swallowed** (SPEC security-
+    memory-write-authorization-choke, 2026-08-30 — SUPERSEDES the prior
+    behavior, where it was). Three independent reviews proved that a
+    silent WARNING here, on a path where the ChromaDB content had already
+    landed, is itself the vulnerability. The PRIMARY enforcement is now
+    ``authorize_write``, called once per file BEFORE any of this
+    function's callers run (``_index_pdf_objects``), so on that path this
+    specific error should never actually reach here on an unauthorized
+    request — but if it ever does (a missed call site, a future
+    refactor), it MUST surface loudly as a 403, never a swallowed
+    warning masking a poisoned/partial write.
 
     *details_log* (ADR-056 #24) — when supplied, every call appends
     one per-document outcome dict for the ``?details=true`` response
@@ -70,7 +79,7 @@ async def _flush_pdf_manifest(
 
     *caller_can_write_shared* — forwarded to ``MemoryManifestService.
     upsert_pdf_metadata``'s fail-closed shared-write authorization
-    (default ``False``).
+    (default ``False`` — the manifest-layer DEFENSE-IN-DEPTH guard).
     """
     if details_log is not None:
         details_log.append(
@@ -120,6 +129,8 @@ async def _flush_pdf_manifest(
             ltv_data=ltv_data,
             caller_can_write_shared=caller_can_write_shared,
         )
+    except ManifestAuthorizationError:
+        raise
     except Exception as exc:
         logger.warning(
             "Failed to write PDF manifest for %s/%s: %s",
