@@ -76,6 +76,7 @@ from typing import Any
 from audittrace.dependencies import get_memory_manifest_service, get_semantic_service
 from audittrace.identity import UserContext
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_manifest import ManifestAuthorizationError
 from audittrace.tools.mcp_write_registry import register_mcp_write_tool
 
 logger = logging.getLogger(__name__)
@@ -130,14 +131,38 @@ async def _write_semantic_document(
         return {"error": f"{exc.__class__.__name__}: write failed"}
 
     manifest = get_memory_manifest_service()
-    entry = await manifest.record_create(
-        layer="semantic",
-        key=f"{collection}/{document_id}",
-        title=title,
-        size_bytes=len(text.encode("utf-8")),
-        user_id=user_context.user_id,
-        tier="private",
-    )
+    try:
+        # ``caller_can_write_shared`` is deliberately OMITTED (defaults
+        # False — SPEC security-memory-manifest-tier-authz, 2026-08-30):
+        # this tool is private-tier ONLY (see the module docstring — "an
+        # MCP write tool never accepts a caller-supplied tier"), so it
+        # must never be able to overwrite an EXISTING corpus-tier row
+        # either. If ``document_id`` collides with an existing corpus
+        # item, ``record_create`` raises rather than silently demoting/
+        # re-authoring it — the same guard the REST create/update routes
+        # get, so this bridge gains no bypass.
+        entry = await manifest.record_create(
+            layer="semantic",
+            key=f"{collection}/{document_id}",
+            title=title,
+            size_bytes=len(text.encode("utf-8")),
+            user_id=user_context.user_id,
+            tier="private",
+        )
+    except ManifestAuthorizationError as exc:
+        logger.info(
+            "mcp write tool denied — existing corpus row collection=%s "
+            "document_id=%s: %s",
+            collection,
+            document_id,
+            exc,
+        )
+        return {
+            "error": (
+                "cannot write: an existing shared corpus item already "
+                "owns this document_id"
+            )
+        }
 
     try:
         await emit_memory_audit_event(

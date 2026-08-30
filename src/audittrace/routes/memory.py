@@ -92,7 +92,10 @@ from audittrace.services.memory_audit import (
     emit_memory_audit_event,
     schedule_read_audit,
 )
-from audittrace.services.memory_manifest import ManifestEntry
+from audittrace.services.memory_manifest import (
+    ManifestAuthorizationError,
+    ManifestEntry,
+)
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.recall_telemetry import (
@@ -335,6 +338,40 @@ def _require_corpus_scope(user: UserContext, collection: str, action: str) -> No
         status_code=403,
         detail=f"Required scope: {required} (or audittrace:admin)",
     )
+
+
+def _corpus_write_authorized(user: UserContext, collection: str | None) -> bool:
+    """``True`` iff *user* may overwrite/demote an EXISTING **corpus**-tier
+    manifest row — the ``caller_can_write_shared`` authorization
+    ``MemoryManifestService.record_create``/``record_update`` require to
+    touch such a row (SPEC security-memory-manifest-tier-authz,
+    2026-08-30).
+
+    ``collection`` is one of the three ADR-062 §4 corpus-scoped ChromaDB
+    collections (``decisions``/``skills``/``semantic``) for ``/memory/
+    semantic`` writes — delegates to ``_has_corpus_scope`` for the exact
+    per-collection grant (or admin). ``None`` is passed for the episodic/
+    procedural layers, which have NO ``memory:corpus:<layer>:write`` scope
+    declared at all (the module note above ``_has_corpus_scope`` — the
+    closed scope set is exactly the three collections above); for those
+    layers only an admin (``audittrace:admin`` or ``is_admin``) can ever
+    satisfy this — matching that no ordinary caller can hold a shared-
+    write grant that does not exist.
+    """
+    if collection is None:
+        return user.is_admin or "audittrace:admin" in user.scopes
+    return _has_corpus_scope(user, collection, "write")
+
+
+def _raise_manifest_authorization_as_403(
+    exc: ManifestAuthorizationError,
+) -> HTTPException:
+    """Map :class:`ManifestAuthorizationError` to the route-layer HTTP 403
+    every other authorization failure in this file uses — never let it
+    fall through to the generic 500 handler (SPEC security-memory-
+    manifest-tier-authz, 2026-08-30, invariant #4: fail-closed, RAISE, not
+    a silent overwrite AND not an opaque 500)."""
+    return HTTPException(status_code=403, detail=str(exc))
 
 
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
@@ -735,6 +772,7 @@ async def _index_md_objects(
     tier: str,
     outcomes: list[bool] | None = None,
     manifest_service: Any | None = None,
+    caller_can_write_shared: bool = False,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
@@ -761,6 +799,16 @@ async def _index_md_objects(
     ``created_at_ms``-ordered manifest scan instead of relying solely on
     the capped, non-recency-ordered ``col.get()`` discovery fallback. See
     the module docstring on ``memory_md_manifest`` for the full story.
+
+    *caller_can_write_shared* (SPEC security-memory-manifest-tier-authz,
+    2026-08-30) — threaded straight through to
+    ``memory_md_manifest._flush_md_manifest``'s ``record_create`` call, so
+    a re-index (e.g. single-file ``/memory/index?file=`` on a corpus key)
+    can never silently overwrite an existing corpus row's manifest
+    metadata unless the caller actually holds the shared-write
+    authorization for *col_name*. Best-effort like the rest of the
+    manifest write here: an unauthorized attempt logs a warning and skips
+    the manifest row rather than failing the whole index call.
     """
     total = 0
     for obj in objects:
@@ -842,6 +890,7 @@ async def _index_md_objects(
             sizes_bytes=[len(c.encode("utf-8")) for c in chunks],
             user_id=user_id,
             tier=tier,
+            caller_can_write_shared=caller_can_write_shared,
         )
     return total
 
@@ -1118,6 +1167,16 @@ async def index_memory(
         )
 
         chunk_count = 0
+        # SPEC security-memory-manifest-tier-authz (2026-08-30): the SAME
+        # shared-write authorization ``create_semantic``/``update_semantic``
+        # compute, threaded through ``_index_md_objects``/``_flush_md_manifest``
+        # into the manifest choke so a re-index can never silently overwrite
+        # an existing corpus row's manifest metadata a caller isn't
+        # authorized to touch (bulk mode is always admin-gated above, so
+        # this is always True there via the admin bypass in
+        # ``_has_corpus_scope``; single-file mode is the path an
+        # under-privileged caller could otherwise reach).
+        col_caller_can_write_shared = _corpus_write_authorized(user, col_name)
         if col_name in ("decisions", "semantic"):
             chunk_count += await _index_md_objects(
                 collection,
@@ -1130,6 +1189,7 @@ async def index_memory(
                 tier=tier,
                 outcomes=object_outcomes,
                 manifest_service=manifest_service,
+                caller_can_write_shared=col_caller_can_write_shared,
             )
         if col_name in ("skills", "semantic"):
             chunk_count += await _index_md_objects(
@@ -1143,6 +1203,7 @@ async def index_memory(
                 tier=tier,
                 outcomes=object_outcomes,
                 manifest_service=manifest_service,
+                caller_can_write_shared=col_caller_can_write_shared,
             )
         if col_name == "ai_research_papers":
             # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
@@ -1365,14 +1426,18 @@ async def create_episodic(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="episodic",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="episodic",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed: see services/memory_audit.py module docstring).
     await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
@@ -1667,6 +1732,7 @@ async def update_episodic(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1674,6 +1740,8 @@ async def update_episodic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
@@ -1768,14 +1836,18 @@ async def create_procedural(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="procedural",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="procedural",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
@@ -1886,6 +1958,7 @@ async def update_procedural(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1893,6 +1966,8 @@ async def update_procedural(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
@@ -2000,14 +2075,18 @@ async def create_semantic(
         await service.upsert(user, collection, document_id, text, metadata, tier=tier)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="semantic",
-        key=_semantic_key(collection, document_id),
-        title=title,
-        size_bytes=len(text.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="semantic",
+            key=_semantic_key(collection, document_id),
+            title=title,
+            size_bytes=len(text.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(
         user=user,
         op="write",
@@ -2421,6 +2500,7 @@ async def update_semantic(
             size_bytes=len(text.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -2429,6 +2509,8 @@ async def update_semantic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(
         user=user,
         op="write",

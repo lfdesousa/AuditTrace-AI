@@ -22,6 +22,7 @@ from audittrace.db.models import MemoryItem
 from audittrace.identity import UserContext
 from audittrace.services.memory_manifest import (
     IndexStatusSummary,
+    ManifestAuthorizationError,
     ManifestEntry,
     MatchedUnindexed,
     MemoryManifestService,
@@ -141,14 +142,94 @@ class TestRecordCreate:
         self, manifest: MockMemoryManifestService
     ) -> None:
         """Recreating an existing row updates its tier too (same branch
-        that already updates title/size_bytes on overwrite)."""
+        that already updates title/size_bytes on overwrite) — PROVIDED
+        the caller is authorized for a shared write (SPEC security-
+        memory-manifest-tier-authz, 2026-08-30: a tier change on an
+        existing row now requires ``caller_can_write_shared``, same as
+        an outright corpus overwrite)."""
         await manifest.record_create(
             "episodic", "k.md", None, 1, "alice", tier="private"
         )
         again = await manifest.record_create(
-            "episodic", "k.md", None, 1, "curator", tier="corpus"
+            "episodic",
+            "k.md",
+            None,
+            1,
+            "curator",
+            tier="corpus",
+            caller_can_write_shared=True,
         )
         assert again.tier == "corpus"
+
+    async def test_recreate_unauthorized_tier_change_preserves_tier(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        """Without ``caller_can_write_shared``, requesting ``tier="corpus"``
+        on an existing PRIVATE row does NOT promote it — the tier is
+        preserved (the write itself still succeeds; only the tier field
+        is protected) — defense-in-depth at the manifest choke, per the
+        SPEC's "only set existing.tier = tier when authorized" design."""
+        await manifest.record_create(
+            "episodic", "k.md", None, 1, "alice", tier="private"
+        )
+        again = await manifest.record_create(
+            "episodic", "k.md", "still mine", 2, "alice", tier="corpus"
+        )
+        assert again.tier == "private"
+        assert again.title == "still mine"
+
+    # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
+    # The M3-WU-D2-2 reviewer's cross-user corpus-hijack/hide finding:
+    # create()-over-an-existing-corpus-row had NO authorization check at
+    # all. FALSIFIABLE: neuter ``_tier_write_unauthorized`` (e.g. make it
+    # always return ``False``) and
+    # ``test_unauthorized_create_over_corpus_row_raises`` goes RED
+    # (no exception, the row silently gets demoted/re-authored); restore
+    # it and it goes GREEN.
+
+    async def test_unauthorized_create_over_corpus_row_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await manifest.record_create(
+                "semantic",
+                "decisions/shared",
+                "pwned",
+                99,
+                "attacker",
+                tier="private",
+            )
+        # No tier change, no overwrite, no re-authorship.
+        row = await manifest.get("semantic", "decisions/shared")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.title == "Shared"
+        assert row.created_by_user_id == "curator"
+        assert row.modified_by_user_id == "curator"
+
+    async def test_authorized_create_over_corpus_row_succeeds(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared", "Shared", 10, "curator", tier="corpus"
+        )
+        updated = await manifest.record_create(
+            "semantic",
+            "decisions/shared",
+            "Updated",
+            20,
+            "curator-2",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+        assert updated.tier == "corpus"
+        assert updated.title == "Updated"
+        assert updated.modified_by_user_id == "curator-2"
+        # created_by_user_id is IMMUTABLE even on an authorized overwrite.
+        assert updated.created_by_user_id == "curator"
 
 
 class TestRecordUpdate:
@@ -186,6 +267,51 @@ class TestRecordUpdate:
         await manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
             await manifest.record_update("episodic", "k.md", 2, "bob")
+
+    # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
+    # ``record_update`` had the SAME missing-authz shape as
+    # ``record_create``: it unconditionally overwrote ``title`` +
+    # ``modified_by_user_id`` of any existing row, across tiers, with no
+    # ownership/tier check. FALSIFIABLE: neuter
+    # ``_tier_write_unauthorized`` and
+    # ``test_unauthorized_update_over_corpus_row_raises`` goes RED
+    # (the corpus row's title/modified_by silently changes); restore and
+    # it goes GREEN.
+
+    async def test_unauthorized_update_over_corpus_row_raises(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared-u", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await manifest.record_update(
+                "semantic", "decisions/shared-u", 99, "attacker", title="pwned"
+            )
+        row = await manifest.get("semantic", "decisions/shared-u")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.title == "Shared"
+        assert row.modified_by_user_id == "curator"
+        assert row.size_bytes == 10
+
+    async def test_authorized_update_over_corpus_row_succeeds(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.record_create(
+            "semantic", "decisions/shared-u2", "Shared", 10, "curator", tier="corpus"
+        )
+        updated = await manifest.record_update(
+            "semantic",
+            "decisions/shared-u2",
+            20,
+            "curator-2",
+            title="Revised",
+            caller_can_write_shared=True,
+        )
+        assert updated.title == "Revised"
+        assert updated.modified_by_user_id == "curator-2"
+        assert updated.created_by_user_id == "curator"
 
 
 class TestRecordDelete:
@@ -951,6 +1077,104 @@ class TestPostgresMemoryManifestService:
         await pg_manifest.record_delete("episodic", "k.md", "alice")
         with pytest.raises(RuntimeError, match="soft-deleted"):
             await pg_manifest.record_update("episodic", "k.md", 2, "bob")
+
+    # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
+    # Real Postgres-backed twin of the Mock guard tests above — proves the
+    # PRODUCTION code path (not just the in-memory test double) raises.
+
+    async def test_unauthorized_create_over_corpus_row_raises(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await pg_manifest.record_create(
+                "semantic",
+                "decisions/shared",
+                "pwned",
+                99,
+                "attacker",
+                tier="private",
+            )
+        row = await pg_manifest.get("semantic", "decisions/shared")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.title == "Shared"
+        assert row.created_by_user_id == "curator"
+        assert row.modified_by_user_id == "curator"
+
+    async def test_authorized_create_over_corpus_row_succeeds(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared-ok", "Shared", 10, "curator", tier="corpus"
+        )
+        updated = await pg_manifest.record_create(
+            "semantic",
+            "decisions/shared-ok",
+            "Updated",
+            20,
+            "curator-2",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+        assert updated.tier == "corpus"
+        assert updated.title == "Updated"
+        assert updated.modified_by_user_id == "curator-2"
+        assert updated.created_by_user_id == "curator"
+
+    async def test_unauthorized_update_over_corpus_row_raises(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared-u", "Shared", 10, "curator", tier="corpus"
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await pg_manifest.record_update(
+                "semantic", "decisions/shared-u", 99, "attacker", title="pwned"
+            )
+        row = await pg_manifest.get("semantic", "decisions/shared-u")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.title == "Shared"
+        assert row.modified_by_user_id == "curator"
+        assert row.size_bytes == 10
+
+    async def test_authorized_update_over_corpus_row_succeeds(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.record_create(
+            "semantic", "decisions/shared-u2", "Shared", 10, "curator", tier="corpus"
+        )
+        updated = await pg_manifest.record_update(
+            "semantic",
+            "decisions/shared-u2",
+            20,
+            "curator-2",
+            title="Revised",
+            caller_can_write_shared=True,
+        )
+        assert updated.title == "Revised"
+        assert updated.modified_by_user_id == "curator-2"
+        assert updated.created_by_user_id == "curator"
+
+    async def test_unauthorized_create_over_private_row_preserves_tier(
+        self, pg_manifest
+    ) -> None:
+        """Defense-in-depth: an unauthorized create landing on an
+        existing PRIVATE row still writes (title/size/modified_by),
+        matching pre-fix behavior for the non-corpus case — but any
+        requested tier change is ignored rather than silently honored."""
+        await pg_manifest.record_create(
+            "episodic", "k-priv.md", "v1", 10, "alice", tier="private"
+        )
+        again = await pg_manifest.record_create(
+            "episodic", "k-priv.md", "v2", 20, "bob", tier="corpus"
+        )
+        assert again.title == "v2"
+        assert again.modified_by_user_id == "bob"
+        assert again.tier == "private"
 
     async def test_delete_sets_timestamp(self, pg_manifest) -> None:
         await pg_manifest.record_create("episodic", "k.md", None, 1, "alice")

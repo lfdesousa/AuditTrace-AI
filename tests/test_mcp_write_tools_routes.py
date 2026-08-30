@@ -414,6 +414,65 @@ class TestValidScopeWritesDocumentAndAudit:
         assert ("semantic", "skills/skill-1") in manifest._rows
 
 
+class TestMcpWriteNoBypassOfCorpusGuard:
+    """SPEC security-memory-manifest-tier-authz (2026-08-30) — ``mcp_write``
+    is documented as PRIVATE-tier only (``write_decision``/``write_skill``
+    never accept a caller-supplied tier). This proves the bridge gains NO
+    bypass of the manifest's corpus-overwrite guard: a caller who happens
+    to pick a ``document_id`` that collides with an EXISTING corpus item
+    must not be able to silently overwrite its title/ownership via MCP,
+    same as the REST ``POST /memory/semantic`` path.
+
+    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
+    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
+    and ``test_write_decision_denied_over_existing_corpus_row`` goes RED
+    (the corpus row's title/owner silently changes to the attacker's);
+    restore it and it goes GREEN.
+    """
+
+    @pytest.mark.asyncio
+    async def test_write_decision_denied_over_existing_corpus_row(
+        self, client: TestClient, test_container, _real_auth_stack: None
+    ) -> None:
+        manifest = test_container._instances["memory_manifest"]
+        await manifest.record_create(
+            "semantic",
+            "decisions/adr-999",
+            "Shared ADR",
+            10,
+            "curator-orig",
+            tier="corpus",
+        )
+
+        token = _make_real_jwt(
+            sub="attacker-mcp", scope="memory:decisions:write", jti="jti-mcp-hijack"
+        )
+        r = client.post(
+            "/mcp",
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "write_decision",
+                    "arguments": {
+                        "document_id": "adr-999",
+                        "text": "attacker content",
+                        "title": "pwned",
+                    },
+                },
+            ),
+            headers=_bearer(token),
+        )
+        assert r.status_code == 200
+        body = r.json()["result"]
+        assert body["isError"] is True
+
+        row = manifest._rows[("semantic", "decisions/adr-999")]
+        assert row["tier"] == "corpus"
+        assert row["title"] == "Shared ADR"
+        assert row["created_by_user_id"] == "curator-orig"
+        assert row["modified_by_user_id"] == "curator-orig"
+
+
 # ───────────────────── caller-supplied identity/tier ignored ───────────────
 
 

@@ -4198,6 +4198,326 @@ class TestSemanticCorpusPromoteGate:
             client.app.dependency_overrides.clear()
 
 
+class TestManifestCorpusOverwriteGuard:
+    """SPEC security-memory-manifest-tier-authz (2026-08-30) — the M3-WU-
+    D2-2 reviewer's cross-user corpus-hijack/hide finding: before this
+    guard, ``MemoryManifestService.record_create``/``record_update``
+    looked up an EXISTING ``(layer, key)`` row with no tier/ownership
+    check at all, so a caller holding only the base
+    ``memory:semantic:write`` scope could ``POST``/``PUT`` over a shared
+    **corpus**-tier item's key and silently demote it to their own
+    private tier + re-own it — hiding it from every other user.
+
+    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
+    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
+    and ``test_base_scope_create_over_corpus_is_denied_and_row_unchanged``
+    / ``test_base_scope_update_over_corpus_is_denied_and_row_unchanged``
+    go RED (the base-scope caller's create/update succeeds and
+    demotes/re-authors the corpus row instead of 403ing); restore it and
+    they go GREEN. ``test_corpus_scope_caller_can_*``/
+    ``test_admin_bypasses_corpus_overwrite_guard`` pin the "should still
+    work" arms so a fix can't just reject every write.
+    """
+
+    @staticmethod
+    def _seed_corpus_doc(
+        client: TestClient,
+        *,
+        document_id: str,
+        text: str = "shared decision",
+        title: str = "Shared",
+    ) -> None:
+        """Admin (sentinel) seeds one corpus doc via the real route (so
+        BOTH the manifest row and the private-vs-corpus physical Chroma
+        write happen exactly like production)."""
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": document_id,
+                "text": text,
+                "title": title,
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    @staticmethod
+    def _get_row(document_id: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(
+            get_memory_manifest_service().get("semantic", f"decisions/{document_id}")
+        )
+
+    def test_base_scope_create_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="hijack-create")
+        before = self._get_row("hijack-create")
+        assert before is not None
+        assert before.tier == "corpus"
+
+        _override_identity(client, "attacker-create", ("memory:semantic:write",))
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "hijack-create",
+                    "text": "attacker content",
+                    "title": "pwned",
+                },
+            )
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("hijack-create")
+        assert after is not None
+        # No tier change, no overwrite, no re-authorship — the exact
+        # invariant the exploit broke.
+        assert after.tier == "corpus"
+        assert after.title == before.title
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.modified_by_user_id == before.modified_by_user_id
+        assert after.modified_at_ms == before.modified_at_ms
+
+    def test_base_scope_update_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="hijack-update")
+        before = self._get_row("hijack-update")
+        assert before is not None
+        assert before.tier == "corpus"
+
+        _override_identity(client, "attacker-update", ("memory:semantic:write",))
+        try:
+            r = client.put(
+                "/memory/semantic/decisions/hijack-update",
+                json={"text": "attacker content", "title": "pwned"},
+            )
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("hijack-update")
+        assert after is not None
+        assert after.tier == "corpus"
+        assert after.title == before.title
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.modified_by_user_id == before.modified_by_user_id
+        assert after.modified_at_ms == before.modified_at_ms
+
+    def test_corpus_scope_caller_can_create_over_corpus_and_ownership_preserved(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="authorized-create")
+        before = self._get_row("authorized-create")
+        assert before is not None
+
+        _override_identity(
+            client,
+            "curator-create",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "authorized-create",
+                    "text": "updated shared content",
+                    "title": "Updated Shared",
+                    "tier": "corpus",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "corpus"
+            assert r.json()["title"] == "Updated Shared"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("authorized-create")
+        assert after is not None
+        assert after.title == "Updated Shared"
+        assert after.modified_by_user_id == "curator-create"
+        # Rule 3 — created_by_user_id is IMMUTABLE even on an AUTHORIZED
+        # overwrite.
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.created_by_user_id != "curator-create"
+
+    def test_corpus_scope_caller_can_update_over_corpus(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="authorized-update")
+        before = self._get_row("authorized-update")
+        assert before is not None
+
+        _override_identity(
+            client,
+            "curator-update",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.put(
+                "/memory/semantic/decisions/authorized-update",
+                json={"text": "revised shared content", "title": "Revised"},
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["title"] == "Revised"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("authorized-update")
+        assert after is not None
+        assert after.title == "Revised"
+        assert after.modified_by_user_id == "curator-update"
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_admin_bypasses_corpus_overwrite_guard(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel
+        — operator bulk-fix flows must keep working."""
+        self._seed_corpus_doc(client, document_id="admin-overwrite")
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "admin-overwrite",
+                "text": "admin edit",
+                "title": "Admin Edit",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["title"] == "Admin Edit"
+
+    def test_new_private_create_unaffected_by_guard(self, client: TestClient) -> None:
+        """A brand-new key (no existing row at all) is the ``existing is
+        None`` branch — never touched by this guard."""
+        _override_identity(client, "writer-new", ("memory:semantic:write",))
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "brand-new",
+                    "text": "x",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "private"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_own_private_create_then_update_unaffected_by_guard(
+        self, client: TestClient
+    ) -> None:
+        """A caller's own PRIVATE-tier item is unaffected — the guard is
+        scoped to corpus-tier rows only."""
+        _override_identity(client, "writer-own", ("memory:semantic:write",))
+        try:
+            r1 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "own-doc",
+                    "text": "v1",
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = client.put(
+                "/memory/semantic/decisions/own-doc",
+                json={"text": "v2", "title": "mine"},
+            )
+            assert r2.status_code == 200, r2.text
+            assert r2.json()["title"] == "mine"
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestEpisodicManifestCorpusOverwriteGuard:
+    """Same guard as ``TestManifestCorpusOverwriteGuard``, threaded for
+    the episodic layer — which has NO ``memory:corpus:episodic:write``
+    scope declared at all (ADR-062 §4's closed scope set is exactly
+    ``decisions``/``skills``/``semantic``), so only
+    ``audittrace:admin``/admin can ever satisfy the shared-write
+    authorization here (``_corpus_write_authorized(user, None)``)."""
+
+    @staticmethod
+    def _seed_corpus_row(filename: str, *, created_by: str = "curator") -> None:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic",
+                filename,
+                "Shared ADR",
+                10,
+                created_by,
+                tier="corpus",
+            )
+        )
+
+    @staticmethod
+    def _get_row(filename: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(get_memory_manifest_service().get("episodic", filename))
+
+    def test_base_scope_create_over_corpus_episodic_is_denied(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_row("ADR-shared-hijack.md")
+        before = self._get_row("ADR-shared-hijack.md")
+        assert before is not None and before.tier == "corpus"
+
+        _override_identity(client, "attacker-episodic", ("memory:episodic:write",))
+        try:
+            r = client.post(
+                "/memory/episodic",
+                json={
+                    "filename": "ADR-shared-hijack.md",
+                    "content": "attacker content",
+                    "title": "pwned",
+                },
+            )
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("ADR-shared-hijack.md")
+        assert after is not None
+        assert after.tier == "corpus"
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.title == before.title
+
+    def test_admin_can_overwrite_corpus_episodic_row(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_row("ADR-shared-admin.md")
+        r = client.post(
+            "/memory/episodic",
+            json={
+                "filename": "ADR-shared-admin.md",
+                "content": "admin edit",
+                "title": "Admin Edit",
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["title"] == "Admin Edit"
+        after = self._get_row("ADR-shared-admin.md")
+        assert after is not None
+        assert after.created_by_user_id == "curator"
+
+
 class TestSemanticCorpusReadGate:
     """ADR-062 Phase B (WU-B4, D3) — reading CORPUS content through the
     ``/memory/semantic`` backoffice requires
@@ -6144,7 +6464,65 @@ class TestFlushMdManifestHelper:
             size_bytes=57,
             user_id="fleet-service-0b0cdd4d",
             tier="private",
+            caller_can_write_shared=False,
         )
+
+    async def test_caller_can_write_shared_threaded_through(self) -> None:
+        """SPEC security-memory-manifest-tier-authz (2026-08-30) —
+        ``caller_can_write_shared`` defaults ``False`` (fail-closed) and
+        is forwarded verbatim to ``record_create`` when the caller passes
+        ``True``."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock()
+        await _flush_md_manifest(
+            manifest,
+            keys=["decisions/chunk-0"],
+            filename="x.md",
+            sizes_bytes=[10],
+            user_id="curator",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+        manifest.record_create.assert_awaited_once_with(
+            layer="semantic",
+            key="decisions/chunk-0",
+            title="x.md",
+            size_bytes=10,
+            user_id="curator",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+
+    async def test_manifest_authorization_error_is_swallowed_like_any_failure(
+        self,
+    ) -> None:
+        """An unauthorized re-index of an existing corpus row must not
+        blow up the whole ``/memory/index`` call — same best-effort
+        contract as any other manifest-write failure."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+        from audittrace.services.memory_manifest import ManifestAuthorizationError
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock(
+            side_effect=ManifestAuthorizationError("denied")
+        )
+        # Should NOT raise.
+        await _flush_md_manifest(
+            manifest,
+            keys=["decisions/chunk-0"],
+            filename="x.md",
+            sizes_bytes=[10],
+            user_id="attacker",
+            tier="corpus",
+            caller_can_write_shared=False,
+        )
+        manifest.record_create.assert_awaited_once()
 
 
 # ── Tier-C: PDF document metadata + corruption taxonomy + per-doc audit (ADR-056) ──

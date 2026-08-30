@@ -54,6 +54,7 @@ async def _flush_md_manifest(
     sizes_bytes: list[int],
     user_id: str,
     tier: str,
+    caller_can_write_shared: bool = False,
 ) -> None:
     """Best-effort manifest row per folded ``.md`` chunk (ADR-059 WU-1c).
 
@@ -73,6 +74,17 @@ async def _flush_md_manifest(
     not hard). *keys* and *sizes_bytes* must be the same length — one
     entry per chunk, in the same order (both derived from the same
     ``chunks`` list at the call site).
+
+    *caller_can_write_shared* (SPEC security-memory-manifest-tier-authz,
+    2026-08-30) — forwarded to ``record_create`` as its fail-closed
+    (default ``False``) shared-write authorization. If a chunk's key
+    lands on an EXISTING **corpus**-tier row the caller isn't authorized
+    to touch, ``record_create`` raises ``ManifestAuthorizationError`` —
+    caught by the same broad ``except Exception`` below as any other
+    manifest-write failure (best-effort: logs a warning, the already-
+    written ChromaDB chunk is not rolled back, and the pre-existing
+    corpus row's metadata is left untouched rather than silently
+    re-authored).
     """
     if manifest_service is None:
         return
@@ -85,6 +97,7 @@ async def _flush_md_manifest(
                 size_bytes=size_bytes,
                 user_id=user_id,
                 tier=tier,
+                caller_can_write_shared=caller_can_write_shared,
             )
         except Exception as exc:
             logger.warning(

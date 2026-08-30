@@ -37,6 +37,40 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+class ManifestAuthorizationError(PermissionError):
+    """Raised by ``record_create``/``record_update`` when a caller writes
+    over an EXISTING **corpus**-tier manifest row without the shared-write
+    authorization that row requires (SPEC security-memory-manifest-tier-
+    authz, 2026-08-30 — the M3-WU-D2-2 reviewer's cross-user corpus-hijack/
+    hide finding).
+
+    ``record_create``/``record_update`` are the shared manifest choke for
+    every writer (the REST ``/memory/{episodic,procedural,semantic}``
+    routes, the ``.md`` fold path via ``memory_md_manifest._flush_md_manifest``,
+    and the ``mcp_write`` tools) — raising HERE, not only at the route
+    layer, means no caller can reach an unauthorized corpus overwrite by a
+    path that forgets to duplicate the route-level scope check. Routes
+    MUST map this to HTTP 403 (never let it fall through to a generic 500)
+    — see ``routes/memory.py``'s create/update handlers.
+    """
+
+
+def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) -> bool:
+    """``True`` iff writing over a row currently at *existing_tier*
+    requires shared-write authorization the caller does NOT hold.
+
+    Only the **corpus** tier is "shared" in the ADR-062 model — a
+    **private**-tier row's owner-agnostic overwrite semantics (the D2/D4
+    per-key-collision follow-up, out of THIS WU's scope — see
+    ``_manifest_visible``'s docstring) are unaffected by this guard. Named
+    as its own predicate so ``record_create``/``record_update`` (and their
+    Mock twins) apply the EXACT same rule, rather than four independently-
+    maintained ``if`` conditions that could drift apart under a future
+    edit.
+    """
+    return existing_tier == "corpus" and not caller_can_write_shared
+
+
 @dataclass(frozen=True, slots=True)
 class ManifestEntry:
     """Plain-data view of a ``MemoryItem`` row, serialisable to JSON.
@@ -219,6 +253,8 @@ class MemoryManifestService:
         size_bytes: int | None,
         user_id: str,
         tier: str = "private",
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Insert a new manifest row, OR un-soft-delete + bump
         timestamps if a row with the same (layer, key) already exists
@@ -232,7 +268,38 @@ class MemoryManifestService:
         (least-shared) side rather than silently defaulting to
         ``"corpus"``. Recreating an existing row (revive-after-delete or
         overwrite) also re-stamps ``tier`` to the caller's requested
-        value — same as ``title``/``size_bytes`` on that branch.
+        value — same as ``title``/``size_bytes`` on that branch — but
+        ONLY when authorized (see ``caller_can_write_shared`` below).
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — ``True`` iff the caller holds
+        ``memory:corpus:<layer>:write`` (or ``audittrace:admin``/admin)
+        for this write, computed by the route from the token's scopes.
+        Defaults ``False`` — FAIL-CLOSED, so a caller of this SERVICE
+        method (not just the route) that forgets to pass it lands on the
+        least-privileged side, same discipline as the ``tier`` default.
+
+        Fixes the cross-user corpus-hijack/hide vulnerability the M3-WU-
+        D2-2 reviewer surfaced: before this guard, an EXISTING row's
+        lookup was ``(layer, key)`` only — no tier/ownership check — so
+        a caller holding just the base ``memory:<layer>:write`` scope
+        could POST a create at a shared **corpus**-tier item's key and
+        silently demote it to their own private tier + re-own it,
+        hiding it from everyone else. Now: if the EXISTING row is
+        corpus-tier and the caller is not authorized for shared writes,
+        this raises :class:`ManifestAuthorizationError` — no tier
+        change, no title/content overwrite, no re-authorship. An
+        authorized caller (or a write landing on an existing PRIVATE
+        row) keeps working exactly as before; an unauthorized write
+        that reaches an existing PRIVATE row still updates
+        title/size/``modified_by_user_id`` (unaffected — private-tier
+        cross-owner collisions are a separate, already-flagged follow-
+        up, see ``routes/memory.py::_manifest_visible``'s docstring) but
+        its ``tier`` field is left untouched rather than blindly set to
+        whatever the caller requested, so an unauthorized promote-to-
+        corpus can never silently land via this defense-in-depth path
+        either. ``created_by_user_id`` is never reassigned (unchanged
+        behavior — always was owner-preserving on this branch).
 
         Returns the resulting entry.
         """
@@ -258,6 +325,12 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _tier_write_unauthorized(existing.tier, caller_can_write_shared):
+                    raise ManifestAuthorizationError(
+                        f"caller lacks shared-write authorization to overwrite "
+                        f"existing corpus-tier manifest row layer={layer!r} "
+                        f"key={key!r}"
+                    )
                 # Recreating after a soft-delete (or overwriting an
                 # existing live entry — caller should usually call
                 # `record_update` for the latter; this path is
@@ -269,7 +342,8 @@ class MemoryManifestService:
                 existing.size_bytes = size_bytes
                 existing.modified_at_ms = now
                 existing.modified_by_user_id = user_id
-                existing.tier = tier
+                if caller_can_write_shared:
+                    existing.tier = tier
                 row = existing
             await session.commit()
             await session.refresh(row)
@@ -283,6 +357,8 @@ class MemoryManifestService:
         size_bytes: int | None,
         user_id: str,
         title: str | None = None,
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Bump ``modified_at_ms`` + ``modified_by_user_id`` on the row.
 
@@ -291,6 +367,19 @@ class MemoryManifestService:
         ``(layer, key)``. Raises ``RuntimeError`` if the row is
         soft-deleted (caller should ``record_create`` to revive
         rather than update a deleted row).
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — same fail-closed (default ``False``)
+        shared-write authorization ``record_create`` takes. Raises
+        :class:`ManifestAuthorizationError` — BEFORE any field is
+        touched — when the row is corpus-tier and the caller lacks it:
+        this closes the same vulnerability class as ``record_create``'s
+        guard for the update path, where an unauthorized caller could
+        previously overwrite a shared corpus row's ``title`` and
+        re-stamp ``modified_by_user_id`` to themselves with no
+        ownership/tier check at all. ``record_update`` never touches
+        ``tier`` (unchanged — it never did), so authorized callers see
+        no behavior change.
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
@@ -305,6 +394,12 @@ class MemoryManifestService:
                 raise RuntimeError(
                     f"manifest row for layer={layer!r} key={key!r} is "
                     f"soft-deleted; use record_create to revive"
+                )
+            if _tier_write_unauthorized(row.tier, caller_can_write_shared):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
                 )
             if title is not None:
                 row.title = title
@@ -698,6 +793,8 @@ class MockMemoryManifestService(MemoryManifestService):
         size_bytes: int | None,
         user_id: str,
         tier: str = "private",
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -721,11 +818,20 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _tier_write_unauthorized(
+                existing.get("tier", "corpus"), caller_can_write_shared
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             existing["title"] = title
             existing["size_bytes"] = size_bytes
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
-            existing["tier"] = tier
+            if caller_can_write_shared:
+                existing["tier"] = tier
             if existing.get("deleted_at_ms") is not None:
                 existing["deleted_at_ms"] = None
                 existing["deleted_by_user_id"] = None
@@ -738,6 +844,8 @@ class MockMemoryManifestService(MemoryManifestService):
         size_bytes: int | None,
         user_id: str,
         title: str | None = None,
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
@@ -747,6 +855,14 @@ class MockMemoryManifestService(MemoryManifestService):
             raise RuntimeError(
                 f"manifest row for layer={layer!r} key={key!r} is "
                 f"soft-deleted; use record_create to revive"
+            )
+        if _tier_write_unauthorized(
+            existing.get("tier", "corpus"), caller_can_write_shared
+        ):
+            raise ManifestAuthorizationError(
+                f"caller lacks shared-write authorization to overwrite "
+                f"existing corpus-tier manifest row layer={layer!r} "
+                f"key={key!r}"
             )
         if title is not None:
             existing["title"] = title
