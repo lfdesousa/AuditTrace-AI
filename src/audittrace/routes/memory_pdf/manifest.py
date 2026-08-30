@@ -50,16 +50,27 @@ async def _flush_pdf_manifest(
     ok: bool = True,
     error: str | None = None,
     details_log: list[dict[str, Any]] | None = None,
+    caller_can_write_shared: bool = False,
 ) -> None:
     """Best-effort manifest write for one PDF (ADR-050 #22 + ADR-056).
 
     Skips manifest write silently when ``manifest_service is None``
     (pre-tier-B callers, unit tests that patch out the manifest path).
-    Logs but does not re-raise on Postgres failure.
+    Logs but does not re-raise on Postgres failure — INCLUDING a
+    ``ManifestAuthorizationError`` (SPEC security-memory-manifest-tier-
+    authz, 2026-08-30): an unauthorized re-index landing on an EXISTING
+    corpus-tier row is denied at the manifest choke and swallowed here
+    exactly like any other manifest-write failure — the ChromaDB chunks
+    already written are not rolled back, but the row's tier / title /
+    signature_status / document_sha256 / owner are left untouched.
 
     *details_log* (ADR-056 #24) — when supplied, every call appends
     one per-document outcome dict for the ``?details=true`` response
     shape.
+
+    *caller_can_write_shared* — forwarded to ``MemoryManifestService.
+    upsert_pdf_metadata``'s fail-closed shared-write authorization
+    (default ``False``).
     """
     if details_log is not None:
         details_log.append(
@@ -107,6 +118,7 @@ async def _flush_pdf_manifest(
             pdfa_part=pdfa_part,
             pdfa_conformance=pdfa_conformance,
             ltv_data=ltv_data,
+            caller_can_write_shared=caller_can_write_shared,
         )
     except Exception as exc:
         logger.warning(

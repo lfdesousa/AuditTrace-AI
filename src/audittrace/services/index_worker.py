@@ -143,6 +143,19 @@ async def default_indexer(envelope: IndexRequestEnvelope, settings: Settings) ->
         ingestion_ts_ms=_now_ms(),
         manifest_service=get_memory_manifest_service(),
         outcomes=outcomes,
+        # SPEC security-memory-manifest-tier-authz (2026-08-30) — this
+        # worker is a SYSTEM writer, not a live caller-scoped request: it
+        # only ever drains an envelope the scan-verdict pipeline itself
+        # enqueued off an ALREADY-authorized upload+scan (never reachable
+        # by an arbitrary attacker directly), so it is trusted to keep
+        # re-indexing/refreshing a row's PDF metadata regardless of tier.
+        # It never gains a DEMOTE bypass because ``upsert_pdf_metadata``
+        # never reassigns ``tier``/``created_by_user_id`` on an existing
+        # row in the first place — this flag only lets it PASS the
+        # corpus-overwrite guard on metadata fields, same "preserve tier/
+        # owner on legitimate re-index" contract as an authorized human
+        # caller gets.
+        caller_can_write_shared=True,
     )
     return bool(outcomes) and outcomes[-1]
 

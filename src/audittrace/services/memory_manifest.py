@@ -71,6 +71,46 @@ def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) 
     return existing_tier == "corpus" and not caller_can_write_shared
 
 
+def _pdf_metadata_write_unauthorized(
+    existing_tier: str,
+    existing_owner: str,
+    caller_user_id: str,
+    caller_can_write_shared: bool,
+) -> bool:
+    """``True`` iff a PDF-metadata refresh over a row at *existing_tier*
+    owned by *existing_owner* requires shared-write authorization the
+    caller does NOT hold (SPEC security-memory-manifest-tier-authz,
+    2026-08-30 — the sibling gap the M3-WU-D2-2 reviewer live-demonstrated
+    in ``upsert_pdf_metadata``, missed by the initial ``record_create``/
+    ``record_update`` fix).
+
+    Looser than :func:`_tier_write_unauthorized` (which
+    ``record_create``/``record_update`` apply unconditionally to any
+    corpus-tier row, regardless of ownership): ``upsert_pdf_metadata`` is
+    the AUTOMATIC re-index writer — every successful ``/memory/index``
+    PDF pass calls it, including routine, DOCUMENTED idempotent re-runs
+    on the SAME file (``routes/memory.py::index_memory``'s own docstring:
+    "Single-file mode... idempotent upsert of one MinIO object") — and
+    EVERY PDF-indexed row defaults to ``tier="corpus"`` server-side
+    (``db/models.py``'s ``tier`` column ``server_default``) regardless of
+    whether the underlying file is actually private or shared, since this
+    writer has no ``tier`` parameter at all. Blocking the row's OWN
+    creator from ever re-indexing their own just-uploaded PDF a second
+    time would be a functional regression, not a security fix — so a
+    caller who already owns the row (``existing_owner == caller_user_id``)
+    is exempt even when the row reads ``tier=="corpus"``. A caller who is
+    NOT the owner still needs ``caller_can_write_shared`` to touch a
+    corpus-tier row — that remains the exact cross-user overwrite this
+    fix closes (the reviewer's live exploit: another user reindexing a
+    curator's corpus-tier PDF and silently reassigning
+    ``modified_by_user_id``/overwriting ``pdf_title``/``signature_status``/
+    ``document_sha256``).
+    """
+    if existing_tier != "corpus" or caller_can_write_shared:
+        return False
+    return existing_owner != caller_user_id
+
+
 @dataclass(frozen=True, slots=True)
 class ManifestEntry:
     """Plain-data view of a ``MemoryItem`` row, serialisable to JSON.
@@ -501,6 +541,7 @@ class MemoryManifestService:
         pdfa_part: str | None = None,
         pdfa_conformance: str | None = None,
         ltv_data: dict[str, Any] | None = None,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Write tier-B + tier-C PDF manifest fields for ``(layer, key)``.
 
@@ -513,6 +554,27 @@ class MemoryManifestService:
         Per ADR-050 #22 + ADR-056 #10: this is the single audit-pivot
         writer. Every successful PDF index call lands one of these per
         file.
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — the SAME fail-closed (default ``False``)
+        shared-write authorization ``record_create``/``record_update``
+        take. This is the manifest choke for the PDF ingestion pipeline
+        (``/memory/index``'s PDF branch, the auto-index outbox worker) —
+        it had NO tier/ownership check at all before this fix, so a
+        caller holding only base ``memory:<layer>:write`` could reindex
+        an EXISTING **corpus**-tier PDF and silently reassign
+        ``modified_by_user_id`` + overwrite ``pdf_title``/
+        ``signature_status``/``document_sha256``/etc — the same
+        cross-owner-overwrite vulnerability class ``record_create``/
+        ``record_update`` were fixed for, on a sibling writer this fix
+        initially missed. Raises :class:`ManifestAuthorizationError`
+        BEFORE touching any field when the EXISTING row is corpus-tier
+        and the caller lacks authorization — a legitimate metadata
+        refresh (same owner, or the system auto-index worker, which
+        always passes ``True``) is unaffected: this method never
+        reassigns ``tier`` in the first place (a metadata refresh is not
+        a tier/owner operation), so an authorized-or-private-tier caller
+        sees no behavior change at all.
         """
         _validate_layer(layer)
         now = _now_ms()
@@ -535,6 +597,14 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _pdf_metadata_write_unauthorized(
+                    row.tier, row.created_by_user_id, user_id, caller_can_write_shared
+                ):
+                    raise ManifestAuthorizationError(
+                        f"caller lacks shared-write authorization to overwrite "
+                        f"existing corpus-tier PDF manifest row layer={layer!r} "
+                        f"key={key!r}"
+                    )
                 row.modified_at_ms = now
                 row.modified_by_user_id = user_id
                 if size_bytes is not None:
@@ -1025,6 +1095,7 @@ class MockMemoryManifestService(MemoryManifestService):
         pdfa_part: str | None = None,
         pdfa_conformance: str | None = None,
         ltv_data: dict[str, Any] | None = None,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -1047,6 +1118,17 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _pdf_metadata_write_unauthorized(
+                existing.get("tier", "corpus"),
+                existing.get("created_by_user_id", ""),
+                user_id,
+                caller_can_write_shared,
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier PDF manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
             if size_bytes is not None:

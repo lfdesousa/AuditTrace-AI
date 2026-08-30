@@ -1036,6 +1036,33 @@ async def index_memory(
             ),
         )
 
+    # SPEC security-memory-manifest-tier-authz (2026-08-30) — close the
+    # index-route gate: ``_require_layer_write``/the single-file-mode check
+    # above only enforces BASE ``memory:<layer>:write``, regardless of the
+    # tier the ``?file=`` key resolved to. Before this, a base-scope caller
+    # could ``POST /memory/index?file=<corpus-prefixed-key>`` (tier resolved
+    # "corpus" above) and reach the manifest choke unauthorized — the
+    # manifest-level guard (``upsert_pdf_metadata``/``_flush_md_manifest``)
+    # is a best-effort SWALLOW there (never blows up the index call), so on
+    # its own it degrades a hijack attempt into "silent no-op", not the
+    # explicit 403 a caller deserves. Bulk mode is unaffected (`tier` stays
+    # "corpus" but ``_require_admin`` already ran above, and admin always
+    # satisfies ``_corpus_write_authorized``). Fail-closed: refuse rather
+    # than allow when this is ambiguous.
+    if tier == "corpus":
+        unauthorized_collections = [
+            c for c in target_collections if not _corpus_write_authorized(user, c)
+        ]
+        if unauthorized_collections:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Required scope: memory:corpus:<collection>:write (or "
+                    "audittrace:admin) to index into an existing corpus-tier "
+                    f"target — missing for: {sorted(unauthorized_collections)!r}"
+                ),
+            )
+
     settings = get_settings()
     # ADR-006 — effective bucket switches between MinIO (default) and
     # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
@@ -1169,13 +1196,16 @@ async def index_memory(
         chunk_count = 0
         # SPEC security-memory-manifest-tier-authz (2026-08-30): the SAME
         # shared-write authorization ``create_semantic``/``update_semantic``
-        # compute, threaded through ``_index_md_objects``/``_flush_md_manifest``
-        # into the manifest choke so a re-index can never silently overwrite
-        # an existing corpus row's manifest metadata a caller isn't
-        # authorized to touch (bulk mode is always admin-gated above, so
-        # this is always True there via the admin bypass in
-        # ``_has_corpus_scope``; single-file mode is the path an
-        # under-privileged caller could otherwise reach).
+        # compute, threaded through BOTH ``_index_md_objects``/
+        # ``_flush_md_manifest`` AND ``_index_pdf_objects``/
+        # ``_flush_pdf_manifest`` into the manifest choke so a re-index can
+        # never silently overwrite an existing corpus row's manifest
+        # metadata a caller isn't authorized to touch (bulk mode is always
+        # admin-gated above, so this is always True there via the admin
+        # bypass in ``_has_corpus_scope``; single-file mode is ALSO hard-
+        # gated at the route entry above when ``tier == "corpus"`` — this
+        # per-call thread is defense-in-depth at the manifest choke itself,
+        # not the only enforcement point).
         col_caller_can_write_shared = _corpus_write_authorized(user, col_name)
         if col_name in ("decisions", "semantic"):
             chunk_count += await _index_md_objects(
@@ -1230,6 +1260,7 @@ async def index_memory(
                 details_log=details_log,
                 dry_run=dry_run,
                 outcomes=object_outcomes,
+                caller_can_write_shared=col_caller_can_write_shared,
             )
             chunk_count += await _index_pdf_objects(
                 collection,
@@ -1245,6 +1276,7 @@ async def index_memory(
                 details_log=details_log,
                 dry_run=dry_run,
                 outcomes=object_outcomes,
+                caller_can_write_shared=col_caller_can_write_shared,
             )
 
         results[col_name] = chunk_count

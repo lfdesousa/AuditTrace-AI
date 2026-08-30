@@ -1387,7 +1387,12 @@ class TestMockUpsertPdfMetadata:
             extraction_warnings=[],
             document_sha256="b" * 64,
         )
-        # Second call as user-2 — bumps modified_*, keeps created_*.
+        # Second call as user-2 (AUTHORIZED — e.g. admin/corpus-scope
+        # re-index) — bumps modified_*, keeps created_*. SPEC security-
+        # memory-manifest-tier-authz (2026-08-30): every PDF row defaults
+        # tier="corpus", so a cross-owner call now requires
+        # ``caller_can_write_shared=True``; ownership stays immutable even
+        # for an authorized overwrite.
         e2 = await manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
@@ -1400,6 +1405,7 @@ class TestMockUpsertPdfMetadata:
             form_field_count=3,
             extraction_warnings=[{"code": "attachment", "name": "x.xml"}],
             document_sha256="c" * 64,
+            caller_can_write_shared=True,
         )
         assert e2.created_by_user_id == "user-1"  # preserved
         assert e2.modified_by_user_id == "user-2"  # bumped
@@ -1407,6 +1413,99 @@ class TestMockUpsertPdfMetadata:
         assert e2.attachment_count == 1
         assert e2.form_field_count == 3
         assert e2.size_bytes == 200
+
+    # ── SPEC security-memory-manifest-tier-authz (2026-08-30) ────────────
+    # The sibling gap the M3-WU-D2-2 reviewer live-demonstrated:
+    # ``upsert_pdf_metadata`` is the manifest-write choke for the PDF
+    # ingestion pipeline, missed by the initial ``record_create``/
+    # ``record_update`` fix. FALSIFIABLE: neuter
+    # ``_pdf_metadata_write_unauthorized`` (e.g. make it always return
+    # ``False``) and ``test_cross_owner_unauthorized_update_raises_and_row_unchanged``
+    # goes RED (a different, unauthorized user's re-index silently
+    # succeeds and reassigns ``modified_by_user_id``/overwrites
+    # ``pdf_title``/``signature_status``/``document_sha256``); restore it
+    # and it goes GREEN.
+
+    async def test_cross_owner_unauthorized_update_raises_and_row_unchanged(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        await manifest.upsert_pdf_metadata(
+            "episodic",
+            "curator-shared.pdf",
+            user_id="curator",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="b" * 64,
+            pdf_title="Original Title",
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await manifest.upsert_pdf_metadata(
+                "episodic",
+                "curator-shared.pdf",
+                user_id="attacker",
+                size_bytes=999,
+                page_count=1,
+                signature_status="signed_tampered",
+                ocr_coverage_pct=99.0,
+                attachment_count=9,
+                form_field_count=9,
+                extraction_warnings=[{"code": "pwned"}],
+                document_sha256="f" * 64,
+                pdf_title="pwned",
+            )
+        # No overwrite at all — tier, owner, and every PDF field intact.
+        row = await manifest.get("episodic", "curator-shared.pdf")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.created_by_user_id == "curator"
+        assert row.modified_by_user_id == "curator"
+        assert row.pdf_title == "Original Title"
+        assert row.signature_status == "signed_valid"
+        assert row.document_sha256 == "b" * 64
+        assert row.size_bytes == 100
+
+    async def test_same_owner_reindex_succeeds_without_shared_write_scope(
+        self, manifest: MockMemoryManifestService
+    ) -> None:
+        """A legitimate metadata re-index by the row's OWN creator must
+        keep working even though every PDF row defaults tier="corpus" —
+        this is the routine, documented idempotent ``/memory/index``
+        re-run, not a cross-user overwrite."""
+        await manifest.upsert_pdf_metadata(
+            "episodic",
+            "own.pdf",
+            user_id="alice",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+        )
+        e2 = await manifest.upsert_pdf_metadata(
+            "episodic",
+            "own.pdf",
+            user_id="alice",
+            size_bytes=150,
+            page_count=12,
+            signature_status="signed_valid",
+            ocr_coverage_pct=5.0,
+            attachment_count=1,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+        )
+        assert e2.created_by_user_id == "alice"
+        assert e2.modified_by_user_id == "alice"
+        assert e2.page_count == 12
+        assert e2.size_bytes == 150
 
     async def test_rejects_invalid_layer(
         self, manifest: MockMemoryManifestService
@@ -1501,6 +1600,9 @@ class TestPostgresUpsertPdfMetadata:
             extraction_warnings=[],
             document_sha256="b" * 64,
         )
+        # SPEC security-memory-manifest-tier-authz (2026-08-30): every PDF
+        # row defaults tier="corpus", so bob (not the owner) now needs
+        # ``caller_can_write_shared=True`` (e.g. admin) to overwrite it.
         e2 = await pg_manifest.upsert_pdf_metadata(
             "episodic",
             "main.pdf",
@@ -1513,10 +1615,89 @@ class TestPostgresUpsertPdfMetadata:
             form_field_count=2,
             extraction_warnings=[],
             document_sha256="c" * 64,
+            caller_can_write_shared=True,
         )
         assert e2.created_by_user_id == "alice"
         assert e2.modified_by_user_id == "bob"
         assert e2.page_count == 20
+
+    async def test_cross_owner_unauthorized_update_raises_and_row_unchanged(
+        self, pg_manifest
+    ) -> None:
+        """Real Postgres-backed twin of the Mock guard test — proves the
+        PRODUCTION code path (not just the in-memory test double) raises."""
+        await pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "curator-shared.pdf",
+            user_id="curator",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="b" * 64,
+            pdf_title="Original Title",
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await pg_manifest.upsert_pdf_metadata(
+                "episodic",
+                "curator-shared.pdf",
+                user_id="attacker",
+                size_bytes=999,
+                page_count=1,
+                signature_status="signed_tampered",
+                ocr_coverage_pct=99.0,
+                attachment_count=9,
+                form_field_count=9,
+                extraction_warnings=[{"code": "pwned"}],
+                document_sha256="f" * 64,
+                pdf_title="pwned",
+            )
+        row = await pg_manifest.get("episodic", "curator-shared.pdf")
+        assert row is not None
+        assert row.tier == "corpus"
+        assert row.created_by_user_id == "curator"
+        assert row.modified_by_user_id == "curator"
+        assert row.pdf_title == "Original Title"
+        assert row.signature_status == "signed_valid"
+        assert row.document_sha256 == "b" * 64
+        assert row.size_bytes == 100
+
+    async def test_same_owner_reindex_succeeds_without_shared_write_scope(
+        self, pg_manifest
+    ) -> None:
+        await pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "own.pdf",
+            user_id="alice",
+            size_bytes=100,
+            page_count=10,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+        )
+        e2 = await pg_manifest.upsert_pdf_metadata(
+            "episodic",
+            "own.pdf",
+            user_id="alice",
+            size_bytes=150,
+            page_count=12,
+            signature_status="signed_valid",
+            ocr_coverage_pct=5.0,
+            attachment_count=1,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+        )
+        assert e2.created_by_user_id == "alice"
+        assert e2.modified_by_user_id == "alice"
+        assert e2.page_count == 12
+        assert e2.size_bytes == 150
 
     async def test_update_after_crud_create_carries_over(self, pg_manifest) -> None:
         """Common flow: operator first POSTs to /memory/episodic

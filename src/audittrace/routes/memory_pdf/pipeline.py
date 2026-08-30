@@ -75,6 +75,7 @@ async def _index_pdf_objects(
     details_log: list[dict[str, Any]] | None = None,
     dry_run: bool = False,
     outcomes: list[bool] | None = None,
+    caller_can_write_shared: bool = False,
 ) -> int:
     """Stream-index ``.pdf`` files into *collection*, per-page.
 
@@ -112,6 +113,16 @@ async def _index_pdf_objects(
     per-object OUTCOME signal the ``/memory/index`` handler's
     loud-422 guard reads — unconditionally available, unlike
     ``details_log`` which is only surfaced when ``?details=true``.
+
+    *caller_can_write_shared* (SPEC security-memory-manifest-tier-authz,
+    2026-08-30) — forwarded verbatim to every ``_flush_pdf_manifest`` call
+    below, which forwards it to ``MemoryManifestService.upsert_pdf_metadata``
+    as its fail-closed shared-write authorization. Defaults ``False``: an
+    unauthorized caller landing on an EXISTING **corpus**-tier PDF manifest
+    row is denied (no tier change, no title/signature/hash overwrite, no
+    re-authorship) — best-effort, same swallow contract as any other
+    manifest-write failure in this pipeline (the ChromaDB chunks already
+    written are not rolled back).
     """
     import pymupdf  # heavy import; only load when ai_research_papers is requested
 
@@ -215,6 +226,7 @@ async def _index_pdf_objects(
                 ok=False,
                 error="max_size",
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
             _record_outcome(False)
             continue
@@ -266,6 +278,7 @@ async def _index_pdf_objects(
                         ok=False,
                         error="encrypted",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
                     _record_outcome(False)
                     continue
@@ -325,6 +338,7 @@ async def _index_pdf_objects(
                         ok=False,
                         error="max_pages",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
                     _record_outcome(False)
                     continue
@@ -369,6 +383,7 @@ async def _index_pdf_objects(
                         ok=False,
                         error="max_xref",
                         details_log=details_log,
+                        caller_can_write_shared=caller_can_write_shared,
                     )
                     _record_outcome(False)
                     continue
@@ -645,6 +660,7 @@ async def _index_pdf_objects(
                 ok=True,
                 error=None,
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
             _record_outcome(True)
         except Exception as exc:
@@ -684,6 +700,7 @@ async def _index_pdf_objects(
                 ok=False,
                 error=str(exc) or code,
                 details_log=details_log,
+                caller_can_write_shared=caller_can_write_shared,
             )
             _record_outcome(False)
             continue

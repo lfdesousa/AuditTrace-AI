@@ -212,8 +212,18 @@ class TestIndexAuth:
     def test_index_single_file_with_layer_write_succeeds(
         self, client: TestClient
     ) -> None:
-        """Single-file mode (``?file=episodic/...``) accepts the matching
-        per-layer write scope. Same M3 UI-flow contract as /memory/upload."""
+        """Single-file mode on the caller's OWN private-tier key
+        (``?file=<sub>/episodic/...``) accepts the matching per-layer write
+        scope. Same M3 UI-flow contract as /memory/upload.
+
+        SPEC security-memory-manifest-tier-authz (2026-08-30): a
+        LEGACY/shared-prefix key (``?file=episodic/...``, no token-sub
+        prefix) resolves tier="corpus" and now additionally requires
+        corpus/admin authorization — covered by
+        ``test_index_single_file_corpus_tier_key_denied_without_corpus_scope``
+        below. This test moved to the private-tier key shape so it keeps
+        testing exactly what its docstring claims (base layer-write scope
+        is sufficient for the caller's OWN content)."""
         mock_minio = MagicMock()
         # Empty list_objects so the body short-circuits with no work — the
         # auth gate fires first regardless, which is what this test asserts.
@@ -248,13 +258,91 @@ class TestIndexAuth:
                 "/memory/index",
                 params={
                     "collections": "ai_research_papers",
-                    "file": "episodic/foo.pdf",
+                    "file": "test-user/episodic/foo.pdf",
                 },
                 headers={"Authorization": "Bearer fake-token"},
             )
         # Auth must have passed; whether the body succeeds or fails on the
         # empty-body path, the status must NOT be 403/401. Accept any
         # 2xx/4xx that isn't auth-related.
+        assert response.status_code not in (401, 403), response.text
+
+    def test_index_single_file_corpus_tier_key_denied_without_corpus_scope(
+        self, client: TestClient
+    ) -> None:
+        """SPEC security-memory-manifest-tier-authz (2026-08-30) — the
+        gap the M3-WU-D2-2 reviewer live-demonstrated: a base
+        ``memory:episodic:write`` token targeting a LEGACY/shared-prefix
+        key (no token-sub prefix -> tier resolves "corpus") must NOT be
+        able to reach the index pipeline at all. FALSIFIABLE: neuter the
+        route-level ``tier == "corpus"`` gate in ``index_memory`` (e.g.
+        drop the block) and this test goes RED (200 instead of 403);
+        restore it and it's GREEN."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "attacker",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/curator-shared.pdf",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 403, response.text
+        assert "corpus" in response.json()["detail"].lower()
+
+    def test_index_single_file_corpus_tier_key_admin_still_succeeds(
+        self, client: TestClient
+    ) -> None:
+        """The 'should still work' arm for the new gate: an
+        ``audittrace:admin`` token targeting the SAME legacy/corpus-prefix
+        key is not blocked (the gate rejects on missing authorization, not
+        on tier alone)."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = iter([])
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "ops-user",
+                "scope": "audittrace:admin",
+            }
+            mock_minio.get_object.return_value = MagicMock(
+                read=lambda: b"", close=MagicMock(), release_conn=MagicMock()
+            )
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/curator-shared.pdf",
+                },
+                headers={"Authorization": "Bearer admin-token"},
+            )
         assert response.status_code not in (401, 403), response.text
 
     def test_index_single_file_cross_layer_denied(self, client: TestClient) -> None:
@@ -6397,6 +6485,67 @@ class TestPdfFlushManifest:
             document_sha256="hash",
         )
         manifest.upsert_pdf_metadata.assert_called_once()
+
+    async def test_manifest_authorization_error_is_swallowed_like_any_failure(
+        self,
+    ) -> None:
+        """SPEC security-memory-manifest-tier-authz (2026-08-30) — an
+        unauthorized re-index of an existing corpus-tier PDF row must not
+        blow up the whole ``/memory/index`` call; same best-effort
+        contract as any other manifest-write failure."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest
+        from audittrace.services.memory_manifest import ManifestAuthorizationError
+
+        manifest = MagicMock()
+        manifest.upsert_pdf_metadata = AsyncMock(
+            side_effect=ManifestAuthorizationError("denied")
+        )
+        # Should NOT raise.
+        await _flush_pdf_manifest(
+            manifest_service=manifest,
+            layer="episodic",
+            key="x.pdf",
+            user_id="attacker",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+            caller_can_write_shared=False,
+        )
+        manifest.upsert_pdf_metadata.assert_called_once()
+
+    async def test_caller_can_write_shared_threaded_through(self) -> None:
+        """``caller_can_write_shared`` defaults ``False`` (fail-closed) and
+        is forwarded verbatim to ``upsert_pdf_metadata``."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        manifest = MagicMock()
+        manifest.upsert_pdf_metadata = AsyncMock()
+        await _flush_pdf_manifest(
+            manifest_service=manifest,
+            layer="episodic",
+            key="x.pdf",
+            user_id="curator",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+            caller_can_write_shared=True,
+        )
+        _, kwargs = manifest.upsert_pdf_metadata.call_args
+        assert kwargs["caller_can_write_shared"] is True
 
 
 class TestFlushMdManifestHelper:
