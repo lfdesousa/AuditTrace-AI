@@ -37,6 +37,80 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+class ManifestAuthorizationError(PermissionError):
+    """Raised by ``record_create``/``record_update`` when a caller writes
+    over an EXISTING **corpus**-tier manifest row without the shared-write
+    authorization that row requires (SPEC security-memory-manifest-tier-
+    authz, 2026-08-30 — the M3-WU-D2-2 reviewer's cross-user corpus-hijack/
+    hide finding).
+
+    ``record_create``/``record_update`` are the shared manifest choke for
+    every writer (the REST ``/memory/{episodic,procedural,semantic}``
+    routes, the ``.md`` fold path via ``memory_md_manifest._flush_md_manifest``,
+    and the ``mcp_write`` tools) — raising HERE, not only at the route
+    layer, means no caller can reach an unauthorized corpus overwrite by a
+    path that forgets to duplicate the route-level scope check. Routes
+    MUST map this to HTTP 403 (never let it fall through to a generic 500)
+    — see ``routes/memory.py``'s create/update handlers.
+    """
+
+
+def _tier_write_unauthorized(existing_tier: str, caller_can_write_shared: bool) -> bool:
+    """``True`` iff writing over a row currently at *existing_tier*
+    requires shared-write authorization the caller does NOT hold.
+
+    Only the **corpus** tier is "shared" in the ADR-062 model — a
+    **private**-tier row's owner-agnostic overwrite semantics (the D2/D4
+    per-key-collision follow-up, out of THIS WU's scope — see
+    ``_manifest_visible``'s docstring) are unaffected by this guard. Named
+    as its own predicate so ``record_create``/``record_update`` (and their
+    Mock twins) apply the EXACT same rule, rather than four independently-
+    maintained ``if`` conditions that could drift apart under a future
+    edit.
+    """
+    return existing_tier == "corpus" and not caller_can_write_shared
+
+
+def _pdf_metadata_write_unauthorized(
+    existing_tier: str,
+    existing_owner: str,
+    caller_user_id: str,
+    caller_can_write_shared: bool,
+) -> bool:
+    """``True`` iff a PDF-metadata refresh over a row at *existing_tier*
+    owned by *existing_owner* requires shared-write authorization the
+    caller does NOT hold (SPEC security-memory-manifest-tier-authz,
+    2026-08-30 — the sibling gap the M3-WU-D2-2 reviewer live-demonstrated
+    in ``upsert_pdf_metadata``, missed by the initial ``record_create``/
+    ``record_update`` fix).
+
+    Looser than :func:`_tier_write_unauthorized` (which
+    ``record_create``/``record_update`` apply unconditionally to any
+    corpus-tier row, regardless of ownership): ``upsert_pdf_metadata`` is
+    the AUTOMATIC re-index writer — every successful ``/memory/index``
+    PDF pass calls it, including routine, DOCUMENTED idempotent re-runs
+    on the SAME file (``routes/memory.py::index_memory``'s own docstring:
+    "Single-file mode... idempotent upsert of one MinIO object") — and
+    EVERY PDF-indexed row defaults to ``tier="corpus"`` server-side
+    (``db/models.py``'s ``tier`` column ``server_default``) regardless of
+    whether the underlying file is actually private or shared, since this
+    writer has no ``tier`` parameter at all. Blocking the row's OWN
+    creator from ever re-indexing their own just-uploaded PDF a second
+    time would be a functional regression, not a security fix — so a
+    caller who already owns the row (``existing_owner == caller_user_id``)
+    is exempt even when the row reads ``tier=="corpus"``. A caller who is
+    NOT the owner still needs ``caller_can_write_shared`` to touch a
+    corpus-tier row — that remains the exact cross-user overwrite this
+    fix closes (the reviewer's live exploit: another user reindexing a
+    curator's corpus-tier PDF and silently reassigning
+    ``modified_by_user_id``/overwriting ``pdf_title``/``signature_status``/
+    ``document_sha256``).
+    """
+    if existing_tier != "corpus" or caller_can_write_shared:
+        return False
+    return existing_owner != caller_user_id
+
+
 @dataclass(frozen=True, slots=True)
 class ManifestEntry:
     """Plain-data view of a ``MemoryItem`` row, serialisable to JSON.
@@ -165,6 +239,117 @@ def _validate_layer(layer: str) -> None:
         )
 
 
+async def authorize_write(
+    manifest: MemoryManifestService,
+    user: UserContext,
+    layer: str,
+    key: str,
+    *,
+    requested_tier: str = "private",
+    owner_exempt: bool = False,
+) -> None:
+    """The PRE-WRITE authorization choke (SPEC security-memory-write-
+    authorization-choke, 2026-08-30) — SUPERSEDES the manifest-only fix
+    (SPEC security-memory-manifest-tier-authz) that three independent
+    reviews proved insufficient.
+
+    **Why this exists.** The manifest-layer guards
+    (``_tier_write_unauthorized``/``_pdf_metadata_write_unauthorized``,
+    applied inside ``record_create``/``record_update``/``record_delete``/
+    ``upsert_pdf_metadata``) authorize the Postgres AUDIT row. On the
+    index paths (the ``.md``/PDF fold, ``mcp_write``) the ChromaDB content
+    write happens BEFORE that audit-row check, and the flush helpers used
+    to swallow the resulting ``ManifestAuthorizationError`` in a broad
+    ``except Exception`` (WARNING only) — so an unauthorized caller's
+    content landed anyway and the response was a silent 200. The
+    third-review reviewer live-demonstrated this: a caller holding only
+    base ``memory:episodic:write`` (no corpus scope) named their private
+    ``.md`` identically to a curator-seeded corpus document; the ChromaDB
+    row was overwritten with the attacker's payload and its
+    ``tier``/``user_id`` metadata flipped to the attacker's — hijack AND
+    hide, achieved with LESS privilege than the exploits the manifest-only
+    fix closed.
+
+    **What this does.** Call this FIRST, before ANY content write
+    (ChromaDB upsert, S3 write) OR manifest mutation, at every write entry
+    point. It resolves the target's CURRENT state via ``manifest.get()`` —
+    a FRESH read, independent of and prior to whatever the eventual
+    manifest write's own internal check does — and enforces the SAME
+    invariant the four manifest guards enforce, just BEFORE instead of
+    AFTER the content lands: a caller may write only (a) a NEW item
+    requested at a tier it's authorized for, or (b) an EXISTING item
+    whose current tier it's authorized to touch. Raises
+    :class:`ManifestAuthorizationError` — routes/callers MUST map that to
+    HTTP 403, and MUST NOT catch-and-swallow it on any content-write path
+    (see ``memory_md_manifest.py``/``memory_pdf/manifest.py``, which no
+    longer do).
+
+    ``requested_tier`` is the tier the WRITE is targeting (``"private"``
+    by default; ``"corpus"`` when the caller explicitly promotes, or when
+    a fold/index path resolved the destination to the shared prefix) —
+    checked against the caller's corpus-write authorization REGARDLESS of
+    whether the target is new or existing, so a promote-into-corpus
+    attempt on a brand-new key is refused just as reliably as an
+    overwrite of an existing corpus row.
+
+    ``owner_exempt`` (default ``False`` — the STRICT rule
+    ``record_create``/``record_update``/``record_delete`` already use: an
+    existing corpus-tier row requires shared-write authorization
+    regardless of who created it) — set ``True`` ONLY for the PDF fold
+    path, whose downstream manifest write (``upsert_pdf_metadata``) uses
+    the LOOSER ``_pdf_metadata_write_unauthorized`` predicate: every
+    PDF-indexed row defaults ``tier="corpus"`` server-side (this writer
+    has no ``tier`` parameter at all), and a routine, DOCUMENTED
+    idempotent re-index of one's OWN just-uploaded PDF must keep working
+    without a corpus scope. When ``True``, an existing row the caller
+    already owns (``existing.created_by_user_id == user.user_id``) is
+    exempt from the corpus-tier check — mirrors
+    ``_pdf_metadata_write_unauthorized`` exactly, so this pre-write choke
+    never rejects a write the downstream manifest guard would have
+    allowed (only ever the reverse: blocking earlier what the manifest
+    guard would also have blocked, before any content lands).
+
+    The corpus-write authorization check itself is
+    ``routes.memory._corpus_write_authorized`` — imported LAZILY
+    (function-scoped) to avoid a circular import: ``routes.memory``
+    already imports ``ManifestAuthorizationError``/``ManifestEntry`` from
+    THIS module at module load time, so a module-level import the other
+    way round would deadlock the import graph. This mirrors the existing
+    precedent in ``routes/memory_pdf/pipeline.py::_index_pdf_objects``,
+    which lazily imports shared helpers from ``routes.memory`` for the
+    identical reason (see that function's docstring).
+    """
+    _validate_layer(layer)
+    from audittrace.routes.memory import (  # noqa: PLC0415 - lazy, avoids a circular import (see docstring)
+        _corpus_write_authorized,
+    )
+
+    collection = key.split("/", 1)[0] if layer == "semantic" else None
+    caller_can_write_shared = _corpus_write_authorized(user, collection)
+
+    if requested_tier == "corpus" and not caller_can_write_shared:
+        raise ManifestAuthorizationError(
+            f"caller lacks shared-write authorization to write a corpus-tier "
+            f"target layer={layer!r} key={key!r}"
+        )
+
+    existing = await manifest.get(layer, key)
+    if existing is None:
+        return
+    if (
+        owner_exempt
+        and not caller_can_write_shared
+        and existing.tier == "corpus"
+        and existing.created_by_user_id == user.user_id
+    ):
+        return
+    if _tier_write_unauthorized(existing.tier, caller_can_write_shared):
+        raise ManifestAuthorizationError(
+            f"caller lacks shared-write authorization to write over an "
+            f"existing corpus-tier target layer={layer!r} key={key!r}"
+        )
+
+
 # ── SPEC #374 (WU-1) — read-path index-status query ──────────────────────
 # Caps the best-effort named-match list (sub-decision #5, ratified
 # 2026-08-16): a recall tool result is not the place for an unbounded list.
@@ -219,6 +404,8 @@ class MemoryManifestService:
         size_bytes: int | None,
         user_id: str,
         tier: str = "private",
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Insert a new manifest row, OR un-soft-delete + bump
         timestamps if a row with the same (layer, key) already exists
@@ -232,7 +419,38 @@ class MemoryManifestService:
         (least-shared) side rather than silently defaulting to
         ``"corpus"``. Recreating an existing row (revive-after-delete or
         overwrite) also re-stamps ``tier`` to the caller's requested
-        value — same as ``title``/``size_bytes`` on that branch.
+        value — same as ``title``/``size_bytes`` on that branch — but
+        ONLY when authorized (see ``caller_can_write_shared`` below).
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — ``True`` iff the caller holds
+        ``memory:corpus:<layer>:write`` (or ``audittrace:admin``/admin)
+        for this write, computed by the route from the token's scopes.
+        Defaults ``False`` — FAIL-CLOSED, so a caller of this SERVICE
+        method (not just the route) that forgets to pass it lands on the
+        least-privileged side, same discipline as the ``tier`` default.
+
+        Fixes the cross-user corpus-hijack/hide vulnerability the M3-WU-
+        D2-2 reviewer surfaced: before this guard, an EXISTING row's
+        lookup was ``(layer, key)`` only — no tier/ownership check — so
+        a caller holding just the base ``memory:<layer>:write`` scope
+        could POST a create at a shared **corpus**-tier item's key and
+        silently demote it to their own private tier + re-own it,
+        hiding it from everyone else. Now: if the EXISTING row is
+        corpus-tier and the caller is not authorized for shared writes,
+        this raises :class:`ManifestAuthorizationError` — no tier
+        change, no title/content overwrite, no re-authorship. An
+        authorized caller (or a write landing on an existing PRIVATE
+        row) keeps working exactly as before; an unauthorized write
+        that reaches an existing PRIVATE row still updates
+        title/size/``modified_by_user_id`` (unaffected — private-tier
+        cross-owner collisions are a separate, already-flagged follow-
+        up, see ``routes/memory.py::_manifest_visible``'s docstring) but
+        its ``tier`` field is left untouched rather than blindly set to
+        whatever the caller requested, so an unauthorized promote-to-
+        corpus can never silently land via this defense-in-depth path
+        either. ``created_by_user_id`` is never reassigned (unchanged
+        behavior — always was owner-preserving on this branch).
 
         Returns the resulting entry.
         """
@@ -258,6 +476,12 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _tier_write_unauthorized(existing.tier, caller_can_write_shared):
+                    raise ManifestAuthorizationError(
+                        f"caller lacks shared-write authorization to overwrite "
+                        f"existing corpus-tier manifest row layer={layer!r} "
+                        f"key={key!r}"
+                    )
                 # Recreating after a soft-delete (or overwriting an
                 # existing live entry — caller should usually call
                 # `record_update` for the latter; this path is
@@ -269,7 +493,8 @@ class MemoryManifestService:
                 existing.size_bytes = size_bytes
                 existing.modified_at_ms = now
                 existing.modified_by_user_id = user_id
-                existing.tier = tier
+                if caller_can_write_shared:
+                    existing.tier = tier
                 row = existing
             await session.commit()
             await session.refresh(row)
@@ -283,6 +508,8 @@ class MemoryManifestService:
         size_bytes: int | None,
         user_id: str,
         title: str | None = None,
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Bump ``modified_at_ms`` + ``modified_by_user_id`` on the row.
 
@@ -291,6 +518,19 @@ class MemoryManifestService:
         ``(layer, key)``. Raises ``RuntimeError`` if the row is
         soft-deleted (caller should ``record_create`` to revive
         rather than update a deleted row).
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — same fail-closed (default ``False``)
+        shared-write authorization ``record_create`` takes. Raises
+        :class:`ManifestAuthorizationError` — BEFORE any field is
+        touched — when the row is corpus-tier and the caller lacks it:
+        this closes the same vulnerability class as ``record_create``'s
+        guard for the update path, where an unauthorized caller could
+        previously overwrite a shared corpus row's ``title`` and
+        re-stamp ``modified_by_user_id`` to themselves with no
+        ownership/tier check at all. ``record_update`` never touches
+        ``tier`` (unchanged — it never did), so authorized callers see
+        no behavior change.
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
@@ -306,6 +546,12 @@ class MemoryManifestService:
                     f"manifest row for layer={layer!r} key={key!r} is "
                     f"soft-deleted; use record_create to revive"
                 )
+            if _tier_write_unauthorized(row.tier, caller_can_write_shared):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             if title is not None:
                 row.title = title
             row.size_bytes = size_bytes
@@ -316,11 +562,34 @@ class MemoryManifestService:
             return ManifestEntry.from_row(row)
 
     @log_call(logger=logger)
-    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(
+        self,
+        layer: str,
+        key: str,
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> ManifestEntry:
         """Soft-delete: set ``deleted_at_ms`` + ``deleted_by_user_id``.
         Idempotent — calling on an already-deleted row is a no-op
         that returns the existing entry. Raises ``LookupError`` if
         the row does not exist at all.
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — the SAME fail-closed (default ``False``)
+        shared-write authorization ``record_create``/``record_update``/
+        ``upsert_pdf_metadata`` take. This is the LAST of the four
+        manifest mutation methods to gain it — the M3-WU-D2-2 reviewer's
+        second REJECT: a caller holding only base ``memory:<layer>:write``
+        could soft-delete (tombstone -> hidden from recall) an existing
+        **corpus**-tier row it doesn't own, stamping
+        ``deleted_by_user_id`` as itself with no ownership/tier check at
+        all. Raises :class:`ManifestAuthorizationError` — BEFORE touching
+        any field — when the row is corpus-tier and the caller lacks
+        authorization; a caller deleting their own PRIVATE-tier item is
+        unaffected. Idempotent-no-op path (already deleted) is likewise
+        gated: an unauthorized caller must not be able to confirm/observe
+        a corpus row's deleted state via a no-op call either.
         """
         _validate_layer(layer)
         async with self._session_factory() as session:
@@ -331,6 +600,12 @@ class MemoryManifestService:
             ).scalar_one_or_none()
             if row is None:
                 raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
+            if _tier_write_unauthorized(row.tier, caller_can_write_shared):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to delete "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             if row.deleted_at_ms is None:
                 row.deleted_at_ms = _now_ms()
                 row.deleted_by_user_id = user_id
@@ -406,6 +681,7 @@ class MemoryManifestService:
         pdfa_part: str | None = None,
         pdfa_conformance: str | None = None,
         ltv_data: dict[str, Any] | None = None,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         """Write tier-B + tier-C PDF manifest fields for ``(layer, key)``.
 
@@ -418,6 +694,27 @@ class MemoryManifestService:
         Per ADR-050 #22 + ADR-056 #10: this is the single audit-pivot
         writer. Every successful PDF index call lands one of these per
         file.
+
+        ``caller_can_write_shared`` (SPEC security-memory-manifest-tier-
+        authz, 2026-08-30) — the SAME fail-closed (default ``False``)
+        shared-write authorization ``record_create``/``record_update``
+        take. This is the manifest choke for the PDF ingestion pipeline
+        (``/memory/index``'s PDF branch, the auto-index outbox worker) —
+        it had NO tier/ownership check at all before this fix, so a
+        caller holding only base ``memory:<layer>:write`` could reindex
+        an EXISTING **corpus**-tier PDF and silently reassign
+        ``modified_by_user_id`` + overwrite ``pdf_title``/
+        ``signature_status``/``document_sha256``/etc — the same
+        cross-owner-overwrite vulnerability class ``record_create``/
+        ``record_update`` were fixed for, on a sibling writer this fix
+        initially missed. Raises :class:`ManifestAuthorizationError`
+        BEFORE touching any field when the EXISTING row is corpus-tier
+        and the caller lacks authorization — a legitimate metadata
+        refresh (same owner, or the system auto-index worker, which
+        always passes ``True``) is unaffected: this method never
+        reassigns ``tier`` in the first place (a metadata refresh is not
+        a tier/owner operation), so an authorized-or-private-tier caller
+        sees no behavior change at all.
         """
         _validate_layer(layer)
         now = _now_ms()
@@ -440,6 +737,14 @@ class MemoryManifestService:
                 )
                 session.add(row)
             else:
+                if _pdf_metadata_write_unauthorized(
+                    row.tier, row.created_by_user_id, user_id, caller_can_write_shared
+                ):
+                    raise ManifestAuthorizationError(
+                        f"caller lacks shared-write authorization to overwrite "
+                        f"existing corpus-tier PDF manifest row layer={layer!r} "
+                        f"key={key!r}"
+                    )
                 row.modified_at_ms = now
                 row.modified_by_user_id = user_id
                 if size_bytes is not None:
@@ -698,6 +1003,8 @@ class MockMemoryManifestService(MemoryManifestService):
         size_bytes: int | None,
         user_id: str,
         tier: str = "private",
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -721,11 +1028,20 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _tier_write_unauthorized(
+                existing.get("tier", "corpus"), caller_can_write_shared
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             existing["title"] = title
             existing["size_bytes"] = size_bytes
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
-            existing["tier"] = tier
+            if caller_can_write_shared:
+                existing["tier"] = tier
             if existing.get("deleted_at_ms") is not None:
                 existing["deleted_at_ms"] = None
                 existing["deleted_by_user_id"] = None
@@ -738,6 +1054,8 @@ class MockMemoryManifestService(MemoryManifestService):
         size_bytes: int | None,
         user_id: str,
         title: str | None = None,
+        *,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
@@ -748,6 +1066,14 @@ class MockMemoryManifestService(MemoryManifestService):
                 f"manifest row for layer={layer!r} key={key!r} is "
                 f"soft-deleted; use record_create to revive"
             )
+        if _tier_write_unauthorized(
+            existing.get("tier", "corpus"), caller_can_write_shared
+        ):
+            raise ManifestAuthorizationError(
+                f"caller lacks shared-write authorization to overwrite "
+                f"existing corpus-tier manifest row layer={layer!r} "
+                f"key={key!r}"
+            )
         if title is not None:
             existing["title"] = title
         existing["size_bytes"] = size_bytes
@@ -755,11 +1081,26 @@ class MockMemoryManifestService(MemoryManifestService):
         existing["modified_by_user_id"] = user_id
         return self._to_entry(existing)
 
-    async def record_delete(self, layer: str, key: str, user_id: str) -> ManifestEntry:
+    async def record_delete(
+        self,
+        layer: str,
+        key: str,
+        user_id: str,
+        *,
+        caller_can_write_shared: bool = False,
+    ) -> ManifestEntry:
         _validate_layer(layer)
         existing = self._rows.get((layer, key))
         if existing is None:
             raise LookupError(f"no manifest row for layer={layer!r} key={key!r}")
+        if _tier_write_unauthorized(
+            existing.get("tier", "corpus"), caller_can_write_shared
+        ):
+            raise ManifestAuthorizationError(
+                f"caller lacks shared-write authorization to delete "
+                f"existing corpus-tier manifest row layer={layer!r} "
+                f"key={key!r}"
+            )
         if existing.get("deleted_at_ms") is None:
             existing["deleted_at_ms"] = _now_ms()
             existing["deleted_by_user_id"] = user_id
@@ -909,6 +1250,7 @@ class MockMemoryManifestService(MemoryManifestService):
         pdfa_part: str | None = None,
         pdfa_conformance: str | None = None,
         ltv_data: dict[str, Any] | None = None,
+        caller_can_write_shared: bool = False,
     ) -> ManifestEntry:
         _validate_layer(layer)
         now = _now_ms()
@@ -931,6 +1273,17 @@ class MockMemoryManifestService(MemoryManifestService):
             }
             self._rows[(layer, key)] = existing
         else:
+            if _pdf_metadata_write_unauthorized(
+                existing.get("tier", "corpus"),
+                existing.get("created_by_user_id", ""),
+                user_id,
+                caller_can_write_shared,
+            ):
+                raise ManifestAuthorizationError(
+                    f"caller lacks shared-write authorization to overwrite "
+                    f"existing corpus-tier PDF manifest row layer={layer!r} "
+                    f"key={key!r}"
+                )
             existing["modified_at_ms"] = now
             existing["modified_by_user_id"] = user_id
             if size_bytes is not None:

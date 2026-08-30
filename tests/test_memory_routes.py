@@ -212,8 +212,18 @@ class TestIndexAuth:
     def test_index_single_file_with_layer_write_succeeds(
         self, client: TestClient
     ) -> None:
-        """Single-file mode (``?file=episodic/...``) accepts the matching
-        per-layer write scope. Same M3 UI-flow contract as /memory/upload."""
+        """Single-file mode on the caller's OWN private-tier key
+        (``?file=<sub>/episodic/...``) accepts the matching per-layer write
+        scope. Same M3 UI-flow contract as /memory/upload.
+
+        SPEC security-memory-manifest-tier-authz (2026-08-30): a
+        LEGACY/shared-prefix key (``?file=episodic/...``, no token-sub
+        prefix) resolves tier="corpus" and now additionally requires
+        corpus/admin authorization — covered by
+        ``test_index_single_file_corpus_tier_key_denied_without_corpus_scope``
+        below. This test moved to the private-tier key shape so it keeps
+        testing exactly what its docstring claims (base layer-write scope
+        is sufficient for the caller's OWN content)."""
         mock_minio = MagicMock()
         # Empty list_objects so the body short-circuits with no work — the
         # auth gate fires first regardless, which is what this test asserts.
@@ -248,13 +258,91 @@ class TestIndexAuth:
                 "/memory/index",
                 params={
                     "collections": "ai_research_papers",
-                    "file": "episodic/foo.pdf",
+                    "file": "test-user/episodic/foo.pdf",
                 },
                 headers={"Authorization": "Bearer fake-token"},
             )
         # Auth must have passed; whether the body succeeds or fails on the
         # empty-body path, the status must NOT be 403/401. Accept any
         # 2xx/4xx that isn't auth-related.
+        assert response.status_code not in (401, 403), response.text
+
+    def test_index_single_file_corpus_tier_key_denied_without_corpus_scope(
+        self, client: TestClient
+    ) -> None:
+        """SPEC security-memory-manifest-tier-authz (2026-08-30) — the
+        gap the M3-WU-D2-2 reviewer live-demonstrated: a base
+        ``memory:episodic:write`` token targeting a LEGACY/shared-prefix
+        key (no token-sub prefix -> tier resolves "corpus") must NOT be
+        able to reach the index pipeline at all. FALSIFIABLE: neuter the
+        route-level ``tier == "corpus"`` gate in ``index_memory`` (e.g.
+        drop the block) and this test goes RED (200 instead of 403);
+        restore it and it's GREEN."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "attacker",
+                "scope": "memory:episodic:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/curator-shared.pdf",
+                },
+                headers={"Authorization": "Bearer fake-token"},
+            )
+        assert response.status_code == 403, response.text
+        assert "corpus" in response.json()["detail"].lower()
+
+    def test_index_single_file_corpus_tier_key_admin_still_succeeds(
+        self, client: TestClient
+    ) -> None:
+        """The 'should still work' arm for the new gate: an
+        ``audittrace:admin`` token targeting the SAME legacy/corpus-prefix
+        key is not blocked (the gate rejects on missing authorization, not
+        on tier alone)."""
+        mock_minio = MagicMock()
+        mock_minio.list_objects.return_value = iter([])
+        mock_chroma = MagicMock()
+        mock_chroma.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        mock_chroma.delete_collection = AsyncMock()
+        mock_chroma.list_collections = AsyncMock(return_value=[])
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client", return_value=mock_minio
+            ),
+            patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "ops-user",
+                "scope": "audittrace:admin",
+            }
+            mock_minio.get_object.return_value = MagicMock(
+                read=lambda: b"", close=MagicMock(), release_conn=MagicMock()
+            )
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "ai_research_papers",
+                    "file": "episodic/curator-shared.pdf",
+                },
+                headers={"Authorization": "Bearer admin-token"},
+            )
         assert response.status_code not in (401, 403), response.text
 
     def test_index_single_file_cross_layer_denied(self, client: TestClient) -> None:
@@ -1367,6 +1455,10 @@ class TestIndexZeroChunksLoud:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -1494,6 +1586,7 @@ class TestIndexZeroChunksLoud:
         mock_chroma, mock_collection = self._mock_chroma()
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -1585,6 +1678,10 @@ class TestIndexGap2AutoRoutePdf:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -4198,6 +4295,1147 @@ class TestSemanticCorpusPromoteGate:
             client.app.dependency_overrides.clear()
 
 
+class TestManifestCorpusOverwriteGuard:
+    """SPEC security-memory-manifest-tier-authz (2026-08-30) — the M3-WU-
+    D2-2 reviewer's cross-user corpus-hijack/hide finding: before this
+    guard, ``MemoryManifestService.record_create``/``record_update``
+    looked up an EXISTING ``(layer, key)`` row with no tier/ownership
+    check at all, so a caller holding only the base
+    ``memory:semantic:write`` scope could ``POST``/``PUT`` over a shared
+    **corpus**-tier item's key and silently demote it to their own
+    private tier + re-own it — hiding it from every other user.
+
+    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
+    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
+    and ``test_base_scope_create_over_corpus_is_denied_and_row_unchanged``
+    / ``test_base_scope_update_over_corpus_is_denied_and_row_unchanged``
+    go RED (the base-scope caller's create/update succeeds and
+    demotes/re-authors the corpus row instead of 403ing); restore it and
+    they go GREEN. ``test_corpus_scope_caller_can_*``/
+    ``test_admin_bypasses_corpus_overwrite_guard`` pin the "should still
+    work" arms so a fix can't just reject every write.
+    """
+
+    @staticmethod
+    def _seed_corpus_doc(
+        client: TestClient,
+        *,
+        document_id: str,
+        text: str = "shared decision",
+        title: str = "Shared",
+    ) -> None:
+        """Admin (sentinel) seeds one corpus doc via the real route (so
+        BOTH the manifest row and the private-vs-corpus physical Chroma
+        write happen exactly like production)."""
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": document_id,
+                "text": text,
+                "title": title,
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    @staticmethod
+    def _get_row(document_id: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(
+            get_memory_manifest_service().get("semantic", f"decisions/{document_id}")
+        )
+
+    def test_base_scope_create_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="hijack-create")
+        before = self._get_row("hijack-create")
+        assert before is not None
+        assert before.tier == "corpus"
+
+        _override_identity(client, "attacker-create", ("memory:semantic:write",))
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "hijack-create",
+                    "text": "attacker content",
+                    "title": "pwned",
+                },
+            )
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("hijack-create")
+        assert after is not None
+        # No tier change, no overwrite, no re-authorship — the exact
+        # invariant the exploit broke.
+        assert after.tier == "corpus"
+        assert after.title == before.title
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.modified_by_user_id == before.modified_by_user_id
+        assert after.modified_at_ms == before.modified_at_ms
+
+    def test_base_scope_update_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="hijack-update")
+        before = self._get_row("hijack-update")
+        assert before is not None
+        assert before.tier == "corpus"
+
+        _override_identity(client, "attacker-update", ("memory:semantic:write",))
+        try:
+            r = client.put(
+                "/memory/semantic/decisions/hijack-update",
+                json={"text": "attacker content", "title": "pwned"},
+            )
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("hijack-update")
+        assert after is not None
+        assert after.tier == "corpus"
+        assert after.title == before.title
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.modified_by_user_id == before.modified_by_user_id
+        assert after.modified_at_ms == before.modified_at_ms
+
+    def test_corpus_scope_caller_can_create_over_corpus_and_ownership_preserved(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="authorized-create")
+        before = self._get_row("authorized-create")
+        assert before is not None
+
+        _override_identity(
+            client,
+            "curator-create",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "authorized-create",
+                    "text": "updated shared content",
+                    "title": "Updated Shared",
+                    "tier": "corpus",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "corpus"
+            assert r.json()["title"] == "Updated Shared"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("authorized-create")
+        assert after is not None
+        assert after.title == "Updated Shared"
+        assert after.modified_by_user_id == "curator-create"
+        # Rule 3 — created_by_user_id is IMMUTABLE even on an AUTHORIZED
+        # overwrite.
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.created_by_user_id != "curator-create"
+
+    def test_corpus_scope_caller_can_update_over_corpus(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="authorized-update")
+        before = self._get_row("authorized-update")
+        assert before is not None
+
+        _override_identity(
+            client,
+            "curator-update",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.put(
+                "/memory/semantic/decisions/authorized-update",
+                json={"text": "revised shared content", "title": "Revised"},
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["title"] == "Revised"
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("authorized-update")
+        assert after is not None
+        assert after.title == "Revised"
+        assert after.modified_by_user_id == "curator-update"
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_admin_bypasses_corpus_overwrite_guard(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel
+        — operator bulk-fix flows must keep working."""
+        self._seed_corpus_doc(client, document_id="admin-overwrite")
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "admin-overwrite",
+                "text": "admin edit",
+                "title": "Admin Edit",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["title"] == "Admin Edit"
+
+    def test_new_private_create_unaffected_by_guard(self, client: TestClient) -> None:
+        """A brand-new key (no existing row at all) is the ``existing is
+        None`` branch — never touched by this guard."""
+        _override_identity(client, "writer-new", ("memory:semantic:write",))
+        try:
+            r = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "brand-new",
+                    "text": "x",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["tier"] == "private"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_own_private_create_then_update_unaffected_by_guard(
+        self, client: TestClient
+    ) -> None:
+        """A caller's own PRIVATE-tier item is unaffected — the guard is
+        scoped to corpus-tier rows only."""
+        _override_identity(client, "writer-own", ("memory:semantic:write",))
+        try:
+            r1 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "own-doc",
+                    "text": "v1",
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = client.put(
+                "/memory/semantic/decisions/own-doc",
+                json={"text": "v2", "title": "mine"},
+            )
+            assert r2.status_code == 200, r2.text
+            assert r2.json()["title"] == "mine"
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestEpisodicManifestCorpusOverwriteGuard:
+    """Same guard as ``TestManifestCorpusOverwriteGuard``, threaded for
+    the episodic layer — which has NO ``memory:corpus:episodic:write``
+    scope declared at all (ADR-062 §4's closed scope set is exactly
+    ``decisions``/``skills``/``semantic``), so only
+    ``audittrace:admin``/admin can ever satisfy the shared-write
+    authorization here (``_corpus_write_authorized(user, None)``)."""
+
+    @staticmethod
+    def _seed_corpus_row(filename: str, *, created_by: str = "curator") -> None:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic",
+                filename,
+                "Shared ADR",
+                10,
+                created_by,
+                tier="corpus",
+            )
+        )
+
+    @staticmethod
+    def _get_row(filename: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(get_memory_manifest_service().get("episodic", filename))
+
+    def test_base_scope_create_over_corpus_episodic_is_denied(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_row("ADR-shared-hijack.md")
+        before = self._get_row("ADR-shared-hijack.md")
+        assert before is not None and before.tier == "corpus"
+
+        _override_identity(client, "attacker-episodic", ("memory:episodic:write",))
+        try:
+            r = client.post(
+                "/memory/episodic",
+                json={
+                    "filename": "ADR-shared-hijack.md",
+                    "content": "attacker content",
+                    "title": "pwned",
+                },
+            )
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("ADR-shared-hijack.md")
+        assert after is not None
+        assert after.tier == "corpus"
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.title == before.title
+
+    def test_admin_can_overwrite_corpus_episodic_row(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_row("ADR-shared-admin.md")
+        r = client.post(
+            "/memory/episodic",
+            json={
+                "filename": "ADR-shared-admin.md",
+                "content": "admin edit",
+                "title": "Admin Edit",
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["title"] == "Admin Edit"
+        after = self._get_row("ADR-shared-admin.md")
+        assert after is not None
+        assert after.created_by_user_id == "curator"
+
+
+class TestManifestCorpusDeleteGuard:
+    """SPEC security-memory-manifest-tier-authz (2026-08-30) — the LAST of
+    the four manifest mutation methods (create/update/upsert_pdf_metadata
+    already fixed): ``MemoryManifestService.record_delete`` had NO
+    ``caller_can_write_shared`` param, and ``delete_episodic``/
+    ``delete_procedural``/``delete_semantic`` gated on base
+    ``memory:<layer>:write`` only. A caller holding only base write scope
+    could soft-delete (tombstone -> hidden from recall) a curator's
+    corpus-tier item it doesn't own — 200 OK, ``deleted_by_user_id`` stamped
+    as the attacker.
+
+    FALSIFIABLE: neuter ``_tier_write_unauthorized`` in
+    ``services/memory_manifest.py`` (e.g. make it always return ``False``)
+    and ``test_base_scope_delete_over_corpus_is_denied_and_row_unchanged``
+    (both semantic and episodic variants below) go RED (the base-scope
+    caller's delete succeeds and tombstones the corpus row); restore it and
+    they go GREEN. ``test_corpus_scope_caller_can_delete_corpus_item`` /
+    ``test_admin_can_delete_corpus_item`` / ``test_own_private_item_delete_
+    unaffected_by_guard`` pin the "should still work" arms.
+    """
+
+    @staticmethod
+    def _seed_corpus_doc(client: TestClient, *, document_id: str) -> None:
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": document_id,
+                "text": "shared decision",
+                "title": "Shared",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    @staticmethod
+    def _get_row(document_id: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(
+            get_memory_manifest_service().get("semantic", f"decisions/{document_id}")
+        )
+
+    def test_base_scope_delete_over_corpus_is_denied_and_row_unchanged(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="delete-hijack")
+        before = self._get_row("delete-hijack")
+        assert before is not None
+        assert before.tier == "corpus"
+        assert before.deleted_at_ms is None
+
+        _override_identity(client, "attacker-delete", ("memory:semantic:write",))
+        try:
+            r = client.delete("/memory/semantic/decisions/delete-hijack")
+            assert r.status_code == 403
+            assert "corpus" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("delete-hijack")
+        assert after is not None
+        # No tombstone at all — tier, ownership, and delete state untouched.
+        assert after.tier == "corpus"
+        assert after.deleted_at_ms is None
+        assert after.deleted_by_user_id is None
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_corpus_scope_caller_can_delete_corpus_item(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_doc(client, document_id="delete-authorized")
+        _override_identity(
+            client,
+            "curator-delete",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r = client.delete("/memory/semantic/decisions/delete-authorized")
+            assert r.status_code == 200, r.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("delete-authorized")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+        assert after.deleted_by_user_id == "curator-delete"
+
+    def test_admin_can_delete_corpus_item(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_doc(client, document_id="delete-admin")
+        r = client.delete("/memory/semantic/decisions/delete-admin")
+        assert r.status_code == 200, r.text
+        after = self._get_row("delete-admin")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+
+    def test_own_private_item_delete_unaffected_by_guard(
+        self, client: TestClient
+    ) -> None:
+        _override_identity(client, "writer-own-delete", ("memory:semantic:write",))
+        try:
+            r1 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "own-delete",
+                    "text": "mine",
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = client.delete("/memory/semantic/decisions/own-delete")
+            assert r2.status_code == 200, r2.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestEpisodicManifestCorpusDeleteGuard:
+    """Episodic twin of ``TestManifestCorpusDeleteGuard`` — episodic has NO
+    ``memory:corpus:episodic:write`` scope declared (ADR-062 §4), so only
+    admin/``audittrace:admin`` can ever satisfy the shared-write
+    authorization for a corpus-tier delete here."""
+
+    @staticmethod
+    def _seed_corpus_row(filename: str, *, created_by: str = "curator") -> None:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic",
+                filename,
+                "Shared ADR",
+                10,
+                created_by,
+                tier="corpus",
+            )
+        )
+
+    @staticmethod
+    def _get_row(filename: str) -> Any:
+        import asyncio
+
+        from audittrace.dependencies import get_memory_manifest_service
+
+        return asyncio.run(get_memory_manifest_service().get("episodic", filename))
+
+    def test_base_scope_delete_over_corpus_episodic_is_denied(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_row("ADR-delete-hijack.md")
+        before = self._get_row("ADR-delete-hijack.md")
+        assert before is not None and before.tier == "corpus"
+
+        _override_identity(
+            client, "attacker-episodic-delete", ("memory:episodic:write",)
+        )
+        try:
+            r = client.delete("/memory/episodic/ADR-delete-hijack.md")
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        after = self._get_row("ADR-delete-hijack.md")
+        assert after is not None
+        assert after.deleted_at_ms is None
+        assert after.deleted_by_user_id is None
+        assert after.created_by_user_id == before.created_by_user_id
+
+    def test_admin_can_delete_corpus_episodic_row(self, client: TestClient) -> None:
+        """The default ``client`` fixture identity is the admin sentinel."""
+        self._seed_corpus_row("ADR-delete-admin.md")
+        r = client.delete("/memory/episodic/ADR-delete-admin.md")
+        assert r.status_code == 200, r.text
+        after = self._get_row("ADR-delete-admin.md")
+        assert after is not None
+        assert after.deleted_at_ms is not None
+
+
+class TestPreWriteAuthorizationChoke:
+    """SPEC security-memory-write-authorization-choke (2026-08-30) —
+    SUPERSEDES the manifest-only fix (``security-memory-manifest-tier-
+    authz``): three independent reviews proved authorization at the
+    Postgres manifest/audit-row layer insufficient, because on the index
+    paths ChromaDB content lands BEFORE the manifest is ever touched
+    (``_upsert_in_batches`` precedes ``_flush_md_manifest``/
+    ``_flush_pdf_manifest``), and those flush helpers used to SWALLOW the
+    resulting ``ManifestAuthorizationError`` in a broad ``except
+    Exception`` (WARNING only) — so the request returned 200 with
+    POISONED content, not 403. The third-review reviewer live-
+    demonstrated this: a caller holding only base
+    ``memory:episodic:write`` (no corpus scope) named their private
+    ``.md`` identically to a curator-seeded corpus document via
+    ``POST /memory/index`` and silently overwrote the ChromaDB row
+    (content hijacked, ``tier`` flipped from ``"corpus"`` to
+    ``"private"`` — hijack AND hide).
+
+    This class asserts on the ACTUAL stored content (the ChromaDB
+    row / manifest row), not just that a 403 came back — matching the
+    reviewer's own finding that the prior guard tests
+    (``TestManifestCorpusOverwriteGuard``/``TestManifestCorpusDeleteGuard``)
+    never captured this gap because they only ever asserted on the
+    Postgres row via ``_get_row``, never on the underlying ChromaDB
+    collection's actual data.
+
+    FALSIFIABLE: neuter ``authorize_write`` in
+    ``services/memory_manifest.py`` (e.g. make it return immediately
+    without ever raising) and every ``test_*_denied_content_unchanged``/
+    ``test_*_ordering_*`` test below goes RED (200 + poisoned/overwritten
+    content, or the ChromaDB/manifest write happening despite the
+    refusal); restore it and they go GREEN.
+    """
+
+    @staticmethod
+    def _minio_object(content: bytes) -> MagicMock:
+        m = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = content
+        response_obj.__enter__.return_value = response_obj
+        m.get_object.return_value = response_obj
+        return m
+
+    # ── `.md` fold path — the reviewer's exact live-demonstrated exploit ──
+
+    async def test_md_fold_private_upload_colliding_with_corpus_doc_is_denied_content_unchanged(
+        self,
+    ) -> None:
+        from audittrace.db.factory import MockChromaDBFactory
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory import _index_md_objects
+        from audittrace.services.memory_manifest import (
+            ManifestAuthorizationError,
+            MockMemoryManifestService,
+        )
+
+        factory = MockChromaDBFactory()
+        chroma_client = await factory.get_client()
+        collection = await chroma_client.get_or_create_collection(name="decisions_v2")
+        manifest = MockMemoryManifestService()
+
+        curator = UserContext(
+            user_id="curator",
+            username="curator",
+            agent_type="test",
+            scopes=("memory:corpus:decisions:write",),
+            is_admin=False,
+        )
+        attacker = UserContext(
+            user_id="attacker",
+            username="attacker",
+            agent_type="test",
+            scopes=("memory:episodic:write",),
+            is_admin=False,
+        )
+
+        # 1. Curator seeds the corpus doc — matches the reviewer's PoC
+        # step 1 (admin/curator bulk-indexes a corpus decision).
+        await _index_md_objects(
+            collection,
+            self._minio_object(b"# curator secret corpus content"),
+            "bucket",
+            [{"key": "decisions/ADR-CURATOR.md", "filename": "ADR-CURATOR.md"}],
+            "decisions",
+            category="episodic",
+            user_id="curator",
+            tier="corpus",
+            user=curator,
+            manifest_service=manifest,
+            caller_can_write_shared=True,
+        )
+        before = [dict(row) for row in collection.data]
+        assert before, "the seed write must have landed"
+        assert any(row["metadata"].get("tier") == "corpus" for row in before)
+
+        # 2. Attacker uploads a private .md with the SAME filename — the
+        # reviewer's PoC step 2 (`file=attacker/episodic/ADR-CURATOR.md`).
+        with pytest.raises(ManifestAuthorizationError):
+            await _index_md_objects(
+                collection,
+                self._minio_object(b"ATTACKER PAYLOAD -- poisoned content"),
+                "bucket",
+                [
+                    {
+                        "key": "attacker/episodic/ADR-CURATOR.md",
+                        "filename": "ADR-CURATOR.md",
+                    }
+                ],
+                "decisions",
+                category="episodic",
+                user_id="attacker",
+                tier="private",
+                user=attacker,
+                manifest_service=manifest,
+                caller_can_write_shared=False,
+            )
+
+        # 3. The ChromaDB row is byte-unchanged — content, tier, owner.
+        after = [dict(row) for row in collection.data]
+        assert after == before
+
+    async def test_md_fold_ordering_upsert_never_called_on_refusal(self) -> None:
+        """Ordering proof: authorization precedes the write, not just
+        accompanies it — the ChromaDB upsert is never invoked at all for
+        a refused write (not called-then-discarded)."""
+        from unittest.mock import AsyncMock, patch
+
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory import _doc_id, _index_md_objects, _semantic_key
+        from audittrace.services.memory_manifest import (
+            ManifestAuthorizationError,
+            MockMemoryManifestService,
+        )
+
+        manifest = MockMemoryManifestService()
+        doc_id = _doc_id("decisions", "existing.md", 0)
+        await manifest.record_create(
+            "semantic",
+            _semantic_key("decisions", doc_id),
+            "Shared",
+            10,
+            "curator",
+            tier="corpus",
+        )
+        attacker = UserContext(
+            user_id="attacker",
+            username="attacker",
+            agent_type="test",
+            scopes=("memory:episodic:write",),
+            is_admin=False,
+        )
+
+        upsert_spy = AsyncMock()
+        with patch("audittrace.routes.memory._upsert_in_batches", upsert_spy):
+            with pytest.raises(ManifestAuthorizationError):
+                await _index_md_objects(
+                    AsyncMock(),  # collection — must never be touched
+                    self._minio_object(b"attacker content"),
+                    "bucket",
+                    [
+                        {
+                            "key": "attacker/episodic/existing.md",
+                            "filename": "existing.md",
+                        }
+                    ],
+                    "decisions",
+                    category="episodic",
+                    user_id="attacker",
+                    tier="private",
+                    user=attacker,
+                    manifest_service=manifest,
+                    caller_can_write_shared=False,
+                )
+        upsert_spy.assert_not_called()
+
+    async def test_md_fold_corpus_scope_caller_succeeds(self) -> None:
+        """Legit arm — a caller holding ``memory:corpus:decisions:write``
+        may legitimately overwrite the existing corpus row."""
+        from audittrace.db.factory import MockChromaDBFactory
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory import _index_md_objects
+        from audittrace.services.memory_manifest import MockMemoryManifestService
+
+        factory = MockChromaDBFactory()
+        chroma_client = await factory.get_client()
+        collection = await chroma_client.get_or_create_collection(name="decisions_v2")
+        manifest = MockMemoryManifestService()
+        curator = UserContext(
+            user_id="curator",
+            username="curator",
+            agent_type="test",
+            scopes=("memory:corpus:decisions:write",),
+            is_admin=False,
+        )
+
+        await _index_md_objects(
+            collection,
+            self._minio_object(b"v1"),
+            "bucket",
+            [{"key": "decisions/ADR-x.md", "filename": "ADR-x.md"}],
+            "decisions",
+            category="episodic",
+            user_id="curator",
+            tier="corpus",
+            user=curator,
+            manifest_service=manifest,
+            caller_can_write_shared=True,
+        )
+        # Same curator re-indexes (authorized overwrite) — must succeed.
+        await _index_md_objects(
+            collection,
+            self._minio_object(b"v2 revised"),
+            "bucket",
+            [{"key": "decisions/ADR-x.md", "filename": "ADR-x.md"}],
+            "decisions",
+            category="episodic",
+            user_id="curator",
+            tier="corpus",
+            user=curator,
+            manifest_service=manifest,
+            caller_can_write_shared=True,
+        )
+        assert any(row["document"] == "v2 revised" for row in collection.data)
+
+    async def test_md_fold_own_private_new_item_unaffected(self) -> None:
+        """Legit arm — a base-scope caller's brand-new private item is
+        unaffected by the choke (no existing row at that content ID)."""
+        from audittrace.db.factory import MockChromaDBFactory
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory import _index_md_objects
+        from audittrace.services.memory_manifest import MockMemoryManifestService
+
+        factory = MockChromaDBFactory()
+        chroma_client = await factory.get_client()
+        collection = await chroma_client.get_or_create_collection(name="decisions_v2")
+        manifest = MockMemoryManifestService()
+        writer = UserContext(
+            user_id="writer",
+            username="writer",
+            agent_type="test",
+            scopes=("memory:episodic:write",),
+            is_admin=False,
+        )
+
+        chunks = await _index_md_objects(
+            collection,
+            self._minio_object(b"my own private note"),
+            "bucket",
+            [{"key": "writer/episodic/my-note.md", "filename": "my-note.md"}],
+            "decisions",
+            category="episodic",
+            user_id="writer",
+            tier="private",
+            user=writer,
+            manifest_service=manifest,
+            caller_can_write_shared=False,
+        )
+        assert chunks >= 1
+        assert any(row["document"] == "my own private note" for row in collection.data)
+
+    # ── PDF fold path ──────────────────────────────────────────────────
+
+    async def test_pdf_fold_denied_over_existing_corpus_key_unchanged_and_ordering(
+        self,
+    ) -> None:
+        """A GENUINELY parseable fake PDF (real pymupdf mocking, matching
+        ``TestPdfIndexOrchestratorEdgePaths``'s pattern) — a garbage byte
+        string would fail to parse regardless of authorization, making
+        the ordering assertion below vacuous. With a real page/text
+        pipeline, ``collection.upsert`` WOULD be reached if the choke
+        didn't fire first."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+        from audittrace.services.memory_manifest import (
+            ManifestAuthorizationError,
+            MockMemoryManifestService,
+        )
+
+        manifest = MockMemoryManifestService()
+        await manifest.upsert_pdf_metadata(
+            "episodic",
+            "episodic/shared.pdf",
+            user_id="curator",
+            size_bytes=10,
+            page_count=1,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+            caller_can_write_shared=True,
+        )
+        before = await manifest.get("episodic", "episodic/shared.pdf")
+        assert before is not None and before.tier == "corpus"
+
+        attacker = UserContext(
+            user_id="attacker",
+            username="attacker",
+            agent_type="test",
+            scopes=("memory:episodic:write",),
+            is_admin=False,
+        )
+        collection_spy = AsyncMock()
+        fake_doc = _fake_pdf_doc(
+            [_fake_pdf_page("attacker payload body text")],
+            metadata={"title": "pwned"},
+            toc=[],
+            page_count=1,
+        )
+        fake_pymupdf = MagicMock()
+        fake_pymupdf.open.return_value = fake_doc
+
+        with (
+            patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
+            pytest.raises(ManifestAuthorizationError),
+        ):
+            await _index_pdf_objects(
+                collection_spy,
+                self._minio_object(b"%PDF-1.4 attacker payload"),
+                "bucket",
+                [{"key": "episodic/shared.pdf", "filename": "shared.pdf"}],
+                "ai_research_papers",
+                category="episodic",
+                layer_prefix="episodic/",
+                user_id="attacker",
+                ingestion_ts_ms=0,
+                user=attacker,
+                manifest_service=manifest,
+            )
+
+        # Ordering: the choke fires before pymupdf even opens the file —
+        # no ChromaDB write of any kind, even though the fake PDF WOULD
+        # otherwise have yielded a real chunk to upsert.
+        collection_spy.upsert.assert_not_called()
+        collection_spy.add.assert_not_called()
+        fake_pymupdf.open.assert_not_called()
+
+        after = await manifest.get("episodic", "episodic/shared.pdf")
+        assert after is not None
+        assert after.tier == "corpus"
+        assert after.created_by_user_id == before.created_by_user_id
+        assert after.document_sha256 == before.document_sha256
+
+    async def test_pdf_fold_same_owner_reindex_succeeds(self) -> None:
+        """Legit arm — the row's own creator re-indexing (routine,
+        idempotent) still works with NO shared-write scope."""
+        from unittest.mock import AsyncMock
+
+        from audittrace.identity import UserContext
+        from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
+        from audittrace.services.memory_manifest import MockMemoryManifestService
+
+        manifest = MockMemoryManifestService()
+        await manifest.upsert_pdf_metadata(
+            "episodic",
+            "alice/episodic/own.pdf",
+            user_id="alice",
+            size_bytes=10,
+            page_count=1,
+            signature_status="signed_valid",
+            ocr_coverage_pct=0.0,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="a" * 64,
+        )
+        alice = UserContext(
+            user_id="alice",
+            username="alice",
+            agent_type="test",
+            scopes=("memory:episodic:write",),
+            is_admin=False,
+        )
+        collection_spy = AsyncMock()
+
+        await _index_pdf_objects(
+            collection_spy,
+            self._minio_object(b"%PDF-1.4 not a real pdf"),
+            "bucket",
+            [{"key": "alice/episodic/own.pdf", "filename": "own.pdf"}],
+            "ai_research_papers",
+            category="episodic",
+            layer_prefix="episodic/",
+            user_id="alice",
+            ingestion_ts_ms=0,
+            user=alice,
+            manifest_service=manifest,
+        )
+        row = await manifest.get("episodic", "alice/episodic/own.pdf")
+        assert row is not None
+        assert row.modified_by_user_id == "alice"
+
+    # ── /memory/semantic create + update ───────────────────────────────
+
+    def test_semantic_create_denied_over_corpus_leaves_chroma_content_unchanged(
+        self, client: TestClient
+    ) -> None:
+        from audittrace.dependencies import get_semantic_service
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-create",
+                "text": "shared decision",
+                "title": "Shared",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+        docs_before = [
+            (d.page_content, dict(d.metadata))
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-create"
+        ]
+        assert docs_before
+
+        _override_identity(client, "attacker-choke-create", ("memory:semantic:write",))
+        try:
+            r2 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "choke-create",
+                    "text": "attacker payload",
+                    "title": "pwned",
+                },
+            )
+            assert r2.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        docs_after = [
+            (d.page_content, dict(d.metadata))
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-create"
+        ]
+        assert docs_after == docs_before
+
+    def test_semantic_update_denied_over_corpus_leaves_chroma_content_unchanged(
+        self, client: TestClient
+    ) -> None:
+        from audittrace.dependencies import get_semantic_service
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-update",
+                "text": "shared decision",
+                "title": "Shared",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+        docs_before = [
+            (d.page_content, dict(d.metadata))
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-update"
+        ]
+        assert docs_before
+
+        _override_identity(client, "attacker-choke-update", ("memory:semantic:write",))
+        try:
+            r2 = client.put(
+                "/memory/semantic/decisions/choke-update",
+                json={"text": "attacker payload", "title": "pwned"},
+            )
+            assert r2.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        docs_after = [
+            (d.page_content, dict(d.metadata))
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-update"
+        ]
+        assert docs_after == docs_before
+
+    def test_semantic_create_corpus_scope_caller_succeeds(
+        self, client: TestClient
+    ) -> None:
+        """Legit arm — an authorized corpus-scope caller's overwrite still
+        works and the new content actually lands in ChromaDB."""
+        from audittrace.dependencies import get_semantic_service
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-authorized",
+                "text": "v1",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        _override_identity(
+            client,
+            "curator-choke",
+            ("memory:semantic:write", "memory:corpus:decisions:write"),
+        )
+        try:
+            r2 = client.post(
+                "/memory/semantic",
+                json={
+                    "collection": "decisions",
+                    "document_id": "choke-authorized",
+                    "text": "v2 revised",
+                    "tier": "corpus",
+                },
+            )
+            assert r2.status_code == 200, r2.text
+        finally:
+            client.app.dependency_overrides.clear()
+
+        docs = [
+            d.page_content
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-authorized"
+        ]
+        assert docs == ["v2 revised"]
+
+    # ── /memory/semantic delete ─────────────────────────────────────────
+
+    def test_semantic_delete_denied_leaves_manifest_and_chroma_content_intact(
+        self, client: TestClient
+    ) -> None:
+        from audittrace.dependencies import get_semantic_service
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-delete",
+                "text": "shared decision",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        _override_identity(client, "attacker-choke-delete", ("memory:semantic:write",))
+        try:
+            r2 = client.delete("/memory/semantic/decisions/choke-delete")
+            assert r2.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        # Not tombstoned, and the ChromaDB document is still present.
+        docs = [
+            d.page_content
+            for d in get_semantic_service()._docs.get("decisions", [])
+            if d.metadata.get("document_id") == "choke-delete"
+        ]
+        assert docs == ["shared decision"]
+
+    def test_delete_handlers_call_authorize_write(self, client: TestClient) -> None:
+        """The delete path never had the content-lands-before-manifest
+        ordering bug (soft-delete only ever touches the manifest row —
+        ``record_delete``'s own guard already fully protects it, proven
+        in the prior pass), so neutering ``authorize_write`` alone can't
+        show a red/green delta for delete (defense-in-depth: the second
+        layer still catches it). This proves the choke is nonetheless
+        genuinely WIRED IN at the top of the delete handlers, per the
+        ratified spec's explicit call-site list — a spy on the real
+        implementation, not a mock that could hide a missing call."""
+        from unittest.mock import AsyncMock, patch
+
+        import audittrace.services.memory_manifest as manifest_module
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-delete-wiring",
+                "text": "shared decision",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        real_authorize_write = manifest_module.authorize_write
+        spy = AsyncMock(side_effect=real_authorize_write)
+        with patch("audittrace.routes.memory.authorize_write", spy):
+            r2 = client.delete("/memory/semantic/decisions/choke-delete-wiring")
+        assert r2.status_code == 200, r2.text
+        spy.assert_awaited_once()
+        _, kwargs = spy.await_args
+        assert kwargs.get("requested_tier", "private") == "private"
+        assert spy.await_args.args[2] == "semantic"
+        assert spy.await_args.args[3] == "decisions/choke-delete-wiring"
+
+    def test_semantic_create_ordering_upsert_never_called_on_refusal(
+        self, client: TestClient
+    ) -> None:
+        """Ordering proof (route level): authorization precedes the
+        ChromaDB write — ``service.upsert`` is never awaited for a
+        refused create, not called-then-discarded."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        r = client.post(
+            "/memory/semantic",
+            json={
+                "collection": "decisions",
+                "document_id": "choke-ordering",
+                "text": "shared decision",
+                "tier": "corpus",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        upsert_spy = AsyncMock()
+        mock_service = MagicMock()
+        mock_service.upsert = upsert_spy
+
+        _override_identity(client, "attacker-ordering", ("memory:semantic:write",))
+        try:
+            with patch(
+                "audittrace.routes.memory.get_semantic_service",
+                return_value=mock_service,
+            ):
+                r2 = client.post(
+                    "/memory/semantic",
+                    json={
+                        "collection": "decisions",
+                        "document_id": "choke-ordering",
+                        "text": "attacker payload",
+                    },
+                )
+            assert r2.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+        upsert_spy.assert_not_called()
+
+
 class TestSemanticCorpusReadGate:
     """ADR-062 Phase B (WU-B4, D3) — reading CORPUS content through the
     ``/memory/semantic`` backoffice requires
@@ -5928,6 +7166,10 @@ class TestPdfManifestColumnsLive:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -6000,6 +7242,10 @@ class TestPdfManifestColumnsLive:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -6078,6 +7324,71 @@ class TestPdfFlushManifest:
         )
         manifest.upsert_pdf_metadata.assert_called_once()
 
+    async def test_manifest_authorization_error_is_not_swallowed(
+        self,
+    ) -> None:
+        """SPEC security-memory-write-authorization-choke (2026-08-30) —
+        SUPERSEDES the manifest-only fix: ``ManifestAuthorizationError``
+        must now PROPAGATE (never be swallowed as a WARNING + implicit
+        success) so a missed call site still surfaces as a 403, not a
+        silent partial write. FALSIFIABLE: revert to a bare
+        ``except Exception`` (dropping the ``except
+        ManifestAuthorizationError: raise`` clause) and this test goes
+        RED (no exception raised); restore it and it's GREEN."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest
+        from audittrace.services.memory_manifest import ManifestAuthorizationError
+
+        manifest = MagicMock()
+        manifest.upsert_pdf_metadata = AsyncMock(
+            side_effect=ManifestAuthorizationError("denied")
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await _flush_pdf_manifest(
+                manifest_service=manifest,
+                layer="episodic",
+                key="x.pdf",
+                user_id="attacker",
+                size_bytes=100,
+                page_count=1,
+                signature_status="check_skipped",
+                ocr_coverage_pct=None,
+                attachment_count=0,
+                form_field_count=0,
+                extraction_warnings=[],
+                document_sha256="hash",
+                caller_can_write_shared=False,
+            )
+        manifest.upsert_pdf_metadata.assert_called_once()
+
+    async def test_caller_can_write_shared_threaded_through(self) -> None:
+        """``caller_can_write_shared`` defaults ``False`` (fail-closed) and
+        is forwarded verbatim to ``upsert_pdf_metadata``."""
+        from unittest.mock import MagicMock
+
+        from audittrace.routes.memory import _flush_pdf_manifest
+
+        manifest = MagicMock()
+        manifest.upsert_pdf_metadata = AsyncMock()
+        await _flush_pdf_manifest(
+            manifest_service=manifest,
+            layer="episodic",
+            key="x.pdf",
+            user_id="curator",
+            size_bytes=100,
+            page_count=1,
+            signature_status="check_skipped",
+            ocr_coverage_pct=None,
+            attachment_count=0,
+            form_field_count=0,
+            extraction_warnings=[],
+            document_sha256="hash",
+            caller_can_write_shared=True,
+        )
+        _, kwargs = manifest.upsert_pdf_metadata.call_args
+        assert kwargs["caller_can_write_shared"] is True
+
 
 class TestFlushMdManifestHelper:
     """ADR-059 WU-1c — ``memory_md_manifest._flush_md_manifest`` resilience,
@@ -6144,7 +7455,70 @@ class TestFlushMdManifestHelper:
             size_bytes=57,
             user_id="fleet-service-0b0cdd4d",
             tier="private",
+            caller_can_write_shared=False,
         )
+
+    async def test_caller_can_write_shared_threaded_through(self) -> None:
+        """SPEC security-memory-manifest-tier-authz (2026-08-30) —
+        ``caller_can_write_shared`` defaults ``False`` (fail-closed) and
+        is forwarded verbatim to ``record_create`` when the caller passes
+        ``True``."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock()
+        await _flush_md_manifest(
+            manifest,
+            keys=["decisions/chunk-0"],
+            filename="x.md",
+            sizes_bytes=[10],
+            user_id="curator",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+        manifest.record_create.assert_awaited_once_with(
+            layer="semantic",
+            key="decisions/chunk-0",
+            title="x.md",
+            size_bytes=10,
+            user_id="curator",
+            tier="corpus",
+            caller_can_write_shared=True,
+        )
+
+    async def test_manifest_authorization_error_is_not_swallowed(
+        self,
+    ) -> None:
+        """SPEC security-memory-write-authorization-choke (2026-08-30) —
+        SUPERSEDES the manifest-only fix: ``ManifestAuthorizationError``
+        must now PROPAGATE (never be swallowed as a WARNING + implicit
+        success) so a missed call site still surfaces as a 403, not a
+        silent partial write. FALSIFIABLE: revert to a bare
+        ``except Exception`` (dropping the ``except
+        ManifestAuthorizationError: raise`` clause) and this test goes
+        RED (no exception raised); restore it and it's GREEN."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from audittrace.routes.memory_md_manifest import _flush_md_manifest
+        from audittrace.services.memory_manifest import ManifestAuthorizationError
+
+        manifest = MagicMock()
+        manifest.record_create = AsyncMock(
+            side_effect=ManifestAuthorizationError("denied")
+        )
+        with pytest.raises(ManifestAuthorizationError):
+            await _flush_md_manifest(
+                manifest,
+                keys=["decisions/chunk-0"],
+                filename="x.md",
+                sizes_bytes=[10],
+                user_id="attacker",
+                tier="corpus",
+                caller_can_write_shared=False,
+            )
+        manifest.record_create.assert_awaited_once()
 
 
 # ── Tier-C: PDF document metadata + corruption taxonomy + per-doc audit (ADR-056) ──
@@ -6735,6 +8109,10 @@ class TestPdfIndexDryRun:
         fake_pymupdf.open.return_value = fake_doc
 
         mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -6796,8 +8174,9 @@ class TestPdfIndexCorruptionExceptionPath:
     direct unit test to exercise the exception branch."""
 
     async def test_pymupdf_raise_is_classified_and_flushed(self) -> None:
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import AsyncMock, MagicMock, patch
 
+        from audittrace.identity import UserContext
         from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
 
         raw_bytes = b"%PDF-1.4 garbage-pretending-to-be-pdf"
@@ -6815,6 +8194,13 @@ class TestPdfIndexCorruptionExceptionPath:
         mock_collection = AsyncMock()
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke now looks up the existing row before anything
+        # else runs; no existing row -> the new-private-item write passes.
+        mock_manifest.get = AsyncMock(return_value=None)
+        user = UserContext(
+            user_id="u1", username="u1", agent_type="test", scopes=(), is_admin=False
+        )
 
         details_log: list[dict] = []
 
@@ -6829,6 +8215,7 @@ class TestPdfIndexCorruptionExceptionPath:
                 layer_prefix="episodic/",
                 user_id="u1",
                 ingestion_ts_ms=0,
+                user=user,
                 manifest_service=mock_manifest,
                 details_log=details_log,
                 dry_run=False,
@@ -6901,6 +8288,7 @@ class TestPdfIndexOrchestratorEdgePaths:
         """
         from unittest.mock import AsyncMock, MagicMock, patch
 
+        from audittrace.identity import UserContext
         from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
 
         mock_minio = MagicMock()
@@ -6911,6 +8299,9 @@ class TestPdfIndexOrchestratorEdgePaths:
         mock_collection = AsyncMock()
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
+        user = UserContext(
+            user_id="u1", username="u1", agent_type="test", scopes=(), is_admin=False
+        )
         details_log: list[dict] = []
 
         with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
@@ -6926,6 +8317,7 @@ class TestPdfIndexOrchestratorEdgePaths:
                 layer_prefix="episodic/",
                 user_id="u1",
                 ingestion_ts_ms=0,
+                user=user,
                 manifest_service=mock_manifest,
                 details_log=details_log,
                 dry_run=False,
@@ -6955,6 +8347,7 @@ class TestPdfIndexOrchestratorEdgePaths:
         """
         from unittest.mock import AsyncMock, MagicMock, patch
 
+        from audittrace.identity import UserContext
         from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
 
         raw_bytes = b"%PDF-1.4 fake-content"
@@ -6978,6 +8371,10 @@ class TestPdfIndexOrchestratorEdgePaths:
         mock_collection = AsyncMock()
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
+        mock_manifest.get = AsyncMock(return_value=None)
+        user = UserContext(
+            user_id="u1", username="u1", agent_type="test", scopes=(), is_admin=False
+        )
         upsert_spy = AsyncMock()
         details_log: list[dict] = []
 
@@ -6995,6 +8392,7 @@ class TestPdfIndexOrchestratorEdgePaths:
                 layer_prefix="episodic/",
                 user_id="u1",
                 ingestion_ts_ms=1234,
+                user=user,
                 manifest_service=mock_manifest,
                 details_log=details_log,
                 dry_run=False,
@@ -7029,6 +8427,7 @@ class TestPdfIndexOrchestratorEdgePaths:
         """
         from unittest.mock import AsyncMock, MagicMock, patch
 
+        from audittrace.identity import UserContext
         from audittrace.routes.memory_pdf.pipeline import _index_pdf_objects
 
         raw_bytes = b"%PDF-1.4 empty-page-tree"
@@ -7045,6 +8444,10 @@ class TestPdfIndexOrchestratorEdgePaths:
         mock_collection = AsyncMock()
         mock_manifest = MagicMock()
         mock_manifest.upsert_pdf_metadata = AsyncMock()
+        mock_manifest.get = AsyncMock(return_value=None)
+        user = UserContext(
+            user_id="u1", username="u1", agent_type="test", scopes=(), is_admin=False
+        )
         details_log: list[dict] = []
 
         with patch.dict("sys.modules", {"pymupdf": fake_pymupdf}):
@@ -7058,6 +8461,7 @@ class TestPdfIndexOrchestratorEdgePaths:
                 layer_prefix="episodic/",
                 user_id="u1",
                 ingestion_ts_ms=0,
+                user=user,
                 manifest_service=mock_manifest,
                 details_log=details_log,
                 dry_run=False,
@@ -7118,6 +8522,13 @@ class TestPdfIndexDetailsResponseShape:
         fake_pymupdf = MagicMock()
         fake_pymupdf.open.return_value = fake_doc
 
+        mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-corpus-item write (bulk mode,
+        # admin) passes.
+        mock_manifest.get = AsyncMock(return_value=None)
+
         with (
             patch(
                 "audittrace.routes.memory._get_minio_client", return_value=mock_minio
@@ -7125,7 +8536,7 @@ class TestPdfIndexDetailsResponseShape:
             patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
             patch(
                 "audittrace.routes.memory.get_memory_manifest_service",
-                return_value=MagicMock(),
+                return_value=mock_manifest,
             ),
             patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
         ):
@@ -7191,6 +8602,13 @@ class TestPdfIndexDetailsResponseShape:
         fake_pymupdf = MagicMock()
         fake_pymupdf.open.return_value = fake_doc
 
+        mock_manifest = MagicMock()
+        # SPEC security-memory-write-authorization-choke (2026-08-30): the
+        # pre-write choke looks up the existing row before anything else
+        # runs; no existing row -> the new-corpus-item write (bulk mode,
+        # admin) passes.
+        mock_manifest.get = AsyncMock(return_value=None)
+
         with (
             patch(
                 "audittrace.routes.memory._get_minio_client", return_value=mock_minio
@@ -7198,7 +8616,7 @@ class TestPdfIndexDetailsResponseShape:
             patch("audittrace.routes.memory.get_chromadb", return_value=mock_chroma),
             patch(
                 "audittrace.routes.memory.get_memory_manifest_service",
-                return_value=MagicMock(),
+                return_value=mock_manifest,
             ),
             patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
         ):

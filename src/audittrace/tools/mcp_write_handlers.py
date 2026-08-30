@@ -76,6 +76,10 @@ from typing import Any
 from audittrace.dependencies import get_memory_manifest_service, get_semantic_service
 from audittrace.identity import UserContext
 from audittrace.services.memory_audit import emit_memory_audit_event
+from audittrace.services.memory_manifest import (
+    ManifestAuthorizationError,
+    authorize_write,
+)
 from audittrace.tools.mcp_write_registry import register_mcp_write_tool
 
 logger = logging.getLogger(__name__)
@@ -115,6 +119,34 @@ async def _write_semantic_document(
     if title is not None and not isinstance(title, str):
         return {"error": "title must be a string if provided"}
     metadata = _sanitize_metadata(clean_args.get("metadata"))
+    key = f"{collection}/{document_id}"
+
+    manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) —
+    # SUPERSEDES relying on record_create's own guard alone. The PRE-WRITE
+    # choke, BEFORE the ChromaDB upsert below — this tool is private-tier
+    # ONLY (the module docstring: "an MCP write tool never accepts a
+    # caller-supplied tier"), and ``document_id`` is literally
+    # caller-chosen, so a base-scope caller could otherwise pick an ID
+    # that collides with an EXISTING corpus item and have their content
+    # land in ChromaDB before the (previously best-effort, now
+    # non-swallowing) manifest guard ever ran.
+    try:
+        await authorize_write(manifest, user_context, "semantic", key)
+    except ManifestAuthorizationError as exc:
+        logger.info(
+            "mcp write tool denied — existing corpus row collection=%s "
+            "document_id=%s: %s",
+            collection,
+            document_id,
+            exc,
+        )
+        return {
+            "error": (
+                "cannot write: an existing shared corpus item already "
+                "owns this document_id"
+            )
+        }
 
     service = get_semantic_service()
     try:
@@ -129,15 +161,33 @@ async def _write_semantic_document(
         )
         return {"error": f"{exc.__class__.__name__}: write failed"}
 
-    manifest = get_memory_manifest_service()
-    entry = await manifest.record_create(
-        layer="semantic",
-        key=f"{collection}/{document_id}",
-        title=title,
-        size_bytes=len(text.encode("utf-8")),
-        user_id=user_context.user_id,
-        tier="private",
-    )
+    try:
+        # ``caller_can_write_shared`` is deliberately OMITTED (defaults
+        # False): the manifest-layer DEFENSE-IN-DEPTH guard behind the
+        # authorize_write choke above — kept for the same reasons, belt
+        # and suspenders.
+        entry = await manifest.record_create(
+            layer="semantic",
+            key=key,
+            title=title,
+            size_bytes=len(text.encode("utf-8")),
+            user_id=user_context.user_id,
+            tier="private",
+        )
+    except ManifestAuthorizationError as exc:
+        logger.info(
+            "mcp write tool denied — existing corpus row collection=%s "
+            "document_id=%s: %s",
+            collection,
+            document_id,
+            exc,
+        )
+        return {
+            "error": (
+                "cannot write: an existing shared corpus item already "
+                "owns this document_id"
+            )
+        }
 
     try:
         await emit_memory_audit_event(

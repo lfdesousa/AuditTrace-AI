@@ -32,16 +32,22 @@ is now effectively a fallback for legacy pre-fix rows that were never
 manifest-tracked: any row a manifest entry already covers is skipped there
 via the existing ``known_keys`` dedup.
 
-Best-effort, same contract as ``_flush_pdf_manifest``: a Postgres failure
-logs a warning and does not fail the index call — the ChromaDB chunk has
+Best-effort for ordinary (e.g. Postgres connectivity) failures: a warning
+is logged and the index call does not fail — the ChromaDB chunk has
 already landed, and audit-trail resiliency (surface it, don't 500) takes
-precedence over strict manifest consistency.
+precedence over strict manifest consistency. **NOT** best-effort for
+:class:`~audittrace.services.memory_manifest.ManifestAuthorizationError`
+(SPEC security-memory-write-authorization-choke, 2026-08-30) — see this
+module's ``_flush_md_manifest`` docstring for why that one specific
+failure must propagate instead of being swallowed.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+
+from audittrace.services.memory_manifest import ManifestAuthorizationError
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,7 @@ async def _flush_md_manifest(
     sizes_bytes: list[int],
     user_id: str,
     tier: str,
+    caller_can_write_shared: bool = False,
 ) -> None:
     """Best-effort manifest row per folded ``.md`` chunk (ADR-059 WU-1c).
 
@@ -73,6 +80,26 @@ async def _flush_md_manifest(
     not hard). *keys* and *sizes_bytes* must be the same length — one
     entry per chunk, in the same order (both derived from the same
     ``chunks`` list at the call site).
+
+    *caller_can_write_shared* — forwarded to ``record_create`` as its
+    fail-closed (default ``False``) shared-write authorization (the
+    manifest-layer DEFENSE-IN-DEPTH guard).
+
+    **``ManifestAuthorizationError`` is NOT swallowed** (SPEC security-
+    memory-write-authorization-choke, 2026-08-30 — SUPERSEDES the prior
+    behavior, where it was). Three independent reviews proved that a
+    silent WARNING + implicit-200 here is itself the vulnerability: the
+    ChromaDB chunk this manifest row is supposed to audit had ALREADY
+    landed by the time this function runs (see the call site,
+    ``routes/memory.py::_index_md_objects``), so on the primary
+    ``authorize_write`` pre-write choke this specific error should never
+    actually reach here on an unauthorized request — but if it ever does
+    (a missed call site, a future refactor), it MUST surface loudly as a
+    403, not a swallowed warning masking a poisoned write. Every OTHER
+    exception (e.g. a genuine Postgres outage) is still caught and
+    logged — the ChromaDB write already landed and is not rolled back
+    either way, so a non-authorization manifest failure staying
+    best-effort is unchanged.
     """
     if manifest_service is None:
         return
@@ -85,7 +112,10 @@ async def _flush_md_manifest(
                 size_bytes=size_bytes,
                 user_id=user_id,
                 tier=tier,
+                caller_can_write_shared=caller_can_write_shared,
             )
+        except ManifestAuthorizationError:
+            raise
         except Exception as exc:
             logger.warning(
                 "Failed to write .md manifest row for semantic/%s: %s",

@@ -391,8 +391,10 @@ class TestDefaultIndexerRouting:
             layer_prefix,
             user_id,
             ingestion_ts_ms,
+            user,
             manifest_service,
             outcomes=None,
+            caller_can_write_shared=False,
         ):
             assert collection is chroma_collection
             assert minio is minio_client
@@ -404,6 +406,19 @@ class TestDefaultIndexerRouting:
             assert category == "episodic"
             assert layer_prefix == "episodic/"
             assert user_id == "alice"
+            # SPEC security-memory-manifest-tier-authz (2026-08-30): the
+            # auto-index outbox worker is a SYSTEM writer — it always
+            # passes ``caller_can_write_shared=True`` so a legitimate
+            # re-index of an already-corpus-tier PDF row keeps working
+            # (never gains a demote bypass — see ``default_indexer``'s
+            # inline comment).
+            assert caller_can_write_shared is True
+            # SPEC security-memory-write-authorization-choke (2026-08-30):
+            # the PRIMARY enforcement — the system worker passes a
+            # trusted, always-authorized identity into the pre-write
+            # choke rather than bypassing it.
+            assert user.is_admin is True
+            assert user.user_id == "alice"
             if outcomes is not None:
                 outcomes.append(True)
             return 3

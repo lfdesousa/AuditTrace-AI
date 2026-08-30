@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select, update
 
 from audittrace.db.models import MemoryItem
+from audittrace.identity import UserContext
 from audittrace.routes.memory_pdf.classification import (
     PERMANENT_INDEX_FAILURE_CODES,
 )
@@ -131,6 +132,23 @@ async def default_indexer(envelope: IndexRequestEnvelope, settings: Settings) ->
     )
     layer_prefix = envelope.key.split("/", 1)[0] + "/"
     outcomes: list[bool] = []
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — this
+    # worker is a SYSTEM writer, not a live caller-scoped request: it only
+    # ever drains an envelope the scan-verdict pipeline itself enqueued off
+    # an ALREADY-authorized upload+scan (never reachable by an arbitrary
+    # attacker directly), so it PASSES the pre-write choke as authorized
+    # (``is_admin=True``) rather than bypassing it — ``authorize_write`` is
+    # still called (inside ``_index_pdf_objects``), it just always
+    # succeeds for this identity. Scoped to THIS call only; never exposed
+    # outside this function, never used for audit stamping (``user_id=``
+    # below still carries the real ``envelope.user_id``).
+    system_user = UserContext(
+        user_id=envelope.user_id,
+        username=envelope.user_id,
+        agent_type="system",
+        scopes=(),
+        is_admin=True,
+    )
     await _index_pdf_objects(
         collection,
         _get_minio_client(),
@@ -141,8 +159,18 @@ async def default_indexer(envelope: IndexRequestEnvelope, settings: Settings) ->
         layer_prefix=layer_prefix,
         user_id=envelope.user_id,
         ingestion_ts_ms=_now_ms(),
+        user=system_user,
         manifest_service=get_memory_manifest_service(),
         outcomes=outcomes,
+        # SPEC security-memory-manifest-tier-authz (2026-08-30) — the
+        # manifest-layer DEFENSE-IN-DEPTH guard (same trusted-system
+        # rationale as ``system_user`` above): it never gains a DEMOTE
+        # bypass because ``upsert_pdf_metadata`` never reassigns
+        # ``tier``/``created_by_user_id`` on an existing row in the first
+        # place — this flag only lets it PASS the corpus-overwrite guard
+        # on metadata fields, same "preserve tier/owner on legitimate
+        # re-index" contract as an authorized human caller gets.
+        caller_can_write_shared=True,
     )
     return bool(outcomes) and outcomes[-1]
 

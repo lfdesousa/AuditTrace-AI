@@ -92,7 +92,11 @@ from audittrace.services.memory_audit import (
     emit_memory_audit_event,
     schedule_read_audit,
 )
-from audittrace.services.memory_manifest import ManifestEntry
+from audittrace.services.memory_manifest import (
+    ManifestAuthorizationError,
+    ManifestEntry,
+    authorize_write,
+)
 from audittrace.services.pagination import sort_and_paginate as _core_sort_and_paginate
 from audittrace.services.procedural import ProceduralService
 from audittrace.services.recall_telemetry import (
@@ -335,6 +339,40 @@ def _require_corpus_scope(user: UserContext, collection: str, action: str) -> No
         status_code=403,
         detail=f"Required scope: {required} (or audittrace:admin)",
     )
+
+
+def _corpus_write_authorized(user: UserContext, collection: str | None) -> bool:
+    """``True`` iff *user* may overwrite/demote an EXISTING **corpus**-tier
+    manifest row — the ``caller_can_write_shared`` authorization
+    ``MemoryManifestService.record_create``/``record_update`` require to
+    touch such a row (SPEC security-memory-manifest-tier-authz,
+    2026-08-30).
+
+    ``collection`` is one of the three ADR-062 §4 corpus-scoped ChromaDB
+    collections (``decisions``/``skills``/``semantic``) for ``/memory/
+    semantic`` writes — delegates to ``_has_corpus_scope`` for the exact
+    per-collection grant (or admin). ``None`` is passed for the episodic/
+    procedural layers, which have NO ``memory:corpus:<layer>:write`` scope
+    declared at all (the module note above ``_has_corpus_scope`` — the
+    closed scope set is exactly the three collections above); for those
+    layers only an admin (``audittrace:admin`` or ``is_admin``) can ever
+    satisfy this — matching that no ordinary caller can hold a shared-
+    write grant that does not exist.
+    """
+    if collection is None:
+        return user.is_admin or "audittrace:admin" in user.scopes
+    return _has_corpus_scope(user, collection, "write")
+
+
+def _raise_manifest_authorization_as_403(
+    exc: ManifestAuthorizationError,
+) -> HTTPException:
+    """Map :class:`ManifestAuthorizationError` to the route-layer HTTP 403
+    every other authorization failure in this file uses — never let it
+    fall through to the generic 500 handler (SPEC security-memory-
+    manifest-tier-authz, 2026-08-30, invariant #4: fail-closed, RAISE, not
+    a silent overwrite AND not an opaque 500)."""
+    return HTTPException(status_code=403, detail=str(exc))
 
 
 def _resolve_requested_tier(payload: dict[str, Any] | None, promote: str | None) -> str:
@@ -733,8 +771,10 @@ async def _index_md_objects(
     category: str,
     user_id: str,
     tier: str,
+    user: UserContext,
     outcomes: list[bool] | None = None,
     manifest_service: Any | None = None,
+    caller_can_write_shared: bool = False,
 ) -> int:
     """Stream-index ``.md`` files into *collection*.
 
@@ -761,6 +801,25 @@ async def _index_md_objects(
     ``created_at_ms``-ordered manifest scan instead of relying solely on
     the capped, non-recency-ordered ``col.get()`` discovery fallback. See
     the module docstring on ``memory_md_manifest`` for the full story.
+
+    *caller_can_write_shared* — threaded straight through to
+    ``memory_md_manifest._flush_md_manifest``'s ``record_create`` call
+    (the manifest-layer guard, DEFENSE-IN-DEPTH behind *user* below).
+
+    *user* (SPEC security-memory-write-authorization-choke, 2026-08-30 —
+    SUPERSEDES relying on the manifest-layer guard alone) — the PRIMARY
+    enforcement. Before EACH file's ``_upsert_in_batches`` ChromaDB write,
+    every chunk's destination key is checked via
+    ``authorize_write(manifest_service, user, ...)``: content-address
+    collisions are attacker-computable (the doc id is a deterministic hash
+    of collection+filename+chunk index — "corpus is discoverable by
+    design"), so a caller whose SOURCE object is legitimately private-tier
+    can still target an EXISTING corpus-tier ChromaDB row by choosing a
+    colliding filename. This is the exact vulnerability three independent
+    reviews found: the manifest-layer guard alone fires only AFTER the
+    ChromaDB write already landed, and the flush helper used to swallow
+    the resulting error (WARNING + 200). Raises before any byte of THIS
+    file's chunks reaches ChromaDB — never a partial write.
     """
     total = 0
     for obj in objects:
@@ -827,6 +886,23 @@ async def _index_md_objects(
             skill_name = obj["filename"].replace("SKILL-", "").replace(".md", "")
             for m in metadatas:
                 m["skill"] = skill_name
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRIMARY pre-write choke, BEFORE the ChromaDB upsert two lines
+        # below. Every chunk this file would land at is checked; the first
+        # unauthorized one aborts the WHOLE file's upsert (never a partial
+        # write). ``manifest_service is None`` only ever happens in a unit
+        # test that deliberately omits it to exercise something else — see
+        # ``_flush_md_manifest``'s own None-skip contract; production
+        # always resolves a real manifest service.
+        if manifest_service is not None:
+            for doc_id in ids:
+                await authorize_write(
+                    manifest_service,
+                    user,
+                    "semantic",
+                    _semantic_key(col_name, doc_id),
+                    requested_tier=tier,
+                )
         await _upsert_in_batches(collection, ids, chunks, metadatas)
         total += len(chunks)
         # ADR-059 WU-1c — thread the manifest write (see this function's
@@ -842,6 +918,7 @@ async def _index_md_objects(
             sizes_bytes=[len(c.encode("utf-8")) for c in chunks],
             user_id=user_id,
             tier=tier,
+            caller_can_write_shared=caller_can_write_shared,
         )
     return total
 
@@ -987,6 +1064,33 @@ async def index_memory(
             ),
         )
 
+    # SPEC security-memory-manifest-tier-authz (2026-08-30) — close the
+    # index-route gate: ``_require_layer_write``/the single-file-mode check
+    # above only enforces BASE ``memory:<layer>:write``, regardless of the
+    # tier the ``?file=`` key resolved to. Before this, a base-scope caller
+    # could ``POST /memory/index?file=<corpus-prefixed-key>`` (tier resolved
+    # "corpus" above) and reach the manifest choke unauthorized — the
+    # manifest-level guard (``upsert_pdf_metadata``/``_flush_md_manifest``)
+    # is a best-effort SWALLOW there (never blows up the index call), so on
+    # its own it degrades a hijack attempt into "silent no-op", not the
+    # explicit 403 a caller deserves. Bulk mode is unaffected (`tier` stays
+    # "corpus" but ``_require_admin`` already ran above, and admin always
+    # satisfies ``_corpus_write_authorized``). Fail-closed: refuse rather
+    # than allow when this is ambiguous.
+    if tier == "corpus":
+        unauthorized_collections = [
+            c for c in target_collections if not _corpus_write_authorized(user, c)
+        ]
+        if unauthorized_collections:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Required scope: memory:corpus:<collection>:write (or "
+                    "audittrace:admin) to index into an existing corpus-tier "
+                    f"target — missing for: {sorted(unauthorized_collections)!r}"
+                ),
+            )
+
     settings = get_settings()
     # ADR-006 — effective bucket switches between MinIO (default) and
     # AWS S3 based on AUDITTRACE_OBJECT_STORAGE_BACKEND. The minio
@@ -1118,73 +1222,100 @@ async def index_memory(
         )
 
         chunk_count = 0
-        if col_name in ("decisions", "semantic"):
-            chunk_count += await _index_md_objects(
-                collection,
-                minio_client,
-                bucket,
-                episodic_objects,
-                col_name,
-                category="episodic",
-                user_id=user.user_id,
-                tier=tier,
-                outcomes=object_outcomes,
-                manifest_service=manifest_service,
-            )
-        if col_name in ("skills", "semantic"):
-            chunk_count += await _index_md_objects(
-                collection,
-                minio_client,
-                bucket,
-                procedural_objects,
-                col_name,
-                category="procedural",
-                user_id=user.user_id,
-                tier=tier,
-                outcomes=object_outcomes,
-                manifest_service=manifest_service,
-            )
-        if col_name == "ai_research_papers":
-            # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
-            # the manifest service AND the per-document details
-            # accumulator AND the dry-run flag. The manifest service
-            # writes Postgres rows (skipped under dry_run); the details
-            # accumulator collects per-doc outcomes for the
-            # ?details=true response shape. ``outcomes`` (#430 v3) is the
-            # separate, ALWAYS-populated per-object ok/reject signal the
-            # loud-422 guard below reads. (ADR-059 WU-1c: ``manifest_service``
-            # is now resolved once, above the ``for col_name`` loop, and
-            # shared with the ``.md`` path too — no longer re-fetched here.)
-            chunk_count += await _index_pdf_objects(
-                collection,
-                minio_client,
-                bucket,
-                episodic_objects,
-                col_name,
-                category="episodic",
-                layer_prefix="episodic/",
-                user_id=user.user_id,
-                ingestion_ts_ms=ingestion_ts_ms,
-                manifest_service=manifest_service,
-                details_log=details_log,
-                dry_run=dry_run,
-                outcomes=object_outcomes,
-            )
-            chunk_count += await _index_pdf_objects(
-                collection,
-                minio_client,
-                bucket,
-                procedural_objects,
-                col_name,
-                category="procedural",
-                layer_prefix="procedural/",
-                user_id=user.user_id,
-                ingestion_ts_ms=ingestion_ts_ms,
-                manifest_service=manifest_service,
-                details_log=details_log,
-                dry_run=dry_run,
-                outcomes=object_outcomes,
-            )
+        # SPEC security-memory-write-authorization-choke (2026-08-30) —
+        # SUPERSEDES the manifest-only fix. ``col_caller_can_write_shared``
+        # (the manifest-layer DEFENSE-IN-DEPTH guard, unchanged) is still
+        # threaded through; PRIMARY enforcement is now ``user`` itself,
+        # threaded into ``_index_md_objects``/``_index_pdf_objects`` so
+        # EACH file's ``authorize_write`` pre-write choke runs before its
+        # ChromaDB upsert — not only before the (best-effort, no-longer-
+        # swallowing) manifest write after it.
+        col_caller_can_write_shared = _corpus_write_authorized(user, col_name)
+        # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+        # PRE-WRITE choke (``authorize_write``, called inside
+        # ``_index_md_objects``/``_index_pdf_objects`` below) raises
+        # ManifestAuthorizationError; map it to 403 HERE at the route, since
+        # the index helpers are route-agnostic (also called by the
+        # non-HTTP auto-index worker) and must not raise HTTPException
+        # themselves.
+        try:
+            if col_name in ("decisions", "semantic"):
+                chunk_count += await _index_md_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    episodic_objects,
+                    col_name,
+                    category="episodic",
+                    user_id=user.user_id,
+                    tier=tier,
+                    user=user,
+                    outcomes=object_outcomes,
+                    manifest_service=manifest_service,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+            if col_name in ("skills", "semantic"):
+                chunk_count += await _index_md_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    procedural_objects,
+                    col_name,
+                    category="procedural",
+                    user_id=user.user_id,
+                    tier=tier,
+                    user=user,
+                    outcomes=object_outcomes,
+                    manifest_service=manifest_service,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+            if col_name == "ai_research_papers":
+                # Tier-B item #22 + tier-C items #23/#24 (ADR-056): thread
+                # the manifest service AND the per-document details
+                # accumulator AND the dry-run flag. The manifest service
+                # writes Postgres rows (skipped under dry_run); the details
+                # accumulator collects per-doc outcomes for the
+                # ?details=true response shape. ``outcomes`` (#430 v3) is the
+                # separate, ALWAYS-populated per-object ok/reject signal the
+                # loud-422 guard below reads. (ADR-059 WU-1c: ``manifest_service``
+                # is now resolved once, above the ``for col_name`` loop, and
+                # shared with the ``.md`` path too — no longer re-fetched here.)
+                chunk_count += await _index_pdf_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    episodic_objects,
+                    col_name,
+                    category="episodic",
+                    layer_prefix="episodic/",
+                    user_id=user.user_id,
+                    ingestion_ts_ms=ingestion_ts_ms,
+                    user=user,
+                    manifest_service=manifest_service,
+                    details_log=details_log,
+                    dry_run=dry_run,
+                    outcomes=object_outcomes,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+                chunk_count += await _index_pdf_objects(
+                    collection,
+                    minio_client,
+                    bucket,
+                    procedural_objects,
+                    col_name,
+                    category="procedural",
+                    layer_prefix="procedural/",
+                    user_id=user.user_id,
+                    ingestion_ts_ms=ingestion_ts_ms,
+                    user=user,
+                    manifest_service=manifest_service,
+                    details_log=details_log,
+                    dry_run=dry_run,
+                    outcomes=object_outcomes,
+                    caller_can_write_shared=col_caller_can_write_shared,
+                )
+        except ManifestAuthorizationError as exc:
+            raise _raise_manifest_authorization_as_403(exc) from exc
 
         results[col_name] = chunk_count
         total_chunks += chunk_count
@@ -1359,20 +1490,34 @@ async def create_episodic(
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, checked BEFORE any content lands (S3 write below).
+    # Supersedes relying on record_create's own guard alone, which only
+    # fires AFTER the content write on other paths (this route never had
+    # that ordering bug, but every content-write entry point now calls
+    # the same choke uniformly per the ratified spec).
+    try:
+        await authorize_write(manifest, user, "episodic", filename, requested_tier=tier)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="episodic",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="episodic",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     # ADR-062 §5 (WU-A4) — write path, audited inline + awaited (fail-
     # closed: see services/memory_audit.py module docstring).
     await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
@@ -1654,6 +1799,12 @@ async def update_episodic(
     title = payload.get("title")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(manifest, user, "episodic", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -1667,6 +1818,7 @@ async def update_episodic(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1674,6 +1826,8 @@ async def update_episodic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="episodic", key=filename)
     return entry.to_dict()
 
@@ -1706,12 +1860,25 @@ async def delete_episodic(
         )
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete. Defense-in-depth ahead of
+    # record_delete's own guard (uniform enforcement point across every
+    # mutation, not just this route's create/update).
+    try:
+        await authorize_write(manifest, user, "episodic", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "episodic", filename, user.user_id
+            "episodic",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
@@ -1762,20 +1929,32 @@ async def create_procedural(
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(
+            manifest, user, "procedural", filename, requested_tier=tier
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="procedural",
-        key=filename,
-        title=title,
-        size_bytes=len(content.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="procedural",
+            key=filename,
+            title=title,
+            size_bytes=len(content.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
@@ -1873,6 +2052,12 @@ async def update_procedural(
     title = payload.get("title")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the S3 write below.
+    try:
+        await authorize_write(manifest, user, "procedural", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
@@ -1886,6 +2071,7 @@ async def update_procedural(
             size_bytes=len(content.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -1893,6 +2079,8 @@ async def update_procedural(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(user=user, op="write", layer="procedural", key=filename)
     return entry.to_dict()
 
@@ -1914,12 +2102,23 @@ async def delete_procedural(
         )
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete.
+    try:
+        await authorize_write(manifest, user, "procedural", filename)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "procedural", filename, user.user_id
+            "procedural",
+            filename,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, None),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete(user, filename)
@@ -1996,18 +2195,41 @@ async def create_semantic(
         _require_corpus_scope(user, collection, "write")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the ChromaDB write below. Semantic already
+    # gated the "requested tier=corpus" case above via
+    # _require_corpus_scope; this ALSO covers overwriting an EXISTING
+    # corpus-tier row when the caller requested private (the exploit
+    # class three reviews found on the .md/PDF index paths — this route
+    # was never actually vulnerable to it, since service.upsert only
+    # targets the tier-specific physical collection, but the choke is
+    # applied uniformly per the ratified spec).
+    try:
+        await authorize_write(
+            manifest,
+            user,
+            "semantic",
+            _semantic_key(collection, document_id),
+            requested_tier=tier,
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.upsert(user, collection, document_id, text, metadata, tier=tier)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    entry: ManifestEntry = await manifest.record_create(
-        layer="semantic",
-        key=_semantic_key(collection, document_id),
-        title=title,
-        size_bytes=len(text.encode("utf-8")),
-        user_id=user.user_id,
-        tier=tier,
-    )
+    try:
+        entry: ManifestEntry = await manifest.record_create(
+            layer="semantic",
+            key=_semantic_key(collection, document_id),
+            title=title,
+            size_bytes=len(text.encode("utf-8")),
+            user_id=user.user_id,
+            tier=tier,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
+        )
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(
         user=user,
         op="write",
@@ -2409,11 +2631,17 @@ async def update_semantic(
     title = payload.get("title")
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
+    key = _semantic_key(collection, document_id)
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the ChromaDB write below.
+    try:
+        await authorize_write(manifest, user, "semantic", key)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         await service.upsert(user, collection, document_id, text, metadata)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    key = _semantic_key(collection, document_id)
     try:
         entry: ManifestEntry = await manifest.record_update(
             layer="semantic",
@@ -2421,6 +2649,7 @@ async def update_semantic(
             size_bytes=len(text.encode("utf-8")),
             user_id=user.user_id,
             title=title,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(
@@ -2429,6 +2658,8 @@ async def update_semantic(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     await _emit_write_audit(
         user=user,
         op="write",
@@ -2459,12 +2690,23 @@ async def delete_semantic(
     service = get_semantic_service()
     manifest = get_memory_manifest_service()
     key = _semantic_key(collection, document_id)
+    # SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    # PRE-WRITE choke, before the soft-delete.
+    try:
+        await authorize_write(manifest, user, "semantic", key)
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     try:
         entry: ManifestEntry = await manifest.record_delete(
-            "semantic", key, user.user_id
+            "semantic",
+            key,
+            user.user_id,
+            caller_can_write_shared=_corpus_write_authorized(user, collection),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ManifestAuthorizationError as exc:
+        raise _raise_manifest_authorization_as_403(exc) from exc
     if hard:
         try:
             await service.delete_document(user, collection, document_id)
