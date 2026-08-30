@@ -2,12 +2,17 @@
 
 The M3 LibreChat console's Backend-for-Frontend sidecar (ADR-042 §5
 Option A — dedicated sidecar, as opposed to Option B, hosting BFF
-endpoints inside `audittrace-server` itself). Spec:
-`specs/2026-08-24-SPEC-m3-librechat-console.md` (WU-2 scope).
+endpoints inside `audittrace-server` itself). Specs:
+`specs/2026-08-24-SPEC-m3-librechat-console.md` (WU-2 scope, the chat
+path) and `specs/2026-08-30-SPEC-m3-souvenirs-sovereign-memory.md`
+(WU-D2-1, the memory-proxy path below).
 
 ## What it does
 
-On every request:
+Two proxy surfaces, both fail-closed through the SAME exchange choke —
+one confidential client, one audit boundary, for both chat and memory:
+
+**Chat — `POST /v1/chat/completions`:**
 
 1. Receives the per-user token LibreChat forwards (`Authorization: Bearer`).
 2. Validates it against the AuditTrace Keycloak realm's JWKS (signature,
@@ -18,8 +23,28 @@ On every request:
    audience so the result carries `aud=audittrace-server` +
    `audittrace:query` (that client's own `aud-audittrace-server`
    protocol mapper + default scope grant, shipped in WU-1).
-4. Proxies `POST /v1/chat/completions` to the orchestrator with the
-   minted token, streaming the response back byte-identical.
+4. Proxies to the orchestrator with the minted token, streaming the
+   response back byte-identical.
+
+**Memory (Souvenirs panel) — `GET/POST/PUT/DELETE /memory/{path}`
+(M3-WU-D2-1):**
+
+1. Same token extraction + JWKS validation as the chat path (step 1-2
+   above).
+2. RFC 8693 token-exchanges the SAME way, but requests the memory scope
+   set explicitly (`bff/memory_scopes.py::MEMORY_SCOPE_STRING` — the
+   four per-user-layer reads + the three writable-layer writes; NEVER
+   `audittrace:admin`) via the exchange's `scope=` parameter
+   (`bff/exchange.py::exchange_token`'s `requested_scope`). These
+   scopes are OPTIONAL (not default) on `audittrace-librechat`, so only
+   an exchange that asks for them by name gets them — the browser's own
+   login token never carries write access to the store.
+3. Proxies to the orchestrator's `/memory` API (`bff/memory_proxy.py`),
+   byte-faithfully and fail-closed: a 401/403/404 the orchestrator
+   returns is relayed as-is, never translated or retried with a
+   different credential. Isolation (RLS, per-user manifest scoping,
+   ADR-062) is entirely the memory API's job — this proxy adds no
+   cross-user query, `$or`, or global escape.
 
 ## Why a separate top-level component, not `src/audittrace/`
 

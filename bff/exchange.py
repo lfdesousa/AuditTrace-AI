@@ -4,16 +4,31 @@ Exchanges the caller's forwarded token for a fresh access token minted
 by the AuditTrace realm's confidential client
 (``audittrace-librechat-bff``), requesting the ``audittrace-librechat``
 client's audience so the result deterministically carries
-``aud=audittrace-server`` + ``audittrace:query`` (the same
-``aud-audittrace-server`` protocol mapper + default scope grant WU-1
-already put on that client — see ``bff/README.md``).
+``aud=audittrace-server`` (the ``aud-audittrace-server`` protocol mapper
+WU-1 already put on that client — see ``bff/README.md``).
+
+The exchange's ``scope`` is per-caller, not fixed: the chat path
+(``bff/app.py::chat_completions``) calls :func:`exchange_token` with
+``requested_scope=None``, which omits the ``scope`` form field entirely —
+Keycloak then falls back to the target client's own DEFAULT scopes
+(``audittrace:query`` among them), exactly WU-1/WU-2's original,
+unregressed behaviour. The memory-proxy path (M3-WU-D2-1,
+``bff/memory_proxy.py``) passes
+``requested_scope=bff.memory_scopes.MEMORY_SCOPE_STRING`` to explicitly
+request the memory read/write scopes, which are OPTIONAL (not default) on
+``audittrace-librechat`` — see ``keycloak/realm-audittrace.json`` — so
+only an exchange that asks for them by name ever gets them; the browser's
+own login token never carries write access to the store.
 
 The non-negotiable invariant this module exists to prove: **the minted
 token carries the caller's ``sub``, never a static/shared identity.**
 :func:`exchange_token` re-validates the exchanged token's signature and
 asserts its ``sub`` matches the inbound token's ``sub`` before ever
 returning it — a Keycloak misconfiguration (or a code regression that
-stamps a static subject) fails closed here, not silently downstream.
+stamps a static subject) fails closed here, not silently downstream. This
+guarantee holds identically for both the chat and memory-scoped exchange
+— ``requested_scope`` only changes what the minted token can DO, never
+whose identity it carries.
 """
 
 from __future__ import annotations
@@ -47,9 +62,18 @@ async def exchange_token(
     inbound_sub: str,
     settings: Settings,
     http_client: httpx.AsyncClient,
+    requested_scope: str | None = None,
 ) -> str:
     """RFC 8693 token-exchange ``inbound_token`` for an
     ``aud=audittrace-server`` access token minted for the SAME subject.
+
+    ``requested_scope`` is an explicit, space-separated RFC 8693 ``scope``
+    request (see the module docstring). ``None`` (the chat path's default)
+    omits the ``scope`` form field entirely, preserving the original
+    WU-1/WU-2 exchange shape byte-for-byte — this is a deliberate
+    non-regression choice, not an oversight: adding an always-present
+    empty-string ``scope=`` field would itself be a behaviour change for
+    Keycloak's exchange endpoint.
 
     Returns the raw minted access token string. Raises
     :class:`TokenExchangeError` on any Keycloak-side failure, a
@@ -65,6 +89,8 @@ async def exchange_token(
         "requested_token_type": settings.exchange_requested_token_type,
         "audience": settings.exchange_audience,
     }
+    if requested_scope:
+        data["scope"] = requested_scope
     try:
         response = await http_client.post(
             settings.keycloak_token_url,

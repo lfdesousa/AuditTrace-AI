@@ -89,6 +89,87 @@ class TestExchangeTokenSuccess:
         assert result == minted
 
 
+class TestRequestedScopeParameter:
+    """M3-WU-D2-1 — the ``requested_scope`` kwarg is what lets the memory
+    path ask for a different scope set than the chat path, from the same
+    ``exchange_token`` call. Neuter the ``if requested_scope:`` branch (or
+    always send an empty ``scope=``) and one of these two tests goes RED."""
+
+    async def test_omitted_scope_sends_no_scope_form_field(self) -> None:
+        """The chat path's default (``requested_scope=None``) — the exact
+        WU-1/WU-2 request shape, byte for byte, no regression."""
+        minted = _minted_token(sub="alice")
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/certs"):
+                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            captured["body"] = request.read().decode()
+            return httpx.Response(
+                200, json={"access_token": minted, "token_type": "Bearer"}
+            )
+
+        client = _client(handler)
+        await exchange_token(make_token(sub="alice"), "alice", _settings(), client)
+        assert "scope=" not in captured["body"]
+
+    async def test_provided_scope_sent_verbatim_in_form_body(self) -> None:
+        """The memory path passes an explicit, space-separated scope
+        string — it must reach Keycloak in the ``scope`` form field,
+        url-encoded (spaces as ``+`` or ``%20``, both valid
+        ``application/x-www-form-urlencoded`` — assert on the decoded
+        parse, not the raw encoding, so this test doesn't pin one or the
+        other)."""
+        from urllib.parse import parse_qs
+
+        minted = _minted_token(sub="alice")
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/certs"):
+                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            captured["body"] = request.read().decode()
+            return httpx.Response(
+                200, json={"access_token": minted, "token_type": "Bearer"}
+            )
+
+        client = _client(handler)
+        requested = "memory:episodic:read memory:episodic:write"
+        await exchange_token(
+            make_token(sub="alice"),
+            "alice",
+            _settings(),
+            client,
+            requested_scope=requested,
+        )
+        parsed = parse_qs(captured["body"])
+        assert parsed["scope"] == [requested]
+
+    async def test_empty_string_scope_treated_as_omitted(self) -> None:
+        """An empty string is falsy — same as ``None``, no ``scope=``
+        field at all, never a nonsensical empty grant request."""
+        minted = _minted_token(sub="alice")
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/certs"):
+                return httpx.Response(200, json={"keys": [TEST_PUBLIC_PEM]})
+            captured["body"] = request.read().decode()
+            return httpx.Response(
+                200, json={"access_token": minted, "token_type": "Bearer"}
+            )
+
+        client = _client(handler)
+        await exchange_token(
+            make_token(sub="alice"),
+            "alice",
+            _settings(),
+            client,
+            requested_scope="",
+        )
+        assert "scope=" not in captured["body"]
+
+
 class TestExchangeTokenFailureModes:
     async def test_keycloak_non_200_raises(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
