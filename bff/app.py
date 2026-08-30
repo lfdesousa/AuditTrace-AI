@@ -1,12 +1,14 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Exactly ONE route matters: ``POST /v1/chat/completions``, the proxy
-target LibreChat's custom endpoint config points at. ``GET /health`` is
-the k8s-probe convenience every AuditTrace deployable carries.
+Two routes matter: ``POST /v1/chat/completions``, the proxy target
+LibreChat's custom endpoint config points at, and
+``GET/POST/PUT/DELETE /memory/{path}``, the Souvenirs panel's memory-proxy
+(M3-WU-D2-1). ``GET /health`` is the k8s-probe convenience every
+AuditTrace deployable carries.
 
-Request flow (fail-closed at every step — see the module docstrings in
-``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` for the guard
-each step enforces):
+Both proxy routes share one fail-closed shape (see the module docstrings
+in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
+``bff/memory_proxy.py`` for the guard each step enforces):
 
 1. Extract ``Authorization: Bearer <token>`` from the inbound request.
    Missing/malformed → 401, orchestrator never contacted.
@@ -14,10 +16,15 @@ each step enforces):
    expired/wrong-issuer → 401, orchestrator never contacted.
 3. RFC 8693 token-exchange it for an ``aud=audittrace-server`` token
    minted for the SAME ``sub``. Keycloak failure / identity mismatch →
-   502, orchestrator never contacted.
-4. Proxy the raw request body to ``/v1/chat/completions`` with the
-   minted token, streaming the response back unchanged. Orchestrator
-   unreachable → 502.
+   502, orchestrator never contacted. The chat route exchanges for
+   ``audittrace:query`` (the default scope, unchanged since WU-2); the
+   memory route exchanges explicitly for
+   ``bff.memory_scopes.MEMORY_SCOPE_STRING`` — never ``audittrace:admin``.
+4. Proxy the raw request body to the orchestrator with the minted token,
+   streaming the response back unchanged — including a 401/403/404 the
+   orchestrator itself returns, which is forwarded as-is (fail-closed:
+   the BFF never manufactures access the exchanged token doesn't carry).
+   Orchestrator unreachable → 502.
 
 There is no code path in this module that can proxy a request without a
 freshly minted, per-caller token — the fail-closed guarantee is
@@ -38,6 +45,8 @@ from starlette.responses import StreamingResponse
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
 from bff.exchange import TokenExchangeError, exchange_token
+from bff.memory_proxy import MemoryProxyError, proxy_memory_request
+from bff.memory_scopes import MEMORY_SCOPE_STRING
 from bff.proxy import ProxyError, proxy_chat_completions
 
 logger = logging.getLogger(__name__)
@@ -140,6 +149,64 @@ def create_app() -> FastAPI:
             )
         except ProxyError as exc:
             logger.error("orchestrator unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/memory/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE"],
+        response_model=None,
+    )
+    async def memory_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning("rejecting /memory request — inbound token invalid: %s", exc)
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as chat_completions — validate_inbound_token raises
+        # for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=MEMORY_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "memory token exchange failed for sub=%s: %s", inbound_sub, exc
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_memory_request(
+                request.method,
+                path,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except MemoryProxyError as exc:
+            logger.error("orchestrator /memory unreachable: %s", exc)
             return JSONResponse(
                 status_code=502, content={"detail": "Upstream service unavailable"}
             )

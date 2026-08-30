@@ -884,6 +884,125 @@ class TestKeycloakOpencodeMemoryWriteScopes:
         )
 
 
+class TestConsoleMemoryProxyScopeGovernance:
+    """M3-WU-D2-1 — the Souvenirs panel's memory-proxy write scopes
+    (``memory:{episodic,procedural,semantic}:write``) reach
+    ``audittrace-librechat`` ONLY as OPTIONAL scopes, via a dedicated
+    ``MEMORY_CONSOLE_WRITE_SCOPES`` array + bind loop kept separate from
+    the plain ``SCOPES`` fan-out (which also carries ``audittrace:admin``
+    and ``audittrace:assessment:ingest`` — see
+    ``TestKeycloakOpencodeMemoryWriteScopes``). This governance class is
+    the WU-D2-1 sibling of ``TestCorpusScopeGovernance``.
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_CONSOLE_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` (e.g. silently widening to
+      ``audittrace-opencode``/``audittrace-webui``) fails
+      ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` appearing in either provisioner's
+      ``MEMORY_CONSOLE_WRITE_SCOPES`` array fails
+      ``test_never_admin_in_console_write_scopes`` — the spec's
+      non-negotiable "console never hard-deletes the audit trail"
+      invariant, enforced at the provisioner level (the realm-level
+      sibling is ``TestLibrechatConsoleClient.test_no_admin_scope_granted``).
+    """
+
+    _EXPECTED_CONSOLE_WRITE_SCOPES: frozenset[str] = frozenset(
+        {
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    @staticmethod
+    def _console_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_CONSOLE_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES=( ... ) block not found — "
+                "M3-WU-D2-1 requires a dedicated array, separate from SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _console_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_CONSOLE_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do ... done`) not '
+                "found — M3-WU-D2-1 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from the CLIENT_KIND "
+                "fan-out."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._console_write_scopes_in(script_path.read_text())
+        cm_scopes = self._console_write_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_CONSOLE_WRITE_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_CONSOLE_WRITE_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_CONSOLE_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._console_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_CONSOLE_WRITE_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_CONSOLE_WRITE_SCOPES bind loop "
+                    f"references {forbidden_client!r} — M3-WU-D2-1 scopes "
+                    "the write grant to audittrace-librechat only."
+                )
+
+    def test_never_admin_in_console_write_scopes(self) -> None:
+        assert "audittrace:admin" not in self._EXPECTED_CONSOLE_WRITE_SCOPES
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._console_write_scopes_in(path.read_text())
+            assert "audittrace:admin" not in scopes, (
+                f"{label}: MEMORY_CONSOLE_WRITE_SCOPES illegally carries "
+                "audittrace:admin."
+            )
+
+
 class TestCorpusScopeGovernance:
     """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
     scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
@@ -1712,18 +1831,35 @@ class TestSingleOwnershipKeyInVectorMetadata:
 class TestLibrechatConsoleClient:
     """M3-WU-1 — the ``audittrace-librechat`` OIDC client (the M3 LibreChat
     console's browser-facing public PKCE client, ADR-064) must exist in
-    BOTH realm files with a read/ask-only scope grant.
+    BOTH realm files with the expected scope grant.
+
+    **M3-WU-D2-1 (2026-08-30) superseded the original read/ask-only
+    boundary this class enforced.** The ratified
+    ``2026-08-30-SPEC-m3-souvenirs-sovereign-memory.md`` deliberately
+    grants ``audittrace-librechat`` the three per-user-layer
+    ``memory:*:write`` scopes — as OPTIONAL, never default — so the BFF's
+    Souvenirs-panel memory-proxy exchange (``bff/memory_proxy.py``,
+    ``bff/memory_scopes.py``) can request them explicitly. The browser's
+    OWN login token never carries them (they are absent from
+    ``defaultClientScopes``); only a BFF-mediated RFC 8693 exchange that
+    asks for them by name in its ``scope=`` parameter can obtain them (see
+    ``bff/exchange.py::exchange_token``'s ``requested_scope``). A
+    companion ADR documenting this boundary change is queued per the
+    spec's "Companion ADR" section.
 
     Falsifiable, one assertion per guard:
 
     * renaming/removing the client from either realm file fails
       ``test_client_present_in_both_realms``;
     * its ``defaultClientScopes`` drifting from the exact read/ask set fails
-      ``test_default_scopes_match_expected_read_ask_set``;
-    * granting it ANY ``memory:*:write`` scope (default or optional) fails
-      ``test_no_memory_write_scope_granted`` — console users are read/ask
-      only (M3 boundary B2/B3); a write scope here is a REJECT-worthy
-      defect, not a nice-to-catch;
+      ``test_default_scopes_match_expected_read_ask_set`` — write access
+      must NEVER be a default (always-issued) scope;
+    * its ``optionalClientScopes`` drifting from the exact expected set
+      (``offline_access`` + the three memory-write scopes) fails
+      ``test_optional_scopes_match_expected_set``;
+    * granting it ``audittrace:admin`` (default OR optional) fails
+      ``test_no_admin_scope_granted`` — the spec is explicit: the console
+      must never obtain hard-delete of the audit trail;
     * granting it a ``memory:corpus:*`` scope fails
       ``test_no_corpus_scope_granted`` (ADR-062 §4 — corpus scopes are
       operator/curator-tier);
@@ -1762,7 +1898,19 @@ class TestLibrechatConsoleClient:
     # OPTIONAL, not default: it is the one scope that changes Keycloak's
     # token-issuance behaviour (a refresh token gets minted), so it stays
     # an explicit per-request opt-in rather than an always-on grant.
-    _EXPECTED_OPTIONAL_SCOPES: frozenset[str] = frozenset({"offline_access"})
+    #
+    # M3-WU-D2-1 (2026-08-30) added the three per-user-layer memory-write
+    # scopes, ALSO optional — same "never auto-granted" discipline: only
+    # the BFF's memory-proxy exchange requests them explicitly (see class
+    # docstring above).
+    _EXPECTED_OPTIONAL_SCOPES: frozenset[str] = frozenset(
+        {
+            "offline_access",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+        }
+    )
 
     @staticmethod
     def _client(realm: dict) -> dict:
@@ -1818,22 +1966,22 @@ class TestLibrechatConsoleClient:
                 f"missing: {sorted(self._EXPECTED_OPTIONAL_SCOPES - optional)}."
             )
 
-    def test_no_memory_write_scope_granted(self) -> None:
-        """Console users are read/ask only (boundary B2/B3). A memory-write
-        scope here — default OR optional — is a REJECT-worthy defect."""
+    def test_no_admin_scope_granted(self) -> None:
+        """M3-WU-D2-1 deliberately granted the three per-user-layer
+        memory-write scopes (optional-only — see
+        ``test_optional_scopes_match_expected_set``); it must NEVER extend
+        to ``audittrace:admin``, in either scope set. Admin is what would
+        let the console hard-delete the audit trail (``?hard=true`` on
+        ``DELETE /memory/...``) — the spec's non-negotiable invariant."""
         for label, realm in self._both_realms():
             c = self._client(realm)
             both = set(c.get("defaultClientScopes") or []) | set(
                 c.get("optionalClientScopes") or []
             )
-            offenders = sorted(
-                s for s in both if s.startswith("memory:") and s.endswith(":write")
-            )
-            assert not offenders, (
-                f"{label}: audittrace-librechat was granted write scope(s) "
-                f"{offenders} — console users are read/ask only (M3 "
-                "boundary B2/B3); this VOIDS the boundary the client exists "
-                "to hold."
+            assert "audittrace:admin" not in both, (
+                f"{label}: audittrace-librechat was granted audittrace:admin "
+                "— this VOIDS the M3-WU-D2-1 invariant that the console can "
+                "never hard-delete the audit trail."
             )
 
     def test_no_corpus_scope_granted(self) -> None:
