@@ -1,5 +1,7 @@
 # ADR-025: Memory Layers as LLM-Callable Tools
 
+> **Amended 2026-08-30:** the current chat model is Qwen 3.8-27B dense+MTP (the Qwen 3.6-35B-A3B MoE was retired 2026-08-16); the memory model is five-layer per ADR-062 (four per-user layers plus one shared corpus). The decision text below, including the dated dogfooding evidence, is unchanged.
+
 **Status:** Accepted
 **Date:** 2026-04-11 (Proposed) · 2026-04-12 (Accepted)
 **Deciders:** Luis Filipe de Sousa

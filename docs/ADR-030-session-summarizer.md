@@ -1,5 +1,7 @@
 # ADR-030: Session Summariser & Three-Model Inference Topology
 
+> **Amended 2026-08-30:** the current chat model is Qwen 3.8-27B dense+MTP (the Qwen 3.6-35B-A3B MoE named in the topology table below was retired 2026-08-16). The summariser (Mistral 7B) and embedder (nomic-embed) placement decisions stand; see `docs/architecture/model-topology.md` for the current chat-model rationale. The decision text below is unchanged.
+
 **Status:** Accepted
 **Date:** 2026-04-15
 **Deciders:** Luis Filipe de Sousa

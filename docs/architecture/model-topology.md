@@ -3,7 +3,8 @@
 > Canonical reference for "why do you run three models?" Keep this current; it is
 > the single source for that answer in pitches, reviews, and design-partner Q&A.
 > Authoritative for the *rationale*; the live model names/ports track ADR-030 and
-> the C4 `workspace.dsl`. Last verified against code 2026-06-18.
+> the C4 `workspace.dsl`. Model + memory-layer facts refreshed 2026-08-30;
+> embedding-path state last verified 2026-06-18.
 
 ## Bottom line
 
@@ -15,21 +16,33 @@ the boundary.
 
 | Job | Model | Port | Placement | Why this model |
 |---|---|---|---|---|
-| **Reasoning (chat)** | Qwen 3.6-35B-A3B-Q4_K_M (MoE, ~3B active/token) | `:11435` | GPU (ROCm) | MoE gives near-35B quality at ~3B inference cost; MoE prompt-eval beats a dense 27B on a consumer GPU at the 5–15K-token prompts the client produces |
+| **Reasoning (chat)** | Qwen 3.8-27B (dense) + MTP, Q4_K_M | `:11435` | GPU (Vulkan) | A single dense 27B holds one coherent reasoning model across the 5-15K-token tool-laden prompts the client emits; multi-token prediction (MTP) speeds generation, the bandwidth-bound half of latency, so we get dense-model quality without the token-rate penalty that first pushed us to MoE |
 | **Summarisation** | Mistral 7B Instruct v0.3 Q4_K_M | `:11437` | GPU (~1 GB, background) | Small, fast, reliable strict-JSON; EU-origin; runs off the user-facing path |
 | **Embeddings** | nomic-embed-text v1.5 Q8_0 (768-dim) | `:11436` | CPU only | Quality is quant-sensitive (Q8); embedding is off the critical path, so it leaves the scarce GPU for chat |
 
 ## The three jobs, and why each gets its own model
 
-### 1 — Reasoning (chat): Qwen 3.6-35B-A3B, on the GPU
+### 1 — Reasoning (chat): Qwen 3.8-27B dense + MTP, on the GPU
 
-The interactive, latency-critical path. It reads the augmented prompt — the four
-memory layers plus, in tools mode, the memory-tool loop — and produces the answer.
-We use a Mixture-of-Experts model: ~3B active parameters per token deliver
-near-35B-class quality at roughly 3B inference cost. The choice is measured, not
-fashionable: MoE prompt-eval throughput is materially faster than a dense 27B on a
-consumer GPU at the 5–15K-token prompts the coding client emits, which is why the
-chat model was swapped back to the MoE on 2026-05-01.
+The interactive, latency-critical path. It reads the augmented prompt: the five
+memory layers plus, in tools mode, the memory-tool loop, and produces the answer.
+We run a single dense 27B model. Dense keeps one coherent reasoning model over the
+whole prompt instead of routing each token to a subset of experts.
+
+We ran the Mixture-of-Experts 35B-A3B here until 2026-08-16, on the theory that
+~3B active parameters per token bought near-35B quality at a fraction of the
+inference cost. That theory rested on one number: dense 27B prompt-eval looked too
+slow on the 5-15K-token prompts the coding client emits. The number was a backend
+artefact. It came from ROCm, before the 2026-05-17 Vulkan swap. On Vulkan with
+flash-attention, dense 27B prompt-eval runs at roughly 190 tokens/s and barely
+degrades from 512 to 2048 tokens, so the prompt-eval bottleneck that justified MoE
+is gone.
+
+Token generation is the other half of latency, and it is memory-bandwidth bound.
+Multi-token prediction (MTP) decodes several tokens per forward pass, which lifts
+exactly that bandwidth-bound half. Dense 27B plus MTP gives us one coherent model,
+competitive generation speed, and none of the routing complexity, so we retired the
+MoE on 2026-08-16 and made dense + MTP the permanent chat model.
 
 ### 2 — Summarisation: Mistral 7B Instruct v0.3, on the GPU (background)
 
@@ -153,9 +166,9 @@ This folds into the real-LLM run (#296), where all three models run for real.
 - `config.py: memory_embedding_dim = 1024` is dead config (unused in `src/`) **and**
   wrong (nomic v1.5 is 768-dim, MiniLM is 384). The llm-stub copied the 1024. Fold
   the correction into the ADR-047 implementation.
-- `docs/architecture/product-and-dependencies.md` still lists the chat model as the
-  dense 27B (a 2026-04-24 note); the live chat model is the 35B-A3B MoE (swapped back
-  2026-05-01). Update on next pass.
+- The chat-model drift is resolved (2026-08-30): `product-and-dependencies.md`, the
+  C4 `workspace.dsl`, and the pitch material now name the dense Qwen 3.8-27B + MTP
+  chat model. The MoE 35B-A3B was retired 2026-08-16.
 
 ## Likely questions, with answers
 

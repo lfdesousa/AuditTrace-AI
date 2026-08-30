@@ -2,6 +2,8 @@
 
 **Your personal working copy.** Edit freely. This is the presenter's notes for walking a non-trivial audience (head of EA, PhD supervisor, CTO, senior architect) through the running system end-to-end.
 
+> **Current chat model (2026-08-30):** Qwen 3.8-27B (dense) + MTP. The Qwen 3.6-35B-A3B MoE was retired 2026-08-16. The `model` field in the probe bodies below is illustrative; the memory-server serves whatever chat model the live llama-server exposes, so send the alias the running server advertises on the demo day.
+
 ---
 
 ## Pre-demo checklist (15 min before)
