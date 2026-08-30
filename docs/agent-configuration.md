@@ -60,7 +60,7 @@ once per workday.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "sovereign/qwen3.5",
+  "model": "sovereign/qwen3.8",
   "provider": {
     "sovereign": {
       "npm": "@ai-sdk/openai-compatible",
@@ -73,8 +73,8 @@ once per workday.
         }
       },
       "models": {
-        "qwen3.5": {
-          "name": "Qwen3.5-35B-A3B",
+        "qwen3.8": {
+          "name": "Qwen3.8-27B (dense) + MTP",
           "tools": true
         }
       }
@@ -160,12 +160,16 @@ memory-server env back to `AUDITTRACE_AUTH_REQUIRED=false` for the
 duration of the debug session:
 
 ```bash
-AUDITTRACE_AUTH_REQUIRED=false docker compose up -d --force-recreate memory-server
+# k3s + Helm is the sole app-deploy path (docker-compose was stopped).
+# Toggle the flag on the running Deployment and roll it:
+kubectl set env deploy/audittrace-memory-server AUDITTRACE_AUTH_REQUIRED=false
+kubectl rollout status deploy/audittrace-memory-server
+# Durable change: set memoryServer env in charts/audittrace/values.yaml + helm upgrade.
 ```
 
 The sentinel `UserContext` takes over and requests without JWTs
 get the admin-by-construction fallback. Flip back to `true` when
-done.
+done (`kubectl set env deploy/audittrace-memory-server AUDITTRACE_AUTH_REQUIRED=true`).
 
 ---
 
@@ -179,9 +183,9 @@ version: 1.0.0
 schema: v1
 
 models:
-  - name: Qwen3.5-35B-A3B (sovereign)
+  - name: Qwen3.8-27B dense+MTP (sovereign)
     provider: openai
-    model: qwen3.5
+    model: qwen3.8
     apiBase: https://localhost/v1
     apiKey: dummy
     contextLength: 65536
@@ -190,9 +194,9 @@ models:
       maxTokens: 4096
 
 tabAutocompleteModel:
-  name: Qwen3.5-35B-A3B (sovereign)
+  name: Qwen3.8-27B dense+MTP (sovereign)
   provider: openai
-  model: qwen3.5
+  model: qwen3.8
   apiBase: https://localhost/v1
   apiKey: dummy
 
@@ -202,13 +206,13 @@ contextProviders:
     params:
       url: https://localhost/context
       title: "Sovereign Memory"
-      description: "4-layer memory — sessions, ADRs, skills, semantic RAG"
+      description: "five-layer memory — sessions, ADRs, skills, semantic RAG, shared corpus"
       displayTitle: "Memory"
 
 systemMessage: |
   You are working with a Solutions Architect specialized in IAM/OAuth2.
-  Local stack: llama-server :11435 (Qwen3.5-35B-A3B MoE, ROCm).
-  Memory server: audittrace-ai (4-layer memory, PostgreSQL + ChromaDB).
+  Local stack: llama-server :11435 (Qwen3.8-27B dense+MTP, Vulkan).
+  Memory server: audittrace-ai (five-layer memory, PostgreSQL + ChromaDB).
   Always answer in English.
 ```
 
@@ -226,7 +230,7 @@ If TLS errors persist, set `NODE_EXTRA_CA_CERTS` in your VS Code launcher.
 | API Provider | OpenAI Compatible |
 | Base URL | `https://localhost/v1` |
 | API Key | `dummy` |
-| Model | `qwen3.5` |
+| Model | `qwen3.8` |
 | Custom Headers | (none) |
 
 If TLS errors appear, launch VS Code with:
@@ -244,7 +248,7 @@ After updating any agent, test with a simple query:
 ```bash
 curl -s https://localhost/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5","messages":[{"role":"user","content":"What is ADR-009 about?"}]}' \
+  -d '{"model":"qwen3.8","messages":[{"role":"user","content":"What is ADR-009 about?"}]}' \
   | python3 -m json.tool
 ```
 

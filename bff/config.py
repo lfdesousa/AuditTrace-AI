@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # profile, cloud rig) — never hardcode a second value in code.
     orchestrator_base_url: str = "http://localhost:8765"
     orchestrator_chat_path: str = "/v1/chat/completions"
+    # M3-WU-D2-1 — the Souvenirs panel's memory-proxy target. Mirrors
+    # ``orchestrator_chat_path``'s own discipline: the orchestrator's
+    # ``/memory`` mount point is a frozen API contract
+    # (``src/audittrace/routes/memory.py``), not a target-shaped value, but
+    # it lives in Settings anyway for the same reason ``orchestrator_chat_path``
+    # does — one place to override in a test double, never two hardcoded
+    # literals to keep in sync.
+    orchestrator_memory_path_prefix: str = "/memory"
     orchestrator_timeout_seconds: float = 120.0
 
     # ── Inbound-token validation (the token LibreChat forwards) ──────────

@@ -83,6 +83,26 @@ data:
       "memory:corpus:semantic:write"
     )
 
+    # M3-WU-D2-1 (2026-08-30) — the Souvenirs panel's memory-proxy write
+    # scopes. Bound ONLY as OPTIONAL to audittrace-librechat (never
+    # default): the browser's own login token must never carry write
+    # access to the store — only the BFF's memory-path RFC 8693 exchange
+    # (bff/memory_scopes.py::MEMORY_SCOPE_STRING) requests them
+    # explicitly. A separate array + bind loop from SCOPES above, same
+    # rationale as CORPUS_SCOPES: a future edit to SCOPES (which also
+    # holds audittrace:admin) must never silently widen
+    # audittrace-librechat's ceiling to admin. This is the realm-side
+    # half of the same drift class every other array in this script
+    # exists to close: realm-audittrace.json already declares these three
+    # as audittrace-librechat's optionalClientScopes (imported on FIRST
+    # boot only), so a PRE-EXISTING realm needs this Job to reconcile them
+    # too (tests/test_chart_drift_guards.py::TestConsoleMemoryProxyScopeGovernance).
+    MEMORY_CONSOLE_WRITE_SCOPES=(
+      "memory:episodic:write"
+      "memory:procedural:write"
+      "memory:semantic:write"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -271,6 +291,15 @@ data:
     echo "▶ binding corpus scopes to client admin-client (optional)..."
     for SCOPE in "${CORPUS_SCOPES[@]}"; do
       bind_scope "admin-client" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2c: bind Souvenirs-panel memory-write scopes (M3-WU-D2-1) ──
+    # audittrace-librechat only, as OPTIONAL — the browser's own login
+    # token must never carry write access; only the BFF's memory-path
+    # RFC 8693 exchange requests these by name. Never audittrace:admin.
+    echo "▶ binding memory-proxy write scopes to client audittrace-librechat (optional)..."
+    for SCOPE in "${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "optional"
     done
 
     # ── Step 3: ensure user-identity protocol mappers ─────────────

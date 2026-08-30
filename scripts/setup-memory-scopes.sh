@@ -152,6 +152,22 @@ CORPUS_SCOPES=(
   "memory:corpus:semantic:write"
 )
 
+# M3-WU-D2-1 (2026-08-30) — the Souvenirs panel's memory-proxy write
+# scopes. Bound ONLY as OPTIONAL to audittrace-librechat (never default —
+# the browser's own login token must never carry write access; only the
+# BFF's memory-path RFC 8693 exchange requests these by name). Mirrors
+# the in-cluster Job's ConfigMap array verbatim
+# (tests/test_chart_drift_guards.py::TestConsoleMemoryProxyScopeGovernance
+# asserts the two stay in lock-step). A subset of SCOPES above, so Step 1
+# ("Ensure each scope exists") already creates them; this is a separate
+# array purely to isolate the bind loop from audittrace:admin/
+# assessment:ingest, which SCOPES also carries.
+MEMORY_CONSOLE_WRITE_SCOPES=(
+  "memory:episodic:write"
+  "memory:procedural:write"
+  "memory:semantic:write"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
 for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}"; do
@@ -233,6 +249,13 @@ done
 echo "▶ binding corpus scopes to client admin-client (optional)..."
 for SCOPE in "${CORPUS_SCOPES[@]}"; do
   bind_scope "admin-client" "${SCOPE}" "optional"
+done
+
+# ----- Bind Souvenirs-panel memory-write scopes (M3-WU-D2-1) -----
+# audittrace-librechat only, as OPTIONAL. Never audittrace:admin.
+echo "▶ binding memory-proxy write scopes to client audittrace-librechat (optional)..."
+for SCOPE in "${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "optional"
 done
 
 # ----- User-identity protocol mappers -----

@@ -4,6 +4,8 @@
 
 **TL;DR.** Given a request, you can reconstruct *who asked what, what memory was consulted, what the model answered, how long each step took, and which rows in which datastores were touched* — in four API calls. The audit trail stops exactly where the memory-server's process boundary ends (**ADR-037**): agent-side tools executed by the client (bash, read, edit, grep, ...) are the client's concern, not ours.
 
+> **Current chat model (2026-08-30):** Qwen 3.8-27B (dense) + multi-token prediction (MTP). The Qwen 3.6-35B-A3B MoE was retired 2026-08-16. The captured run and figures below are preserved verbatim from an earlier 35B-A3B deployment (on Vulkan, 2026-05-17). They are a genuine reconstruction record and are deliberately left unaltered; the current five-layer memory model adds a shared corpus to the four per-user layers shown (ADR-062).
+
 ---
 
 ## The shape of the audit trail

@@ -2,6 +2,8 @@
 
 These screenshots are embedded in `docs/reconstructibility-walkthrough.md`. The doc is the pitch baseline; the images are what a CTO actually clicks on.
 
+> **Current chat model (2026-08-30):** Qwen 3.8-27B (dense) + MTP. The Qwen 3.6-35B-A3B MoE was retired 2026-08-16. The probe below and the existing screenshots are from the earlier 35B-A3B deployment; a fresh re-capture should send the model alias the live server exposes today.
+
 **Capture conventions**
 - PNG, 1600×1000 or wider (retina export is fine).
 - Dark theme preferred — it matches the architecture colour palette and prints cleanly on dark slides.
