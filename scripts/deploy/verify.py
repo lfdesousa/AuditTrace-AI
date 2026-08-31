@@ -37,7 +37,7 @@ evidence it stands on):
   ``recall_*``, then ``GET /interactions/{id}/tool-calls`` asserting a recall row
   was recorded. Memory + auth alone is not E2E. The chat call alone uses a
   calibrated, configurable client timeout (``--e2e-timeout`` /
-  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 120s — see
+  ``AUDITTRACE_VERIFY_E2E_TIMEOUT``, default 400s — see
   :data:`E2E_CHAT_TIMEOUT_DEFAULT`); every other probe keeps the short,
   unwidened fast-probe timeout (:data:`FAST_PROBE_TIMEOUT`).
 
@@ -282,15 +282,26 @@ FAST_PROBE_TIMEOUT = 30
 # Client-side HTTP timeout (seconds) for the recall-e2e CHAT probe
 # (``POST /v1/chat/completions``) ONLY. Calibrated, not arbitrary: the v1.17.0
 # deploy-verify FAIL recorded a real backend SUCCESS at 30.577s against the old
-# fixed 30s budget (interaction 806, Tempo trace 3c826281...), and the
-# 2026-07-20 v1.10.0 run observed 59s for max_tokens=2000 on a reasoning model.
-# 120s is ~2x the worst observed 59s — generous enough to cover a reasoning
-# model spending time in <think> on an architect-shaped prompt, while still a
-# REAL gate: a response past 120s is a genuine FAIL worth surfacing, not
-# something this bound papers over. Configurable via ``--e2e-timeout`` / the
-# ``AUDITTRACE_VERIFY_E2E_TIMEOUT`` env var so a different target/model can be
-# tuned without a code change (portability invariant).
-E2E_CHAT_TIMEOUT_DEFAULT = 120
+# fixed 30s budget (interaction 806, Tempo trace 3c826281...), which is why
+# this became a dedicated, configurable bound in the first place. It was then
+# set to 120s on 2026-07-20 (v1.10.0), ~2x the then-worst-observed 59s for
+# max_tokens=2000 on a REASONING chat model.
+#
+# That calibration went stale with the permanent swap to the dense
+# **Qwen3.8-27B + MTP** chat model (`project_chat_model_q4_27b`): its
+# recall-tool-loop latency on the reference laptop runs ~150-181s, over the
+# 120s bound. The v1.25.0 deploy-verify run (2026-08-31) FAILed the
+# recall-e2e probe on exactly this — the backend audit trail proves the turn
+# SUCCEEDED end-to-end (interaction id=3823, duration_ms=181118, 3 recorded
+# tool calls), it just overran the stale client-side bound. 400s is ~2x that
+# worst-observed 181s (362), rounded up for run-to-run variance headroom —
+# the SAME "~2x worst observed" principle as the original 120s, NOT a number
+# chosen merely to make the FAIL go away. A response past 400s is still a
+# genuine FAIL worth surfacing, not something this bound papers over.
+# Configurable via ``--e2e-timeout`` / the ``AUDITTRACE_VERIFY_E2E_TIMEOUT``
+# env var so a different target/model can be tuned without a code change
+# (portability invariant).
+E2E_CHAT_TIMEOUT_DEFAULT = 400
 E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
 
 # The scan-dlq-depth probe's FAIL threshold (spec 2026-08-23, closes the
@@ -1618,9 +1629,10 @@ def build_parser() -> argparse.ArgumentParser:
             "(POST /v1/chat/completions) ONLY -- every other probe (health, "
             "kubectl, helm) keeps its own short, unwidened timeout. Default "
             f"{E2E_CHAT_TIMEOUT_DEFAULT}s, calibrated to ~2x the worst observed "
-            "real-model latency (59s, 2026-07-20 v1.10.0 run); a response past "
-            "the bound is still a genuine FAIL. Portable across targets/models "
-            f"via this flag or the {E2E_TIMEOUT_ENV_VAR} env var."
+            "real-model latency (181s, 2026-08-31 v1.25.0 run, dense "
+            "Qwen3.8-27B+MTP); a response past the bound is still a genuine "
+            "FAIL. Portable across targets/models via this flag or the "
+            f"{E2E_TIMEOUT_ENV_VAR} env var."
         ),
     )
     parser.add_argument(
