@@ -52,7 +52,7 @@ jobs:
       - name: Create .env
         run: |
           cat > .env <<'EOF'
-          AUDITTRACE_IMAGE_TAG=1.24.9
+          AUDITTRACE_IMAGE_TAG=1.24.10
           AUDITTRACE_POSTGRES_PASSWORD=test-postgres-password
           AUDITTRACE_CHROMA_TOKEN=test-chroma-token
           AUDITTRACE_REDIS_PASSWORD=test-redis-password
