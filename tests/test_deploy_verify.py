@@ -708,8 +708,8 @@ def test_recall_e2e_fail_recall_not_recorded(tmp_path, monkeypatch):
 # call back to FAST_PROBE_TIMEOUT (neutering the calibration) turns it red.
 
 
-def test_verify_config_default_e2e_timeout_is_120s(tmp_path):
-    assert _cfg(tmp_path).e2e_timeout == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+def test_verify_config_default_e2e_timeout_is_400s(tmp_path):
+    assert _cfg(tmp_path).e2e_timeout == 400 == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
 def test_recall_e2e_chat_probe_uses_the_configured_e2e_timeout(tmp_path, monkeypatch):
@@ -729,15 +729,15 @@ def test_recall_e2e_chat_probe_uses_the_configured_e2e_timeout(tmp_path, monkeyp
     )
 
 
-def test_recall_e2e_default_run_uses_120s_for_the_chat_call_only(tmp_path, monkeypatch):
-    # No e2e_timeout override — the calibrated DEFAULT (120s) must reach the
+def test_recall_e2e_default_run_uses_400s_for_the_chat_call_only(tmp_path, monkeypatch):
+    # No e2e_timeout override — the calibrated DEFAULT (400s) must reach the
     # chat call, and only the chat call.
     monkeypatch.setattr(verify, "load_token", lambda tf: "tok")
     spy = _TimeoutSpy(_recall_routes())
     monkeypatch.setattr(verify, "_http_request", spy)
     VerifyRunner(_cfg(tmp_path)).probe_recall_e2e()
     chat_timeout = next(t for m, p, t in spy.timeouts if p == "/v1/chat/completions")
-    assert chat_timeout == verify.E2E_CHAT_TIMEOUT_DEFAULT == 120
+    assert chat_timeout == verify.E2E_CHAT_TIMEOUT_DEFAULT == 400
     other_timeouts = [t for m, p, t in spy.timeouts if p != "/v1/chat/completions"]
     assert other_timeouts and all(
         t == verify.FAST_PROBE_TIMEOUT for t in other_timeouts
@@ -1259,7 +1259,7 @@ def test_config_from_args_maps_and_normalizes(tmp_path):
 # ── e2e-timeout calibration: CLI flag + env var wiring ────────────────────────
 # Portability invariant (SPEC §2): a different target/model can tune the
 # recall-e2e chat-probe timeout WITHOUT a code change, via --e2e-timeout or
-# AUDITTRACE_VERIFY_E2E_TIMEOUT. Precedence: flag > env var > 120s default.
+# AUDITTRACE_VERIFY_E2E_TIMEOUT. Precedence: flag > env var > 400s default.
 
 
 def _args(monkeypatch, extra=None):
@@ -1273,9 +1273,9 @@ def _args(monkeypatch, extra=None):
     ]
 
 
-def test_e2e_timeout_default_unset_env_falls_back_to_120(monkeypatch):
+def test_e2e_timeout_default_unset_env_falls_back_to_400(monkeypatch):
     monkeypatch.delenv(verify.E2E_TIMEOUT_ENV_VAR, raising=False)
-    assert verify._e2e_timeout_default() == 120 == verify.E2E_CHAT_TIMEOUT_DEFAULT
+    assert verify._e2e_timeout_default() == 400 == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
 def test_e2e_timeout_default_honors_the_env_var(monkeypatch):
@@ -1288,9 +1288,9 @@ def test_e2e_timeout_default_invalid_env_var_falls_back_fail_closed(monkeypatch)
     assert verify._e2e_timeout_default() == verify.E2E_CHAT_TIMEOUT_DEFAULT
 
 
-def test_cli_e2e_timeout_defaults_to_120_without_flag_or_env(monkeypatch):
+def test_cli_e2e_timeout_defaults_to_400_without_flag_or_env(monkeypatch):
     args = verify.build_parser().parse_args(_args(monkeypatch))
-    assert verify.config_from_args(args).e2e_timeout == 120
+    assert verify.config_from_args(args).e2e_timeout == 400
 
 
 def test_cli_e2e_timeout_flag_overrides_the_default(monkeypatch):
