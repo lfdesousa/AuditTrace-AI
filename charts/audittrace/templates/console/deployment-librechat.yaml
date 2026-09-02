@@ -17,6 +17,12 @@
 # expects. The realm's registered redirect URI is DOMAIN_SERVER +
 # OPENID_CALLBACK_URL, which is kept in lock-step with
 # keycloak.librechat.redirectUris (D5, both realm files).
+# M3-WU-D2-5H (2026-09-02) — single source of truth for the OIDC discovery
+# URL: computed ONCE here and referenced by BOTH the main container's
+# OPENID_ISSUER env (below) and the initContainer's readiness-gate poll
+# target (spec invariant: the gate must poll the SAME URL the app fetches,
+# never a duplicated literal).
+{{- $oidcDiscoveryURL := printf "https://%s/realms/audittrace/.well-known/openid-configuration" .Values.console.librechat.frontDoorHost }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,6 +51,82 @@ spec:
       # chart-templated coredns-custom overlay
       # (templates/dns/configmap-coredns-frontdoor.yaml), never a pod
       # `/etc/hosts` entry.
+      # M3-WU-D2-5H (2026-09-02) — the OIDC discovery startup-ordering gate.
+      # LibreChat configures its `openid` passport strategy via a ONE-SHOT,
+      # NO-RETRY fetch of OPENID_ISSUER at process start: if Keycloak (or
+      # the Istio gateway in front of it) is not yet serving the front door
+      # on a boot storm, the strategy is never registered for the life of
+      # the process and every login fails with `Unknown authentication
+      # strategy "openid"` — even though the pod itself looks healthy (2/2,
+      # /health green). Confirmed live on the 2026-09-01 PM reboot: Part
+      # E's DNS fix (frontDoorNodeName, above) was intact and the host IP
+      # had NOT even changed, yet the race still fired because this pod won
+      # the race against Keycloak's readiness. This gate complements —
+      # does NOT replace — Part E: E makes the discovery URL resolvable,
+      # this initContainer makes WHEN it's fetched safe by blocking the
+      # main container until a real HTTP 200 is observed. Reuses the SAME
+      # fork image as the init image (no new egress image, no new
+      # CA-trust surface — it already carries Node + the identical
+      # NODE_EXTRA_CA_CERTS/insecureTLS wiring the main container's real
+      # discovery fetch trusts, so this probe validates the SAME TLS
+      # chain). Bounded via console.librechat.oidcWait: on timeout it
+      # exits non-zero so the pod surfaces a loud `Init:CrashLoopBackOff`
+      # rather than silently starting into an unregistered-strategy state.
+      initContainers:
+        - name: wait-for-oidc-discovery
+          image: "{{ .Values.console.librechat.image.repository }}:{{ .Values.console.librechat.image.tag }}{{ if .Values.console.librechat.image.digest }}@{{ .Values.console.librechat.image.digest }}{{ end }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: OIDC_DISCOVERY_URL
+              value: {{ $oidcDiscoveryURL | quote }}
+            - name: OIDC_WAIT_TIMEOUT_SECONDS
+              value: {{ .Values.console.librechat.oidcWait.timeoutSeconds | quote }}
+            - name: OIDC_WAIT_INTERVAL_SECONDS
+              value: {{ .Values.console.librechat.oidcWait.intervalSeconds | quote }}
+            {{- if .Values.console.librechat.insecureTLS }}
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+            {{- else }}
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/audittrace/ca.crt"
+            {{- end }}
+          {{- if not .Values.console.librechat.insecureTLS }}
+          volumeMounts:
+            - name: ca-trust
+              mountPath: /etc/audittrace/ca.crt
+              subPath: ca.crt
+              readOnly: true
+          {{- end }}
+          command:
+            - sh
+            - -c
+            - |
+              cat <<'JS' > /tmp/oidc-discovery-check.js
+              const https = require('https');
+              const url = process.env.OIDC_DISCOVERY_URL;
+              const req = https.get(url, { timeout: 5000 }, (res) => {
+                console.log(res.statusCode);
+                res.resume();
+              });
+              req.on('timeout', () => { req.destroy(); });
+              req.on('error', () => { console.log('0'); });
+              JS
+              elapsed=0
+              echo "wait-for-oidc-discovery: polling ${OIDC_DISCOVERY_URL} (timeout=${OIDC_WAIT_TIMEOUT_SECONDS}s interval=${OIDC_WAIT_INTERVAL_SECONDS}s)"
+              while true; do
+                status=$(node /tmp/oidc-discovery-check.js 2>/dev/null)
+                status="${status:-0}"
+                if [ "$status" = "200" ]; then
+                  echo "wait-for-oidc-discovery: HTTP 200 after ${elapsed}s - discovery ready, starting main container"
+                  exit 0
+                fi
+                if [ "$elapsed" -ge "$OIDC_WAIT_TIMEOUT_SECONDS" ]; then
+                  echo "wait-for-oidc-discovery: still not ready after ${OIDC_WAIT_TIMEOUT_SECONDS}s (last status=${status}) - failing loudly (Init:CrashLoopBackOff) rather than starting LibreChat into an unregistered-strategy state"
+                  exit 1
+                fi
+                sleep "$OIDC_WAIT_INTERVAL_SECONDS"
+                elapsed=$((elapsed + OIDC_WAIT_INTERVAL_SECONDS))
+              done
       containers:
         - name: librechat
           image: "{{ .Values.console.librechat.image.repository }}:{{ .Values.console.librechat.image.tag }}{{ if .Values.console.librechat.image.digest }}@{{ .Values.console.librechat.image.digest }}{{ end }}"
@@ -92,7 +174,7 @@ spec:
             # insecureTLS wiring below is what makes the resulting HTTPS
             # call actually validate.
             - name: OPENID_ISSUER
-              value: "https://{{ .Values.console.librechat.frontDoorHost }}/realms/audittrace/.well-known/openid-configuration"
+              value: {{ $oidcDiscoveryURL | quote }}
             - name: OPENID_CLIENT_ID
               value: "audittrace-librechat"
             # `audittrace-librechat` is a PUBLIC client (PKCE, no secret —
