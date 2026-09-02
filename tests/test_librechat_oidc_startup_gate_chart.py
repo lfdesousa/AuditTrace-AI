@@ -187,7 +187,12 @@ class TestInitContainerReusesForkImage:
             f"{main['image']!r} — the spec requires reusing the fork "
             "image, never a new egress image / CA-trust surface"
         )
-        assert gate["image"].startswith("ghcr.io/danny-avila/librechat")
+        # M3-WU-D2-5C (2026-09-02) — the D2-4 sovereign fork cutover
+        # repointed console.librechat.image from the D1 stock upstream
+        # image to the pinned fork; the invariant this test guards (init
+        # image == main image, no NEW egress image) is unchanged, only
+        # the concrete repository moved.
+        assert gate["image"].startswith("docker.io/lfds/audittrace-librechat:")
 
 
 class TestWaitIsBounded:

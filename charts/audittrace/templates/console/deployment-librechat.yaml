@@ -1,5 +1,6 @@
 {{- if .Values.console.enabled }}
-# M3-WU-3b (D1/D2) — LibreChat itself. Stock image (no source edit).
+# M3-WU-D2-4 — LibreChat itself. The sovereign fork image (D2 cutover from
+# the D1 stock-image posture — see values.yaml console.librechat comment).
 # Routes to the BFF only (D4 — see authorizationpolicy-console.yaml); the
 # ONE route it holds to the front door is the OIDC relying-party flow
 # (discovery/JWKS/token — D2, resolved via the coredns-custom overlay,
@@ -245,6 +246,19 @@ spec:
             - name: NODE_EXTRA_CA_CERTS
               value: "/etc/audittrace/ca.crt"
             {{- end }}
+            # M3-WU-D2-4 — the fork's sovereign one-brain switch (D2
+            # cutover). AUDITTRACE_MEMORY_BACKEND renders
+            # console.librechat.memoryBackend VERBATIM — the fork's
+            # config.js fails CLOSED to Mongo for any value that is not
+            # exactly "sovereign" (never silently forced here). The BFF
+            # base URL names the real in-cluster Service
+            # (templates/console/service-bff.yaml), never hardcoded.
+            - name: AUDITTRACE_MEMORY_BACKEND
+              value: {{ .Values.console.librechat.memoryBackend | quote }}
+            - name: AUDITTRACE_BFF_BASE_URL
+              value: "http://{{ .Release.Name }}-librechat-bff:{{ .Values.console.bff.port }}"
+            - name: AUDITTRACE_BFF_TIMEOUT_MS
+              value: {{ .Values.console.librechat.bffTimeoutMs | quote }}
           volumeMounts:
             - name: librechat-yaml
               mountPath: /app/librechat.yaml
