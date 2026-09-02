@@ -803,6 +803,38 @@ chromadb:
 console:
   enabled: false
 
+  # M3-WU-D2-5E (2026-09-02) — DHCP-proof front-door DNS. Supersedes the
+  # removed `console.librechat.frontDoorHostAlias` static-IP pin. The
+  # 2026-09-01 incident: an overnight DHCP renewal moved the host LAN IP
+  # (192.168.1.231 -> 10.12.40.59); the pod's `hostAliases` entry pinned
+  # to the OLD IP went dead (hostAliases override CoreDNS), and
+  # LibreChat's own one-shot (no-retry) OIDC discovery fetch failed
+  # permanently for the process life — HARD DOWN login
+  # (`Unknown authentication strategy "openid"`). `frontDoorNodeName`
+  # feeds a chart-templated `coredns-custom` overlay
+  # (templates/dns/configmap-coredns-frontdoor.yaml) that rewrites the
+  # front-door hostnames to this NODE NAME instead of an IP — k3s's
+  # built-in CoreDNS already tracks the node name -> its CURRENT IP via
+  # NodeHosts (reloaded every 15s), so resolution self-heals on any DHCP
+  # change with NO pod restart. Left empty by default so
+  # `console.enabled=true` still helm-lints/renders cleanly with no live
+  # `kubectl get nodes` compute step at template time (portability
+  # invariant — [[project_portability_invariant]]: a live lookup here is
+  # exactly the non-reproducible pattern `frontDoorHostAlias` was
+  # originally rejected for; see values-laptop.yaml for the laptop
+  # reference-target value). A cloud target sets its own node name OR
+  # routes these hosts at the Istio ingress gateway's in-cluster Service
+  # DNS name instead — still a NAME, never an IP.
+  frontDoorNodeName: ""
+  # The parallel public domain name the SAME target answers to alongside
+  # `console.librechat.frontDoorHost` (`audittrace.local`) — self-signed
+  # on the laptop, a real Let's Encrypt cert on the cloud rig (see
+  # CLAUDE.md). Included in the coredns-custom rewrite overlay too so an
+  # operator testing against either name gets the DHCP-proof fix; a
+  # target that serves a genuinely different second domain overrides
+  # this in its own values-<target>.yaml.
+  frontDoorCloudHost: "audittrace.allaboutdata.eu"
+
   # ── D1 — the BFF sidecar (bff/, RFC 8693 token-exchange) ────────────────
   bff:
     # M3-WU-3c (D1) — where the RFC 8693 exchange-client secret comes from.
@@ -876,20 +908,17 @@ console:
     # adds to `audittrace-librechat`.
     openidScope: "openid profile email offline_access"
     # k8s equivalent of the compose profile's `extra_hosts:
-    # audittrace.local:host-gateway` — Keycloak's discovery document always
-    # carries KC_HOSTNAME_URL-derived (external front-door) endpoint URLs
-    # regardless of which network path fetched it, so LibreChat's own
-    # server-side OIDC calls (token exchange, JWKS) still need to reach the
-    # external front door by name. `hostAlias` is the operator-supplied IP
-    # a NodePort-reachable front door resolves to from inside the cluster
-    # (the k3s node's own IP on the laptop reference target — NodePort
-    # Services are reachable from in-cluster pods via the node IP by
-    # ordinary kube-proxy behaviour, not a special case). Left empty by
-    # default so `console.enabled=true` still renders cleanly (helm-lint /
-    # CI); the hostAliases block is only emitted when non-empty — a real
-    # deploy MUST set this (see the deploy runbook's first operator step).
+    # audittrace.local:host-gateway`: LibreChat's own server-side OIDC
+    # calls (token exchange, JWKS) need to resolve `audittrace.local` to
+    # something reachable from inside the cluster — Keycloak's discovery
+    # document always carries KC_HOSTNAME_URL-derived (external
+    # front-door) endpoint URLs regardless of which network path fetched
+    # it. M3-WU-D2-5E (2026-09-02): resolved via the `coredns-custom`
+    # overlay + `console.frontDoorNodeName` above, NOT a pod hostAliases
+    # entry — the removed `frontDoorHostAlias` static-IP pin was the
+    # 2026-09-01 incident's root cause (see console.frontDoorNodeName's
+    # comment for the full story).
     frontDoorHost: "audittrace.local"
-    frontDoorHostAlias: ""
     # M3-WU-3d (D4) — the BROWSER-facing host LibreChat is served at, at
     # the ROOT path (no subpath). The earlier `/librechat` prefix fought
     # LibreChat's own base-href/API routing (blank page; `/api/config`

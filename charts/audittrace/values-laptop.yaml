@@ -1,27 +1,37 @@
 # M3-WU-3c (D2) — the laptop reference-infra profile for the console.
 #
-# `console.librechat.frontDoorHostAlias` is the k8s equivalent of the
-# docker-compose profile's `extra_hosts: audittrace.local:host-gateway`
-# (see values.yaml's comment on the same field): LibreChat's own
-# server-side OIDC calls (token exchange, JWKS) need to resolve
-# `audittrace.local` to something reachable from inside the cluster, and
-# on the laptop single-node k3s reference target that is the node's own
-# LAN IP (NodePort Services are reachable from in-cluster pods via the
-# node IP by ordinary kube-proxy behaviour — not a special case).
+# M3-WU-D2-5E (2026-09-02) — DHCP-proof front-door DNS. This file used to
+# pin `console.librechat.frontDoorHostAlias` to the node's LAN IP
+# (`192.168.1.231`), rendered into a pod `hostAliases` entry that
+# OVERRIDES CoreDNS. An overnight DHCP renewal moved the host IP to
+# `10.12.40.59` on 2026-09-01, the pinned entry went dead, and
+# LibreChat's own one-shot (no-retry) OIDC discovery fetch failed
+# permanently for the process life — HARD DOWN login
+# (`Unknown authentication strategy "openid"`). The static-IP pin is GONE
+# (`feedback_no_static_host_ip_pin_resolve_by_name`); front-door hosts now
+# resolve via a chart-templated `coredns-custom` overlay
+# (templates/dns/configmap-coredns-frontdoor.yaml) that rewrites them to
+# `console.frontDoorNodeName` below — the k3s NODE NAME, which k3s's
+# built-in CoreDNS already tracks to the node's CURRENT IP via NodeHosts
+# (reloaded every 15s, self-healing, no pod restart needed on the next
+# DHCP change).
 #
-# Previously this value was resolved LIVE at deploy time via
-# `kubectl get nodes` — not reproducible, and exactly the kind of
-# live-compute step the WU-3c spec (D2) rejects. Pinning it here makes
-# `helm upgrade -f values-laptop.yaml ...` the ONE reproducible deploy
-# command for the laptop reference target (portability invariant —
-# [[project_portability_invariant]]: laptop is the reference profile, not
-# a special case; a cloud target gets its own values-<target>.yaml sibling
-# carrying its own frontDoorHostAlias, never a hardcode in core
-# templates).
-#
-# A more in-cluster-stable resolution — routing via the Istio gateway
-# ClusterIP instead of the node IP — is a noted future improvement, not
-# this work unit (spec non-goals).
+# `console.frontDoorNodeName` is committed here (rather than resolved
+# live via `kubectl get nodes`) for the same reproducible-
+# `helm upgrade -f values-laptop.yaml ...` reason `frontDoorHostAlias`
+# was originally pinned for (portability invariant —
+# [[project_portability_invariant]]: laptop is the reference profile, a
+# cloud target gets its own values-<target>.yaml sibling carrying its own
+# node name / Service-DNS routing, never a hardcode in core templates).
+# Value: the k3s node's registered name — this host has no `--node-name`
+# override in /etc/systemd/system/k3s.service, so k3s derives it from the
+# OS hostname (`pcLuisLinux`); kubelet's hostname resolution lowercases
+# it per Kubernetes' RFC 1123 node-name requirement (node names must be
+# valid lowercase DNS labels) to `pcluislinux`. **Verify with
+# `kubectl get nodes` before the first real `helm upgrade` under this
+# WU** — this value could not be confirmed against a live cluster from
+# this build (deploy/verify explicitly deferred to a later operator-gated
+# session, per the D2-5E build round's hard constraints).
 #
 # M3-WU-3d (D4) — `console.librechat.host` is committed here too (even
 # though it equals values.yaml's own default) so this file stays the
@@ -29,6 +39,6 @@
 # for the laptop reference target — no value an operator has to remember
 # to also pass on the command line.
 console:
+  frontDoorNodeName: "pcluislinux"
   librechat:
-    frontDoorHostAlias: "192.168.1.231"
     host: "librechat.audittrace.local"
