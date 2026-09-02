@@ -1003,6 +1003,135 @@ class TestConsoleMemoryProxyScopeGovernance:
             )
 
 
+class TestD25AMemoryWriteScopesJobRenderedBinding:
+    """D2-5A (``2026-09-01-SPEC-console-hardening-a-memory-write-scopes.md``)
+    Rule 1 render check — the ACTUAL rendered ``ensure-memory-scopes`` Job
+    ConfigMap (via ``helm template``, not the raw source file —
+    ``TestConsoleMemoryProxyScopeGovernance`` above already covers the raw
+    file for both provisioners) binds the three
+    ``memory:{episodic,procedural,semantic}:write`` scopes to
+    ``audittrace-librechat`` as OPTIONAL, and the spec's literal "own-tier
+    write only" invariant is checked scope-by-scope: NOT
+    ``audittrace:admin``, NOT any ``memory:corpus:*:{read,write}`` scope,
+    NOT ``memory:decisions:write``/``memory:skills:write`` — not merely
+    "not admin", every named forbidden scope individually.
+
+    Falsifiable: dropping/renaming a scope in the rendered
+    ``MEMORY_CONSOLE_WRITE_SCOPES`` bind loop, widening it to
+    ``audittrace-opencode``/``audittrace-webui``, flipping it from
+    ``optional`` to ``default``, or adding any forbidden scope to the
+    array fails one of the tests below. Non-vacuity proven live in the
+    D2-5A build record (neuter the array in the ConfigMap source ->
+    this class goes RED; restore -> GREEN).
+    """
+
+    _EXPECTED: frozenset[str] = (
+        TestConsoleMemoryProxyScopeGovernance._EXPECTED_CONSOLE_WRITE_SCOPES
+    )
+
+    # Every scope the spec names by exact identifier as forbidden from this
+    # bind loop — deliberately broader than "not admin" (admin, both corpus
+    # read+write triplets, and the two shared/curated-collection write
+    # scopes decisions/skills).
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:decisions:write",
+            "memory:skills:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _rendered_memory_scopes_script(docs: list[dict]) -> str:
+        name = f"{RELEASE}-memory-scopes-script"
+        for d in docs:
+            if d.get("kind") != "ConfigMap":
+                continue
+            if d.get("metadata", {}).get("name") != name:
+                continue
+            raw = (d.get("data") or {}).get("ensure-memory-scopes.sh", "")
+            if not raw:
+                raise AssertionError(
+                    f"ConfigMap {name} has no data['ensure-memory-scopes.sh'] "
+                    "— render regression"
+                )
+            return raw
+        raise AssertionError(f"ConfigMap {name} not present in the render")
+
+    @staticmethod
+    def _all_scopes_in_console_array(text: str) -> set[str]:
+        """Deliberately broader than
+        ``TestConsoleMemoryProxyScopeGovernance._console_write_scopes_in``
+        (which only captures ``memory:``-prefixed tokens — correct for its
+        own purpose, since by construction that array only ever holds
+        memory scopes). This helper also captures ``audittrace:``-prefixed
+        tokens so an ``audittrace:admin`` leak into the array is not
+        silently invisible to the extractor itself (caught live during the
+        D2-5A neuter/restore pass: a first draft of this test used the
+        narrower extractor and stayed vacuously GREEN with
+        ``audittrace:admin`` injected into the array)."""
+        m = re.search(r"MEMORY_CONSOLE_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_CONSOLE_WRITE_SCOPES=( ... ) block not found in the "
+                "rendered ConfigMap script."
+            )
+        return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', m.group(1)))
+
+    def test_rendered_job_binds_exactly_the_three_console_write_scopes(
+        self,
+    ) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_console_array(script)
+        assert scopes == self._EXPECTED, (
+            "D2-5A: the RENDERED Job ConfigMap's MEMORY_CONSOLE_WRITE_SCOPES "
+            f"drifted from the exact expected set. Rendered: {sorted(scopes)}. "
+            f"Expected: {sorted(self._EXPECTED)}."
+        )
+
+    def test_rendered_bind_loop_targets_only_librechat_as_optional(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        loop_body = TestConsoleMemoryProxyScopeGovernance._console_bind_loop_body(
+            script
+        )
+        assert "audittrace-librechat" in loop_body, (
+            "D2-5A: the rendered Job's MEMORY_CONSOLE_WRITE_SCOPES bind loop "
+            "does not target audittrace-librechat."
+        )
+        for other in TestConsoleMemoryProxyScopeGovernance._OTHER_END_USER_CLIENTS:
+            assert other not in loop_body, (
+                f"D2-5A: the rendered Job's bind loop references {other!r} — "
+                "scoped to audittrace-librechat only."
+            )
+        assert '"optional"' in loop_body, (
+            "D2-5A: the rendered Job must bind the console write scopes as "
+            "OPTIONAL client scopes — the browser's own login token must "
+            "never carry write access by default."
+        )
+        assert '"default"' not in loop_body, (
+            "D2-5A: the rendered Job's console-write bind loop must never "
+            "bind as a DEFAULT (always-issued) client scope."
+        )
+
+    def test_rendered_never_binds_a_forbidden_scope(self) -> None:
+        """The spec's literal 'own-tier write only' invariant, checked one
+        forbidden scope at a time — not just 'no admin'."""
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_console_array(script)
+        offenders = scopes & self._FORBIDDEN
+        assert not offenders, (
+            "D2-5A: the rendered Job's console-write bind loop illegally "
+            f"carries {sorted(offenders)} — own-tier write only, per the "
+            "ratified spec's non-negotiable invariant."
+        )
+
+
 class TestCorpusScopeGovernance:
     """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
     scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
