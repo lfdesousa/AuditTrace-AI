@@ -16,6 +16,7 @@ name: Publish
 #
 # Image at:  docker.io/lfds/audittrace-memory-server:<version>
 # Stub at:   docker.io/lfds/audittrace-llm-stub:<version>  (wiring-test only)
+# BFF at:    docker.io/lfds/audittrace-librechat-bff:<version>  (bff/Dockerfile)
 # Chart at:  oci://registry-1.docker.io/lfds/audittrace:<version>
 #
 # Image and chart land at distinct OCI repositories by virtue of the
@@ -137,6 +138,29 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build + push LibreChat BFF image (multi-arch)
+        # D2-5B (console-hardening Part B) — the LibreChat BFF sidecar
+        # (bff/, ADR-042 §5 Option A / RFC 8693 token-exchange) was
+        # missing from this pipeline, so the chart's release-versioned
+        # BFF tag could point at an image that was never published for
+        # that version (root cause of the 2026-08-31 stale-BFF E2E
+        # finding — deployed image predated the /memory proxy, #312).
+        # Build context is the REPO ROOT (not bff/) because
+        # bff/Dockerfile does `COPY bff/requirements.txt` /
+        # `COPY bff/` relative to the repo root, mirroring how the
+        # main image's Dockerfile also builds from context `.`.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bff/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            docker.io/lfds/audittrace-librechat-bff:${{ steps.ver.outputs.version }}
+            docker.io/lfds/audittrace-librechat-bff:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
@@ -244,6 +268,7 @@ jobs:
           - Image: \`docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
             - Platforms: linux/amd64, linux/arm64
           - Stub:  \`docker.io/lfds/audittrace-llm-stub:${{ steps.ver.outputs.version }}\` (wiring-test only; also \`:latest\`)
+          - BFF:   \`docker.io/lfds/audittrace-librechat-bff:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
           - Chart: \`oci://registry-1.docker.io/lfds/audittrace:${{ steps.ver.outputs.version }}\`
           - Tag:   \`${{ steps.ver.outputs.tag }}\`
           - Commit: \`${{ github.sha }}\`
