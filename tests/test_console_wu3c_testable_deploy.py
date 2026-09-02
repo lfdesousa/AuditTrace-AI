@@ -29,8 +29,16 @@ Drift classes covered:
   ``values.yaml`` carries a non-empty, well-formed ``sha256:<64-hex>``
   digest for the LibreChat image, which the rendered Deployment's image
   ref actually carries (``@sha256:...``). ``values-laptop.yaml`` pins
-  ``frontDoorHostAlias`` so `-f values-laptop.yaml` is the whole story —
-  no ``kubectl get nodes`` at deploy time.
+  ``console.frontDoorNodeName`` so `-f values-laptop.yaml` is the whole
+  story — no ``kubectl get nodes`` at deploy time. M3-WU-D2-5E
+  (2026-09-02) superseded the original static ``frontDoorHostAlias`` /
+  pod ``hostAliases`` mechanism this bullet used to describe (the
+  2026-09-01 DHCP hard-down incident: a static IP pin cannot self-heal
+  when DHCP moves the host's LAN IP) with a chart-templated
+  ``coredns-custom`` overlay that rewrites front-door hosts to the node
+  NAME instead — see ``tests/test_frontdoor_dns_chart.py`` for that
+  mechanism's own guards; the LibreChat pod carries NO ``hostAliases``
+  at all any more, laptop profile or not.
 * **D3 — session secrets are generate-if-absent + persist, not
   regenerate-every-render.** The persistence mechanism (a `lookup`-guarded
   Secret template) is structurally present in the template source (a
@@ -368,36 +376,42 @@ class TestDigestPinned:
 
 
 class TestValuesLaptopProfile:
-    def test_file_exists_and_pins_host_alias(self) -> None:
+    def test_file_exists_and_pins_node_name(self) -> None:
+        """M3-WU-D2-5E (2026-09-02): the laptop profile pins
+        `console.frontDoorNodeName` (a k3s NODE NAME, resolved by k3s's
+        own CoreDNS NodeHosts) rather than the removed
+        `frontDoorHostAlias` static IP — so `-f values-laptop.yaml` is
+        still the whole reproducible-deploy story, with no
+        `kubectl get nodes` compute step, but self-heals across a DHCP
+        change instead of going hard-down (2026-09-01 incident)."""
         assert VALUES_LAPTOP_FILE.exists(), (
             "charts/audittrace/values-laptop.yaml is missing — D2 requires "
             "a committed laptop reference profile so `-f values-laptop.yaml` "
             "replaces a live `kubectl get nodes` compute step."
         )
         laptop_values = yaml.safe_load(VALUES_LAPTOP_FILE.read_text())
-        host_alias = laptop_values["console"]["librechat"]["frontDoorHostAlias"]
-        assert host_alias, "values-laptop.yaml sets no frontDoorHostAlias."
+        node_name = laptop_values["console"]["frontDoorNodeName"]
+        assert node_name, "values-laptop.yaml sets no console.frontDoorNodeName."
 
-    def test_helm_upgrade_style_render_with_laptop_profile_sets_host_alias(
+    def test_helm_upgrade_style_render_with_laptop_profile_sets_no_host_alias(
         self,
     ) -> None:
+        """M3-WU-D2-5E: `-f values-laptop.yaml` renders NO `hostAliases` on
+        the LibreChat pod at all — front-door resolution moved entirely to
+        the chart-templated `coredns-custom` overlay (see
+        tests/test_frontdoor_dns_chart.py), which a static pod-spec field
+        can never self-heal the way CoreDNS's NodeHosts does."""
         docs = _render(values_files=[VALUES_LAPTOP_FILE])
         dep = _find(docs, "Deployment", "-librechat")
-        host_aliases = dep["spec"]["template"]["spec"].get("hostAliases")
-        laptop_values = yaml.safe_load(VALUES_LAPTOP_FILE.read_text())
-        expected_ip = laptop_values["console"]["librechat"]["frontDoorHostAlias"]
-        assert host_aliases == [
-            {"ip": expected_ip, "hostnames": ["audittrace.local"]}
-        ], (
-            f"hostAliases={host_aliases!r} — -f values-laptop.yaml must "
-            f"resolve to a static hostAliases block (ip={expected_ip!r}), "
-            "no live compute."
+        assert not dep["spec"]["template"]["spec"].get("hostAliases"), (
+            "hostAliases resurfaced on the LibreChat pod under the laptop "
+            "profile — the static-IP pin mechanism must stay removed."
         )
 
     def test_without_laptop_profile_no_host_alias_rendered(self) -> None:
         """The empty values.yaml default must still render cleanly (D1
-        parity with WU-3b) — hostAliases only appears when the profile (or
-        an explicit --set) supplies a non-empty alias."""
+        parity with WU-3b) — hostAliases never appears, laptop profile or
+        not, post M3-WU-D2-5E."""
         docs = _render()
         dep = _find(docs, "Deployment", "-librechat")
         assert not dep["spec"]["template"]["spec"].get("hostAliases")

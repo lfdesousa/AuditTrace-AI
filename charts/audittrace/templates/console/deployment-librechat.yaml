@@ -2,8 +2,9 @@
 # M3-WU-3b (D1/D2) — LibreChat itself. Stock image (no source edit).
 # Routes to the BFF only (D4 — see authorizationpolicy-console.yaml); the
 # ONE route it holds to the front door is the OIDC relying-party flow
-# (discovery/JWKS/token — D2, via hostAliases below), never a second
-# route to /v1 or Keycloak's admin surface.
+# (discovery/JWKS/token — D2, resolved via the coredns-custom overlay,
+# templates/dns/configmap-coredns-frontdoor.yaml — M3-WU-D2-5E), never a
+# second route to /v1 or Keycloak's admin surface.
 #
 # M3-WU-3d (D4) — served at ROOT on its own dedicated host
 # (`console.librechat.host`, default `librechat.audittrace.local`), NOT
@@ -37,17 +38,13 @@ spec:
         sidecar.istio.io/inject: "true"
     spec:
       serviceAccountName: {{ .Release.Name }}-librechat
-      {{- with .Values.console.librechat.frontDoorHostAlias }}
-      # k8s equivalent of docker-compose's `extra_hosts:
-      # audittrace.local:host-gateway` — see values.yaml
-      # console.librechat.frontDoorHostAlias for why this is needed.
-      # Empty by default so console.enabled=true still renders cleanly;
-      # a real deploy MUST set this (deploy runbook, operator step 1).
-      hostAliases:
-        - ip: {{ . | quote }}
-          hostnames:
-            - {{ $.Values.console.librechat.frontDoorHost | quote }}
-      {{- end }}
+      # M3-WU-D2-5E (2026-09-02) — the static `hostAliases` pin to the
+      # node's LAN IP that used to live here is GONE (the 2026-09-01 DHCP
+      # hard-down incident — see values.yaml console.frontDoorNodeName
+      # comment). `console.librechat.frontDoorHost` now resolves via the
+      # chart-templated coredns-custom overlay
+      # (templates/dns/configmap-coredns-frontdoor.yaml), never a pod
+      # `/etc/hosts` entry.
       containers:
         - name: librechat
           image: "{{ .Values.console.librechat.image.repository }}:{{ .Values.console.librechat.image.tag }}{{ if .Values.console.librechat.image.digest }}@{{ .Values.console.librechat.image.digest }}{{ end }}"
@@ -89,10 +86,11 @@ spec:
             # string mismatch (Keycloak's canonical `iss` differs from the
             # external front door) the same way the WU-3 compose profile's
             # issuer did. Reached via the front-door HOST NAME (not the
-            # in-cluster Service) — `frontDoorHostAlias` (hostAliases
-            # above) is what makes that name resolve from inside the
-            # cluster; the CA-trust / insecureTLS wiring below is what
-            # makes the resulting HTTPS call actually validate.
+            # in-cluster Service) — the coredns-custom overlay (M3-WU-D2-5E,
+            # templates/dns/configmap-coredns-frontdoor.yaml) is what makes
+            # that name resolve from inside the cluster; the CA-trust /
+            # insecureTLS wiring below is what makes the resulting HTTPS
+            # call actually validate.
             - name: OPENID_ISSUER
               value: "https://{{ .Values.console.librechat.frontDoorHost }}/realms/audittrace/.well-known/openid-configuration"
             - name: OPENID_CLIENT_ID

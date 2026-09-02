@@ -1,0 +1,46 @@
+{{- if .Values.console.frontDoorNodeName }}
+# M3-WU-D2-5E (2026-09-02) — DHCP-proof front-door DNS (chart-templated
+# form of the 2026-09-01 hand-applied fix). Supersedes the removed
+# `console.librechat.frontDoorHostAlias` static-IP pin: pinning a pod's
+# `hostAliases` to the node's LAN IP breaks the moment DHCP renews that
+# IP (192.168.1.231 -> 10.12.40.59, 2026-09-01), because `hostAliases`
+# writes directly into the pod's `/etc/hosts` and OVERRIDES CoreDNS —
+# there is no self-healing path back to a live IP.
+#
+# The fix resolves front-door hosts to the k3s NODE NAME instead of an
+# IP. k3s's packaged CoreDNS already maintains a `NodeHosts` entry
+# mapping the node's hostname -> its CURRENT IP, reloaded every ~15s
+# (https://docs.k3s.io/networking#coredns-configuration) — completely
+# independent of any values this chart controls. k3s's packaged CoreDNS
+# `ConfigMap/coredns` (kube-system) in turn auto-imports any
+# `*.override` key from a SIBLING `ConfigMap/coredns-custom` (also
+# kube-system, name FIXED by k3s convention — not release-scoped, hence
+# the explicit `namespace: kube-system` below rather than
+# `.Release.Namespace`). An `.override` here that rewrites each
+# front-door host to `console.frontDoorNodeName` therefore self-heals on
+# any DHCP change with NO pod restart, NO chart re-apply. Proven live
+# (hand-applied) 2026-09-01: `OpenID Connect configured successfully.`
+# and `GET /oauth/openid` -> 302 to the Keycloak auth endpoint.
+#
+# Guarded on `console.frontDoorNodeName` being set (empty by default) so
+# `helm template`/`helm lint` render clean with no live `kubectl get
+# nodes` compute step — the same non-reproducible pattern
+# `frontDoorHostAlias` was already rejected for. A real deploy sets the
+# laptop reference-target value in values-laptop.yaml; a cloud target
+# gets its own values-<target>.yaml value, or routes these hosts at the
+# Istio ingress gateway's in-cluster Service DNS name instead — still a
+# NAME, never an IP (portability invariant,
+# [[project_portability_invariant]]).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+  labels:
+    {{- include "audittrace.labels" . | nindent 4 }}
+data:
+  frontdoor.override: |
+    rewrite name exact {{ .Values.console.librechat.frontDoorHost }} {{ .Values.console.frontDoorNodeName }}
+    rewrite name exact {{ .Values.console.frontDoorCloudHost }} {{ .Values.console.frontDoorNodeName }}
+    rewrite name exact {{ .Values.console.librechat.host }} {{ .Values.console.frontDoorNodeName }}
+{{- end }}
