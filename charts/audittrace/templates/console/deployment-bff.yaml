@@ -34,7 +34,12 @@ spec:
       {{- end }}
       containers:
         - name: bff
-          image: "{{ .Values.console.bff.image.repository }}:{{ .Values.console.bff.image.tag | default .Chart.AppVersion }}"
+          # M3-WU-D2-5C — digest-pin plumbing, mirrors the console.librechat
+          # image ref below (deployment-librechat.yaml) / the memory-server
+          # digest-pin pattern: `repository:tag@digest` when a digest is
+          # set, `repository:tag` otherwise (e.g. a bare `--set
+          # console.bff.image.tag=...` override with no digest).
+          image: "{{ .Values.console.bff.image.repository }}:{{ .Values.console.bff.image.tag | default .Chart.AppVersion }}{{ if .Values.console.bff.image.digest }}@{{ .Values.console.bff.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.console.bff.image.pullPolicy }}
           {{- if $useVault }}
           # Source the Vault Agent-rendered secret file before exec'ing the

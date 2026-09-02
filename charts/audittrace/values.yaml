@@ -849,11 +849,29 @@ console:
     # source of truth this toggle feeds.
     secretSource: vault
     image:
-      # Built from bff/Dockerfile, pushed to the local registry — same
-      # convention as memoryServer.image (tag defaults to .Chart.AppVersion
-      # when unset, see templates/console/deployment-bff.yaml).
-      repository: localhost:5000/audittrace/librechat-bff
-      tag: ""
+      # M3-WU-D2-5C (2026-09-02) — published to Docker Hub by
+      # .github/workflows/publish.yml (Part B, console-hardening-b-bff-in-
+      # publish) same as memoryServer.image. Supersedes the
+      # `localhost:5000/audittrace/librechat-bff` local-registry, tag-only
+      # pin that let the stale `wu3b` image run in production — that
+      # posture is GONE, `wu3b` dies with it.
+      repository: docker.io/lfds/audittrace-librechat-bff
+      # Explicit release version, not the AppVersion-tracking empty-string
+      # convenience memoryServer.image.tag uses — the digest below is
+      # pinned to THIS specific published version, so tag and digest must
+      # move together on every bump (mirrors console.librechat.image
+      # below, not memoryServer).
+      tag: "1.25.1"
+      # M3-WU-D2-5C — the published INDEX digest for
+      # docker.io/lfds/audittrace-librechat-bff:1.25.1, confirmed live on
+      # Docker Hub 2026-09-02 via `docker-content-digest` on a manifest
+      # HEAD/GET (never fabricated). Mirrors the console.librechat.image
+      # digest-pin pattern below. When Part B's release pipeline publishes
+      # a new version this reconciles to whatever digest THAT publish
+      # produces — never hand-edited without re-verifying against the
+      # registry. When set, the rendered image ref becomes
+      # `<repository>:<tag>@<digest>` (deployment-bff.yaml).
+      digest: "sha256:286fe5b699a9b7248e72990a063d353ce6692f7a37e823177e324f5a42bab488"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -877,22 +895,45 @@ console:
     exchangeClientId: audittrace-librechat-bff
     exchangeAudience: audittrace-librechat
 
-  # ── D1 — LibreChat itself (stock image, no source edit) ─────────────────
+  # ── D2 — LibreChat: the sovereign fork (M3-WU-D2-4 cutover) ─────────────
+  # M3-WU-D2-4 (2026-08-31) supersedes the D1 "stock image, no source edit"
+  # posture: the Souvenirs Day-2 code layer (adapter D2-2, panel + agent-
+  # write→sovereign D2-3, context-reads→sovereign D2-3c) is built, merged,
+  # and certified in `lfds/LibreChat main @ 0f08e22`, and the fork image is
+  # pushed to Docker Hub. This is our fork, not upstream — the sovereign
+  # memory adapter (`api/server/services/AuditTraceMemory/config.js`) lives
+  # inside it, reading the three env vars rendered below. Frozen at
+  # `0f08e22`; any further fork code change is a new tag + digest, never an
+  # in-place mutation of this pin. Incorporated into the chart via
+  # M3-WU-D2-5C (2026-09-02) — the digest was re-verified against Docker
+  # Hub at that time (unchanged from the D2-4 branch's original pin).
   librechat:
     image:
-      repository: ghcr.io/danny-avila/librechat
-      # v0.8.7 is the first stable release carrying the native
-      # `{{LIBRECHAT_OPENID_ACCESS_TOKEN}}` custom-endpoint header
-      # placeholder (LibreChat #9444 / PR #9344, GA v0.8.0) — this is what
-      # eliminates the WU-3 paste-token crutch (D2).
-      tag: "v0.8.7"
-      # M3-WU-3c (D2) — pinned so the deploy is reproducible with no live
+      repository: docker.io/lfds/audittrace-librechat
+      tag: "0f08e22"
+      # M3-WU-D2-4 (D2) — pinned so the deploy is reproducible with no live
       # `docker pull ... && docker inspect` compute step. This is the
-      # resolved digest for ghcr.io/danny-avila/librechat:v0.8.7. A future
-      # bump moves it, like any pinned digest (Dependabot / operator
-      # verifies via `docker inspect`, never fabricated). When set, the
-      # rendered image ref becomes `<repository>:<tag>@<digest>`.
-      digest: "sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9"
+      # pushed INDEX digest for
+      # docker.io/lfds/audittrace-librechat:0f08e22 (confirmed live on
+      # Docker Hub 2026-08-31, re-confirmed 2026-09-02 via
+      # `docker-content-digest` on a manifest GET). A future bump moves it,
+      # like any pinned digest (operator verifies via `docker inspect`,
+      # never fabricated). When set, the rendered image ref becomes
+      # `<repository>:<tag>@<digest>`.
+      digest: "sha256:2d9590a567bd256d7be4fa16bac238f18427ac7f795666bddd472e42c8ff1474"
+    # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
+    # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
+    # one-brain path ONLY when it is exactly "sovereign" — any other value
+    # (unset, "mongo", a typo) fails CLOSED to LibreChat's own Mongo store,
+    # never the other way round. This value renders VERBATIM into the env
+    # var below (never coerced to "sovereign"), so an operator can flip it
+    # back to "mongo" and the fork reverts, no chart-code change needed.
+    memoryBackend: "sovereign"
+    # M3-WU-D2-4 — timeout for the panel's memory CRUD calls to the BFF
+    # (milliseconds). Panel memory CRUD via the BFF is fast; the observed
+    # ~150-180s latency belongs to the CHAT recall-tool-loop over `/v1`,
+    # NOT the BFF, so 15s is ample headroom here.
+    bffTimeoutMs: 15000
     replicaCount: 1
     port: 3080
     resources:
