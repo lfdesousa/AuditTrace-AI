@@ -943,6 +943,28 @@ console:
     # TLS certificate validation outright (`NODE_TLS_REJECT_UNAUTHORIZED=0`)
     # — never set true against anything but a throwaway/dev cluster.
     insecureTLS: false
+    # M3-WU-D2-5H (2026-09-02) — bounds for the OIDC discovery readiness
+    # gate (the `wait-for-oidc-discovery` initContainer in
+    # deployment-librechat.yaml). LibreChat's own `openid` passport
+    # strategy is configured via a ONE-SHOT, NO-RETRY fetch of the
+    # OPENID_ISSUER discovery URL at process start: if Keycloak (or the
+    # Istio gateway in front of it) is not yet serving the front door on a
+    # boot storm, the strategy is never registered for the process life
+    # and every login fails with `Unknown authentication strategy
+    # "openid"` — even though the pod itself looks healthy (2/2, /health
+    # green). Confirmed live on the 2026-09-01 PM reboot: Part E's DNS fix
+    # (frontDoorNodeName) was intact and the host IP had NOT even changed,
+    # yet the race still fired because the librechat pod won the race
+    # against Keycloak's readiness. This gate complements — does NOT
+    # replace — Part E: E makes the discovery URL resolvable, this makes
+    # WHEN it's fetched safe. `intervalSeconds` = poll cadence;
+    # `timeoutSeconds` = generous enough to cover a cold Keycloak +
+    # Istio-gateway warm-up on this laptop box before the initContainer
+    # gives up and exits non-zero, surfacing a loud `Init:CrashLoopBackOff`
+    # instead of a silent unregistered-strategy hard-down.
+    oidcWait:
+      timeoutSeconds: 300
+      intervalSeconds: 5
 
   # ── D1 — MongoDB (LibreChat's own store; pinned, no external port) ──────
   mongodb:
