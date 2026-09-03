@@ -11,7 +11,13 @@
 # The script is idempotent — safe to re-run on every helm upgrade
 # (which is what the post-upgrade hook does). It only ever creates
 # missing scopes / missing client bindings; never deletes or
-# rewrites existing realm content.
+# rewrites existing realm content — EXCEPT Step 6 (M3-WU-D2-5D)
+# below, which deliberately SETS (not merely ensures-present) the
+# `audittrace-librechat` client's `redirectUris`/`webOrigins` to the
+# config-as-code target on every upgrade. That is a narrow, named
+# exception: reconciling exactly those two fields on that one client
+# is the whole point of Step 6 (killing redirect-URI drift), never a
+# general license to rewrite other realm content.
 #
 # Step 4 (M3-WU-2b) additionally provisions the RFC 8693 token-exchange
 # fine-grained admin permission that authorizes `audittrace-librechat-bff`
@@ -20,6 +26,14 @@
 # new one to avoid new Vault-role/Istio-AuthorizationPolicy surface for
 # what is, functionally, the same "harden the running realm after
 # --import-realm" concern.
+#
+# Step 6 (M3-WU-D2-5D, 2026-09-01) reconciles `audittrace-librechat`'s
+# `redirectUris`/`webOrigins` to the value `console.librechat.host`
+# derives on every upgrade — closing the 2026-08-31 incident where an
+# operator hand-added a callback URL in the Keycloak admin console
+# because realm.json's updated redirect URI never reached the running
+# realm (`--import-realm` only imports on first run — the identical
+# gap Steps 1-5 close for scopes/mappers/token-exchange).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -521,6 +535,57 @@ data:
     bind_scope "audittrace-librechat" "offline_access" "optional"
 
     echo "✅ console realm-scope reconcile complete."
+
+    # ── Step 6: reconcile audittrace-librechat redirectUris/webOrigins ──
+    # (M3-WU-D2-5D, 2026-09-01)
+    #
+    # Root cause this closes: on 2026-08-31 login failed until an operator
+    # hand-added `https://librechat.audittrace.local/oauth/openid/callback`
+    # to `audittrace-librechat` in the Keycloak admin console — realm.json
+    # already declared the correct redirectUris/webOrigins, but
+    # `kc.sh start --import-realm` NEVER overwrites an existing realm, so a
+    # change to those two fields after first import silently never reaches
+    # the running DB. Same "config-as-code that never reconciles to the
+    # running system" disease Steps 1-5 above exist to close for scopes/
+    # mappers/token-exchange — this step closes it for the client's own
+    # redirect fields.
+    #
+    # Deliberately driven by `console.librechat.host` — the SAME chart
+    # value `templates/console/deployment-librechat.yaml` uses to render
+    # DOMAIN_CLIENT/DOMAIN_SERVER (the D5 lock-step that template's own
+    # comment documents) — never by `keycloak.librechat.redirectUris`
+    # (the values.yaml literal realm.json's FIRST-import path renders
+    # from). Keying the reconcile to the host value the running LibreChat
+    # pod actually serves from is what makes it self-correcting even when
+    # an operator bumps `console.librechat.host` and forgets the sibling
+    # `keycloak.librechat.redirectUris`/`webOrigins` literals.
+    #
+    # SETS (never appends/merges) both fields to exactly one entry each —
+    # the failure mode above was a STALE wrong entry that needed
+    # replacing, not a missing one that needed adding alongside it.
+    # Exact-match only, HTTPS only, no wildcard `*`/`/*` suffix (RFC 9700
+    # — ties the OIDC-REDIRECT-URI-DRIFT security item and
+    # `feedback_no_more_drifts`).
+    #
+    # Scoped to this ONE client's TWO fields only — every other client,
+    # user, mapper, and scope on the realm (including this same client's
+    # own scope grants, reconciled separately by Steps 2c/5 above) is
+    # untouched by this step. Falsifiability covered by
+    # tests/test_chart_drift_guards.py::TestD25DConsoleRedirectReconcile
+    # (renders this Job's ConfigMap, targets this exact step block).
+    CONSOLE_REDIRECT_URI="https://{{ .Values.console.librechat.host }}/oauth/openid/callback"
+    CONSOLE_WEB_ORIGIN="https://{{ .Values.console.librechat.host }}"
+
+    echo "▶ reconciling audittrace-librechat redirectUris/webOrigins..."
+    if ! LIBRECHAT_CLIENT_UUID=$(find_client_id "audittrace-librechat"); then
+      echo "❌ client audittrace-librechat not found — cannot reconcile redirect URIs." >&2
+      exit 1
+    fi
+    "${KCADM}" update "clients/${LIBRECHAT_CLIENT_UUID}" -r "${REALM}" \
+      -s "redirectUris=[\"${CONSOLE_REDIRECT_URI}\"]" \
+      -s "webOrigins=[\"${CONSOLE_WEB_ORIGIN}\"]" >/dev/null
+    echo "  ✓ audittrace-librechat redirectUris=[\"${CONSOLE_REDIRECT_URI}\"] webOrigins=[\"${CONSOLE_WEB_ORIGIN}\"]"
+    echo "✅ audittrace-librechat redirect reconcile complete."
 
     # ── Istio sidecar shutdown ────────────────────────────────────
     # Same intent as the summariser-role Job (Phase C.8 root cause):
