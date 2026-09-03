@@ -28,7 +28,11 @@ spec:
   restartPolicy: Never
   containers:
     - name: tests
-      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}"
+      # M3-WU-D2-5F — digest-pin render form, mirrors
+      # templates/console/deployment-bff.yaml: `repository:tag@digest`
+      # when a digest is set, `repository:tag` otherwise (e.g. a bare
+      # `--set tests.image.tag=...` override with no digest).
+      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}{{ if .Values.tests.image.digest }}@{{ .Values.tests.image.digest }}{{ end }}"
       imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
       command: ["/bin/sh", "-c"]
       args:

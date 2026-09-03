@@ -161,6 +161,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build + push tests image (multi-arch)
+        # M3-WU-D2-5F (console-hardening Part F) — Dockerfile.tests (the
+        # `helm.sh/hook: test` RLS-integration-suite image, chart Chart-A
+        # 2026-05-13) was the LAST `localhost:5000` reference left in the
+        # chart: `values.yaml`'s `tests.image` pinned
+        # `localhost:5000/audittrace/tests:latest` — a local-registry,
+        # mutable-`:latest`, `pullPolicy: Always` ref that only ever
+        # resolved against the laptop's dev registry, surfaced by the
+        # D2-5C review as the chart's remaining non-reproducible image.
+        # Mirrors the BFF job above exactly (context `.`, both platforms,
+        # docker/build-push-action@v6, the same tags shape). The one
+        # addition is `TESTS_BASE_IMAGE`: Dockerfile.tests's own docstring
+        # says a CI/release pipeline should override it to "the immutable
+        # published runtime tag they want to validate" — here that is the
+        # memory-server image this SAME job just pushed above, so the
+        # tests image always validates the exact runtime it ships
+        # alongside for this version, never a locally-built stand-in.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.tests
+          build-args: |
+            TESTS_BASE_IMAGE=docker.io/lfds/audittrace-memory-server:${{ steps.ver.outputs.version }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            docker.io/lfds/audittrace-tests:${{ steps.ver.outputs.version }}
+            docker.io/lfds/audittrace-tests:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
@@ -269,6 +300,7 @@ jobs:
             - Platforms: linux/amd64, linux/arm64
           - Stub:  \`docker.io/lfds/audittrace-llm-stub:${{ steps.ver.outputs.version }}\` (wiring-test only; also \`:latest\`)
           - BFF:   \`docker.io/lfds/audittrace-librechat-bff:${{ steps.ver.outputs.version }}\` (also \`:latest\`)
+          - Tests: \`docker.io/lfds/audittrace-tests:${{ steps.ver.outputs.version }}\` (helm-test hook image; also \`:latest\`)
           - Chart: \`oci://registry-1.docker.io/lfds/audittrace:${{ steps.ver.outputs.version }}\`
           - Tag:   \`${{ steps.ver.outputs.tag }}\`
           - Commit: \`${{ github.sha }}\`

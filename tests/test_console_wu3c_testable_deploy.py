@@ -72,6 +72,7 @@ VALUES_LAPTOP_FILE = CHART_DIR / "values-laptop.yaml"
 SECRET_LIBRECHAT_TEMPLATE = (
     CHART_DIR / "templates" / "console" / "secret-librechat.yaml"
 )
+SECRET_BFF_TEMPLATE = CHART_DIR / "templates" / "console" / "secret-bff.yaml"
 HELPERS_TEMPLATE = CHART_DIR / "templates" / "_helpers.tpl"
 
 RELEASE = "audittrace"
@@ -219,27 +220,46 @@ class TestSecretSourceValues:
         )
 
     def test_k8s_secret_rendered_with_supplied_value(self) -> None:
+        """M3-WU-D2-5F: the Secret now renders via the shared
+        audittrace.console.persistedSecret helper (base64 `data:`, not
+        plaintext `stringData:`) — see TestBffSecretPersistence below for
+        the full generate-if-absent/preserve invariant this supersedes."""
         docs = _render(
             vault_enabled=True,
             secret_source="values",
             extra_set=["--set", "secrets.console.bffExchangeClientSecret=test-value-1"],
         )
         secret = _find(docs, "Secret", "-librechat-bff-secret")
-        assert secret["stringData"]["exchange-client-secret"] == "test-value-1"
+        assert (
+            base64.b64decode(secret["data"]["exchange-client-secret"]).decode()
+            == "test-value-1"
+        )
 
-    def test_fails_closed_when_secret_left_empty(self) -> None:
-        """Missing-secret fail-closed guard MUST still fire — D1 says never
-        an empty secret silently accepted. bff/config.py's Settings has no
-        default for the exchange secret, so an empty stringData still means
-        the pod would refuse to start meaningfully; here we just confirm
-        the chart never invents a non-empty placeholder when the operator
-        supplied none."""
+    def test_generates_a_value_when_none_supplied_and_no_existing_secret(
+        self,
+    ) -> None:
+        """M3-WU-D2-5F SUPERSEDES the previous fail-closed-on-empty
+        behaviour this test used to police (an intentional, spec-driven
+        change — see [[feedback_ratified_spec_immutable]], this is not a
+        drift). Before D2-5F, no operator input rendered an EMPTY
+        stringData, forcing bff/config.py's Settings to raise at startup
+        (CrashLoop) — visible but meant the CD agent had to remember to
+        re-pass the live secret on every plain `helm upgrade`, which is
+        exactly the friction D2-5F removes. Now: no explicit value AND no
+        existing cluster Secret (a genuine first install, which is all a
+        hermetic `helm template` run can ever see — `lookup` sees nothing
+        without a real cluster) generates a fresh non-empty value, mirroring
+        the D3 session-secret precedent (TestSessionSecretsPersistIfPresent
+        below). This path only renders for the laptop-dev/test
+        `secretSource=values` fallback — the Vault production posture
+        (TestSecretSourceVaultUnchanged) is untouched by this WU."""
         docs = _render(vault_enabled=True, secret_source="values")
         secret = _find(docs, "Secret", "-librechat-bff-secret")
-        assert secret["stringData"]["exchange-client-secret"] == "", (
-            "chart rendered a non-empty exchange-client-secret with no "
-            "operator input — a fabricated default would defeat the "
-            "fail-closed startup guard."
+        value = base64.b64decode(secret["data"]["exchange-client-secret"]).decode()
+        assert value, (
+            "chart rendered an empty exchange-client-secret with no "
+            "operator input and no existing cluster Secret — D2-5F's "
+            "generate-if-absent guard did not fire."
         )
 
 
@@ -321,6 +341,118 @@ class TestSecretSourceVaultUnchanged:
         # WU-3c-only markers (they only ever appear on the OTHER branch).
         assert "console.bff.secretSource=values" not in result.stdout
         assert result.stdout.count('vault.hashicorp.com/agent-inject: "true"') == 1
+
+
+class TestBffSecretPersistence:
+    """M3-WU-D2-5F — the BFF exchange-client secret is now generate-if-
+    absent + persist, via the SAME `audittrace.console.persistedSecret`
+    helper secret-librechat.yaml (D3) already uses. Before D2-5F, a plain
+    `helm upgrade` re-rendered `stringData` straight from
+    `.Values.secrets.console.bffExchangeClientSecret` (default `""`) on
+    EVERY apply — since the CD agent never re-passes the live secret on a
+    routine upgrade, this silently EMPTIED the running exchange secret,
+    forcing the CD agent to remember a `--set-string` re-pass every time
+    (the exact friction this WU exists to remove). Neuter this guard
+    (revert to a bare `.Values`-only Secret, always overwriting) and this
+    class's structural test goes RED — a live `helm upgrade` would empty
+    the secret again even though a single hermetic render still "looks
+    fine" (mirrors the analogous D3 guard for secret-librechat.yaml)."""
+
+    def test_template_source_uses_lookup_guarded_persistence(self) -> None:
+        src = SECRET_BFF_TEMPLATE.read_text()
+        assert 'lookup "v1" "Secret"' in src, (
+            'secret-bff.yaml no longer calls `lookup "v1" "Secret"` — '
+            "D2-5F's generate-if-absent + persist mechanism was removed; "
+            "every `helm upgrade` would empty the BFF exchange-client "
+            "secret again."
+        )
+        assert 'define "audittrace.console.persistedSecret"' not in src, (
+            "secret-bff.yaml should CALL the shared helper, not redefine "
+            "it — a redefinition would silently diverge from the "
+            "secret-librechat.yaml (D3) precedent this WU deliberately "
+            "reuses."
+        )
+        assert 'include "audittrace.console.persistedSecret"' in src
+        assert '"key" "exchange-client-secret"' in src
+
+    def test_helper_precedence_explicit_then_existing_then_generated(
+        self,
+    ) -> None:
+        """Same ordering guard as D3's
+        test_helper_defines_explicit_existing_generated_precedence — an
+        operator-supplied value must never be overridden by stale cluster
+        state, and stale cluster state must never be silently
+        regenerated."""
+        src = HELPERS_TEMPLATE.read_text()
+        explicit_idx = src.index("if .explicit")
+        existing_idx = src.index("hasKey .existing .key")
+        assert explicit_idx < existing_idx
+
+    def test_explicit_value_is_stable_across_two_renders(self) -> None:
+        """Idempotent: an operator-pinned secrets.console.
+        bffExchangeClientSecret must render IDENTICALLY on every
+        `helm upgrade` — never silently re-randomised out from under a
+        pinned value."""
+        extra = [
+            "--set",
+            "secrets.console.bffExchangeClientSecret=fixed-exchange-secret",
+        ]
+        secret_1 = _find(
+            _render(vault_enabled=True, secret_source="values", extra_set=extra),
+            "Secret",
+            "-librechat-bff-secret",
+        )
+        secret_2 = _find(
+            _render(vault_enabled=True, secret_source="values", extra_set=extra),
+            "Secret",
+            "-librechat-bff-secret",
+        )
+        assert secret_1["data"] == secret_2["data"]
+        assert (
+            base64.b64decode(secret_1["data"]["exchange-client-secret"]).decode()
+            == "fixed-exchange-secret"
+        )
+
+    def test_no_explicit_value_two_renders_differ_and_are_nonempty(
+        self,
+    ) -> None:
+        """Honest hermetic boundary (mirrors D3's
+        test_two_renders_with_no_explicit_value_are_non_empty_and_differ):
+        with no real cluster, `lookup` sees nothing on either independent
+        `helm template` invocation, so two such renders with NO explicit
+        override are expected to generate two DIFFERENT values — this
+        guards against a regression to a fixed/hardcoded fallback
+        masquerading as genuine per-install generation. True persistence
+        across a real `helm upgrade` (the guard this WU actually targets)
+        is Rule 2/3 live, out of this Rule-1-only build's scope."""
+        secret_1 = _find(
+            _render(vault_enabled=True, secret_source="values"),
+            "Secret",
+            "-librechat-bff-secret",
+        )
+        secret_2 = _find(
+            _render(vault_enabled=True, secret_source="values"),
+            "Secret",
+            "-librechat-bff-secret",
+        )
+        v1 = base64.b64decode(secret_1["data"]["exchange-client-secret"]).decode()
+        v2 = base64.b64decode(secret_2["data"]["exchange-client-secret"]).decode()
+        assert v1 and v2
+        assert v1 != v2, (
+            "two independent renders with no explicit value and no cluster "
+            "produced the SAME exchange-client-secret — suggests a "
+            "hardcoded fallback rather than genuine per-install generation."
+        )
+
+    def test_no_secret_value_committed_to_chart_source(self) -> None:
+        """Invariant: no secret VALUE committed to values or templates —
+        the preserve guard reads the live Secret, it does not bake a
+        plaintext secret into the chart."""
+        src = SECRET_BFF_TEMPLATE.read_text()
+        values_src = VALUES_FILE.read_text()
+        for forbidden in ("fixed-exchange-secret", "test-value-1"):
+            assert forbidden not in src
+            assert forbidden not in values_src
 
 
 class TestSecretSourceMatrix:
