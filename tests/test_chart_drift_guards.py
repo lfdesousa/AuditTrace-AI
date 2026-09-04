@@ -554,6 +554,16 @@ def _render_with_extras(extras: list[str]) -> str:
     return result.stdout
 
 
+def _render_docs_with_extras(extras: list[str]) -> list[dict]:
+    """Like ``_render()`` but allows extra ``--set`` overrides on top of the
+    standard vault/istio + lint-secrets baseline — used by
+    ``TestD25DConsoleRedirectReconcile`` to prove the reconcile step tracks
+    a non-default ``console.librechat.host`` rather than a value baked in
+    at render time for the default host alone."""
+    raw = _render_with_extras(extras)
+    return [d for d in yaml.safe_load_all(raw) if isinstance(d, dict) and d.get("kind")]
+
+
 class TestSecretTemplatesAllRenderInProdMode:
     # Templates documented to render only in vault-disabled mode.
     # Each entry MUST cite the reason — drive-by skips are forbidden.
@@ -2301,6 +2311,209 @@ class TestConsoleRealmScopeReconcile:
             "reference tests/test_chart_drift_guards.py::"
             "TestConsoleRealmScopeReconcile (this class) by name."
         )
+
+
+class TestD25DConsoleRedirectReconcile:
+    """D2-5D (``2026-09-01-SPEC-console-hardening-d-realm-reconcile.md``) —
+    the ``ensure-memory-scopes`` Job's Step 6 kcadm reconcile sets
+    ``audittrace-librechat``'s ``redirectUris``/``webOrigins`` to the
+    config-as-code target derived from ``console.librechat.host`` on
+    EVERY ``helm upgrade`` (``--import-realm`` never overwrites an
+    existing realm, so a realm.json edit to these two fields alone never
+    reaches a pre-existing running realm — the 2026-08-31 incident this
+    spec closes).
+
+    Falsifiable, one assertion per guard:
+
+    * the reconcile block missing from the rendered Job's ConfigMap fails
+      ``test_reconcile_step_present``;
+    * the target URIs not matching what ``console.librechat.host``'s
+      DEFAULT derives fails
+      ``test_redirect_uri_derived_from_console_librechat_host_default``;
+    * hardcoding the target instead of deriving it from
+      ``console.librechat.host`` fails
+      ``test_redirect_uri_tracks_a_custom_console_librechat_host`` — a
+      non-default host override must change the rendered target too;
+    * widening the reconcile to any other client (``audittrace-webui``,
+      ``audittrace-opencode``, ``admin-client``,
+      ``audittrace-librechat-bff``) fails
+      ``test_reconcile_targets_librechat_client_only``;
+    * hardcoding a client id/path instead of the resolved UUID fails
+      ``test_reconcile_uses_client_uuid_not_a_literal_client_id_path``;
+    * dropping/duplicating/widening the reconciled field set beyond
+      exactly ``redirectUris``+``webOrigins`` fails
+      ``test_reconcile_sets_exactly_redirecturis_and_weborigins``;
+    * a wildcard (``*``) suffix or a plain-HTTP scheme on either target
+      fails ``test_no_wildcard_or_plain_http_target`` (RFC 9700).
+
+    Non-vacuity proven live in the D2-5D build record: neutering
+    ``CONSOLE_REDIRECT_URI``/the ``find_client_id "audittrace-librechat"``
+    call/the ``-s`` flag set in the ConfigMap source turns each guard
+    above RED individually; restoring turns it back GREEN.
+    """
+
+    _STEP_START_MARKER = (
+        "Step 6: reconcile audittrace-librechat redirectUris/webOrigins"
+    )
+    _STEP_END_MARKER = "Istio sidecar shutdown"
+
+    _OTHER_CLIENTS: tuple[str, ...] = (
+        "audittrace-webui",
+        "audittrace-opencode",
+        "admin-client",
+        "audittrace-librechat-bff",
+    )
+
+    @classmethod
+    def _reconcile_block(cls, script: str) -> str:
+        start = script.find(cls._STEP_START_MARKER)
+        assert start != -1, (
+            "D2-5D: the rendered ensure-memory-scopes ConfigMap script is "
+            f"missing the {cls._STEP_START_MARKER!r} step — the redirect/"
+            "webOrigin reconcile was removed or renamed."
+        )
+        end = script.find(cls._STEP_END_MARKER, start)
+        assert end != -1, (
+            "D2-5D: could not bound the Step 6 block — the "
+            f"{cls._STEP_END_MARKER!r} marker that follows it in the "
+            "source is missing or was reordered."
+        )
+        return script[start:end]
+
+    @classmethod
+    def _rendered_block(cls, extra_sets: list[str] | None = None) -> str:
+        docs = _render_docs_with_extras(extra_sets) if extra_sets else _render()
+        script = (
+            TestD25AMemoryWriteScopesJobRenderedBinding._rendered_memory_scopes_script(
+                docs
+            )
+        )
+        return cls._reconcile_block(script)
+
+    @staticmethod
+    def _targets(block: str) -> tuple[str, str]:
+        m_redirect = re.search(r'CONSOLE_REDIRECT_URI="([^"]+)"', block)
+        m_origin = re.search(r'CONSOLE_WEB_ORIGIN="([^"]+)"', block)
+        assert m_redirect is not None, (
+            'D2-5D: CONSOLE_REDIRECT_URI="..." not found in the rendered Step 6 block.'
+        )
+        assert m_origin is not None, (
+            'D2-5D: CONSOLE_WEB_ORIGIN="..." not found in the rendered Step 6 block.'
+        )
+        return m_redirect.group(1), m_origin.group(1)
+
+    def test_reconcile_step_present(self) -> None:
+        self._rendered_block()  # raises AssertionError if missing
+
+    def test_redirect_uri_derived_from_console_librechat_host_default(
+        self,
+    ) -> None:
+        redirect_uri, web_origin = self._targets(self._rendered_block())
+        assert (
+            redirect_uri == "https://librechat.audittrace.local/oauth/openid/callback"
+        ), (
+            "D2-5D: default-host redirectUri target drifted from the "
+            f"expected value. Got: {redirect_uri!r}."
+        )
+        assert web_origin == "https://librechat.audittrace.local", (
+            "D2-5D: default-host webOrigin target drifted from the "
+            f"expected value. Got: {web_origin!r}."
+        )
+
+    def test_redirect_uri_tracks_a_custom_console_librechat_host(
+        self,
+    ) -> None:
+        """The whole point of D2-5D: the reconcile must be DRIVEN by
+        ``console.librechat.host``, not a value frozen at the chart's
+        default. Overriding the host must change the rendered target."""
+        block = self._rendered_block(
+            [
+                "--set",
+                "console.librechat.host=my-console.example.test",
+            ]
+        )
+        redirect_uri, web_origin = self._targets(block)
+        assert (
+            redirect_uri == "https://my-console.example.test/oauth/openid/callback"
+        ), (
+            "D2-5D: overriding console.librechat.host did not change the "
+            f"reconciled redirectUri target. Got: {redirect_uri!r}."
+        )
+        assert web_origin == "https://my-console.example.test", (
+            "D2-5D: overriding console.librechat.host did not change the "
+            f"reconciled webOrigin target. Got: {web_origin!r}."
+        )
+        # Scope the "no stale default" check to the EXECUTABLE portion only
+        # (from the CONSOLE_REDIRECT_URI= assignment onward) — the block's
+        # leading comment prose legitimately narrates the 2026-08-31
+        # incident by quoting the OLD default-host callback URL, which
+        # would otherwise false-positive this guard.
+        code_start = block.find("CONSOLE_REDIRECT_URI=")
+        assert code_start != -1
+        code = block[code_start:]
+        assert "librechat.audittrace.local" not in code, (
+            "D2-5D: the default host leaked into Step 6's EXECUTABLE code "
+            "even after overriding console.librechat.host — the "
+            "reconcile is not actually driven by the chart value."
+        )
+
+    def test_reconcile_targets_librechat_client_only(self) -> None:
+        block = self._rendered_block()
+        assert 'find_client_id "audittrace-librechat"' in block, (
+            "D2-5D: Step 6 must resolve the client UUID via "
+            'find_client_id "audittrace-librechat".'
+        )
+        for other in self._OTHER_CLIENTS:
+            assert other not in block, (
+                f"D2-5D: Step 6 references {other!r} — the reconcile must "
+                "be scoped to audittrace-librechat only."
+            )
+
+    def test_reconcile_uses_client_uuid_not_a_literal_client_id_path(
+        self,
+    ) -> None:
+        block = self._rendered_block()
+        assert '"${KCADM}" update "clients/${LIBRECHAT_CLIENT_UUID}"' in block, (
+            "D2-5D: Step 6 must PUT to the resolved client UUID path "
+            "(clients/${LIBRECHAT_CLIENT_UUID}), never a hardcoded/"
+            "literal client-id path."
+        )
+
+    def test_reconcile_sets_exactly_redirecturis_and_weborigins(
+        self,
+    ) -> None:
+        block = self._rendered_block()
+        set_fields = re.findall(r'-s "([A-Za-z]+)=', block)
+        assert set_fields.count("redirectUris") == 1, (
+            "D2-5D: Step 6 must set redirectUris exactly once. Found: "
+            f"{set_fields.count('redirectUris')}."
+        )
+        assert set_fields.count("webOrigins") == 1, (
+            "D2-5D: Step 6 must set webOrigins exactly once. Found: "
+            f"{set_fields.count('webOrigins')}."
+        )
+        assert set(set_fields) == {"redirectUris", "webOrigins"}, (
+            "D2-5D: Step 6 must reconcile EXACTLY these two fields on the "
+            f"client — found {sorted(set(set_fields))}. Any other field "
+            "widens the reconcile beyond the spec's 'only these two "
+            "fields' invariant."
+        )
+
+    def test_no_wildcard_or_plain_http_target(self) -> None:
+        redirect_uri, web_origin = self._targets(self._rendered_block())
+        for label, value in (
+            ("redirectUri", redirect_uri),
+            ("webOrigin", web_origin),
+        ):
+            assert value.startswith("https://"), (
+                f"D2-5D: {label} target {value!r} is not HTTPS — RFC 9700 "
+                "forbids plain-HTTP redirect URIs/webOrigins."
+            )
+            assert not value.endswith("*"), (
+                f"D2-5D: {label} target {value!r} carries a wildcard "
+                "suffix — RFC 9700 / ADR-042 §3 forbid it "
+                "(OIDC-REDIRECT-URI-DRIFT)."
+            )
 
 
 class TestLibrechatBffClient:
