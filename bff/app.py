@@ -1,13 +1,14 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Two routes matter: ``POST /v1/chat/completions``, the proxy target
-LibreChat's custom endpoint config points at, and
-``GET/POST/PUT/DELETE /memory/{path}``, the Souvenirs panel's memory-proxy
-(M3-WU-D2-1). ``GET /health`` is the k8s-probe convenience every
-AuditTrace deployable carries.
+Three routes matter: ``POST /v1/chat/completions``, the proxy target
+LibreChat's custom endpoint config points at; ``GET/POST/PUT/DELETE
+/memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1); and
+``POST /console/files``, the console's narrow-scope ephemeral file-ingest
+entry (M3 Sovereign-Attach WU-2). ``GET /health`` is the k8s-probe
+convenience every AuditTrace deployable carries.
 
-Both proxy routes share one fail-closed shape (see the module docstrings
-in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
+All three proxy routes share one fail-closed shape (see the module
+docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
 ``bff/memory_proxy.py`` for the guard each step enforces):
 
 1. Extract ``Authorization: Bearer <token>`` from the inbound request.
@@ -19,12 +20,20 @@ in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    502, orchestrator never contacted. The chat route exchanges for
    ``audittrace:query`` (the default scope, unchanged since WU-2); the
    memory route exchanges explicitly for
-   ``bff.memory_scopes.MEMORY_SCOPE_STRING`` — never ``audittrace:admin``.
+   ``bff.memory_scopes.MEMORY_SCOPE_STRING``; the console-files route
+   exchanges explicitly for
+   ``bff.console_files_scopes.INGEST_SCOPE_STRING`` — a single scope,
+   ``memory:session:write``, never the memory route's broad set, never
+   ``audittrace:admin``.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
    the BFF never manufactures access the exchanged token doesn't carry).
-   Orchestrator unreachable → 502.
+   Orchestrator unreachable → 502. The console-files route additionally
+   FORCES the upstream ``/memory/upload`` request's ``layer`` query
+   parameter to ``settings.console_files_forced_layer`` regardless of
+   what (if anything) the caller's own query string carries — the
+   console cannot choose a durable layer from this seam.
 
 There is no code path in this module that can proxy a request without a
 freshly minted, per-caller token — the fail-closed guarantee is
@@ -44,6 +53,7 @@ from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
+from bff.console_files_scopes import INGEST_SCOPE_STRING
 from bff.exchange import TokenExchangeError, exchange_token
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
@@ -207,6 +217,78 @@ def create_app() -> FastAPI:
             )
         except MemoryProxyError as exc:
             logger.error("orchestrator /memory unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.post("/console/files", response_model=None)
+    async def console_files(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console's narrow ephemeral file-ingest entry (M3
+        Sovereign-Attach WU-2). Exchanges for ONLY
+        ``memory:session:write`` and proxies the multipart upload
+        byte-faithful to ``/memory/upload``, with the ``layer`` query
+        parameter FORCED to ``settings.console_files_forced_layer`` —
+        any ``layer`` the caller's own query string carries is ignored,
+        never honoured. See the module docstring for the shared
+        fail-closed shape.
+        """
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/files request — inbound token invalid: %s", exc
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as chat_completions/memory_proxy —
+        # validate_inbound_token raises for a falsy token, so reaching
+        # here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=INGEST_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-files token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        # Forced server-side, NOT read from request.url.query — the
+        # console cannot target any layer other than the configured
+        # ephemeral one from this seam (see the WU-2 spec's "forced
+        # layer" frozen invariant).
+        forced_query_string = f"layer={settings.console_files_forced_layer}"
+        try:
+            return await proxy_memory_request(
+                "POST",
+                "upload",
+                forced_query_string,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except MemoryProxyError as exc:
+            logger.error("orchestrator /memory/upload unreachable: %s", exc)
             return JSONResponse(
                 status_code=502, content={"detail": "Upstream service unavailable"}
             )
