@@ -169,6 +169,210 @@ class TestUploadAuth:
         assert response.status_code == 200
 
 
+class TestUploadSessionLayerAuth:
+    """WU-1 (Sovereign-Attach EPIC) — ``memory:session:write`` gates
+    ``POST /memory/upload?layer=session`` and grants ONLY that layer.
+
+    Acceptance tests (a)/(b)/(c) from the ratified spec
+    (2026-09-03-SPEC-wu1-session-layer-narrow-ingest-scope.md): each is
+    non-vacuous by construction — (a) fails RED if the scope check or
+    the session-write dispatch is neutered (unmet 200); (b) fails RED if
+    the least-privilege wall is neutered (would wrongly 200 an
+    episodic write with a session-only token); (c) fails RED if the
+    no-scope 403 gate is neutered."""
+
+    def test_session_write_scope_uploads_to_session_layer(
+        self, client: TestClient
+    ) -> None:
+        """(a) memory:session:write token -> POST /memory/upload?layer=session = 200."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "session"},
+                files=_make_upload_file(b"scratch note", "note.txt"),
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "uploaded"
+        assert data["layer"] == "session"
+        assert data["tier"] == "private"
+        assert data["key"] == "chat-user/session/note.txt"
+        assert data["size_bytes"] == len(b"scratch note")
+        # The session layer has no S3 bucket — the response must NOT
+        # imply one exists (distinguishes it from the episodic/procedural
+        # branch, which always returns "bucket").
+        assert "bucket" not in data
+
+    def test_session_write_scope_cannot_write_episodic(
+        self, client: TestClient
+    ) -> None:
+        """(b) same token -> layer=episodic = 403 (the least-privilege wall).
+
+        This is the guard that PROVES memory:session:write grants ONLY
+        the session layer — neutering ``_require_layer_write`` (or
+        collapsing the scope check to a prefix match) turns this RED."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "episodic"},
+                files=_make_upload_file(),
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_no_scope_token_cannot_write_session(self, client: TestClient) -> None:
+        """(c) no-scope token -> layer=session = 403."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "audittrace:query",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "session"},
+                files=_make_upload_file(),
+                headers={"Authorization": "Bearer no-scope-token"},
+            )
+        assert response.status_code == 403
+        assert "memory:session:write" in response.json()["detail"]
+
+    def test_session_write_scope_cannot_write_procedural(
+        self, client: TestClient
+    ) -> None:
+        """Least-privilege wall, second durable layer: same guard as (b)
+        against ``layer=procedural`` so a narrowed/one-off fix to the
+        episodic branch alone can't leave procedural silently open."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "procedural"},
+                files=_make_upload_file(),
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 403
+        assert "memory:procedural:write" in response.json()["detail"]
+
+    def test_session_promote_corpus_rejected_fail_closed(
+        self, client: TestClient
+    ) -> None:
+        """``?promote=corpus`` on layer=session stays rejected — no
+        corpus-write scope was ever declared for this layer (WU-1 §Target:
+        "NOTHING durable")."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "session", "promote": "corpus"},
+                files=_make_upload_file(b"scratch", "note.txt"),
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 400
+        assert "corpus promotion is not supported" in response.json()["detail"]
+
+    def test_session_pdf_upload_refused(self, client: TestClient) -> None:
+        """A PDF-shaped upload to layer=session is refused (400), not
+        routed into the quarantine->promote pipeline: that pipeline
+        promotes a clean verdict into episodic/papers/ (DURABLE)
+        regardless of the declared layer, which would let a
+        memory:session:write-only token land content durably anyway."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/upload",
+                params={"layer": "session"},
+                files={
+                    "file": (
+                        "doc.pdf",
+                        BytesIO(b"%PDF-1.4\n%fake pdf bytes"),
+                        "application/pdf",
+                    )
+                },
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 400
+        assert "layer=session is not supported" in response.json()["detail"]
+
+
 class TestIndexAuth:
     """POST /memory/index — bulk mode is admin-only; single-file mode
     requires per-layer ``memory:<layer>:write`` (or admin)."""
@@ -371,6 +575,44 @@ class TestIndexAuth:
             )
         assert response.status_code == 403
         assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_index_single_file_session_layer_not_supported(
+        self, client: TestClient
+    ) -> None:
+        """WU-1 — a caller with ``memory:session:write`` authorized for
+        ``?file=<sub>/session/...`` still hits the "not supported" 400:
+        the session layer is Postgres-backed (services/session_memory.py),
+        not an S3 object this ChromaDB-embedding pipeline can walk. Proves
+        the layer-dispatch branch newly reachable since WU-1 added a
+        THIRD MemoryLayer member fails closed rather than falling through
+        silently."""
+        with (
+            patch("audittrace.auth.get_settings") as mock_settings,
+            patch("audittrace.auth._get_jwks_keys") as mock_jwks,
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers") as mock_decode,
+            patch(
+                "audittrace.routes.memory._get_minio_client",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_settings.return_value = MagicMock(
+                auth_enabled=True, auth_required=True
+            )
+            mock_jwks.return_value = ["fake-key"]
+            mock_decode.return_value = {
+                "sub": "chat-user",
+                "scope": "memory:session:write",
+            }
+            response = client.post(
+                "/memory/index",
+                params={
+                    "collections": "decisions",
+                    "file": "chat-user/session/note.txt",
+                },
+                headers={"Authorization": "Bearer session-token"},
+            )
+        assert response.status_code == 400
+        assert "episodic/ and procedural/ layers" in response.json()["detail"]
 
 
 # ── upload behaviour ─────────────────────────────────────────────────────────

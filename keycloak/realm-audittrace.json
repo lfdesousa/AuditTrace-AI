@@ -89,6 +89,13 @@
       }
     },
     {
+      "name": "memory:session:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:decisions:write",
       "protocol": "openid-connect",
       "attributes": {
@@ -669,7 +676,7 @@
       ]
     },
     {
-      "description": "Public client for the M3 LibreChat console (Auth Code + PKCE, ADR-042). WU-2's BFF exchanges its token. WU-D2-1 added memory:*:write as OPTIONAL (never default) for the BFF's Souvenirs-panel exchange — console is no longer read/ask-only.",
+      "description": "Public client for the M3 LibreChat console (Auth Code + PKCE, ADR-042). WU-D2-1 + WU-1 added memory:*:write scopes (incl. memory:session:write), OPTIONAL only — console is no longer read/ask-only.",
       "clientId": "audittrace-librechat",
       "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
       "enabled": true,
@@ -706,7 +713,8 @@
         "offline_access",
         "memory:episodic:write",
         "memory:procedural:write",
-        "memory:semantic:write"
+        "memory:semantic:write",
+        "memory:session:write"
       ],
       "protocolMappers": [
         {

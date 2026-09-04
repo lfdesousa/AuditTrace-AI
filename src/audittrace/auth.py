@@ -84,6 +84,14 @@ ALL_SCOPES: dict[str, str] = {
     "memory:procedural:write": "Create/update/delete procedural-layer documents",
     "memory:semantic:read": "Read semantic-layer (vector) documents",
     "memory:semantic:write": "Create/update/delete semantic-layer documents",
+    "memory:session:write": (
+        "Create documents in the per-user EPHEMERAL session memory layer "
+        "ONLY (WU-1, Sovereign-Attach EPIC) — NOT durable memory. Grants "
+        "no access to episodic, procedural, semantic, or corpus layers. "
+        "Promoting session content to a durable layer requires a "
+        "separate durable memory:<layer>:write scope via the explicit "
+        "promote action (deferred; WU-4)."
+    ),
     "memory:decisions:write": (
         "Create/update/delete documents in the ``decisions`` ChromaDB "
         "collection (ADR/decision records — vector-searchable via "
