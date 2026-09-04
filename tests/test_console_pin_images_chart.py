@@ -314,16 +314,28 @@ class TestNoLocalRegistryOrStaleTagSurvives:
             "predicate held true anyway — the guard is vacuous"
         )
 
-    def test_unrelated_tests_hook_image_pin_is_untouched(self) -> None:
-        """The pre-existing `tests.image.repository` (the `helm test`
-        RLS-hook image, templates/tests/test-rls.yaml) is a DIFFERENT,
-        unrelated component this spec never touches (out of scope:
-        console.bff.image / D2-4 only). Asserted explicitly UNCHANGED
-        here so this WU's fix doesn't accidentally mask or silently
-        sweep it up."""
+    def test_unrelated_tests_hook_image_pin_now_owned_by_d2_5f(self) -> None:
+        """SUPERSEDED by M3-WU-D2-5F (2026-09-02, spec amendment folding
+        in the last-`localhost:5000` cleanup surfaced by THIS D2-5C
+        review). At D2-5C build time, `tests.image.repository` (the
+        `helm test` RLS-hook image, templates/tests/test-rls.yaml) was a
+        genuinely different, unrelated component this spec never touched
+        (out of scope: console.bff.image / D2-4 only) — this guard
+        originally asserted it stayed UNCHANGED so D2-5C's fix didn't
+        accidentally mask or silently sweep it up. D2-5F now owns and
+        deliberately kills that exact `localhost:5000` pin (the LAST one
+        in the chart); the invariant this guard polices going forward is
+        that it's no longer the local-registry stand-in — see
+        tests/test_console_d2_5f_reproducible_values_and_secrets.py::
+        TestZeroLocalhost5000InRenderedChart for the full D2-5F guard
+        suite (repository, tag, digest shape, structural
+        digest-conditional, and a neuter -> RED falsifiability check)."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         assert (
-            values["tests"]["image"]["repository"] == "localhost:5000/audittrace/tests"
+            values["tests"]["image"]["repository"] == "docker.io/lfds/audittrace-tests"
+        )
+        assert (
+            values["tests"]["image"]["repository"] != "localhost:5000/audittrace/tests"
         )
 
 

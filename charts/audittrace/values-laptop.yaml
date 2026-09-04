@@ -38,7 +38,23 @@
 # single reproducible `helm upgrade -f values-laptop.yaml ...` command
 # for the laptop reference target — no value an operator has to remember
 # to also pass on the command line.
+#
+# M3-WU-D2-5F (2026-09-02) — `console.enabled: true` folded in. The
+# rev-262/263 deploys (2026-08-31/09-01) needed a hand
+# `--set console.enabled=true` on top of this file every time — a CD
+# agent detail that is easy to forget (rev 263's console.enabled had
+# regressed to orphan pods from a failed prior release exactly because
+# the flag was never durable). `values.yaml`'s own default stays
+# `console.enabled: false` (console is opt-in for a bare memory-server-
+# only install); this laptop profile is the one reference target where
+# the console IS the point, so it flips the switch here instead of at
+# the CD agent's fingertips. The BFF `--set-string` secret re-pass this
+# same round of deploys needed is fixed separately by the
+# `secret-bff.yaml` preserve guard (this WU, item 2) — not a
+# values-laptop.yaml concern, since the value itself is never committed
+# to any values file.
 console:
+  enabled: true
   frontDoorNodeName: "pcluislinux"
   librechat:
     host: "librechat.audittrace.local"
