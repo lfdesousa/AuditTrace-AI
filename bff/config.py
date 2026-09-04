@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     # literals to keep in sync.
     orchestrator_memory_path_prefix: str = "/memory"
     orchestrator_timeout_seconds: float = 120.0
+    # M3 Sovereign-Attach WU-2 — the console file-upload route
+    # (``POST /console/files``) always forwards to
+    # ``/memory/upload?layer=<this value>``, regardless of any ``layer``
+    # the caller's query string carries. Explicit + testable config
+    # rather than a bare string literal in ``bff/app.py``, so a reviewer
+    # (or a future WU) can see and override the forced layer in one
+    # place — see ``bff/console_files_scopes.py`` for the scope half of
+    # the same wall.
+    console_files_forced_layer: str = "session"
 
     # ── Inbound-token validation (the token LibreChat forwards) ──────────
     # Same Keycloak realm as the orchestrator's own auth.py; the BFF

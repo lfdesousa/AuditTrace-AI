@@ -24,6 +24,7 @@ class TestSettingsDefaults:
         assert settings.proxy_source_label == "librechat"
         assert settings.keycloak_issuer_extras == []
         assert settings.ca_bundle_path == ""
+        assert settings.console_files_forced_layer == "session"
 
     def test_ca_bundle_path_env_override_is_read(
         self, monkeypatch: pytest.MonkeyPatch
@@ -42,6 +43,16 @@ class TestSettingsDefaults:
         settings = Settings()
         assert settings.orchestrator_base_url == "http://audittrace-server:8765"
         assert settings.port == 9999
+
+    def test_console_files_forced_layer_env_override_is_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.setenv(
+            "AUDITTRACE_BFF_CONSOLE_FILES_FORCED_LAYER", "different-layer"
+        )
+        settings = Settings()
+        assert settings.console_files_forced_layer == "different-layer"
 
 
 class TestExchangeSecretFailClosed:
