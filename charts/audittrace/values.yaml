@@ -1033,9 +1033,33 @@ console:
 tests:
   enabled: true
   image:
-    repository: localhost:5000/audittrace/tests
-    tag: latest
-    pullPolicy: Always
+    # M3-WU-D2-5F (2026-09-02) — the LAST `localhost:5000` reference in
+    # the chart, killed. Was `localhost:5000/audittrace/tests:latest`
+    # with `pullPolicy: Always` — a local-registry, MUTABLE-`:latest`
+    # ref that only ever resolved against the laptop's dev registry (the
+    # D2-5C review surfaced it as the chart's one remaining
+    # non-reproducible image). Published by
+    # .github/workflows/publish.yml's new `audittrace-tests` job
+    # (mirrors the BFF job D2-5B added), same repository namespace as
+    # the other console/runtime images.
+    repository: docker.io/lfds/audittrace-tests
+    # Explicit release version, tag+digest move together on every bump —
+    # mirrors console.bff.image / console.librechat.image above, not
+    # memoryServer's AppVersion-tracking empty-string convenience.
+    tag: "1.25.1"
+    # RULE-2/3 DEFERRED (2026-09-02, M3-WU-D2-5F build round): the
+    # `audittrace-tests` repository has never been published — the
+    # publish.yml job that builds it ships in THIS same commit and only
+    # fires on the NEXT tag push, so no real index digest exists yet to
+    # verify against Docker Hub. This all-zero value is a clearly-marked
+    # PLACEHOLDER (never a fabricated "verified" digest) that keeps the
+    # `repository:tag@sha256:...` render SHAPE consistent with the
+    # sibling console images below — replace it with the real published
+    # index digest (verify via `docker-content-digest` on a manifest
+    # GET/HEAD, same discipline as console.bff.image.digest /
+    # console.librechat.image.digest) once the next release publishes.
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    pullPolicy: IfNotPresent
   resources:
     requests:
       cpu: 100m

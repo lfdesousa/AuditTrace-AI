@@ -153,6 +153,14 @@ test-integration: docker-build ## Run RLS integration suite as a Helm test Pod i
 	  -t localhost:5000/audittrace/tests:latest . > /dev/null
 	@echo "📦 Pushing to local registry..."
 	@docker push localhost:5000/audittrace/tests:latest > /dev/null
+	@echo "🔧 Pointing the helm-test hook at the local-registry image (M3-WU-D2-5F: tests.image now defaults to the published docker.io/lfds/audittrace-tests digest pin, not the local registry — override for this dev-loop invocation only, mirrors k8s-rolling-image's LOCAL_MEMORY_REPO pattern)..."
+	@KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} helm upgrade $(RELEASE) $(CHART_DIR) -n $(NAMESPACE) \
+	  --reuse-values \
+	  --set tests.image.repository=localhost:5000/audittrace/tests \
+	  --set tests.image.tag=latest \
+	  --set tests.image.digest="" \
+	  --set tests.image.pullPolicy=Always \
+	  --wait --timeout 120s
 	@echo "🧪 Running helm test (Vault + Istio mTLS path)..."
 	@KUBECONFIG=$${KUBECONFIG:-$$HOME/.kube/config} helm test audittrace -n audittrace --logs
 	@echo "✅ helm test integration suite passed"
