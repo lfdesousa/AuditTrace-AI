@@ -1665,18 +1665,36 @@ class TestPostDeployVerifyKeycloakScopeGuard:
 
 
 class TestRestrictedClientStaysRestricted:
-    """`audittrace-restricted` must never gain an audit or admin scope (SC-09).
+    """`audittrace-restricted` must never gain an audit, admin, or memory
+    write scope (SC-09).
 
     This client exists for exactly one purpose: to hold a token that CANNOT be
     widened by asking. Keycloak silently DROPS a requested scope a client does
     not offer rather than erroring, so "the client does not offer it" is the
-    entire mechanism. Adding `audittrace:audit` to either scope set - even as
-    optional, even "just for a test" - does not weaken the evidence, it VOIDS
-    it: every SC-09 403 would then prove only that the caller did not ask.
+    entire mechanism. Adding `audittrace:audit` (or any memory:*:write scope)
+    to either scope set - even as optional, even "just for a test" - does not
+    weaken the evidence, it VOIDS it: every SC-09 403 would then prove only
+    that the caller did not ask.
 
     The failure mode this guards against is quiet. Nothing breaks, no test
     goes red, and the adversarial result silently becomes worthless while
     still being cited. Hence a test rather than a comment.
+
+    2026-09-04 independent-review fix (WU-1, Sovereign-Attach EPIC): the
+    original FORBIDDEN tuple below covered only the four ``audittrace:*``
+    scopes — SC-09 could be granted ANY ``memory:<layer>:write`` scope
+    (including the new ``memory:session:write``) and this class stayed
+    GREEN. Proven vacuous by the reviewer: granting
+    ``memory:session:write`` to ``audittrace-restricted`` in
+    ``keycloak/realm-audittrace.json`` did not turn this class red. FORBIDDEN
+    now names every ``memory:<layer>:write`` scope explicitly (per-layer
+    write scopes are added one-by-one, not by prefix, on purpose — a prefix
+    match would also swallow the *read* scopes, e.g.
+    ``memory:conversational:read-own``, which SC-09 actually holds (its
+    real default scopes) for the SC-09 adversarial-read scenario itself)
+    — see ``test_realm_grants_no_forbidden_scope`` below, which
+    now also checks BOTH realm files (the vacuous version checked only the
+    top-level file).
     """
 
     FORBIDDEN = (
@@ -1684,6 +1702,17 @@ class TestRestrictedClientStaysRestricted:
         "audittrace:admin",
         "audittrace:assessment:ingest",
         "audittrace:index",
+        # 2026-09-04 (WU-1 independent-review fix, project_restricted_client_sc09_reserved)
+        # — SC-09 is the RESERVED restricted client: it must never hold ANY
+        # memory write scope, durable or ephemeral. Named individually, not
+        # matched by a "memory:" prefix — that would also catch the READ
+        # scope SC-09 actually holds (memory:conversational:read-own,
+        # one of its defaultClientScopes) for the SC-09 adversarial
+        # cross-tenant READ scenario.
+        "memory:episodic:write",
+        "memory:procedural:write",
+        "memory:semantic:write",
+        "memory:session:write",
     )
 
     @staticmethod
@@ -1698,40 +1727,59 @@ class TestRestrictedClientStaysRestricted:
             "boundary. See audittrace-private doc 14."
         )
 
-    def test_top_level_realm_grants_no_audit_scope(self) -> None:
-        realm = json.loads(
+    def test_realm_grants_no_forbidden_scope(self) -> None:
+        """Checked against BOTH realm files, in BOTH scope sets.
+
+        2026-09-04 fix: the pre-fix version of this test
+        (``test_top_level_realm_grants_no_audit_scope``) checked ONLY
+        ``keycloak/realm-audittrace.json`` — a forbidden scope landing
+        solely in the chart's rendered realm file would have slipped
+        through undetected. Mirrors
+        ``test_no_corpus_scope_on_restricted_client``'s both-realms loop
+        below so the two guards read the realm identically."""
+        top_level = json.loads(
             (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
                 encoding="utf-8"
             )
         )
-        c = self._restricted(realm)
-        both = list(c.get("defaultClientScopes", [])) + list(
-            c.get("optionalClientScopes", [])
-        )
-        offenders = [s for s in both if s in self.FORBIDDEN]
-        assert not offenders, (
-            "audittrace-restricted was granted "
-            f"{offenders} - this VOIDS every SC-09 result. The client's only "
-            "purpose is that these scopes are unobtainable, not merely "
-            "unrequested. Remove them, or stop citing SC-09."
-        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._restricted(realm)
+            both = list(c.get("defaultClientScopes", [])) + list(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = [s for s in both if s in self.FORBIDDEN]
+            assert not offenders, (
+                f"{label}: audittrace-restricted was granted "
+                f"{offenders} - this VOIDS every SC-09 result. The client's "
+                "only purpose is that these scopes are unobtainable, not "
+                "merely unrequested. Remove them, or stop citing SC-09."
+            )
 
     def test_no_corpus_scope_on_restricted_client(self) -> None:
         """WU-A3 (ADR-062 §4) — ``memory:corpus:*`` scopes are operator/
         curator-tier and must never appear on ``audittrace-restricted``
         (SC-09), in EITHER scope set, in EITHER realm file. Same VOID
-        mechanism as ``test_top_level_realm_grants_no_audit_scope`` above:
+        mechanism as ``test_realm_grants_no_forbidden_scope`` above:
         Keycloak silently drops a requested-but-not-offered scope, so "the
         client does not offer it" is the entire guarantee an adversarial
         cross-tenant/corpus-boundary test relies on.
 
-        Checked against both realm files (not the FORBIDDEN tuple above,
-        which predates ADR-062 and is a fixed literal list) so a corpus
-        scope added to either file's audittrace-restricted client fails
-        here regardless of which realm file it landed in. The top-level
-        file is plain JSON; the chart file has Helm templating elsewhere
-        (webui redirectUris/webOrigins) so it's read via the rendered
-        realm, same as every other chart-file check in this module."""
+        Checked against both realm files via a glob (not the FORBIDDEN
+        tuple above, which is a fixed literal list — the corpus scopes are
+        a closed set named ``memory:corpus:<collection>:{read,write}`` per
+        collection, cheaper to catch by prefix here) so a corpus scope
+        added to either file's audittrace-restricted client fails here
+        regardless of which realm file it landed in. The top-level file is
+        plain JSON; the chart file has Helm templating elsewhere (webui
+        redirectUris/webOrigins) so it's read via the rendered realm, same
+        as every other chart-file check in this module."""
         top_level = json.loads(
             (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
                 encoding="utf-8"
