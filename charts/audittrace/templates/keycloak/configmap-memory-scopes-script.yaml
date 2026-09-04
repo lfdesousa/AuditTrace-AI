@@ -117,6 +117,20 @@ data:
       "memory:semantic:write"
     )
 
+    # WU-1 (Sovereign-Attach EPIC, 2026-09-03) — the ephemeral chat-upload
+    # least-privilege wall. Bound ONLY as OPTIONAL to audittrace-librechat
+    # (never default), in its OWN array/bind loop — kept SEPARATE from
+    # MEMORY_CONSOLE_WRITE_SCOPES above on purpose:
+    # TestD25AMemoryWriteScopesJobRenderedBinding asserts that array is
+    # EXACTLY {episodic,procedural,semantic}:write, so folding
+    # memory:session:write into it would both fail that exact-match guard
+    # AND — more importantly — muddy the "durable write" vs "ephemeral-
+    # only write" distinction this WU exists to make real. Only WU-2's
+    # narrow upload exchange requests this scope by name.
+    MEMORY_SESSION_WRITE_SCOPES=(
+      "memory:session:write"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -202,7 +216,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -313,6 +327,15 @@ data:
     # RFC 8693 exchange requests these by name. Never audittrace:admin.
     echo "▶ binding memory-proxy write scopes to client audittrace-librechat (optional)..."
     for SCOPE in "${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2d: bind the ephemeral-ingest scope (WU-1, 2026-09-03) ────
+    # audittrace-librechat only, as OPTIONAL — separate array/loop from
+    # Step 2c above (see MEMORY_SESSION_WRITE_SCOPES's comment). Only
+    # WU-2's narrow upload exchange requests this scope by name.
+    echo "▶ binding ephemeral-session write scope to client audittrace-librechat (optional)..."
+    for SCOPE in "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
       bind_scope "audittrace-librechat" "${SCOPE}" "optional"
     done
 

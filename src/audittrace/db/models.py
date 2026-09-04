@@ -376,3 +376,43 @@ class MemoryItem(Base):
     __table_args__ = (
         UniqueConstraint("layer", "key", name="uq_memory_items_layer_key"),
     )
+
+
+class SessionMemoryItem(Base):
+    """The ``session`` memory layer — WU-1 of the Sovereign-Attach EPIC
+    (migration 022): a per-user, EPHEMERAL ingest tier, distinct from the
+    S3-backed ``episodic``/``procedural`` layers above.
+
+    Unlike ``MemoryItem`` (an operator-global manifest describing bytes
+    that live in S3/ChromaDB), this table IS the content — there is no
+    corpus/shared tier for this layer (WU-1's ephemeral-default decision
+    deliberately excludes promotion; that is WU-4's job) and no listing/
+    recall surface yet (WU-5), so a lightweight, GC-friendly (WU-6)
+    Postgres row is the natural fit rather than an S3 object plus a
+    manifest row.
+
+    RLS (migration 022, mirrors migration 005's shape exactly): a
+    Postgres policy compares ``user_id`` against
+    ``current_setting('app.current_user_id', true)``. On SQLite (the
+    unit-test suite) RLS is a no-op — ``PostgresSessionMemoryService``
+    additionally filters every query by ``user_id`` explicitly at the
+    SERVICE layer so a dropped filter is still caught by SQLite unit
+    tests instead of only by a live-Postgres integration run
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "session_memory_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Keycloak ``sub`` claim — no FK, same rationale as every other
+    # user_id column in this module (§15 — identity is Keycloak-owned).
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Unix epoch milliseconds UTC — same convention as MemoryItem's
+    # created_at_ms (sub-second ordering, matches Date.now()/time.time()*1000).
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # W3C-traceparent-derived trace_id from the originating request, when
+    # a span is active — same convention as MemoryItem.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)

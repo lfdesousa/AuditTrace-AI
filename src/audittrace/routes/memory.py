@@ -66,6 +66,7 @@ from audittrace.dependencies import (
     get_postgres_factory,
     get_procedural_service,
     get_semantic_service,
+    get_session_memory_service,
 )
 from audittrace.identity import UserContext
 from audittrace.models import (
@@ -103,6 +104,7 @@ from audittrace.services.recall_telemetry import (
     classify_recall_source_from_request,
     emit_recall_telemetry,
 )
+from audittrace.services.session_memory import SessionMemoryService
 from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory_write
 
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
@@ -171,6 +173,12 @@ class MemoryLayer(StrEnum):
 
     episodic = "episodic"
     procedural = "procedural"
+    # WU-1 (Sovereign-Attach EPIC) — per-user EPHEMERAL layer, Postgres-
+    # backed (services/session_memory.py), gated by memory:session:write.
+    # Distinct from episodic/procedural: no S3 tier, no corpus/promote
+    # path in this WU (WU-4), no /memory/index single-file support (see
+    # the dispatch guard below) — write-path + isolation only.
+    session = "session"
 
 
 def _chunk_text(
@@ -524,29 +532,37 @@ async def _emit_write_audit(
 async def _write_layer_private(
     layer: MemoryLayer, user: UserContext, filename: str, content: str
 ) -> None:
-    """Dispatch to the episodic/procedural service's PRIVATE-tier write
-    (ADR-062 Phase B, WU-B5), normalizing its exceptions to the same
-    400/502 shape every other CRUD route in this file uses.
+    """Dispatch to the target layer's PRIVATE-tier write, normalizing
+    its exceptions to the same 400/502 shape every other CRUD route in
+    this file uses.
 
-    Shared by ``upload_memory_file``'s legacy non-PDF branch so a plain
+    Episodic/procedural (ADR-062 Phase B, WU-B5): shared by
+    ``upload_memory_file``'s legacy non-PDF branch so a plain
     /memory/upload gets WU-B2's private-tier routing + cache
     invalidation + filename validation for free, instead of hand-rolling
     a raw S3 ``put_object`` that used to land unconditionally in the
     shared/corpus bucket regardless of who uploaded (the leak this WU
-    closes — see ``upload_memory_file``'s docstring)."""
-    service: EpisodicService | ProceduralService = (
-        get_episodic_service()
-        if layer == MemoryLayer.episodic
-        else get_procedural_service()
-    )
+    closes — see ``upload_memory_file``'s docstring).
+
+    Session (WU-1, Sovereign-Attach EPIC): dispatches to the Postgres-
+    backed ``SessionMemoryService`` instead — there is no S3 tier for
+    this layer (see ``services/session_memory.py``'s module docstring).
+    """
+    service: EpisodicService | ProceduralService | SessionMemoryService
+    if layer == MemoryLayer.session:
+        service = get_session_memory_service()
+    elif layer == MemoryLayer.episodic:
+        service = get_episodic_service()
+    else:
+        service = get_procedural_service()
     try:
         await service.write(user, filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
-        logger.error("Object storage write failed: %s", exc)
+        logger.error("Memory-layer write failed (layer=%s): %s", layer.value, exc)
         raise HTTPException(
-            status_code=502, detail="Object storage write failed"
+            status_code=502, detail="Memory-layer write failed"
         ) from exc
 
 
@@ -603,15 +619,28 @@ async def upload_memory_file(
       decisions/skills/semantic), so ``?promote=corpus`` is rejected
       with 400 rather than silently accepted or silently ignored.
 
+    * **``layer=session`` uploads** (WU-1, Sovereign-Attach EPIC): a
+      THIRD case of the non-PDF branch — writes to the Postgres-backed,
+      per-user, EPHEMERAL session layer instead of S3
+      (``services/session_memory.py``). PDF content is refused for this
+      layer (400) rather than routed into the quarantine pipeline above:
+      that pipeline promotes a clean verdict into ``episodic/papers/``
+      (DURABLE) regardless of the ``layer`` query param — silently
+      letting it through would let a token holding ONLY
+      ``memory:session:write`` (nothing durable) land content durably
+      anyway, defeating this WU's least-privilege wall.
+
     Authorization (per-layer): the caller's JWT must carry
     ``memory:<layer>:write`` matching the ``layer`` query parameter
     (or ``audittrace:admin``). A token with ``memory:procedural:write``
-    cannot upload to ``layer=episodic`` and vice-versa. This is enforced
-    by ``_require_layer_write`` on the first line below — the endpoint is
-    **not** auth-only despite the static ``scopes=[]`` on the OAuth2
-    declaration (which exists only so the spec lists the security scheme;
-    the effective scope is dynamic in the ``layer`` parameter, so it
-    cannot be declared statically — same contract as ``/memory/index``).
+    cannot upload to ``layer=episodic`` and vice-versa; a token with
+    ONLY ``memory:session:write`` cannot upload to any durable layer.
+    This is enforced by ``_require_layer_write`` on the first line below
+    — the endpoint is **not** auth-only despite the static ``scopes=[]``
+    on the OAuth2 declaration (which exists only so the spec lists the
+    security scheme; the effective scope is dynamic in the ``layer``
+    parameter, so it cannot be declared statically — same contract as
+    ``/memory/index``).
     """
     _require_layer_write(user, layer)
     settings = get_settings()
@@ -629,6 +658,23 @@ async def upload_memory_file(
 
     claimed_ct = file.content_type or ""
     if is_pdf_upload(claimed_content_type=claimed_ct, content=content):
+        if layer == MemoryLayer.session:
+            # WU-1 — see the docstring's third bullet: the quarantine →
+            # verdict → promotion pipeline below has no ephemeral-tier
+            # concept (``handle_pdf_upload`` never even receives
+            # ``layer``), so it would land clean-verdict PDFs durably
+            # regardless of the caller's declared layer. Fail closed
+            # until a PDF-aware session pipeline ships (deferred, out of
+            # WU-1 scope) rather than silently widen a
+            # memory:session:write-only token's reach.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "PDF upload to layer=session is not supported — the "
+                    "PDF ingestion pipeline has no ephemeral tier yet; "
+                    "session uploads must be plain text"
+                ),
+            )
         from audittrace.dependencies import (  # noqa: PLC0415
             get_postgres_factory,
         )
@@ -657,8 +703,8 @@ async def upload_memory_file(
     # ── Legacy synchronous path (markdown, etc.) ────────────────
     # ADR-062 Phase B (WU-B5): defaults to the caller's PRIVATE tier.
     # See the docstring above + `_write_layer_private` for the leak this
-    # closes. ``?promote=corpus`` has no declared scope for these two
-    # layers, so it is rejected outright (fail-closed) rather than
+    # closes. ``?promote=corpus`` has no declared scope for any of these
+    # three layers, so it is rejected outright (fail-closed) rather than
     # silently downgraded to private or silently ignored.
     tier = _resolve_requested_tier(None, promote)
     _reject_corpus_promotion_for(layer.value, tier)
@@ -674,6 +720,36 @@ async def upload_memory_file(
 
     # M2 — write-telemetry counter (layer label, no PII).
     emit_memory_write(layer=layer.value)
+
+    if layer == MemoryLayer.session:
+        # WU-1 — no S3 bucket backs this layer (Postgres-only; see
+        # services/session_memory.py), so the response omits the
+        # ``bucket`` field the S3-backed branch below returns rather
+        # than report a bucket name the bytes never touched. Frozen
+        # invariant (traceability, feedback_traceability_requirement):
+        # write the usual audit row, token-derived identity, awaited
+        # inline (fail-closed — see services/memory_audit.py).
+        await _emit_write_audit(
+            user=user,
+            op="write",
+            layer=MemoryLayer.session.value,
+            key=target_filename,
+            detail_extra={"tier": "private"},
+        )
+        key = f"{user.user_id}/{layer.value}/{target_filename}"
+        logger.info(
+            "Uploaded %s (%d bytes) to session memory (tier=private, ephemeral) key=%s",
+            target_filename,
+            len(content),
+            key,
+        )
+        return {
+            "status": "uploaded",
+            "layer": MemoryLayer.session.value,
+            "key": key,
+            "size_bytes": len(content),
+            "tier": "private",
+        }
 
     private_bucket = (
         settings.aws_private_bucket
@@ -1182,12 +1258,15 @@ async def index_memory(
         elif layer_for_scope == MemoryLayer.procedural:
             procedural_objects = [single_obj]
         else:
-            # Defensive only — unreachable while MemoryLayer has exactly
-            # these two members (already validated above by the
-            # ``MemoryLayer(layer_str)`` construction, which 400s on any
-            # other value). Guards against a future MemoryLayer addition
-            # being wired into the enum without updating this dispatch.
-            raise HTTPException(  # pragma: no cover
+            # WU-1 (Sovereign-Attach EPIC) made this branch REACHABLE:
+            # ``layer_for_scope`` can now resolve to ``MemoryLayer.session``
+            # too (validated above by ``MemoryLayer(layer_str)``), and the
+            # session layer is Postgres-backed (services/session_memory.py)
+            # — it has no MinIO/S3 object for this ChromaDB-embedding
+            # pipeline to walk. Fail closed with a 400 ("not supported",
+            # never silently 0-chunk) rather than extending this dispatch
+            # to a storage backend /memory/index does not speak.
+            raise HTTPException(
                 status_code=400,
                 detail=(
                     "single-file /memory/index supports only "

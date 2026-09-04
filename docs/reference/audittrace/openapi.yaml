@@ -582,6 +582,7 @@ components:
       enum:
       - episodic
       - procedural
+      - session
       title: MemoryLayer
       type: string
     MetricsResponse:
@@ -939,6 +940,10 @@ components:
             memory:procedural:write: Create/update/delete procedural-layer documents
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
+            memory:session:write: Create documents in the per-user EPHEMERAL session memory layer ONLY (WU-1, Sovereign-Attach
+              EPIC) — NOT durable memory. Grants no access to episodic, procedural, semantic, or corpus layers. Promoting
+              session content to a durable layer requires a separate durable memory:<layer>:write scope via the explicit promote
+              action (deferred; WU-4).
             memory:skills:write: Create/update/delete documents in the ``skills`` ChromaDB collection (SKILL/procedural records
               — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:upload:write: Upload bytes (PDFs, etc.) into the ingestion content-control pipeline (ADR-048). Distinct
@@ -2489,12 +2494,19 @@ paths:
         \ via the\n  episodic/procedural service's own ``write()`` (already wired to\n  the private bucket by WU-B2), closing\
         \ a leak where every non-PDF\n  upload used to land unconditionally in the shared/corpus bucket\n  regardless of who\
         \ uploaded it. Neither layer has a declared\n  corpus-write scope (ADR-062 §4's frozenset is exactly\n  decisions/skills/semantic),\
-        \ so ``?promote=corpus`` is rejected\n  with 400 rather than silently accepted or silently ignored.\n\nAuthorization\
-        \ (per-layer): the caller's JWT must carry\n``memory:<layer>:write`` matching the ``layer`` query parameter\n(or ``audittrace:admin``).\
-        \ A token with ``memory:procedural:write``\ncannot upload to ``layer=episodic`` and vice-versa. This is enforced\n\
-        by ``_require_layer_write`` on the first line below — the endpoint is\n**not** auth-only despite the static ``scopes=[]``\
-        \ on the OAuth2\ndeclaration (which exists only so the spec lists the security scheme;\nthe effective scope is dynamic\
-        \ in the ``layer`` parameter, so it\ncannot be declared statically — same contract as ``/memory/index``)."
+        \ so ``?promote=corpus`` is rejected\n  with 400 rather than silently accepted or silently ignored.\n\n* **``layer=session``\
+        \ uploads** (WU-1, Sovereign-Attach EPIC): a\n  THIRD case of the non-PDF branch — writes to the Postgres-backed,\n\
+        \  per-user, EPHEMERAL session layer instead of S3\n  (``services/session_memory.py``). PDF content is refused for\
+        \ this\n  layer (400) rather than routed into the quarantine pipeline above:\n  that pipeline promotes a clean verdict\
+        \ into ``episodic/papers/``\n  (DURABLE) regardless of the ``layer`` query param — silently\n  letting it through\
+        \ would let a token holding ONLY\n  ``memory:session:write`` (nothing durable) land content durably\n  anyway, defeating\
+        \ this WU's least-privilege wall.\n\nAuthorization (per-layer): the caller's JWT must carry\n``memory:<layer>:write``\
+        \ matching the ``layer`` query parameter\n(or ``audittrace:admin``). A token with ``memory:procedural:write``\ncannot\
+        \ upload to ``layer=episodic`` and vice-versa; a token with\nONLY ``memory:session:write`` cannot upload to any durable\
+        \ layer.\nThis is enforced by ``_require_layer_write`` on the first line below\n— the endpoint is **not** auth-only\
+        \ despite the static ``scopes=[]``\non the OAuth2 declaration (which exists only so the spec lists the\nsecurity scheme;\
+        \ the effective scope is dynamic in the ``layer``\nparameter, so it cannot be declared statically — same contract\
+        \ as\n``/memory/index``)."
       operationId: upload_memory_file_memory_upload_post
       parameters:
       - in: query

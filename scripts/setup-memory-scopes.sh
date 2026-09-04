@@ -168,9 +168,23 @@ MEMORY_CONSOLE_WRITE_SCOPES=(
   "memory:semantic:write"
 )
 
+# WU-1 (Sovereign-Attach EPIC, 2026-09-03) — the ephemeral chat-upload
+# least-privilege wall. Bound ONLY as OPTIONAL to audittrace-librechat, in
+# its OWN array/bind loop — kept separate from MEMORY_CONSOLE_WRITE_SCOPES
+# above (the in-cluster Job's ConfigMap mirrors this verbatim; see
+# tests/test_chart_drift_guards.py::TestKeycloakSessionWriteScopeGovernance
+# for why: TestD25AMemoryWriteScopesJobRenderedBinding asserts
+# MEMORY_CONSOLE_WRITE_SCOPES stays EXACTLY {episodic,procedural,semantic}
+# :write, so folding memory:session:write into it would break that guard
+# AND muddy the durable-vs-ephemeral distinction this WU exists to make
+# real. Only WU-2's narrow upload exchange requests this scope by name.
+MEMORY_SESSION_WRITE_SCOPES=(
+  "memory:session:write"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -255,6 +269,14 @@ done
 # audittrace-librechat only, as OPTIONAL. Never audittrace:admin.
 echo "▶ binding memory-proxy write scopes to client audittrace-librechat (optional)..."
 for SCOPE in "${MEMORY_CONSOLE_WRITE_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+done
+
+# ----- Bind the ephemeral-ingest scope (WU-1, 2026-09-03) -----
+# audittrace-librechat only, as OPTIONAL — separate loop from the one
+# above (see MEMORY_SESSION_WRITE_SCOPES's comment).
+echo "▶ binding ephemeral-session write scope to client audittrace-librechat (optional)..."
+for SCOPE in "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "optional"
 done
 

@@ -61,6 +61,11 @@ from audittrace.services.semantic import (
     SemanticService,
     UserScopedSemanticService,
 )
+from audittrace.services.session_memory import (
+    MockSessionMemoryService,
+    PostgresSessionMemoryService,
+    SessionMemoryService,
+)
 from audittrace.services.trust_store import (
     CompositeTrustStoreBuilder,
     EuLotlTrustStoreBuilder,
@@ -343,6 +348,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         session_factory=pg_factory.get_session_factory(),
     )
 
+    # WU-1 (Sovereign-Attach EPIC) — the `session` layer's backing store.
+    # Postgres-only (no S3 tier, no corpus): see
+    # services/session_memory.py's module docstring for the rationale.
+    session_memory: SessionMemoryService = PostgresSessionMemoryService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     # Memory-layer manifest (CRUD backoffice — migration 009 + the
     # /memory/<layer> REST endpoints). Postgres-backed; same session
     # factory as conversational since the table is in the same DB.
@@ -383,6 +395,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["session_memory"] = session_memory
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -557,6 +570,17 @@ def get_conversational_service() -> ConversationalService:
 
 
 @log_call(logger=logger)
+def get_session_memory_service() -> SessionMemoryService:
+    """Get the ``session`` memory-layer service (dependency injection).
+
+    WU-1 (Sovereign-Attach EPIC) — the ephemeral, per-user, Postgres-only
+    layer ``/memory/upload?layer=session`` writes through
+    (``routes/memory.py::_write_layer_private``).
+    """
+    return cast(SessionMemoryService, container._instances["session_memory"])
+
+
+@log_call(logger=logger)
 def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
@@ -613,6 +637,7 @@ def _register_mock_memory_services() -> None:
     procedural = MockProceduralService()
     conversational = MockConversationalService()
     semantic = MockSemanticService()
+    session_memory = MockSessionMemoryService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -624,6 +649,7 @@ def _register_mock_memory_services() -> None:
     container._instances["procedural"] = procedural
     container._instances["conversational"] = conversational
     container._instances["semantic"] = semantic
+    container._instances["session_memory"] = session_memory
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -672,5 +698,15 @@ def create_test_container() -> DependencyContainer:
         directory="/tmp/audittrace-test-trust-store-empty"
     )
     # In-memory PostgreSQL factory so persistence side-effects work in tests
-    test_container._instances["postgres_factory"] = InMemoryPostgresFactory()
+    pg_factory = InMemoryPostgresFactory()
+    test_container._instances["postgres_factory"] = pg_factory
+    # WU-1 (Sovereign-Attach EPIC) — real Postgres-backed session-memory
+    # service (not a mock): the acceptance tests exercise the actual
+    # write + explicit-user_id-filter isolation logic through the route
+    # layer, and InMemoryPostgresFactory (aiosqlite) is already wired
+    # above for exactly this purpose (same pattern PostgresConversationalService
+    # would use if this container wired it directly).
+    test_container._instances["session_memory"] = PostgresSessionMemoryService(
+        session_factory=pg_factory.get_session_factory(),
+    )
     return test_container
