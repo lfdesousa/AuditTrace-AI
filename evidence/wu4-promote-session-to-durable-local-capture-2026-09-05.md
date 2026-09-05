@@ -247,3 +247,114 @@ No image was built, no `helm upgrade` ran, no pod was hit through the
 public API with a scoped JWT against a deployed image — this WU is
 LOCAL-only by ratified spec. Live E2E is explicitly deferred to WU-6 +
 operator go, per the spec's "Out of scope" section.
+
+## 6. Review pass 1 REJECTION + fix (2026-09-05, same day)
+
+The independent reviewer REJECTED the build on a live-proven finding:
+semantic promote used the raw session **filename** as the ChromaDB
+`document_id` in the shared `semantic_v2` physical collection, with NO
+per-user namespacing. Two users independently promoting a same-named
+file (e.g. both promoting `shared.md`) silently overwrote the SAME
+ChromaDB row — reproduced live against the real `/memory/promote` +
+`/memory/semantic` endpoints. User A's read-back of "their own" key
+returned User B's content + attribution.
+
+### 6a. The fix
+
+`src/audittrace/routes/memory_promote.py::_namespaced_semantic_document_id`
+(new) bakes the TOKEN-derived `user.user_id` into the ChromaDB
+`document_id` (`f"{user_id}/{filename}"`), mirroring the INTENT of
+episodic's per-user S3 object-prefix isolation (episodic/procedural
+already isolate PRIVATE-tier content by a per-user storage path; the
+semantic layer's private-tier physical collection has no equivalent
+per-user storage-path mechanism, so the namespace has to live inside
+the id itself). `_promote_to_semantic` now returns `(durable_key,
+collection)` explicitly rather than re-deriving `collection` via
+`durable_key.rsplit("/", 1)` — the old single-split parse would have
+silently mis-parsed the collection name once the id itself started
+containing a `/`. Does NOT touch the broader, pre-existing
+`authorize_write` corpus-collision primitive gap (ADR-062 §B4) — that
+stays the documented separate follow-up; this closes the specific
+hijack this promote path introduced.
+
+Three existing tests updated for the new (correct) namespaced key shape
+(`TestPromoteSemanticTarget::test_promote_to_semantic_default_collection`
+/ `test_promote_to_semantic_custom_collection` /
+`test_semantic_document_readable_after_promote`) and one existing
+corpus-collision seed
+(`TestPromoteManifestAuthorizationChoke::test_promote_over_existing_corpus_semantic_row_denied`)
+updated to seed the namespaced key so the collision it tests still
+actually collides.
+
+### 6b. New non-vacuous regression test (the crux)
+
+`TestPromoteSemanticCrossUserIsolation::test_two_users_same_filename_never_collide`
+— two users (alice, bob) each upload a session doc named `shared.md`
+with DIFFERENT content, both promote to the default semantic
+collection, and the test asserts: (1) the two returned durable keys are
+DIFFERENT (`semantic/alice/shared.md` vs `semantic/bob/shared.md`, never
+a shared `semantic/shared.md`); (2) each user's read-back returns THEIR
+OWN content, never the other's.
+
+```
+$ pytest tests/test_memory_promote_route.py::TestPromoteSemanticCrossUserIsolation -q --no-cov
+1 passed in ...s
+```
+
+Neuter: `_namespaced_semantic_document_id` reverted to return the raw
+*filename* (dropping the `user_id` prefix) — the exact pre-fix shape.
+
+```
+$ pytest tests/test_memory_promote_route.py::TestPromoteSemanticCrossUserIsolation -q --no-cov
+FAILED test_two_users_same_filename_never_collide - AssertionError: assert 'semantic/shared.md' != 'semantic/shared.md'
+1 failed in 0.32s
+
+# restored (diff <backup> <file> -> no output):
+$ pytest tests/test_memory_promote_route.py -q --no-cov
+32 passed in 6.96s
+```
+
+### 6c. All 7 original guards re-confirmed after the fix (RED -> restore -> GREEN)
+
+Every guard from §3 re-neutered and re-restored against the POST-FIX
+code, confirming the fix did not regress any of them (the diff between
+pre-fix and post-fix `memory_promote.py` is scoped entirely to
+`_promote_to_semantic` + the caller's tuple-unpack — verified via
+`git diff` before this pass):
+
+1. Durable scope gate (session-only token 403) — RED then GREEN.
+2. Ownership 404 (nonexistent + cross-user) — RED (2 tests) then GREEN.
+3. Provenance token-derived — RED then GREEN.
+4. Copy-not-move — RED then GREEN; full 32-test file re-run GREEN after
+   restore.
+5. `target_layer` validation (durable set only) — RED (2 tests) then
+   GREEN; `diff` confirmed byte-identical restore.
+6. BFF exact durable scope — RED (3 tests) then GREEN; `diff` confirmed
+   byte-identical restore of `bff/app.py`.
+7. BFF fail-closed relay — RED (3 tests) then GREEN; `diff` confirmed
+   byte-identical restore.
+
+### 6d. Full gate re-run after the fix
+
+```
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.70%
+4217 passed, 2 warnings in 380.88s (0:06:20)
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (104 files checked, lines >= 90%, branches >= 90% on 93 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+
+$ make lint  -> clean
+$ make helm-lint -> 1 chart(s) linted, 0 chart(s) failed
+$ mypy <10 touched/new files> -> Success: no issues found in 10 source files
+```
+
+New-file coverage: `src/audittrace/routes/memory_promote.py` 100%
+(107 statements, 16 branches, 0 missed).
+
+This section satisfies ADR-049 Rule 1 (Verification) and Rule 3
+(Reconstruction — the neuter/restore transcripts above) for the fix
+commit; Rule 2 (Validation) remains deferred to WU-6 as in §5.

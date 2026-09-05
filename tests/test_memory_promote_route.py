@@ -374,7 +374,10 @@ class TestPromoteSemanticTarget:
         assert response.status_code == 200
         body = response.json()
         assert body["target_layer"] == "semantic"
-        assert body["key"] == "semantic/sem-note.txt"
+        # Per-user-namespaced document_id (cross-user hijack fix, review
+        # pass 1) — the key is <collection>/<user_id>/<filename>, never
+        # the bare <collection>/<filename> two-segment shape.
+        assert body["key"] == "semantic/alice/sem-note.txt"
 
     def test_promote_to_semantic_custom_collection(self, client: TestClient) -> None:
         _upload_session_doc(client, sub="alice", filename="sem-custom.txt")
@@ -389,7 +392,7 @@ class TestPromoteSemanticTarget:
             },
         )
         assert response.status_code == 200
-        assert response.json()["key"] == "decisions/sem-custom.txt"
+        assert response.json()["key"] == "decisions/alice/sem-custom.txt"
 
     def test_semantic_document_readable_after_promote(self, client: TestClient) -> None:
         from audittrace.dependencies import get_semantic_service
@@ -408,7 +411,7 @@ class TestPromoteSemanticTarget:
             ctx = sentinel_user_context()
             ctx = replace(ctx, user_id="alice")
             return await get_semantic_service().get_document(
-                ctx, "semantic", "sem-read.txt"
+                ctx, "semantic", "alice/sem-read.txt"
             )
 
         doc = asyncio.run(_read())
@@ -514,7 +517,10 @@ class TestPromoteManifestAuthorizationChoke:
     def test_promote_over_existing_corpus_semantic_row_denied(
         self, client: TestClient
     ) -> None:
-        self._seed_corpus_semantic_row("semantic", "collide-sem.txt")
+        # Seeded key must match the NAMESPACED document_id promote will
+        # actually compute (<user_id>/<filename>) for the collision to
+        # trigger — see the cross-user hijack fix in memory_promote.py.
+        self._seed_corpus_semantic_row("semantic", "alice/collide-sem.txt")
         _upload_session_doc(client, sub="alice", filename="collide-sem.txt")
         response = _promote(
             client,
@@ -694,3 +700,86 @@ class TestPromoteRecordCreateAuthorizationNotSwallowed:
             payload={"filename": "rc-deny-sem.txt", "target_layer": "semantic"},
         )
         assert response.status_code == 403
+
+
+# ── cross-user semantic promote isolation (review pass 1 finding) ────────────
+
+
+class TestPromoteSemanticCrossUserIsolation:
+    """Independent-review finding (pass 1): two users independently
+    promoting a SAME-NAMED session file to the default semantic
+    collection used to silently collide on one shared ChromaDB row
+    (``document_id == filename``, no per-user namespacing) — reproduced
+    live against the real ``/memory/promote`` + ``/memory/semantic``
+    endpoints. User A would promote ``shared.md``, User B would promote
+    their OWN ``shared.md`` to the same collection, and User A reading
+    their key back would get User B's content + attribution.
+
+    The fix bakes the TOKEN-derived ``user.user_id`` into the
+    ``document_id`` (``_namespaced_semantic_document_id`` in
+    ``routes/memory_promote.py``) so two different users can NEVER
+    produce the same ``document_id``, regardless of filename choice.
+
+    Falsifiable: revert ``_namespaced_semantic_document_id`` to return
+    the raw *filename* (dropping the ``user_id`` prefix) and
+    ``test_two_users_same_filename_never_collide`` goes RED — Bob's
+    write silently overwrites Alice's row, and Alice's read-back either
+    returns Bob's content or (if the mock enforced ownership) `None`
+    instead of her own content."""
+
+    def test_two_users_same_filename_never_collide(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_semantic_service
+        from audittrace.identity import sentinel_user_context
+
+        _upload_session_doc(
+            client, sub="alice", filename="shared.md", content=b"alice's content"
+        )
+        _upload_session_doc(
+            client, sub="bob", filename="shared.md", content=b"bob's content"
+        )
+
+        resp_alice = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        resp_bob = _promote(
+            client,
+            sub="bob",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        assert resp_bob.status_code == 200
+
+        key_alice = resp_alice.json()["key"]
+        key_bob = resp_bob.json()["key"]
+
+        # The load-bearing assertion: two users, the SAME filename, MUST
+        # produce two DIFFERENT durable keys — never a shared one.
+        assert key_alice != key_bob
+        assert key_alice == "semantic/alice/shared.md"
+        assert key_bob == "semantic/bob/shared.md"
+
+        document_id_alice = key_alice.split("/", 1)[1]
+        document_id_bob = key_bob.split("/", 1)[1]
+
+        async def _read(sub: str, document_id: str) -> Any:
+            ctx = sentinel_user_context()
+            ctx = replace(ctx, user_id=sub)
+            return await get_semantic_service().get_document(
+                ctx, "semantic", document_id
+            )
+
+        doc_alice = asyncio.run(_read("alice", document_id_alice))
+        doc_bob = asyncio.run(_read("bob", document_id_bob))
+
+        assert doc_alice is not None
+        assert doc_bob is not None
+        # Each user reads back THEIR OWN content — never the other's.
+        assert "alice's content" in doc_alice.page_content
+        assert "bob's content" in doc_bob.page_content
+        assert doc_alice.page_content != doc_bob.page_content
+        assert "bob's content" not in doc_alice.page_content
+        assert "alice's content" not in doc_bob.page_content

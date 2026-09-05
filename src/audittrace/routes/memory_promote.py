@@ -150,6 +150,29 @@ def _semantic_key(collection: str, document_id: str) -> str:
     return f"{collection}/{document_id}"
 
 
+def _namespaced_semantic_document_id(user_id: str, filename: str) -> str:
+    """Per-user-namespaced ChromaDB ``document_id`` for a semantic
+    promote — ``<user_id>/<filename>``.
+
+    **Why this exists (independent-review finding, pass 1 — cross-user
+    hijack).** The semantic layer's private-tier physical ChromaDB
+    collection is SHARED across every private writer (unlike episodic/
+    procedural, whose private content lives under a per-user S3 object
+    prefix); a bare ``document_id == filename`` let two users who
+    independently promoted a same-named file silently overwrite the
+    SAME row. Baking the TOKEN-derived ``user_id`` (never a caller-
+    supplied field — the caller never gets to choose this value; it is
+    always ``user.user_id`` from :func:`~audittrace.auth.require_user`)
+    into the id itself makes that collision structurally impossible —
+    two different ``user_id`` values always produce two different
+    ``document_id`` values, regardless of how many users pick the exact
+    same filename. Falsifiable: revert to the raw *filename* and
+    ``tests/test_memory_promote_route.py::
+    TestPromoteSemanticCrossUserIsolation`` goes RED.
+    """
+    return f"{user_id}/{filename}"
+
+
 def _durable_episodic_filename(session_filename: str) -> str:
     """Derive an episodic-safe (``.md``) filename from a session filename
     that may carry any extension — session uploads aren't restricted to
@@ -280,16 +303,44 @@ async def _promote_to_semantic(
     title: str,
     collection: Any,
     extra_metadata: dict[str, Any],
-) -> str:
+) -> tuple[str, str]:
     """Copy *stamped_content* into the caller's private-tier semantic
-    collection (default :data:`_DEFAULT_PROMOTE_COLLECTION`), keyed by
-    the session filename as the ``document_id``. Returns the durable key
-    (``<collection>/<document_id>``)."""
+    collection (default :data:`_DEFAULT_PROMOTE_COLLECTION`), keyed by a
+    PER-USER-NAMESPACED ``document_id``. Returns ``(durable_key,
+    collection)`` — the resolved collection name is returned explicitly
+    (not re-derived by splitting ``durable_key``) because the
+    per-user-namespaced ``document_id`` itself now contains a ``/``,
+    so a naive ``durable_key.rsplit("/", 1)`` would silently mis-parse
+    the collection name once the namespacing fix below landed.
+
+    **Cross-user collision fix (independent-review finding, pass 1).**
+    Unlike episodic/procedural — whose PRIVATE-tier content is isolated
+    by a per-user S3 object prefix (``{private_bucket}/{jwt.sub}/
+    episodic/...``, entirely separate from the manifest-row collision
+    ADR-062 §B4 already documents as a follow-up) — the semantic layer's
+    private-tier ChromaDB physical collection
+    (``ChromaSemanticService._physical``) is ONE SHARED collection for
+    every private writer; there is no per-user storage-path mechanism at
+    all. A ``document_id`` equal to the raw session filename therefore
+    let two users who independently promoted a same-named file
+    (e.g. both promoting ``shared.md``) silently overwrite the SAME
+    ChromaDB row — reproduced live against the real ``/memory/promote``
+    + ``/memory/semantic`` endpoints. :func:`_namespaced_semantic_document_id`
+    bakes the TOKEN-derived ``user.user_id`` (never a caller-supplied
+    field — feedback_never_trust_caller_metadata_for_security_fields)
+    into the ``document_id`` itself, mirroring the INTENT of episodic's
+    per-user S3 prefix (a stable per-user segment baked into the storage
+    key) even though the exact mechanism differs, since ChromaDB has no
+    separate storage-path concept to isolate on. This does NOT touch the
+    broader, pre-existing ``authorize_write`` corpus-collision primitive
+    gap (ADR-062 §B4) — that stays the documented separate follow-up;
+    this closes the specific hijack this promote path introduced.
+    """
     if collection is None:
         collection = _DEFAULT_PROMOTE_COLLECTION
     if not isinstance(collection, str) or not collection:
         raise HTTPException(status_code=400, detail="collection must be a string")
-    document_id = filename
+    document_id = _namespaced_semantic_document_id(user.user_id, filename)
     manifest = get_memory_manifest_service()
     durable_key = _semantic_key(collection, document_id)
     try:
@@ -324,7 +375,7 @@ async def _promote_to_semantic(
         )
     except ManifestAuthorizationError as exc:
         raise _raise_manifest_authorization_as_403(exc) from exc
-    return durable_key
+    return durable_key, collection
 
 
 async def promote_session_to_durable(
@@ -392,7 +443,7 @@ async def promote_session_to_durable(
         collection: str | None = None
     else:
         collection_value = payload.get("collection")
-        durable_key = await _promote_to_semantic(
+        durable_key, collection = await _promote_to_semantic(
             user,
             filename,
             stamped_content,
@@ -404,7 +455,6 @@ async def promote_session_to_durable(
                 "promoted_by": promoted_by,
             },
         )
-        collection = durable_key.rsplit("/", 1)[0]
 
     await _emit_promote_audit(
         user=user,
