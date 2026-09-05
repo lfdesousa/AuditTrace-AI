@@ -25,6 +25,7 @@ class TestSettingsDefaults:
         assert settings.keycloak_issuer_extras == []
         assert settings.ca_bundle_path == ""
         assert settings.console_files_forced_layer == "session"
+        assert settings.console_promote_default_layer == "episodic"
 
     def test_ca_bundle_path_env_override_is_read(
         self, monkeypatch: pytest.MonkeyPatch
@@ -53,6 +54,32 @@ class TestSettingsDefaults:
         )
         settings = Settings()
         assert settings.console_files_forced_layer == "different-layer"
+
+
+class TestConsolePromoteDefaultLayer:
+    """M3 Sovereign-Attach WU-4 — ``console_promote_default_layer``
+    is env-overridable but constrained to the durable set (fail-closed
+    at STARTUP, never at the first request)."""
+
+    def test_env_override_to_semantic_is_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.setenv("AUDITTRACE_BFF_CONSOLE_PROMOTE_DEFAULT_LAYER", "semantic")
+        settings = Settings()
+        assert settings.console_promote_default_layer == "semantic"
+
+    def test_non_durable_value_raises_at_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neuter the ``field_validator`` and this goes RED (a
+        misconfigured ``console_promote_default_layer=session`` would
+        silently construct, then 422 at every request instead of failing
+        fast at startup)."""
+        monkeypatch.setenv("AUDITTRACE_BFF_EXCHANGE_CLIENT_SECRET", "s3cr3t")
+        monkeypatch.setenv("AUDITTRACE_BFF_CONSOLE_PROMOTE_DEFAULT_LAYER", "session")
+        with pytest.raises(ValidationError, match="console_promote_default_layer"):
+            Settings()
 
 
 class TestExchangeSecretFailClosed:

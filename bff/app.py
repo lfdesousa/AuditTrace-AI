@@ -1,13 +1,15 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Three routes matter: ``POST /v1/chat/completions``, the proxy target
+Four routes matter: ``POST /v1/chat/completions``, the proxy target
 LibreChat's custom endpoint config points at; ``GET/POST/PUT/DELETE
-/memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1); and
+/memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1);
 ``POST /console/files``, the console's narrow-scope ephemeral file-ingest
-entry (M3 Sovereign-Attach WU-2). ``GET /health`` is the k8s-probe
-convenience every AuditTrace deployable carries.
+entry (M3 Sovereign-Attach WU-2); and ``POST /console/files/{filename}/
+promote``, the "keep this" durable-promote entry (M3 Sovereign-Attach
+WU-4). ``GET /health`` is the k8s-probe convenience every AuditTrace
+deployable carries.
 
-All three proxy routes share one fail-closed shape (see the module
+All four proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
 ``bff/memory_proxy.py`` for the guard each step enforces):
 
@@ -24,7 +26,11 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    exchanges explicitly for
    ``bff.console_files_scopes.INGEST_SCOPE_STRING`` — a single scope,
    ``memory:session:write``, never the memory route's broad set, never
-   ``audittrace:admin``.
+   ``audittrace:admin``; the console-files-promote route exchanges
+   explicitly for the SINGLE configured durable scope
+   (``bff.console_promote_scopes.promote_scope_string_for_layer``,
+   default ``memory:episodic:write``) — a THIRD, distinct exchange, never
+   the session scope, never the broad set, never admin.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -33,7 +39,11 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    FORCES the upstream ``/memory/upload`` request's ``layer`` query
    parameter to ``settings.console_files_forced_layer`` regardless of
    what (if anything) the caller's own query string carries — the
-   console cannot choose a durable layer from this seam.
+   console cannot choose a durable layer from this seam. The
+   console-files-promote route similarly FORCES the upstream
+   ``/memory/promote`` request's ``target_layer`` JSON field to
+   ``settings.console_promote_default_layer`` — the caller supplies only
+   the path-parameter ``filename``, never a target-layer override.
 
 There is no code path in this module that can proxy a request without a
 freshly minted, per-caller token — the fail-closed guarantee is
@@ -42,6 +52,7 @@ structural, not just an if-check.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -54,6 +65,7 @@ from starlette.responses import StreamingResponse
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
 from bff.console_files_scopes import INGEST_SCOPE_STRING
+from bff.console_promote_scopes import promote_scope_string_for_layer
 from bff.exchange import TokenExchangeError, exchange_token
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
@@ -289,6 +301,88 @@ def create_app() -> FastAPI:
             )
         except MemoryProxyError as exc:
             logger.error("orchestrator /memory/upload unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.post("/console/files/{filename}/promote", response_model=None)
+    async def console_files_promote(
+        filename: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console's "keep this" promote entry (M3 Sovereign-Attach
+        WU-4): exchanges for ONLY the configured target durable scope
+        (``settings.console_promote_default_layer``, default
+        ``memory:episodic:write``) — a SEPARATE, narrower exchange from
+        both the broad Souvenirs scope set and WU-2's ephemeral ingest
+        scope, per ``bff/console_promote_scopes.py`` — and proxies to the
+        orchestrator's ``POST /memory/promote`` with a JSON body naming
+        *filename* (the session doc reference) and the configured
+        ``target_layer``. See the module docstring for the shared
+        fail-closed shape.
+        """
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/files promote request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        requested_scope = promote_scope_string_for_layer(
+            settings.console_promote_default_layer
+        )
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=requested_scope,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-files-promote token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        # Body is server-CONSTRUCTED, not forwarded from the caller's own
+        # request body — the caller supplies no target_layer/filename
+        # override from this seam; ``filename`` is the path parameter,
+        # ``target_layer`` is the configured default, matching the
+        # console-files route's own "forced, never caller-chosen" wall.
+        raw_body = json.dumps(
+            {
+                "filename": filename,
+                "target_layer": settings.console_promote_default_layer,
+            }
+        ).encode("utf-8")
+        try:
+            return await proxy_memory_request(
+                "POST",
+                "promote",
+                "",
+                raw_body,
+                "application/json",
+                minted_token,
+                settings,
+                http_client,
+            )
+        except MemoryProxyError as exc:
+            logger.error("orchestrator /memory/promote unreachable: %s", exc)
             return JSONResponse(
                 status_code=502, content={"detail": "Upstream service unavailable"}
             )

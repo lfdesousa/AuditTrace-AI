@@ -17,7 +17,10 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from bff.console_promote_scopes import DURABLE_PROMOTE_LAYERS
 
 # Skip .env loading when BFF_ENV=test, same discipline as
 # ``audittrace.config`` — a developer's local .env (with a real client
@@ -69,6 +72,26 @@ class Settings(BaseSettings):
     # place — see ``bff/console_files_scopes.py`` for the scope half of
     # the same wall.
     console_files_forced_layer: str = "session"
+
+    # M3 Sovereign-Attach WU-4 — the "keep this" promote route
+    # (``POST /console/files/{filename}/promote``) forwards this value
+    # as the orchestrator ``/memory/promote`` request's ``target_layer``
+    # field AND uses it to compute the SINGLE durable scope the
+    # per-request RFC 8693 exchange requests (see
+    # ``bff/console_promote_scopes.py``). Constrained to the durable set
+    # (episodic/semantic) — fail-closed at STARTUP (``ValidationError``),
+    # not at the first request, if misconfigured.
+    console_promote_default_layer: str = "episodic"
+
+    @field_validator("console_promote_default_layer")
+    @classmethod
+    def _validate_console_promote_default_layer(cls, value: str) -> str:
+        if value not in DURABLE_PROMOTE_LAYERS:
+            raise ValueError(
+                f"console_promote_default_layer must be one of "
+                f"{sorted(DURABLE_PROMOTE_LAYERS)} (got {value!r})"
+            )
+        return value
 
     # ── Inbound-token validation (the token LibreChat forwards) ──────────
     # Same Keycloak realm as the orchestrator's own auth.py; the BFF

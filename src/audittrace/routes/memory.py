@@ -84,6 +84,9 @@ from audittrace.models import (
 from audittrace.routes import memory_pdf as _pdf  # noqa: E402
 from audittrace.routes import memory_scan as _scan  # noqa: E402
 from audittrace.routes.memory_md_manifest import _flush_md_manifest
+from audittrace.routes.memory_promote import (
+    promote_session_to_durable as _promote_session_to_durable,
+)
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
@@ -773,6 +776,47 @@ async def upload_memory_file(
         "size_bytes": len(content),
         "tier": "private",
     }
+
+
+# ── POST /memory/promote ────────────────────────────────────────────────────
+
+
+@router.post("/promote")
+async def promote_memory(
+    payload: dict[str, Any] = Body(
+        ..., description="{filename, target_layer?, collection?, title?}"
+    ),
+    # NOT auth-only: the real gate is
+    # ``memory_promote._require_durable_write_scope`` below, dynamic in
+    # the (validated) ``target_layer`` body field — same pattern as
+    # ``upload_memory_file``'s static ``scopes=[]`` + dynamic
+    # ``_require_layer_write``, since a single decorator can't express
+    # "memory:episodic:write OR memory:semantic:write" as an AND-only
+    # FastAPI ``Security(..., scopes=[...])`` declaration.
+    _auth: dict[str, Any] = Security(validate_jwt, scopes=[]),
+    user: UserContext = Depends(require_user),
+) -> dict[str, Any]:
+    """Promote (COPY, never move) the caller's own ephemeral ``session``
+    document into a durable memory layer — WU-4 of the Sovereign-Attach
+    EPIC's explicit "keep this" action.
+
+    Body: ``{"filename": <session doc reference>, "target_layer":
+    <"episodic"|"semantic", default "episodic">, "collection": <optional,
+    semantic only>, "title": <optional>}``. ``target_layer`` outside the
+    durable set (``session``/``conversational``/anything unknown) is
+    rejected 422 — never silently coerced.
+
+    Authorization: the caller's JWT must carry
+    ``memory:<target_layer>:write`` (or ``audittrace:admin``) — a token
+    holding ONLY ``memory:session:write`` (everything WU-1/2/3 grant by
+    default) gets 403 here. Ownership of the session doc is enforced by
+    ``SessionMemoryService.read_own`` (404 if not the caller's own).
+
+    The implementation lives in ``audittrace.routes.memory_promote`` —
+    see that module's docstring for the full step-by-step + why the
+    logic is split out of this (already >3000 LOC) file.
+    """
+    return await _promote_session_to_durable(payload, user)
 
 
 # ── POST /memory/index ──────────────────────────────────────────────────────
