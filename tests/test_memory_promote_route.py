@@ -1,0 +1,1005 @@
+"""Tests for ``POST /memory/promote`` — WU-4 of the Sovereign-Attach
+EPIC ("keep this": promote a caller's session document into a durable
+memory layer).
+
+Non-vacuous guards, each with its own test class (ratified spec
+2026-09-05-SPEC-wu4-promote-session-to-durable.md):
+
+* ``TestPromoteScopeGate`` — a ``memory:session:write``-only token 403s;
+  the durable ``memory:<target_layer>:write`` scope is required. Neuter
+  ``_require_durable_write_scope`` and
+  ``test_session_only_token_cannot_promote`` goes RED.
+* ``TestPromoteTargetLayerValidation`` — ``target_layer`` is constrained
+  to the durable set (episodic/semantic); session/conversational/unknown
+  are rejected 422.
+* ``TestPromoteOwnership`` — a caller cannot promote another user's (or a
+  nonexistent) session doc: 404, never a different status code that
+  would disclose existence.
+* ``TestPromoteProvenance`` — ``promoted_by`` is ALWAYS the token's
+  ``sub``, never a caller-supplied field; the durable content itself
+  carries the provenance stamp.
+* ``TestPromoteCopyNotMove`` — the session doc still exists after a
+  successful promote.
+* ``TestPromoteSemanticTarget`` — the semantic durable path (default +
+  custom collection).
+* ``TestPromoteAuditFailsClosed`` — an audit-emit failure is a 500, never
+  a silently-unaudited 200 (mirrors ``TestMemoryAuditWriteFailsClosed``
+  in ``tests/test_memory_routes.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+# ── auth helpers ─────────────────────────────────────────────────────────────
+
+
+class _Auth:
+    """Small helper bundling the three patches + their return values so
+    every test doesn't repeat the same six lines."""
+
+    def __init__(self, sub: str, scope: str) -> None:
+        self.sub = sub
+        self.scope = scope
+
+    def __enter__(self):
+        self._patches = [
+            patch("audittrace.auth.get_settings"),
+            patch("audittrace.auth._get_jwks_keys"),
+            patch("audittrace.auth._decode_jwt_with_allowed_issuers"),
+        ]
+        mocks = [p.__enter__() for p in self._patches]
+        mock_settings, mock_jwks, mock_decode = mocks
+        mock_settings.return_value = MagicMock(auth_enabled=True, auth_required=True)
+        mock_jwks.return_value = ["fake-key"]
+        mock_decode.return_value = {"sub": self.sub, "scope": self.scope}
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for p in reversed(self._patches):
+            p.__exit__(*exc)
+
+
+def _upload_session_doc(
+    client: TestClient, *, sub: str, filename: str, content: bytes = b"scratch note"
+) -> None:
+    """Seed a session-layer document via the real (WU-1) upload route, as
+    *sub*, so promote tests exercise the real read_own ownership path
+    rather than reaching into service internals directly."""
+    with (
+        _Auth(sub, "memory:session:write"),
+        patch(
+            "audittrace.routes.memory._get_minio_client",
+            return_value=MagicMock(),
+        ),
+    ):
+        response = client.post(
+            "/memory/upload",
+            params={"layer": "session"},
+            files={"file": (filename, content, "text/plain")},
+            headers={"Authorization": "Bearer session-token"},
+        )
+    assert response.status_code == 200, response.text
+
+
+def _promote(
+    client: TestClient,
+    *,
+    sub: str,
+    scope: str,
+    payload: dict[str, Any],
+) -> Any:
+    with _Auth(sub, scope):
+        return client.post(
+            "/memory/promote",
+            json=payload,
+            headers={"Authorization": "Bearer promote-token"},
+        )
+
+
+def _get_semantic(
+    client: TestClient, *, sub: str, collection: str, document_id: str
+) -> Any:
+    """Hit the REAL ``GET /memory/semantic/{collection}/{document_id}``
+    route (feedback_test_through_real_http_route — the pass-2 review
+    finding: a regression test that calls the service method directly
+    never exercises Starlette's own path-matching, which is exactly
+    where the read-outage bug lived)."""
+    with _Auth(sub, "memory:semantic:read"):
+        return client.get(
+            f"/memory/semantic/{collection}/{document_id}",
+            headers={"Authorization": "Bearer read-token"},
+        )
+
+
+# ── scope gate ───────────────────────────────────────────────────────────────
+
+
+class TestPromoteScopeGate:
+    """Deliverable: durable scope REQUIRED, session scope INSUFFICIENT."""
+
+    def test_session_only_token_cannot_promote(self, client: TestClient) -> None:
+        """A ``memory:session:write``-only token — everything WU-1/2/3
+        grant by default — MUST 403 at the promote choke. Neutering
+        ``_require_durable_write_scope`` to also accept the session
+        scope turns this RED."""
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:session:write",
+            payload={"filename": "note.txt"},
+        )
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_no_scope_token_cannot_promote(self, client: TestClient) -> None:
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:query",
+            payload={"filename": "note.txt"},
+        )
+        assert response.status_code == 403
+
+    def test_episodic_scope_can_promote_to_episodic(self, client: TestClient) -> None:
+        """The positive case: holding the DURABLE scope the target
+        requires succeeds."""
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "note.txt"},
+        )
+        assert response.status_code == 200
+        assert response.json()["target_layer"] == "episodic"
+
+    def test_semantic_scope_cannot_promote_to_episodic(
+        self, client: TestClient
+    ) -> None:
+        """Cross-layer denial mirrors ``_require_layer_write``'s own
+        discipline: holding the WRONG durable scope is still refused."""
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "note.txt", "target_layer": "episodic"},
+        )
+        assert response.status_code == 403
+        assert "memory:episodic:write" in response.json()["detail"]
+
+    def test_admin_scope_bypasses_gate(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={"filename": "note.txt"},
+        )
+        assert response.status_code == 200
+
+
+# ── target_layer validation ──────────────────────────────────────────────────
+
+
+class TestPromoteTargetLayerValidation:
+    def test_target_layer_session_rejected_422(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:session:write memory:episodic:write memory:semantic:write",
+            payload={"filename": "note.txt", "target_layer": "session"},
+        )
+        assert response.status_code == 422
+
+    def test_target_layer_conversational_rejected_422(self, client: TestClient) -> None:
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={"filename": "note.txt", "target_layer": "conversational"},
+        )
+        assert response.status_code == 422
+
+    def test_target_layer_unknown_value_rejected_422(self, client: TestClient) -> None:
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={"filename": "note.txt", "target_layer": "not-a-real-layer"},
+        )
+        assert response.status_code == 422
+
+    def test_target_layer_procedural_rejected_422(self, client: TestClient) -> None:
+        """The durable set is exactly episodic/semantic — NOT procedural,
+        even though procedural is itself a durable, S3-backed layer for
+        other routes. The EPIC decision text names only episodic/semantic."""
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={"filename": "note.txt", "target_layer": "procedural"},
+        )
+        assert response.status_code == 422
+
+    def test_default_target_layer_is_episodic(self, client: TestClient) -> None:
+        """Omitting ``target_layer`` entirely defaults to episodic."""
+        _upload_session_doc(client, sub="alice", filename="default-target.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "default-target.txt"},
+        )
+        assert response.status_code == 200
+        assert response.json()["target_layer"] == "episodic"
+
+
+# ── ownership (RLS-equivalent) ───────────────────────────────────────────────
+
+
+class TestPromoteOwnership:
+    """Deliverable: a caller cannot promote another user's session doc —
+    read_own enforces this (feedback_unit_tests_miss_rls: the session
+    layer's isolation is a service-layer explicit filter, proven the
+    same way WU-1's own acceptance test (d) proves it)."""
+
+    def test_promote_nonexistent_filename_404(self, client: TestClient) -> None:
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "never-uploaded.txt"},
+        )
+        assert response.status_code == 404
+
+    def test_cross_user_promote_404(self, client: TestClient) -> None:
+        """Alice's session doc is invisible to Bob's promote attempt —
+        neutering the ownership/isolation check (e.g. dropping
+        ``read_own``'s user_id filter) makes this go RED (200 instead
+        of 404)."""
+        _upload_session_doc(client, sub="alice", filename="alices-note.txt")
+        response = _promote(
+            client,
+            sub="bob",
+            scope="memory:episodic:write",
+            payload={"filename": "alices-note.txt"},
+        )
+        assert response.status_code == 404
+
+    def test_owner_can_promote_own_doc(self, client: TestClient) -> None:
+        """Positive control for the two 404 tests above: the SAME
+        filename, promoted by its OWNER, succeeds."""
+        _upload_session_doc(client, sub="alice", filename="alices-note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "alices-note.txt"},
+        )
+        assert response.status_code == 200
+
+
+# ── provenance ────────────────────────────────────────────────────────────────
+
+
+class TestPromoteProvenance:
+    """Deliverable: ``promoted_by`` is TOKEN-derived, never a caller-
+    supplied field (feedback_never_trust_caller_metadata_for_security_fields)."""
+
+    def test_provenance_from_token_not_caller_field(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={
+                "filename": "note.txt",
+                # An attacker-controlled attempt to forge attribution —
+                # neither of these body fields is ever read by the
+                # implementation for identity purposes.
+                "promoted_by": "mallory",
+                "user_id": "mallory",
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["promoted_by"] == "alice"
+        assert body["promoted_by"] != "mallory"
+
+    def test_provenance_stamped_on_durable_content(self, client: TestClient) -> None:
+        """The durable document's own content carries the provenance
+        block — read it back through the (mock) episodic service."""
+        from audittrace.dependencies import get_episodic_service
+        from audittrace.identity import sentinel_user_context
+
+        _upload_session_doc(client, sub="alice", filename="stamped.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "stamped.txt"},
+        )
+        assert response.status_code == 200
+        key = response.json()["key"]
+        assert key == "stamped.txt.md"
+
+        async def _read() -> Any:
+            ctx = sentinel_user_context()
+            ctx = replace(ctx, user_id="alice")
+            return await get_episodic_service().read(ctx, key)
+
+        doc = asyncio.run(_read())
+        assert doc is not None
+        assert "promoted_from: alice/session/stamped.txt" in doc.page_content
+        assert "promoted_by: alice" in doc.page_content
+        assert "scratch note" in doc.page_content
+
+
+# ── copy, not move ────────────────────────────────────────────────────────────
+
+
+class TestPromoteCopyNotMove:
+    def test_session_doc_still_exists_after_promote(self, client: TestClient) -> None:
+        """Neutering promote to also delete/GC the session row would
+        make this go RED (``read_own`` would return ``None``)."""
+        from audittrace.dependencies import get_session_memory_service
+        from audittrace.identity import sentinel_user_context
+
+        _upload_session_doc(client, sub="alice", filename="keepalive.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "keepalive.txt"},
+        )
+        assert response.status_code == 200
+
+        async def _read_own() -> Any:
+            ctx = sentinel_user_context()
+            ctx = replace(ctx, user_id="alice")
+            return await get_session_memory_service().read_own(ctx, "keepalive.txt")
+
+        doc = asyncio.run(_read_own())
+        assert doc is not None
+        assert doc.page_content == "scratch note"
+
+
+# ── semantic durable target ──────────────────────────────────────────────────
+
+
+class TestPromoteSemanticTarget:
+    def test_promote_to_semantic_default_collection(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="sem-note.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "sem-note.txt", "target_layer": "semantic"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["target_layer"] == "semantic"
+        # Per-user-namespaced document_id (cross-user hijack fix, review
+        # pass 1) — the key is <collection>/<user_id>/<filename>, never
+        # the bare <collection>/<filename> two-segment shape.
+        assert body["key"] == "semantic/alice__sem-note.txt"
+
+    def test_promote_to_semantic_custom_collection(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="sem-custom.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={
+                "filename": "sem-custom.txt",
+                "target_layer": "semantic",
+                "collection": "decisions",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["key"] == "decisions/alice__sem-custom.txt"
+
+    def test_semantic_document_readable_after_promote(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_semantic_service
+        from audittrace.identity import sentinel_user_context
+
+        _upload_session_doc(client, sub="alice", filename="sem-read.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "sem-read.txt", "target_layer": "semantic"},
+        )
+        assert response.status_code == 200
+
+        async def _read() -> Any:
+            ctx = sentinel_user_context()
+            ctx = replace(ctx, user_id="alice")
+            return await get_semantic_service().get_document(
+                ctx, "semantic", "alice__sem-read.txt"
+            )
+
+        doc = asyncio.run(_read())
+        assert doc is not None
+        assert "promoted_from: alice/session/sem-read.txt" in doc.page_content
+
+
+# ── missing filename ──────────────────────────────────────────────────────────
+
+
+class TestPromoteMissingFilename:
+    def test_missing_filename_400(self, client: TestClient) -> None:
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={},
+        )
+        assert response.status_code == 400
+
+
+# ── audit fails closed ───────────────────────────────────────────────────────
+
+
+class TestPromoteAuditFailsClosed:
+    """Mirrors ``TestMemoryAuditWriteFailsClosed`` in
+    ``tests/test_memory_routes.py`` — an audit-emit failure must fail the
+    request closed, never silently succeed unaudited."""
+
+    def test_promote_returns_500_when_audit_emit_fails(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.routes import memory_promote as mp
+
+        async def _boom(**_kwargs: Any) -> None:
+            raise RuntimeError("audit store unavailable")
+
+        _upload_session_doc(client, sub="alice", filename="audit-fc.txt")
+        monkeypatch.setattr(mp, "emit_memory_audit_event", _boom)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "audit-fc.txt"},
+        )
+        assert response.status_code == 500
+
+
+# ── manifest pre-write authorization choke ────────────────────────────────────
+
+
+class TestPromoteManifestAuthorizationChoke:
+    """The ``authorize_write`` pre-write choke (SPEC security-memory-
+    write-authorization-choke, 2026-08-30) applies to promote exactly
+    like every other durable write entry point: promoting OVER an
+    existing CORPUS-tier row without shared-write authorization is
+    refused 403 — no new hole opened for this WU."""
+
+    @staticmethod
+    def _seed_corpus_episodic_row(filename: str) -> None:
+        from audittrace.dependencies import get_memory_manifest_service
+
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "episodic",
+                filename,
+                "Shared ADR",
+                10,
+                "curator",
+                tier="corpus",
+            )
+        )
+
+    @staticmethod
+    def _seed_corpus_semantic_row(collection: str, document_id: str) -> None:
+        from audittrace.dependencies import get_memory_manifest_service
+
+        key = f"{collection}/{document_id}"
+        asyncio.run(
+            get_memory_manifest_service().record_create(
+                "semantic",
+                key,
+                "Shared doc",
+                10,
+                "curator",
+                tier="corpus",
+            )
+        )
+
+    def test_promote_over_existing_corpus_episodic_row_denied(
+        self, client: TestClient
+    ) -> None:
+        self._seed_corpus_episodic_row("collide.txt.md")
+        _upload_session_doc(client, sub="alice", filename="collide.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "collide.txt"},
+        )
+        assert response.status_code == 403
+
+    def test_promote_over_existing_corpus_semantic_row_denied(
+        self, client: TestClient
+    ) -> None:
+        # Seeded key must match the NAMESPACED document_id promote will
+        # actually compute (<user_id>/<filename>) for the collision to
+        # trigger — see the cross-user hijack fix in memory_promote.py.
+        self._seed_corpus_semantic_row("semantic", "alice__collide-sem.txt")
+        _upload_session_doc(client, sub="alice", filename="collide-sem.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "collide-sem.txt", "target_layer": "semantic"},
+        )
+        assert response.status_code == 403
+
+    def test_admin_can_promote_over_existing_corpus_row(
+        self, client: TestClient
+    ) -> None:
+        """Positive control: an admin (shared-write authorized) CAN
+        overwrite the corpus row — proves the 403s above are genuinely
+        about authorization, not a blanket "any existing row" refusal."""
+        self._seed_corpus_episodic_row("collide-admin.txt.md")
+        _upload_session_doc(client, sub="alice", filename="collide-admin.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="audittrace:admin",
+            payload={"filename": "collide-admin.txt"},
+        )
+        assert response.status_code == 200
+
+
+# ── durable write-primitive failures ─────────────────────────────────────────
+
+
+class TestPromoteWritePrimitiveFailures:
+    """The episodic/semantic write-primitive failure branches — mirrors
+    ``create_episodic``/``create_semantic``'s own 400/502 mapping."""
+
+    def test_episodic_write_value_error_maps_to_400(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.services.episodic import MockEpisodicService
+
+        async def _raise_value_error(*_a: Any, **_kw: Any) -> Any:
+            raise ValueError("invalid filename")
+
+        _upload_session_doc(client, sub="alice", filename="badwrite.txt")
+        monkeypatch.setattr(MockEpisodicService, "write", _raise_value_error)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "badwrite.txt"},
+        )
+        assert response.status_code == 400
+
+    def test_episodic_write_runtime_error_maps_to_502(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.services.episodic import MockEpisodicService
+
+        async def _raise_runtime_error(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("backend unavailable")
+
+        _upload_session_doc(client, sub="alice", filename="badwrite2.txt")
+        monkeypatch.setattr(MockEpisodicService, "write", _raise_runtime_error)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "badwrite2.txt"},
+        )
+        assert response.status_code == 502
+
+    def test_semantic_upsert_failure_maps_to_502(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.services.semantic import MockSemanticService
+
+        async def _raise(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("chroma unavailable")
+
+        _upload_session_doc(client, sub="alice", filename="badsem.txt")
+        monkeypatch.setattr(MockSemanticService, "upsert", _raise)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "badsem.txt", "target_layer": "semantic"},
+        )
+        assert response.status_code == 502
+
+    def test_semantic_collection_must_be_a_string(self, client: TestClient) -> None:
+        _upload_session_doc(client, sub="alice", filename="badcol.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={
+                "filename": "badcol.txt",
+                "target_layer": "semantic",
+                "collection": 123,
+            },
+        )
+        assert response.status_code == 400
+
+
+# ── optional title field ──────────────────────────────────────────────────────
+
+
+class TestPromoteTitleField:
+    def test_explicit_title_is_used_on_the_manifest_row(
+        self, client: TestClient
+    ) -> None:
+        from audittrace.dependencies import get_memory_manifest_service
+
+        _upload_session_doc(client, sub="alice", filename="titled.txt")
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "titled.txt", "title": "My Custom Title"},
+        )
+        assert response.status_code == 200
+        key = response.json()["key"]
+
+        entry = asyncio.run(get_memory_manifest_service().get("episodic", key))
+        assert entry is not None
+        assert entry.title == "My Custom Title"
+
+
+# ── record_create's own (second) authorization check ─────────────────────────
+
+
+class TestPromoteRecordCreateAuthorizationNotSwallowed:
+    """SPEC security-memory-write-authorization-choke (2026-08-30) — the
+    manifest's OWN ``record_create`` guard is a SECOND, independent
+    check (belt-and-suspenders alongside the pre-write
+    ``authorize_write`` choke). Mirrors
+    ``TestManifestWriteChokeSupersedes*`` in ``tests/test_memory_routes.py``:
+    ``ManifestAuthorizationError`` raised from ``record_create`` itself
+    must propagate as 403, never be swallowed."""
+
+    def test_episodic_record_create_authorization_error_is_403(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.services.memory_manifest import (
+            ManifestAuthorizationError,
+            MockMemoryManifestService,
+        )
+
+        async def _deny(*_a: Any, **_kw: Any) -> Any:
+            raise ManifestAuthorizationError("denied by record_create")
+
+        _upload_session_doc(client, sub="alice", filename="rc-deny.txt")
+        monkeypatch.setattr(MockMemoryManifestService, "record_create", _deny)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:episodic:write",
+            payload={"filename": "rc-deny.txt"},
+        )
+        assert response.status_code == 403
+
+    def test_semantic_record_create_authorization_error_is_403(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from audittrace.services.memory_manifest import (
+            ManifestAuthorizationError,
+            MockMemoryManifestService,
+        )
+
+        async def _deny(*_a: Any, **_kw: Any) -> Any:
+            raise ManifestAuthorizationError("denied by record_create")
+
+        _upload_session_doc(client, sub="alice", filename="rc-deny-sem.txt")
+        monkeypatch.setattr(MockMemoryManifestService, "record_create", _deny)
+        response = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "rc-deny-sem.txt", "target_layer": "semantic"},
+        )
+        assert response.status_code == 403
+
+
+# ── cross-user semantic promote isolation (review pass 1 finding) ────────────
+
+
+class TestPromoteSemanticCrossUserIsolation:
+    """Independent-review finding (pass 1): two users independently
+    promoting a SAME-NAMED session file to the default semantic
+    collection used to silently collide on one shared ChromaDB row
+    (``document_id == filename``, no per-user namespacing) — reproduced
+    live against the real ``/memory/promote`` + ``/memory/semantic``
+    endpoints. User A would promote ``shared.md``, User B would promote
+    their OWN ``shared.md`` to the same collection, and User A reading
+    their key back would get User B's content + attribution.
+
+    The fix bakes the TOKEN-derived ``user.user_id`` into the
+    ``document_id`` (``_namespaced_semantic_document_id`` in
+    ``routes/memory_promote.py``) so two different users can NEVER
+    produce the same ``document_id``, regardless of filename choice.
+
+    Falsifiable: revert ``_namespaced_semantic_document_id`` to return
+    the raw *filename* (dropping the ``user_id`` prefix) and
+    ``test_two_users_same_filename_never_collide`` goes RED — Bob's
+    write silently overwrites Alice's row, and Alice's read-back either
+    returns Bob's content or (if the mock enforced ownership) `None`
+    instead of her own content.
+
+    **This class exercises the SERVICE method directly** (cheap,
+    write-collision-focused). It does NOT, by itself, prove the fix is
+    safe end-to-end through the real read route — that gap is exactly
+    what pass-2 review caught (a slash-containing id silently broke
+    ``GET /memory/semantic/{collection}/{document_id}`` for everyone).
+    See ``TestPromoteSemanticRealHttpRoundTrip`` below for the
+    route-level round-trip + cross-user-read-denial proof
+    (feedback_test_through_real_http_route)."""
+
+    def test_two_users_same_filename_never_collide(self, client: TestClient) -> None:
+        from audittrace.dependencies import get_semantic_service
+        from audittrace.identity import sentinel_user_context
+
+        _upload_session_doc(
+            client, sub="alice", filename="shared.md", content=b"alice's content"
+        )
+        _upload_session_doc(
+            client, sub="bob", filename="shared.md", content=b"bob's content"
+        )
+
+        resp_alice = _promote(
+            client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        resp_bob = _promote(
+            client,
+            sub="bob",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        assert resp_bob.status_code == 200
+
+        key_alice = resp_alice.json()["key"]
+        key_bob = resp_bob.json()["key"]
+
+        # The load-bearing assertion: two users, the SAME filename, MUST
+        # produce two DIFFERENT durable keys — never a shared one.
+        assert key_alice != key_bob
+        assert key_alice == "semantic/alice__shared.md"
+        assert key_bob == "semantic/bob__shared.md"
+
+        document_id_alice = key_alice.split("/", 1)[1]
+        document_id_bob = key_bob.split("/", 1)[1]
+
+        async def _read(sub: str, document_id: str) -> Any:
+            ctx = sentinel_user_context()
+            ctx = replace(ctx, user_id=sub)
+            return await get_semantic_service().get_document(
+                ctx, "semantic", document_id
+            )
+
+        doc_alice = asyncio.run(_read("alice", document_id_alice))
+        doc_bob = asyncio.run(_read("bob", document_id_bob))
+
+        assert doc_alice is not None
+        assert doc_bob is not None
+        # Each user reads back THEIR OWN content — never the other's.
+        assert "alice's content" in doc_alice.page_content
+        assert "bob's content" in doc_bob.page_content
+        assert doc_alice.page_content != doc_bob.page_content
+        assert "bob's content" not in doc_alice.page_content
+        assert "alice's content" not in doc_bob.page_content
+
+
+# ── real HTTP round-trip (pass-2 review finding: the crux) ───────────────────
+
+
+@pytest.fixture
+def real_semantic_client(monkeypatch: pytest.MonkeyPatch):
+    """A TestClient wired to the REAL ``ChromaSemanticService`` (backed
+    by the in-repo fake ChromaDB client, ``MockChromaDBFactory``)
+    instead of the standard ``client`` fixture's ``MockSemanticService``.
+
+    Why this fixture exists: ``MockSemanticService.get_document`` is
+    explicitly documented as "mock: no scoping" — it does NOT enforce
+    ``ChromaSemanticService._tier_authorized``'s ownership check. A test
+    asserting cross-user READ denial through the standard ``client``
+    fixture would therefore pass VACUOUSLY (the mock never denies
+    anything) regardless of whether the real production read-scoping
+    works. Wiring the real service (still no live ChromaDB — the fake
+    client is a pure in-process double) is the only way to prove the
+    actual `_tier_authorized` ownership check the real
+    ``GET /memory/semantic/{collection}/{document_id}`` route depends
+    on for its no-existence-disclosure guarantee.
+    """
+    from audittrace import dependencies
+    from audittrace.db.factory import MockChromaDBFactory
+    from audittrace.dependencies import create_test_container, reset_container
+    from audittrace.server import create_app
+    from audittrace.services.semantic import ChromaSemanticService
+
+    monkeypatch.setattr(
+        "audittrace.services.semantic.embed_via_nomic",
+        AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+    )
+
+    factory = MockChromaDBFactory()
+    real_client = asyncio.run(factory.get_client())
+    real_semantic = ChromaSemanticService(
+        client=real_client, default_collections=["semantic", "decisions"]
+    )
+
+    test_container = create_test_container()
+    test_container._instances["semantic"] = real_semantic
+    dependencies.container = test_container
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
+    reset_container()
+
+
+class TestPromoteSemanticRealHttpRoundTrip:
+    """Pass-2 independent-review REJECT: the pass-1 fix
+    (``f"{user_id}/{filename}"``) closed the write collision but broke
+    EVERY read — the ``GET/PUT/DELETE /memory/semantic/{collection}/
+    {document_id}`` route's ``{document_id}`` path parameter is
+    Starlette's default converter (``[^/]+``, a single URL segment), so
+    a slash-containing id could never match that route at all. The
+    pass-1 regression test never caught this because it called
+    ``get_semantic_service().get_document(...)`` DIRECTLY, bypassing
+    Starlette's own path-matching entirely
+    (feedback_test_through_real_http_route).
+
+    This class proves the CURRENT fix (``__``-separated,
+    single-URL-segment id) through the REAL HTTP surface, both halves
+    of the isolation invariant (feedback_per_user_namespace_shared_store_ids):
+
+    1. WRITE uniqueness — two users promoting the identical filename get
+       two DIFFERENT keys (the id-uniqueness half — same invariant as
+       ``TestPromoteSemanticCrossUserIsolation``, now proven via the
+       real ``GET`` round-trip instead of a direct service call).
+    2. READ scoping — a caller who somehow learns another user's exact
+       key still cannot read it (404) — the metadata
+       ``where``/ownership-filter half
+       (``ChromaSemanticService.get_document``'s pre-existing
+       ``_tier_authorized`` check on the ``user_id`` ``upsert``
+       unconditionally stamps into the document's metadata).
+
+    Falsifiable independently for EACH half:
+
+    * Neuter #1 (id-uniqueness): revert
+      ``_namespaced_semantic_document_id`` to the raw *filename* ->
+      ``test_two_users_same_filename_full_http_round_trip`` goes RED
+      (the SECOND promote's ``key`` collides with the first, or the
+      real ``GET`` for one user returns the OTHER user's content).
+    * Neuter #2 (read where-filter): break
+      ``ChromaSemanticService._tier_authorized`` to return ``True``
+      unconditionally (or ``ChromaSemanticService.upsert`` to stop
+      stamping ``meta["user_id"]``) ->
+      ``test_cross_user_read_by_known_key_returns_404`` goes RED (Bob's
+      real ``GET`` of Alice's exact key succeeds and returns her
+      content, instead of 404).
+    """
+
+    def test_two_users_same_filename_full_http_round_trip(
+        self, real_semantic_client: TestClient
+    ) -> None:
+        _upload_session_doc(
+            real_semantic_client,
+            sub="alice",
+            filename="shared.md",
+            content=b"alice's content",
+        )
+        _upload_session_doc(
+            real_semantic_client,
+            sub="bob",
+            filename="shared.md",
+            content=b"bob's content",
+        )
+
+        resp_alice = _promote(
+            real_semantic_client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        resp_bob = _promote(
+            real_semantic_client,
+            sub="bob",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        assert resp_bob.status_code == 200
+
+        key_alice = resp_alice.json()["key"]
+        key_bob = resp_bob.json()["key"]
+        # Half 1 — WRITE uniqueness: two users, same filename, MUST
+        # produce two DIFFERENT durable keys.
+        assert key_alice != key_bob
+
+        collection_a, document_id_a = key_alice.split("/", 1)
+        collection_b, document_id_b = key_bob.split("/", 1)
+
+        # The load-bearing round-trip THIS class exists to prove: the
+        # REAL HTTP GET route must actually resolve the promoted doc —
+        # this is exactly the request shape that 404'd for everyone
+        # under the pass-1 (slash-separated) id.
+        get_alice = _get_semantic(
+            real_semantic_client,
+            sub="alice",
+            collection=collection_a,
+            document_id=document_id_a,
+        )
+        assert get_alice.status_code == 200
+        assert "alice's content" in get_alice.json()["content"]
+
+        get_bob = _get_semantic(
+            real_semantic_client,
+            sub="bob",
+            collection=collection_b,
+            document_id=document_id_b,
+        )
+        assert get_bob.status_code == 200
+        assert "bob's content" in get_bob.json()["content"]
+        assert get_alice.json()["content"] != get_bob.json()["content"]
+
+    def test_cross_user_read_by_known_key_returns_404(
+        self, real_semantic_client: TestClient
+    ) -> None:
+        """Half 2 — READ scoping: even if Bob somehow learns Alice's
+        EXACT key (e.g. by observing it in a log), requesting it as
+        himself must 404 — no existence disclosure, matching
+        ``read_semantic``'s own documented no-leak posture."""
+        _upload_session_doc(
+            real_semantic_client,
+            sub="alice",
+            filename="secret.md",
+            content=b"alice's secret",
+        )
+        resp_alice = _promote(
+            real_semantic_client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "secret.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        key_alice = resp_alice.json()["key"]
+        collection, document_id = key_alice.split("/", 1)
+
+        # Sanity: the OWNER can read it (positive control).
+        get_by_alice = _get_semantic(
+            real_semantic_client,
+            sub="alice",
+            collection=collection,
+            document_id=document_id,
+        )
+        assert get_by_alice.status_code == 200
+
+        # The security-critical assertion: Bob, given Alice's EXACT
+        # key, still cannot read it.
+        get_by_bob = _get_semantic(
+            real_semantic_client,
+            sub="bob",
+            collection=collection,
+            document_id=document_id,
+        )
+        assert get_by_bob.status_code == 404

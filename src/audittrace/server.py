@@ -817,6 +817,15 @@ _PER_LAYER_OR_SCOPES: dict[tuple[str, str], list[list[str]]] = {
         ["memory:procedural:write"],
         ["audittrace:admin"],
     ],
+    # /memory/promote (WU-4, Sovereign-Attach EPIC) — the durable target
+    # is a runtime-validated body field (episodic/semantic only, no
+    # procedural — see routes/memory_promote.py's frozenset), never
+    # session (the source layer is never a valid promote destination).
+    ("post", "/memory/promote"): [
+        ["memory:episodic:write"],
+        ["memory:semantic:write"],
+        ["audittrace:admin"],
+    ],
 }
 
 

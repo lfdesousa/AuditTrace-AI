@@ -2113,6 +2113,77 @@ paths:
       summary: Update Procedural
       tags:
       - memory
+  /memory/promote:
+    post:
+      description: 'Promote (COPY, never move) the caller''s own ephemeral ``session``
+
+        document into a durable memory layer — WU-4 of the Sovereign-Attach
+
+        EPIC''s explicit "keep this" action.
+
+
+        Body: ``{"filename": <session doc reference>, "target_layer":
+
+        <"episodic"|"semantic", default "episodic">, "collection": <optional,
+
+        semantic only>, "title": <optional>}``. ``target_layer`` outside the
+
+        durable set (``session``/``conversational``/anything unknown) is
+
+        rejected 422 — never silently coerced.
+
+
+        Authorization: the caller''s JWT must carry
+
+        ``memory:<target_layer>:write`` (or ``audittrace:admin``) — a token
+
+        holding ONLY ``memory:session:write`` (everything WU-1/2/3 grant by
+
+        default) gets 403 here. Ownership of the session doc is enforced by
+
+        ``SessionMemoryService.read_own`` (404 if not the caller''s own).
+
+
+        The implementation lives in ``audittrace.routes.memory_promote`` —
+
+        see that module''s docstring for the full step-by-step + why the
+
+        logic is split out of this (already >3000 LOC) file.'
+      operationId: promote_memory_memory_promote_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties: true
+              description: '{filename, target_layer?, collection?, title?}'
+              title: Payload
+              type: object
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Promote Memory Memory Promote Post
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:episodic:write
+      - audittrace-oauth2:
+        - memory:semantic:write
+      - audittrace-oauth2:
+        - audittrace:admin
+      summary: Promote Memory
+      tags:
+      - memory
   /memory/semantic:
     get:
       description: 'List semantic-layer items. Merges the manifest with ChromaDB
