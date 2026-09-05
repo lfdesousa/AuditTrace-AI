@@ -152,7 +152,7 @@ def _semantic_key(collection: str, document_id: str) -> str:
 
 def _namespaced_semantic_document_id(user_id: str, filename: str) -> str:
     """Per-user-namespaced ChromaDB ``document_id`` for a semantic
-    promote — ``<user_id>/<filename>``.
+    promote — ``<user_id>__<filename>`` (double underscore, NO ``/``).
 
     **Why this exists (independent-review finding, pass 1 — cross-user
     hijack).** The semantic layer's private-tier physical ChromaDB
@@ -166,11 +166,36 @@ def _namespaced_semantic_document_id(user_id: str, filename: str) -> str:
     into the id itself makes that collision structurally impossible —
     two different ``user_id`` values always produce two different
     ``document_id`` values, regardless of how many users pick the exact
-    same filename. Falsifiable: revert to the raw *filename* and
-    ``tests/test_memory_promote_route.py::
-    TestPromoteSemanticCrossUserIsolation`` goes RED.
+    same filename. No collision is possible across DIFFERENT users even
+    with an adversarially-chosen filename: ``user_id`` is a fixed-length
+    Keycloak ``sub`` (UUID), never caller-controlled, so two distinct
+    user ids always differ within their own fixed-length prefix
+    regardless of what follows.
+
+    **Why ``__`` and not ``/`` (independent-review finding, PASS 2 —
+    read-outage).** The pass-1 fix used ``f"{user_id}/{filename}"``,
+    which closed the write collision but broke every read: the existing
+    ``GET/PUT/DELETE /memory/semantic/{collection}/{document_id}``
+    route's ``{document_id}`` path parameter is Starlette's DEFAULT
+    converter (``[^/]+`` — a SINGLE URL segment, no embedded ``/``), so
+    a slash-containing id could never match that route AT ALL — a
+    total, silent read-outage for every promoted semantic doc, for
+    every caller, not just an attacker. This function returns a
+    single-segment id (any separator with no ``/`` works) specifically
+    so the EXISTING route keeps matching unchanged — no route/path-
+    converter change needed. Falsifiable: revert to the raw *filename*
+    (dropping the ``user_id`` prefix) and
+    ``TestPromoteSemanticCrossUserIsolation`` /
+    ``TestPromoteSemanticRealHttpRoundTrip`` go RED (write collision);
+    the READ-scoping half (a caller cannot fetch ANOTHER user's id even
+    if they know it) is enforced independently by
+    ``ChromaSemanticService.get_document``'s pre-existing
+    ``_tier_authorized`` ownership check on the metadata this same
+    ``upsert`` call unconditionally stamps — see
+    ``TestPromoteSemanticRealHttpRoundTrip::
+    test_cross_user_read_by_known_key_returns_404``.
     """
-    return f"{user_id}/{filename}"
+    return f"{user_id}__{filename}"
 
 
 def _durable_episodic_filename(session_filename: str) -> str:
@@ -306,12 +331,16 @@ async def _promote_to_semantic(
 ) -> tuple[str, str]:
     """Copy *stamped_content* into the caller's private-tier semantic
     collection (default :data:`_DEFAULT_PROMOTE_COLLECTION`), keyed by a
-    PER-USER-NAMESPACED ``document_id``. Returns ``(durable_key,
+    PER-USER-NAMESPACED, single-URL-segment ``document_id`` (see
+    :func:`_namespaced_semantic_document_id`). Returns ``(durable_key,
     collection)`` — the resolved collection name is returned explicitly
-    (not re-derived by splitting ``durable_key``) because the
-    per-user-namespaced ``document_id`` itself now contains a ``/``,
-    so a naive ``durable_key.rsplit("/", 1)`` would silently mis-parse
-    the collection name once the namespacing fix below landed.
+    (not re-derived by splitting ``durable_key``) as defensive clarity:
+    an EARLIER version of this fix (pass 1) namespaced the id with a
+    ``/`` separator, which both broke the existing read route (pass-2
+    finding) AND would have made a naive ``durable_key.rsplit("/", 1)``
+    silently mis-parse the collection name. The current ``__``-separated
+    id no longer contains a ``/`` at all, but the explicit tuple return
+    stays as the more robust, less fragile shape.
 
     **Cross-user collision fix (independent-review finding, pass 1).**
     Unlike episodic/procedural — whose PRIVATE-tier content is isolated

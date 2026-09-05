@@ -358,3 +358,138 @@ New-file coverage: `src/audittrace/routes/memory_promote.py` 100%
 This section satisfies ADR-049 Rule 1 (Verification) and Rule 3
 (Reconstruction — the neuter/restore transcripts above) for the fix
 commit; Rule 2 (Validation) remains deferred to WU-6 as in §5.
+
+## 7. Review pass 2 REJECTION + re-fix #2 (2026-09-05, same day)
+
+Pass-2 review REJECTED fix commit `fa76ead1`: the namespaced id
+`f"{user_id}/{filename}"` contains a `/`, and the read route
+`GET/PUT/DELETE /memory/semantic/{collection}/{document_id}` compiles
+`document_id` to Starlette's default converter (`[^/]+`, a single URL
+segment) — it can NEVER match a slash-containing id, so EVERY promoted
+semantic doc became permanently unreadable via the REST surface, for
+EVERY caller (not just an attacker). The cross-user collision genuinely
+was closed, but the fix traded a data-leak for a total-read-outage. The
+pass-1 regression test missed this because it called
+`get_semantic_service().get_document(...)` DIRECTLY, bypassing
+Starlette's own path-matching — the actual failure point.
+
+### 7a. Lessons recalled before the re-fix
+
+`lesson-wu4-pass2-real-http-route-20260905.md` (memory server, key
+`decisions/085b4a8d89f4d59f` et al.): (1) security/round-trip regression
+tests MUST exercise the REAL HTTP route, never the service method
+directly; (2) a security fix must not trade one bug for another —
+always re-run the happy path end to end after a security fix; (3) any
+id/key containing `/` needs a `:path` converter or must avoid the slash
+entirely — check every route consuming that id when its shape changes;
+(4) isolation has TWO halves — unique-per-user id (write) AND
+read-scoping (read) — fix and test BOTH.
+
+### 7b. The re-fix (operator-chosen approach: metadata scoping)
+
+1. `_namespaced_semantic_document_id` changed from `f"{user_id}/
+   {filename}"` to `f"{user_id}__{filename}"` (double underscore, NO
+   `/`) — a single URL segment the existing route's default `[^/]+`
+   converter matches, so no route change and no `:path` converter is
+   needed. Collision-safety argument: Keycloak `sub` values are
+   fixed-length UUIDs (36 chars); two distinct user ids always differ
+   within that fixed-length prefix regardless of what an attacker's own
+   (non-spoofable, token-derived) filename choice appends after it.
+2. **Metadata scoping was ALREADY the existing pattern** —
+   `ChromaSemanticService.upsert` already unconditionally stamps
+   `meta["user_id"] = user_context.user_id` (token-derived, direct
+   assignment, WU-B5 review fix 2026-08-04) on every write, and
+   `ChromaSemanticService.get_document` already applies
+   `_tier_authorized` (owner-or-corpus, admin-bypass) before returning
+   a fetched-by-id document — `read_semantic`
+   (`routes/memory.py`) already calls `service.get_document(user, ...)`
+   with the REAL caller. No service/route code change was needed for
+   this half; the promote path already passed the real `user` through
+   to `upsert` since the pass-1 fix. Verified by reading
+   `services/semantic.py::ChromaSemanticService.upsert`/
+   `get_document`/`_tier_authorized` and `routes/memory.py::
+   read_semantic` directly rather than assumed.
+3. Verified the semantic GET round-trip WORKS end-to-end after the
+   change (§7c) — the exact regression pass-2 caught.
+
+### 7c. New regression tests — REAL HTTP route (the crux)
+
+`TestPromoteSemanticRealHttpRoundTrip` (new,
+`tests/test_memory_promote_route.py`) — wired to a REAL
+`ChromaSemanticService` (backed by the in-repo fake ChromaDB client,
+`MockChromaDBFactory`) via a dedicated `real_semantic_client` fixture,
+because the standard `client` fixture's `MockSemanticService.
+get_document` is explicitly documented "mock: no scoping" and would
+make a cross-user-read-denial assertion pass VACUOUSLY.
+
+* `test_two_users_same_filename_full_http_round_trip` — two users
+  promote the SAME filename via the real `POST /memory/promote`;
+  asserts distinct keys; each reads back via the real
+  `GET /memory/semantic/{collection}/{document_id}` and gets ONLY their
+  OWN content (200, correct body) — the exact request shape that 404'd
+  for everyone under the pass-1 id.
+* `test_cross_user_read_by_known_key_returns_404` — Alice promotes;
+  Bob, given Alice's EXACT key, attempts to read it — 404 (no existence
+  disclosure), while Alice's own read of the same key succeeds (200,
+  positive control).
+
+```
+$ pytest tests/test_memory_promote_route.py::TestPromoteSemanticRealHttpRoundTrip -q --no-cov
+2 passed in 0.25s
+```
+
+### 7d. Two independent neuter proofs (both halves)
+
+**Neuter #1 — id-uniqueness** (write half). Reverted
+`_namespaced_semantic_document_id` to return the raw *filename*.
+
+```
+$ pytest tests/test_memory_promote_route.py::TestPromoteSemanticRealHttpRoundTrip::test_two_users_same_filename_full_http_round_trip -q --no-cov
+FAILED ... AssertionError: assert 'semantic/shared.md' != 'semantic/shared.md'
+1 failed in 0.20s
+
+# restored (diff <backup> <file> -> no output):
+$ pytest tests/test_memory_promote_route.py -q --no-cov
+34 passed in 2.72s
+```
+
+**Neuter #2 — read where-filter** (read half). Broke
+`ChromaSemanticService._tier_authorized` to return `True`
+unconditionally (dropping the ownership check).
+
+```
+$ pytest tests/test_memory_promote_route.py::TestPromoteSemanticRealHttpRoundTrip::test_cross_user_read_by_known_key_returns_404 -q --no-cov
+FAILED ... assert 200 == 404
+1 failed in 0.21s
+
+# restored (diff <backup> <file> -> no output):
+$ pytest tests/test_memory_promote_route.py -q --no-cov
+34 passed in 2.75s
+```
+
+### 7e. Full gate re-run after re-fix #2
+
+```
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.70%
+4219 passed, 2 warnings in 332.21s (0:05:32)
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (104 files checked, lines >= 90%, branches >= 90% on 93 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+
+$ make lint -> clean
+$ make helm-lint -> 1 chart(s) linted, 0 chart(s) failed
+$ mypy <11 touched/new files> -> Success: no issues found in 11 source files
+```
+
+`src/audittrace/routes/memory_promote.py` remains 100% covered.
+`src/audittrace/services/semantic.py` untouched in the final diff
+(only transiently edited during the neuter proof, restored
+byte-identical — confirmed via `diff`).
+
+This section satisfies ADR-049 Rule 1 (Verification) and Rule 3
+(Reconstruction) for re-fix #2. Rule 2 (Validation through a deployed
+image) remains deferred to WU-6, unchanged from §5.

@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -100,6 +100,21 @@ def _promote(
             "/memory/promote",
             json=payload,
             headers={"Authorization": "Bearer promote-token"},
+        )
+
+
+def _get_semantic(
+    client: TestClient, *, sub: str, collection: str, document_id: str
+) -> Any:
+    """Hit the REAL ``GET /memory/semantic/{collection}/{document_id}``
+    route (feedback_test_through_real_http_route — the pass-2 review
+    finding: a regression test that calls the service method directly
+    never exercises Starlette's own path-matching, which is exactly
+    where the read-outage bug lived)."""
+    with _Auth(sub, "memory:semantic:read"):
+        return client.get(
+            f"/memory/semantic/{collection}/{document_id}",
+            headers={"Authorization": "Bearer read-token"},
         )
 
 
@@ -377,7 +392,7 @@ class TestPromoteSemanticTarget:
         # Per-user-namespaced document_id (cross-user hijack fix, review
         # pass 1) — the key is <collection>/<user_id>/<filename>, never
         # the bare <collection>/<filename> two-segment shape.
-        assert body["key"] == "semantic/alice/sem-note.txt"
+        assert body["key"] == "semantic/alice__sem-note.txt"
 
     def test_promote_to_semantic_custom_collection(self, client: TestClient) -> None:
         _upload_session_doc(client, sub="alice", filename="sem-custom.txt")
@@ -392,7 +407,7 @@ class TestPromoteSemanticTarget:
             },
         )
         assert response.status_code == 200
-        assert response.json()["key"] == "decisions/alice/sem-custom.txt"
+        assert response.json()["key"] == "decisions/alice__sem-custom.txt"
 
     def test_semantic_document_readable_after_promote(self, client: TestClient) -> None:
         from audittrace.dependencies import get_semantic_service
@@ -411,7 +426,7 @@ class TestPromoteSemanticTarget:
             ctx = sentinel_user_context()
             ctx = replace(ctx, user_id="alice")
             return await get_semantic_service().get_document(
-                ctx, "semantic", "alice/sem-read.txt"
+                ctx, "semantic", "alice__sem-read.txt"
             )
 
         doc = asyncio.run(_read())
@@ -520,7 +535,7 @@ class TestPromoteManifestAuthorizationChoke:
         # Seeded key must match the NAMESPACED document_id promote will
         # actually compute (<user_id>/<filename>) for the collision to
         # trigger — see the cross-user hijack fix in memory_promote.py.
-        self._seed_corpus_semantic_row("semantic", "alice/collide-sem.txt")
+        self._seed_corpus_semantic_row("semantic", "alice__collide-sem.txt")
         _upload_session_doc(client, sub="alice", filename="collide-sem.txt")
         response = _promote(
             client,
@@ -725,7 +740,16 @@ class TestPromoteSemanticCrossUserIsolation:
     ``test_two_users_same_filename_never_collide`` goes RED — Bob's
     write silently overwrites Alice's row, and Alice's read-back either
     returns Bob's content or (if the mock enforced ownership) `None`
-    instead of her own content."""
+    instead of her own content.
+
+    **This class exercises the SERVICE method directly** (cheap,
+    write-collision-focused). It does NOT, by itself, prove the fix is
+    safe end-to-end through the real read route — that gap is exactly
+    what pass-2 review caught (a slash-containing id silently broke
+    ``GET /memory/semantic/{collection}/{document_id}`` for everyone).
+    See ``TestPromoteSemanticRealHttpRoundTrip`` below for the
+    route-level round-trip + cross-user-read-denial proof
+    (feedback_test_through_real_http_route)."""
 
     def test_two_users_same_filename_never_collide(self, client: TestClient) -> None:
         from audittrace.dependencies import get_semantic_service
@@ -759,8 +783,8 @@ class TestPromoteSemanticCrossUserIsolation:
         # The load-bearing assertion: two users, the SAME filename, MUST
         # produce two DIFFERENT durable keys — never a shared one.
         assert key_alice != key_bob
-        assert key_alice == "semantic/alice/shared.md"
-        assert key_bob == "semantic/bob/shared.md"
+        assert key_alice == "semantic/alice__shared.md"
+        assert key_bob == "semantic/bob__shared.md"
 
         document_id_alice = key_alice.split("/", 1)[1]
         document_id_bob = key_bob.split("/", 1)[1]
@@ -783,3 +807,199 @@ class TestPromoteSemanticCrossUserIsolation:
         assert doc_alice.page_content != doc_bob.page_content
         assert "bob's content" not in doc_alice.page_content
         assert "alice's content" not in doc_bob.page_content
+
+
+# ── real HTTP round-trip (pass-2 review finding: the crux) ───────────────────
+
+
+@pytest.fixture
+def real_semantic_client(monkeypatch: pytest.MonkeyPatch):
+    """A TestClient wired to the REAL ``ChromaSemanticService`` (backed
+    by the in-repo fake ChromaDB client, ``MockChromaDBFactory``)
+    instead of the standard ``client`` fixture's ``MockSemanticService``.
+
+    Why this fixture exists: ``MockSemanticService.get_document`` is
+    explicitly documented as "mock: no scoping" — it does NOT enforce
+    ``ChromaSemanticService._tier_authorized``'s ownership check. A test
+    asserting cross-user READ denial through the standard ``client``
+    fixture would therefore pass VACUOUSLY (the mock never denies
+    anything) regardless of whether the real production read-scoping
+    works. Wiring the real service (still no live ChromaDB — the fake
+    client is a pure in-process double) is the only way to prove the
+    actual `_tier_authorized` ownership check the real
+    ``GET /memory/semantic/{collection}/{document_id}`` route depends
+    on for its no-existence-disclosure guarantee.
+    """
+    from audittrace import dependencies
+    from audittrace.db.factory import MockChromaDBFactory
+    from audittrace.dependencies import create_test_container, reset_container
+    from audittrace.server import create_app
+    from audittrace.services.semantic import ChromaSemanticService
+
+    monkeypatch.setattr(
+        "audittrace.services.semantic.embed_via_nomic",
+        AsyncMock(side_effect=lambda texts, **_: [[0.1, 0.2, 0.3] for _ in texts]),
+    )
+
+    factory = MockChromaDBFactory()
+    real_client = asyncio.run(factory.get_client())
+    real_semantic = ChromaSemanticService(
+        client=real_client, default_collections=["semantic", "decisions"]
+    )
+
+    test_container = create_test_container()
+    test_container._instances["semantic"] = real_semantic
+    dependencies.container = test_container
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
+    reset_container()
+
+
+class TestPromoteSemanticRealHttpRoundTrip:
+    """Pass-2 independent-review REJECT: the pass-1 fix
+    (``f"{user_id}/{filename}"``) closed the write collision but broke
+    EVERY read — the ``GET/PUT/DELETE /memory/semantic/{collection}/
+    {document_id}`` route's ``{document_id}`` path parameter is
+    Starlette's default converter (``[^/]+``, a single URL segment), so
+    a slash-containing id could never match that route at all. The
+    pass-1 regression test never caught this because it called
+    ``get_semantic_service().get_document(...)`` DIRECTLY, bypassing
+    Starlette's own path-matching entirely
+    (feedback_test_through_real_http_route).
+
+    This class proves the CURRENT fix (``__``-separated,
+    single-URL-segment id) through the REAL HTTP surface, both halves
+    of the isolation invariant (feedback_per_user_namespace_shared_store_ids):
+
+    1. WRITE uniqueness — two users promoting the identical filename get
+       two DIFFERENT keys (the id-uniqueness half — same invariant as
+       ``TestPromoteSemanticCrossUserIsolation``, now proven via the
+       real ``GET`` round-trip instead of a direct service call).
+    2. READ scoping — a caller who somehow learns another user's exact
+       key still cannot read it (404) — the metadata
+       ``where``/ownership-filter half
+       (``ChromaSemanticService.get_document``'s pre-existing
+       ``_tier_authorized`` check on the ``user_id`` ``upsert``
+       unconditionally stamps into the document's metadata).
+
+    Falsifiable independently for EACH half:
+
+    * Neuter #1 (id-uniqueness): revert
+      ``_namespaced_semantic_document_id`` to the raw *filename* ->
+      ``test_two_users_same_filename_full_http_round_trip`` goes RED
+      (the SECOND promote's ``key`` collides with the first, or the
+      real ``GET`` for one user returns the OTHER user's content).
+    * Neuter #2 (read where-filter): break
+      ``ChromaSemanticService._tier_authorized`` to return ``True``
+      unconditionally (or ``ChromaSemanticService.upsert`` to stop
+      stamping ``meta["user_id"]``) ->
+      ``test_cross_user_read_by_known_key_returns_404`` goes RED (Bob's
+      real ``GET`` of Alice's exact key succeeds and returns her
+      content, instead of 404).
+    """
+
+    def test_two_users_same_filename_full_http_round_trip(
+        self, real_semantic_client: TestClient
+    ) -> None:
+        _upload_session_doc(
+            real_semantic_client,
+            sub="alice",
+            filename="shared.md",
+            content=b"alice's content",
+        )
+        _upload_session_doc(
+            real_semantic_client,
+            sub="bob",
+            filename="shared.md",
+            content=b"bob's content",
+        )
+
+        resp_alice = _promote(
+            real_semantic_client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        resp_bob = _promote(
+            real_semantic_client,
+            sub="bob",
+            scope="memory:semantic:write",
+            payload={"filename": "shared.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        assert resp_bob.status_code == 200
+
+        key_alice = resp_alice.json()["key"]
+        key_bob = resp_bob.json()["key"]
+        # Half 1 — WRITE uniqueness: two users, same filename, MUST
+        # produce two DIFFERENT durable keys.
+        assert key_alice != key_bob
+
+        collection_a, document_id_a = key_alice.split("/", 1)
+        collection_b, document_id_b = key_bob.split("/", 1)
+
+        # The load-bearing round-trip THIS class exists to prove: the
+        # REAL HTTP GET route must actually resolve the promoted doc —
+        # this is exactly the request shape that 404'd for everyone
+        # under the pass-1 (slash-separated) id.
+        get_alice = _get_semantic(
+            real_semantic_client,
+            sub="alice",
+            collection=collection_a,
+            document_id=document_id_a,
+        )
+        assert get_alice.status_code == 200
+        assert "alice's content" in get_alice.json()["content"]
+
+        get_bob = _get_semantic(
+            real_semantic_client,
+            sub="bob",
+            collection=collection_b,
+            document_id=document_id_b,
+        )
+        assert get_bob.status_code == 200
+        assert "bob's content" in get_bob.json()["content"]
+        assert get_alice.json()["content"] != get_bob.json()["content"]
+
+    def test_cross_user_read_by_known_key_returns_404(
+        self, real_semantic_client: TestClient
+    ) -> None:
+        """Half 2 — READ scoping: even if Bob somehow learns Alice's
+        EXACT key (e.g. by observing it in a log), requesting it as
+        himself must 404 — no existence disclosure, matching
+        ``read_semantic``'s own documented no-leak posture."""
+        _upload_session_doc(
+            real_semantic_client,
+            sub="alice",
+            filename="secret.md",
+            content=b"alice's secret",
+        )
+        resp_alice = _promote(
+            real_semantic_client,
+            sub="alice",
+            scope="memory:semantic:write",
+            payload={"filename": "secret.md", "target_layer": "semantic"},
+        )
+        assert resp_alice.status_code == 200
+        key_alice = resp_alice.json()["key"]
+        collection, document_id = key_alice.split("/", 1)
+
+        # Sanity: the OWNER can read it (positive control).
+        get_by_alice = _get_semantic(
+            real_semantic_client,
+            sub="alice",
+            collection=collection,
+            document_id=document_id,
+        )
+        assert get_by_alice.status_code == 200
+
+        # The security-critical assertion: Bob, given Alice's EXACT
+        # key, still cannot read it.
+        get_by_bob = _get_semantic(
+            real_semantic_client,
+            sub="bob",
+            collection=collection,
+            document_id=document_id,
+        )
+        assert get_by_bob.status_code == 404
