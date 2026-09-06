@@ -259,6 +259,14 @@ memoryServer:
     AUDITTRACE_SCAN_PUBLISHER_DRAIN_INTERVAL_MS: "100"
     AUDITTRACE_SCAN_JANITOR_INTERVAL_SECONDS: "30"
     AUDITTRACE_SCAN_JANITOR_GRACE_SECONDS: "60"
+    # ── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ──
+    # Bounded hard-DELETE sweep of the ephemeral ``session`` layer past
+    # its retention window. Same two-knob shape as the scan/index janitors
+    # above; unlike them this is NOT gated by scan_pipeline_enabled — the
+    # session layer has nothing to do with the scan/index outbox.
+    AUDITTRACE_SESSION_GC_ENABLED: "true"
+    AUDITTRACE_SESSION_GC_INTERVAL_SECONDS: "300"
+    AUDITTRACE_SESSION_RETENTION_HOURS: "24"
     OTEL_SERVICE_NAME: "audittrace-server"
     OTEL_SEMCONV_STABILITY_OPT_IN: "http/dup"
     # OTEL_RESOURCE_ATTRIBUTES is templated in
