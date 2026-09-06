@@ -15,11 +15,13 @@ from audittrace.config import get_settings
 from audittrace.db.rls import install_rls_listener
 from audittrace.dependencies import (
     get_postgres_factory,
+    get_session_memory_service,
     register_default_dependencies,
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
 from audittrace.routes.memory_upload import router as memory_upload_status_router
+from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
 
 logger = getLogger(__name__)
@@ -311,6 +313,60 @@ async def _bootstrap_scan_pipeline(app: FastAPI, settings: Any) -> Any:
     return stack
 
 
+def _maybe_start_session_gc_janitor(
+    settings: Any, service: Any
+) -> asyncio.Task[None] | None:
+    """Schedule ``SessionGCJanitor.run()`` iff ``settings.session_gc_enabled``
+    (WU-6 Part A) AND a real database is configured, else return ``None``.
+    Extracted from ``lifespan`` as a small, pure-ish function — unlike the
+    ``scan_pipeline_enabled`` / ``summarizer_enabled`` gates above (each
+    entangled with broker connections, dedicated Postgres factories, or
+    other lifespan-only setup that make them ``# pragma: no cover — live-
+    startup path``), this gate's ONLY inputs are ``settings`` + an
+    already-constructed ``SessionMemoryService`` — decoupled enough from
+    the rest of lifespan startup to be exercised directly by a fast async
+    unit test (see
+    ``tests/test_session_gc_janitor.py::TestMaybeStartSessionGcJanitor``).
+
+    The ``settings.database_url`` half of the gate mirrors
+    ``summarizer_enabled and summarizer_db_url`` above exactly (both
+    default-True flags that additionally require a REAL Postgres to be
+    configured before actually scheduling their task) — it is what keeps
+    this janitor dormant in the unit-test suite's ``AUDITTRACE_ENV=test``
+    default (``database_url`` is ``None`` there), which matters because
+    the test suite's ``InMemoryPostgresFactory`` (aiosqlite) engine is
+    NOT safe to touch from two different event loops at once: the
+    ``TestClient`` lifespan runs on its own anyio-portal thread/loop,
+    while async test bodies run on pytest-asyncio's loop, and aiosqlite's
+    background-thread bridge is loop-bound — confirmed live (a bare
+    ``AUDITTRACE_SESSION_GC_ENABLED=true`` default with no DB-configured
+    gate deadlocked ``tests/test_routes.py::test_list_interactions_
+    returns_seeded_rows`` the instant this janitor's first sweep ran on
+    the portal loop while the test seeded a row on its own loop).
+
+    This is the exact guard spec §2.5 guard 4 names: neuter the ``if``
+    check below (schedule the task unconditionally) and
+    ``test_does_not_start_when_disabled`` goes RED.
+    """
+    if not settings.session_gc_enabled or not settings.database_url:
+        logger.info(
+            "Session GC janitor NOT started (enabled=%s, db=%s)",
+            settings.session_gc_enabled,
+            "yes" if settings.database_url else "no",
+        )
+        return None
+    task = asyncio.create_task(
+        SessionGCJanitor(settings=settings, service=service).run(),
+        name="session-gc-janitor",
+    )
+    logger.info(
+        "Session GC janitor scheduled — interval=%ds retention=%dh",
+        settings.session_gc_interval_seconds,
+        settings.session_retention_hours,
+    )
+    return task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Application lifespan handler - startup and shutdown."""
@@ -464,6 +520,20 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     else:
         logger.info("Async-persist consumer NOT started (async_persist_enabled=False)")
 
+    # ─── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ─
+    # Per-pod background task, same simple flag-gated shape as the
+    # summariser/async-persist tasks above (not tied to
+    # ``scan_pipeline_enabled`` — the session layer has nothing to do with
+    # the scan/index outbox). The gate itself is extracted into
+    # ``_maybe_start_session_gc_janitor`` (below) so it is directly
+    # pytest-unit-testable without mocking the rest of lifespan's startup
+    # sequence (ChromaDB/MinIO/telemetry init) — the non-vacuity guard
+    # spec §2.5 guard 4 names: neuter that helper's ``if`` check to always
+    # schedule the task and ``test_does_not_start_when_disabled`` goes RED.
+    session_gc_task = _maybe_start_session_gc_janitor(
+        settings, get_session_memory_service()
+    )
+
     # ─── ADR-048 PR-B3 — scan-request producer + janitor ──────────────
     # Background tasks owning the Hohpe outbox. The route handler
     # in routes/memory.py only enqueues; these two drain the queue
@@ -496,6 +566,10 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         async_persist_task.cancel()
         with contextlib.suppress(TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(async_persist_task, timeout=5.0)
+    if session_gc_task is not None:  # pragma: no cover - paired with startup
+        session_gc_task.cancel()
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(session_gc_task, timeout=5.0)
     if scan_pipeline_stack is not None:  # pragma: no cover - paired with startup
         await scan_pipeline_stack.aclose()
     telemetry.shutdown()

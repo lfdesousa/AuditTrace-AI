@@ -17,10 +17,21 @@ test classes below (``TestMockSessionMemoryServiceListOwn`` /
 non-vacuity guards named in the spec: the ``user_id`` isolation filter,
 recency ordering, and the "+1 probe" window that makes ``has_more``
 correct.
+
+WU-6 Part A (2026-09-06-SPEC-wu6-session-gc-live-e2e-release.md) adds
+``gc_expired`` test classes below (``TestMockSessionMemoryServiceGcExpired``
+/ ``TestPostgresSessionMemoryServiceGcExpired``), covering non-vacuity
+guards 1 (the ``created_at_ms < older_than_ms`` cutoff) and 2 (the
+``limit`` batch bound) from spec §2.5. Guard 3 (promoted-durable
+independence) is a real-HTTP-route proof and lives in
+``tests/test_wu6_session_gc_promoted_independence.py``; guard 4 (the
+``AUDITTRACE_SESSION_GC_ENABLED`` flag) lives in
+``tests/test_session_gc_janitor.py``.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 
 import pytest
@@ -146,6 +157,70 @@ class TestMockSessionMemoryServiceListOwn:
         await service.write(user_context, "only.txt", "solo")
         window = await service.list_own(user_context, limit=10, offset=0)
         assert len(window) == 1
+
+
+class TestMockSessionMemoryServiceGcExpired:
+    """WU-6 Part A — the janitor's bounded hard-DELETE sweep
+    (2026-09-06-SPEC-wu6-session-gc-live-e2e-release.md §2.5)."""
+
+    async def test_gc_expired_empty_store_is_noop(self) -> None:
+        service = MockSessionMemoryService()
+        assert await service.gc_expired(older_than_ms=999_999_999_999, limit=100) == 0
+
+    async def test_gc_expired_deletes_only_rows_older_than_cutoff(
+        self, user_context
+    ) -> None:
+        """Non-vacuity guard 1 (spec §2.5): neuter the
+        ``created_at_ms < older_than_ms`` filter (e.g. delete
+        unconditionally) and the fresh row asserted to survive below goes
+        missing."""
+        service = MockSessionMemoryService()
+        await service.write(user_context, "old.txt", "expired")
+        await service.write(user_context, "fresh.txt", "not yet expired")
+        # Back-date only the first row well into the past; leave the
+        # second at its real write-time timestamp.
+        old_row, fresh_row = service._items
+        service._items = [
+            type(old_row)(
+                id=old_row.id,
+                user_id=old_row.user_id,
+                filename=old_row.filename,
+                content=old_row.content,
+                created_at_ms=1_000,
+            ),
+            fresh_row,
+        ]
+        cutoff = fresh_row.created_at_ms  # strictly between the two rows
+        deleted = await service.gc_expired(older_than_ms=cutoff, limit=100)
+
+        assert deleted == 1
+        remaining_filenames = {item.filename for item in service._items}
+        assert remaining_filenames == {"fresh.txt"}, (
+            "gc_expired deleted a row that was NOT past the cutoff — the "
+            "created_at_ms < older_than_ms filter is missing/neutered"
+        )
+
+    async def test_gc_expired_respects_batch_limit(self, user_context) -> None:
+        """Non-vacuity guard 2 (spec §2.5): neuter the ``limit`` bound
+        (e.g. delete unconditionally) and this assertion goes RED — more
+        than ``limit`` rows would vanish in one call."""
+        service = MockSessionMemoryService()
+        for i in range(5):
+            await service.write(user_context, f"note-{i}.txt", "expired")
+        ancient = 1_000
+        service._items = [
+            type(item)(
+                id=item.id,
+                user_id=item.user_id,
+                filename=item.filename,
+                content=item.content,
+                created_at_ms=ancient,
+            )
+            for item in service._items
+        ]
+        deleted = await service.gc_expired(older_than_ms=int(1e15), limit=2)
+        assert deleted == 2
+        assert len(service._items) == 3
 
 
 # ── PostgresSessionMemoryService ─────────────────────────────────────────────
@@ -340,3 +415,121 @@ class TestPostgresSessionMemoryServiceListOwn:
         await service.write(user_context, "only.txt", "solo")
         window = await service.list_own(user_context, limit=10, offset=0)
         assert len(window) == 1
+
+
+async def _seed_session_row(
+    pg_factory,
+    *,
+    row_id: str,
+    user_id: str,
+    created_at_ms: int,
+    filename: str = "f.txt",
+) -> None:
+    """Insert a ``session_memory_items`` row directly, with explicit
+    control over ``created_at_ms`` — mirrors ``test_index_janitor.py``'s
+    ``_seed`` helper (write-then-backdate isn't possible through the
+    service's own ``write`` since it always stamps "now")."""
+    from audittrace.db.models import SessionMemoryItem
+
+    async with pg_factory.get_session_factory()() as session:
+        session.add(
+            SessionMemoryItem(
+                id=row_id,
+                user_id=user_id,
+                filename=filename,
+                content="expired content",
+                size_bytes=1,
+                created_at_ms=created_at_ms,
+            )
+        )
+        await session.commit()
+
+
+class TestPostgresSessionMemoryServiceGcExpired:
+    """WU-6 Part A — the janitor's bounded hard-DELETE sweep, against the
+    real (aiosqlite) SQLAlchemy path (2026-09-06-SPEC-wu6-session-gc-live-
+    e2e-release.md §2.5)."""
+
+    async def test_gc_expired_empty_store_is_noop(self, service) -> None:
+        assert await service.gc_expired(older_than_ms=999_999_999_999, limit=100) == 0
+
+    async def test_gc_expired_deletes_only_rows_older_than_cutoff(
+        self, service, pg_factory, user_context
+    ) -> None:
+        """Non-vacuity guard 1 (spec §2.5): neuter the
+        ``created_at_ms < older_than_ms`` filter in
+        ``PostgresSessionMemoryService.gc_expired`` (e.g. delete
+        unconditionally) and the fresh row asserted to survive below goes
+        missing."""
+        now = int(time.time() * 1000)
+        await _seed_session_row(
+            pg_factory,
+            row_id="old-1",
+            user_id=user_context.user_id,
+            created_at_ms=now - 100_000,
+            filename="old.txt",
+        )
+        await _seed_session_row(
+            pg_factory,
+            row_id="fresh-1",
+            user_id=user_context.user_id,
+            created_at_ms=now + 100_000,
+            filename="fresh.txt",
+        )
+
+        deleted = await service.gc_expired(older_than_ms=now, limit=100)
+
+        assert deleted == 1
+        remaining = await service.list_own(user_context, limit=10)
+        assert [d.metadata["filename"] for d in remaining] == ["fresh.txt"], (
+            "gc_expired deleted a row that was NOT past the cutoff — the "
+            "created_at_ms < older_than_ms filter is missing/neutered"
+        )
+
+    async def test_gc_expired_respects_batch_limit(
+        self, service, pg_factory, user_context
+    ) -> None:
+        """Non-vacuity guard 2 (spec §2.5): neuter the ``.limit(limit)``
+        call in ``PostgresSessionMemoryService.gc_expired`` (e.g. an
+        unbounded delete) and this assertion goes RED — more than
+        ``limit`` rows would vanish in one call."""
+        now = int(time.time() * 1000)
+        for i in range(5):
+            await _seed_session_row(
+                pg_factory,
+                row_id=f"old-{i}",
+                user_id=user_context.user_id,
+                created_at_ms=now - 100_000 - i,
+                filename=f"old-{i}.txt",
+            )
+
+        deleted = await service.gc_expired(older_than_ms=now, limit=2)
+
+        assert deleted == 2
+        remaining = await service.list_own(user_context, limit=10)
+        assert len(remaining) == 3
+
+    async def test_gc_expired_cross_user_sweep_is_system_wide(
+        self, service, pg_factory
+    ) -> None:
+        """``gc_expired`` is the janitor's SYSTEM-WIDE sweep (spec §2.3
+        A-D1) — unlike every other method on this service it takes NO
+        ``UserContext`` and deletes across every user's rows, not just
+        one caller's own."""
+        now = int(time.time() * 1000)
+        await _seed_session_row(
+            pg_factory,
+            row_id="alice-old",
+            user_id="user-alice-gc",
+            created_at_ms=now - 100_000,
+        )
+        await _seed_session_row(
+            pg_factory,
+            row_id="bob-old",
+            user_id="user-bob-gc",
+            created_at_ms=now - 100_000,
+        )
+
+        deleted = await service.gc_expired(older_than_ms=now, limit=100)
+
+        assert deleted == 2

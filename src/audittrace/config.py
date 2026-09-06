@@ -517,6 +517,23 @@ class Settings(BaseSettings):
     # hop later in the pipeline).
     index_max_attempts: int = 5
 
+    # ─── WU-6 (Sovereign-Attach EPIC, Part A) — session-memory GC janitor ─
+    # ``SessionGCJanitor`` (services/session_gc_janitor.py) periodically
+    # hard-DELETEs ``session_memory_items`` rows older than the retention
+    # window — the ephemeral ``session`` layer (WU-1) has no corpus tier
+    # and no soft-delete concept (A-b decision), so GC is a bounded hard
+    # delete, not a tombstone. Flag-gated (default on) so an operator can
+    # disable the sweep without removing the knobs — same shape as
+    # ``summarizer_enabled``/``async_persist_enabled`` above.
+    session_gc_enabled: bool = True
+    # How often the janitor wakes up to sweep — same two-knob shape as
+    # ``scan_janitor_*``/``index_janitor_*`` above.
+    session_gc_interval_seconds: int = 300
+    # A-a decision: a chat session's ephemeral scratch survives the
+    # conversation plus the same-turn recall/promote window (WU-4/WU-5),
+    # then is collected. Operator-tunable.
+    session_retention_hours: int = 24
+
     # ─── ADR-063 Phase 2 Track B — MCP tool-broker gateway ─────────────────
     # Operator-configured downstream MCP servers AuditTrace brokers (proxies
     # + records) tool calls to. NO auto-discovery of untrusted servers — an
