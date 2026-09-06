@@ -5,10 +5,15 @@ Ephemeral, per-user, Postgres-backed memory layer: the enforced
 least-privilege wall the ratified *ephemeral-default* decision requires.
 Distinct from episodic/procedural (S3-backed, dual-tier per ADR-062
 Phase B) — session content has **no corpus tier** and **no promote path**
-in this WU (promotion to a durable layer is WU-4, out of scope here) and
-**no recall/GC surface** (WU-5/WU-6). This module is write-path +
-isolation ONLY, per the ratified spec
+in this WU (promotion to a durable layer is WU-4, out of scope here).
+This module is write-path + isolation ONLY, per the ratified spec
 (2026-09-03-SPEC-wu1-session-layer-narrow-ingest-scope.md).
+
+**WU-5 (same-turn recall, 2026-09-06-SPEC-wu5-same-turn-session-recall.md)
+adds :meth:`SessionMemoryService.list_own`** — a recency-ordered LIST of
+the caller's own recent uploads (D-a: not a vector search over session
+rows; the layer stays ephemeral scratch, never indexed into ChromaDB —
+GC is WU-6's job and untouched by this addition).
 
 Every method takes ``user_context: UserContext`` and filters explicitly
 by ``user_context.user_id`` at the SERVICE layer — the same "Phase 2"
@@ -34,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from audittrace.db.models import SessionMemoryItem
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.semantic import MAX_RECALL_WINDOW
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +83,9 @@ def _document_from(
 class SessionMemoryService(ABC):
     """Abstract ephemeral session-memory service.
 
-    Write-path + isolation only (WU-1 scope) — no search/list/delete/
-    promote here; those land in later WUs (WU-4 promote, WU-5 recall,
-    WU-6 GC).
+    Write-path + isolation (WU-1) + recency-ordered listing (WU-5,
+    :meth:`list_own`) — no search/delete/promote here; promote is WU-4
+    (``routes/memory_promote.py``), GC is WU-6.
     """
 
     @abstractmethod
@@ -108,6 +114,33 @@ class SessionMemoryService(ABC):
         guard the RLS acceptance test (spec deliverable 3 / acceptance
         (d)) exercises: writing as user A and reading as user B must
         yield ``None``.
+        """
+
+    @abstractmethod
+    async def list_own(
+        self, user_context: UserContext, *, limit: int, offset: int = 0
+    ) -> list[Document]:
+        """Return a WINDOW of the caller's OWN session uploads,
+        recency-ordered (``created_at_ms`` descending) — WU-5 same-turn
+        recall (``2026-09-06-SPEC-wu5-same-turn-session-recall.md``).
+
+        Returns the raw window — up to ``min(offset + limit + 1,
+        MAX_RECALL_WINDOW)`` rows, most-recent-first, filtered by
+        ``user_id == user_context.user_id`` (the isolation guard the
+        recall non-vacuity test neuters: drop that filter and another
+        user's uploads leak into the window). The **caller** (the
+        ``recall_attachments`` tool handler) slices ``[offset:offset +
+        limit]`` for the page and derives ``total``/``has_more`` from
+        ``len(window)`` — the same "+1 probe" division of labour
+        ``recall_recent_sessions`` already uses over
+        ``ConversationalService.load_sessions`` (see
+        ``tools/memory_handlers.py``), so a caller paging past a full
+        window still gets a correct ``has_more`` signal instead of the
+        false-negative a plain ``LIMIT limit`` would produce.
+
+        MUST NEVER include another user's row — the non-vacuity guard
+        this method exists to satisfy (spec §6.1): neuter the explicit
+        ``user_id`` filter and a cross-user isolation test goes RED.
         """
 
 
@@ -195,6 +228,46 @@ class PostgresSessionMemoryService(SessionMemoryService):
             created_at_ms=row_created_at_ms,
         )
 
+    @log_call(logger=logger)
+    async def list_own(
+        self, user_context: UserContext, *, limit: int, offset: int = 0
+    ) -> list[Document]:
+        window = min(offset + limit + 1, MAX_RECALL_WINDOW)
+        # #364 discipline: extract plain values INSIDE the `async with`
+        # block (see read_own above) — build the tuple list here, turn
+        # each into a Document only AFTER the session has closed.
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(SessionMemoryItem)
+                        # Explicit user_id filter (Phase-2 pattern) — the
+                        # isolation guard the recall non-vacuity test
+                        # neuters: drop this .filter() and another
+                        # user's uploads leak into the window.
+                        .filter(SessionMemoryItem.user_id == user_context.user_id)
+                        .order_by(SessionMemoryItem.created_at_ms.desc())
+                        .limit(window)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            plain_rows = [
+                (row.id, row.user_id, row.filename, row.content, row.created_at_ms)
+                for row in rows
+            ]
+        return [
+            _document_from(
+                row_id=row_id,
+                user_id=row_user_id,
+                filename=row_filename,
+                content=row_content,
+                created_at_ms=row_created_at_ms,
+            )
+            for row_id, row_user_id, row_filename, row_content, row_created_at_ms in plain_rows
+        ]
+
 
 @dataclass(frozen=True)
 class _MockRow:
@@ -260,6 +333,35 @@ class MockSessionMemoryService(SessionMemoryService):
             content=row.content,
             created_at_ms=row.created_at_ms,
         )
+
+    @log_call(logger=logger)
+    async def list_own(
+        self, user_context: UserContext, *, limit: int, offset: int = 0
+    ) -> list[Document]:
+        window = min(offset + limit + 1, MAX_RECALL_WINDOW)
+        # Reverse insertion order FIRST, then a stable sort by
+        # created_at_ms (descending) — `time.time()` millisecond
+        # resolution means two writes issued back-to-back (no I/O
+        # between them, unlike the real Postgres path) can tie on
+        # created_at_ms; reversing first makes the tie-break
+        # deterministically "most-recently-written-first" instead of
+        # depending on Python's stable-sort preserving append order.
+        mine = [
+            item
+            for item in reversed(self._items)
+            if item.user_id == user_context.user_id
+        ]
+        mine.sort(key=lambda item: item.created_at_ms, reverse=True)
+        return [
+            _document_from(
+                row_id=row.id,
+                user_id=row.user_id,
+                filename=row.filename,
+                content=row.content,
+                created_at_ms=row.created_at_ms,
+            )
+            for row in mine[:window]
+        ]
 
     def reset(self) -> None:
         """Clear all session-memory items."""

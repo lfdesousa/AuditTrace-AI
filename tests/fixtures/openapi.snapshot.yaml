@@ -932,6 +932,10 @@ components:
             memory:procedural:write: Create/update/delete procedural-layer documents
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
+            memory:session:read-own: Read your own recently attached files/notes from the per-user EPHEMERAL session memory
+              layer (WU-5, Sovereign-Attach EPIC, same-turn recall — recall_attachments). Read-own only, same family as memory:conversational:read-own
+              — grants no access to another user's session uploads, and no access to episodic, procedural, semantic, or corpus
+              layers.
             memory:session:write: Create documents in the per-user EPHEMERAL session memory layer ONLY (WU-1, Sovereign-Attach
               EPIC) — NOT durable memory. Grants no access to episodic, procedural, semantic, or corpus layers. Promoting
               session content to a durable layer requires a separate durable memory:<layer>:write scope via the explicit promote

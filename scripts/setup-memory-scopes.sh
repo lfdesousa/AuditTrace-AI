@@ -182,9 +182,20 @@ MEMORY_SESSION_WRITE_SCOPES=(
   "memory:session:write"
 )
 
+# WU-5 (Sovereign-Attach EPIC, 2026-09-06) — same-turn recall of the
+# caller's OWN ephemeral session uploads (recall_attachments). Bound as
+# DEFAULT to audittrace-librechat (see the in-cluster Job's ConfigMap for
+# the full rationale: this is a READ-OWN scope, same family as
+# memory:conversational:read-own/memory:semantic:read, both already
+# DEFAULT — unlike MEMORY_SESSION_WRITE_SCOPES above). Own array/bind
+# loop, separate from the write array.
+MEMORY_SESSION_READ_SCOPES=(
+  "memory:session:read-own"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -278,6 +289,14 @@ done
 echo "▶ binding ephemeral-session write scope to client audittrace-librechat (optional)..."
 for SCOPE in "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+done
+
+# ----- Bind the ephemeral-session READ-OWN scope (WU-5, 2026-09-06) -----
+# audittrace-librechat only, as DEFAULT (see MEMORY_SESSION_READ_SCOPES's
+# comment above).
+echo "▶ binding ephemeral-session read-own scope to client audittrace-librechat (default)..."
+for SCOPE in "${MEMORY_SESSION_READ_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "default"
 done
 
 # ----- User-identity protocol mappers -----

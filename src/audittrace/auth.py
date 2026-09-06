@@ -92,6 +92,14 @@ ALL_SCOPES: dict[str, str] = {
         "separate durable memory:<layer>:write scope via the explicit "
         "promote action (deferred; WU-4)."
     ),
+    "memory:session:read-own": (
+        "Read your own recently attached files/notes from the per-user "
+        "EPHEMERAL session memory layer (WU-5, Sovereign-Attach EPIC, "
+        "same-turn recall — recall_attachments). Read-own only, same "
+        "family as memory:conversational:read-own — grants no access to "
+        "another user's session uploads, and no access to episodic, "
+        "procedural, semantic, or corpus layers."
+    ),
     "memory:decisions:write": (
         "Create/update/delete documents in the ``decisions`` ChromaDB "
         "collection (ADR/decision records — vector-searchable via "

@@ -1361,6 +1361,214 @@ class TestSessionWriteScopeJobRenderedBinding:
         )
 
 
+class TestKeycloakSessionReadOwnScopeGovernance:
+    """WU-5 (Sovereign-Attach EPIC, 2026-09-06-SPEC-wu5-same-turn-session-
+    recall.md) — the same-turn recall provisioning half:
+    ``memory:session:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope (never optional — unlike WU-1's
+    ``memory:session:write``), via a dedicated ``MEMORY_SESSION_READ_SCOPES``
+    array + bind loop kept SEPARATE from ``MEMORY_SESSION_WRITE_SCOPES``.
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_SESSION_READ_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any write/corpus scope) appearing in either
+      provisioner's ``MEMORY_SESSION_READ_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_session_read_scopes``.
+    """
+
+    _EXPECTED_SESSION_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:session:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:session:write",
+            "memory:decisions:write",
+            "memory:skills:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _session_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES=( ... ) block not found — "
+                "WU-5 requires a dedicated array, separate from SCOPES "
+                "and MEMORY_SESSION_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _session_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_SESSION_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_SESSION_READ_SCOPES[@]}"; do ... done`) not '
+                "found — WU-5 requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._session_read_scopes_in(script_path.read_text())
+        cm_scopes = self._session_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_SESSION_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            f"divergent/incomplete MEMORY_SESSION_READ_SCOPES arrays. "
+            f"Script: {sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_SESSION_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._session_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_SESSION_READ_SCOPES bind loop does "
+                "not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_SESSION_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — WU-5 scopes the "
+                    "read-own grant to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_session_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._session_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_SESSION_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestSessionReadOwnScopeJobRenderedBinding:
+    """WU-5 Rule 1 render check — the ACTUAL rendered ``ensure-memory-
+    scopes`` Job ConfigMap (via ``helm template``, not the raw source
+    file — ``TestKeycloakSessionReadOwnScopeGovernance`` above already
+    covers the raw file for both provisioners) binds
+    ``memory:session:read-own`` to ``audittrace-librechat`` as DEFAULT
+    (never optional), and every write/admin/corpus scope is individually
+    absent from that bind loop — not merely "not admin".
+
+    Falsifiable: dropping/renaming the scope in the rendered
+    ``MEMORY_SESSION_READ_SCOPES`` bind loop, widening it to
+    ``audittrace-opencode``/``audittrace-webui``, flipping it from
+    ``default`` to ``optional``, or adding any forbidden scope to the
+    array fails one of the tests below.
+    """
+
+    _EXPECTED: frozenset[str] = (
+        TestKeycloakSessionReadOwnScopeGovernance._EXPECTED_SESSION_READ_SCOPES
+    )
+    _FORBIDDEN: frozenset[str] = TestKeycloakSessionReadOwnScopeGovernance._FORBIDDEN
+
+    @staticmethod
+    def _rendered_memory_scopes_script(docs: list[dict]) -> str:
+        return TestSessionWriteScopeJobRenderedBinding._rendered_memory_scopes_script(
+            docs
+        )
+
+    @staticmethod
+    def _all_scopes_in_session_array(text: str) -> set[str]:
+        m = re.search(r"MEMORY_SESSION_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_SESSION_READ_SCOPES=( ... ) block not found in the "
+                "rendered ConfigMap script."
+            )
+        return set(re.findall(r'"((?:memory|audittrace):[^"]+)"', m.group(1)))
+
+    def test_rendered_job_binds_exactly_the_session_read_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        assert scopes == self._EXPECTED, (
+            "WU-5: the RENDERED Job ConfigMap's MEMORY_SESSION_READ_SCOPES "
+            f"drifted from the exact expected set. Rendered: {sorted(scopes)}. "
+            f"Expected: {sorted(self._EXPECTED)}."
+        )
+
+    def test_rendered_bind_loop_targets_only_librechat_as_default(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        loop_body = TestKeycloakSessionReadOwnScopeGovernance._session_bind_loop_body(
+            script
+        )
+        assert "audittrace-librechat" in loop_body, (
+            "WU-5: the rendered Job's MEMORY_SESSION_READ_SCOPES bind loop "
+            "does not target audittrace-librechat."
+        )
+        for other in TestKeycloakSessionReadOwnScopeGovernance._OTHER_END_USER_CLIENTS:
+            assert other not in loop_body, (
+                f"WU-5: the rendered Job's bind loop references {other!r} — "
+                "scoped to audittrace-librechat only."
+            )
+        assert '"default"' in loop_body, (
+            "WU-5: the rendered Job must bind memory:session:read-own as a "
+            "DEFAULT client scope — otherwise the plain chat-token exchange "
+            "never carries it and recall_attachments is unreachable from "
+            "the real console."
+        )
+        assert '"optional"' not in loop_body, (
+            "WU-5: the rendered Job's session-read-own bind loop must never "
+            "bind as an OPTIONAL client scope."
+        )
+
+    def test_rendered_never_binds_a_forbidden_scope(self) -> None:
+        script = self._rendered_memory_scopes_script(_render())
+        scopes = self._all_scopes_in_session_array(script)
+        offenders = scopes & self._FORBIDDEN
+        assert not offenders, (
+            "WU-5: the rendered Job's session-read-own bind loop illegally "
+            f"carries {sorted(offenders)} — grants ONLY the read-own "
+            "scope, per the ratified spec's non-negotiable invariant."
+        )
+
+
 class TestCorpusScopeGovernance:
     """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
     scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
@@ -2253,6 +2461,20 @@ class TestLibrechatConsoleClient:
     companion ADR documenting this boundary change is queued per the
     spec's "Companion ADR" section.
 
+    **WU-5 (Sovereign-Attach EPIC, 2026-09-06-SPEC-wu5-same-turn-session-
+    recall.md)** added ``memory:session:read-own`` to ``defaultClientScopes``
+    — deliberately DEFAULT, unlike its write counterpart
+    ``memory:session:write``: it is a READ-OWN scope (same family as
+    ``memory:conversational:read-own``/``memory:semantic:read``, both
+    already default here), and the plain chat-token RFC 8693 exchange
+    (``bff/exchange.py::exchange_token``, ``requested_scope=None``) mints a
+    token carrying only the TARGET client's DEFAULT scopes — an
+    optional-only grant would never reach the ``/v1`` tool loop through
+    that path, making ``recall_attachments`` unreachable from the real
+    console. See ``TestKeycloakSessionReadOwnScopeGovernance`` for the
+    dedicated provisioner-side (``configmap``/``scripts/setup-memory-
+    scopes.sh``) falsifiable guards.
+
     Falsifiable, one assertion per guard:
 
     * renaming/removing the client from either realm file fails
@@ -2293,6 +2515,12 @@ class TestLibrechatConsoleClient:
             "memory:procedural:read",
             "memory:conversational:read-own",
             "memory:semantic:read",
+            # WU-5 (Sovereign-Attach EPIC, 2026-09-06) — same-turn recall of
+            # the caller's OWN ephemeral session uploads
+            # (recall_attachments). DEFAULT, same read-own family as
+            # memory:conversational:read-own above — see the class
+            # docstring for why this must be default, not optional.
+            "memory:session:read-own",
             # M3-WU-3b (D3) — standard OIDC scopes the LibreChat console
             # needs for its own identity claims (LibreChat's
             # OPENID_SCOPE="openid profile email offline_access").

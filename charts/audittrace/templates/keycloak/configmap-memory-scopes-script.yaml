@@ -131,6 +131,23 @@ data:
       "memory:session:write"
     )
 
+    # WU-5 (Sovereign-Attach EPIC, 2026-09-06) — same-turn recall of the
+    # caller's OWN ephemeral session uploads (recall_attachments). Bound as
+    # DEFAULT to audittrace-librechat — deliberately UNLIKE
+    # MEMORY_SESSION_WRITE_SCOPES above: this is a READ-OWN scope, the same
+    # family as memory:conversational:read-own/memory:semantic:read (both
+    # already DEFAULT on this client), not a write grant. The chat path's
+    # plain RFC 8693 exchange (bff/exchange.py::exchange_token,
+    # requested_scope=None) mints a token carrying only the TARGET client's
+    # DEFAULT scopes — an OPTIONAL-only grant would never reach the /v1 tool
+    # loop through that path, silently making recall_attachments
+    # unreachable from the real console. Own array/bind loop so a future
+    # edit to MEMORY_SESSION_WRITE_SCOPES's "optional" binding cannot
+    # silently also flip this one.
+    MEMORY_SESSION_READ_SCOPES=(
+      "memory:session:read-own"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -216,7 +233,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -337,6 +354,14 @@ data:
     echo "▶ binding ephemeral-session write scope to client audittrace-librechat (optional)..."
     for SCOPE in "${MEMORY_SESSION_WRITE_SCOPES[@]}"; do
       bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2e: bind the ephemeral-session READ-OWN scope (WU-5, 2026-09-06) ──
+    # audittrace-librechat only, as DEFAULT (see MEMORY_SESSION_READ_SCOPES's
+    # comment above for why this differs from Step 2d's OPTIONAL binding).
+    echo "▶ binding ephemeral-session read-own scope to client audittrace-librechat (default)..."
+    for SCOPE in "${MEMORY_SESSION_READ_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "default"
     done
 
     # ── Step 3: ensure user-identity protocol mappers ─────────────
