@@ -94,6 +94,7 @@ from audittrace.dependencies import (
     get_memory_manifest_service,
     get_procedural_service,
     get_semantic_service,
+    get_session_memory_service,
 )
 from audittrace.identity import UserContext
 from audittrace.services.recall_telemetry import emit_recall_telemetry
@@ -734,6 +735,119 @@ async def recall_recent_sessions(
     }
 
 
+# ───────────────────────────── recall_attachments ────────────────────────────
+# WU-5, Sovereign-Attach EPIC (2026-09-06-SPEC-wu5-same-turn-session-recall.md).
+# Same-turn recall of the caller's OWN ephemeral ``session``-layer uploads —
+# closes the gap where a chat file-attachment (WU-1..3) existed but was
+# invisible to every recall tool in the SAME turn ("summarise what I just
+# attached" returned nothing). D-a: a recency-ordered LIST, not a vector
+# search — session content is ephemeral scratch (WU-6 GCs it), so indexing it
+# into ChromaDB would add a GC/consistency burden for no benefit. Deliberately
+# named ``recall_attachments`` (D-c), distinct from ``recall_recent_sessions``
+# (conversational history), to avoid tool-selection confusion.
+
+
+@register_memory_tool(
+    name="recall_attachments",
+    description=(
+        "Recall the caller's own recently attached files/notes from the "
+        "current chat's ephemeral upload scratch space. Use when the user "
+        "refers to something they just attached or uploaded — 'summarise "
+        "what I just attached', 'what does that file say' — before it has "
+        "been promoted to durable memory. Scoped to the caller: only "
+        "returns uploads owned by this user."
+    ),
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "n": {
+                "type": "integer",
+                "description": "Max number of attachments to return. Default 5.",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 50,
+            },
+            "offset": {
+                "type": "integer",
+                "description": _PAGE_DOC,
+                "default": 0,
+                "minimum": 0,
+            },
+        },
+        "required": [],
+    },
+    required_scope="memory:session:read-own",
+)
+async def recall_attachments(
+    user_context: UserContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Wrap ``SessionMemoryService.list_own`` in the canonical shape.
+
+    Mirrors ``recall_recent_sessions`` exactly: recency-ordered
+    (``sort="recency"``/``order="desc"`` fixed, no request-side ``sort``/
+    ``order`` param — there is no relevance ranking for an ephemeral
+    per-user list), offset-only pagination, snippet capped at
+    ``_SNIPPET_LIMIT`` with the same deprecated ``truncated`` alias of
+    ``has_more`` in the response tail.
+
+    **WU-5 v2 AMENDMENT B** (2026-09-06-SPEC-wu5-same-turn-session-
+    recall-v2.md, pass-1 REJECT fix): the response-level ``truncated``
+    field is just the ``has_more`` pagination alias — it says nothing
+    about whether any ONE match's own content was cut down to fit the
+    snippet cap. Each match therefore carries its OWN boolean
+    ``content_truncated``, DISTINCT from ``truncated``/``has_more``:
+    ``True`` iff THIS item's raw content exceeded ``_SNIPPET_LIMIT`` and
+    was shortened, ``False`` otherwise — computed from the RAW
+    ``d.page_content`` length before the cap is applied, so the LLM can
+    tell a returned attachment is partial.
+
+    ``list_own`` returns the RAW window (see its docstring) — the "+1
+    probe" division of labour is applied HERE, identically to
+    ``recall_recent_sessions`` over ``load_sessions``: ``total =
+    len(window)``, the page is ``window[offset:offset+n]``, and
+    ``has_more = offset + n < total``.
+    """
+    n_raw = args.get("n", 5)
+    try:
+        n = max(1, min(int(n_raw), 50))
+    except (TypeError, ValueError):
+        return {"error": "recall_attachments: 'n' must be an integer"}
+
+    offset = _parse_offset(args, "recall_attachments")
+    if isinstance(offset, dict):
+        return offset
+
+    session_memory = get_session_memory_service()
+    window = await session_memory.list_own(user_context, limit=n, offset=offset)
+    total = len(window)
+    page_docs = window[offset : offset + n]
+    has_more = offset + n < total
+    emit_recall_telemetry("tool", "session", total, cache="miss")
+
+    matches: list[dict[str, Any]] = [
+        {
+            "title": d.metadata.get("filename", "attachment"),
+            "snippet": d.page_content[:_SNIPPET_LIMIT],
+            # AMENDMENT B — per-item signal, computed from the RAW
+            # (un-capped) content length, DISTINCT from the response-level
+            # truncated/has_more pagination alias below.
+            "content_truncated": len(d.page_content) > _SNIPPET_LIMIT,
+            "source": d.metadata.get("created_at_ms", ""),
+        }
+        for d in page_docs
+    ]
+    return {
+        "matches": matches,
+        "total": total,
+        "limit": n,
+        "offset": offset,
+        "sort": "recency",
+        "order": "desc",
+        "has_more": has_more,
+        "truncated": has_more,
+    }
+
+
 # ───────────────────────────── recall_semantic ──────────────────────────────
 
 
@@ -980,6 +1094,7 @@ __all__ = [
     "recall_decisions",
     "recall_skills",
     "recall_recent_sessions",
+    "recall_attachments",
     "recall_semantic",
     "read_decision",
     "read_skill",

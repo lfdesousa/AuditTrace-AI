@@ -96,6 +96,13 @@
       }
     },
     {
+      "name": "memory:session:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "memory:decisions:write",
       "protocol": "openid-connect",
       "attributes": {
@@ -684,7 +691,7 @@
       ]
     },
     {
-      "description": "Public client for the M3 LibreChat console (Auth Code + PKCE, ADR-042). WU-D2-1 + WU-1 added memory:*:write scopes (incl. memory:session:write), OPTIONAL only — console is no longer read/ask-only.",
+      "description": "Public client for the M3 LibreChat console (Auth Code + PKCE, ADR-042). WU-D2-1 + WU-1 added memory:*:write scopes (incl. memory:session:write), OPTIONAL only. WU-5 added memory:session:read-own as DEFAULT (read-own family) — see bff/exchange.py.",
       "clientId": "audittrace-librechat",
       "name": "AuditTrace LibreChat Console (browser auth-code flow + PKCE)",
       "enabled": true,
@@ -718,6 +725,7 @@
         "memory:procedural:read",
         "memory:conversational:read-own",
         "memory:semantic:read",
+        "memory:session:read-own",
         "profile",
         "email"
       ],

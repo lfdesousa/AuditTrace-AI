@@ -325,6 +325,7 @@ _TOOL_TO_COLLECTION: dict[str, str] = {
     "recall_skills": "skills",
     "recall_semantic": "semantic",
     "recall_recent_sessions": "sessions",
+    "recall_attachments": "session",
     "read_decision": "episodic",
     "read_skill": "procedural",
 }

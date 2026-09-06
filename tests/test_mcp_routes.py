@@ -58,6 +58,7 @@ _READ_TOOL_NAMES = {
     "recall_decisions",
     "recall_skills",
     "recall_recent_sessions",
+    "recall_attachments",
     "recall_semantic",
     "read_decision",
     "read_skill",
