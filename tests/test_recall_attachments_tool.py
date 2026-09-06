@@ -13,12 +13,12 @@ already takes, and the "REAL service, not mock" pattern
 ``tests/test_memory_promote_route.py::real_semantic_client`` uses for the
 analogous ChromaDB read-scoping proof.
 
-Non-vacuity guards covered (spec §6):
+Non-vacuity guards covered (spec v2 §6):
 
 * isolation — ``TestRecallAttachmentsIsolation`` (guard 1);
 * scope gate — ``TestRecallAttachmentsScopeGate`` (guard 2);
-* content cap / truncation flag — ``TestRecallAttachmentsContentCap``
-  (guard 3);
+* per-item ``content_truncated`` (AMENDMENT B, pass-1 REJECT fix) —
+  ``TestRecallAttachmentsContentCap`` (guard 3);
 * ``has_more`` +1 probe — ``TestRecallAttachmentsPagination`` (guard 4).
 """
 
@@ -116,7 +116,11 @@ class TestRecallAttachmentsCanonicalShape:
         # most-recent write first
         assert result["matches"][0]["title"] == "log.txt"
         assert result["matches"][0]["snippet"] == "second upload"
+        # AMENDMENT B — per-item content_truncated is present on every
+        # match (distinct from the response-level truncated/has_more).
+        assert result["matches"][0]["content_truncated"] is False
         assert result["matches"][1]["title"] == "notes.txt"
+        assert result["matches"][1]["content_truncated"] is False
 
     async def test_empty_when_no_uploads(self, _session_container, _fakeredis_cache):
         user = sentinel_user_context()
@@ -209,10 +213,22 @@ class TestRecallAttachmentsIsolation:
 
 
 class TestRecallAttachmentsContentCap:
-    """Non-vacuity guard 3 (spec §6.3): content is capped at
-    ``_SNIPPET_LIMIT`` and the response carries the ``truncated`` flag."""
+    """Non-vacuity guard 3 (spec v2 §6.3, AMENDMENT B — pass-1 REJECT fix):
+    content is capped at ``_SNIPPET_LIMIT`` and each match carries its OWN
+    ``content_truncated`` boolean, DISTINCT from the response-level
+    ``truncated``/``has_more`` pagination alias. The pass-1 build only
+    asserted ``"truncated" in result`` (key presence on the RESPONSE,
+    which is always present regardless of any single item's content
+    length) — that passed even though a 650-char upload capped at 400
+    reported no per-item signal at all. These tests assert the VALUE of
+    ``content_truncated`` on the MATCH itself.
 
-    async def test_long_upload_snippet_is_capped_and_flagged(
+    Falsifiable: neuter the truncation-detection (e.g. hardcode
+    ``content_truncated=False`` unconditionally, or compare the CAPPED
+    snippet length against the cap instead of the RAW content length)
+    and ``test_over_cap_upload_reports_content_truncated_true`` goes RED."""
+
+    async def test_over_cap_upload_reports_content_truncated_true(
         self, _session_container, _fakeredis_cache
     ):
         user = sentinel_user_context()
@@ -223,11 +239,20 @@ class TestRecallAttachmentsContentCap:
         tool = get_tool_by_name("recall_attachments")
         result, _ = await invoke_tool(user, tool, {}, session_id="sess-1")
 
-        assert len(result["matches"][0]["snippet"]) == _SNIPPET_LIMIT
-        assert result["matches"][0]["snippet"] == long_content[:_SNIPPET_LIMIT]
-        assert "truncated" in result
+        match = result["matches"][0]
+        assert len(match["snippet"]) == _SNIPPET_LIMIT
+        assert match["snippet"] == long_content[:_SNIPPET_LIMIT]
+        assert match["content_truncated"] is True, (
+            "an over-cap upload must report content_truncated=True — "
+            f"got {match.get('content_truncated')!r}"
+        )
+        # The response-level truncated/has_more alias is UNCHANGED and
+        # DISTINCT from the per-item signal — a single, non-paginated
+        # result has has_more=False regardless of content length.
+        assert result["truncated"] is False
+        assert result["has_more"] is False
 
-    async def test_short_upload_snippet_is_not_truncated(
+    async def test_under_cap_upload_reports_content_truncated_false(
         self, _session_container, _fakeredis_cache
     ):
         user = sentinel_user_context()
@@ -238,7 +263,30 @@ class TestRecallAttachmentsContentCap:
         tool = get_tool_by_name("recall_attachments")
         result, _ = await invoke_tool(user, tool, {}, session_id="sess-1")
 
-        assert result["matches"][0]["snippet"] == short_content
+        match = result["matches"][0]
+        assert match["snippet"] == short_content
+        assert match["content_truncated"] is False, (
+            "an under-cap upload must report content_truncated=False — "
+            f"got {match.get('content_truncated')!r}"
+        )
+
+    async def test_exact_cap_length_upload_is_not_truncated(
+        self, _session_container, _fakeredis_cache
+    ):
+        """Boundary case: content EXACTLY at the cap length is not
+        truncated — the comparison must be strictly-greater-than, not
+        greater-or-equal."""
+        user = sentinel_user_context()
+        session_memory = dependencies.get_session_memory_service()
+        exact_content = "y" * _SNIPPET_LIMIT
+        await session_memory.write(user, "exact.txt", exact_content)
+
+        tool = get_tool_by_name("recall_attachments")
+        result, _ = await invoke_tool(user, tool, {}, session_id="sess-1")
+
+        match = result["matches"][0]
+        assert match["snippet"] == exact_content
+        assert match["content_truncated"] is False
 
 
 # ───────────────────────────── Pagination ───────────────────────────────────

@@ -790,6 +790,17 @@ async def recall_attachments(
     ``_SNIPPET_LIMIT`` with the same deprecated ``truncated`` alias of
     ``has_more`` in the response tail.
 
+    **WU-5 v2 AMENDMENT B** (2026-09-06-SPEC-wu5-same-turn-session-
+    recall-v2.md, pass-1 REJECT fix): the response-level ``truncated``
+    field is just the ``has_more`` pagination alias — it says nothing
+    about whether any ONE match's own content was cut down to fit the
+    snippet cap. Each match therefore carries its OWN boolean
+    ``content_truncated``, DISTINCT from ``truncated``/``has_more``:
+    ``True`` iff THIS item's raw content exceeded ``_SNIPPET_LIMIT`` and
+    was shortened, ``False`` otherwise — computed from the RAW
+    ``d.page_content`` length before the cap is applied, so the LLM can
+    tell a returned attachment is partial.
+
     ``list_own`` returns the RAW window (see its docstring) — the "+1
     probe" division of labour is applied HERE, identically to
     ``recall_recent_sessions`` over ``load_sessions``: ``total =
@@ -817,6 +828,10 @@ async def recall_attachments(
         {
             "title": d.metadata.get("filename", "attachment"),
             "snippet": d.page_content[:_SNIPPET_LIMIT],
+            # AMENDMENT B — per-item signal, computed from the RAW
+            # (un-capped) content length, DISTINCT from the response-level
+            # truncated/has_more pagination alias below.
+            "content_truncated": len(d.page_content) > _SNIPPET_LIMIT,
             "source": d.metadata.get("created_at_ms", ""),
         }
         for d in page_docs

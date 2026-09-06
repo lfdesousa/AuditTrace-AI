@@ -1,13 +1,20 @@
-# Evidence — WU-5 same-turn session recall, local capture (2026-09-06)
+# Evidence — WU-5 same-turn session recall, local capture (2026-09-06, v2 fix pass)
 
-**Scope of this evidence file.** This is a **LOCAL-only** work unit per its
-ratified spec (`2026-09-06-SPEC-wu5-same-turn-session-recall.md`,
-sha256 `a000459d1b4558e287cbbafc0007a1f73d3311839ba314823cfb725b31b827f0`) —
-`Loop: ADR-059 builder -> independent reviewer; LOCAL gates only; operator
-merges via web` and explicit "Out of scope: ... live front-door E2E
-(ADR-049 Rule 2/3 live evidence for WU-1..5)" — deferred to WU-6. This file
-satisfies ADR-049 Rule 1 (Verification) in full and gives a
-reconstructible Rule-3-shaped capture (neuter-proof of every non-vacuity
+**Scope of this evidence file.** §1-4 below document the pass-1 build
+against the ratified v1 spec (`2026-09-06-SPEC-wu5-same-turn-session-
+recall.md`, sha256
+`a000459d1b4558e287cbbafc0007a1f73d3311839ba314823cfb725b31b827f0`). Pass-1
+was REJECTED by the independent reviewer for the reason captured in §6
+below; the operator amended + re-ratified the spec as
+`2026-09-06-SPEC-wu5-same-turn-session-recall-v2.md` (sha256
+`1f60d6cc765f98de441aa05f6935a3776d2cc54492aa652ce4d51476e59c44c6`), and
+§5-6 document the surgical fix pass against v2, on the SAME branch/commit
+lineage. This is a **LOCAL-only** work unit throughout — `Loop: ADR-059
+builder -> independent reviewer; LOCAL gates only; operator merges via
+web` and explicit "Out of scope: ... live front-door E2E (ADR-049 Rule
+2/3 live evidence for WU-1..5)" — deferred to WU-6. This file satisfies
+ADR-049 Rule 1 (Verification) in full and gives a reconstructible
+Rule-3-shaped capture (neuter-proof of every non-vacuity
 guard named in the spec, through the real production code paths — the
 real `PostgresSessionMemoryService`, the real `ChromaSemanticService`, the
 real `tools_visible_to`/`invoke_tool` dispatch, and the real
@@ -249,39 +256,126 @@ only the originally-staged file set, zero unstaged diff) before the final
   request/args field — `recall_attachments`'s `args` schema has no
   `user_id`/`filename`-scoping property at all, only `n`/`offset`.
 
-## 5. Spec deviation — scope grant type (documented, per builder discretion on ambiguity)
+## 5. Scope grant type — RATIFIED as v2 Amendment A (was a documented deviation in pass-1)
 
-The spec's D3 item (4) says "grant OPTIONAL on the `audittrace-librechat`
-client", following the WU-1 `memory:session:write` pattern literally. This
-build instead grants `memory:session:read-own` as **DEFAULT**, for three
-converging reasons, all traced in code comments
+The v1 spec's D3 item (4) literally said "grant OPTIONAL on the
+`audittrace-librechat` client", following the WU-1 `memory:session:write`
+pattern, while item (5) required the scope to reach the `/v1` tool loop
+"the same way `memory:semantic:read` does" (a DEFAULT binding) — an
+internal contradiction. Pass-1 resolved it by binding
+`memory:session:read-own` as **DEFAULT**, flagged explicitly as a spec
+deviation per the BUILDER contract's "note it" instruction. The
+independent reviewer's pass-1 REJECT was NOT on this point (isolation, the
+scope gate, `has_more`, and the promoted-durable guard were all confirmed
+non-vacuous) — the operator separately amended + re-ratified the spec as
+`2026-09-06-SPEC-wu5-same-turn-session-recall-v2.md`
+(sha256 `1f60d6cc765f98de441aa05f6935a3776d2cc54492aa652ce4d51476e59c44c6`),
+**Amendment A**, which now RATIFIES the DEFAULT binding outright — no
+longer a builder judgment call. Traced in code comments
 (`src/audittrace/auth.py`, both realm files, the ConfigMap script,
 `scripts/setup-memory-scopes.sh`) and in
-`tests/test_chart_drift_guards.py::TestKeycloakSessionReadOwnScopeGovernance`:
+`tests/test_chart_drift_guards.py::TestKeycloakSessionReadOwnScopeGovernance`
+— reasoning kept for the record:
 
-1. The spec's own item (5) requires the scope to "reach the `/v1` tool
-   loop the same way `memory:semantic:read` does" — and `memory:semantic:
-   read` is a DEFAULT scope on `audittrace-librechat`, not optional.
+1. `memory:semantic:read` (the item-5 comparator) is itself a DEFAULT
+   scope on `audittrace-librechat`, not optional.
 2. Traced mechanism: the console chat path's RFC 8693 exchange
    (`bff/exchange.py::exchange_token`, `requested_scope=None`) mints a
    token carrying ONLY the target client's DEFAULT scopes — an
    optional-only grant on `memory:session:read-own` would never reach the
-   minted chat token through the real console path, making
-   `recall_attachments` permanently unreachable in practice regardless of
-   how the realm declares it.
+   minted chat token through the real console path.
 3. Precedent: every OTHER read-own/read scope on `audittrace-librechat`
-   (`memory:episodic:read`, `memory:procedural:read`,
-   `memory:conversational:read-own`, `memory:semantic:read`) is DEFAULT;
-   only WRITE scopes are optional-only. `memory:session:read-own` follows
-   the established read-scope pattern, not the write-scope one.
+   is DEFAULT; only WRITE scopes are optional-only.
 
 Fail-closed reasoning: DEFAULT here does not widen risk — it is a
 READ-OWN scope (a caller can only ever see their OWN uploads, per the
 guard in §3.1), the same risk profile as `memory:conversational:
-read-own`, already DEFAULT. Flagged explicitly per the BUILDER contract's
-"note it" instruction on spec ambiguity.
+read-own`, already DEFAULT. **No code change was needed for this
+v2 fix pass** — confirmed by re-running
+`TestKeycloakSessionReadOwnScopeGovernance` +
+`TestSessionReadOwnScopeJobRenderedBinding` (both still green, still
+asserting DEFAULT not OPTIONAL) and grepping the realm files/ConfigMap/
+script for any stray "optional" binding of this scope (none found).
 
-## 6. What this file does NOT claim
+## 6. Fix pass (2026-09-06, v2) — Amendment B: per-item `content_truncated`
+
+The independent reviewer REJECTED the pass-1 build on a live-proven
+finding: the `truncated` field `recall_attachments` emitted was only the
+response-level `has_more` pagination alias (inherited verbatim from
+`recall_recent_sessions`'s canonical shape) — it said nothing about
+whether any ONE match's own content had been cut down to fit the snippet
+cap. A 650-char upload capped at 400 chars reported `truncated=False`
+(single result, no pagination overflow), even though that exact match's
+content WAS truncated. The operator amended the spec (Amendment B,
+v2 §4/§6.3) to require a NEW, DISTINCT per-item boolean
+`content_truncated` on each match.
+
+**Fix** (`src/audittrace/tools/memory_handlers.py::recall_attachments`):
+added `"content_truncated": len(d.page_content) > _SNIPPET_LIMIT` to each
+match dict, computed from the RAW (un-capped) content length — `True` iff
+that item's own content exceeded the cap, `False` otherwise. The
+response-level `truncated`/`has_more` pagination alias is byte-unchanged.
+
+**Non-vacuity (guard 3, re-proven):**
+
+```
+$ pytest tests/test_recall_attachments_tool.py::TestRecallAttachmentsContentCap -q --no-cov
+3 passed in ...
+
+# neutered: content_truncated hardcoded to False unconditionally
+$ pytest tests/test_recall_attachments_tool.py::TestRecallAttachmentsContentCap -q --no-cov
+FAILED test_over_cap_upload_reports_content_truncated_true
+1 failed, 2 passed in ...
+
+# restored:
+$ pytest tests/test_recall_attachments_tool.py -q --no-cov
+17 passed in ...
+```
+
+Test fix (`tests/test_recall_attachments_tool.py::
+TestRecallAttachmentsContentCap`): replaced the pass-1 test (which only
+asserted `"truncated" in result` — response-level key presence, which is
+always true regardless of content length, hence vacuous against this
+exact defect) with three VALUE-asserting tests: an over-cap upload
+(`_SNIPPET_LIMIT + 250` chars) must report `content_truncated=True`; an
+under-cap upload must report `content_truncated=False`; and a boundary
+case at EXACTLY `_SNIPPET_LIMIT` chars must report `False` (strictly-
+greater-than, not greater-or-equal — proves the comparison operator
+itself, not just its direction). Also added a `content_truncated` value
+assertion to `TestRecallAttachmentsCanonicalShape` for the two ordinary
+(short) uploads it already seeds.
+
+**Full gate re-run** (isolated worktree venv, `import audittrace`
+resolves into the worktree — confirmed):
+
+```
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.71%
+4259 passed, 2 warnings in 438.78s (0:07:18)
+per-file coverage gate: PASS (104 files checked, lines >= 90%, branches >= 90% on 93 file(s) with branches)
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+
+$ make lint
+Ran 2 rules on 158 files: 0 findings.
+All checks passed!
+290 files already formatted
+
+$ make helm-lint
+1 chart(s) linted, 0 chart(s) failed
+✅ vaultSecretFileGuard present in 3 workloads
+
+$ .venv/bin/mypy src/
+src/audittrace/services/trust_store.py:610: error: ... [call-arg]
+Found 1 error in 1 file (checked 109 source files)
+```
+
+The single `mypy` error is the SAME pre-existing, unrelated error
+identified in the pass-1 capture (§1) — `trust_store.py` is untouched by
+this WU on both passes; verified reproducing identically on `main`.
+
+## 7. What this file does NOT claim
 
 No image was built, no `helm upgrade` ran, no pod was hit through the
 public API with a scoped JWT against a deployed image — this WU is
