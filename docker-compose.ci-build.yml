@@ -1,0 +1,46 @@
+# CI-only build overlay — build the first-party memory-server image
+# locally instead of pulling the (possibly unpublished) release tag.
+#
+# Problem this fixes (2026-09-07 operator directive — "a release should
+# be deterministic; I won't merge a red PR"): `make release` bumps
+# `.env.ci` / the compose default AUDITTRACE_IMAGE_TAG to the NEW
+# version BEFORE `publish.yml` has run (that only fires on the tag
+# push). Base `docker-compose.yml` pins `memory-server` to
+# `image:`-only (no `build:` — B7 step 1 flipped it that way so the
+# default stack runs prod bytes), so `docker compose pull` in the
+# `compose-e2e` CI job tries to pull an image that does not exist yet
+# and RErrors until after publish. A release PR's `compose-e2e` gate
+# is therefore order-dependent on publish timing — non-deterministic.
+#
+# Fix — "build-not-pull on PRs" (ratified
+# 2026-09-07-SPEC-compose-e2e-build-not-pull-deterministic-release.md):
+# stack this overlay on top of the base compose file so `memory-server`
+# becomes "buildable" again:
+#   * `docker compose pull --ignore-buildable` SKIPS memory-server (no
+#     attempt to pull the unpublished tag)
+#   * `docker compose up -d --build --wait` builds it locally from the
+#     prod Dockerfile instead
+#
+# Deliberately MINIMAL: adds ONLY `build:` (+ an explicit local `image:`
+# tag so the built image is addressable) to the base `memory-server`
+# service. It does NOT touch entrypoint, command, healthcheck, volumes,
+# or env — contrast `docker-compose.dev.yml`, which ALSO swaps the
+# entrypoint to uvicorn `--reload` + bind-mounts /src (unusable for CI:
+# `--wait` needs the real prod healthcheck, not a dev reload loop).
+#
+# CI-only: never referenced by base `docker-compose.yml`,
+# `docker-compose.dev.yml`, `e2e.yml`, `publish.yml`, or the deploy/
+# helm path. Prod `docker compose up` (no overlay) keeps pulling the
+# published image — "same bytes as prod" holds for the prod path.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ci-build.yml <cmd>
+# or, for a whole shell/job:
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.ci-build.yml
+
+services:
+  memory-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: audittrace-memory-server:ci-build
