@@ -36,6 +36,18 @@ jobs:
   compose-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Build-not-pull (2026-09-07 operator directive; spec
+      # 2026-09-07-SPEC-compose-e2e-build-not-pull-deterministic-release.md).
+      # Stacks the CI-only overlay on every `docker compose` invocation
+      # in this job via the COMPOSE_FILE env var (colon-separated on
+      # Linux) so memory-server is built locally from source instead of
+      # pulled — decouples this gate from Docker Hub publish timing on
+      # a release PR that bumps .env.ci's AUDITTRACE_IMAGE_TAG ahead of
+      # `publish.yml` running on the tag push. See
+      # docker-compose.ci-build.yml for what the overlay does (and does
+      # NOT do).
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci-build.yml
 
     steps:
       - uses: actions/checkout@v6
@@ -73,14 +85,19 @@ jobs:
         # often enough to break CI roughly weekly. Pull explicitly
         # with up to 3 attempts BEFORE `up --wait`, so a registry
         # flake is treated as a retry, not a job failure. mock-llm
-        # is a local build (no pull) so this skips it.
+        # is a local build (no pull) so this skips it. As of the
+        # build-not-pull overlay (COMPOSE_FILE, job env above),
+        # memory-server is ALSO buildable now — `--ignore-buildable`
+        # skips it too, so a release PR's not-yet-published
+        # AUDITTRACE_IMAGE_TAG is never pulled here.
         run: |
           # Exponential backoff (15s,30s,60s,120s,240s) over 5 attempts so a
           # Docker Hub registry/auth blip (auth.docker.io token timeouts) is
           # absorbed as a retry, not a job failure. A 2026-05-29 outage
           # outlasted the old 3×15s (~45s) window — a DIFFERENT image timed
-          # out each attempt; the images themselves were fine. mock-llm is a
-          # local build (no pull) so this skips it.
+          # out each attempt; the images themselves were fine. mock-llm (and,
+          # since the build-not-pull overlay, memory-server too) is a local
+          # build (no pull) so this skips both.
           delay=15
           for attempt in 1 2 3 4 5; do
             if docker compose pull --quiet --ignore-buildable; then
@@ -98,13 +115,18 @@ jobs:
 
       - name: Bring up compose stack with `mock-llm` profile
         # .env.ci sets COMPOSE_PROFILES=mock-llm so the mock-llm
-        # service joins the up command. --build builds the mock-llm
-        # image from images/llm-stub (the pull step --ignore-buildable
-        # skips it). --wait blocks until all services with healthchecks
-        # report healthy. --wait-timeout 300s covers keycloak's realm
-        # import (~20s) + AMQP topology convergence + memory-server
-        # lifespan (the stub itself starts in <2s — deps baked at
-        # build time, no pip-at-boot).
+        # service joins the up command. --build builds both the
+        # mock-llm image from images/llm-stub AND (via the
+        # docker-compose.ci-build.yml overlay stacked through
+        # COMPOSE_FILE, job env above) the memory-server image from
+        # the prod Dockerfile — the pull step --ignore-buildable
+        # skipped both. --wait blocks until all services with
+        # healthchecks report healthy, gating on memory-server's REAL
+        # prod healthcheck (the overlay does not touch it). --wait-
+        # timeout 300s covers keycloak's realm import (~20s) + AMQP
+        # topology convergence + memory-server build+lifespan (the
+        # llm stub itself starts in <2s — deps baked at build time,
+        # no pip-at-boot).
         run: docker compose up -d --build --wait --wait-timeout 300
 
       - name: Show container status
