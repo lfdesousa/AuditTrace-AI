@@ -869,17 +869,18 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.25.1"
-      # M3-WU-D2-5C — the published INDEX digest for
-      # docker.io/lfds/audittrace-librechat-bff:1.25.1, confirmed live on
-      # Docker Hub 2026-09-02 via `docker-content-digest` on a manifest
-      # HEAD/GET (never fabricated). Mirrors the console.librechat.image
+      tag: "1.26.0"
+      # WU-6 Part C (2026-09-10) — the published INDEX digest for
+      # docker.io/lfds/audittrace-librechat-bff:1.26.0, confirmed live on
+      # Docker Hub 2026-09-10 via a manifest GET on hub.docker.com
+      # (never fabricated; publish.yml built it on the v1.26.0 tag push,
+      # 2026-09-07T20:14Z). Mirrors the console.librechat.image
       # digest-pin pattern below. When Part B's release pipeline publishes
       # a new version this reconciles to whatever digest THAT publish
       # produces — never hand-edited without re-verifying against the
       # registry. When set, the rendered image ref becomes
       # `<repository>:<tag>@<digest>` (deployment-bff.yaml).
-      digest: "sha256:286fe5b699a9b7248e72990a063d353ce6692f7a37e823177e324f5a42bab488"
+      digest: "sha256:e15af5a03581d521492b01ad1d7a2ac521b55dc9aa2773bcfa3344b6db2e54b7"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -907,28 +908,29 @@ console:
   # M3-WU-D2-4 (2026-08-31) supersedes the D1 "stock image, no source edit"
   # posture: the Souvenirs Day-2 code layer (adapter D2-2, panel + agent-
   # write→sovereign D2-3, context-reads→sovereign D2-3c) is built, merged,
-  # and certified in `lfds/LibreChat main @ 0f08e22`, and the fork image is
-  # pushed to Docker Hub. This is our fork, not upstream — the sovereign
-  # memory adapter (`api/server/services/AuditTraceMemory/config.js`) lives
-  # inside it, reading the three env vars rendered below. Frozen at
-  # `0f08e22`; any further fork code change is a new tag + digest, never an
-  # in-place mutation of this pin. Incorporated into the chart via
-  # M3-WU-D2-5C (2026-09-02) — the digest was re-verified against Docker
-  # Hub at that time (unchanged from the D2-4 branch's original pin).
+  # and certified in `lfds/LibreChat main @ c879b74` (WU-3 composer repoint
+  # folded in), and the fork image is pushed to Docker Hub. This is our fork,
+  # not upstream — the sovereign memory adapter
+  # (`api/server/services/AuditTraceMemory/config.js`) lives inside it,
+  # reading the three env vars rendered below. Frozen at `c879b74`; any
+  # further fork code change is a new tag + digest, never an in-place
+  # mutation of this pin. Re-pinned from `0f08e22` via WU-6 Part C
+  # (2026-09-10) — the digest was verified against Docker Hub at that time.
   librechat:
     image:
       repository: docker.io/lfds/audittrace-librechat
-      tag: "0f08e22"
-      # M3-WU-D2-4 (D2) — pinned so the deploy is reproducible with no live
-      # `docker pull ... && docker inspect` compute step. This is the
+      tag: "c879b74"
+      # WU-6 Part C (2026-09-10) — pinned so the deploy is reproducible with
+      # no live `docker pull ... && docker inspect` compute step. This is the
       # pushed INDEX digest for
-      # docker.io/lfds/audittrace-librechat:0f08e22 (confirmed live on
-      # Docker Hub 2026-08-31, re-confirmed 2026-09-02 via
-      # `docker-content-digest` on a manifest GET). A future bump moves it,
-      # like any pinned digest (operator verifies via `docker inspect`,
-      # never fabricated). When set, the rendered image ref becomes
-      # `<repository>:<tag>@<digest>`.
-      digest: "sha256:2d9590a567bd256d7be4fa16bac238f18427ac7f795666bddd472e42c8ff1474"
+      # docker.io/lfds/audittrace-librechat:c879b74 (built + pushed
+      # 2026-09-10T07:53Z, confirmed live via a manifest GET on
+      # hub.docker.com). Bumped from 0f08e22 to close the deferred WU-3
+      # deliverable-4 (fork now carries WU-3 composer→/console/files repoint,
+      # merged fork PR #4). A future bump moves it, like any pinned digest
+      # (operator verifies against the registry, never fabricated). When set,
+      # the rendered image ref becomes `<repository>:<tag>@<digest>`.
+      digest: "sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
     # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
     # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
     # one-brain path ONLY when it is exactly "sovereign" — any other value
@@ -1054,19 +1056,15 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.25.1"
-    # RULE-2/3 DEFERRED (2026-09-02, M3-WU-D2-5F build round): the
-    # `audittrace-tests` repository has never been published — the
-    # publish.yml job that builds it ships in THIS same commit and only
-    # fires on the NEXT tag push, so no real index digest exists yet to
-    # verify against Docker Hub. This all-zero value is a clearly-marked
-    # PLACEHOLDER (never a fabricated "verified" digest) that keeps the
-    # `repository:tag@sha256:...` render SHAPE consistent with the
-    # sibling console images below — replace it with the real published
-    # index digest (verify via `docker-content-digest` on a manifest
-    # GET/HEAD, same discipline as console.bff.image.digest /
-    # console.librechat.image.digest) once the next release publishes.
-    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    tag: "1.26.0"
+    # RULE-2/3 RESOLVED (WU-6 Part C, 2026-09-10): the placeholder is now a
+    # real published index digest. The `audittrace-tests` publish.yml job
+    # (added in the D2-5F round) first fired on the v1.26.0 tag push and
+    # published docker.io/lfds/audittrace-tests:1.26.0 on 2026-09-07T20:15Z;
+    # this digest was confirmed via a manifest GET on hub.docker.com
+    # (never fabricated), same discipline as console.bff.image.digest /
+    # console.librechat.image.digest. Tag+digest move together on every bump.
+    digest: "sha256:84771ab04ec9aedbc828a2b8c73a3ad2369cbcf58f0c99890244bd8c48d796d0"
     pullPolicy: IfNotPresent
   resources:
     requests:
