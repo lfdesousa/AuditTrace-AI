@@ -43,9 +43,10 @@ timeout) and that E's (coredns/frontDoorNodeName, no hostAliases) and H's
 (wait-for-oidc-discovery initContainer) chart state coexist unchanged
 alongside this WU's image-pin + D2-4 changes — ``TestD2FourAndEAndHCoexist``.
 
-Both real digests (BFF ``sha256:286fe5b6...``, fork
-``sha256:2d9590a5...``) were verified against Docker Hub's
-``docker-content-digest`` header at build time (read-only manifest GET,
+Both real digests (BFF ``sha256:e15af5a0...``, fork
+``sha256:edd23f45...``) were re-pinned to the v1.26.0 release / fork commit
+``c879b74`` at WU-6 Part C (2026-09-10) and verified against Docker Hub's
+``docker-content-digest`` header via a manifest GET (read-only,
 no push) — see the build-record for the captured transcript. This module
 does not re-verify against the live registry (no network dependency in
 the test suite); it guards that the chart renders the pinned values
@@ -171,13 +172,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.25.1"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.26.0"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:286fe5b699a9b7248e72990a063d353ce6692f7a37e823177e324f5a42bab488"
+            "sha256:e15af5a03581d521492b01ad1d7a2ac521b55dc9aa2773bcfa3344b6db2e54b7"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -192,14 +193,16 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"LibreChat image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":0f08e22"), f"unexpected LibreChat tag: {repo_tag!r}"
+        assert repo_tag.endswith(":c879b74"), f"unexpected LibreChat tag: {repo_tag!r}"
 
     def test_librechat_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["librechat"]["image"]["digest"]
         assert pinned == (
-            "sha256:2d9590a567bd256d7be4fa16bac238f18427ac7f795666bddd472e42c8ff1474"
-        ), f"LibreChat digest in values.yaml drifted from the D2-4 pin: {pinned!r}"
+            "sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
+        ), (
+            f"LibreChat digest in values.yaml drifted from the WU-6 Part C pin: {pinned!r}"
+        )
         resources = _render(_CONSOLE_ENABLED)
         assert _librechat_image(resources).endswith(f"@{pinned}")
 
@@ -244,7 +247,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.25.1"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.26.0"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -419,8 +422,8 @@ class TestD2FourAndEAndHCoexist:
             gate["image"]
             == main["image"]
             == (
-                "docker.io/lfds/audittrace-librechat:0f08e22"
-                "@sha256:2d9590a567bd256d7be4fa16bac238f18427ac7f795666bddd472e42c8ff1474"
+                "docker.io/lfds/audittrace-librechat:c879b74"
+                "@sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
             )
         )
 
