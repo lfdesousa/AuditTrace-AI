@@ -43,6 +43,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from scripts.deploy import mesh, registry
 
 logger = logging.getLogger("audittrace.deploy.runner")
@@ -65,6 +67,14 @@ _COMPONENT_SELECTOR = f"app.kubernetes.io/component={MEMORY_SERVER_COMPONENT}"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT_SCRIPT = REPO_ROOT / "scripts" / "deploy-preflight.sh"
 CHART_DIR = REPO_ROOT / "charts" / "audittrace"
+CHART_VALUES_FILE = CHART_DIR / "values.yaml"
+
+# First-party console images this runner deterministically pins on every
+# apply (spec 2026-09-10). Third-party subchart images (postgres/redis/
+# vault/rabbitmq) are explicitly OUT of scope — see the spec's "Out of
+# scope" section; llm-stub is `enabled: false` and the tests image is a
+# Job, not a Deployment, so neither belongs here either.
+_CONSOLE_IMAGE_COMPONENTS = ("librechat", "bff")
 
 # The runner never marks a deploy healthy. This string is stamped verbatim into
 # the report so a reader (and the Verify Agent) sees the hand-off unambiguously.
@@ -235,8 +245,101 @@ def apply_image_tag(cfg: DeployConfig, image_ref: registry.ImageRef) -> str:
     return cfg.image_tag
 
 
-def _helm_apply_cmd(cfg: DeployConfig, image_ref: registry.ImageRef) -> list[str]:
-    """The exact ``helm upgrade --install`` argv for P2 (surge-safe via chart)."""
+def _read_chart_values(path: Path = CHART_VALUES_FILE) -> dict[str, Any]:
+    """Parse the committed chart ``values.yaml`` — the SSOT the runner reads
+    the first-party console image pins from (spec 2026-09-10).
+
+    Read fresh off disk on every call: no live registry lookup, no
+    ``docker inspect`` — deterministic and reproducible offline, unlike
+    memory-server's tag->digest resolve (the chart's committed digests are
+    already operator-verified against the registry, per the spec's §3).
+    An unreadable or malformed file degrades to ``{}`` (no console ``--set``
+    derived by :func:`console_image_set_args`) rather than crashing the
+    apply — a missing/broken values.yaml is a chart-lint failure the
+    preflight gate already catches, not something this helper should raise
+    on.
+    """
+    try:
+        raw = path.read_text()
+    except OSError:
+        return {}
+    try:
+        parsed = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def console_image_set_args(chart_values: dict[str, Any]) -> list[str]:
+    """The explicit ``--set`` argv asserting the first-party console images.
+
+    Reads ``console.<component>.image.{repository,tag,digest}`` off the
+    given (already-parsed) chart values — normally the committed
+    ``values.yaml`` via :func:`_read_chart_values` — and renders them
+    exactly as the chart's own templates expect: separate ``repository`` /
+    ``tag`` / ``digest`` keys (``templates/console/deployment-librechat.yaml``
+    and ``deployment-bff.yaml`` both render
+    ``repository:tag{{ if digest }}@{{ digest }}{{ end }}``), UNLIKE the
+    memory-server pin which folds the digest into the tag because that
+    chart has no ``image.digest`` key at all.
+
+    Passed as explicit ``--set`` args on every ``helm upgrade``, so they
+    ALWAYS outrank any stale stored per-image override that
+    ``--reset-then-reuse-values`` would otherwise re-apply forever — the
+    #394-class defect this closes for console images (origin finding
+    ``finding-deploy-runner-stale-setoverride-shadows-chart-20260910.md``,
+    observed live at the v1.26.0 WU-6 Part C deploy).
+
+    Returns ``[]`` when ``console.enabled`` is falsy in ``chart_values`` —
+    the console isn't even templated in that case
+    (``{{- if .Values.console.enabled }}``), so emitting a ``--set`` for it
+    would be spurious. Also returns ``[]`` per-component when that
+    component's ``image`` block isn't a mapping (defensive: a malformed
+    values.yaml degrades to "no console pins asserted", never a crash), and
+    skips any of ``repository``/``tag``/``digest`` that is empty/absent so a
+    partially-specified block never emits a broken ``--set``.
+
+    Falsifiable: drop this function's output from :func:`_helm_apply_cmd`
+    (the pre-fix behaviour) and a stale stored console-image override once
+    again silently shadows the chart default — proven by the neuter-proof
+    test in ``tests/test_deploy_runner_console_image_pins.py``.
+    """
+    console = chart_values.get("console")
+    if not isinstance(console, dict) or not console.get("enabled"):
+        return []
+    args: list[str] = []
+    for component in _CONSOLE_IMAGE_COMPONENTS:
+        block = console.get(component)
+        image = block.get("image") if isinstance(block, dict) else None
+        if not isinstance(image, dict):
+            continue
+        repository = image.get("repository")
+        tag = image.get("tag")
+        digest = image.get("digest")
+        if repository:
+            args += ["--set", f"console.{component}.image.repository={repository}"]
+        if tag:
+            args += ["--set", f"console.{component}.image.tag={tag}"]
+        if digest:
+            args += ["--set", f"console.{component}.image.digest={digest}"]
+    return args
+
+
+def _helm_apply_cmd(
+    cfg: DeployConfig,
+    image_ref: registry.ImageRef,
+    chart_values: dict[str, Any] | None = None,
+) -> list[str]:
+    """The exact ``helm upgrade --install`` argv for P2 (surge-safe via chart).
+
+    ``chart_values`` defaults to a fresh read of the committed chart
+    ``values.yaml`` (:func:`_read_chart_values`); tests inject an explicit
+    dict so the console-image assertion (:func:`console_image_set_args`) is
+    exercised hermetically without depending on the chart's current
+    on-disk state.
+    """
+    if chart_values is None:
+        chart_values = _read_chart_values()
     return [
         "helm",
         "upgrade",
@@ -250,6 +353,7 @@ def _helm_apply_cmd(cfg: DeployConfig, image_ref: registry.ImageRef) -> list[str
         f"memoryServer.image.repository={image_ref.repository}",
         "--set",
         f"memoryServer.image.tag={apply_image_tag(cfg, image_ref)}",
+        *console_image_set_args(chart_values),
         "--wait",
         "--timeout",
         f"{cfg.timeout}s",

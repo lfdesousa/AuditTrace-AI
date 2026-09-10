@@ -630,6 +630,178 @@ def test_apply_image_tag_pins_by_digest_and_local_plain():
     assert runner.apply_image_tag(cfg, unpinned) == "1.13.0"
 
 
+# ── console image pins (spec 2026-09-10) ────────────────────────────────────
+# `console.librechat.image` / `console.bff.image` are chart-`values.yaml`-
+# driven; `--reset-then-reuse-values` re-applies any stale stored per-image
+# `--set` from a pre-D2-5C deploy over the chart default forever (#394-class
+# defect, observed live at the v1.26.0 WU-6 Part C deploy — origin finding
+# `finding-deploy-runner-stale-setoverride-shadows-chart-20260910.md`). The
+# runner now reads the committed values.yaml (SSOT) and asserts explicit
+# --set args for both images on every apply so they always outrank a stale
+# stored override. Real-`helm template` neuter proof (that a stale stored
+# override actually loses to these --set args) lives in
+# tests/test_deploy_runner_console_image_pins.py; these are the hermetic
+# unit-level guards over the pure derivation + disk read.
+
+
+def test_console_image_set_args_empty_when_console_disabled():
+    assert runner.console_image_set_args({"console": {"enabled": False}}) == []
+    assert runner.console_image_set_args({}) == []
+    assert runner.console_image_set_args({"console": "not-a-dict"}) == []
+
+
+def test_console_image_set_args_full_shape():
+    values = {
+        "console": {
+            "enabled": True,
+            "librechat": {
+                "image": {
+                    "repository": "docker.io/lfds/audittrace-librechat",
+                    "tag": "c879b74",
+                    "digest": "sha256:aaaa",
+                }
+            },
+            "bff": {
+                "image": {
+                    "repository": "docker.io/lfds/audittrace-librechat-bff",
+                    "tag": "1.26.0",
+                    "digest": "sha256:bbbb",
+                }
+            },
+        }
+    }
+    args = runner.console_image_set_args(values)
+    assert args == [
+        "--set",
+        "console.librechat.image.repository=docker.io/lfds/audittrace-librechat",
+        "--set",
+        "console.librechat.image.tag=c879b74",
+        "--set",
+        "console.librechat.image.digest=sha256:aaaa",
+        "--set",
+        "console.bff.image.repository=docker.io/lfds/audittrace-librechat-bff",
+        "--set",
+        "console.bff.image.tag=1.26.0",
+        "--set",
+        "console.bff.image.digest=sha256:bbbb",
+    ]
+
+
+def test_console_image_set_args_skips_missing_fields_and_bad_block():
+    values = {
+        "console": {
+            "enabled": True,
+            "librechat": {
+                "image": {"repository": "repo/lc", "tag": "", "digest": None}
+            },
+            "bff": {"image": "not-a-dict"},
+        }
+    }
+    args = runner.console_image_set_args(values)
+    # empty tag / None digest / non-dict bff image block all skipped —
+    # never a broken `--set console.librechat.image.tag=`.
+    assert args == ["--set", "console.librechat.image.repository=repo/lc"]
+
+
+def test_read_chart_values_real_committed_file_has_console_block():
+    values = runner._read_chart_values()
+    assert isinstance(values.get("console"), dict)
+    assert "librechat" in values["console"]
+    assert "bff" in values["console"]
+
+
+def test_read_chart_values_missing_file_returns_empty(tmp_path):
+    assert runner._read_chart_values(tmp_path / "does-not-exist.yaml") == {}
+
+
+def test_read_chart_values_malformed_yaml_returns_empty(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("console: [unterminated\n  - a: b\n:::")
+    assert runner._read_chart_values(bad) == {}
+
+
+def test_read_chart_values_non_mapping_returns_empty(tmp_path):
+    p = tmp_path / "list.yaml"
+    p.write_text("- a\n- b\n")
+    assert runner._read_chart_values(p) == {}
+
+
+_CONSOLE_VALUES_ENABLED = {
+    "console": {
+        "enabled": True,
+        "librechat": {
+            "image": {"repository": "r1", "tag": "t1", "digest": "sha256:d1"}
+        },
+        "bff": {"image": {"repository": "r2", "tag": "t2", "digest": "sha256:d2"}},
+    }
+}
+_CONSOLE_VALUES_DISABLED = {"console": {"enabled": False}}
+
+
+def test_helm_apply_cmd_includes_console_sets_when_enabled():
+    cfg = DeployConfig(target_version="v9.9.9")
+    ref = registry.ImageRef("repo", "9.9.9", "sha256:x", "hub")
+    cmd = runner._helm_apply_cmd(cfg, ref, chart_values=_CONSOLE_VALUES_ENABLED)
+    joined = " ".join(cmd)
+    assert "console.librechat.image.repository=r1" in joined
+    assert "console.librechat.image.tag=t1" in joined
+    assert "console.librechat.image.digest=sha256:d1" in joined
+    assert "console.bff.image.repository=r2" in joined
+    assert "console.bff.image.tag=t2" in joined
+    assert "console.bff.image.digest=sha256:d2" in joined
+
+
+def test_helm_apply_cmd_no_console_sets_when_disabled():
+    cfg = DeployConfig(target_version="v9.9.9")
+    ref = registry.ImageRef("repo", "9.9.9", "sha256:x", "hub")
+    cmd = runner._helm_apply_cmd(cfg, ref, chart_values=_CONSOLE_VALUES_DISABLED)
+    assert not any(str(a).startswith("console.") for a in cmd)
+
+
+def test_helm_apply_cmd_defaults_to_reading_real_chart_values_file(monkeypatch):
+    """No explicit `chart_values` -> reads from disk via `_read_chart_values`
+    — the production path (`phase_chart_apply` never passes `chart_values`)
+    actually wires through to the on-disk SSOT, not just the injectable test
+    seam. Deliberately does NOT assert on `console.enabled`'s current value
+    (mutable chart state) — only that the disk-read function is the one
+    consulted."""
+    calls: list[tuple] = []
+    real_read = runner._read_chart_values
+
+    def _spy(*a, **k):
+        calls.append((a, k))
+        return real_read(*a, **k)
+
+    monkeypatch.setattr(runner, "_read_chart_values", _spy)
+    cfg = DeployConfig(target_version="v9.9.9")
+    ref = registry.ImageRef("repo", "9.9.9", "sha256:x", "hub")
+    runner._helm_apply_cmd(cfg, ref)
+    assert calls, (
+        "_helm_apply_cmd must call _read_chart_values() when chart_values is None"
+    )
+
+
+def test_chart_apply_dry_run_includes_console_pins_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_ENABLED
+    )
+    r = DeployRunner(_cfg(tmp_path, dry_run=True))
+    r.image_ref = _hub_ref("sha256:abc")
+    r.phase_chart_apply()
+    assert "console.librechat.image.tag=t1" in r.records[0].command
+    assert "console.bff.image.digest=sha256:d2" in r.records[0].command
+
+
+def test_chart_apply_dry_run_no_console_pins_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_DISABLED
+    )
+    r = DeployRunner(_cfg(tmp_path, dry_run=True))
+    r.image_ref = _hub_ref("sha256:abc")
+    r.phase_chart_apply()
+    assert "console." not in r.records[0].command
+
+
 def test_chart_apply_flags_helm_failure(tmp_path, monkeypatch):
     disp = _Dispatcher(
         rules=[
