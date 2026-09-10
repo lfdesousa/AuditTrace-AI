@@ -374,10 +374,29 @@ def test_is_converged_blind_to_same_console_drift_without_overlay(
     the console pods, and wrongly reports converged. This is the exact
     v1.26.0 Part C.4 symptom (helm revision stayed at 265) reproduced
     without a cluster."""
+    memory_server_doc = {
+        "kind": "Deployment",
+        "metadata": {"name": "audittrace-memory-server"},
+        "spec": {
+            "template": {"spec": {"containers": [{"name": "memory-server", "env": []}]}}
+        },
+    }
     disp = _Dispatcher(
-        rules=_console_dispatch_rules(
-            librechat_digest="sha256:STALE-ON-CLUSTER", bff_digest=_REAL_BFF_DIGEST
-        )
+        rules=[
+            *_console_dispatch_rules(
+                librechat_digest="sha256:STALE-ON-CLUSTER", bff_digest=_REAL_BFF_DIGEST
+            ),
+            # config-drift check (spec 2026-09-10-SPEC-deploy-runner-
+            # convergence-config-drift): memory-server only, since base
+            # console.enabled=False skips the console workloads here too —
+            # matching intended + live specs so this stays the TRUE no-op
+            # control case the test name promises.
+            ("helm template", _proc(0, json.dumps(memory_server_doc))),
+            (
+                "get deployment audittrace-memory-server -n",
+                _proc(0, json.dumps(memory_server_doc)),
+            ),
+        ]
     )
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))  # no values_files -> base only

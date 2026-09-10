@@ -103,6 +103,80 @@ class _Dispatcher:
         return self.default
 
 
+def _deployment_doc(
+    name,
+    container,
+    *,
+    env=None,
+    args=None,
+    command=None,
+    resources=None,
+):
+    """A minimal Deployment manifest doc — the ``spec.template.spec.containers``
+    shape shared by BOTH a `helm template` render and a live `kubectl get
+    deployment -o json` read (spec 2026-09-10-SPEC-deploy-runner-convergence-
+    config-drift)."""
+    return {
+        "kind": "Deployment",
+        "metadata": {"name": name},
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": container,
+                            "env": env or [],
+                            "args": args or [],
+                            "command": command or [],
+                            "resources": resources or {},
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+
+def _render_manifest_yaml(*docs):
+    """A multi-doc YAML string — the `helm template` stdout shape. JSON is
+    valid YAML, so `json.dumps` per doc keeps this dependency-free (no extra
+    `yaml.dump` import in the test module)."""
+    return "\n---\n".join(json.dumps(d) for d in docs)
+
+
+def _helm_template_rule(*docs):
+    """A `_Dispatcher` rule matching the config-drift check's `helm template`
+    render call, returning the given docs as its multi-doc stdout."""
+    return ("helm template", _proc(0, _render_manifest_yaml(*docs)))
+
+
+def _live_deployment_rule(name, doc):
+    """A `_Dispatcher` rule matching the config-drift check's LIVE
+    `kubectl get deployment <name> ... -o json` read for one workload. The
+    needle includes the trailing `` -n`` so it can never collide with the
+    older tag-convergence path's `-o jsonpath=...` read of the SAME
+    deployment name (distinguished by the ``-o json`` vs ``-o jsonpath=``
+    tail, which the needle stops short of)."""
+    return (f"get deployment {name} -n", _proc(0, json.dumps(doc)))
+
+
+def _no_config_drift_rules(*name_container_pairs):
+    """Dispatch rules making the config-drift check report NO drift for each
+    given ``(deployment_name, container_name)`` pair — one shared `helm
+    template` render plus one matching LIVE read per pair. Longest
+    deployment name first, mirroring the existing
+    `component=librechat-bff`-before-`component=librechat` ordering rule
+    elsewhere in this module: `audittrace-librechat-bff` must never be
+    shadowed by the shorter `audittrace-librechat` needle."""
+    docs = [
+        _deployment_doc(name, container) for name, container in name_container_pairs
+    ]
+    rules = [_helm_template_rule(*docs)]
+    for name, container in sorted(name_container_pairs, key=lambda nc: -len(nc[0])):
+        rules.append(_live_deployment_rule(name, _deployment_doc(name, container)))
+    return rules
+
+
 # ── pure surge-assertion logic (the WS1 guarantee) ───────────────────────────
 
 
@@ -421,8 +495,9 @@ def _hub_ref(digest="sha256:x"):
 
 
 def test_chart_apply_noop_when_digest_converged(tmp_path, monkeypatch):
-    # digest match + helm release status "deployed" -> the unchanged control
-    # case from the #451 falsifiable acceptance list.
+    # digest match + helm release status "deployed" + no config drift -> the
+    # unchanged control case from the #451 falsifiable acceptance list
+    # (extended 2026-09-10 with the config-drift no-op control).
     disp = _Dispatcher(
         rules=[
             # live pod imageID carries the SAME digest -> converged
@@ -431,6 +506,7 @@ def test_chart_apply_noop_when_digest_converged(tmp_path, monkeypatch):
                 "helm status",
                 _proc(0, json.dumps({"version": 7, "info": {"status": "deployed"}})),
             ),
+            *_no_config_drift_rules(("audittrace-memory-server", "memory-server")),
         ]
     )
     monkeypatch.setattr(runner, "_run", disp)
@@ -463,16 +539,28 @@ def test_chart_apply_upgrades_when_digest_differs(tmp_path, monkeypatch):
 
 def test_chart_apply_local_unpinned_uses_tag_convergence(tmp_path, monkeypatch):
     intended = "localhost:5000/audittrace/memory-server:9.9.9"
-    disp = _Dispatcher(
-        rules=[
-            ("get deployment", _proc(0, intended)),  # tag-string convergence path
-            (
-                "helm status",
-                _proc(0, json.dumps({"version": 3, "info": {"status": "deployed"}})),
-            ),
-        ]
-    )
-    monkeypatch.setattr(runner, "_run", disp)
+    live_doc = _deployment_doc("audittrace-memory-server", "memory-server")
+
+    def fake_run(cmd, *, env=None):
+        # `_running_image()` (tag-string convergence, `-o jsonpath=...`) and
+        # the config-drift check's LIVE read (`-o json`) both target
+        # `kubectl get deployment audittrace-memory-server ...` — disambiguate
+        # by the actual last argv element rather than a substring needle,
+        # since "-o json" is itself a substring of "-o jsonpath=...".
+        if cmd[:3] == ["kubectl", "get", "deployment"]:
+            return (
+                _proc(0, json.dumps(live_doc))
+                if cmd[-1] == "json"
+                else _proc(0, intended)
+            )
+        joined = " ".join(cmd)
+        if "helm template" in joined:
+            return _proc(0, _render_manifest_yaml(live_doc))
+        if "helm status" in joined:
+            return _proc(0, json.dumps({"version": 3, "info": {"status": "deployed"}}))
+        return _proc(0, "")
+
+    monkeypatch.setattr(runner, "_run", fake_run)
     r = DeployRunner(_cfg(tmp_path, registry="local"))
     r.image_ref = registry.ImageRef(
         "localhost:5000/audittrace/memory-server", "9.9.9", None, "local"
@@ -671,7 +759,16 @@ def test_is_converged_true_when_all_first_party_images_match(tmp_path, monkeypat
     """All first-party images (memory-server + both console images) match
     their pins, helm `deployed` -> converged (the true no-op case is
     preserved, not just any mismatch making everything NOT-converged)."""
-    disp = _Dispatcher(rules=_console_dispatch_rules())
+    disp = _Dispatcher(
+        rules=[
+            *_console_dispatch_rules(),
+            *_no_config_drift_rules(
+                ("audittrace-memory-server", "memory-server"),
+                ("audittrace-librechat", "librechat"),
+                ("audittrace-librechat-bff", "bff"),
+            ),
+        ]
+    )
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
     r.image_ref = _hub_ref("sha256:x")
@@ -684,7 +781,16 @@ def test_chart_apply_noop_when_all_first_party_images_match(tmp_path, monkeypatc
     """End-to-end: with every first-party image matched, P2 still records the
     true no-op (`helm upgrade` never called) — the console check must not
     turn every deploy into a spurious upgrade."""
-    disp = _Dispatcher(rules=_console_dispatch_rules())
+    disp = _Dispatcher(
+        rules=[
+            *_console_dispatch_rules(),
+            *_no_config_drift_rules(
+                ("audittrace-memory-server", "memory-server"),
+                ("audittrace-librechat", "librechat"),
+                ("audittrace-librechat-bff", "bff"),
+            ),
+        ]
+    )
     monkeypatch.setattr(runner, "_run", disp)
     monkeypatch.setattr(
         runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_ENABLED
@@ -711,6 +817,7 @@ def test_is_converged_ignores_console_when_disabled(tmp_path, monkeypatch):
                 "helm status",
                 _proc(0, json.dumps({"version": 1, "info": {"status": "deployed"}})),
             ),
+            *_no_config_drift_rules(("audittrace-memory-server", "memory-server")),
         ]
     )
     monkeypatch.setattr(runner, "_run", disp)
@@ -753,6 +860,414 @@ def test_is_converged_defaults_to_reading_real_chart_values_file(tmp_path, monke
     assert calls, (
         "_is_converged must call _read_chart_values() when chart_values is None"
     )
+
+
+# ── config-drift convergence (spec 2026-09-10-SPEC-deploy-runner-convergence-
+# config-drift) ───────────────────────────────────────────────────────────
+# `_is_converged()` keyed on first-party IMAGE digests alone let a
+# config-only chart change (env vars, args/command, resource limits — no
+# image moves) silently no-op: observed live 2026-09-10, the WU-5
+# sources-trailer redeploy (`AUDITTRACE_RESPONSE_SOURCES: off->trailer`, all
+# images unchanged) no-op'd — rev stayed 266, the live env stayed `off`.
+# `_is_converged()` must ALSO compare the INTENDED (`helm template`-rendered)
+# container spec of each ENABLED first-party workload against its LIVE
+# `kubectl get deployment` container spec.
+
+
+def test_is_converged_false_when_config_env_differs(tmp_path, monkeypatch):
+    """Images all match + helm `deployed`, but the INTENDED (rendered) env
+    differs from the LIVE deployment's env -> NOT converged (so P2 runs
+    `helm upgrade`) — the exact WU-5 sources-trailer no-op this spec closes.
+
+    Falsifiable / neuter: drop the config-drift check from `_is_converged`
+    (revert to image-digest + helm-status-only convergence, the pre-fix
+    behaviour) and this test goes RED — `check.converged` flips to True,
+    silently reproducing the live no-op observed 2026-09-10.
+    """
+    intended_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        env=[{"name": "AUDITTRACE_RESPONSE_SOURCES", "value": "trailer"}],
+    )
+    live_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        env=[{"name": "AUDITTRACE_RESPONSE_SOURCES", "value": "off"}],
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 266, "info": {"status": "deployed"}})),
+            ),
+            _helm_template_rule(intended_doc),
+            _live_deployment_rule("audittrace-memory-server", live_doc),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is False
+    assert "config drift: memory-server" in check.basis
+    assert check.helm_status == "deployed"
+    # No reconcile-note flag: config drift explains the non-convergence on
+    # its own, distinct from the #451 "digest matches but status != deployed"
+    # case.
+    assert check.digest_matched is False
+
+
+def test_chart_apply_runs_upgrade_when_config_env_differs(tmp_path, monkeypatch):
+    """End-to-end through `phase_chart_apply`: a config-only env drift means
+    `helm upgrade` actually RUNS (not skipped as a no-op) — the fix for the
+    WU-5 sources-trailer no-op."""
+    intended_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        env=[{"name": "AUDITTRACE_RESPONSE_SOURCES", "value": "trailer"}],
+    )
+    live_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        env=[{"name": "AUDITTRACE_RESPONSE_SOURCES", "value": "off"}],
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 266, "info": {"status": "deployed"}})),
+            ),
+            _helm_template_rule(intended_doc),
+            _live_deployment_rule("audittrace-memory-server", live_doc),
+            ("helm upgrade", _proc(0, "deployed")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_DISABLED
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is False
+    assert r.records[0].status != "noop"
+    assert any("helm upgrade" in " ".join(c) for c in disp.calls)
+
+
+def test_is_converged_false_when_config_resources_differ(tmp_path, monkeypatch):
+    """A `resources` diff (not just env) also trips NOT-converged — the
+    config-drift check compares env AND args/command AND resources."""
+    intended_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        resources={"requests": {"cpu": "500m"}, "limits": {"cpu": "1"}},
+    )
+    live_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        resources={"requests": {"cpu": "250m"}, "limits": {"cpu": "1"}},
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 1, "info": {"status": "deployed"}})),
+            ),
+            _helm_template_rule(intended_doc),
+            _live_deployment_rule("audittrace-memory-server", live_doc),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is False
+    assert "config drift: memory-server" in check.basis
+
+
+def test_is_converged_false_when_config_args_differ(tmp_path, monkeypatch):
+    """An `args` diff also trips NOT-converged."""
+    intended_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        command=["/bin/sh", "-c"],
+        args=["exec new-thing"],
+    )
+    live_doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        command=["/bin/sh", "-c"],
+        args=["exec old-thing"],
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 1, "info": {"status": "deployed"}})),
+            ),
+            _helm_template_rule(intended_doc),
+            _live_deployment_rule("audittrace-memory-server", live_doc),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is False
+    assert "config drift: memory-server" in check.basis
+
+
+def test_is_converged_true_when_config_also_matches(tmp_path, monkeypatch):
+    """Nothing changed — images, console, AND config all match — is still a
+    TRUE no-op: the config-drift check must not turn every unchanged deploy
+    into a spurious upgrade."""
+    doc = _deployment_doc(
+        "audittrace-memory-server",
+        "memory-server",
+        env=[{"name": "AUDITTRACE_RESPONSE_SOURCES", "value": "trailer"}],
+    )
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 266, "info": {"status": "deployed"}})),
+            ),
+            _helm_template_rule(doc),
+            _live_deployment_rule("audittrace-memory-server", doc),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is True
+    assert "config drift" not in check.basis
+
+
+def test_config_drift_check_skipped_when_helm_status_not_deployed(
+    tmp_path, monkeypatch
+):
+    """The config-drift check runs LAST: when the Helm release status is
+    itself not `deployed`, `_is_converged` returns NOT-converged from the
+    existing #451 status check WITHOUT ever calling `helm template` or
+    reading the live Deployment spec — preserves the #451 efficiency note
+    ("no helm status call once mismatch found") symmetrically for config."""
+    disp = _Dispatcher(
+        rules=[
+            ("component=memory-server", _proc(0, "repo@sha256:x")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 1, "info": {"status": "failed"}})),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is False
+    assert not any("helm template" in " ".join(c) for c in disp.calls)
+    assert not any("get deployment" in " ".join(c) for c in disp.calls)
+
+
+def test_config_drifted_workloads_fail_safe_on_unreadable_render(tmp_path, monkeypatch):
+    """An unreadable `helm template` (non-zero exit) counts as drift, never a
+    silent match — fail-safe, mirrors `_mismatched_console_images`'s own
+    unknown-state handling."""
+    disp = _Dispatcher(
+        rules=[
+            ("helm template", _proc(returncode=1, stderr="boom")),
+            _live_deployment_rule(
+                "audittrace-memory-server",
+                _deployment_doc("audittrace-memory-server", "memory-server"),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_DISABLED)
+    assert drifted == ["memory-server"]
+
+
+def test_config_drifted_workloads_fail_safe_on_unreadable_live(tmp_path, monkeypatch):
+    """An unreadable LIVE `kubectl get deployment` (non-zero exit) also
+    counts as drift, never a silent match."""
+    doc = _deployment_doc("audittrace-memory-server", "memory-server")
+    disp = _Dispatcher(
+        rules=[
+            _helm_template_rule(doc),
+            ("get deployment audittrace-memory-server -n", _proc(returncode=1)),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_DISABLED)
+    assert drifted == ["memory-server"]
+
+
+def test_config_drifted_workloads_multi_workload_partial_drift(tmp_path, monkeypatch):
+    """Only the drifted component is named — a match on one first-party
+    workload does not mask a drift on another."""
+    disp = _Dispatcher(
+        rules=[
+            *_no_config_drift_rules(
+                ("audittrace-memory-server", "memory-server"),
+                ("audittrace-librechat-bff", "bff"),
+            ),
+            _live_deployment_rule(
+                "audittrace-librechat",
+                _deployment_doc(
+                    "audittrace-librechat",
+                    "librechat",
+                    env=[{"name": "DRIFTED", "value": "yes"}],
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_ENABLED)
+    assert drifted == ["librechat"]
+
+
+def test_render_chart_manifest_none_on_helm_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(returncode=1))
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._render_chart_manifest() is None
+
+
+def test_render_chart_manifest_none_on_unparsable_yaml(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_run", lambda *a, **k: _proc(0, ": not: yaml: at: all:")
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._render_chart_manifest() is None
+
+
+def test_render_chart_manifest_skips_non_mapping_docs(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_run", lambda *a, **k: _proc(0, "- a\n- b\n---\nkind: Deployment\n")
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    docs = r._render_chart_manifest()
+    assert docs == [{"kind": "Deployment"}]
+
+
+def test_live_deployment_container_spec_none_on_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(returncode=1))
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._live_deployment_container_spec("audittrace-memory-server", "x") is None
+
+
+def test_live_deployment_container_spec_none_on_unparsable_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0, "not json"))
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._live_deployment_container_spec("audittrace-memory-server", "x") is None
+
+
+def test_first_party_config_workloads_memory_server_only_when_console_disabled(
+    tmp_path,
+):
+    r = DeployRunner(_cfg(tmp_path))
+    workloads = r._first_party_config_workloads(_CONSOLE_VALUES_DISABLED)
+    assert workloads == [("memory-server", "audittrace-memory-server", "memory-server")]
+
+
+def test_first_party_config_workloads_includes_console_when_enabled(tmp_path):
+    r = DeployRunner(_cfg(tmp_path))
+    workloads = r._first_party_config_workloads(_CONSOLE_VALUES_ENABLED)
+    assert workloads == [
+        ("memory-server", "audittrace-memory-server", "memory-server"),
+        ("librechat", "audittrace-librechat", "librechat"),
+        ("bff", "audittrace-librechat-bff", "bff"),
+    ]
+
+
+# ── config-drift normalisation (pure helpers) ────────────────────────────────
+
+
+def test_normalize_env_handles_value_and_valuefrom_and_skips_malformed():
+    env = [
+        {"name": "A", "value": "1"},
+        {"name": "B", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}},
+        {"value": "no-name"},  # skipped: no name
+        "not-a-dict",  # skipped: malformed
+    ]
+    assert runner._normalize_env(env) == {
+        "A": "1",
+        "B": {"valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}},
+    }
+    assert runner._normalize_env(None) == {}
+
+
+def test_normalize_resources_defaults_and_malformed():
+    assert runner._normalize_resources({"requests": {"cpu": "1"}}) == {
+        "requests": {"cpu": "1"},
+        "limits": {},
+    }
+    assert runner._normalize_resources("not-a-dict") == {"requests": {}, "limits": {}}
+    assert runner._normalize_resources({"requests": "bad", "limits": None}) == {
+        "requests": {},
+        "limits": {},
+    }
+
+
+def test_normalize_container_spec_shape():
+    container = {
+        "name": "memory-server",
+        "env": [{"name": "A", "value": "1"}],
+        "args": ["x"],
+        "command": ["/bin/sh"],
+        "resources": {"requests": {"cpu": "1"}},
+        "image": "repo:tag",  # deliberately ignored — digest convergence covers it
+    }
+    assert runner._normalize_container_spec(container) == {
+        "env": {"A": "1"},
+        "args": ["x"],
+        "command": ["/bin/sh"],
+        "resources": {"requests": {"cpu": "1"}, "limits": {}},
+    }
+
+
+def test_find_container_returns_none_when_absent_or_malformed():
+    assert runner._find_container(None, "x") is None
+    assert runner._find_container([{"name": "y"}], "x") is None
+    assert runner._find_container(["not-a-dict"], "x") is None
+    assert runner._find_container([{"name": "x", "env": []}], "x") == {
+        "name": "x",
+        "env": [],
+    }
+
+
+def test_container_spec_from_deployment_doc_missing_pieces():
+    assert runner._container_spec_from_deployment_doc(None, "x") is None
+    assert (
+        runner._container_spec_from_deployment_doc({"spec": "not-a-dict"}, "x") is None
+    )
+    assert (
+        runner._container_spec_from_deployment_doc(
+            {"spec": {"template": {"spec": {"containers": [{"name": "other"}]}}}},
+            "x",
+        )
+        is None
+    )
+
+
+def test_find_deployment_doc_matches_by_kind_and_name():
+    docs = [
+        {"kind": "Service", "metadata": {"name": "audittrace-memory-server"}},
+        {"kind": "Deployment", "metadata": {"name": "other"}},
+        {"kind": "Deployment", "metadata": {"name": "audittrace-memory-server"}},
+    ]
+    found = runner._find_deployment_doc(docs, "audittrace-memory-server")
+    assert found is docs[2]
+    assert runner._find_deployment_doc(None, "x") is None
+    assert runner._find_deployment_doc([], "x") is None
 
 
 def test_console_image_digests_empty_when_disabled_or_malformed():
