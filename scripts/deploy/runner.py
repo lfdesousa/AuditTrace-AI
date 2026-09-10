@@ -76,6 +76,18 @@ CHART_VALUES_FILE = CHART_DIR / "values.yaml"
 # Job, not a Deployment, so neither belongs here either.
 _CONSOLE_IMAGE_COMPONENTS = ("librechat", "bff")
 
+# component -> (pod label selector, live container name), mirroring
+# charts/audittrace/templates/console/deployment-{librechat,bff}.yaml's
+# `app.kubernetes.io/component` label + container `name:` exactly. Feeds
+# the first-party-image-complete convergence check (spec
+# 2026-09-10-SPEC-deploy-runner-convergence-first-party-image-complete):
+# `_is_converged()` reads the SAME two components `console_image_set_args`
+# pins, never a third-party subchart image.
+_CONSOLE_COMPONENT_SELECTORS: dict[str, tuple[str, str]] = {
+    "librechat": ("app.kubernetes.io/component=librechat", "librechat"),
+    "bff": ("app.kubernetes.io/component=librechat-bff", "bff"),
+}
+
 # The runner never marks a deploy healthy. This string is stamped verbatim into
 # the report so a reader (and the Verify Agent) sees the hand-off unambiguously.
 VERIFICATION_DEFERRED = (
@@ -323,6 +335,38 @@ def console_image_set_args(chart_values: dict[str, Any]) -> list[str]:
         if digest:
             args += ["--set", f"console.{component}.image.digest={digest}"]
     return args
+
+
+def console_image_digests(chart_values: dict[str, Any]) -> dict[str, str]:
+    """The chart-pinned digest for each ENABLED console component (spec
+    2026-09-10-SPEC-deploy-runner-convergence-first-party-image-complete).
+
+    Reads the identical source :func:`console_image_set_args` parses
+    (``console.<component>.image.digest`` off the given, already-parsed
+    chart values — normally the committed ``values.yaml`` via
+    :func:`_read_chart_values`) — never re-resolved from the registry, so
+    convergence and the apply-side `--set` args can never disagree about
+    what "the intended console digest" is.
+
+    Returns ``{}`` when ``console.enabled`` is falsy (the console isn't
+    even templated, so there is nothing to converge on) or the top-level
+    ``console`` block isn't a mapping. A component is OMITTED (not
+    reported as a mismatch candidate) when its ``image`` block isn't a
+    mapping or its ``digest`` is empty/absent — there is nothing pinned to
+    compare a live pod against in that case, mirroring
+    :func:`console_image_set_args`'s own per-field skip.
+    """
+    console = chart_values.get("console")
+    if not isinstance(console, dict) or not console.get("enabled"):
+        return {}
+    digests: dict[str, str] = {}
+    for component in _CONSOLE_IMAGE_COMPONENTS:
+        block = console.get(component)
+        image = block.get("image") if isinstance(block, dict) else None
+        digest = image.get("digest") if isinstance(image, dict) else None
+        if digest:
+            digests[component] = digest
+    return digests
 
 
 def _helm_apply_cmd(
@@ -622,11 +666,19 @@ class DeployRunner:
             return None
         return proc.stdout.strip() or None
 
-    def _running_image_digest(self) -> str | None:
-        """The ``sha256:...`` actually running, from the live pod ``imageID``."""
+    def _running_component_digest(self, selector: str, container: str) -> str | None:
+        """The ``sha256:...`` actually running for an arbitrary
+        component/container pair, from the live pod ``imageID``.
+
+        Generalises the memory-server-only jsonpath read so the
+        first-party-image-complete convergence check (spec 2026-09-10) can
+        read a console component's live digest through the identical
+        kubectl call shape, without duplicating it. :meth:`_running_image_digest`
+        is this method specialised to the memory-server component.
+        """
         jsonpath = (
             '{.items[*].status.containerStatuses[?(@.name=="'
-            + MEMORY_SERVER_CONTAINER
+            + container
             + '")].imageID}'
         )
         proc = _run(
@@ -635,7 +687,7 @@ class DeployRunner:
                 "get",
                 "pods",
                 "-l",
-                _COMPONENT_SELECTOR,
+                selector,
                 "-n",
                 self.cfg.namespace,
                 "-o",
@@ -651,9 +703,55 @@ class DeployRunner:
                 return digest
         return None
 
-    def _is_converged(self) -> ConvergenceCheck:
-        """Converged when the LIVE digest equals the resolved digest AND the
-        Helm release itself is ``deployed`` (#451).
+    def _running_image_digest(self) -> str | None:
+        """The ``sha256:...`` actually running, from the live pod ``imageID``."""
+        return self._running_component_digest(
+            _COMPONENT_SELECTOR, MEMORY_SERVER_CONTAINER
+        )
+
+    def _mismatched_console_images(self, pinned: dict[str, str]) -> list[str]:
+        """Component names (of ``pinned``) whose live pod ``imageID`` differs
+        from the chart-pinned digest (spec 2026-09-10-SPEC-deploy-runner-
+        convergence-first-party-image-complete).
+
+        ``pinned`` is normally :func:`console_image_digests` applied to the
+        committed chart ``values.yaml`` — the exact digests
+        :func:`console_image_set_args` would ``--set``. An unreadable live
+        ``imageID`` (kubectl error, no matching pod, ...) counts as a
+        mismatch — fail-safe: unknown state must never be read as converged.
+        """
+        mismatched: list[str] = []
+        for component, digest in pinned.items():
+            selector, container = _CONSOLE_COMPONENT_SELECTORS[component]
+            running = self._running_component_digest(selector, container)
+            if running != digest:
+                mismatched.append(component)
+        return mismatched
+
+    def _is_converged(
+        self, chart_values: dict[str, Any] | None = None
+    ) -> ConvergenceCheck:
+        """Converged when the LIVE digest equals the resolved digest, EVERY
+        enabled first-party console image also matches its chart pin, AND
+        the Helm release itself is ``deployed`` (#451 + spec 2026-09-10).
+
+        **First-party-image-complete (2026-09-10).** Digest-keying the
+        memory-server image alone is not enough: at the v1.26.0 WU-6 Part
+        C.4 redeploy, memory-server was already converged while the
+        `librechat` console pod had silently drifted to a stale digest —
+        ``_is_converged()`` reported converged, P2 skipped ``helm upgrade``
+        entirely, and the already-merged console ``--set`` fix
+        (:func:`console_image_set_args`) never ran to correct the drift.
+        So after the memory-server digest matches, every ENABLED console
+        component's live pod ``imageID`` is compared against the digest
+        pinned in the committed chart ``values.yaml`` (:func:`console_image_digests`
+        — the SAME source :func:`console_image_set_args` reads; never
+        re-resolved from the registry). ANY first-party mismatch means NOT
+        converged, so ``helm upgrade`` runs and reasserts the correct
+        ``--set``. ``console.enabled=false`` skips the console checks
+        entirely (an absent, un-templated component is not a mismatch).
+        Third-party subchart images (postgres/redis/rabbitmq/vault) are
+        out of scope, matching :func:`console_image_set_args`.
 
         Digest match alone is NOT sufficient: a release stuck in ``failed`` /
         ``pending-install`` / ``pending-upgrade`` / ``pending-rollback`` — e.g.
@@ -672,9 +770,12 @@ class DeployRunner:
         only when the digest is unresolved (local registry, soft-fail); the
         Helm-status requirement still applies on that path.
 
-        Only reads Helm status when the digest already matches — a digest
-        mismatch runs ``helm upgrade`` unconditionally, so there is nothing to
-        gain from an extra ``helm status`` call in that case.
+        Only reads Helm status when the digest AND every console image
+        already match — a mismatch on any first-party image runs
+        ``helm upgrade`` unconditionally, so there is nothing to gain from an
+        extra ``helm status`` call in that case. ``basis`` records which
+        image(s) drove the verdict (memory-server digest always; the console
+        components too, whenever console is enabled).
         """
         assert self.image_ref is not None
         if self.image_ref.digest:
@@ -688,6 +789,16 @@ class DeployRunner:
 
         if not digest_matched:
             return ConvergenceCheck(False, basis, None, False)
+
+        if chart_values is None:
+            chart_values = _read_chart_values()
+        pinned = console_image_digests(chart_values)
+        if pinned:
+            mismatched = self._mismatched_console_images(pinned)
+            if mismatched:
+                basis = f"{basis}; console mismatch: {', '.join(sorted(mismatched))}"
+                return ConvergenceCheck(False, basis, None, False)
+            basis = f"{basis}; console matched: {', '.join(sorted(pinned))}"
 
         revision, status = self._helm_status_info()
         self.helm_revision = revision
