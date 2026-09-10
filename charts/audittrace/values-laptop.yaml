@@ -58,3 +58,18 @@ console:
   frontDoorNodeName: "pcluislinux"
   librechat:
     host: "librechat.audittrace.local"
+
+# WU-5 (2026-09-10) — force the sources trailer ON for the laptop/demo
+# target THROUGH the overlay (not just the base default). The base
+# `values.yaml` already defaults AUDITTRACE_RESPONSE_SOURCES to "trailer",
+# but a STALE stored user-value ("off", carried in the release since rev
+# 261 / 2026-08-31 via `helm upgrade --reset-then-reuse-values`) shadows
+# that chart default. Setting it here in the `-f values-laptop.yaml`
+# overlay wins over the reused stored value (helm precedence: -f/--set
+# beat reused values), so the deterministic redeploy renders it "trailer"
+# regardless of the stale stored override. The runner is overlay-aware
+# (consumes this file) as of the target-overlay-aware fix. Additive to
+# the /v1 response content only; interactions.answer stays clean (B5).
+memoryServer:
+  env:
+    AUDITTRACE_RESPONSE_SOURCES: "trailer"
