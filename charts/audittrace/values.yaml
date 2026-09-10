@@ -192,6 +192,13 @@ memoryServer:
     AUDITTRACE_AUTH_ENABLED: "true"
     AUDITTRACE_AUTH_REQUIRED: "true"
     AUDITTRACE_MEMORY_MODE: "tools"
+    # WU-5 (2026-09-10) — sources trailer ON. Appends the deterministic
+    # "Sources consultées" citation block to /v1 answers (flag-gated code
+    # already merged: #328 + the #301/#303 truncation fix). Additive to the
+    # /v1 RESPONSE CONTENT only when finish_reason==stop — the audit row's
+    # interactions.answer stays clean (B5). Default is "off"; the console
+    # turns it on here so recalled sources are visible to the user.
+    AUDITTRACE_RESPONSE_SOURCES: "trailer"
     AUDITTRACE_MEMORY_TOOL_LOOP_MAX_ITERATIONS: "10"
     AUDITTRACE_MEMORY_TOOL_CACHE_TTL_SECONDS: "900"
     AUDITTRACE_TOKEN_CACHE_TTL_SECONDS: "300"
