@@ -588,6 +588,213 @@ def test_chart_apply_upgrade_runs_on_digest_mismatch_no_reconcile_note(
     assert "reconcile release state" not in r.records[0].detail
 
 
+# ── first-party-image-complete convergence (spec 2026-09-10) ────────────────
+# `_is_converged()` keying on the memory-server digest alone let the v1.26.0
+# WU-6 Part C.4 redeploy no-op while the `librechat` console pod stayed on a
+# stale digest (origin finding
+# `finding-deploy-runner-convergence-noop-console-20260910.md`): memory-server
+# was already converged, so P2 skipped `helm upgrade` and the already-merged
+# console `--set` fix (`console_image_set_args`) never ran to correct the
+# drift. `_is_converged()` must ALSO compare each ENABLED console image's live
+# pod `imageID` against the digest pinned in the committed chart
+# `values.yaml` (the same source `console_image_set_args` reads).
+
+# Reuses `_CONSOLE_VALUES_ENABLED` / `_CONSOLE_VALUES_DISABLED` defined below
+# (librechat pinned to sha256:d1, bff pinned to sha256:d2) — module-level
+# constants, resolved at call time so the forward reference is safe.
+
+
+def _console_dispatch_rules(
+    *, librechat_digest="sha256:d1", bff_digest="sha256:d2", helm_status="deployed"
+):
+    """Shared dispatcher rules: memory-server digest matches, console images
+    running the given digests. Order matters — `component=librechat-bff` MUST
+    be checked before the plainer `component=librechat` needle, since the
+    latter is a substring of the former."""
+    return [
+        (
+            "component=memory-server",
+            _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x"),
+        ),
+        ("component=librechat-bff", _proc(0, f"repo/bff@{bff_digest}")),
+        ("component=librechat", _proc(0, f"repo/librechat@{librechat_digest}")),
+        (
+            "helm status",
+            _proc(0, json.dumps({"version": 265, "info": {"status": helm_status}})),
+        ),
+        ("helm upgrade", _proc(0, "deployed")),
+    ]
+
+
+def test_is_converged_false_when_console_image_mismatches(tmp_path, monkeypatch):
+    """Memory-server digest matches + helm `deployed`, but the live
+    `librechat` pod imageID != the chart-pinned digest -> NOT converged.
+
+    Falsifiable / neuter: revert `_is_converged()` to memory-server-only
+    convergence (drop the console check) and this test goes RED —
+    `check.converged` flips to True, exactly the v1.26.0 WU-6 Part C.4 defect
+    reproduced hermetically (guard name matches behaviour,
+    `feedback_vacuous_neuter_test_antipattern`).
+    """
+    disp = _Dispatcher(rules=_console_dispatch_rules(librechat_digest="sha256:STALE"))
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_ENABLED)
+    assert check.converged is False
+    assert "console mismatch: librechat" in check.basis
+    # bff matched -> only librechat is named as the mismatch.
+    assert "bff" not in check.basis.split("console mismatch:")[1]
+    # No `helm status` read once a console mismatch is found — mirrors the
+    # existing "digest mismatch skips helm status" efficiency (#451).
+    assert not any("helm status" in " ".join(c) for c in disp.calls)
+
+
+def test_chart_apply_runs_upgrade_when_console_image_mismatches(tmp_path, monkeypatch):
+    """End-to-end through `phase_chart_apply`: a console-image mismatch
+    means `helm upgrade` actually RUNS (not skipped as a no-op) — the fix
+    for the v1.26.0 WU-6 Part C.4 no-op."""
+    disp = _Dispatcher(rules=_console_dispatch_rules(librechat_digest="sha256:STALE"))
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_ENABLED
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is False
+    assert r.records[0].status != "noop"
+    assert any("helm upgrade" in " ".join(c) for c in disp.calls)
+
+
+def test_is_converged_true_when_all_first_party_images_match(tmp_path, monkeypatch):
+    """All first-party images (memory-server + both console images) match
+    their pins, helm `deployed` -> converged (the true no-op case is
+    preserved, not just any mismatch making everything NOT-converged)."""
+    disp = _Dispatcher(rules=_console_dispatch_rules())
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_ENABLED)
+    assert check.converged is True
+    assert "console matched: bff, librechat" in check.basis
+
+
+def test_chart_apply_noop_when_all_first_party_images_match(tmp_path, monkeypatch):
+    """End-to-end: with every first-party image matched, P2 still records the
+    true no-op (`helm upgrade` never called) — the console check must not
+    turn every deploy into a spurious upgrade."""
+    disp = _Dispatcher(rules=_console_dispatch_rules())
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _CONSOLE_VALUES_ENABLED
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.converged is True and r.records[0].status == "noop"
+    assert not any("helm upgrade" in " ".join(c) for c in disp.calls)
+
+
+def test_is_converged_ignores_console_when_disabled(tmp_path, monkeypatch):
+    """`console.enabled=false` -> convergence keys on memory-server alone;
+    no console kubectl calls are made and a "would-be mismatch" digest is
+    never even read, so a disabled (absent) component can never falsely
+    report NOT-converged."""
+    disp = _Dispatcher(
+        rules=[
+            (
+                "component=memory-server",
+                _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x"),
+            ),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 1, "info": {"status": "deployed"}})),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    check = r._is_converged(chart_values=_CONSOLE_VALUES_DISABLED)
+    assert check.converged is True
+    assert "console" not in check.basis
+    assert not any("librechat" in " ".join(c) for c in disp.calls)
+
+
+def test_is_converged_defaults_to_reading_real_chart_values_file(tmp_path, monkeypatch):
+    """No explicit `chart_values` -> `_is_converged` reads from disk via
+    `_read_chart_values`, exactly like `_helm_apply_cmd` — the production
+    path never passes `chart_values` explicitly."""
+    calls: list[tuple] = []
+    real_read = runner._read_chart_values
+
+    def _spy(*a, **k):
+        calls.append((a, k))
+        return real_read(*a, **k)
+
+    monkeypatch.setattr(runner, "_read_chart_values", _spy)
+    disp = _Dispatcher(
+        rules=[
+            (
+                "component=memory-server",
+                _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x"),
+            ),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 1, "info": {"status": "deployed"}})),
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(_cfg(tmp_path))
+    r.image_ref = _hub_ref("sha256:x")
+    r._is_converged()
+    assert calls, (
+        "_is_converged must call _read_chart_values() when chart_values is None"
+    )
+
+
+def test_console_image_digests_empty_when_disabled_or_malformed():
+    assert runner.console_image_digests({"console": {"enabled": False}}) == {}
+    assert runner.console_image_digests({}) == {}
+    assert runner.console_image_digests({"console": "not-a-dict"}) == {}
+
+
+def test_console_image_digests_full_shape():
+    assert runner.console_image_digests(_CONSOLE_VALUES_ENABLED) == {
+        "librechat": "sha256:d1",
+        "bff": "sha256:d2",
+    }
+
+
+def test_console_image_digests_omits_component_missing_digest():
+    values = {
+        "console": {
+            "enabled": True,
+            "librechat": {"image": {"repository": "repo/lc", "tag": "t"}},
+            "bff": "not-a-dict",
+        }
+    }
+    assert runner.console_image_digests(values) == {}
+
+
+def test_running_component_digest_generalizes_memory_server(tmp_path, monkeypatch):
+    """`_running_image_digest` delegates to `_running_component_digest` with
+    the memory-server selector/container — proves the refactor preserves the
+    original behaviour exactly (same public method, same result)."""
+    monkeypatch.setattr(
+        runner, "_run", lambda *a, **k: _proc(0, "repo:tag repo@sha256:live")
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    assert (
+        r._running_component_digest(
+            runner._COMPONENT_SELECTOR, runner.MEMORY_SERVER_CONTAINER
+        )
+        == r._running_image_digest()
+    )
+
+
 def test_helm_status_info_parsers(tmp_path, monkeypatch):
     r = DeployRunner(_cfg(tmp_path))
     monkeypatch.setattr(
