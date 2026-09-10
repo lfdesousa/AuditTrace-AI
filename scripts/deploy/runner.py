@@ -38,6 +38,7 @@ import os
 import re
 import subprocess  # noqa: S404 - the runner is the operator; it shells out to helm/kubectl/make
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -175,6 +176,13 @@ class DeployConfig:
     timeout: int = 300
     settle_samples: int = 6
     settle_interval: float = 5.0
+    # Ordered extra chart values files (``--values``/``-f``, repeatable),
+    # e.g. ``charts/audittrace/values-laptop.yaml`` — spec
+    # 2026-09-10-SPEC-deploy-runner-target-overlay-aware. Empty tuple ==
+    # today's behaviour: base ``values.yaml`` only. A plain immutable
+    # default (not a ``field(default_factory=tuple)``) is safe here because
+    # an empty tuple can never be mutated in place.
+    values_files: tuple[Path, ...] = ()
 
     @property
     def deployment(self) -> str:
@@ -257,19 +265,12 @@ def apply_image_tag(cfg: DeployConfig, image_ref: registry.ImageRef) -> str:
     return cfg.image_tag
 
 
-def _read_chart_values(path: Path = CHART_VALUES_FILE) -> dict[str, Any]:
-    """Parse the committed chart ``values.yaml`` — the SSOT the runner reads
-    the first-party console image pins from (spec 2026-09-10).
+def _parse_values_file(path: Path) -> dict[str, Any]:
+    """Parse a single chart values file to a mapping.
 
-    Read fresh off disk on every call: no live registry lookup, no
-    ``docker inspect`` — deterministic and reproducible offline, unlike
-    memory-server's tag->digest resolve (the chart's committed digests are
-    already operator-verified against the registry, per the spec's §3).
-    An unreadable or malformed file degrades to ``{}`` (no console ``--set``
-    derived by :func:`console_image_set_args`) rather than crashing the
-    apply — a missing/broken values.yaml is a chart-lint failure the
-    preflight gate already catches, not something this helper should raise
-    on.
+    An unreadable or malformed file degrades to ``{}`` rather than raising —
+    a missing/broken values file is a chart-lint failure the preflight gate
+    already catches, not something this helper should crash the apply on.
     """
     try:
         raw = path.read_text()
@@ -280,6 +281,63 @@ def _read_chart_values(path: Path = CHART_VALUES_FILE) -> dict[str, Any]:
     except yaml.YAMLError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``overlay`` onto ``base``; ``overlay`` wins.
+
+    Nested mappings merge key-by-key (mirrors Helm's own ``-f`` merge
+    semantics: a later values file overrides only the keys it sets, not
+    sibling keys in the same block); any non-mapping value in ``overlay``
+    (scalar, list, ``None``) replaces the base value outright. Neither input
+    is mutated.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_chart_values(
+    path: Path = CHART_VALUES_FILE,
+    *,
+    values_files: Sequence[Path] = (),
+) -> dict[str, Any]:
+    """The EFFECTIVE chart values: base ``values.yaml`` deep-merged with each
+    ``--values``/``-f`` overlay file, in order, later files winning (spec
+    2026-09-10-SPEC-deploy-runner-target-overlay-aware).
+
+    This is the SSOT :func:`console_image_set_args`, :func:`console_image_digests`
+    and :meth:`DeployRunner._is_converged` read the first-party console image
+    pins from. Before this fix the runner read ONLY base ``values.yaml``
+    (``console.enabled: false`` there), so on the laptop target — where the
+    console is enabled via the ``values-laptop.yaml`` overlay passed to
+    ``helm upgrade`` but never read back by the runner — those three
+    functions were permanently blind to the console, silently no-opping the
+    apply-side console pin and the console-digest convergence check (origin
+    finding ``finding-deploy-runner-not-overlay-aware-console-inert-20260910.md``).
+
+    Read fresh off disk on every call: no live registry lookup, no
+    ``docker inspect`` — deterministic and reproducible offline, unlike
+    memory-server's tag->digest resolve (the chart's committed digests are
+    already operator-verified against the registry, per the console-pins
+    spec's §3).
+
+    With no ``values_files`` (the default), behaviour is byte-identical to
+    before this fix: a single parse of ``path``. Falsifiable: ignore
+    ``values_files`` here (base-only, the pre-fix behaviour) and the
+    overlay-aware neuter-proof test goes RED — the effective view stays
+    ``console.enabled=false`` even when a laptop overlay enabling it is
+    passed, exactly the live defect this spec closes.
+    """
+    merged = _parse_values_file(path)
+    for overlay_path in values_files:
+        merged = _deep_merge(merged, _parse_values_file(overlay_path))
+    return merged
 
 
 def console_image_set_args(chart_values: dict[str, Any]) -> list[str]:
@@ -369,6 +427,14 @@ def console_image_digests(chart_values: dict[str, Any]) -> dict[str, str]:
     return digests
 
 
+def _values_file_args(values_files: Sequence[Path]) -> list[str]:
+    """``-f <path>`` argv pairs, one per overlay, in order."""
+    args: list[str] = []
+    for path in values_files:
+        args += ["-f", str(path)]
+    return args
+
+
 def _helm_apply_cmd(
     cfg: DeployConfig,
     image_ref: registry.ImageRef,
@@ -376,14 +442,21 @@ def _helm_apply_cmd(
 ) -> list[str]:
     """The exact ``helm upgrade --install`` argv for P2 (surge-safe via chart).
 
-    ``chart_values`` defaults to a fresh read of the committed chart
-    ``values.yaml`` (:func:`_read_chart_values`); tests inject an explicit
-    dict so the console-image assertion (:func:`console_image_set_args`) is
-    exercised hermetically without depending on the chart's current
-    on-disk state.
+    ``chart_values`` defaults to a fresh read of the EFFECTIVE chart values
+    (:func:`_read_chart_values`, base ``values.yaml`` deep-merged with
+    ``cfg.values_files`` in order); tests inject an explicit dict so the
+    console-image assertion (:func:`console_image_set_args`) is exercised
+    hermetically without depending on the chart's current on-disk state.
+
+    Each of ``cfg.values_files`` is ALSO passed to helm itself as an
+    explicit ``-f <path>`` — after the chart directory / namespace, before
+    ``--set`` — so the apply doesn't rely on ``--reset-then-reuse-values``
+    to carry a previously-``-f``'d overlay forward (spec 2026-09-10-SPEC-
+    deploy-runner-target-overlay-aware). With no ``values_files`` this argv
+    is byte-identical to before the fix.
     """
     if chart_values is None:
-        chart_values = _read_chart_values()
+        chart_values = _read_chart_values(values_files=cfg.values_files)
     return [
         "helm",
         "upgrade",
@@ -392,6 +465,7 @@ def _helm_apply_cmd(
         str(CHART_DIR),
         "-n",
         cfg.namespace,
+        *_values_file_args(cfg.values_files),
         "--reset-then-reuse-values",
         "--set",
         f"memoryServer.image.repository={image_ref.repository}",
@@ -791,7 +865,7 @@ class DeployRunner:
             return ConvergenceCheck(False, basis, None, False)
 
         if chart_values is None:
-            chart_values = _read_chart_values()
+            chart_values = _read_chart_values(values_files=self.cfg.values_files)
         pinned = console_image_digests(chart_values)
         if pinned:
             mismatched = self._mismatched_console_images(pinned)
@@ -1211,6 +1285,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=300,
         help="bounded helm/rollout timeout (seconds)",
     )
+    parser.add_argument(
+        "--values",
+        "-f",
+        dest="values_files",
+        action="append",
+        type=Path,
+        default=None,
+        help=(
+            "extra chart values file (repeatable, ordered — later files win); "
+            "e.g. -f charts/audittrace/values-laptop.yaml. Deep-merged with "
+            "base values.yaml and passed to helm as -f (spec 2026-09-10-SPEC-"
+            "deploy-runner-target-overlay-aware). Omit for base-only "
+            "(unchanged pre-fix behaviour)."
+        ),
+    )
     return parser
 
 
@@ -1223,6 +1312,7 @@ def config_from_args(args: argparse.Namespace) -> DeployConfig:
         dry_run=args.dry_run,
         out_dir=args.out_dir,
         timeout=args.timeout,
+        values_files=tuple(args.values_files or ()),
     )
 
 
