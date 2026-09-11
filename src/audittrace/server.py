@@ -26,6 +26,7 @@ from audittrace.routes.console_chat_projects import (
 from audittrace.routes.console_conversations import (
     router as console_conversations_router,
 )
+from audittrace.routes.console_files import router as console_files_router
 from audittrace.routes.console_presets import router as console_presets_router
 from audittrace.routes.console_prompts import router as console_prompts_router
 from audittrace.routes.memory_upload import router as memory_upload_status_router
@@ -807,6 +808,19 @@ def create_app() -> FastAPI:
         console_chat_projects_router,
         prefix="/console/chat-projects",
         tags=["console-chat-projects"],
+    )
+    # Files-metadata domain (MongoDB-elimination EPIC) — the
+    # console-files store's REST surface (upsert/list/get/delete +
+    # batch-get-by-ids), RLS-isolated by the caller's token sub.
+    # METADATA ONLY — the file bytes stay in object storage
+    # (feedback_storage_always_s3). Additive-only, distinct from
+    # /memory/* (including the pre-existing ephemeral-ingest
+    # /memory/upload path), /console/conversations, /console/presets,
+    # /console/prompts, and /console/chat-projects.
+    app.include_router(
+        console_files_router,
+        prefix="/console/files",
+        tags=["console-files"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

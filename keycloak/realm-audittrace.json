@@ -222,6 +222,20 @@
       }
     },
     {
+      "name": "memory:files:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:files:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "audittrace:scan:retrigger",
       "protocol": "openid-connect",
       "attributes": {
@@ -774,6 +788,7 @@
         "memory:presets:read-own",
         "memory:prompts:read-own",
         "memory:chat_projects:read-own",
+        "memory:files:read-own",
         "profile",
         "email"
       ],
@@ -786,7 +801,8 @@
         "memory:conversations:write",
         "memory:presets:write",
         "memory:prompts:write",
-        "memory:chat_projects:write"
+        "memory:chat_projects:write",
+        "memory:files:write"
       ],
       "protocolMappers": [
         {

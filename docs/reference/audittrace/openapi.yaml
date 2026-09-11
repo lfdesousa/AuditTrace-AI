@@ -369,6 +369,211 @@ components:
       - conversation_id
       title: ConsoleConversationUpsertRequest
       type: object
+    ConsoleFileBatchGetRequest:
+      description: 'Request body for ``POST /console/files/batch-get`` — fetch the
+
+        caller''s OWN file-metadata records for a batch of ``file_id``s in
+
+        one round trip (the fork resolves a conversation''s attachments this
+
+        way). Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+
+        cursor-paginated list route, so a hostile caller cannot force an
+
+        unbounded ``IN (...)`` query.'
+      properties:
+        file_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: File Ids
+          type: array
+      required:
+      - file_ids
+      title: ConsoleFileBatchGetRequest
+      type: object
+    ConsoleFileBatchGetResponse:
+      description: 'Response from ``POST /console/files/batch-get``. ``items`` omits
+
+        any requested ``file_id`` that doesn''t exist, is soft-deleted, or
+
+        belongs to another user — same not-found-vs-403 discipline as
+
+        ``GET /console/files/{file_id}`` (never leaks existence), just
+
+        batched: the caller cannot distinguish "not mine" from "never
+
+        existed" from the response shape alone.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleFileItem'
+          title: Items
+          type: array
+      title: ConsoleFileBatchGetResponse
+      type: object
+    ConsoleFileItem:
+      description: One file-metadata row, as returned by the console-files API.
+      properties:
+        bytes:
+          title: Bytes
+          type: integer
+        context:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Context
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        embedded:
+          default: false
+          title: Embedded
+          type: boolean
+        file_id:
+          title: File Id
+          type: string
+        filename:
+          title: Filename
+          type: string
+        height:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Height
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        object_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Object Key
+        temp_file_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Temp File Id
+        type:
+          title: Type
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        usage:
+          additionalProperties: true
+          title: Usage
+          type: object
+        width:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Width
+      required:
+      - file_id
+      - filename
+      - type
+      - bytes
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleFileItem
+      type: object
+    ConsoleFileListResponse:
+      description: 'Response from ``GET /console/files`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleFileItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleFileListResponse
+      type: object
+    ConsoleFileUpsertRequest:
+      description: 'Request body for ``POST /console/files`` — create/update the
+
+        caller''s own file-metadata record (upsert by ``file_id``).'
+      properties:
+        bytes:
+          default: 0
+          minimum: 0.0
+          title: Bytes
+          type: integer
+        context:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Context
+        embedded:
+          default: false
+          title: Embedded
+          type: boolean
+        file_id:
+          maxLength: 255
+          minLength: 1
+          title: File Id
+          type: string
+        filename:
+          maxLength: 512
+          minLength: 1
+          title: Filename
+          type: string
+        height:
+          anyOf:
+          - minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Height
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        object_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Object Key
+        temp_file_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Temp File Id
+        type:
+          maxLength: 255
+          minLength: 1
+          title: Type
+          type: string
+        usage:
+          additionalProperties: true
+          title: Usage
+          type: object
+        width:
+          anyOf:
+          - minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Width
+      required:
+      - file_id
+      - filename
+      - type
+      title: ConsoleFileUpsertRequest
+      type: object
     ConsoleMessageEditRequest:
       description: 'Request body for
 
@@ -1657,6 +1862,13 @@ components:
               records — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:episodic:read: Read episodic-layer (ADR-style) documents
             memory:episodic:write: Create/update/delete episodic-layer documents
+            memory:files:read-own: 'Read your own file-metadata records (and batch-get-by-ids) from the console-files store
+              (Files-metadata domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s file records.
+              METADATA ONLY: the file bytes stay in object storage. Grants no access to another user''s file records or to
+              any other memory layer.'
+            memory:files:write: Create/update/delete your own file-metadata records in the console-files store (Files-metadata
+              domain, MongoDB-elimination EPIC). Grants no access to another user's file records (RLS-enforced), no access
+              to any other memory layer, and no access to the file BYTES themselves (object storage is a separate concern).
             memory:presets:read-own: Read your own saved model/endpoint presets from the console-presets store (Mongo-repl
               WU-presets, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's saved presets. Grants no
               access to another user's presets or to any other memory layer.
@@ -2216,6 +2428,185 @@ paths:
       summary: Edit Message
       tags:
       - console-conversations
+  /console/files:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) file-metadata records,
+
+        newest-first, cursor-paginated. Never returns another user''s file —
+
+        RLS plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_files_console_files_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: List Files
+      tags:
+      - console-files
+    post:
+      description: 'Create or update the CALLER''s OWN file-metadata record (upsert by
+
+        ``file_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_file_console_files_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleFileUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:write
+      summary: Upsert File
+      tags:
+      - console-files
+  /console/files/batch-get:
+    post:
+      description: 'Fetch the CALLER''s OWN file-metadata records for a batch of
+
+        ``file_id``s in one round trip. A POST (not a GET with repeated
+
+        query params) so the request body — not the URL — carries the
+
+        (potentially large) id list; this is a READ operation despite the
+
+        verb (same rationale as the fork''s own attachment-resolution
+
+        calls), gated on the READ scope, never the write scope.'
+      operationId: batch_get_files_console_files_batch_get_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleFileBatchGetRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileBatchGetResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: Batch Get Files
+      tags:
+      - console-files
+  /console/files/{file_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN file-metadata record. 404 if not
+
+        found/not owned/already deleted.'
+      operationId: delete_file_console_files__file_id__delete
+      parameters:
+      - in: path
+        name: file_id
+        required: true
+        schema:
+          title: File Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:write
+      summary: Delete File
+      tags:
+      - console-files
+    get:
+      description: 'Fetch the CALLER''s OWN file-metadata record. 404 if it doesn''t
+
+        exist, is deleted, or belongs to another user — never 403 (would
+
+        leak existence to a caller probing foreign file ids).'
+      operationId: get_file_console_files__file_id__get
+      parameters:
+      - in: path
+        name: file_id
+        required: true
+        schema:
+          title: File Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleFileItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:files:read-own
+      summary: Get File
+      tags:
+      - console-files
   /console/presets:
     get:
       description: 'List the CALLER''s OWN (non-deleted) presets, newest-first,

@@ -829,3 +829,96 @@ class ConsoleChatProject(Base):
             name="uq_console_chat_projects_user_project",
         ),
     )
+
+
+class ConsoleFile(Base):
+    """The ``console_files`` store — the Files-metadata domain of the
+    MongoDB-elimination EPIC (migration 027): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``File`` collection
+    (``packages/data-schemas/src/schema/file.ts``) — the file METADATA
+    record only.
+
+    **Scope boundary (the ratified spec's design note).** This table
+    owns the metadata record; the file BYTES stay in object storage
+    (S3/MinIO, ``feedback_storage_always_s3``) — no code path in this
+    module reads or writes bytes. :attr:`object_key` is the pointer
+    into that store, not the payload.
+
+    **Naming resolution — ``object_key`` vs the fork's ``source``/
+    ``filepath`` pair.** LibreChat's Mongo schema splits the storage
+    reference across ``source`` (backend enum, e.g. ``"local"``/
+    ``"s3"``) and ``filepath``/``storageKey`` (the path within that
+    backend). The ratified spec names this column ambiguously
+    (``object_key``/``source``) and leaves the exact shape to the
+    builder. RESOLVED here as a single ``object_key`` column — the one
+    fact this store needs to reference the bytes-at-rest location
+    (which object-storage backend it lives in is an operator-wide
+    config concern, not a per-file fact, per the portability
+    invariant) — nullable, since a file record can exist
+    (upload-in-flight, or promoted-but-not-yet-relocated) before its
+    final object key is known.
+
+    ``file_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleChatProject.chat_project_id` — the
+    internal PK ``id`` is a separate server-generated UUID so
+    ``file_id`` collisions across users can coexist, disambiguated only
+    by ``(user_sub, file_id)`` (the unique constraint below).
+
+    ``usage`` is modelled as a jsonb column (not the fork's numeric
+    counter) per the ratified spec's explicit text ("`usage` jsonb") —
+    a structured bag for forward compatibility (e.g. per-purpose usage
+    counts), distinct from :attr:`metadata` (the generic free-form
+    bag every console-* table carries).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 027, mirrors migrations 022-026's shape exactly)
+    compares ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleFilesService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    file_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    type: Mapped[str] = mapped_column(String(255), nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # The object-storage pointer — see the class docstring's naming
+    # resolution note. Nullable: a record can exist before its final
+    # key is known.
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    usage_json: Mapped[dict[str, Any]] = mapped_column(
+        "usage", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    embedded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    temp_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleChatProject.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleChatProject.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "file_id",
+            name="uq_console_files_user_file",
+        ),
+    )
