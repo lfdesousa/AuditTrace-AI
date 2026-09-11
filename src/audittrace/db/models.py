@@ -542,3 +542,70 @@ class ConsoleMessage(Base):
             "user_sub", "message_id", name="uq_console_messages_user_message"
         ),
     )
+
+
+class ConsolePreset(Base):
+    """The ``console_presets`` store — WU-presets of the MongoDB-
+    elimination EPIC (migration 024): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Preset`` collection
+    (``packages/data-schemas/src/schema/preset.ts``) — the user's saved
+    model/endpoint presets.
+
+    ``preset_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleConversation.conversation_id` — the
+    internal PK ``id`` is a separate server-generated UUID so
+    ``preset_id`` collisions across users can coexist, disambiguated
+    only by ``(user_sub, preset_id)`` (the unique constraint below).
+
+    The preset's config (``endpoint``/``model``/``temperature``/... —
+    the large, loosely-typed field set on the fork's ``IPreset``
+    interface) is carried as a single ``data`` jsonb blob rather than
+    one column per field: the fork's own schema treats these as an open
+    index-signature bag (``...conversationPreset`` spread), so promoting
+    each field to a typed column here would need re-widening on every
+    upstream fork change for no isolation or query benefit — only
+    ``title``/``preset_id`` are promoted to first-class columns because
+    the console's list view sorts/displays by them directly.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 024, mirrors migrations 022/023's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id', true)``.
+    On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsolePresetsService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_presets"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    preset_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="New Chat")
+    # The preset config blob (endpoint/model/temperature/... — see the
+    # class docstring for why this is one jsonb column, not many).
+    data: Mapped[dict[str, Any]] = mapped_column(
+        _ConsoleMetadataType, nullable=False, default=dict
+    )
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as MemoryItem.deleted_at_ms /
+    # ConsoleConversation.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversation.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "preset_id", name="uq_console_presets_user_preset"
+        ),
+    )

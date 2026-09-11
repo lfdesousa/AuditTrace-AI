@@ -164,6 +164,19 @@ ALL_SCOPES: dict[str, str] = {
         "Grants no access to another user's conversations or messages "
         "(RLS-enforced) and no access to any other memory layer."
     ),
+    "memory:presets:read-own": (
+        "Read your own saved model/endpoint presets from the console-"
+        "presets store (Mongo-repl WU-presets, MongoDB-elimination "
+        "EPIC) — the RLS-isolated store backing LibreChat's saved "
+        "presets. Grants no access to another user's presets or to any "
+        "other memory layer."
+    ),
+    "memory:presets:write": (
+        "Create/update/delete your own presets in the console-presets "
+        "store (Mongo-repl WU-presets, MongoDB-elimination EPIC). "
+        "Grants no access to another user's presets (RLS-enforced) and "
+        "no access to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

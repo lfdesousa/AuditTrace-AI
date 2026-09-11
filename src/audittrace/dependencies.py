@@ -30,6 +30,11 @@ from audittrace.services.console_conversations import (
     MockConsoleConversationsService,
     PostgresConsoleConversationsService,
 )
+from audittrace.services.console_presets import (
+    ConsolePresetsService,
+    MockConsolePresetsService,
+    PostgresConsolePresetsService,
+)
 from audittrace.services.context_builder import (
     ContextBuilderService,
     DefaultContextBuilder,
@@ -369,6 +374,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         )
     )
 
+    # WU-presets (MongoDB-elimination EPIC) — the console-presets store's
+    # backing service (Postgres RLS-isolated, migration 024). Same
+    # session factory as console_conversations above.
+    console_presets: ConsolePresetsService = PostgresConsolePresetsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     # Memory-layer manifest (CRUD backoffice — migration 009 + the
     # /memory/<layer> REST endpoints). Postgres-backed; same session
     # factory as conversational since the table is in the same DB.
@@ -411,6 +423,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["semantic"] = semantic
     container._instances["session_memory"] = session_memory
     container._instances["console_conversations"] = console_conversations
+    container._instances["console_presets"] = console_presets
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -608,6 +621,16 @@ def get_console_conversations_service() -> ConsoleConversationsService:
 
 
 @log_call(logger=logger)
+def get_console_presets_service() -> ConsolePresetsService:
+    """Get the console-presets service (dependency injection).
+
+    WU-presets (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_presets.py`` writes/reads through.
+    """
+    return cast(ConsolePresetsService, container._instances["console_presets"])
+
+
+@log_call(logger=logger)
 def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
@@ -666,6 +689,7 @@ def _register_mock_memory_services() -> None:
     semantic = MockSemanticService()
     session_memory = MockSessionMemoryService()
     console_conversations = MockConsoleConversationsService()
+    console_presets = MockConsolePresetsService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -679,6 +703,7 @@ def _register_mock_memory_services() -> None:
     container._instances["semantic"] = semantic
     container._instances["session_memory"] = session_memory
     container._instances["console_conversations"] = console_conversations
+    container._instances["console_presets"] = console_presets
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -746,5 +771,10 @@ def create_test_container() -> DependencyContainer:
         PostgresConsoleConversationsService(
             session_factory=pg_factory.get_session_factory(),
         )
+    )
+    # WU-presets (MongoDB-elimination EPIC) — same rationale as
+    # console_conversations above.
+    test_container._instances["console_presets"] = PostgresConsolePresetsService(
+        session_factory=pg_factory.get_session_factory(),
     )
     return test_container

@@ -23,6 +23,7 @@ from audittrace.routes import admin, audit, chat, context, health, mcp, memory, 
 from audittrace.routes.console_conversations import (
     router as console_conversations_router,
 )
+from audittrace.routes.console_presets import router as console_presets_router
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
@@ -774,6 +775,15 @@ def create_app() -> FastAPI:
         console_conversations_router,
         prefix="/console/conversations",
         tags=["console-conversations"],
+    )
+    # WU-presets (MongoDB-elimination EPIC) — the console-presets store's
+    # REST surface (create/list/get/delete), RLS-isolated by the
+    # caller's token sub. Additive-only, distinct from /memory/* and
+    # /console/conversations.
+    app.include_router(
+        console_presets_router,
+        prefix="/console/presets",
+        tags=["console-presets"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-
