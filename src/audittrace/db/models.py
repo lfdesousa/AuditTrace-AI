@@ -755,3 +755,77 @@ class ConsolePromptVersion(Base):
             "user_sub", "prompt_id", name="uq_console_prompt_versions_user_prompt"
         ),
     )
+
+
+class ConsoleChatProject(Base):
+    """The ``console_chat_projects`` store — the Chat-Projects domain of
+    the MongoDB-elimination EPIC (migration 026): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ChatProject`` collection
+    (``packages/data-schemas/src/schema/chatProject.ts``) — a
+    first-class, user-created grouping of conversations.
+
+    ``chat_project_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its
+    own), same pattern as :attr:`ConsolePreset.preset_id` — the internal
+    PK ``id`` is a separate server-generated UUID so ``chat_project_id``
+    collisions across users can coexist, disambiguated only by
+    ``(user_sub, chat_project_id)`` (the unique constraint below).
+
+    **Design note — reconciling the two pre-existing "project" seams**
+    (per the ratified spec's design note): ``src/audittrace/models.py``
+    already carries an unrelated ``project`` field (a memory-context/
+    audit-namespace string, e.g. default ``"self-audit"``) — that field
+    is NOT touched by this WU and remains exactly what it was; it is a
+    namespacing label, not a first-class store. Separately,
+    :class:`ConsoleConversation` (migration 023, WU-1) already reserved
+    a NULLABLE ``chat_project_id`` column on the conversations table in
+    anticipation of this store landing later — THIS table is what that
+    reserved column will eventually reference (by client-supplied string
+    key, same non-FK convention as every other cross-table reference in
+    this module — e.g. :attr:`ConsolePromptVersion.group_id` — since the
+    isolation invariant that matters is ``(user_sub, chat_project_id)``,
+    not a database-level cascade). Wiring
+    ``ConsoleConversation.chat_project_id`` to validate against this
+    table is explicitly OUT OF SCOPE for this WU (a later WU, per the
+    spec's "Out of scope" section).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 026, mirrors migrations 022/023/024/025's shape exactly)
+    compares ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleChatProjectsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_chat_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    chat_project_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsolePreset.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsolePreset.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "chat_project_id",
+            name="uq_console_chat_projects_user_project",
+        ),
+    )

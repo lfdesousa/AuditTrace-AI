@@ -11,8 +11,11 @@ console-conversations proxy (WU-1, MongoDB-elimination EPIC);
 ``GET/POST/DELETE /console/presets[/{path}]``, the console-presets proxy
 (Mongo-repl WU-presets, MongoDB-elimination EPIC); and
 ``GET/POST/PATCH/DELETE /console/prompts[/{path}]``, the console-prompts
-proxy (Mongo-repl WU-prompts, MongoDB-elimination EPIC). ``GET /health``
-is the k8s-probe convenience every AuditTrace deployable carries.
+proxy (Mongo-repl WU-prompts, MongoDB-elimination EPIC); and
+``GET/POST/DELETE /console/chat-projects[/{path}]``, the
+console-chat-projects proxy (Chat-Projects domain, MongoDB-elimination
+EPIC). ``GET /health`` is the k8s-probe convenience every AuditTrace
+deployable carries.
 
 All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
@@ -47,7 +50,12 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    the console-prompts proxy exchanges explicitly for
    ``bff.console_prompts_scopes.CONSOLE_PROMPTS_SCOPE_STRING``
    (``memory:prompts:read-own`` + ``memory:prompts:write``) — a SIXTH,
-   distinct exchange, own scope pair, never any other route's scopes.
+   distinct exchange, own scope pair, never any other route's scopes;
+   the console-chat-projects proxy exchanges explicitly for
+   ``bff.console_chat_projects_scopes.CONSOLE_CHAT_PROJECTS_SCOPE_STRING``
+   (``memory:chat_projects:read-own`` + ``memory:chat_projects:write``)
+   — a SEVENTH, distinct exchange, own scope pair, never any other
+   route's scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -81,6 +89,11 @@ from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
+from bff.console_chat_projects_proxy import (
+    ConsoleChatProjectsProxyError,
+    proxy_console_chat_projects_request,
+)
+from bff.console_chat_projects_scopes import CONSOLE_CHAT_PROJECTS_SCOPE_STRING
 from bff.console_conversations_proxy import (
     ConsoleConversationsProxyError,
     proxy_console_conversations_request,
@@ -710,6 +723,105 @@ def create_app() -> FastAPI:
         ``{group_id}/versions``, ``{group_id}/production``. See
         ``_console_prompts_proxy_impl`` for the shared shape."""
         return await _console_prompts_proxy_impl(path, request, settings, http_client)
+
+    async def _console_chat_projects_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-chat-projects routes below (the
+        base path with no suffix, and the ``{path:path}`` catch-all) —
+        same shape as ``_console_presets_proxy_impl`` above, but
+        exchanges for ``CONSOLE_CHAT_PROJECTS_SCOPE_STRING`` and
+        forwards to the orchestrator's ``/console/chat-projects`` mount
+        (Chat-Projects domain, MongoDB-elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/chat-projects request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_CHAT_PROJECTS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-chat-projects token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_chat_projects_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleChatProjectsProxyError as exc:
+            logger.error("orchestrator /console/chat-projects unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/chat-projects",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_chat_projects_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-chat-projects list/create entry (Chat-Projects
+        domain, MongoDB-elimination EPIC) — no path suffix. See
+        ``_console_chat_projects_proxy_impl`` for the shared shape."""
+        return await _console_chat_projects_proxy_impl(
+            "", request, settings, http_client
+        )
+
+    @app.api_route(
+        "/console/chat-projects/{path:path}",
+        methods=["GET", "POST", "DELETE"],
+        response_model=None,
+    )
+    async def console_chat_projects_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-chat-projects per-resource entry (Chat-Projects
+        domain, MongoDB-elimination EPIC) — ``{chat_project_id}``. See
+        ``_console_chat_projects_proxy_impl`` for the shared shape."""
+        return await _console_chat_projects_proxy_impl(
+            path, request, settings, http_client
+        )
 
     return app
 

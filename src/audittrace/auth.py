@@ -191,6 +191,19 @@ ALL_SCOPES: dict[str, str] = {
         "prompts (RLS-enforced) and no access to any other memory "
         "layer."
     ),
+    "memory:chat_projects:read-own": (
+        "Read your own first-class chat-projects from the console-"
+        "chat-projects store (Chat-Projects domain, MongoDB-elimination "
+        "EPIC) — the RLS-isolated store backing LibreChat's chat-project "
+        "groupings of conversations. Grants no access to another user's "
+        "chat-projects or to any other memory layer."
+    ),
+    "memory:chat_projects:write": (
+        "Create/update/delete your own chat-projects in the console-"
+        "chat-projects store (Chat-Projects domain, MongoDB-elimination "
+        "EPIC). Grants no access to another user's chat-projects "
+        "(RLS-enforced) and no access to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

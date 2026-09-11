@@ -668,3 +668,42 @@ class ConsolePromptGroupListResponse(BaseModel):
 
     items: list[ConsolePromptGroupItem] = Field(default_factory=list)
     next_cursor: str | None = None
+
+
+# ── Console-chat-projects (Chat-Projects domain, MongoDB-elimination EPIC) ─
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as the console-conversations/console-
+# presets/console-prompts models above
+# (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleChatProjectUpsertRequest(BaseModel):
+    """Request body for ``POST /console/chat-projects`` — create/update
+    the caller's own chat-project (upsert by ``chat_project_id``)."""
+
+    chat_project_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleChatProjectItem(BaseModel):
+    """One chat-project row, as returned by the console-chat-projects
+    API."""
+
+    chat_project_id: str
+    name: str
+    description: str
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleChatProjectListResponse(BaseModel):
+    """Response from ``GET /console/chat-projects`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleChatProjectItem] = Field(default_factory=list)
+    next_cursor: str | None = None
