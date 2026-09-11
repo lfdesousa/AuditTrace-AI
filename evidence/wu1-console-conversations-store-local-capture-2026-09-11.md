@@ -14,6 +14,8 @@ read shim), mirroring the `wu1-session-layer-narrow-ingest-scope` precedent.
 
 ## 1. Full test-suite run (Rule 1 — Verification)
 
+First pass (before the per-file coverage top-up described in §1a):
+
 ```
 $ make test
 ...
@@ -23,32 +25,51 @@ Required test coverage of 90% reached. Total coverage: 98.36%
 
 (One unrelated pre-existing test — `test_release_bump_files_ssot.py::
 test_make_release_dirties_exactly_the_ssot_set` — failed transiently before
-this commit landed: it spawns a throwaway nested git worktree at `HEAD` but
-reuses THIS worktree's editable-installed venv, so it imported the
+the WU-1 commit landed: it spawns a throwaway nested git worktree at `HEAD`
+but reuses THIS worktree's editable-installed venv, so it imported the
 uncommitted `src/audittrace` tree rather than the nested worktree's own
 checked-out (pre-commit) copy, producing a spurious extra OpenAPI-regen
-diff. Re-ran green after this commit landed — see §1b.)
+diff. Re-ran green after the commit landed:
+`.venv/bin/python -m pytest tests/test_release_bump_files_ssot.py -q --no-cov`
+→ `2 passed`.)
 
-### 1b. Re-run after commit (confirms the transient failure above is resolved)
+The same run also failed the PER-FILE coverage gate on
+`src/audittrace/services/console_conversations.py` (88.45% lines / 63.83%
+branches — the update-existing branches of `upsert_conversation`/
+`upsert_message`/`edit_message`, and one `_decode_cursor` int-parse failure
+path, were untested). §1a adds the missing branch coverage; the corrected
+final run is captured below.
+
+### 1a. Corrected final run (per-file coverage gate PASS)
 
 ```
-$ .venv/bin/python -m pytest tests/test_release_bump_files_ssot.py -q --no-cov
-2 passed
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.78%
+4482 passed, 2 warnings in 524.40s (0:08:44)
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (115 files checked, lines >= 90%, branches >= 90% on 99 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
 ```
 
-New-file coverage (line + branch), from the full run's coverage report:
+New-file coverage (line + branch), isolated run:
 
 ```
-src/audittrace/services/console_conversations.py   329     38     94     22    83%
-src/audittrace/routes/console_conversations.py      (covered via
-  tests/test_console_conversations_routes.py — 33 HTTP-route tests, all pass)
+$ .venv/bin/python -m pytest tests/test_console_conversations_service.py \
+    tests/test_console_conversations_routes.py \
+    --cov=src/audittrace/services/console_conversations \
+    --cov=src/audittrace/routes/console_conversations --cov-report=term-missing -q
+src/audittrace/routes/console_conversations.py    86    0   12    0   100%
+src/audittrace/services/console_conversations.py  329   0   94    0   100%
+91 passed in 20.23s
 ```
 
-The service file's 83% reflects defensive branches inside the Postgres
-implementation's exception-handling / dict-comprehension paths exercised
-indirectly; the abstract-interface + Mock + Postgres CRUD/isolation surface
-is fully covered by the 51 Mock + 27 Postgres unit tests in
-`tests/test_console_conversations_service.py`.
+100% lines AND branches on both new files — the abstract-interface + Mock +
+Postgres CRUD/isolation/update-existing surface is fully covered by the 59
+Mock/Postgres unit tests in `tests/test_console_conversations_service.py`
+plus the 33 HTTP-route tests in `tests/test_console_conversations_routes.py`.
 
 `make lint` (ruff check + ruff format) and `make helm-lint` both green:
 

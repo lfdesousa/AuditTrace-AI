@@ -48,6 +48,13 @@ class TestCursorCodec:
         with pytest.raises(ValueError, match="invalid cursor"):
             _decode_cursor(garbage)
 
+    def test_decode_rejects_non_integer_timestamp(self) -> None:
+        import base64
+
+        garbage = base64.urlsafe_b64encode(b"not-a-number:conv-1").decode("ascii")
+        with pytest.raises(ValueError, match="invalid cursor"):
+            _decode_cursor(garbage)
+
 
 # ── MockConsoleConversationsService ───────────────────────────────────────
 
@@ -94,6 +101,40 @@ class TestMockConsoleConversationsServiceConversations:
 
         items, _ = await service.list_conversations(user_context, limit=10)
         assert len(items) == 1
+
+    async def test_upsert_updates_every_optional_field_on_existing_row(
+        self, user_context
+    ) -> None:
+        """The upsert's update-existing branch updates EACH optional field
+        independently (title omitted/unchanged here; endpoint/model/
+        agent_id/chat_project_id/metadata all changed) — covers every
+        ``if <field> is not None`` branch on the second call."""
+        service = MockConsoleConversationsService()
+        await service.upsert_conversation(
+            user_context,
+            "conv-1",
+            title="A",
+            endpoint="e1",
+            model="m1",
+            agent_id="a1",
+            chat_project_id="p1",
+        )
+        updated = await service.upsert_conversation(
+            user_context,
+            "conv-1",
+            title=None,
+            endpoint="e2",
+            model="m2",
+            agent_id="a2",
+            chat_project_id="p2",
+            metadata={"k": "v"},
+        )
+        assert updated["title"] == "A", "title=None must leave the title unchanged"
+        assert updated["endpoint"] == "e2"
+        assert updated["model"] == "m2"
+        assert updated["agent_id"] == "a2"
+        assert updated["chat_project_id"] == "p2"
+        assert updated["metadata"] == {"k": "v"}
 
     async def test_update_title(self, user_context) -> None:
         service = MockConsoleConversationsService()
@@ -263,6 +304,42 @@ class TestMockConsoleConversationsServiceMessages:
         assert len(rows) == 1
         assert rows[0]["text"] == "v2"
 
+    async def test_upsert_message_updates_every_optional_field_on_existing_row(
+        self, user_context
+    ) -> None:
+        """Same rationale as the conversation-upsert equivalent above —
+        covers each ``if <field> is not None`` branch on the message
+        upsert's update-existing path."""
+        service = MockConsoleConversationsService()
+        await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="user",
+            text="v1",
+            is_created_by_user=True,
+        )
+        updated = await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="assistant",
+            text="v2",
+            is_created_by_user=False,
+            parent_message_id="msg-root",
+            model="gpt-x",
+            endpoint="openAI",
+            token_count=42,
+            error="rate-limited",
+            metadata={"k": "v"},
+        )
+        assert updated["parent_message_id"] == "msg-root"
+        assert updated["model"] == "gpt-x"
+        assert updated["endpoint"] == "openAI"
+        assert updated["token_count"] == 42
+        assert updated["error"] == "rate-limited"
+        assert updated["metadata"] == {"k": "v"}
+
     async def test_message_tree_ordering_is_chronological(self, user_context) -> None:
         service = MockConsoleConversationsService()
         root = await service.upsert_message(
@@ -320,6 +397,28 @@ class TestMockConsoleConversationsServiceMessages:
         )
         assert edited is not None
         assert edited["text"] == "edited"
+
+    async def test_edit_message_metadata_only_leaves_text_unchanged(
+        self, user_context
+    ) -> None:
+        """``text=None`` (the default) must skip the text assignment
+        entirely — covers the ``if text is not None`` False branch —
+        while ``metadata`` alone is still applied."""
+        service = MockConsoleConversationsService()
+        await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="user",
+            text="original",
+            is_created_by_user=True,
+        )
+        edited = await service.edit_message(
+            user_context, "conv-1", "msg-1", metadata={"k": "v"}
+        )
+        assert edited is not None
+        assert edited["text"] == "original"
+        assert edited["metadata"] == {"k": "v"}
 
     async def test_edit_message_missing_returns_none(self, user_context) -> None:
         service = MockConsoleConversationsService()
@@ -444,6 +543,38 @@ class TestPostgresConsoleConversationsServiceConversations:
         items, _ = await service.list_conversations(user_context, limit=10)
         assert len(items) == 1
         assert items[0]["title"] == "B"
+
+    async def test_upsert_updates_every_optional_field_on_existing_row(
+        self, service, user_context
+    ) -> None:
+        """Same rationale as the Mock-service equivalent — covers each
+        ``if <field> is not None`` branch on the update-existing path,
+        against the real (aiosqlite) SQLAlchemy path."""
+        await service.upsert_conversation(
+            user_context,
+            "conv-1",
+            title="A",
+            endpoint="e1",
+            model="m1",
+            agent_id="a1",
+            chat_project_id="p1",
+        )
+        updated = await service.upsert_conversation(
+            user_context,
+            "conv-1",
+            title=None,
+            endpoint="e2",
+            model="m2",
+            agent_id="a2",
+            chat_project_id="p2",
+            metadata={"k": "v"},
+        )
+        assert updated["title"] == "A", "title=None must leave the title unchanged"
+        assert updated["endpoint"] == "e2"
+        assert updated["model"] == "m2"
+        assert updated["agent_id"] == "a2"
+        assert updated["chat_project_id"] == "p2"
+        assert updated["metadata"] == {"k": "v"}
 
     async def test_update_title_missing_returns_none(
         self, service, user_context
@@ -609,6 +740,103 @@ class TestPostgresConsoleConversationsServiceMessages:
         rows = await service.get_messages(user_context, "conv-1")
         assert len(rows) == 1
         assert rows[0]["text"] == "hello"
+
+    async def test_upsert_message_updates_every_optional_field_on_existing_row(
+        self, service, user_context
+    ) -> None:
+        """Same rationale as the Mock-service equivalent — covers each
+        ``if <field> is not None`` branch on the message upsert's
+        update-existing path, against the real (aiosqlite) SQLAlchemy
+        path."""
+        await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="user",
+            text="v1",
+            is_created_by_user=True,
+        )
+        updated = await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="assistant",
+            text="v2",
+            is_created_by_user=False,
+            parent_message_id="msg-root",
+            model="gpt-x",
+            endpoint="openAI",
+            token_count=42,
+            error="rate-limited",
+            metadata={"k": "v"},
+        )
+        assert updated["parent_message_id"] == "msg-root"
+        assert updated["model"] == "gpt-x"
+        assert updated["endpoint"] == "openAI"
+        assert updated["token_count"] == 42
+        assert updated["error"] == "rate-limited"
+        assert updated["metadata"] == {"k": "v"}
+
+        # A THIRD upsert omitting every optional field (defaults None)
+        # must leave the previously-set values untouched — covers the
+        # False branch of each ``if <field> is not None`` on the
+        # update-existing path (the True branch was covered above).
+        unchanged = await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="assistant",
+            text="v3",
+            is_created_by_user=False,
+        )
+        assert unchanged["parent_message_id"] == "msg-root"
+        assert unchanged["model"] == "gpt-x"
+        assert unchanged["endpoint"] == "openAI"
+        assert unchanged["token_count"] == 42
+        assert unchanged["error"] == "rate-limited"
+        assert unchanged["metadata"] == {"k": "v"}
+        assert unchanged["text"] == "v3"
+
+    async def test_upsert_message_failure_raises_runtime_error(
+        self, service, user_context, monkeypatch
+    ) -> None:
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "sqlalchemy.ext.asyncio.AsyncSession.commit",
+            _boom,
+        )
+        with pytest.raises(RuntimeError, match="upsert_message.*failed"):
+            await service.upsert_message(
+                user_context,
+                "conv-1",
+                "msg-1",
+                sender="user",
+                text="x",
+                is_created_by_user=True,
+            )
+
+    async def test_edit_message_metadata_only_leaves_text_unchanged(
+        self, service, user_context
+    ) -> None:
+        """``text=None`` (the default) must skip the text assignment
+        entirely — covers the ``if text is not None`` False branch —
+        while ``metadata`` alone is still applied."""
+        await service.upsert_message(
+            user_context,
+            "conv-1",
+            "msg-1",
+            sender="user",
+            text="original",
+            is_created_by_user=True,
+        )
+        edited = await service.edit_message(
+            user_context, "conv-1", "msg-1", metadata={"k": "v"}
+        )
+        assert edited is not None
+        assert edited["text"] == "original"
+        assert edited["metadata"] == {"k": "v"}
 
     async def test_message_tree_ordering_is_chronological(
         self, service, user_context
