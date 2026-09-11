@@ -1,7 +1,8 @@
 .PHONY: help venv install install-hooks lint security-lint test test-cov test-coverage clean \
        docker-build docker-run k8s-build k8s-install k8s-upgrade k8s-status k8s-template \
        deploy-preflight verify-deploy sync-requirements check-requirements-sync check-pr-body \
-       token-guard sync-dashboards check-dashboard-drift check-retention-drift integration
+       token-guard sync-dashboards check-dashboard-drift check-retention-drift integration \
+       release-bump-files release release-cut
 
 # SPEC #441 — the obs-stack (ADR-028, external docker-compose project) is a
 # sibling checkout, not part of this repo. Its Grafana file-provider dir is a
@@ -355,6 +356,9 @@ openapi-export: ## Regenerate docs/reference/audittrace/openapi.yaml + tests/fix
 	@echo "   docs/reference/audittrace/openapi.yaml"
 	@echo "Commit both alongside the API change so reviewers see the diff."
 
+release-bump-files: ## Print the SSOT release version-bearing file set (scripts/release/version_files.py), space-joined, for shell consumption by `release` below AND `scripts/release/runner.py::BUMP_FILES`. Drift-guarded by tests/test_release_bump_files_ssot.py (SPEC D3).
+	@.venv/bin/python -c "from scripts.release.version_files import BUMP_FILES; print(' '.join(BUMP_FILES))"
+
 release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate OpenAPI snapshot + run drift gate. Usage: make release VERSION=1.0.14. (ADR-055)
 	@if [ -z "$(VERSION)" ]; then \
 		echo "❌ usage: make release VERSION=1.0.14"; \
@@ -372,21 +376,17 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@sed -i 's/$${AUDITTRACE_IMAGE_TAG:-[^}]*}/$${AUDITTRACE_IMAGE_TAG:-$(VERSION)}/g' docker-compose.yml
 	@echo "🔖 bumping .env.ci + .env.dev-real-llm.example AUDITTRACE_IMAGE_TAG → $(VERSION)"
 	@sed -i 's/^AUDITTRACE_IMAGE_TAG=.*/AUDITTRACE_IMAGE_TAG=$(VERSION)/' .env.ci .env.dev-real-llm.example
-	@echo "📝 regenerating OpenAPI snapshot ..."
-	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov >/dev/null
-	@echo "🚦 running drift gate ..."
-	@.venv/bin/pytest tests/test_version_drift.py -q --no-cov
+	@PYTEST="$$( [ -x .venv/bin/pytest ] && echo .venv/bin/pytest || command -v pytest )"; \
+	echo "📝 regenerating OpenAPI snapshot (defensive — no version string embedded today, so this is normally a no-op diff) ..."; \
+	OPENAPI_SNAPSHOT_UPDATE=1 "$$PYTEST" tests/test_openapi_drift.py -q --no-cov >/dev/null; \
+	echo "🚦 running drift gate ..."; \
+	"$$PYTEST" tests/test_version_drift.py -q --no-cov
 	@echo
 	@echo "✅ release-prep done for v$(VERSION). Diff:"
-	@git diff --stat pyproject.toml charts/audittrace/Chart.yaml \
-	    docs/reference/audittrace/openapi.yaml tests/fixtures/openapi.snapshot.yaml README.md \
-	    docker-compose.yml .env.ci .env.dev-real-llm.example
+	@git diff --stat $$($(MAKE) --no-print-directory release-bump-files)
 	@echo
 	@echo "Next steps:"
-	@echo "  1. git add pyproject.toml charts/audittrace/Chart.yaml \\"
-	@echo "         docs/reference/audittrace/openapi.yaml \\"
-	@echo "         tests/fixtures/openapi.snapshot.yaml \\"
-	@echo "         docker-compose.yml .env.ci .env.dev-real-llm.example"
+	@echo "  1. git add $$($(MAKE) --no-print-directory release-bump-files)"
 	@echo "  2. git commit -m 'chore(release): v$(VERSION)'"
 	@echo "  3. open release PR; after merge, tag v$(VERSION) on main"
 	@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"
