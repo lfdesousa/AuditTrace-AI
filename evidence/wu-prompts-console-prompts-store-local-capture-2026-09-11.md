@@ -234,12 +234,15 @@ client block in both realm files is untouched by this change.
 ## 7. Full test-suite run (pre-existing transient + confirmed post-commit green)
 
 ```
-$ .venv/bin/python -m pytest -q
+$ make test
 ...
-4692 passed, 2 failed, ... warnings
+4693 passed, 1 failed, 2 warnings in 498.50s (0:08:18)
 FAILED tests/test_release_bump_files_ssot.py::test_make_release_dirties_exactly_the_ssot_set
-FAILED tests/test_openapi_drift.py::test_openapi_snapshot_matches
 ```
+
+(An earlier full run, before the OpenAPI snapshot was regenerated, also
+showed `test_openapi_drift.py::test_openapi_snapshot_matches` failing —
+expected, since this WU adds new routes/scopes to the schema.)
 
 Both failures are pre-existing/expected-before-regen, same root cause
 documented in WU-1's and WU-presets' own evidence captures:
@@ -265,10 +268,32 @@ documented in WU-1's and WU-presets' own evidence captures:
    (HEAD == working tree, no uncommitted diff for the nested worktree's
    shared venv to leak) — re-confirmed post-commit below.
 
-**Confirmed final run — full suite, post-commit, zero unexpected failures:**
-(see the commit body / PR for the exact post-commit re-run counts, captured
-immediately after the WU-prompts commit landed on this branch, mirroring
-WU-presets' §6 methodology).
+**Confirmed final run — full suite, post-commit (`7495793`), zero failures:**
+
+```
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.84%
+4694 passed, 2 warnings in 516.11s (0:08:36)
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (125 files checked, lines >= 90%, branches >= 90% on 107 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+```
+
+(The 2 warnings are pre-existing, unrelated `RuntimeWarning`s about an
+un-awaited `_flush_pdf_manifest` coroutine in two PDF-manifest tests —
+present on `origin/main` before this change, not introduced by it — same
+as documented in WU-presets' evidence file.)
+
+Targeted confirmation of the specific transient test, run immediately
+post-commit:
+
+```
+$ .venv/bin/python -m pytest tests/test_release_bump_files_ssot.py -q --no-cov
+2 passed in 4.37s
+```
 
 ## 8. What this file does NOT claim
 
