@@ -189,6 +189,25 @@ data:
       "memory:presets:read-own"
     )
 
+    # Mongo-repl WU-prompts (2026-09-11) — the console-prompts store's
+    # write scope. Bound ONLY as OPTIONAL to audittrace-librechat (never
+    # default), in its OWN array/bind loop — same "never auto-granted"
+    # discipline as MEMORY_PRESETS_WRITE_SCOPES above: only the BFF's
+    # console-prompts proxy exchange
+    # (bff/console_prompts_scopes.py::CONSOLE_PROMPTS_SCOPE_STRING)
+    # requests it by name.
+    MEMORY_PROMPTS_WRITE_SCOPES=(
+      "memory:prompts:write"
+    )
+
+    # Mongo-repl WU-prompts (2026-09-11) — the console-prompts store's
+    # read-own scope. Bound as DEFAULT to audittrace-librechat — same
+    # rationale as MEMORY_PRESETS_READ_SCOPES above. Own array/bind
+    # loop, separate from the write array.
+    MEMORY_PROMPTS_READ_SCOPES=(
+      "memory:prompts:read-own"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -274,7 +293,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -434,6 +453,22 @@ data:
     # audittrace-librechat only, as DEFAULT — same rationale as Step 2g.
     echo "▶ binding console-presets read-own scope to client audittrace-librechat (default)..."
     for SCOPE in "${MEMORY_PRESETS_READ_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "default"
+    done
+
+    # ── Step 2j: bind the console-prompts WRITE scope (Mongo-repl WU-prompts) ──
+    # audittrace-librechat only, as OPTIONAL — separate loop, same
+    # discipline as Step 2h. Only the BFF's console-prompts proxy
+    # exchange requests this scope by name.
+    echo "▶ binding console-prompts write scope to client audittrace-librechat (optional)..."
+    for SCOPE in "${MEMORY_PROMPTS_WRITE_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2k: bind the console-prompts READ-OWN scope (Mongo-repl WU-prompts) ──
+    # audittrace-librechat only, as DEFAULT — same rationale as Step 2i.
+    echo "▶ binding console-prompts read-own scope to client audittrace-librechat (default)..."
+    for SCOPE in "${MEMORY_PROMPTS_READ_SCOPES[@]}"; do
       bind_scope "audittrace-librechat" "${SCOPE}" "default"
     done
 

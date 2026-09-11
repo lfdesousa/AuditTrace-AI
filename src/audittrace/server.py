@@ -24,6 +24,7 @@ from audittrace.routes.console_conversations import (
     router as console_conversations_router,
 )
 from audittrace.routes.console_presets import router as console_presets_router
+from audittrace.routes.console_prompts import router as console_prompts_router
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
@@ -784,6 +785,15 @@ def create_app() -> FastAPI:
         console_presets_router,
         prefix="/console/presets",
         tags=["console-presets"],
+    )
+    # WU-prompts (MongoDB-elimination EPIC) — the console-prompts
+    # store's REST surface (group CRUD + nested versions/production),
+    # RLS-isolated by the caller's token sub. Additive-only, distinct
+    # from /memory/*, /console/conversations, and /console/presets.
+    app.include_router(
+        console_prompts_router,
+        prefix="/console/prompts",
+        tags=["console-prompts"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

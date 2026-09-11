@@ -609,3 +609,149 @@ class ConsolePreset(Base):
             "user_sub", "preset_id", name="uq_console_presets_user_preset"
         ),
     )
+
+
+class ConsolePromptGroup(Base):
+    """The ``console_prompt_groups`` store — WU-prompts of the MongoDB-
+    elimination EPIC (migration 025): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``PromptGroup``
+    collection (``packages/data-schemas/src/schema/promptGroup.ts``).
+
+    Model shape RESOLVED per the ratified spec's design note: LibreChat
+    ships TWO Mongo collections (``PromptGroup`` + ``Prompt``, one row
+    per version); this is modelled here the same way console-
+    conversations models convo/message — a group row
+    (:class:`ConsolePromptGroup`) plus one row per prompt VERSION
+    (:class:`ConsolePromptVersion`), linked by the client-supplied
+    string ``group_id`` (mirrors :attr:`ConsoleMessage.conversation_id`
+    — no hard SQLAlchemy ``ForeignKey``, since the isolation invariant
+    that matters is ``(user_sub, group_id)``/``(user_sub, prompt_id)``,
+    not a database-level cascade). This preserves LibreChat's
+    versioning + ``productionId`` semantics: each edit is a NEW,
+    immutable version row, and ``production_prompt_id`` below points at
+    whichever version is "live" — exactly like ``PromptGroup
+    .productionId`` referencing a specific ``Prompt`` document.
+
+    ``group_id`` is CLIENT-SUPPLIED (LibreChat mints its own, not an
+    ObjectId) — the internal PK ``id`` is a separate server-generated
+    UUID so ``group_id`` collisions across users can coexist,
+    disambiguated only by ``(user_sub, group_id)`` (the unique
+    constraint below) — same pattern as
+    :attr:`ConsoleConversation.conversation_id`.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 025, mirrors migration 023's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsolePromptsService`` additionally filters every query
+    by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+
+    ``author``/``authorName`` on the fork's schema are not modelled as
+    separate columns here — in this single-tenant-per-user store the
+    owning ``user_sub`` already IS the sole author (no cross-user
+    sharing of a prompt group exists), so promoting a redundant author
+    column would carry no isolation or query benefit (same rationale
+    as :class:`ConsolePreset` declining to widen its ``data`` blob into
+    typed columns).
+    """
+
+    __tablename__ = "console_prompt_groups"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    group_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    category: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    oneliner: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    command: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Client-supplied `prompt_id` of the version currently marked
+    # "production" for this group (LibreChat's `PromptGroup.productionId`).
+    # Plain string, not a FK — same rationale as `group_id` above; the
+    # service layer verifies the target version exists AND belongs to
+    # this (user_sub, group_id) before ever writing this column.
+    production_prompt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleConversation.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversation.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "group_id", name="uq_console_prompt_groups_user_group"
+        ),
+    )
+
+
+class ConsolePromptVersion(Base):
+    """The ``console_prompt_versions`` store — WU-prompts of the
+    MongoDB-elimination EPIC (migration 025): the per-version rows a
+    prompt group's history is built from (LibreChat's Mongo ``Prompt``
+    collection, ``prompt.ts`` — one document per version, ``groupId``
+    FK + ``type`` ``text``/``chat``).
+
+    ``group_id`` is a plain string column (the same client-supplied key
+    as :attr:`ConsolePromptGroup.group_id`), not a hard SQLAlchemy
+    ``ForeignKey`` — same rationale as :attr:`ConsoleMessage
+    .conversation_id`: the practical uniqueness constraint that matters
+    for RLS isolation is ``(user_sub, prompt_id)`` below, and the
+    service layer always filters by ``user_sub`` AND ``group_id``
+    together when listing a group's versions, so an orphaned
+    ``group_id`` is a not-found, not a leak.
+
+    Immutable-by-convention: each edit the caller makes is a NEW
+    version row (the ``upsert_version`` service method updates an
+    EXISTING row only when the caller re-submits the SAME ``prompt_id``
+    — same idempotent-upsert-by-client-id shape as every other Mongo-
+    repl WU, not a "create a new version on every PATCH" free-for-all).
+
+    Same RLS + explicit-filter discipline as :class:`ConsolePromptGroup`
+    above.
+    """
+
+    __tablename__ = "console_prompt_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    prompt_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    group_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # LibreChat's Prompt.type enum — enforced at the Pydantic request-
+    # model layer (Literal["text", "chat"]), stored here as a plain
+    # string column (same portability rationale as every enum-shaped
+    # column in this module — SQLite has no native CHECK-enum type
+    # worth fighting).
+    type: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
+    # 1-based, monotonically increasing per (user_sub, group_id) —
+    # assigned by the service at creation (max existing + 1), never
+    # caller-supplied (a hostile caller cannot renumber another
+    # version by racing this field in the request body — no such field
+    # exists on the upsert-version request model).
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsolePromptGroup.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "prompt_id", name="uq_console_prompt_versions_user_prompt"
+        ),
+    )
