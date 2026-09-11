@@ -23,6 +23,7 @@ from sqlalchemy import (
     CHAR,
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -416,3 +417,128 @@ class SessionMemoryItem(Base):
     # W3C-traceparent-derived trace_id from the originating request, when
     # a span is active — same convention as MemoryItem.trace_id.
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+# JSONB on Postgres, plain JSON (TEXT under the hood) on SQLite — same
+# portability rationale as ``_PdfWarningsType`` above, reused generically
+# for the console-conversations ``metadata`` columns below (WU-1,
+# MongoDB-elimination EPIC).
+_ConsoleMetadataType = JSON().with_variant(JSONB(), "postgresql")
+
+
+class ConsoleConversation(Base):
+    """The ``console_conversations`` store — WU-1 of the MongoDB-
+    elimination EPIC (migration 023): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Conversation``
+    collection (``packages/data-schemas/src/schema/convo.ts``).
+
+    ``conversation_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its
+    own, not an ObjectId) — the internal PK ``id`` is a separate
+    server-generated UUID so ``conversation_id`` collisions across users
+    (two different subs both minting the same client id) can coexist,
+    disambiguated only by ``(user_sub, conversation_id)`` — see the
+    unique constraint below.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 023, mirrors migration 022's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id', true)``.
+    On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleConversationsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+
+    Distinct from the existing ``conversational`` layer
+    (``PostgresConversationalService`` / ``SessionRecord``): that table
+    stores ONE per-session SUMMARY, not a message tree — see the WU-1
+    spec's "EPIC CORRECTION" for why a new store was needed rather than
+    reusing it.
+    """
+
+    __tablename__ = "console_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    conversation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="New Chat")
+    endpoint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_temporary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    agent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Reserved for the later chat-projects domain (DESIGN §WU breakdown,
+    # not built here) — carried now so a future migration doesn't need to
+    # widen this table's shape again.
+    chat_project_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as MemoryItem.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # SessionMemoryItem.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "conversation_id", name="uq_console_conversations_user_convo"
+        ),
+    )
+
+
+class ConsoleMessage(Base):
+    """The ``console_messages`` store — WU-1 of the MongoDB-elimination
+    EPIC (migration 023): the message-tree rows a conversation's
+    ``parent_message_id`` chain reconstructs (LibreChat's Mongo
+    ``Message`` collection, ``message.ts``).
+
+    ``conversation_id`` is a plain string column (the same client-
+    supplied key as ``ConsoleConversation.conversation_id``), not a hard
+    SQLAlchemy ``ForeignKey`` — the practical uniqueness constraint that
+    matters for RLS isolation is ``(user_sub, message_id)`` below, and a
+    composite FK against ``(user_sub, conversation_id)`` would add
+    migration complexity for no isolation benefit (the service layer
+    always filters by ``user_sub`` AND ``conversation_id`` together, so
+    an orphaned ``conversation_id`` is a not-found, not a leak).
+
+    Same RLS + explicit-filter discipline as :class:`ConsoleConversation`
+    above.
+    """
+
+    __tablename__ = "console_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # The tree link — NULL for the first message in a conversation.
+    parent_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sender: Mapped[str] = mapped_column(String(64), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_created_by_user: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    endpoint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id (EU AI Act Art 12 traceability).
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub", "message_id", name="uq_console_messages_user_message"
+        ),
+    )

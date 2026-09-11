@@ -150,6 +150,20 @@ ALL_SCOPES: dict[str, str] = {
     "memory:conversational:read-own": (
         "Read your own past conversations from the conversational layer"
     ),
+    "memory:conversations:read-own": (
+        "Read your own conversations + messages from the console-"
+        "conversations store (WU-1, MongoDB-elimination EPIC) — the "
+        "RLS-isolated, message-tree-shaped store backing LibreChat's "
+        "sidebar/history. Distinct from memory:conversational:read-own, "
+        "which reads the older per-session SUMMARY layer, not a message "
+        "tree."
+    ),
+    "memory:conversations:write": (
+        "Create/update/delete your own conversations + messages in the "
+        "console-conversations store (WU-1, MongoDB-elimination EPIC). "
+        "Grants no access to another user's conversations or messages "
+        "(RLS-enforced) and no access to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

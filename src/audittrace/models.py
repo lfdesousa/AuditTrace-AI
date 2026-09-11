@@ -438,3 +438,109 @@ class ConversationalDetailResponse(BaseModel):
     session: ConversationalSessionItem
     interactions: list[ConversationalDetailInteraction] = Field(default_factory=list)
     total: int = 0
+
+
+# ── Console-conversations (WU-1, MongoDB-elimination EPIC) ──────────────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on any request
+# model below — the route layer stamps ``user_sub`` from the resolved
+# ``UserContext`` (token-derived), never from the request body
+# (feedback_never_trust_caller_metadata_for_security_fields). Pydantic's
+# default ``extra="ignore"`` means a hostile caller sending a
+# ``user_sub``/``user_id`` JSON key is silently dropped during parsing —
+# there is no field on these models it could bind to.
+
+
+class ConsoleConversationUpsertRequest(BaseModel):
+    """Request body for ``POST /console/conversations`` — create/update
+    the caller's own conversation (upsert by ``conversation_id``)."""
+
+    conversation_id: str = Field(..., min_length=1, max_length=255)
+    title: str | None = Field(default=None, max_length=512)
+    endpoint: str | None = Field(default=None, max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    is_temporary: bool = False
+    agent_id: str | None = Field(default=None, max_length=255)
+    chat_project_id: str | None = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTitleUpdateRequest(BaseModel):
+    """Request body for ``PATCH /console/conversations/{conversation_id}``."""
+
+    title: str = Field(..., min_length=1, max_length=512)
+
+
+class ConsoleConversationItem(BaseModel):
+    """One conversation row, as returned by the console-conversations API."""
+
+    conversation_id: str
+    title: str
+    endpoint: str | None = None
+    model: str | None = None
+    is_temporary: bool = False
+    agent_id: str | None = None
+    chat_project_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationListResponse(BaseModel):
+    """Response from ``GET /console/conversations`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleConversationItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleMessageUpsertRequest(BaseModel):
+    """Request body for
+    ``POST /console/conversations/{conversation_id}/messages`` —
+    create/update the caller's own message (upsert by ``message_id``)."""
+
+    message_id: str = Field(..., min_length=1, max_length=255)
+    parent_message_id: str | None = Field(default=None, max_length=255)
+    sender: str = Field(..., min_length=1, max_length=64)
+    text: str
+    is_created_by_user: bool
+    model: str | None = Field(default=None, max_length=128)
+    endpoint: str | None = Field(default=None, max_length=64)
+    token_count: int | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleMessageEditRequest(BaseModel):
+    """Request body for
+    ``PATCH /console/conversations/{conversation_id}/messages/{message_id}``.
+    Both fields optional — only the ones supplied are updated."""
+
+    text: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class ConsoleMessageItem(BaseModel):
+    """One message row, as returned by the console-conversations API."""
+
+    message_id: str
+    conversation_id: str
+    parent_message_id: str | None = None
+    sender: str
+    text: str
+    is_created_by_user: bool
+    model: str | None = None
+    endpoint: str | None = None
+    token_count: int | None = None
+    error: str | None = None
+    created_at_ms: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleMessageListResponse(BaseModel):
+    """Response from
+    ``GET /console/conversations/{conversation_id}/messages`` — the full
+    message tree, chronological (``created_at_ms`` ASC)."""
+
+    items: list[ConsoleMessageItem] = Field(default_factory=list)
