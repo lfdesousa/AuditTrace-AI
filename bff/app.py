@@ -1,16 +1,18 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Seven routes matter: ``POST /v1/chat/completions``, the proxy target
+Eight routes matter: ``POST /v1/chat/completions``, the proxy target
 LibreChat's custom endpoint config points at; ``GET/POST/PUT/DELETE
 /memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1);
 ``POST /console/files``, the console's narrow-scope ephemeral file-ingest
 entry (M3 Sovereign-Attach WU-2); ``POST /console/files/{filename}/
 promote``, the "keep this" durable-promote entry (M3 Sovereign-Attach
 WU-4); ``GET/POST/PATCH/DELETE /console/conversations[/{path}]``, the
-console-conversations proxy (WU-1, MongoDB-elimination EPIC); and
+console-conversations proxy (WU-1, MongoDB-elimination EPIC);
 ``GET/POST/DELETE /console/presets[/{path}]``, the console-presets proxy
-(Mongo-repl WU-presets, MongoDB-elimination EPIC). ``GET /health`` is
-the k8s-probe convenience every AuditTrace deployable carries.
+(Mongo-repl WU-presets, MongoDB-elimination EPIC); and
+``GET/POST/PATCH/DELETE /console/prompts[/{path}]``, the console-prompts
+proxy (Mongo-repl WU-prompts, MongoDB-elimination EPIC). ``GET /health``
+is the k8s-probe convenience every AuditTrace deployable carries.
 
 All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
@@ -41,6 +43,10 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    scopes; the console-presets proxy exchanges explicitly for
    ``bff.console_presets_scopes.CONSOLE_PRESETS_SCOPE_STRING``
    (``memory:presets:read-own`` + ``memory:presets:write``) — a FIFTH,
+   distinct exchange, own scope pair, never any other route's scopes;
+   the console-prompts proxy exchanges explicitly for
+   ``bff.console_prompts_scopes.CONSOLE_PROMPTS_SCOPE_STRING``
+   (``memory:prompts:read-own`` + ``memory:prompts:write``) — a SIXTH,
    distinct exchange, own scope pair, never any other route's scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
@@ -87,6 +93,11 @@ from bff.console_presets_proxy import (
 )
 from bff.console_presets_scopes import CONSOLE_PRESETS_SCOPE_STRING
 from bff.console_promote_scopes import promote_scope_string_for_layer
+from bff.console_prompts_proxy import (
+    ConsolePromptsProxyError,
+    proxy_console_prompts_request,
+)
+from bff.console_prompts_scopes import CONSOLE_PROMPTS_SCOPE_STRING
 from bff.exchange import TokenExchangeError, exchange_token
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
@@ -603,6 +614,102 @@ def create_app() -> FastAPI:
         MongoDB-elimination EPIC) — ``{preset_id}``. See
         ``_console_presets_proxy_impl`` for the shared shape."""
         return await _console_presets_proxy_impl(path, request, settings, http_client)
+
+    async def _console_prompts_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-prompts routes below (the base
+        path with no suffix, and the ``{path:path}`` catch-all) — same
+        shape as ``_console_presets_proxy_impl`` above, but exchanges
+        for ``CONSOLE_PROMPTS_SCOPE_STRING`` and forwards to the
+        orchestrator's ``/console/prompts`` mount (Mongo-repl
+        WU-prompts, MongoDB-elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/prompts request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_PROMPTS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-prompts token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_prompts_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsolePromptsProxyError as exc:
+            logger.error("orchestrator /console/prompts unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/prompts",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_prompts_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-prompts list-groups/create-group entry (Mongo-repl
+        WU-prompts, MongoDB-elimination EPIC) — no path suffix. See
+        ``_console_prompts_proxy_impl`` for the shared shape."""
+        return await _console_prompts_proxy_impl("", request, settings, http_client)
+
+    @app.api_route(
+        "/console/prompts/{path:path}",
+        methods=["GET", "POST", "PATCH", "DELETE"],
+        response_model=None,
+    )
+    async def console_prompts_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-prompts per-resource entry (Mongo-repl WU-prompts,
+        MongoDB-elimination EPIC) — ``{group_id}``,
+        ``{group_id}/versions``, ``{group_id}/production``. See
+        ``_console_prompts_proxy_impl`` for the shared shape."""
+        return await _console_prompts_proxy_impl(path, request, settings, http_client)
 
     return app
 

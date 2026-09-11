@@ -521,6 +521,260 @@ components:
       - preset_id
       title: ConsolePresetUpsertRequest
       type: object
+    ConsolePromptGroupItem:
+      description: 'One prompt-group row (summary shape, no versions), as returned
+
+        by the list-groups API.'
+      properties:
+        category:
+          title: Category
+          type: string
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        oneliner:
+          title: Oneliner
+          type: string
+        production_prompt_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Production Prompt Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - group_id
+      - name
+      - category
+      - oneliner
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptGroupItem
+      type: object
+    ConsolePromptGroupListResponse:
+      description: 'Response from ``GET /console/prompts`` — cursor-paginated,
+
+        newest-first, summary shape (no versions per row).'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsolePromptGroupItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsolePromptGroupListResponse
+      type: object
+    ConsolePromptGroupUpsertRequest:
+      description: 'Request body for ``POST /console/prompts`` — create/update the
+
+        caller''s own prompt group (upsert by ``group_id``).'
+      properties:
+        category:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Category
+        command:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Command
+        group_id:
+          maxLength: 255
+          minLength: 1
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+        oneliner:
+          anyOf:
+          - maxLength: 4096
+            type: string
+          - type: 'null'
+          title: Oneliner
+      required:
+      - group_id
+      - name
+      title: ConsolePromptGroupUpsertRequest
+      type: object
+    ConsolePromptGroupWithVersionsItem:
+      description: 'The full group shape, INCLUDING its version history — returned
+
+        by ``GET /console/prompts/{group_id}`` and
+
+        ``PATCH /console/prompts/{group_id}/production``.'
+      properties:
+        category:
+          title: Category
+          type: string
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        oneliner:
+          title: Oneliner
+          type: string
+        production_prompt_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Production Prompt Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        versions:
+          items:
+            $ref: '#/components/schemas/ConsolePromptVersionItem'
+          title: Versions
+          type: array
+      required:
+      - group_id
+      - name
+      - category
+      - oneliner
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptGroupWithVersionsItem
+      type: object
+    ConsolePromptSetProductionRequest:
+      description: 'Request body for ``PATCH /console/prompts/{group_id}/production``
+
+        — mark ``prompt_id`` (an existing version of the group) as the
+
+        group''s production version.'
+      properties:
+        prompt_id:
+          maxLength: 255
+          minLength: 1
+          title: Prompt Id
+          type: string
+      required:
+      - prompt_id
+      title: ConsolePromptSetProductionRequest
+      type: object
+    ConsolePromptVersionItem:
+      description: One prompt-version row, as returned by the console-prompts API.
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        group_id:
+          title: Group Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        prompt_id:
+          title: Prompt Id
+          type: string
+        text:
+          title: Text
+          type: string
+        type:
+          title: Type
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+        version:
+          title: Version
+          type: integer
+      required:
+      - prompt_id
+      - group_id
+      - text
+      - type
+      - version
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePromptVersionItem
+      type: object
+    ConsolePromptVersionUpsertRequest:
+      description: 'Request body for ``POST /console/prompts/{group_id}/versions`` —
+
+        create/update the caller''s own prompt version (upsert by
+
+        ``prompt_id``) attached to ``group_id``.'
+      properties:
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        prompt_id:
+          maxLength: 255
+          minLength: 1
+          title: Prompt Id
+          type: string
+        text:
+          minLength: 1
+          title: Text
+          type: string
+        type:
+          default: text
+          enum:
+          - text
+          - chat
+          title: Type
+          type: string
+      required:
+      - prompt_id
+      - text
+      title: ConsolePromptVersionUpsertRequest
+      type: object
     ContextBuildResponse:
       description: Response schema for /context endpoint (4-layer assembled context).
       properties:
@@ -1322,6 +1576,12 @@ components:
               memory layer.
             memory:procedural:read: Read procedural-layer (SKILL-style) documents
             memory:procedural:write: Create/update/delete procedural-layer documents
+            memory:prompts:read-own: Read your own saved prompt groups + versions from the console-prompts store (Mongo-repl
+              WU-prompts, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's saved prompts. Grants no
+              access to another user's prompts or to any other memory layer.
+            memory:prompts:write: Create/update/delete your own prompt groups + versions in the console-prompts store (Mongo-repl
+              WU-prompts, MongoDB-elimination EPIC). Grants no access to another user's prompts (RLS-enforced) and no access
+              to any other memory layer.
             memory:semantic:read: Read semantic-layer (vector) documents
             memory:semantic:write: Create/update/delete semantic-layer documents
             memory:session:read-own: Read your own recently attached files/notes from the per-user EPHEMERAL session memory
@@ -1867,6 +2127,240 @@ paths:
       summary: Get Preset
       tags:
       - console-presets
+  /console/prompts:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) prompt groups, newest-first,
+
+        cursor-paginated (summary shape, no versions per row). Never
+
+        returns another user''s group — RLS plus the service''s own explicit
+
+        ``user_sub`` filter.'
+      operationId: list_groups_console_prompts_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:read-own
+      summary: List Groups
+      tags:
+      - console-prompts
+    post:
+      description: 'Create or update the CALLER''s OWN prompt group (upsert by
+
+        ``group_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_group_console_prompts_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptGroupUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Upsert Group
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN prompt group AND its versions. 404
+
+        if not found/not owned/already deleted.'
+      operationId: delete_group_console_prompts__group_id__delete
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Delete Group
+      tags:
+      - console-prompts
+    get:
+      description: 'Fetch the CALLER''s OWN prompt group INCLUDING its full version
+
+        history. 404 if it doesn''t exist, is deleted, or belongs to
+
+        another user — never 403 (would leak existence to a caller probing
+
+        foreign group ids).'
+      operationId: get_group_console_prompts__group_id__get
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupWithVersionsItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:read-own
+      summary: Get Group
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}/production:
+    patch:
+      description: 'Mark ``body.prompt_id`` as the production version of the
+
+        CALLER''s OWN ``group_id``. 404 if the group doesn''t exist/isn''t
+
+        owned, OR the named version doesn''t exist/isn''t owned/doesn''t
+
+        belong to this group — a hostile caller can never point
+
+        ``production_prompt_id`` at another user''s version or at a
+
+        version from a different group.'
+      operationId: set_production_console_prompts__group_id__production_patch
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptSetProductionRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptGroupWithVersionsItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Set Production
+      tags:
+      - console-prompts
+  /console/prompts/{group_id}/versions:
+    post:
+      description: 'Create or update the CALLER''s OWN prompt version (upsert by
+
+        ``prompt_id``), attached to the CALLER''s OWN ``group_id``. 404 if
+
+        the group doesn''t exist/isn''t owned by the caller — a hostile
+
+        caller can never attach a version to another user''s group by
+
+        guessing its ``group_id``.'
+      operationId: upsert_version_console_prompts__group_id__versions_post
+      parameters:
+      - in: path
+        name: group_id
+        required: true
+        schema:
+          title: Group Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePromptVersionUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePromptVersionItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:prompts:write
+      summary: Upsert Version
+      tags:
+      - console-prompts
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.

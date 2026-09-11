@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     # "one place to override" rationale as
     # ``orchestrator_console_conversations_path_prefix`` above.
     orchestrator_console_presets_path_prefix: str = "/console/presets"
+    # Mongo-repl WU-prompts (MongoDB-elimination EPIC) — the console-
+    # prompts store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_prompts.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_presets_path_prefix`` above.
+    orchestrator_console_prompts_path_prefix: str = "/console/prompts"
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

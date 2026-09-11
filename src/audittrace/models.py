@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -580,4 +580,91 @@ class ConsolePresetListResponse(BaseModel):
     newest-first."""
 
     items: list[ConsolePresetItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+# ── Console-prompts (Mongo-repl WU-prompts, MongoDB-elimination EPIC) ────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on any request
+# model below — same rationale as the console-conversations/console-
+# presets models above (feedback_never_trust_caller_metadata_for_security_fields).
+# Model shape mirrors console-conversations' group+child-rows split
+# (group ~ ConsoleConversation, version ~ ConsoleMessage) — see
+# services/console_prompts.py's module docstring for the full
+# LibreChat-PromptGroup/Prompt design-note rationale.
+
+
+class ConsolePromptGroupUpsertRequest(BaseModel):
+    """Request body for ``POST /console/prompts`` — create/update the
+    caller's own prompt group (upsert by ``group_id``)."""
+
+    group_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    category: str | None = Field(default=None, max_length=128)
+    oneliner: str | None = Field(default=None, max_length=4096)
+    command: str | None = Field(default=None, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptVersionUpsertRequest(BaseModel):
+    """Request body for ``POST /console/prompts/{group_id}/versions`` —
+    create/update the caller's own prompt version (upsert by
+    ``prompt_id``) attached to ``group_id``."""
+
+    prompt_id: str = Field(..., min_length=1, max_length=255)
+    text: str = Field(..., min_length=1)
+    type: Literal["text", "chat"] = "text"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptSetProductionRequest(BaseModel):
+    """Request body for ``PATCH /console/prompts/{group_id}/production``
+    — mark ``prompt_id`` (an existing version of the group) as the
+    group's production version."""
+
+    prompt_id: str = Field(..., min_length=1, max_length=255)
+
+
+class ConsolePromptVersionItem(BaseModel):
+    """One prompt-version row, as returned by the console-prompts API."""
+
+    prompt_id: str
+    group_id: str
+    text: str
+    type: str
+    version: int
+    created_at_ms: int
+    updated_at_ms: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptGroupItem(BaseModel):
+    """One prompt-group row (summary shape, no versions), as returned
+    by the list-groups API."""
+
+    group_id: str
+    name: str
+    category: str
+    oneliner: str
+    command: str | None = None
+    production_prompt_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePromptGroupWithVersionsItem(ConsolePromptGroupItem):
+    """The full group shape, INCLUDING its version history — returned
+    by ``GET /console/prompts/{group_id}`` and
+    ``PATCH /console/prompts/{group_id}/production``."""
+
+    versions: list[ConsolePromptVersionItem] = Field(default_factory=list)
+
+
+class ConsolePromptGroupListResponse(BaseModel):
+    """Response from ``GET /console/prompts`` — cursor-paginated,
+    newest-first, summary shape (no versions per row)."""
+
+    items: list[ConsolePromptGroupItem] = Field(default_factory=list)
     next_cursor: str | None = None

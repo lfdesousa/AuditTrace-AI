@@ -177,6 +177,20 @@ ALL_SCOPES: dict[str, str] = {
         "Grants no access to another user's presets (RLS-enforced) and "
         "no access to any other memory layer."
     ),
+    "memory:prompts:read-own": (
+        "Read your own saved prompt groups + versions from the "
+        "console-prompts store (Mongo-repl WU-prompts, MongoDB-"
+        "elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's saved prompts. Grants no access to another "
+        "user's prompts or to any other memory layer."
+    ),
+    "memory:prompts:write": (
+        "Create/update/delete your own prompt groups + versions in "
+        "the console-prompts store (Mongo-repl WU-prompts, MongoDB-"
+        "elimination EPIC). Grants no access to another user's "
+        "prompts (RLS-enforced) and no access to any other memory "
+        "layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "
