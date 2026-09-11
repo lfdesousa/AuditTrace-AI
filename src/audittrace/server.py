@@ -20,6 +20,9 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes.console_chat_projects import (
+    router as console_chat_projects_router,
+)
 from audittrace.routes.console_conversations import (
     router as console_conversations_router,
 )
@@ -794,6 +797,16 @@ def create_app() -> FastAPI:
         console_prompts_router,
         prefix="/console/prompts",
         tags=["console-prompts"],
+    )
+    # Chat-Projects domain (MongoDB-elimination EPIC) — the console-
+    # chat-projects store's REST surface (create/list/get/delete),
+    # RLS-isolated by the caller's token sub. Additive-only, distinct
+    # from /memory/*, /console/conversations, /console/presets, and
+    # /console/prompts.
+    app.include_router(
+        console_chat_projects_router,
+        prefix="/console/chat-projects",
+        tags=["console-chat-projects"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

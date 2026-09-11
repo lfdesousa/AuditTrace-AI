@@ -150,6 +150,89 @@ components:
       - file
       title: Body_upload_memory_file_memory_upload_post
       type: object
+    ConsoleChatProjectItem:
+      description: 'One chat-project row, as returned by the console-chat-projects
+
+        API.'
+      properties:
+        chat_project_id:
+          title: Chat Project Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          title: Name
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - chat_project_id
+      - name
+      - description
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleChatProjectItem
+      type: object
+    ConsoleChatProjectListResponse:
+      description: 'Response from ``GET /console/chat-projects`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleChatProjectItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleChatProjectListResponse
+      type: object
+    ConsoleChatProjectUpsertRequest:
+      description: 'Request body for ``POST /console/chat-projects`` — create/update
+
+        the caller''s own chat-project (upsert by ``chat_project_id``).'
+      properties:
+        chat_project_id:
+          maxLength: 255
+          minLength: 1
+          title: Chat Project Id
+          type: string
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+      required:
+      - chat_project_id
+      - name
+      title: ConsoleChatProjectUpsertRequest
+      type: object
     ConsoleConversationItem:
       description: One conversation row, as returned by the console-conversations API.
       properties:
@@ -1544,6 +1627,12 @@ components:
             audittrace:query: Issue chat completions and inference queries
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
+            memory:chat_projects:read-own: Read your own first-class chat-projects from the console-chat-projects store (Chat-Projects
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's chat-project groupings of conversations.
+              Grants no access to another user's chat-projects or to any other memory layer.
+            memory:chat_projects:write: Create/update/delete your own chat-projects in the console-chat-projects store (Chat-Projects
+              domain, MongoDB-elimination EPIC). Grants no access to another user's chat-projects (RLS-enforced) and no access
+              to any other memory layer.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
             memory:conversations:read-own: Read your own conversations + messages from the console-conversations store (WU-1,
               MongoDB-elimination EPIC) — the RLS-isolated, message-tree-shaped store backing LibreChat's sidebar/history.
@@ -1660,6 +1749,146 @@ paths:
       summary: Create Assessment
       tags:
       - audit
+  /console/chat-projects:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) chat-projects, newest-first,
+
+        cursor-paginated. Never returns another user''s chat-project — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_chat_projects_console_chat_projects_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:read-own
+      summary: List Chat Projects
+      tags:
+      - console-chat-projects
+    post:
+      description: 'Create or update the CALLER''s OWN chat-project (upsert by
+
+        ``chat_project_id``). ``user_sub`` is stamped from ``user`` — the
+
+        body carries no such field to override it with.'
+      operationId: upsert_chat_project_console_chat_projects_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleChatProjectUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:write
+      summary: Upsert Chat Project
+      tags:
+      - console-chat-projects
+  /console/chat-projects/{chat_project_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN chat-project. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_chat_project_console_chat_projects__chat_project_id__delete
+      parameters:
+      - in: path
+        name: chat_project_id
+        required: true
+        schema:
+          title: Chat Project Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:write
+      summary: Delete Chat Project
+      tags:
+      - console-chat-projects
+    get:
+      description: 'Fetch the CALLER''s OWN chat-project. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign chat-project ids).'
+      operationId: get_chat_project_console_chat_projects__chat_project_id__get
+      parameters:
+      - in: path
+        name: chat_project_id
+        required: true
+        schema:
+          title: Chat Project Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleChatProjectItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:chat_projects:read-own
+      summary: Get Chat Project
+      tags:
+      - console-chat-projects
   /console/conversations:
     get:
       description: 'List the CALLER''s OWN (non-deleted) conversations, newest-first,
