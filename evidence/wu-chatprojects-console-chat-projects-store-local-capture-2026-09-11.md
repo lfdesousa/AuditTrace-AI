@@ -215,11 +215,35 @@ no edit in this WU touches that client's block in either realm file.
 
 ## 6. Post-commit re-run (the release-bump-files transient resolves)
 
-To be run immediately after the WU-chat-projects commit lands on this branch — HEAD then
-equals the working tree, so the nested throwaway worktree the
+Run immediately after the WU-chat-projects commit (`c95d46e`) landed on this branch —
+HEAD now equals the working tree, so the nested throwaway worktree the
 `test_release_bump_files_ssot` test spawns checks out the SAME (committed) source the
-shared editable `.venv` resolves to, and the spurious extra OpenAPI-regen diff disappears
-(same mechanism confirmed at WU-1/WU-presets/WU-prompts).
+shared editable `.venv` resolves to, and the spurious extra OpenAPI-regen diff
+disappears (same mechanism confirmed at WU-1/WU-presets/WU-prompts):
+
+```
+$ .venv/bin/python -m pytest tests/test_release_bump_files_ssot.py -q --no-cov
+2 passed in 4.75s
+```
+
+**Confirmed final run — full suite + per-file gate, post-commit (`c95d46e`), zero
+failures:**
+
+```
+$ make test
+...
+Required test coverage of 90% reached. Total coverage: 98.86%
+4782 passed, 2 warnings in 653.83s (0:10:53)
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (129 files checked, lines >= 90%, branches >= 90% on 110 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+```
+
+(The 2 warnings are pre-existing, unrelated `RuntimeWarning`s about an un-awaited
+`_flush_pdf_manifest` coroutine in two PDF-manifest tests — present before this change,
+not introduced by it.)
 
 ## 7. What this file does NOT claim
 
