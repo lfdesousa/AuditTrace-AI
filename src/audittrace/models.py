@@ -544,3 +544,40 @@ class ConsoleMessageListResponse(BaseModel):
     message tree, chronological (``created_at_ms`` ASC)."""
 
     items: list[ConsoleMessageItem] = Field(default_factory=list)
+
+
+# ── Console-presets (WU-presets, MongoDB-elimination EPIC) ───────────────
+#
+# Deliberately carry NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as the console-conversations models
+# above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsolePresetUpsertRequest(BaseModel):
+    """Request body for ``POST /console/presets`` — create/update the
+    caller's own preset (upsert by ``preset_id``)."""
+
+    preset_id: str = Field(..., min_length=1, max_length=255)
+    title: str | None = Field(default=None, max_length=512)
+    data: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePresetItem(BaseModel):
+    """One preset row, as returned by the console-presets API."""
+
+    preset_id: str
+    title: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsolePresetListResponse(BaseModel):
+    """Response from ``GET /console/presets`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsolePresetItem] = Field(default_factory=list)
+    next_cursor: str | None = None

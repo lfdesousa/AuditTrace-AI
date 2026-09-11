@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     # override" rationale as ``orchestrator_memory_path_prefix`` above —
     # a frozen API contract, not a target-shaped value.
     orchestrator_console_conversations_path_prefix: str = "/console/conversations"
+    # Mongo-repl WU-presets (MongoDB-elimination EPIC) — the console-
+    # presets store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_presets.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_conversations_path_prefix`` above.
+    orchestrator_console_presets_path_prefix: str = "/console/presets"
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

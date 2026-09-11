@@ -441,6 +441,86 @@ components:
       - is_created_by_user
       title: ConsoleMessageUpsertRequest
       type: object
+    ConsolePresetItem:
+      description: One preset row, as returned by the console-presets API.
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        data:
+          additionalProperties: true
+          title: Data
+          type: object
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        preset_id:
+          title: Preset Id
+          type: string
+        title:
+          title: Title
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - preset_id
+      - title
+      - created_at_ms
+      - updated_at_ms
+      title: ConsolePresetItem
+      type: object
+    ConsolePresetListResponse:
+      description: 'Response from ``GET /console/presets`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsolePresetItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsolePresetListResponse
+      type: object
+    ConsolePresetUpsertRequest:
+      description: 'Request body for ``POST /console/presets`` — create/update the
+
+        caller''s own preset (upsert by ``preset_id``).'
+      properties:
+        data:
+          additionalProperties: true
+          title: Data
+          type: object
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        preset_id:
+          maxLength: 255
+          minLength: 1
+          title: Preset Id
+          type: string
+        title:
+          anyOf:
+          - maxLength: 512
+            type: string
+          - type: 'null'
+          title: Title
+      required:
+      - preset_id
+      title: ConsolePresetUpsertRequest
+      type: object
     ContextBuildResponse:
       description: Response schema for /context endpoint (4-layer assembled context).
       properties:
@@ -1234,6 +1314,12 @@ components:
               records — vector-searchable via /memory/index single-file mode and recall_semantic).
             memory:episodic:read: Read episodic-layer (ADR-style) documents
             memory:episodic:write: Create/update/delete episodic-layer documents
+            memory:presets:read-own: Read your own saved model/endpoint presets from the console-presets store (Mongo-repl
+              WU-presets, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's saved presets. Grants no
+              access to another user's presets or to any other memory layer.
+            memory:presets:write: Create/update/delete your own presets in the console-presets store (Mongo-repl WU-presets,
+              MongoDB-elimination EPIC). Grants no access to another user's presets (RLS-enforced) and no access to any other
+              memory layer.
             memory:procedural:read: Read procedural-layer (SKILL-style) documents
             memory:procedural:write: Create/update/delete procedural-layer documents
             memory:semantic:read: Read semantic-layer (vector) documents
@@ -1641,6 +1727,146 @@ paths:
       summary: Edit Message
       tags:
       - console-conversations
+  /console/presets:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) presets, newest-first,
+
+        cursor-paginated. Never returns another user''s preset — RLS plus
+
+        the service''s own explicit ``user_sub`` filter.'
+      operationId: list_presets_console_presets_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:read-own
+      summary: List Presets
+      tags:
+      - console-presets
+    post:
+      description: 'Create or update the CALLER''s OWN preset (upsert by
+
+        ``preset_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_preset_console_presets_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolePresetUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:write
+      summary: Upsert Preset
+      tags:
+      - console-presets
+  /console/presets/{preset_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN preset. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_preset_console_presets__preset_id__delete
+      parameters:
+      - in: path
+        name: preset_id
+        required: true
+        schema:
+          title: Preset Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:write
+      summary: Delete Preset
+      tags:
+      - console-presets
+    get:
+      description: 'Fetch the CALLER''s OWN preset. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign preset ids).'
+      operationId: get_preset_console_presets__preset_id__get
+      parameters:
+      - in: path
+        name: preset_id
+        required: true
+        schema:
+          title: Preset Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolePresetItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:presets:read-own
+      summary: Get Preset
+      tags:
+      - console-presets
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.
