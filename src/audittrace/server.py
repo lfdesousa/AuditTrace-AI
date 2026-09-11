@@ -20,6 +20,9 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes.console_conversations import (
+    router as console_conversations_router,
+)
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
@@ -764,6 +767,14 @@ def create_app() -> FastAPI:
     # `/memory`), so it adds the status endpoint without forcing the
     # upload-POST surface to fork.
     app.include_router(memory_upload_status_router, tags=["memory"])
+    # WU-1 (MongoDB-elimination EPIC) — the console-conversations store's
+    # REST surface (create/list/get/delete/messages), RLS-isolated by
+    # the caller's token sub. Additive-only, distinct from /memory/*.
+    app.include_router(
+        console_conversations_router,
+        prefix="/console/conversations",
+        tags=["console-conversations"],
+    )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-
     # keycloak.yaml routes `/admin` to keycloak's REST API). ADR-052

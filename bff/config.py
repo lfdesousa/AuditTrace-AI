@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     # does — one place to override in a test double, never two hardcoded
     # literals to keep in sync.
     orchestrator_memory_path_prefix: str = "/memory"
+    # WU-1 (MongoDB-elimination EPIC) — the console-conversations store's
+    # mount point on the orchestrator (``src/audittrace/routes/
+    # console_conversations.py``, ``server.py``). Same "one place to
+    # override" rationale as ``orchestrator_memory_path_prefix`` above —
+    # a frozen API contract, not a target-shaped value.
+    orchestrator_console_conversations_path_prefix: str = "/console/conversations"
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

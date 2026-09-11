@@ -193,9 +193,24 @@ MEMORY_SESSION_READ_SCOPES=(
   "memory:session:read-own"
 )
 
+# Mongo-repl WU-1 (2026-09-11) — the console-conversations store's write
+# scope. Bound ONLY as OPTIONAL to audittrace-librechat (never default),
+# own array/bind loop — only the BFF's console-conversations proxy
+# exchange requests it by name.
+MEMORY_CONVERSATIONS_WRITE_SCOPES=(
+  "memory:conversations:write"
+)
+
+# Mongo-repl WU-1 (2026-09-11) — the console-conversations store's
+# read-own scope. Bound as DEFAULT to audittrace-librechat — same
+# rationale as MEMORY_SESSION_READ_SCOPES above.
+MEMORY_CONVERSATIONS_READ_SCOPES=(
+  "memory:conversations:read-own"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -296,6 +311,22 @@ done
 # comment above).
 echo "▶ binding ephemeral-session read-own scope to client audittrace-librechat (default)..."
 for SCOPE in "${MEMORY_SESSION_READ_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "default"
+done
+
+# ----- Bind the console-conversations WRITE scope (Mongo-repl WU-1) -----
+# audittrace-librechat only, as OPTIONAL — separate loop from the one
+# above.
+echo "▶ binding console-conversations write scope to client audittrace-librechat (optional)..."
+for SCOPE in "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+done
+
+# ----- Bind the console-conversations READ-OWN scope (Mongo-repl WU-1) -----
+# audittrace-librechat only, as DEFAULT — same rationale as the
+# ephemeral-session read-own bind above.
+echo "▶ binding console-conversations read-own scope to client audittrace-librechat (default)..."
+for SCOPE in "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "default"
 done
 

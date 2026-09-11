@@ -1,15 +1,17 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Four routes matter: ``POST /v1/chat/completions``, the proxy target
+Six routes matter: ``POST /v1/chat/completions``, the proxy target
 LibreChat's custom endpoint config points at; ``GET/POST/PUT/DELETE
 /memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1);
 ``POST /console/files``, the console's narrow-scope ephemeral file-ingest
-entry (M3 Sovereign-Attach WU-2); and ``POST /console/files/{filename}/
+entry (M3 Sovereign-Attach WU-2); ``POST /console/files/{filename}/
 promote``, the "keep this" durable-promote entry (M3 Sovereign-Attach
-WU-4). ``GET /health`` is the k8s-probe convenience every AuditTrace
-deployable carries.
+WU-4); and ``GET/POST/PATCH/DELETE /console/conversations[/{path}]``, the
+console-conversations proxy (WU-1, MongoDB-elimination EPIC). ``GET
+/health`` is the k8s-probe convenience every AuditTrace deployable
+carries.
 
-All four proxy routes share one fail-closed shape (see the module
+All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
 ``bff/memory_proxy.py`` for the guard each step enforces):
 
@@ -30,7 +32,12 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    explicitly for the SINGLE configured durable scope
    (``bff.console_promote_scopes.promote_scope_string_for_layer``,
    default ``memory:episodic:write``) — a THIRD, distinct exchange, never
-   the session scope, never the broad set, never admin.
+   the session scope, never the broad set, never admin; the console-
+   conversations proxy exchanges explicitly for
+   ``bff.console_conversations_scopes.CONSOLE_CONVERSATIONS_SCOPE_STRING``
+   (``memory:conversations:read-own`` + ``memory:conversations:write``) —
+   a FOURTH, distinct exchange, own scope pair, never any other route's
+   scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -64,6 +71,11 @@ from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
+from bff.console_conversations_proxy import (
+    ConsoleConversationsProxyError,
+    proxy_console_conversations_request,
+)
+from bff.console_conversations_scopes import CONSOLE_CONVERSATIONS_SCOPE_STRING
 from bff.console_files_scopes import INGEST_SCOPE_STRING
 from bff.console_promote_scopes import promote_scope_string_for_layer
 from bff.exchange import TokenExchangeError, exchange_token
@@ -386,6 +398,107 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 status_code=502, content={"detail": "Upstream service unavailable"}
             )
+
+    async def _console_conversations_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-conversations routes below (the
+        base path with no suffix, and the ``{path:path}`` catch-all) —
+        same shape as ``memory_proxy`` above, but exchanges for
+        ``CONSOLE_CONVERSATIONS_SCOPE_STRING`` and forwards to the
+        orchestrator's ``/console/conversations`` mount (WU-1, MongoDB-
+        elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/conversations request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_CONVERSATIONS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-conversations token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_conversations_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleConversationsProxyError as exc:
+            logger.error("orchestrator /console/conversations unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/conversations",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_conversations_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-conversations list/create entry (WU-1, MongoDB-
+        elimination EPIC) — no path suffix. See
+        ``_console_conversations_proxy_impl`` for the shared shape."""
+        return await _console_conversations_proxy_impl(
+            "", request, settings, http_client
+        )
+
+    @app.api_route(
+        "/console/conversations/{path:path}",
+        methods=["GET", "POST", "PATCH", "DELETE"],
+        response_model=None,
+    )
+    async def console_conversations_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-conversations per-resource entry (WU-1, MongoDB-
+        elimination EPIC) — ``{conversation_id}``,
+        ``{conversation_id}/messages``,
+        ``{conversation_id}/messages/{message_id}``. See
+        ``_console_conversations_proxy_impl`` for the shared shape."""
+        return await _console_conversations_proxy_impl(
+            path, request, settings, http_client
+        )
 
     return app
 

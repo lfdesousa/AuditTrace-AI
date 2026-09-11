@@ -150,6 +150,297 @@ components:
       - file
       title: Body_upload_memory_file_memory_upload_post
       type: object
+    ConsoleConversationItem:
+      description: One conversation row, as returned by the console-conversations API.
+      properties:
+        agent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Agent Id
+        chat_project_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Chat Project Id
+        conversation_id:
+          title: Conversation Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        endpoint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Endpoint
+        is_temporary:
+          default: false
+          title: Is Temporary
+          type: boolean
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        title:
+          title: Title
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - conversation_id
+      - title
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleConversationItem
+      type: object
+    ConsoleConversationListResponse:
+      description: 'Response from ``GET /console/conversations`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleConversationItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleConversationListResponse
+      type: object
+    ConsoleConversationTitleUpdateRequest:
+      description: Request body for ``PATCH /console/conversations/{conversation_id}``.
+      properties:
+        title:
+          maxLength: 512
+          minLength: 1
+          title: Title
+          type: string
+      required:
+      - title
+      title: ConsoleConversationTitleUpdateRequest
+      type: object
+    ConsoleConversationUpsertRequest:
+      description: 'Request body for ``POST /console/conversations`` — create/update
+
+        the caller''s own conversation (upsert by ``conversation_id``).'
+      properties:
+        agent_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Agent Id
+        chat_project_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Chat Project Id
+        conversation_id:
+          maxLength: 255
+          minLength: 1
+          title: Conversation Id
+          type: string
+        endpoint:
+          anyOf:
+          - maxLength: 64
+            type: string
+          - type: 'null'
+          title: Endpoint
+        is_temporary:
+          default: false
+          title: Is Temporary
+          type: boolean
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Model
+        title:
+          anyOf:
+          - maxLength: 512
+            type: string
+          - type: 'null'
+          title: Title
+      required:
+      - conversation_id
+      title: ConsoleConversationUpsertRequest
+      type: object
+    ConsoleMessageEditRequest:
+      description: 'Request body for
+
+        ``PATCH /console/conversations/{conversation_id}/messages/{message_id}``.
+
+        Both fields optional — only the ones supplied are updated.'
+      properties:
+        metadata:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Metadata
+        text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Text
+      title: ConsoleMessageEditRequest
+      type: object
+    ConsoleMessageItem:
+      description: One message row, as returned by the console-conversations API.
+      properties:
+        conversation_id:
+          title: Conversation Id
+          type: string
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        endpoint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Endpoint
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        is_created_by_user:
+          title: Is Created By User
+          type: boolean
+        message_id:
+          title: Message Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        parent_message_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Message Id
+        sender:
+          title: Sender
+          type: string
+        text:
+          title: Text
+          type: string
+        token_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Token Count
+      required:
+      - message_id
+      - conversation_id
+      - sender
+      - text
+      - is_created_by_user
+      - created_at_ms
+      title: ConsoleMessageItem
+      type: object
+    ConsoleMessageListResponse:
+      description: 'Response from
+
+        ``GET /console/conversations/{conversation_id}/messages`` — the full
+
+        message tree, chronological (``created_at_ms`` ASC).'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleMessageItem'
+          title: Items
+          type: array
+      title: ConsoleMessageListResponse
+      type: object
+    ConsoleMessageUpsertRequest:
+      description: 'Request body for
+
+        ``POST /console/conversations/{conversation_id}/messages`` —
+
+        create/update the caller''s own message (upsert by ``message_id``).'
+      properties:
+        endpoint:
+          anyOf:
+          - maxLength: 64
+            type: string
+          - type: 'null'
+          title: Endpoint
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        is_created_by_user:
+          title: Is Created By User
+          type: boolean
+        message_id:
+          maxLength: 255
+          minLength: 1
+          title: Message Id
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 128
+            type: string
+          - type: 'null'
+          title: Model
+        parent_message_id:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Parent Message Id
+        sender:
+          maxLength: 64
+          minLength: 1
+          title: Sender
+          type: string
+        text:
+          title: Text
+          type: string
+        token_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Token Count
+      required:
+      - message_id
+      - sender
+      - text
+      - is_created_by_user
+      title: ConsoleMessageUpsertRequest
+      type: object
     ContextBuildResponse:
       description: Response schema for /context endpoint (4-layer assembled context).
       properties:
@@ -920,6 +1211,13 @@ components:
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
+            memory:conversations:read-own: Read your own conversations + messages from the console-conversations store (WU-1,
+              MongoDB-elimination EPIC) — the RLS-isolated, message-tree-shaped store backing LibreChat's sidebar/history.
+              Distinct from memory:conversational:read-own, which reads the older per-session SUMMARY layer, not a message
+              tree.
+            memory:conversations:write: Create/update/delete your own conversations + messages in the console-conversations
+              store (WU-1, MongoDB-elimination EPIC). Grants no access to another user's conversations or messages (RLS-enforced)
+              and no access to any other memory layer.
             memory:corpus:decisions:read: Read the shared-corpus ``decisions`` collection (Layer 5, ADR-062 §4) — distinct
               from the per-user memory:semantic:read.
             memory:corpus:decisions:write: Create/update/delete documents in the shared-corpus ``decisions`` collection (Layer
@@ -1016,6 +1314,333 @@ paths:
       summary: Create Assessment
       tags:
       - audit
+  /console/conversations:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) conversations, newest-first,
+
+        cursor-paginated. Never returns another user''s conversation — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_conversations_console_conversations_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: List Conversations
+      tags:
+      - console-conversations
+    post:
+      description: 'Create or update the CALLER''s OWN conversation (upsert by
+
+        ``conversation_id``). ``user_sub`` is stamped from ``user`` — the
+
+        body carries no such field to override it with.'
+      operationId: upsert_conversation_console_conversations_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Upsert Conversation
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN conversation AND its messages. 404 if
+
+        not found/not owned/already deleted.'
+      operationId: delete_conversation_console_conversations__conversation_id__delete
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Delete Conversation
+      tags:
+      - console-conversations
+    get:
+      description: 'Fetch the CALLER''s OWN conversation. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign conversation ids).'
+      operationId: get_conversation_console_conversations__conversation_id__get
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: Get Conversation
+      tags:
+      - console-conversations
+    patch:
+      description: Rename the CALLER's OWN conversation. 404 if not found/not owned.
+      operationId: update_conversation_title_console_conversations__conversation_id__patch
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationTitleUpdateRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Update Conversation Title
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}/messages:
+    get:
+      description: 'Return the full message TREE for the CALLER''s OWN conversation,
+
+        chronological (``created_at_ms`` ASC). 404 if the conversation
+
+        itself doesn''t exist/isn''t owned by the caller — checked via
+
+        :func:`get_conversation` first so an empty-but-owned conversation
+
+        (200, empty list) is distinguishable from a not-found/foreign one
+
+        (404).'
+      operationId: get_messages_console_conversations__conversation_id__messages_get
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:read-own
+      summary: Get Messages
+      tags:
+      - console-conversations
+    post:
+      description: 'Create or update the CALLER''s OWN message (upsert by
+
+        ``message_id``). ``user_sub`` is stamped from ``user`` — the body
+
+        carries no such field to override it with.'
+      operationId: upsert_message_console_conversations__conversation_id__messages_post
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleMessageUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Upsert Message
+      tags:
+      - console-conversations
+  /console/conversations/{conversation_id}/messages/{message_id}:
+    delete:
+      description: Delete the CALLER's OWN message. 404 if not found/not owned.
+      operationId: delete_message_console_conversations__conversation_id__messages__message_id__delete
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      - in: path
+        name: message_id
+        required: true
+        schema:
+          title: Message Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Delete Message
+      tags:
+      - console-conversations
+    patch:
+      description: Edit the CALLER's OWN message. 404 if not found/not owned.
+      operationId: edit_message_console_conversations__conversation_id__messages__message_id__patch
+      parameters:
+      - in: path
+        name: conversation_id
+        required: true
+        schema:
+          title: Conversation Id
+          type: string
+      - in: path
+        name: message_id
+        required: true
+        schema:
+          title: Message Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleMessageEditRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleMessageItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversations:write
+      summary: Edit Message
+      tags:
+      - console-conversations
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.
