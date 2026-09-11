@@ -41,6 +41,19 @@ $ .venv/bin/python -m pytest tests/test_release_bump_files_ssot.py -q --no-cov
 
 (See §6 for the exact post-commit re-run this claim rests on.)
 
+**Confirmed final run — full suite, post-commit (`d68f7e5`), zero failures:**
+
+```
+$ .venv/bin/python -m pytest -q
+...
+Required test coverage of 90% reached. Total coverage: 98.31%
+4569 passed, 2 warnings in 526.58s (0:08:46)
+```
+
+(The 2 warnings are pre-existing, unrelated `RuntimeWarning`s about an
+un-awaited `_flush_pdf_manifest` coroutine in two PDF-manifest tests —
+present on `origin/main` before this change, not introduced by it.)
+
 New-file coverage (line + branch), isolated run:
 
 ```
