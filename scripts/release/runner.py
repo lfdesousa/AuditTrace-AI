@@ -69,6 +69,8 @@ from typing import Any
 
 import yaml
 
+from scripts.release.version_files import BUMP_FILES
+
 logger = logging.getLogger("audittrace.release.runner")
 
 # Ordered phase identifiers — the determinism contract fixes this sequence.
@@ -83,16 +85,15 @@ PHASES = (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The fixed set of files `make release VERSION=...` touches (Makefile
-# `release` target + its README-refresh dependency). Staged verbatim in R3 —
-# the runner never guesses via `git add -A`, so an accidentally-dirty
-# unrelated file can never ride along into the release commit.
-BUMP_FILES: tuple[str, ...] = (
-    "pyproject.toml",
-    "charts/audittrace/Chart.yaml",
-    "docs/reference/audittrace/openapi.yaml",
-    "tests/fixtures/openapi.snapshot.yaml",
-    "README.md",
-)
+# `release` target). Staged verbatim in R3 — the runner never guesses via
+# `git add -A`, so an accidentally-dirty unrelated file can never ride along
+# into the release commit. SPEC D3 (2026-09-10): this is now imported from
+# `scripts.release.version_files` — the ONE shared source of truth also
+# consumed by the Makefile's `release-bump-files` helper — rather than a
+# second hand-typed copy. The two copies drifted before (see
+# `version_files.py`'s module docstring for the incident); importing the
+# same object (not re-typing an equal-looking tuple) is what makes drift
+# impossible rather than merely unlikely.
 
 # Strict MAJOR.MINOR.PATCH semver core — this repo's actual version scheme
 # (verified against pyproject.toml / Chart.yaml, both plain X.Y.Z, no
