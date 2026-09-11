@@ -376,10 +376,11 @@ release: ## Bump pyproject + Chart.yaml::appVersion to VERSION + regenerate Open
 	@sed -i 's/$${AUDITTRACE_IMAGE_TAG:-[^}]*}/$${AUDITTRACE_IMAGE_TAG:-$(VERSION)}/g' docker-compose.yml
 	@echo "🔖 bumping .env.ci + .env.dev-real-llm.example AUDITTRACE_IMAGE_TAG → $(VERSION)"
 	@sed -i 's/^AUDITTRACE_IMAGE_TAG=.*/AUDITTRACE_IMAGE_TAG=$(VERSION)/' .env.ci .env.dev-real-llm.example
-	@echo "📝 regenerating OpenAPI snapshot (defensive — no version string embedded today, so this is normally a no-op diff) ..."
-	@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov >/dev/null
-	@echo "🚦 running drift gate ..."
-	@.venv/bin/pytest tests/test_version_drift.py -q --no-cov
+	@PYTEST="$$( [ -x .venv/bin/pytest ] && echo .venv/bin/pytest || command -v pytest )"; \
+	echo "📝 regenerating OpenAPI snapshot (defensive — no version string embedded today, so this is normally a no-op diff) ..."; \
+	OPENAPI_SNAPSHOT_UPDATE=1 "$$PYTEST" tests/test_openapi_drift.py -q --no-cov >/dev/null; \
+	echo "🚦 running drift gate ..."; \
+	"$$PYTEST" tests/test_version_drift.py -q --no-cov
 	@echo
 	@echo "✅ release-prep done for v$(VERSION). Diff:"
 	@git diff --stat $$($(MAKE) --no-print-directory release-bump-files)
