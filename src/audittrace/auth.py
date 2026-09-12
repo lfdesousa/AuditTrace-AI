@@ -204,6 +204,22 @@ ALL_SCOPES: dict[str, str] = {
         "EPIC). Grants no access to another user's chat-projects "
         "(RLS-enforced) and no access to any other memory layer."
     ),
+    "memory:files:read-own": (
+        "Read your own file-metadata records (and batch-get-by-ids) "
+        "from the console-files store (Files-metadata domain, "
+        "MongoDB-elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's file records. METADATA ONLY: the file bytes stay "
+        "in object storage. Grants no access to another user's file "
+        "records or to any other memory layer."
+    ),
+    "memory:files:write": (
+        "Create/update/delete your own file-metadata records in the "
+        "console-files store (Files-metadata domain, MongoDB-"
+        "elimination EPIC). Grants no access to another user's file "
+        "records (RLS-enforced), no access to any other memory layer, "
+        "and no access to the file BYTES themselves (object storage is "
+        "a separate concern)."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

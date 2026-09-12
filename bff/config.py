@@ -86,6 +86,29 @@ class Settings(BaseSettings):
     # Same "one place to override" rationale as
     # ``orchestrator_console_prompts_path_prefix`` above.
     orchestrator_console_chat_projects_path_prefix: str = "/console/chat-projects"
+    # Files-metadata domain (MongoDB-elimination EPIC) — the
+    # console-files store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_files.py``, ``server.py``). Same
+    # "one place to override" rationale as
+    # ``orchestrator_console_chat_projects_path_prefix`` above.
+    #
+    # NAMED DIFFERENTLY FROM THE BFF-FACING ROUTE (spec deviation, noted
+    # in the build record): the orchestrator mounts this store at
+    # ``/console/files`` exactly as the ratified spec names it — no
+    # collision there, the orchestrator never had a route at that path.
+    # The BFF, however, ALREADY owns ``POST /console/files`` (the
+    # pre-existing M3 Sovereign-Attach WU-2 ephemeral file-INGEST route,
+    # a completely different concern: multipart bytes forwarded to
+    # ``/memory/upload``) and ``POST /console/files/{filename}/promote``
+    # — reusing that exact path+method for this domain's upsert would
+    # silently shadow one of the two behaviours. Fail-closed resolution:
+    # this metadata CRUD proxy is exposed on the BFF at
+    # ``/console/file-records`` instead (see ``bff/app.py``), while
+    # still forwarding to the orchestrator's ``/console/files`` mount —
+    # the orchestrator's contract matches the spec's literal text; only
+    # the BFF-facing path differs, to avoid colliding with pre-existing,
+    # frozen infrastructure this spec never asked to change.
+    orchestrator_console_files_path_prefix: str = "/console/files"
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

@@ -707,3 +707,82 @@ class ConsoleChatProjectListResponse(BaseModel):
 
     items: list[ConsoleChatProjectItem] = Field(default_factory=list)
     next_cursor: str | None = None
+
+
+# ── Console-files (Files-metadata domain, MongoDB-elimination EPIC) ───────
+#
+# METADATA ONLY — the file bytes stay in object storage
+# (feedback_storage_always_s3); this request model carries no byte
+# payload, only the record that references it.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field — same
+# rationale as every other console-* upsert request model above
+# (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleFileUpsertRequest(BaseModel):
+    """Request body for ``POST /console/files`` — create/update the
+    caller's own file-metadata record (upsert by ``file_id``)."""
+
+    file_id: str = Field(..., min_length=1, max_length=255)
+    filename: str = Field(..., min_length=1, max_length=512)
+    type: str = Field(..., min_length=1, max_length=255)
+    bytes: int = Field(default=0, ge=0)
+    object_key: str | None = None
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    context: str | None = Field(default=None, max_length=128)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    embedded: bool = False
+    temp_file_id: str | None = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleFileItem(BaseModel):
+    """One file-metadata row, as returned by the console-files API."""
+
+    file_id: str
+    filename: str
+    type: str
+    bytes: int
+    object_key: str | None = None
+    width: int | None = None
+    height: int | None = None
+    context: str | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    embedded: bool = False
+    temp_file_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleFileListResponse(BaseModel):
+    """Response from ``GET /console/files`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleFileItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleFileBatchGetRequest(BaseModel):
+    """Request body for ``POST /console/files/batch-get`` — fetch the
+    caller's OWN file-metadata records for a batch of ``file_id``s in
+    one round trip (the fork resolves a conversation's attachments this
+    way). Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+    cursor-paginated list route, so a hostile caller cannot force an
+    unbounded ``IN (...)`` query."""
+
+    file_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleFileBatchGetResponse(BaseModel):
+    """Response from ``POST /console/files/batch-get``. ``items`` omits
+    any requested ``file_id`` that doesn't exist, is soft-deleted, or
+    belongs to another user — same not-found-vs-403 discipline as
+    ``GET /console/files/{file_id}`` (never leaks existence), just
+    batched: the caller cannot distinguish "not mine" from "never
+    existed" from the response shape alone."""
+
+    items: list[ConsoleFileItem] = Field(default_factory=list)

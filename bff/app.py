@@ -1,6 +1,6 @@
 """FastAPI application factory for the LibreChat BFF.
 
-Eight routes matter: ``POST /v1/chat/completions``, the proxy target
+Nine routes matter: ``POST /v1/chat/completions``, the proxy target
 LibreChat's custom endpoint config points at; ``GET/POST/PUT/DELETE
 /memory/{path}``, the Souvenirs panel's memory-proxy (M3-WU-D2-1);
 ``POST /console/files``, the console's narrow-scope ephemeral file-ingest
@@ -14,8 +14,15 @@ console-conversations proxy (WU-1, MongoDB-elimination EPIC);
 proxy (Mongo-repl WU-prompts, MongoDB-elimination EPIC); and
 ``GET/POST/DELETE /console/chat-projects[/{path}]``, the
 console-chat-projects proxy (Chat-Projects domain, MongoDB-elimination
-EPIC). ``GET /health`` is the k8s-probe convenience every AuditTrace
-deployable carries.
+EPIC); and ``GET/POST/DELETE /console/file-records[/{path}]``, the
+console-files-METADATA proxy (Files-metadata domain, MongoDB-elimination
+EPIC) — named ``file-records`` rather than ``files`` on THIS side only,
+to avoid colliding with the pre-existing ``/console/files`` ephemeral-
+ingest route above (see ``bff/config.py``'s
+``orchestrator_console_files_path_prefix`` docstring for the full
+rationale); it forwards to the orchestrator's real, spec-literal
+``/console/files`` mount. ``GET /health`` is the k8s-probe convenience
+every AuditTrace deployable carries.
 
 All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
@@ -55,7 +62,13 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    ``bff.console_chat_projects_scopes.CONSOLE_CHAT_PROJECTS_SCOPE_STRING``
    (``memory:chat_projects:read-own`` + ``memory:chat_projects:write``)
    — a SEVENTH, distinct exchange, own scope pair, never any other
-   route's scopes.
+   route's scopes; the console-file-records proxy exchanges explicitly
+   for
+   ``bff.console_file_records_scopes.CONSOLE_FILE_RECORDS_SCOPE_STRING``
+   (``memory:files:read-own`` + ``memory:files:write``) — an EIGHTH,
+   distinct exchange, own scope pair, never any other route's scopes
+   (in particular never the console-files-ingest route's
+   ``memory:session:write``, despite the similar name).
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -99,6 +112,11 @@ from bff.console_conversations_proxy import (
     proxy_console_conversations_request,
 )
 from bff.console_conversations_scopes import CONSOLE_CONVERSATIONS_SCOPE_STRING
+from bff.console_file_records_proxy import (
+    ConsoleFileRecordsProxyError,
+    proxy_console_file_records_request,
+)
+from bff.console_file_records_scopes import CONSOLE_FILE_RECORDS_SCOPE_STRING
 from bff.console_files_scopes import INGEST_SCOPE_STRING
 from bff.console_presets_proxy import (
     ConsolePresetsProxyError,
@@ -820,6 +838,109 @@ def create_app() -> FastAPI:
         domain, MongoDB-elimination EPIC) — ``{chat_project_id}``. See
         ``_console_chat_projects_proxy_impl`` for the shared shape."""
         return await _console_chat_projects_proxy_impl(
+            path, request, settings, http_client
+        )
+
+    async def _console_file_records_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-file-records routes below (the
+        base path with no suffix, and the ``{path:path}`` catch-all) —
+        same shape as ``_console_chat_projects_proxy_impl`` above, but
+        exchanges for ``CONSOLE_FILE_RECORDS_SCOPE_STRING`` and forwards
+        to the orchestrator's ``/console/files`` mount (Files-metadata
+        domain, MongoDB-elimination EPIC). See ``bff/config.py``'s
+        ``orchestrator_console_files_path_prefix`` docstring for why
+        this proxy's OWN BFF-facing path is ``/console/file-records``,
+        not ``/console/files``."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/file-records request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_FILE_RECORDS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-file-records token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_file_records_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleFileRecordsProxyError as exc:
+            logger.error("orchestrator /console/files unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/file-records",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_file_records_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-file-records list/create entry (Files-metadata
+        domain, MongoDB-elimination EPIC) — no path suffix. See
+        ``_console_file_records_proxy_impl`` for the shared shape."""
+        return await _console_file_records_proxy_impl(
+            "", request, settings, http_client
+        )
+
+    @app.api_route(
+        "/console/file-records/{path:path}",
+        methods=["GET", "POST", "DELETE"],
+        response_model=None,
+    )
+    async def console_file_records_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-file-records per-resource entry (Files-metadata
+        domain, MongoDB-elimination EPIC) — ``{file_id}``,
+        ``batch-get``. See ``_console_file_records_proxy_impl`` for the
+        shared shape."""
+        return await _console_file_records_proxy_impl(
             path, request, settings, http_client
         )
 
