@@ -312,9 +312,14 @@ services:
     restart: unless-stopped
 
   minio:
-    # ADR-027 — S3-compatible storage. Chart pin is `minio/minio:latest`
-    # (upstream — NOT bitnami). Preserved here so compose matches.
-    image: minio/minio:latest
+    # ADR-027 — S3-compatible storage. Chart pin is
+    # `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z` (upstream — NOT
+    # bitnami). Preserved here so compose matches. Repinned 2026-09-12
+    # off Docker Hub `minio/minio:latest` after Docker Hub removed
+    # anonymous pull for the MinIO org (finding
+    # finding-minio-dockerhub-anon-pull-removed-20260912.md) — pin exact
+    # dated tags, never `:latest`.
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: audittrace-minio
     command: server /data --console-address ":9001"
     environment:
