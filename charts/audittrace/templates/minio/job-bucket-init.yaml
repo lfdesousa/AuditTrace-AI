@@ -99,7 +99,7 @@ spec:
       {{- end }}
       containers:
         - name: mc
-          image: minio/mc:latest
+          image: "{{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}"
           imagePullPolicy: IfNotPresent
           env:
             - name: MINIO_URL
@@ -363,7 +363,7 @@ spec:
               # work — at worst the Job pod stays Running until
               # backoffLimit forces a restart).
               #
-              # 2026-05-13: minio/mc:latest has no curl/wget/nc, but
+              # 2026-05-13: the mc image has no curl/wget/nc, but
               # its /bin/sh IS bash, so we use bash's /dev/tcp built-in
               # to POST a raw HTTP request. Avoids the prior failure
               # mode where `curl: command not found` left istio-proxy

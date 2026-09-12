@@ -112,7 +112,7 @@ MinIO, same as PostgreSQL and ChromaDB. No application changes needed.
 
 ```yaml
 minio:
-  image: minio/minio:latest
+  image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
   container_name: sovereign-minio
   command: server /data --console-address ":9001"
   environment:

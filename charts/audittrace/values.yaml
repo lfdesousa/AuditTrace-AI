@@ -653,8 +653,18 @@ rabbitmq:
 minio:
   enabled: true
   image:
-    repository: minio/minio
-    tag: latest
+    # Repinned 2026-09-12 off Docker Hub `minio/minio:latest` after
+    # Docker Hub removed anonymous pull for the MinIO org (finding
+    # finding-minio-dockerhub-anon-pull-removed-20260912.md). Pin exact
+    # dated tags, never `:latest`.
+    repository: quay.io/minio/minio
+    tag: RELEASE.2025-04-22T22-12-26Z
+  mcImage:
+    # Bucket-init Job (templates/minio/job-bucket-init.yaml) client
+    # image. `mc` has its own release-tag scheme (not aligned with the
+    # server's dated tags) — pinned independently, same rule applies.
+    repository: quay.io/minio/mc
+    tag: RELEASE.2025-04-16T18-13-26Z
   auth:
     rootUser: minioadmin
     rootPassword: ""
