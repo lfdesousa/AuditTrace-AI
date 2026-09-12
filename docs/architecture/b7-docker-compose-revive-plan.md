@@ -63,7 +63,7 @@ Single `docker-compose.yml` (extended by overlays in §3) renders the following 
 | `redis` | `ghcr.io/lfdesousa/audittrace-redis:8.6.2-bitnami-frozen-apr17` | TokenCache + ToolResultCache (RDB v13 parity) | — | AUDITTRACE_REDIS_PASSWORD | `audittrace_redis_data` | none | `redis-cli ping` |
 | `rabbitmq` | `bitnamilegacy/rabbitmq:<chart-pin>` (TBD §10 Q4 — chart default) | ADR-057 scan-control broker | — | RABBITMQ_DEFAULT_USER/PASS/VHOST | `rabbitmq_data` | `15672` (mgmt) | `rabbitmq-diagnostics check_running` |
 | `chromadb` | `chromadb/chroma:1.5.8` | semantic memory store | — | CHROMA_SERVER_AUTHN_* | `chroma_data` | `18000:8000` | `/api/v2/heartbeat` |
-| `minio` | `minio/minio:RELEASE.2025-XX` (pin chart-side digest) | S3 object storage | — | MINIO_ROOT_USER/PASSWORD, MINIO_KMS_SECRET_KEY | `minio_data` | `19000:9000`, `19001:9001` | `/minio/health/live` |
+| `minio` | `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z` (chart-pinned; repinned off Docker Hub `:latest` 2026-09-12) | S3 object storage | — | MINIO_ROOT_USER/PASSWORD, MINIO_KMS_SECRET_KEY | `minio_data` | `19000:9000`, `19001:9001` | `/minio/health/live` |
 | `keycloak` | `quay.io/keycloak/keycloak:24.0` | IdP for JWT issuance | postgres | KC_DB_*, KEYCLOAK_ADMIN_*, KC_HOSTNAME_URL, KC_PROXY | `realm-audittrace.json` mount | via traefik | `/health/ready` |
 | `traefik` | `traefik:v3.6` | TLS termination + path routing for local Device-Flow | — | DOCKER_API_VERSION | `traefik.yml`, `dynamic.yml`, `./certs` | `443`, `8080` | container only |
 | `vault` (optional, profile `vault`) | `hashicorp/vault:1.18` (dev mode) | secret injection parity | — | VAULT_DEV_ROOT_TOKEN_ID | `vault_data` | `8200:8200` | `/v1/sys/health` |

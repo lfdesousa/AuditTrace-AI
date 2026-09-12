@@ -366,7 +366,8 @@ path; the Helm chart in `charts/audittrace/` remains canonical.
 After B7 step 1 the compose stack pulls the SAME images Helm
 deploys in prod: `ghcr.io/lfdesousa/audittrace-{postgresql,redis,
 rabbitmq}` (B1.5 / B1.6 frozen Bitnami), `chromadb/chroma:1.5.7`
-(chart pin), `quay.io/keycloak/keycloak:24.0`, `minio/minio:latest`,
+(chart pin), `quay.io/keycloak/keycloak:24.0`,
+`quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z`,
 `docker.io/lfds/audittrace-memory-server:1.0.22` (published).
 Configuration follows Bitnami conventions (`POSTGRESQL_*`,
 `REDIS_*`, `RABBITMQ_*` env vars; `/bitnami/{postgresql,redis,
