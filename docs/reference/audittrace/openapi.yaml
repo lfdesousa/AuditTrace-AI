@@ -150,6 +150,203 @@ components:
       - file
       title: Body_upload_memory_file_memory_upload_post
       type: object
+    ConsoleAgentBatchGetRequest:
+      description: 'Request body for ``POST /console/agents/batch-get`` — fetch the
+
+        caller''s OWN agents for a batch of ``agent_id``s in one round trip.
+
+        Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+
+        cursor-paginated list route, so a hostile caller cannot force an
+
+        unbounded ``IN (...)`` query.'
+      properties:
+        agent_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: Agent Ids
+          type: array
+      required:
+      - agent_ids
+      title: ConsoleAgentBatchGetRequest
+      type: object
+    ConsoleAgentBatchGetResponse:
+      description: 'Response from ``POST /console/agents/batch-get``. ``items`` omits
+
+        any requested ``agent_id`` that doesn''t exist, is soft-deleted, or
+
+        belongs to another user — same not-found-vs-403 discipline as
+
+        ``GET /console/agents/{agent_id}`` (never leaks existence), just
+
+        batched: the caller cannot distinguish "not mine" from "never
+
+        existed" from the response shape alone.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleAgentItem'
+          title: Items
+          type: array
+      title: ConsoleAgentBatchGetResponse
+      type: object
+    ConsoleAgentItem:
+      description: One agent row, as returned by the console-agents API.
+      properties:
+        agent_id:
+          title: Agent Id
+          type: string
+        artifacts:
+          additionalProperties: true
+          title: Artifacts
+          type: object
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        end_after_tools:
+          default: false
+          title: End After Tools
+          type: boolean
+        instructions:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instructions
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        model_parameters:
+          additionalProperties: true
+          title: Model Parameters
+          type: object
+        name:
+          title: Name
+          type: string
+        project_ids:
+          items:
+            type: string
+          title: Project Ids
+          type: array
+        provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider
+        tools:
+          items: {}
+          title: Tools
+          type: array
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - agent_id
+      - name
+      - description
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleAgentItem
+      type: object
+    ConsoleAgentListResponse:
+      description: 'Response from ``GET /console/agents`` — cursor-paginated,
+
+        newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleAgentItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleAgentListResponse
+      type: object
+    ConsoleAgentUpsertRequest:
+      description: 'Request body for ``POST /console/agents`` — create/update the
+
+        caller''s own agent (upsert by ``agent_id``).'
+      properties:
+        agent_id:
+          maxLength: 255
+          minLength: 1
+          title: Agent Id
+          type: string
+        artifacts:
+          additionalProperties: true
+          title: Artifacts
+          type: object
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        end_after_tools:
+          default: false
+          title: End After Tools
+          type: boolean
+        instructions:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instructions
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        model:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Model
+        model_parameters:
+          additionalProperties: true
+          title: Model Parameters
+          type: object
+        name:
+          maxLength: 512
+          minLength: 1
+          title: Name
+          type: string
+        project_ids:
+          items:
+            type: string
+          title: Project Ids
+          type: array
+        provider:
+          anyOf:
+          - maxLength: 255
+            type: string
+          - type: 'null'
+          title: Provider
+        tools:
+          items: {}
+          title: Tools
+          type: array
+      required:
+      - agent_id
+      - name
+      title: ConsoleAgentUpsertRequest
+      type: object
     ConsoleChatProjectItem:
       description: 'One chat-project row, as returned by the console-chat-projects
 
@@ -1832,6 +2029,11 @@ components:
             audittrace:query: Issue chat completions and inference queries
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
+            memory:agents:read-own: 'Read your own agents (and batch-get-by-ids) from the console-agents store (Agents domain,
+              MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s Agent records. Own-agents-only: sharing/marketplace
+              is out of scope. Grants no access to another user''s agents or to any other memory layer.'
+            memory:agents:write: Create/update/delete your own agents in the console-agents store (Agents domain, MongoDB-elimination
+              EPIC). Grants no access to another user's agents (RLS-enforced) and no access to any other memory layer.
             memory:chat_projects:read-own: Read your own first-class chat-projects from the console-chat-projects store (Chat-Projects
               domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat's chat-project groupings of conversations.
               Grants no access to another user's chat-projects or to any other memory layer.
@@ -1961,6 +2163,189 @@ paths:
       summary: Create Assessment
       tags:
       - audit
+  /console/agents:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) agents, newest-first,
+
+        cursor-paginated. Never returns another user''s agent — RLS plus the
+
+        service''s own explicit ``user_sub`` filter.'
+      operationId: list_agents_console_agents_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: List Agents
+      tags:
+      - console-agents
+    post:
+      description: 'Create or update the CALLER''s OWN agent (upsert by ``agent_id``).
+
+        ``user_sub`` is stamped from ``user`` — the body carries no such
+
+        field to override it with.'
+      operationId: upsert_agent_console_agents_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAgentUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:write
+      summary: Upsert Agent
+      tags:
+      - console-agents
+  /console/agents/batch-get:
+    post:
+      description: 'Fetch the CALLER''s OWN agents for a batch of ``agent_id``s in one
+
+        round trip. A POST (not a GET with repeated query params) so the
+
+        request body — not the URL — carries the (potentially large) id
+
+        list; this is a READ operation despite the verb (same rationale as
+
+        the console-files batch-get route), gated on the READ scope, never
+
+        the write scope.'
+      operationId: batch_get_agents_console_agents_batch_get_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAgentBatchGetRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentBatchGetResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: Batch Get Agents
+      tags:
+      - console-agents
+  /console/agents/{agent_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN agent. 404 if not found/not
+
+        owned/already deleted.'
+      operationId: delete_agent_console_agents__agent_id__delete
+      parameters:
+      - in: path
+        name: agent_id
+        required: true
+        schema:
+          title: Agent Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:write
+      summary: Delete Agent
+      tags:
+      - console-agents
+    get:
+      description: 'Fetch the CALLER''s OWN agent. 404 if it doesn''t exist, is
+
+        deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign agent ids). ``:path`` on the
+
+        route param — LibreChat agent ids can carry a ``/`` (e.g. provider-
+
+        prefixed ids).'
+      operationId: get_agent_console_agents__agent_id__get
+      parameters:
+      - in: path
+        name: agent_id
+        required: true
+        schema:
+          title: Agent Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAgentItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:agents:read-own
+      summary: Get Agent
+      tags:
+      - console-agents
   /console/chat-projects:
     get:
       description: 'List the CALLER''s OWN (non-deleted) chat-projects, newest-first,

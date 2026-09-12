@@ -25,6 +25,11 @@ from audittrace.db.postgres import (
 )
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.console_agents import (
+    ConsoleAgentsService,
+    MockConsoleAgentsService,
+    PostgresConsoleAgentsService,
+)
 from audittrace.services.console_chat_projects import (
     ConsoleChatProjectsService,
     MockConsoleChatProjectsService,
@@ -420,6 +425,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         session_factory=pg_factory.get_session_factory(),
     )
 
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's backing service (Postgres RLS-isolated, migration 028).
+    # Same session factory as console_files above.
+    console_agents: ConsoleAgentsService = PostgresConsoleAgentsService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     # Memory-layer manifest (CRUD backoffice — migration 009 + the
     # /memory/<layer> REST endpoints). Postgres-backed; same session
     # factory as conversational since the table is in the same DB.
@@ -466,6 +478,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["console_prompts"] = console_prompts
     container._instances["console_chat_projects"] = console_chat_projects
     container._instances["console_files"] = console_files
+    container._instances["console_agents"] = console_agents
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -705,6 +718,16 @@ def get_console_files_service() -> ConsoleFilesService:
 
 
 @log_call(logger=logger)
+def get_console_agents_service() -> ConsoleAgentsService:
+    """Get the console-agents service (dependency injection).
+
+    Agents domain (MongoDB-elimination EPIC) — the RLS-isolated store
+    ``routes/console_agents.py`` writes/reads through.
+    """
+    return cast(ConsoleAgentsService, container._instances["console_agents"])
+
+
+@log_call(logger=logger)
 def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
@@ -767,6 +790,7 @@ def _register_mock_memory_services() -> None:
     console_prompts = MockConsolePromptsService()
     console_chat_projects = MockConsoleChatProjectsService()
     console_files = MockConsoleFilesService()
+    console_agents = MockConsoleAgentsService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -784,6 +808,7 @@ def _register_mock_memory_services() -> None:
     container._instances["console_prompts"] = console_prompts
     container._instances["console_chat_projects"] = console_chat_projects
     container._instances["console_files"] = console_files
+    container._instances["console_agents"] = console_agents
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -872,6 +897,11 @@ def create_test_container() -> DependencyContainer:
     # Files-metadata domain (MongoDB-elimination EPIC) — same rationale
     # as console_chat_projects above.
     test_container._instances["console_files"] = PostgresConsoleFilesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+    # Agents domain (MongoDB-elimination EPIC) — same rationale as
+    # console_files above.
+    test_container._instances["console_agents"] = PostgresConsoleAgentsService(
         session_factory=pg_factory.get_session_factory(),
     )
     return test_container

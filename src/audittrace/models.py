@@ -786,3 +786,82 @@ class ConsoleFileBatchGetResponse(BaseModel):
     existed" from the response shape alone."""
 
     items: list[ConsoleFileItem] = Field(default_factory=list)
+
+
+# ── Console-agents (Agents domain, MongoDB-elimination EPIC) ──────────────
+#
+# Own-agents-only v1 — sharing/marketplace (a fork ``author``/global-agent
+# concept) is explicitly OUT OF SCOPE (disclosed in the ratified spec).
+# ``tools``/``model_parameters``/``artifacts`` are opaque jsonb blobs; this
+# store persists the agent record, it never executes or validates tools.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleAgentUpsertRequest(BaseModel):
+    """Request body for ``POST /console/agents`` — create/update the
+    caller's own agent (upsert by ``agent_id``)."""
+
+    agent_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    instructions: str | None = None
+    provider: str | None = Field(default=None, max_length=255)
+    model: str | None = Field(default=None, max_length=255)
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
+    tools: list[Any] = Field(default_factory=list)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    end_after_tools: bool = False
+    project_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleAgentItem(BaseModel):
+    """One agent row, as returned by the console-agents API."""
+
+    agent_id: str
+    name: str
+    description: str
+    instructions: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
+    tools: list[Any] = Field(default_factory=list)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    end_after_tools: bool = False
+    project_ids: list[str] = Field(default_factory=list)
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleAgentListResponse(BaseModel):
+    """Response from ``GET /console/agents`` — cursor-paginated,
+    newest-first."""
+
+    items: list[ConsoleAgentItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ConsoleAgentBatchGetRequest(BaseModel):
+    """Request body for ``POST /console/agents/batch-get`` — fetch the
+    caller's OWN agents for a batch of ``agent_id``s in one round trip.
+    Capped at ``MAX_LIST_LIMIT`` (200) — same bound as the
+    cursor-paginated list route, so a hostile caller cannot force an
+    unbounded ``IN (...)`` query."""
+
+    agent_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleAgentBatchGetResponse(BaseModel):
+    """Response from ``POST /console/agents/batch-get``. ``items`` omits
+    any requested ``agent_id`` that doesn't exist, is soft-deleted, or
+    belongs to another user — same not-found-vs-403 discipline as
+    ``GET /console/agents/{agent_id}`` (never leaks existence), just
+    batched: the caller cannot distinguish "not mine" from "never
+    existed" from the response shape alone."""
+
+    items: list[ConsoleAgentItem] = Field(default_factory=list)

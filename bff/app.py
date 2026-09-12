@@ -21,8 +21,10 @@ to avoid colliding with the pre-existing ``/console/files`` ephemeral-
 ingest route above (see ``bff/config.py``'s
 ``orchestrator_console_files_path_prefix`` docstring for the full
 rationale); it forwards to the orchestrator's real, spec-literal
-``/console/files`` mount. ``GET /health`` is the k8s-probe convenience
-every AuditTrace deployable carries.
+``/console/files`` mount. ``GET/POST/DELETE /console/agents[/{path}]``,
+the console-agents proxy (Agents domain, MongoDB-elimination EPIC) —
+own-agents-only v1, no naming collision on this side. ``GET /health``
+is the k8s-probe convenience every AuditTrace deployable carries.
 
 All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
@@ -68,7 +70,11 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    (``memory:files:read-own`` + ``memory:files:write``) — an EIGHTH,
    distinct exchange, own scope pair, never any other route's scopes
    (in particular never the console-files-ingest route's
-   ``memory:session:write``, despite the similar name).
+   ``memory:session:write``, despite the similar name); the console-
+   agents proxy exchanges explicitly for
+   ``bff.console_agents_scopes.CONSOLE_AGENTS_SCOPE_STRING``
+   (``memory:agents:read-own`` + ``memory:agents:write``) — a NINTH,
+   distinct exchange, own scope pair, never any other route's scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -102,6 +108,11 @@ from starlette.responses import StreamingResponse
 
 from bff.auth import InboundTokenError, validate_inbound_token
 from bff.config import Settings, get_settings
+from bff.console_agents_proxy import (
+    ConsoleAgentsProxyError,
+    proxy_console_agents_request,
+)
+from bff.console_agents_scopes import CONSOLE_AGENTS_SCOPE_STRING
 from bff.console_chat_projects_proxy import (
     ConsoleChatProjectsProxyError,
     proxy_console_chat_projects_request,
@@ -943,6 +954,101 @@ def create_app() -> FastAPI:
         return await _console_file_records_proxy_impl(
             path, request, settings, http_client
         )
+
+    async def _console_agents_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-agents routes below (the base
+        path with no suffix, and the ``{path:path}`` catch-all) — same
+        shape as ``_console_chat_projects_proxy_impl`` above, but
+        exchanges for ``CONSOLE_AGENTS_SCOPE_STRING`` and forwards to
+        the orchestrator's ``/console/agents`` mount (Agents domain,
+        MongoDB-elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/agents request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_AGENTS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-agents token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_agents_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleAgentsProxyError as exc:
+            logger.error("orchestrator /console/agents unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/agents",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_agents_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-agents list/create entry (Agents domain,
+        MongoDB-elimination EPIC) — no path suffix. See
+        ``_console_agents_proxy_impl`` for the shared shape."""
+        return await _console_agents_proxy_impl("", request, settings, http_client)
+
+    @app.api_route(
+        "/console/agents/{path:path}",
+        methods=["GET", "POST", "DELETE"],
+        response_model=None,
+    )
+    async def console_agents_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-agents per-resource entry (Agents domain,
+        MongoDB-elimination EPIC) — ``{agent_id}``, ``batch-get``. See
+        ``_console_agents_proxy_impl`` for the shared shape."""
+        return await _console_agents_proxy_impl(path, request, settings, http_client)
 
     return app
 
