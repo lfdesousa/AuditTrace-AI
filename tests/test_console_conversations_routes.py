@@ -91,16 +91,19 @@ class TestConsoleConversationsCrud:
         r = client.post("/console/conversations", json={"title": "no id"})
         assert r.status_code == 422
 
-    def test_hostile_body_user_sub_is_ignored(self, client: TestClient) -> None:
-        """A hostile caller cannot stamp an arbitrary ``user_sub``/
-        ``user_id`` via the request body — the field doesn't exist on the
-        request model, so Pydantic drops it, and the route always stamps
-        the RESOLVED identity. Falsifiable: if a future change added a
-        ``user_sub`` field to the request model AND wired it into the
-        service call, this conversation would silently be created for
-        the hostile value instead of the caller's real (sentinel)
-        identity, and this test's shape (a 200 that ignores the extra
-        field entirely) would need to change."""
+    def test_hostile_body_extra_fields_are_dropped_from_response(
+        self, client: TestClient
+    ) -> None:
+        """Shape-only smoke check: Pydantic's ``extra="ignore"`` drops a
+        ``user_sub``/``user_id`` field the request model doesn't declare,
+        so it never round-trips into the response. This is NOT the
+        security proof — a response shape says nothing about which row
+        the write landed in; see
+        ``TestCrossUserIsolation::test_hostile_body_user_sub_cannot_hijack_another_users_row``
+        (and the pre-existing
+        ``test_hostile_body_user_sub_never_lands_as_another_real_user``)
+        for the actual non-vacuous side-effect proofs (two distinct real
+        subs through the real ``require_user`` cold path)."""
         r = client.post(
             "/console/conversations",
             json={
@@ -522,3 +525,120 @@ class TestCrossUserIsolation:
             "/console/conversations/hostile-conv",
         )
         assert bob_read.status_code == 200
+
+    def test_hostile_body_user_sub_cannot_hijack_another_users_row(
+        self, client: TestClient
+    ) -> None:
+        """The real non-vacuous proof that a hostile ``user_sub``/
+        ``user_id`` body field is IGNORED, not merely absent from the
+        response shape, AND cannot overwrite a victim's EXISTING row —
+        driven through TWO DISTINCT real subs via the real
+        ``require_user`` cold path (the single-identity sentinel
+        ``client`` fixture used by
+        ``TestConsoleConversationsCrud::test_hostile_body_extra_fields_are_dropped_from_response``
+        cannot observe cross-user ownership at all, since every request
+        in that fixture resolves to the SAME sentinel sub). Complements
+        ``test_hostile_body_user_sub_never_lands_as_another_real_user``
+        above, which only covers a FRESH ``conversation_id`` — this test
+        covers the attacker targeting the victim's PRE-EXISTING row.
+
+        Falsifiable: if a future change added a ``user_sub`` field to
+        ``ConsoleConversationUpsertRequest`` AND the route honored it
+        (e.g. via ``dataclasses.replace(user, user_id=body.user_sub)``),
+        the attacker's writes below would land in/leak into the
+        victim's rows and this test would go RED — proven by a
+        builder-side neuter pass (temporarily reintroducing exactly
+        that injection) reported in the evidence file.
+        """
+        # The victim already owns a row under her OWN real identity.
+        victim_create = self._act_as(
+            client,
+            "victim-hostile",
+            "POST",
+            "/console/conversations",
+            json={
+                "conversation_id": "shared-hostile-id",
+                "title": "victim's real conversation",
+            },
+        )
+        assert victim_create.status_code == 200
+
+        # The attacker upserts the SAME conversation_id, with a hostile
+        # body claiming (via user_sub AND user_id) to BE the victim — an
+        # attempted overwrite/hijack of the victim's existing row.
+        attacker_upsert = self._act_as(
+            client,
+            "attacker-hostile",
+            "POST",
+            "/console/conversations",
+            json={
+                "conversation_id": "shared-hostile-id",
+                "title": "hijacked by attacker",
+                "user_sub": "victim-hostile",
+                "user_id": "victim-hostile",
+            },
+        )
+        assert attacker_upsert.status_code == 200
+
+        # The victim's row must be COMPLETELY UNTOUCHED — the hostile
+        # user_sub/user_id body fields must never redirect the write
+        # into the victim's row.
+        victim_read = self._act_as(
+            client, "victim-hostile", "GET", "/console/conversations/shared-hostile-id"
+        )
+        assert victim_read.status_code == 200
+        assert victim_read.json()["title"] == "victim's real conversation", (
+            "attacker's hostile user_sub/user_id body fields hijacked/"
+            "overwrote the victim's conversation — the fields must be "
+            "silently ignored, never honored"
+        )
+
+        # The attacker's write must have landed under the ATTACKER's OWN
+        # real identity (RLS-isolated from the victim's row with the
+        # same conversation_id), not the victim's.
+        attacker_read = self._act_as(
+            client,
+            "attacker-hostile",
+            "GET",
+            "/console/conversations/shared-hostile-id",
+        )
+        assert attacker_read.status_code == 200
+        assert attacker_read.json()["title"] == "hijacked by attacker"
+
+        # A second hostile upsert, this time under a FRESH
+        # conversation_id, must never be visible to the victim via
+        # get/list — proving the hostile field cannot plant a row the
+        # victim can see either.
+        planted = self._act_as(
+            client,
+            "attacker-hostile",
+            "POST",
+            "/console/conversations",
+            json={
+                "conversation_id": "planted-hostile-id",
+                "title": "planted",
+                "user_sub": "victim-hostile",
+                "user_id": "victim-hostile",
+            },
+        )
+        assert planted.status_code == 200
+
+        victim_get_planted = self._act_as(
+            client,
+            "victim-hostile",
+            "GET",
+            "/console/conversations/planted-hostile-id",
+        )
+        assert victim_get_planted.status_code == 404, (
+            "the victim can read a conversation planted via a hostile "
+            "user_sub body field — the field must never be honored"
+        )
+
+        victim_list = self._act_as(
+            client, "victim-hostile", "GET", "/console/conversations"
+        )
+        victim_ids = [i["conversation_id"] for i in victim_list.json()["items"]]
+        assert "planted-hostile-id" not in victim_ids, (
+            "the victim's list included a conversation planted via a "
+            "hostile user_sub body field"
+        )
