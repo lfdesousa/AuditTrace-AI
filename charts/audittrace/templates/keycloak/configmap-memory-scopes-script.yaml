@@ -248,6 +248,25 @@ data:
       "memory:files:read-own"
     )
 
+    # Agents domain (2026-09-12, MongoDB-elimination EPIC) — the
+    # console-agents store's write scope. Bound ONLY as OPTIONAL to
+    # audittrace-librechat (never default), in its OWN array/bind loop —
+    # same "never auto-granted" discipline as MEMORY_FILES_WRITE_SCOPES
+    # above: only the BFF's console-agents proxy exchange
+    # (bff/console_agents_scopes.py::CONSOLE_AGENTS_SCOPE_STRING)
+    # requests it by name.
+    MEMORY_AGENTS_WRITE_SCOPES=(
+      "memory:agents:write"
+    )
+
+    # Agents domain (2026-09-12) — the console-agents store's read-own
+    # scope. Bound as DEFAULT to audittrace-librechat — same rationale
+    # as MEMORY_FILES_READ_SCOPES above. Own array/bind loop, separate
+    # from the write array.
+    MEMORY_AGENTS_READ_SCOPES=(
+      "memory:agents:read-own"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -333,7 +352,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -541,6 +560,22 @@ data:
     # audittrace-librechat only, as DEFAULT — same rationale as Step 2m.
     echo "▶ binding console-files read-own scope to client audittrace-librechat (default)..."
     for SCOPE in "${MEMORY_FILES_READ_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "default"
+    done
+
+    # ── Step 2p: bind the console-agents WRITE scope (Agents domain) ──
+    # audittrace-librechat only, as OPTIONAL — separate loop, same
+    # discipline as Step 2n. Only the BFF's console-agents proxy
+    # exchange requests this scope by name.
+    echo "▶ binding console-agents write scope to client audittrace-librechat (optional)..."
+    for SCOPE in "${MEMORY_AGENTS_WRITE_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2q: bind the console-agents READ-OWN scope (Agents domain) ──
+    # audittrace-librechat only, as DEFAULT — same rationale as Step 2o.
+    echo "▶ binding console-agents read-own scope to client audittrace-librechat (default)..."
+    for SCOPE in "${MEMORY_AGENTS_READ_SCOPES[@]}"; do
       bind_scope "audittrace-librechat" "${SCOPE}" "default"
     done
 

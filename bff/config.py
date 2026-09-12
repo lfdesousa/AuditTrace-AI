@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     # the BFF-facing path differs, to avoid colliding with pre-existing,
     # frozen infrastructure this spec never asked to change.
     orchestrator_console_files_path_prefix: str = "/console/files"
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's mount point on the orchestrator (``src/audittrace/routes/
+    # console_agents.py``, ``server.py``). Same "one place to override"
+    # rationale as ``orchestrator_console_files_path_prefix`` above — no
+    # naming collision here (unlike the files domain): the BFF never had
+    # a pre-existing route at ``/console/agents``, so this proxy's
+    # BFF-facing path matches the orchestrator mount 1:1.
+    orchestrator_console_agents_path_prefix: str = "/console/agents"
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

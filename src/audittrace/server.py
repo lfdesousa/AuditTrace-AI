@@ -20,6 +20,7 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes.console_agents import router as console_agents_router
 from audittrace.routes.console_chat_projects import (
     router as console_chat_projects_router,
 )
@@ -821,6 +822,16 @@ def create_app() -> FastAPI:
         console_files_router,
         prefix="/console/files",
         tags=["console-files"],
+    )
+    # Agents domain (MongoDB-elimination EPIC) — the console-agents
+    # store's REST surface (upsert/list/get/delete + batch-get-by-ids),
+    # RLS-isolated by the caller's token sub. Own-agents-only v1
+    # (sharing/marketplace out of scope). Additive-only, distinct from
+    # every other /console/* mount above.
+    app.include_router(
+        console_agents_router,
+        prefix="/console/agents",
+        tags=["console-agents"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

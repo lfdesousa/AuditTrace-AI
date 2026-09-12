@@ -220,6 +220,20 @@ ALL_SCOPES: dict[str, str] = {
         "and no access to the file BYTES themselves (object storage is "
         "a separate concern)."
     ),
+    "memory:agents:read-own": (
+        "Read your own agents (and batch-get-by-ids) from the "
+        "console-agents store (Agents domain, MongoDB-elimination EPIC) "
+        "— the RLS-isolated store backing LibreChat's Agent records. "
+        "Own-agents-only: sharing/marketplace is out of scope. Grants "
+        "no access to another user's agents or to any other memory "
+        "layer."
+    ),
+    "memory:agents:write": (
+        "Create/update/delete your own agents in the console-agents "
+        "store (Agents domain, MongoDB-elimination EPIC). Grants no "
+        "access to another user's agents (RLS-enforced) and no access "
+        "to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "
