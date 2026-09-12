@@ -922,3 +922,96 @@ class ConsoleFile(Base):
             name="uq_console_files_user_file",
         ),
     )
+
+
+class ConsoleAgent(Base):
+    """The ``console_agents`` store — the Agents domain of the
+    MongoDB-elimination EPIC (migration 028): AuditTrace's first-party,
+    RLS-isolated replacement for LibreChat's Mongo ``Agent`` collection
+    (``packages/data-schemas/src/schema/agent.ts``).
+
+    **Own-agents-only v1 (the ratified spec's scope boundary).** LibreChat
+    supports agent SHARING/marketplace (an ``author`` owner field plus
+    global/shared agents visible to other users). That is explicitly OUT
+    OF SCOPE here — every row is owned by exactly one ``user_sub`` (the
+    unique constraint below), and there is no "shared"/"global" row
+    concept in this table. Cross-user sharing is a later WU, per the
+    spec's "Out of scope" section.
+
+    ``agent_id`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own),
+    same pattern as :attr:`ConsoleFile.file_id` — the internal PK ``id``
+    is a separate server-generated UUID so ``agent_id`` collisions across
+    users can coexist, disambiguated only by ``(user_sub, agent_id)``
+    (the unique constraint below).
+
+    ``tools``/``model_parameters``/``artifacts`` are stored as opaque
+    jsonb blobs per the ratified spec's explicit text — this store
+    persists the agent record; it never executes or validates the tools
+    a row references (that stays entirely client-side / a later WU).
+
+    ``project_ids`` is a jsonb array of :attr:`ConsoleChatProject.
+    chat_project_id` STRING keys — no FK, same non-FK cross-table-
+    reference convention as every other console-* domain in this module
+    (e.g. :attr:`ConsoleConversation.chat_project_id`), since the
+    isolation invariant that matters is ``(user_sub, agent_id)``, not a
+    database-level cascade. Validating that a referenced chat-project
+    exists/is owned by the same user is explicitly OUT OF SCOPE for this
+    WU.
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN
+    at the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 028, mirrors migrations 022-027's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleAgentsService`` additionally filters every query by
+    ``user_sub`` explicitly at the SERVICE layer, so a dropped filter is
+    caught by the SQLite unit suite too (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_agents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    agent_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model_parameters_json: Mapped[dict[str, Any]] = mapped_column(
+        "model_parameters", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    tools_json: Mapped[list[Any]] = mapped_column(
+        "tools", _ConsoleMetadataType, nullable=False, default=list
+    )
+    artifacts_json: Mapped[dict[str, Any]] = mapped_column(
+        "artifacts", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    end_after_tools: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    project_ids_json: Mapped[list[str]] = mapped_column(
+        "project_ids", _ConsoleMetadataType, nullable=False, default=list
+    )
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleFile.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleFile.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "agent_id",
+            name="uq_console_agents_user_agent",
+        ),
+    )
