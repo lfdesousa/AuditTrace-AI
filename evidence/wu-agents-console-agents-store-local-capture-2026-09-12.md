@@ -257,7 +257,9 @@ same `MEMORY_AGENTS_{WRITE,READ}_SCOPES` arrays, bound only to `audittrace-libre
 - `user_sub` token-derived at the choke, never caller-supplied: no request model in
   `audittrace.models` (`ConsoleAgentUpsertRequest`, `ConsoleAgentBatchGetRequest`)
   declares a `user_sub`/`user_id` field — Pydantic's default `extra="ignore"`
-  silently drops a hostile caller's attempt to supply one. Proven in §3.
+  silently drops a hostile caller's attempt to supply one. Proven NON-VACUOUSLY
+  (side-effect through two distinct real subs, not a response-shape tautology) in
+  §9 (post-review fix).
 - Traceability: RLS migration 028 mirrors migrations 022-027's shape (ENABLE + FORCE
   ROW LEVEL SECURITY + a `FOR ALL` policy comparing `user_sub` against
   `current_setting('app.current_user_id', true)`), guarded by `_is_postgres()` so
@@ -297,3 +299,98 @@ No image was built, no `helm upgrade` ran, no pod was hit through the public API
 with a scoped JWT against a deployed image — Rule 2/3 (live E2E) is explicitly
 deferred to the later fork agents-shim WU per the ratified spec's own acceptance
 criteria.
+
+## 9. Post-review fix — the hostile-body test was VACUOUS, now fixed (commit `a60f050`)
+
+**Independent review finding (REJECT, one issue).** The production code was
+CORRECT — no exploitable defect. `TestConsoleAgentsCrud::
+test_hostile_body_user_sub_is_ignored` asserted response SHAPE, not the SIDE
+EFFECT:
+
+```python
+assert "user_sub" not in body   # tautology — ConsoleAgentItem has no such field
+assert "user_id" not in body    # tautology
+```
+
+It also ran under the single-identity sentinel `client` fixture, so it
+structurally could not observe cross-user ownership. The reviewer proved
+vacuity: adding `user_sub: str | None` to `ConsoleAgentUpsertRequest` and
+honoring it via `dataclasses.replace(user, user_id=body.user_sub)` in the route
+left this test GREEN while a real two-sub test went RED.
+
+**Fix — test only, production code untouched.** Renamed the old test to
+`test_hostile_body_extra_fields_are_dropped_from_response` (kept as an honestly-
+scoped shape smoke check, docstring now points at the real proof) and added
+`TestCrossUserIsolation::test_hostile_body_user_sub_cannot_hijack_another_users_row`:
+drives an attacker and a victim through the REAL `require_user` cold path (two
+distinct real subs, via the `_act_as`/`_identity` helpers already in the file —
+not the sentinel `client` fixture), has the attacker upsert a hostile body
+(`user_sub`/`user_id` = the victim's sub) against the victim's EXISTING
+`agent_id`, and asserts the SIDE EFFECT:
+
+- the victim's row keeps its original name (no hijack/overwrite);
+- the attacker's write lands under the attacker's OWN identity (RLS-isolated
+  from the victim's row despite the identical `agent_id`);
+- a SECOND hostile-planted row (fresh `agent_id`, same hostile `user_sub`/
+  `user_id`) is invisible to the victim via `GET`, `GET /console/agents`
+  (list), and `POST /console/agents/batch-get`.
+
+**Non-vacuity proof (RED → GREEN).** Temporarily reintroduced the EXACT
+injection the reviewer described:
+
+```
+$ git diff --stat src/audittrace/models.py src/audittrace/routes/console_agents.py
+ src/audittrace/models.py             | 1 +
+ src/audittrace/routes/console_agents.py | 6 +++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+```
+(`ConsoleAgentUpsertRequest.user_sub: str | None = None`, plus
+`if body.user_sub: user = dataclasses.replace(user, user_id=body.user_sub)`
+before the `service.upsert_agent(user, ...)` call.)
+
+```
+$ .venv/bin/python -m pytest tests/test_console_agents_routes.py -q --no-cov -k "hostile" -v
+tests/test_console_agents_routes.py::TestConsoleAgentsCrud::test_hostile_body_extra_fields_are_dropped_from_response PASSED
+tests/test_console_agents_routes.py::TestCrossUserIsolation::test_hostile_body_user_sub_cannot_hijack_another_users_row FAILED
+1 failed, 1 passed, 26 deselected
+```
+
+Reproduces the reviewer's own vacuity proof exactly: the OLD shape-only test
+stays GREEN under the injection (proving it was vacuous all along); the NEW
+side-effect test goes RED (the attacker's hostile body successfully hijacked/
+read the victim's identity).
+
+**Restored byte-identical:**
+
+```
+$ git diff --stat src/audittrace/models.py src/audittrace/routes/console_agents.py
+(no output)
+```
+
+**Re-confirmed GREEN**, full agents suite + full `make test`:
+
+```
+$ .venv/bin/python -m pytest tests/test_console_agents_routes.py tests/test_console_agents_service.py \
+    tests/bff/test_console_agents.py tests/bff/test_console_agents_scopes.py -q --no-cov
+99 passed in 10.91s
+
+$ make test
+...
+4996 passed, 2 warnings in 753.15s (0:12:33)
+per-file coverage gate: PASS (137 files checked, lines >= 90%, branches >= 90% on 116 file(s) with branches)
+[no-skip-check] No skipped tests in junit.xml. Good.
+```
+
+Full green — the `test_release_bump_files_ssot` transient (§1/§7) has now fully
+resolved since HEAD includes the prior commit, exactly as predicted.
+
+**Cross-domain scope note (reported, NOT fixed here).** `grep -rn
+"def test_hostile_body_user_sub_is_ignored" tests/` shows the SAME shape-only
+tautology (`assert "user_sub" not in body` / `"user_id" not in body`, under the
+single-identity `client` fixture, no side-effect/two-sub assertion) in FIVE
+already-merged sibling domains: `tests/test_console_chat_projects_routes.py`,
+`tests/test_console_prompts_routes.py`, `tests/test_console_files_routes.py`,
+`tests/test_console_presets_routes.py`, `tests/test_console_conversations_routes.py`.
+This WU only fixes the Agents domain's copy (the one it introduced); the other
+five are out of this branch's scope — reported to the coordinator for a
+dedicated cross-domain test-hardening WU.
