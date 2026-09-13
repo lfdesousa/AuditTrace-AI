@@ -3540,6 +3540,309 @@ class TestOpencodeClientScopesUnchangedByConversationTags:
             )
 
 
+class TestKeycloakToolFavoritesWriteScopeGovernance:
+    """Tool-Favorites domain
+    (2026-09-13-SPEC-mongo-repl-wu-tool-favorites-store.md) — the
+    console-tool-favorites WRITE provisioning half:
+    ``memory:tool_favorites:write`` reaches ``audittrace-librechat`` as
+    an OPTIONAL scope only, via a dedicated
+    ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` array + bind loop kept
+    SEPARATE from every other scope array in this script (same
+    discipline as ``TestKeycloakConversationTagsWriteScopeGovernance``).
+
+    Falsifiable:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete
+      ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` arrays fails
+      ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any read/corpus scope) appearing in either
+      provisioner's ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_tool_favorites_write_scopes``.
+    """
+
+    _EXPECTED_TOOL_FAVORITES_WRITE_SCOPES: frozenset[str] = frozenset(
+        {"memory:tool_favorites:write"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "memory:episodic:read",
+            "memory:procedural:read",
+            "memory:semantic:read",
+            "memory:conversational:read-own",
+            "memory:session:read-own",
+            "memory:conversations:read-own",
+            "memory:presets:read-own",
+            "memory:prompts:read-own",
+            "memory:chat_projects:read-own",
+            "memory:files:read-own",
+            "memory:agents:read-own",
+            "memory:conversation_tags:read-own",
+            "memory:tool_favorites:read-own",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _tool_favorites_write_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_TOOL_FAVORITES_WRITE_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES=( ... ) block not "
+                "found — the Tool-Favorites domain requires a "
+                "dedicated array, separate from every other scope array "
+                "in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _tool_favorites_write_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_TOOL_FAVORITES_WRITE_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}"; '
+                "do ... done`) not found — the Tool-Favorites domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._tool_favorites_write_scopes_in(script_path.read_text())
+        cm_scopes = self._tool_favorites_write_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_TOOL_FAVORITES_WRITE_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_TOOL_FAVORITES_WRITE_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._tool_favorites_write_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_TOOL_FAVORITES_WRITE_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+                    f"bind loop references {forbidden_client!r} — the "
+                    "Tool-Favorites domain scopes the write grant to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_tool_favorites_write_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._tool_favorites_write_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_TOOL_FAVORITES_WRITE_SCOPES "
+                f"illegally carries {sorted(offenders)} — this array "
+                "grants ONLY the write scope, nothing read/corpus/admin."
+            )
+
+
+class TestKeycloakToolFavoritesReadOwnScopeGovernance:
+    """Tool-Favorites domain — the console-tool-favorites READ-OWN
+    provisioning half: ``memory:tool_favorites:read-own`` reaches
+    ``audittrace-librechat`` as a DEFAULT scope (never optional —
+    unlike the write counterpart above), via a dedicated
+    ``MEMORY_TOOL_FAVORITES_READ_SCOPES`` array + bind loop kept
+    SEPARATE from ``MEMORY_TOOL_FAVORITES_WRITE_SCOPES``.
+
+    Falsifiable, same shape as
+    ``TestKeycloakConversationTagsReadOwnScopeGovernance``.
+    """
+
+    _EXPECTED_TOOL_FAVORITES_READ_SCOPES: frozenset[str] = frozenset(
+        {"memory:tool_favorites:read-own"}
+    )
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = (
+        TestKeycloakToolFavoritesWriteScopeGovernance._FORBIDDEN
+        | frozenset({"memory:tool_favorites:write"})
+    ) - frozenset({"memory:tool_favorites:read-own"})
+
+    @staticmethod
+    def _tool_favorites_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_TOOL_FAVORITES_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_READ_SCOPES=( ... ) block not "
+                "found — the Tool-Favorites domain requires a "
+                "dedicated array, separate from "
+                "MEMORY_TOOL_FAVORITES_WRITE_SCOPES."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _tool_favorites_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_TOOL_FAVORITES_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_TOOL_FAVORITES_READ_SCOPES bind loop (`for "
+                'SCOPE in "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; '
+                "do ... done`) not found — the Tool-Favorites domain "
+                "requires a bind loop scoped to audittrace-librechat "
+                "only, separate from every other loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._tool_favorites_read_scopes_in(script_path.read_text())
+        cm_scopes = self._tool_favorites_read_scopes_in(cm_path.read_text())
+
+        assert (
+            script_scopes == cm_scopes == self._EXPECTED_TOOL_FAVORITES_READ_SCOPES
+        ), (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_TOOL_FAVORITES_READ_SCOPES "
+            f"arrays. Script: {sorted(script_scopes)}. ConfigMap: "
+            f"{sorted(cm_scopes)}. Expected: "
+            f"{sorted(self._EXPECTED_TOOL_FAVORITES_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._tool_favorites_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_TOOL_FAVORITES_READ_SCOPES bind "
+                "loop does not bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_TOOL_FAVORITES_READ_SCOPES "
+                    f"bind loop references {forbidden_client!r} — scoped "
+                    "to audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_tool_favorites_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._tool_favorites_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_TOOL_FAVORITES_READ_SCOPES illegally "
+                f"carries {sorted(offenders)} — this array grants ONLY "
+                "the read-own scope, nothing write/durable/corpus."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByToolFavorites:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e): the new ``memory:tool_favorites:{read-own,write}``
+    scope pair is ADDITIVE on ``audittrace-librechat`` ONLY — this class
+    asserts ``audittrace-opencode``'s full scope set (both realm files,
+    both defaultClientScopes and optionalClientScopes) never gains
+    either tool-favorites scope. Mirrors the SC-09
+    (``TestRestrictedClientStaysRestricted``) and every prior Mongo-repl
+    domain's regression-safety pattern: a scope leaking onto a client
+    that was never meant to widen is a silent failure mode, not a loud
+    one — hence a test, not a comment.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:tool_favorites:read-own", "memory:tool_favorites:write"}
+    )
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_tool_favorites_scopes(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the Tool-Favorites domain scopes are additive on "
+                "audittrace-librechat ONLY (standing regression-safety "
+                "requirement); OpenCode's client must stay untouched."
+            )
+
+
 class TestCorpusScopeGovernance:
     """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
     scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
@@ -3925,6 +4228,11 @@ class TestRestrictedClientStaysRestricted:
         # guard, same "no prefix match" rationale as the Agents addition
         # above.
         "memory:conversation_tags:write",
+        # M4 hardening (2026-09-13, Tool-Favorites domain build) —
+        # append the Tool-Favorites domain's write scope to the same
+        # guard, same "no prefix match" rationale as the
+        # Conversation-Tags addition above.
+        "memory:tool_favorites:write",
     )
 
     @staticmethod
@@ -4543,6 +4851,10 @@ class TestLibrechatConsoleClient:
             # conversation-tags store's read-own scope. DEFAULT, same
             # read-own family as memory:agents:read-own above.
             "memory:conversation_tags:read-own",
+            # Tool-Favorites domain (2026-09-13) — the console-tool-
+            # favorites store's read-own scope. DEFAULT, same read-own
+            # family as memory:conversation_tags:read-own above.
+            "memory:tool_favorites:read-own",
             # M3-WU-3b (D3) — standard OIDC scopes the LibreChat console
             # needs for its own identity claims (LibreChat's
             # OPENID_SCOPE="openid profile email offline_access").
@@ -4601,6 +4913,11 @@ class TestLibrechatConsoleClient:
             # only the BFF's console-conversation-tags proxy exchange
             # requests it explicitly.
             "memory:conversation_tags:write",
+            # Tool-Favorites domain (2026-09-13) — the console-tool-
+            # favorites store's write scope, ALSO optional — only the
+            # BFF's console-tool-favorites proxy exchange requests it
+            # explicitly.
+            "memory:tool_favorites:write",
         }
     )
 

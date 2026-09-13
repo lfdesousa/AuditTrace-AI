@@ -33,6 +33,9 @@ from audittrace.routes.console_conversations import (
 from audittrace.routes.console_files import router as console_files_router
 from audittrace.routes.console_presets import router as console_presets_router
 from audittrace.routes.console_prompts import router as console_prompts_router
+from audittrace.routes.console_tool_favorites import (
+    router as console_tool_favorites_router,
+)
 from audittrace.routes.memory_upload import router as memory_upload_status_router
 from audittrace.services.session_gc_janitor import SessionGCJanitor
 from audittrace.services.session_summarizer import SessionSummarizer
@@ -844,6 +847,17 @@ def create_app() -> FastAPI:
         console_conversation_tags_router,
         prefix="/console/conversation-tags",
         tags=["console-conversation-tags"],
+    )
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — the
+    # console-tool-favorites store's REST surface (add/list/remove),
+    # RLS-isolated by the caller's token sub. Own-favorites-only v1
+    # (sharing/marketplace out of scope), MAX_TOOL_FAVORITES enforced
+    # server-side. Additive-only, distinct from every other /console/*
+    # mount above.
+    app.include_router(
+        console_tool_favorites_router,
+        prefix="/console/tool-favorites",
+        tags=["console-tool-favorites"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

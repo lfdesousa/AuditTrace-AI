@@ -1350,6 +1350,91 @@ components:
       - text
       title: ConsolePromptVersionUpsertRequest
       type: object
+    ConsoleToolFavoriteAddRequest:
+      description: 'Request body for ``POST /console/tool-favorites`` — add (or
+
+        idempotently re-affirm) the caller''s own tool-favorite.'
+      properties:
+        item_id:
+          maxLength: 256
+          minLength: 1
+          title: Item Id
+          type: string
+        item_type:
+          enum:
+          - builtin
+          - tool
+          - mcp
+          - skill
+          title: Item Type
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        tenant_id:
+          anyOf:
+          - maxLength: 256
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - item_type
+      - item_id
+      title: ConsoleToolFavoriteAddRequest
+      type: object
+    ConsoleToolFavoriteItem:
+      description: 'One tool-favorite row, as returned by the console-tool-favorites
+
+        API.'
+      properties:
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        item_id:
+          title: Item Id
+          type: string
+        item_type:
+          title: Item Type
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        tenant_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tenant Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - item_type
+      - item_id
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleToolFavoriteItem
+      type: object
+    ConsoleToolFavoriteListResponse:
+      description: 'Response from ``GET /console/tool-favorites`` — the caller''s
+
+        ENTIRE favorites list (no pagination; bounded by
+
+        ``MAX_TOOL_FAVORITES``), oldest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleToolFavoriteItem'
+          title: Items
+          type: array
+      title: ConsoleToolFavoriteListResponse
+      type: object
     ContextBuildResponse:
       description: Response schema for /context endpoint (4-layer assembled context).
       properties:
@@ -2194,6 +2279,13 @@ components:
               action (deferred; WU-4).
             memory:skills:write: Create/update/delete documents in the ``skills`` ChromaDB collection (SKILL/procedural records
               — vector-searchable via /memory/index single-file mode and recall_semantic).
+            memory:tool_favorites:read-own: 'Read your own tool-favorites from the console-tool-favorites store (Tool-Favorites
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s ToolFavorite records. Own-favorites-only:
+              sharing/marketplace is out of scope. Grants no access to another user''s tool-favorites or to any other memory
+              layer.'
+            memory:tool_favorites:write: Add/remove your own tool-favorites in the console-tool-favorites store (Tool-Favorites
+              domain, MongoDB-elimination EPIC), subject to the MAX_TOOL_FAVORITES per-user cap. Grants no access to another
+              user's tool-favorites (RLS-enforced) and no access to any other memory layer.
             memory:upload:write: Upload bytes (PDFs, etc.) into the ingestion content-control pipeline (ADR-048). Distinct
               from memory:episodic:write because uploads land in a quarantine prefix the memory-server cannot read; promotion
               to episodic/papers/ happens only after a scanner verdict.
@@ -3603,6 +3695,95 @@ paths:
       summary: Upsert Version
       tags:
       - console-prompts
+  /console/tool-favorites:
+    get:
+      description: 'List ALL of the CALLER''s OWN (non-deleted) tool-favorites,
+
+        oldest-first. Never returns another user''s favorite — RLS plus the
+
+        service''s own explicit ``user_sub`` filter.'
+      operationId: list_tool_favorites_console_tool_favorites_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleToolFavoriteListResponse'
+          description: Successful Response
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:read-own
+      summary: List Tool Favorites
+      tags:
+      - console-tool-favorites
+    post:
+      description: 'Add (or idempotently re-affirm) the CALLER''s OWN tool-favorite.
+
+        ``user_sub`` is stamped from ``user`` — the body carries no such
+
+        field to override it with. 409 if the caller already owns
+
+        ``MAX_TOOL_FAVORITES`` active favorites and this pair is a new one.'
+      operationId: add_tool_favorite_console_tool_favorites_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleToolFavoriteAddRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleToolFavoriteItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:write
+      summary: Add Tool Favorite
+      tags:
+      - console-tool-favorites
+  /console/tool-favorites/{item_type}/{item_id}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN tool-favorite. 404 if not
+
+        found/not owned/already removed.'
+      operationId: remove_tool_favorite_console_tool_favorites__item_type___item_id__delete
+      parameters:
+      - in: path
+        name: item_type
+        required: true
+        schema:
+          title: Item Type
+          type: string
+      - in: path
+        name: item_id
+        required: true
+        schema:
+          title: Item Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:tool_favorites:write
+      summary: Remove Tool Favorite
+      tags:
+      - console-tool-favorites
   /context:
     post:
       description: Retrieve relevant context from all 4 memory layers.

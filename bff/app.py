@@ -83,7 +83,11 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    ``bff.console_conversation_tags_scopes.CONSOLE_CONVERSATION_TAGS_SCOPE_STRING``
    (``memory:conversation_tags:read-own`` + ``memory:conversation_tags:write``)
    — a TENTH, distinct exchange, own scope pair, never any other route's
-   scopes.
+   scopes; the console-tool-favorites proxy exchanges explicitly for
+   ``bff.console_tool_favorites_scopes.CONSOLE_TOOL_FAVORITES_SCOPE_STRING``
+   (``memory:tool_favorites:read-own`` + ``memory:tool_favorites:write``)
+   — an ELEVENTH, distinct exchange, own scope pair, never any other
+   route's scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -156,6 +160,11 @@ from bff.console_prompts_proxy import (
     proxy_console_prompts_request,
 )
 from bff.console_prompts_scopes import CONSOLE_PROMPTS_SCOPE_STRING
+from bff.console_tool_favorites_proxy import (
+    ConsoleToolFavoritesProxyError,
+    proxy_console_tool_favorites_request,
+)
+from bff.console_tool_favorites_scopes import CONSOLE_TOOL_FAVORITES_SCOPE_STRING
 from bff.exchange import TokenExchangeError, exchange_token
 from bff.memory_proxy import MemoryProxyError, proxy_memory_request
 from bff.memory_scopes import MEMORY_SCOPE_STRING
@@ -1165,6 +1174,106 @@ def create_app() -> FastAPI:
         ``{tag}``. See ``_console_conversation_tags_proxy_impl`` for the
         shared shape."""
         return await _console_conversation_tags_proxy_impl(
+            path, request, settings, http_client
+        )
+
+    async def _console_tool_favorites_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-tool-favorites routes below (the
+        base path with no suffix, and the ``{path:path}`` catch-all) —
+        same shape as ``_console_conversation_tags_proxy_impl`` above,
+        but exchanges for ``CONSOLE_TOOL_FAVORITES_SCOPE_STRING`` and
+        forwards to the orchestrator's ``/console/tool-favorites`` mount
+        (Tool-Favorites domain, MongoDB-elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/tool-favorites request — inbound token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_TOOL_FAVORITES_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-tool-favorites token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_tool_favorites_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleToolFavoritesProxyError as exc:
+            logger.error("orchestrator /console/tool-favorites unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/tool-favorites",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_tool_favorites_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-tool-favorites list/add entry (Tool-Favorites
+        domain, MongoDB-elimination EPIC) — no path suffix. See
+        ``_console_tool_favorites_proxy_impl`` for the shared shape."""
+        return await _console_tool_favorites_proxy_impl(
+            "", request, settings, http_client
+        )
+
+    @app.api_route(
+        "/console/tool-favorites/{path:path}",
+        methods=["GET", "POST", "DELETE"],
+        response_model=None,
+    )
+    async def console_tool_favorites_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-tool-favorites per-resource entry (Tool-Favorites
+        domain, MongoDB-elimination EPIC) — ``{item_type}/{item_id}``.
+        See ``_console_tool_favorites_proxy_impl`` for the shared
+        shape."""
+        return await _console_tool_favorites_proxy_impl(
             path, request, settings, http_client
         )
 
