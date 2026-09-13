@@ -234,6 +234,21 @@ ALL_SCOPES: dict[str, str] = {
         "access to another user's agents (RLS-enforced) and no access "
         "to any other memory layer."
     ),
+    "memory:conversation_tags:read-own": (
+        "Read your own conversation-tags from the "
+        "console-conversation-tags store (Conversation-Tags domain, "
+        "MongoDB-elimination EPIC) — the RLS-isolated store backing "
+        "LibreChat's conversationTag records. Own-tags-only: sharing/"
+        "marketplace is out of scope. Grants no access to another "
+        "user's conversation-tags or to any other memory layer."
+    ),
+    "memory:conversation_tags:write": (
+        "Create/update/delete your own conversation-tags in the "
+        "console-conversation-tags store (Conversation-Tags domain, "
+        "MongoDB-elimination EPIC). Grants no access to another user's "
+        "conversation-tags (RLS-enforced) and no access to any other "
+        "memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

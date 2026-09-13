@@ -23,8 +23,12 @@ ingest route above (see ``bff/config.py``'s
 rationale); it forwards to the orchestrator's real, spec-literal
 ``/console/files`` mount. ``GET/POST/DELETE /console/agents[/{path}]``,
 the console-agents proxy (Agents domain, MongoDB-elimination EPIC) —
-own-agents-only v1, no naming collision on this side. ``GET /health``
-is the k8s-probe convenience every AuditTrace deployable carries.
+own-agents-only v1, no naming collision on this side.
+``GET/POST/DELETE /console/conversation-tags[/{path}]``, the
+console-conversation-tags proxy (Conversation-Tags domain, MongoDB-
+elimination EPIC) — own-tags-only v1, no naming collision on this side.
+``GET /health`` is the k8s-probe convenience every AuditTrace deployable
+carries.
 
 All proxy routes share one fail-closed shape (see the module
 docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
@@ -74,7 +78,12 @@ docstrings in ``bff/auth.py`` / ``bff/exchange.py`` / ``bff/proxy.py`` /
    agents proxy exchanges explicitly for
    ``bff.console_agents_scopes.CONSOLE_AGENTS_SCOPE_STRING``
    (``memory:agents:read-own`` + ``memory:agents:write``) — a NINTH,
-   distinct exchange, own scope pair, never any other route's scopes.
+   distinct exchange, own scope pair, never any other route's scopes;
+   the console-conversation-tags proxy exchanges explicitly for
+   ``bff.console_conversation_tags_scopes.CONSOLE_CONVERSATION_TAGS_SCOPE_STRING``
+   (``memory:conversation_tags:read-own`` + ``memory:conversation_tags:write``)
+   — a TENTH, distinct exchange, own scope pair, never any other route's
+   scopes.
 4. Proxy the raw request body to the orchestrator with the minted token,
    streaming the response back unchanged — including a 401/403/404 the
    orchestrator itself returns, which is forwarded as-is (fail-closed:
@@ -118,6 +127,13 @@ from bff.console_chat_projects_proxy import (
     proxy_console_chat_projects_request,
 )
 from bff.console_chat_projects_scopes import CONSOLE_CHAT_PROJECTS_SCOPE_STRING
+from bff.console_conversation_tags_proxy import (
+    ConsoleConversationTagsProxyError,
+    proxy_console_conversation_tags_request,
+)
+from bff.console_conversation_tags_scopes import (
+    CONSOLE_CONVERSATION_TAGS_SCOPE_STRING,
+)
 from bff.console_conversations_proxy import (
     ConsoleConversationsProxyError,
     proxy_console_conversations_request,
@@ -1049,6 +1065,108 @@ def create_app() -> FastAPI:
         MongoDB-elimination EPIC) — ``{agent_id}``, ``batch-get``. See
         ``_console_agents_proxy_impl`` for the shared shape."""
         return await _console_agents_proxy_impl(path, request, settings, http_client)
+
+    async def _console_conversation_tags_proxy_impl(
+        path_suffix: str,
+        request: Request,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+    ) -> StreamingResponse | JSONResponse:
+        """Shared body for both console-conversation-tags routes below
+        (the base path with no suffix, and the ``{path:path}``
+        catch-all) — same shape as ``_console_agents_proxy_impl`` above,
+        but exchanges for ``CONSOLE_CONVERSATION_TAGS_SCOPE_STRING`` and
+        forwards to the orchestrator's ``/console/conversation-tags``
+        mount (Conversation-Tags domain, MongoDB-elimination EPIC)."""
+        token = _extract_bearer_token(request.headers.get("authorization"))
+        try:
+            claims = await validate_inbound_token(token, settings, http_client)
+        except InboundTokenError as exc:
+            logger.warning(
+                "rejecting /console/conversation-tags request — inbound "
+                "token invalid: %s",
+                exc,
+            )
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Same narrowing as every other route above — validate_inbound_token
+        # raises for a falsy token, so reaching here means it is non-None.
+        assert token is not None
+        inbound_sub = claims["sub"]
+        try:
+            minted_token = await exchange_token(
+                token,
+                inbound_sub,
+                settings,
+                http_client,
+                requested_scope=CONSOLE_CONVERSATION_TAGS_SCOPE_STRING,
+            )
+        except TokenExchangeError as exc:
+            logger.error(
+                "console-conversation-tags token exchange failed for sub=%s: %s",
+                inbound_sub,
+                exc,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Upstream authentication service error"},
+            )
+
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type")
+        try:
+            return await proxy_console_conversation_tags_request(
+                request.method,
+                path_suffix,
+                request.url.query,
+                raw_body,
+                content_type,
+                minted_token,
+                settings,
+                http_client,
+            )
+        except ConsoleConversationTagsProxyError as exc:
+            logger.error("orchestrator /console/conversation-tags unreachable: %s", exc)
+            return JSONResponse(
+                status_code=502, content={"detail": "Upstream service unavailable"}
+            )
+
+    @app.api_route(
+        "/console/conversation-tags",
+        methods=["GET", "POST"],
+        response_model=None,
+    )
+    async def console_conversation_tags_base(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-conversation-tags list/create entry
+        (Conversation-Tags domain, MongoDB-elimination EPIC) — no path
+        suffix. See ``_console_conversation_tags_proxy_impl`` for the
+        shared shape."""
+        return await _console_conversation_tags_proxy_impl(
+            "", request, settings, http_client
+        )
+
+    @app.api_route(
+        "/console/conversation-tags/{path:path}",
+        methods=["GET", "POST", "DELETE"],
+        response_model=None,
+    )
+    async def console_conversation_tags_proxy(
+        path: str,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        http_client: httpx.AsyncClient = Depends(get_http_client),
+    ) -> StreamingResponse | JSONResponse:
+        """The console-conversation-tags per-resource entry
+        (Conversation-Tags domain, MongoDB-elimination EPIC) —
+        ``{tag}``. See ``_console_conversation_tags_proxy_impl`` for the
+        shared shape."""
+        return await _console_conversation_tags_proxy_impl(
+            path, request, settings, http_client
+        )
 
     return app
 

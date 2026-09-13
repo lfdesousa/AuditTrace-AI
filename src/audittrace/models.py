@@ -865,3 +865,48 @@ class ConsoleAgentBatchGetResponse(BaseModel):
     existed" from the response shape alone."""
 
     items: list[ConsoleAgentItem] = Field(default_factory=list)
+
+
+# ── Console-conversation-tags (Conversation-Tags domain, MongoDB- ─────────
+# elimination EPIC) ────────────────────────────────────────────────────────
+#
+# Own-tags-only v1 — every row is owned by exactly one user_sub, same
+# discipline as every other console-* domain above. ``count``/``position``
+# are plain caller-maintained integers this store persists as-is.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+
+class ConsoleConversationTagUpsertRequest(BaseModel):
+    """Request body for ``POST /console/conversation-tags`` — create/
+    update the caller's own conversation-tag (upsert by ``tag``)."""
+
+    tag: str = Field(..., min_length=1, max_length=512)
+    description: str | None = None
+    count: int = Field(default=0, ge=0)
+    position: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTagItem(BaseModel):
+    """One conversation-tag row, as returned by the console-
+    conversation-tags API."""
+
+    tag: str
+    description: str
+    count: int
+    position: int
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleConversationTagListResponse(BaseModel):
+    """Response from ``GET /console/conversation-tags`` —
+    cursor-paginated, newest-first."""
+
+    items: list[ConsoleConversationTagItem] = Field(default_factory=list)
+    next_cursor: str | None = None

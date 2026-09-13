@@ -267,6 +267,26 @@ data:
       "memory:agents:read-own"
     )
 
+    # Conversation-Tags domain (2026-09-13, MongoDB-elimination EPIC) —
+    # the console-conversation-tags store's write scope. Bound ONLY as
+    # OPTIONAL to audittrace-librechat (never default), in its OWN
+    # array/bind loop — same "never auto-granted" discipline as
+    # MEMORY_AGENTS_WRITE_SCOPES above: only the BFF's
+    # console-conversation-tags proxy exchange
+    # (bff/console_conversation_tags_scopes.py::CONSOLE_CONVERSATION_TAGS_SCOPE_STRING)
+    # requests it by name.
+    MEMORY_CONVERSATION_TAGS_WRITE_SCOPES=(
+      "memory:conversation_tags:write"
+    )
+
+    # Conversation-Tags domain (2026-09-13) — the console-
+    # conversation-tags store's read-own scope. Bound as DEFAULT to
+    # audittrace-librechat — same rationale as MEMORY_AGENTS_READ_SCOPES
+    # above. Own array/bind loop, separate from the write array.
+    MEMORY_CONVERSATION_TAGS_READ_SCOPES=(
+      "memory:conversation_tags:read-own"
+    )
+
     # Vault-Agent rendered the admin password to /vault/secrets/env
     # when vault.enabled=true; otherwise it's a regular env var via
     # K8s Secret.
@@ -352,7 +372,7 @@ data:
     }
 
     declare -A SCOPE_ID
-    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}"; do
+    for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}"; do
       if EXISTING=$(find_scope_id "${SCOPE}"); then
         echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
         SCOPE_ID["${SCOPE}"]="${EXISTING}"
@@ -576,6 +596,22 @@ data:
     # audittrace-librechat only, as DEFAULT — same rationale as Step 2o.
     echo "▶ binding console-agents read-own scope to client audittrace-librechat (default)..."
     for SCOPE in "${MEMORY_AGENTS_READ_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "default"
+    done
+
+    # ── Step 2r: bind the console-conversation-tags WRITE scope (Conversation-Tags domain) ──
+    # audittrace-librechat only, as OPTIONAL — separate loop, same
+    # discipline as Step 2p. Only the BFF's console-conversation-tags
+    # proxy exchange requests this scope by name.
+    echo "▶ binding console-conversation-tags write scope to client audittrace-librechat (optional)..."
+    for SCOPE in "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}"; do
+      bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+    done
+
+    # ── Step 2s: bind the console-conversation-tags READ-OWN scope (Conversation-Tags domain) ──
+    # audittrace-librechat only, as DEFAULT — same rationale as Step 2q.
+    echo "▶ binding console-conversation-tags read-own scope to client audittrace-librechat (default)..."
+    for SCOPE in "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}"; do
       bind_scope "audittrace-librechat" "${SCOPE}" "default"
     done
 

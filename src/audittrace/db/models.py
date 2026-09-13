@@ -1015,3 +1015,72 @@ class ConsoleAgent(Base):
             name="uq_console_agents_user_agent",
         ),
     )
+
+
+class ConsoleConversationTag(Base):
+    """The ``console_conversation_tags`` store — the Conversation-Tags
+    domain of the MongoDB-elimination EPIC (migration 029): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ConversationTag`` collection
+    (``packages/data-schemas/src/schema/conversationTag.ts``).
+
+    **Own-tags-only v1 (the ratified spec's scope boundary).** Every row
+    is owned by exactly one ``user_sub`` (the unique constraint below) —
+    there is no shared/global tag concept in this table (mirrors every
+    other console-* domain's own-scoped v1: presets/prompts/chat-projects/
+    files/agents).
+
+    ``tag`` is a CLIENT-SUPPLIED STRING (LibreChat mints its own, e.g.
+    "work" or "urgent"), same pattern as :attr:`ConsoleAgent.agent_id` —
+    the internal PK ``id`` is a separate server-generated UUID so ``tag``
+    collisions across users can coexist, disambiguated only by
+    ``(user_sub, tag)`` (the unique constraint below).
+
+    ``count`` (number of conversations carrying this tag) and
+    ``position`` (sort order) are plain caller-maintained integers — this
+    store persists whatever the caller upserts; it never independently
+    recomputes ``count`` by cross-referencing conversations (that
+    reconciliation, if ever needed, is a later WU, same "opaque blob,
+    not enforced" discipline as :attr:`ConsoleAgent.tools_json`).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 029, mirrors migrations 022-028's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleConversationTagsService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (feedback_unit_tests_miss_rls).
+    """
+
+    __tablename__ = "console_conversation_tags"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    tag: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleAgent.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleAgent.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "tag",
+            name="uq_console_conversation_tags_user_tag",
+        ),
+    )
