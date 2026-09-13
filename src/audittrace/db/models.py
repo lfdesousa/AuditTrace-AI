@@ -1084,3 +1084,81 @@ class ConsoleConversationTag(Base):
             name="uq_console_conversation_tags_user_tag",
         ),
     )
+
+
+class ConsoleToolFavorite(Base):
+    """The ``console_tool_favorites`` store — the Tool-Favorites domain
+    of the MongoDB-elimination EPIC (migration 030): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``ToolFavorite`` collection
+    (``packages/data-schemas/src/schema/favorite.ts``).
+
+    **Own-favorites-only v1.** Every row is owned by exactly one
+    ``user_sub`` — there is no shared/global favorite concept (mirrors
+    every other console-* domain's own-scoped v1: presets/prompts/
+    chat-projects/files/agents/conversation-tags).
+
+    ``item_type``/``item_id`` are the CLIENT-SUPPLIED composite key the
+    fork mints (e.g. ``itemType="tool"``, ``itemId="web-search"``) — the
+    internal PK ``id`` is a separate server-generated UUID so the same
+    ``(item_type, item_id)`` pair can coexist across users,
+    disambiguated only by ``(user_sub, item_type, item_id)`` (the unique
+    constraint below, mirroring the fork's own
+    ``{ user: 1, itemType: 1, itemId: 1 }`` unique index).
+
+    ``tenant_id`` is the grounding schema's 4th field
+    (``packages/data-schemas/src/schema/favorite.ts``'s optional
+    ``tenantId``) — persisted as an opaque, caller-supplied string, never
+    interpreted by this store (own-scoped v1 has no multi-tenant
+    concept; this column exists purely for schema fidelity with the
+    fork's Mongo document).
+
+    ``user_sub`` is the Keycloak ``sub`` claim, stamped from the TOKEN at
+    the route layer — NEVER from the request body
+    (``feedback_never_trust_caller_metadata_for_security_fields``). RLS
+    (migration 030, mirrors migrations 022-029's shape exactly) compares
+    ``user_sub`` against ``current_setting('app.current_user_id',
+    true)``. On SQLite (unit tests) RLS is a no-op —
+    ``PostgresConsoleToolFavoritesService`` additionally filters every
+    query by ``user_sub`` explicitly at the SERVICE layer, so a dropped
+    filter is caught by the SQLite unit suite too
+    (``feedback_unit_tests_miss_rls``).
+
+    Soft-delete + re-create discipline (the D13 quirk this domain
+    deliberately AVOIDS): the service's existence lookup for an ACTIVE
+    row filters ``deleted_at_ms IS NULL``; re-favoriting a previously
+    unfavorited ``(item_type, item_id)`` pair clears the tombstone on
+    the SAME row (the unique constraint below forbids a second row for
+    that key) rather than leaving it soft-deleted under an
+    apparently-successful upsert.
+    """
+
+    __tablename__ = "console_tool_favorites"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Keycloak `sub` claim — no FK, same rationale as every other user_id/
+    # user_sub column in this module (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    item_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Soft delete — same convention as ConsoleConversationTag.deleted_at_ms.
+    deleted_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", _ConsoleMetadataType, nullable=False, default=dict
+    )
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as
+    # ConsoleConversationTag.trace_id.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_sub",
+            "item_type",
+            "item_id",
+            name="uq_console_tool_favorites_user_item",
+        ),
+    )

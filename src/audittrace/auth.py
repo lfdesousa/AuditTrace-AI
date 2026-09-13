@@ -249,6 +249,21 @@ ALL_SCOPES: dict[str, str] = {
         "conversation-tags (RLS-enforced) and no access to any other "
         "memory layer."
     ),
+    "memory:tool_favorites:read-own": (
+        "Read your own tool-favorites from the console-tool-favorites "
+        "store (Tool-Favorites domain, MongoDB-elimination EPIC) — the "
+        "RLS-isolated store backing LibreChat's ToolFavorite records. "
+        "Own-favorites-only: sharing/marketplace is out of scope. "
+        "Grants no access to another user's tool-favorites or to any "
+        "other memory layer."
+    ),
+    "memory:tool_favorites:write": (
+        "Add/remove your own tool-favorites in the console-tool-"
+        "favorites store (Tool-Favorites domain, MongoDB-elimination "
+        "EPIC), subject to the MAX_TOOL_FAVORITES per-user cap. Grants "
+        "no access to another user's tool-favorites (RLS-enforced) and "
+        "no access to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

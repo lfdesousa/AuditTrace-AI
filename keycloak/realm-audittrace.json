@@ -264,6 +264,20 @@
       }
     },
     {
+      "name": "memory:tool_favorites:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
+      "name": "memory:tool_favorites:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "audittrace:scan:retrigger",
       "protocol": "openid-connect",
       "attributes": {
@@ -819,6 +833,7 @@
         "memory:files:read-own",
         "memory:agents:read-own",
         "memory:conversation_tags:read-own",
+        "memory:tool_favorites:read-own",
         "profile",
         "email"
       ],
@@ -834,7 +849,8 @@
         "memory:chat_projects:write",
         "memory:files:write",
         "memory:agents:write",
-        "memory:conversation_tags:write"
+        "memory:conversation_tags:write",
+        "memory:tool_favorites:write"
       ],
       "protocolMappers": [
         {

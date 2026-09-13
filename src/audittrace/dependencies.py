@@ -60,6 +60,11 @@ from audittrace.services.console_prompts import (
     MockConsolePromptsService,
     PostgresConsolePromptsService,
 )
+from audittrace.services.console_tool_favorites import (
+    ConsoleToolFavoritesService,
+    MockConsoleToolFavoritesService,
+    PostgresConsoleToolFavoritesService,
+)
 from audittrace.services.context_builder import (
     ContextBuilderService,
     DefaultContextBuilder,
@@ -447,6 +452,16 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         )
     )
 
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — the
+    # console-tool-favorites store's backing service (Postgres
+    # RLS-isolated, migration 030). Same session factory as
+    # console_conversation_tags above.
+    console_tool_favorites: ConsoleToolFavoritesService = (
+        PostgresConsoleToolFavoritesService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+
     # Memory-layer manifest (CRUD backoffice — migration 009 + the
     # /memory/<layer> REST endpoints). Postgres-backed; same session
     # factory as conversational since the table is in the same DB.
@@ -495,6 +510,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["console_files"] = console_files
     container._instances["console_agents"] = console_agents
     container._instances["console_conversation_tags"] = console_conversation_tags
+    container._instances["console_tool_favorites"] = console_tool_favorites
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -758,6 +774,19 @@ def get_console_conversation_tags_service() -> ConsoleConversationTagsService:
 
 
 @log_call(logger=logger)
+def get_console_tool_favorites_service() -> ConsoleToolFavoritesService:
+    """Get the console-tool-favorites service (dependency injection).
+
+    Tool-Favorites domain (MongoDB-elimination EPIC) — the RLS-isolated
+    store ``routes/console_tool_favorites.py`` writes/reads through.
+    """
+    return cast(
+        ConsoleToolFavoritesService,
+        container._instances["console_tool_favorites"],
+    )
+
+
+@log_call(logger=logger)
 def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
@@ -822,6 +851,7 @@ def _register_mock_memory_services() -> None:
     console_files = MockConsoleFilesService()
     console_agents = MockConsoleAgentsService()
     console_conversation_tags = MockConsoleConversationTagsService()
+    console_tool_favorites = MockConsoleToolFavoritesService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -841,6 +871,7 @@ def _register_mock_memory_services() -> None:
     container._instances["console_files"] = console_files
     container._instances["console_agents"] = console_agents
     container._instances["console_conversation_tags"] = console_conversation_tags
+    container._instances["console_tool_favorites"] = console_tool_favorites
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -940,6 +971,13 @@ def create_test_container() -> DependencyContainer:
     # rationale as console_agents above.
     test_container._instances["console_conversation_tags"] = (
         PostgresConsoleConversationTagsService(
+            session_factory=pg_factory.get_session_factory(),
+        )
+    )
+    # Tool-Favorites domain (MongoDB-elimination EPIC) — same rationale
+    # as console_conversation_tags above.
+    test_container._instances["console_tool_favorites"] = (
+        PostgresConsoleToolFavoritesService(
             session_factory=pg_factory.get_session_factory(),
         )
     )

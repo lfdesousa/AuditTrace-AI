@@ -910,3 +910,47 @@ class ConsoleConversationTagListResponse(BaseModel):
 
     items: list[ConsoleConversationTagItem] = Field(default_factory=list)
     next_cursor: str | None = None
+
+
+# ── Console-tool-favorites (Tool-Favorites domain, MongoDB- ───────────────
+# elimination EPIC) ────────────────────────────────────────────────────────
+#
+# Own-favorites-only v1 — every row is owned by exactly one user_sub, same
+# discipline as every other console-* domain above.
+#
+# Deliberately carries NO ``user_sub``/``user_id`` field on the request
+# model below — same rationale as every other console-* upsert request
+# model above (feedback_never_trust_caller_metadata_for_security_fields).
+
+_TOOL_FAVORITE_ITEM_TYPE = Literal["builtin", "tool", "mcp", "skill"]
+
+
+class ConsoleToolFavoriteAddRequest(BaseModel):
+    """Request body for ``POST /console/tool-favorites`` — add (or
+    idempotently re-affirm) the caller's own tool-favorite."""
+
+    item_type: _TOOL_FAVORITE_ITEM_TYPE
+    item_id: str = Field(..., min_length=1, max_length=256)
+    tenant_id: str | None = Field(default=None, max_length=256)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleToolFavoriteItem(BaseModel):
+    """One tool-favorite row, as returned by the console-tool-favorites
+    API."""
+
+    item_type: str
+    item_id: str
+    tenant_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+    deleted_at_ms: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConsoleToolFavoriteListResponse(BaseModel):
+    """Response from ``GET /console/tool-favorites`` — the caller's
+    ENTIRE favorites list (no pagination; bounded by
+    ``MAX_TOOL_FAVORITES``), oldest-first."""
+
+    items: list[ConsoleToolFavoriteItem] = Field(default_factory=list)

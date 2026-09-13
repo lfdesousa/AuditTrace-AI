@@ -299,9 +299,24 @@ MEMORY_CONVERSATION_TAGS_READ_SCOPES=(
   "memory:conversation_tags:read-own"
 )
 
+# Tool-Favorites domain (2026-09-13, MongoDB-elimination EPIC) — the
+# console-tool-favorites store's write scope. Bound ONLY as OPTIONAL to
+# audittrace-librechat (never default), own array/bind loop — only the
+# BFF's console-tool-favorites proxy exchange requests it by name.
+MEMORY_TOOL_FAVORITES_WRITE_SCOPES=(
+  "memory:tool_favorites:write"
+)
+
+# Tool-Favorites domain (2026-09-13) — the console-tool-favorites
+# store's read-own scope. Bound as DEFAULT to audittrace-librechat —
+# same rationale as MEMORY_CONVERSATION_TAGS_READ_SCOPES above.
+MEMORY_TOOL_FAVORITES_READ_SCOPES=(
+  "memory:tool_favorites:read-own"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -514,6 +529,22 @@ done
 # console-agents read-own bind above.
 echo "▶ binding console-conversation-tags read-own scope to client audittrace-librechat (default)..."
 for SCOPE in "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "default"
+done
+
+# ----- Bind the console-tool-favorites WRITE scope (Tool-Favorites domain) -----
+# audittrace-librechat only, as OPTIONAL — separate loop from the ones
+# above.
+echo "▶ binding console-tool-favorites write scope to client audittrace-librechat (optional)..."
+for SCOPE in "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+done
+
+# ----- Bind the console-tool-favorites READ-OWN scope (Tool-Favorites domain) -----
+# audittrace-librechat only, as DEFAULT — same rationale as the
+# console-conversation-tags read-own bind above.
+echo "▶ binding console-tool-favorites read-own scope to client audittrace-librechat (default)..."
+for SCOPE in "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "default"
 done
 
