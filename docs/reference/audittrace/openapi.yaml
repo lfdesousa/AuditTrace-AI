@@ -502,6 +502,96 @@ components:
           title: Next Cursor
       title: ConsoleConversationListResponse
       type: object
+    ConsoleConversationTagItem:
+      description: 'One conversation-tag row, as returned by the console-
+
+        conversation-tags API.'
+      properties:
+        count:
+          title: Count
+          type: integer
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        deleted_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Deleted At Ms
+        description:
+          title: Description
+          type: string
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        position:
+          title: Position
+          type: integer
+        tag:
+          title: Tag
+          type: string
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - tag
+      - description
+      - count
+      - position
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleConversationTagItem
+      type: object
+    ConsoleConversationTagListResponse:
+      description: 'Response from ``GET /console/conversation-tags`` —
+
+        cursor-paginated, newest-first.'
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ConsoleConversationTagItem'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      title: ConsoleConversationTagListResponse
+      type: object
+    ConsoleConversationTagUpsertRequest:
+      description: 'Request body for ``POST /console/conversation-tags`` — create/
+
+        update the caller''s own conversation-tag (upsert by ``tag``).'
+      properties:
+        count:
+          default: 0
+          minimum: 0.0
+          title: Count
+          type: integer
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        metadata:
+          additionalProperties: true
+          title: Metadata
+          type: object
+        position:
+          default: 0
+          title: Position
+          type: integer
+        tag:
+          maxLength: 512
+          minLength: 1
+          title: Tag
+          type: string
+      required:
+      - tag
+      title: ConsoleConversationTagUpsertRequest
+      type: object
     ConsoleConversationTitleUpdateRequest:
       description: Request body for ``PATCH /console/conversations/{conversation_id}``.
       properties:
@@ -2040,6 +2130,13 @@ components:
             memory:chat_projects:write: Create/update/delete your own chat-projects in the console-chat-projects store (Chat-Projects
               domain, MongoDB-elimination EPIC). Grants no access to another user's chat-projects (RLS-enforced) and no access
               to any other memory layer.
+            memory:conversation_tags:read-own: 'Read your own conversation-tags from the console-conversation-tags store (Conversation-Tags
+              domain, MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s conversationTag records. Own-tags-only:
+              sharing/marketplace is out of scope. Grants no access to another user''s conversation-tags or to any other memory
+              layer.'
+            memory:conversation_tags:write: Create/update/delete your own conversation-tags in the console-conversation-tags
+              store (Conversation-Tags domain, MongoDB-elimination EPIC). Grants no access to another user's conversation-tags
+              (RLS-enforced) and no access to any other memory layer.
             memory:conversational:read-own: Read your own past conversations from the conversational layer
             memory:conversations:read-own: Read your own conversations + messages from the console-conversations store (WU-1,
               MongoDB-elimination EPIC) — the RLS-isolated, message-tree-shaped store backing LibreChat's sidebar/history.
@@ -2486,6 +2583,146 @@ paths:
       summary: Get Chat Project
       tags:
       - console-chat-projects
+  /console/conversation-tags:
+    get:
+      description: 'List the CALLER''s OWN (non-deleted) conversation-tags, newest-
+
+        first, cursor-paginated. Never returns another user''s tag — RLS
+
+        plus the service''s own explicit ``user_sub`` filter.'
+      operationId: list_conversation_tags_console_conversation_tags_get
+      parameters:
+      - description: Opaque pagination cursor.
+        in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Opaque pagination cursor.
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 25
+          maximum: 200
+          minimum: 1
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:read-own
+      summary: List Conversation Tags
+      tags:
+      - console-conversation-tags
+    post:
+      description: 'Create or update the CALLER''s OWN conversation-tag (upsert by
+
+        ``tag``). ``user_sub`` is stamped from ``user`` — the body carries
+
+        no such field to override it with.'
+      operationId: upsert_conversation_tag_console_conversation_tags_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleConversationTagUpsertRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:write
+      summary: Upsert Conversation Tag
+      tags:
+      - console-conversation-tags
+  /console/conversation-tags/{tag}:
+    delete:
+      description: 'Soft-delete the CALLER''s OWN conversation-tag. 404 if not
+
+        found/not owned/already deleted.'
+      operationId: delete_conversation_tag_console_conversation_tags__tag__delete
+      parameters:
+      - in: path
+        name: tag
+        required: true
+        schema:
+          title: Tag
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:write
+      summary: Delete Conversation Tag
+      tags:
+      - console-conversation-tags
+    get:
+      description: 'Fetch the CALLER''s OWN conversation-tag. 404 if it doesn''t exist,
+
+        is deleted, or belongs to another user — never 403 (would leak
+
+        existence to a caller probing foreign tag names).'
+      operationId: get_conversation_tag_console_conversation_tags__tag__get
+      parameters:
+      - in: path
+        name: tag
+        required: true
+        schema:
+          title: Tag
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleConversationTagItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:conversation_tags:read-own
+      summary: Get Conversation Tag
+      tags:
+      - console-conversation-tags
   /console/conversations:
     get:
       description: 'List the CALLER''s OWN (non-deleted) conversations, newest-first,

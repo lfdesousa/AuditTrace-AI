@@ -117,6 +117,17 @@ class Settings(BaseSettings):
     # a pre-existing route at ``/console/agents``, so this proxy's
     # BFF-facing path matches the orchestrator mount 1:1.
     orchestrator_console_agents_path_prefix: str = "/console/agents"
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    # console-conversation-tags store's mount point on the orchestrator
+    # (``src/audittrace/routes/console_conversation_tags.py``,
+    # ``server.py``). Same "one place to override" rationale as
+    # ``orchestrator_console_agents_path_prefix`` above — no naming
+    # collision here: the BFF never had a pre-existing route at
+    # ``/console/conversation-tags``, so this proxy's BFF-facing path
+    # matches the orchestrator mount 1:1.
+    orchestrator_console_conversation_tags_path_prefix: str = (
+        "/console/conversation-tags"
+    )
     orchestrator_timeout_seconds: float = 120.0
     # M3 Sovereign-Attach WU-2 — the console file-upload route
     # (``POST /console/files``) always forwards to

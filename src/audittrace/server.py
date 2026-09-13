@@ -24,6 +24,9 @@ from audittrace.routes.console_agents import router as console_agents_router
 from audittrace.routes.console_chat_projects import (
     router as console_chat_projects_router,
 )
+from audittrace.routes.console_conversation_tags import (
+    router as console_conversation_tags_router,
+)
 from audittrace.routes.console_conversations import (
     router as console_conversations_router,
 )
@@ -832,6 +835,15 @@ def create_app() -> FastAPI:
         console_agents_router,
         prefix="/console/agents",
         tags=["console-agents"],
+    )
+    # Conversation-Tags domain (MongoDB-elimination EPIC) — the
+    # console-conversation-tags store's REST surface (upsert/list/get/
+    # delete), RLS-isolated by the caller's token sub. Own-tags-only v1.
+    # Additive-only, distinct from every other /console/* mount above.
+    app.include_router(
+        console_conversation_tags_router,
+        prefix="/console/conversation-tags",
+        tags=["console-conversation-tags"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-
