@@ -76,10 +76,13 @@ logger = logging.getLogger(__name__)
 # overshoot by one under concurrency" acknowledgement).
 MAX_TOOL_FAVORITES = 100
 
-# Mirrors the fork's types/favorite.ts::FAVORITE_ITEM_TYPES Mongoose
-# enum exactly — closed vocabulary, not free-form, so a typo'd
-# item_type cannot silently create an orphan favorite category.
-TOOL_FAVORITE_ITEM_TYPES: tuple[str, ...] = ("builtin", "tool", "mcp", "skill")
+# The closed ``item_type`` vocabulary (the fork's
+# types/favorite.ts::FAVORITE_ITEM_TYPES Mongoose enum) has ONE source of
+# truth: ``audittrace.models._TOOL_FAVORITE_ITEM_TYPE`` — the Pydantic
+# ``Literal`` that rejects an unknown item_type with 422 at the route
+# boundary BEFORE any service method runs. This module deliberately does
+# NOT carry a duplicate tuple (a second copy was dead code that could
+# silently drift from the enforced one — 2026-09-13 review F2).
 
 
 class ToolFavoritesCapExceededError(Exception):

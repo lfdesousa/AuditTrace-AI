@@ -278,3 +278,91 @@ No image was built, no `helm upgrade` ran, no pod was hit through the public API
 with a scoped JWT against a deployed image — Rule 2/3 (live E2E) is explicitly
 deferred to the later fork tool-favorites-shim WU per the ratified spec's own
 acceptance criteria.
+
+## 9. Review-fix (2026-09-13, REJECT F1/F2/F3) — cap-count aggregate proven user-scoped, every filter enumerated
+
+Addresses the independent reviewer's REJECT
+(`review-verdict-mongo-repl-tool-favorites-store-20260913.outcome-reject.md`,
+distilled as `lesson-aggregate-queries-must-be-user-scoped-20260913`): the
+cap-COUNT aggregate's `user_sub` filter in BOTH `add_tool_favorite` implementations
+was present and correct but had NO test whose failure would catch its removal
+(deleting it left all 51 store tests green — a latent per-user-to-GLOBAL cap
+regression = cross-user DoS). No service logic changed; only tests (+ the F2
+dead-code collapse).
+
+### 9.1 New tests (8)
+
+Service, Mock (`TestMockConsoleToolFavoritesService`):
+`test_cap_is_per_user_not_global`,
+`test_add_tool_favorite_cannot_overwrite_another_users_row`,
+`test_add_cannot_resurrect_another_users_tombstone`, `test_cross_user_remove_denied`.
+Service, Postgres (`TestPostgresConsoleToolFavoritesService`, bracketed with
+`set_current_user_id`): `test_cap_is_per_user_not_global`,
+`test_add_cannot_resurrect_another_users_tombstone`.
+HTTP, two distinct real subs through the real `require_user` cold path
+(`TestCrossUserIsolation`, existing `_act_as`/`_identity` helpers, NOT a
+single-identity fixture): `test_cap_is_per_user_through_real_route` (alice at MAX
+→ 409 for her; bob's FIRST add → 200), `test_user_b_add_cannot_resurrect_user_as_removed_favorite`.
+
+```
+$ .venv/bin/pytest tests/test_console_tool_favorites_service.py \
+    tests/test_console_tool_favorites_routes.py -q --no-cov
+59 passed        (was 51)
+```
+
+### 9.2 Non-vacuity proofs — EVERY user-scoped filter, BOTH implementations (targeted pytest, one neuter at a time, restored byte-identical each time; sha256 of the service module `99b0e852f84cf973c82816b217fa74e699d91e03f0e8fc0c45d0738b49bd12e0` before and after every step)
+
+| # | filter neutered (service module) | RED result (targeted run) | tests that went RED |
+|---|---|---|---|
+| P1 | Postgres `add`: cap-COUNT `select(func.count())` `user_sub` clause (the F1 gap) | 2 failed / 57 passed | Postgres `test_cap_is_per_user_not_global` (pytest.fail: "bob's FIRST add was rejected because ALICE is at the cap"), HTTP `test_cap_is_per_user_through_real_route` (bob got `409 {"detail":"maximum of 100 tool favorites reached"}`) |
+| P2 | Postgres `add`: ACTIVE-row lookup `user_sub` | 3 failed / 56 passed | Postgres `test_add_tool_favorite_cannot_overwrite_another_users_row`; HTTP `test_user_b_cannot_write_user_as_favorite`, `test_hostile_body_user_sub_cannot_hijack_another_users_row` |
+| P3 | Postgres `add`: TOMBSTONE lookup `user_sub` | 5 failed / 54 passed | Postgres `test_add_cannot_resurrect_another_users_tombstone` (+ overwrite test); HTTP `test_user_b_add_cannot_resurrect_user_as_removed_favorite` (+ write, hostile-body) |
+| P4 | Postgres `list` `user_sub` | 8 failed / 51 passed | Postgres `test_cross_user_isolation_denies_list` (+ every cross-user test that lists) ; HTTP `test_user_b_cannot_list_user_as_favorite` (+3) |
+| P5 | Postgres `remove` lookup `user_sub` | 2 failed / 57 passed | Postgres `test_cross_user_remove_denied`; HTTP `test_user_b_cannot_write_user_as_favorite` |
+| M1 | Mock `add`: cap-COUNT `sum(...)` `user_sub` clause (the F1 gap) | 1 failed / 58 passed | Mock `test_cap_is_per_user_not_global` |
+| M2 | Mock `_find_active` `user_sub` (add ACTIVE lookup + remove lookup) | 2 failed / 57 passed | Mock `test_add_tool_favorite_cannot_overwrite_another_users_row`, `test_cross_user_remove_denied` |
+| M3 | Mock `_find_any` `user_sub` (add TOMBSTONE lookup) | 2 failed / 57 passed | Mock `test_add_cannot_resurrect_another_users_tombstone` (+ overwrite test) |
+| M4 | Mock `list` `user_sub` | 4 failed / 55 passed | Mock `test_isolates_tool_favorites_by_user` (+3) |
+
+After each restore: `59 passed`. The HTTP-route tests exercise the Postgres
+(aiosqlite `InMemoryPostgresFactory`) implementation the `client` fixture wires
+(`dependencies.py`), so Mock neuters correctly leave the HTTP suite green.
+
+Enumeration result: 5 Postgres filters + 4 Mock filter sites (the Mock's
+`_find_active` serves both the add ACTIVE lookup and the remove lookup) = every
+user-scoped read, write, tombstone/active lookup and aggregate in the service,
+each with at least one test whose failure catches its removal.
+
+### 9.3 F2 — one source of truth for `item_type`
+
+`services/console_tool_favorites.py::TOOL_FAVORITE_ITEM_TYPES` (dead — referenced
+nowhere) deleted; `audittrace.models._TOOL_FAVORITE_ITEM_TYPE` (the Pydantic
+`Literal` that produces the 422, covered by `test_add_rejects_invalid_item_type`)
+is the single source of truth, documented at both sites.
+`grep -rn TOOL_FAVORITE_ITEM_TYPES src tests bff docs` → no matches.
+
+### 9.4 F3 — re-measured gates (supersede §1 and §6 numbers)
+
+```
+$ make test
+5186 passed, 2 warnings in 617.05s (0:10:17)
+Required test coverage of 90% reached. Total coverage: 98.95%
+per-file coverage gate: PASS (145 files checked, lines >= 90%, branches >= 90% on 122 file(s) with branches)
+[no-skip-check] No skipped tests in junit.xml. Good.
+src/audittrace/services/console_tool_favorites.py   144  0  40  0  100%
+src/audittrace/routes/console_tool_favorites.py      38  0   2  0  100%
+src/audittrace/models.py                            441  0   8  0  100%
+bff/console_tool_favorites_proxy.py                  29  0   6  0  100%
+
+$ .venv/bin/pytest tests/test_chart_drift_guards.py -q --no-cov
+163 passed            (§6 previously claimed 228 — that number did not reproduce)
+
+$ make helm-lint      → 1 chart(s) linted, 0 chart(s) failed
+$ .venv/bin/alembic heads → 9d4e2b7f1c63 (head)   (single head, unchanged)
+$ ruff check / ruff format --check / mypy on the touched files → clean
+```
+
+The §1 "1 failed, 5177 passed" figure was this branch's PRE-commit run (the
+documented editable-install worktree transient); post-commit it does not reproduce:
+0 failed. Corrected build-record re-logged via `log_build_record` (key reported in
+the handoff).

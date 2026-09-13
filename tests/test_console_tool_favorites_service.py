@@ -17,6 +17,18 @@ Also covers the two acceptance-critical behaviours the ratified spec
 calls out by name: the ``MAX_TOOL_FAVORITES`` per-user cap (101st add
 fails) and soft-delete-then-re-create (the D13 quirk this domain
 AVOIDS).
+
+**Every user-scoped filter has a neuter-sensitive test, BOTH
+implementations** (the 2026-09-13 review's rule — aggregate queries
+must be user-scoped too):
+
+| filter (per implementation)          | test whose removal-of-filter turns RED       |
+|--------------------------------------|----------------------------------------------|
+| add: ACTIVE-row lookup ``user_sub``  | ``test_add_tool_favorite_cannot_overwrite_another_users_row`` |
+| add: cap-COUNT aggregate ``user_sub``| ``test_cap_is_per_user_not_global``          |
+| add: TOMBSTONE lookup ``user_sub``   | ``test_add_cannot_resurrect_another_users_tombstone`` |
+| list ``user_sub``                    | ``test_isolates_tool_favorites_by_user`` / ``test_cross_user_isolation_denies_list`` |
+| remove lookup ``user_sub``           | ``test_cross_user_remove_denied``            |
 """
 
 from __future__ import annotations
@@ -209,6 +221,124 @@ class TestMockConsoleToolFavoritesService:
             "the isolation wall is broken (missing/neutered user_sub filter)"
         )
 
+        alice_items = await service.list_tool_favorites(alice)
+        assert len(alice_items) == 1
+
+    async def test_cap_is_per_user_not_global(self, user_context) -> None:
+        """Non-vacuity guard for the cap-COUNT aggregate's ``user_sub``
+        filter (the 2026-09-13 REJECT — aggregate queries must be
+        user-scoped): alice holding ``MAX_TOOL_FAVORITES`` active
+        favorites must NOT consume bob's quota. Neuter the
+        ``f.user_sub == user_context.user_id`` clause in the Mock's
+        ``active_count`` sum and bob's FIRST add raises
+        ``ToolFavoritesCapExceededError`` (one user filling the cap
+        would deny the feature to every other user — cross-user DoS)."""
+        service = MockConsoleToolFavoritesService()
+        alice = replace(user_context, user_id="user-alice-cap", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-cap", is_admin=False)
+        for i in range(MAX_TOOL_FAVORITES):
+            await service.add_tool_favorite(alice, "tool", f"alice-item-{i}")
+
+        # Alice really is at the cap.
+        with pytest.raises(ToolFavoritesCapExceededError):
+            await service.add_tool_favorite(alice, "tool", "alice-one-too-many")
+
+        # Bob's FIRST add must succeed — his active count is 0, not 100.
+        try:
+            created = await service.add_tool_favorite(bob, "tool", "bob-first")
+        except ToolFavoritesCapExceededError as exc:
+            pytest.fail(
+                "bob's FIRST add was rejected because ALICE is at the cap — "
+                "the cap-count aggregate is missing/neutered its user_sub "
+                f"filter (per-user cap degraded to a GLOBAL cap): {exc}"
+            )
+        assert created["item_id"] == "bob-first"
+        assert created["user_sub"] == bob.user_id
+
+        bob_items = await service.list_tool_favorites(bob)
+        assert [i["item_id"] for i in bob_items] == ["bob-first"]
+        alice_items = await service.list_tool_favorites(alice)
+        assert len(alice_items) == MAX_TOOL_FAVORITES
+
+    async def test_add_tool_favorite_cannot_overwrite_another_users_row(
+        self, user_context
+    ) -> None:
+        """Non-vacuity guard for the ACTIVE-row lookup's ``user_sub``
+        filter (``_find_active`` as used by ``add_tool_favorite``): bob
+        adding the IDENTICAL ``(item_type, item_id)`` must create HIS OWN
+        row, never update alice's. Neuter the ``f.user_sub == user_sub``
+        clause in ``_find_active`` and bob's ``tenant_id`` overwrites
+        alice's row."""
+        service = MockConsoleToolFavoritesService()
+        alice = replace(user_context, user_id="user-alice-add", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-add", is_admin=False)
+
+        await service.add_tool_favorite(
+            alice, "tool", "shared-item", tenant_id="alice-tenant"
+        )
+        await service.add_tool_favorite(
+            bob, "tool", "shared-item", tenant_id="bob-tenant"
+        )
+
+        alice_items = await service.list_tool_favorites(alice)
+        bob_items = await service.list_tool_favorites(bob)
+        assert len(alice_items) == 1
+        assert len(bob_items) == 1
+        assert alice_items[0]["tenant_id"] == "alice-tenant", (
+            "bob's add overwrote alice's tool-favorite — the user_sub "
+            "isolation filter in the add's existence-check is "
+            "missing/neutered"
+        )
+        assert bob_items[0]["tenant_id"] == "bob-tenant"
+
+    async def test_add_cannot_resurrect_another_users_tombstone(
+        self, user_context
+    ) -> None:
+        """Non-vacuity guard for the TOMBSTONE lookup's ``user_sub``
+        filter (``_find_any`` as used by the un-tombstone branch): when
+        alice's ONLY row for a key is soft-deleted and bob (who has no
+        row) adds the same key, bob must get his OWN fresh row — alice's
+        tombstone must stay deleted. Neuter the ``f.user_sub == user_sub``
+        clause in ``_find_any`` and bob's add un-tombstones ALICE's row
+        (with bob's ``tenant_id``), making it reappear in alice's list."""
+        service = MockConsoleToolFavoritesService()
+        alice = replace(user_context, user_id="user-alice-tomb", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-tomb", is_admin=False)
+
+        await service.add_tool_favorite(
+            alice, "tool", "shared-tomb", tenant_id="alice-tenant"
+        )
+        assert await service.remove_tool_favorite(alice, "tool", "shared-tomb") is True
+        assert await service.list_tool_favorites(alice) == []
+
+        created = await service.add_tool_favorite(
+            bob, "tool", "shared-tomb", tenant_id="bob-tenant"
+        )
+        assert created["user_sub"] == bob.user_id
+
+        alice_items = await service.list_tool_favorites(alice)
+        assert alice_items == [], (
+            "bob's add resurrected alice's soft-deleted tool-favorite — the "
+            "user_sub isolation filter in the add's tombstone lookup is "
+            "missing/neutered"
+        )
+        bob_items = await service.list_tool_favorites(bob)
+        assert len(bob_items) == 1
+        assert bob_items[0]["tenant_id"] == "bob-tenant"
+
+    async def test_cross_user_remove_denied(self, user_context) -> None:
+        """Non-vacuity guard for the REMOVE lookup's ``user_sub`` filter
+        (``_find_active`` as used by ``remove_tool_favorite``): neuter it
+        and bob soft-deletes alice's row."""
+        service = MockConsoleToolFavoritesService()
+        alice = replace(user_context, user_id="user-alice-del", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-del", is_admin=False)
+        await service.add_tool_favorite(alice, "tool", "alice-item")
+
+        removed = await service.remove_tool_favorite(bob, "tool", "alice-item")
+        assert removed is False, (
+            "user B removed user A's tool-favorite — isolation broken"
+        )
         alice_items = await service.list_tool_favorites(alice)
         assert len(alice_items) == 1
 
@@ -432,6 +562,8 @@ class TestPostgresConsoleToolFavoritesService:
         assert bob_items[0]["tenant_id"] == "bob-tenant"
 
     async def test_cross_user_remove_denied(self, service, user_context) -> None:
+        """Non-vacuity guard for the REMOVE lookup's ``user_sub`` filter:
+        neuter it and bob soft-deletes alice's row."""
         alice = replace(user_context, user_id="user-alice-del", is_admin=False)
         bob = replace(user_context, user_id="user-bob-del", is_admin=False)
         await service.add_tool_favorite(alice, "tool", "alice-item")
@@ -442,6 +574,93 @@ class TestPostgresConsoleToolFavoritesService:
         )
         alice_items = await service.list_tool_favorites(alice)
         assert len(alice_items) == 1
+
+    async def test_cap_is_per_user_not_global(self, service, user_context) -> None:
+        """Non-vacuity guard for the cap-COUNT aggregate's ``user_sub``
+        filter, Postgres-backed path (the 2026-09-13 REJECT — aggregate
+        queries must be user-scoped): alice holding ``MAX_TOOL_FAVORITES``
+        active favorites must NOT consume bob's quota. Neuter the
+        ``.filter(ConsoleToolFavorite.user_sub == user_context.user_id)``
+        clause on the ``select(func.count())`` in
+        ``PostgresConsoleToolFavoritesService.add_tool_favorite`` and
+        bob's FIRST add raises ``ToolFavoritesCapExceededError`` — one
+        user filling the cap would deny the feature to every other user
+        (cross-user DoS).
+
+        Brackets each caller's calls with ``set_current_user_id`` per
+        ``feedback_unit_tests_miss_rls`` — SQLite has no RLS GUC, so the
+        guard under test is the service's own explicit filter."""
+        alice = replace(user_context, user_id="user-alice-cap", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-cap", is_admin=False)
+
+        set_current_user_id(alice.user_id)
+        try:
+            for i in range(MAX_TOOL_FAVORITES):
+                await service.add_tool_favorite(alice, "tool", f"alice-item-{i}")
+            # Alice really is at the cap.
+            with pytest.raises(ToolFavoritesCapExceededError):
+                await service.add_tool_favorite(alice, "tool", "alice-one-too-many")
+        finally:
+            set_current_user_id(None)
+
+        set_current_user_id(bob.user_id)
+        try:
+            try:
+                created = await service.add_tool_favorite(bob, "tool", "bob-first")
+            except ToolFavoritesCapExceededError as exc:
+                pytest.fail(
+                    "bob's FIRST add was rejected because ALICE is at the cap "
+                    "— the cap-count aggregate is missing/neutered its "
+                    f"user_sub filter (per-user cap degraded to GLOBAL): {exc}"
+                )
+            bob_items = await service.list_tool_favorites(bob)
+        finally:
+            set_current_user_id(None)
+
+        assert created["item_id"] == "bob-first"
+        assert created["user_sub"] == bob.user_id
+        assert [i["item_id"] for i in bob_items] == ["bob-first"]
+
+        set_current_user_id(alice.user_id)
+        try:
+            alice_items = await service.list_tool_favorites(alice)
+        finally:
+            set_current_user_id(None)
+        assert len(alice_items) == MAX_TOOL_FAVORITES
+
+    async def test_add_cannot_resurrect_another_users_tombstone(
+        self, service, user_context
+    ) -> None:
+        """Non-vacuity guard for the TOMBSTONE lookup's ``user_sub``
+        filter in ``add_tool_favorite``'s un-tombstone branch: when
+        alice's ONLY row for a key is soft-deleted and bob (who has no
+        row) adds the same key, bob must get his OWN fresh row — alice's
+        tombstone must stay deleted. Neuter the ``user_sub`` clause on
+        the ``tombstoned`` select and bob's add un-tombstones ALICE's row
+        (with bob's ``tenant_id``), making it reappear in alice's list."""
+        alice = replace(user_context, user_id="user-alice-tomb", is_admin=False)
+        bob = replace(user_context, user_id="user-bob-tomb", is_admin=False)
+
+        await service.add_tool_favorite(
+            alice, "tool", "shared-tomb", tenant_id="alice-tenant"
+        )
+        assert await service.remove_tool_favorite(alice, "tool", "shared-tomb") is True
+        assert await service.list_tool_favorites(alice) == []
+
+        created = await service.add_tool_favorite(
+            bob, "tool", "shared-tomb", tenant_id="bob-tenant"
+        )
+        assert created["user_sub"] == bob.user_id
+
+        alice_items = await service.list_tool_favorites(alice)
+        assert alice_items == [], (
+            "bob's add resurrected alice's soft-deleted tool-favorite — the "
+            "user_sub isolation filter in the add's tombstone lookup is "
+            "missing/neutered"
+        )
+        bob_items = await service.list_tool_favorites(bob)
+        assert len(bob_items) == 1
+        assert bob_items[0]["tenant_id"] == "bob-tenant"
 
     async def test_write_failure_raises_runtime_error(
         self, service, user_context, monkeypatch

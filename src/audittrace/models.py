@@ -922,6 +922,10 @@ class ConsoleConversationTagListResponse(BaseModel):
 # model below — same rationale as every other console-* upsert request
 # model above (feedback_never_trust_caller_metadata_for_security_fields).
 
+# The SINGLE source of truth for the closed item_type vocabulary (mirrors
+# the fork's types/favorite.ts::FAVORITE_ITEM_TYPES Mongoose enum). The
+# service module deliberately carries no duplicate — a typo'd item_type
+# is rejected here with 422 before any service method runs.
 _TOOL_FAVORITE_ITEM_TYPE = Literal["builtin", "tool", "mcp", "skill"]
 
 

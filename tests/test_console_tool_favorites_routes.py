@@ -332,6 +332,108 @@ class TestCrossUserIsolation:
         )
         assert alice_items["shared-w"]["tenant_id"] == "original"
 
+    def test_cap_is_per_user_through_real_route(self, client: TestClient) -> None:
+        """The cap-COUNT aggregate's ``user_sub`` filter, proven through
+        the REAL HTTP route with TWO DISTINCT real subs via the real
+        ``require_user`` cold path (the 2026-09-13 REJECT — aggregate
+        queries must be user-scoped). Alice fills ``MAX_TOOL_FAVORITES``;
+        her next add is 409; bob's FIRST add must still be 200.
+
+        Falsifiable: neuter the ``user_sub`` clause on the
+        ``select(func.count())`` in
+        ``PostgresConsoleToolFavoritesService.add_tool_favorite`` (the
+        implementation the ``client`` fixture wires) and bob's first add
+        returns 409 — one user filling the cap would deny the feature to
+        every other user (cross-user DoS)."""
+        for i in range(MAX_TOOL_FAVORITES):
+            r = self._act_as(
+                client,
+                "user-alice-cap",
+                "POST",
+                "/console/tool-favorites",
+                json={"item_type": "tool", "item_id": f"alice-item-{i}"},
+            )
+            assert r.status_code == 200
+        alice_over = self._act_as(
+            client,
+            "user-alice-cap",
+            "POST",
+            "/console/tool-favorites",
+            json={"item_type": "tool", "item_id": "alice-one-too-many"},
+        )
+        assert alice_over.status_code == 409
+
+        bob_first = self._act_as(
+            client,
+            "user-bob-cap",
+            "POST",
+            "/console/tool-favorites",
+            json={"item_type": "tool", "item_id": "bob-first"},
+        )
+        assert bob_first.status_code == 200, (
+            "bob's FIRST add was rejected because ALICE is at the cap — the "
+            "cap-count aggregate is missing/neutered its user_sub filter "
+            f"(per-user cap degraded to GLOBAL): {bob_first.status_code} "
+            f"{bob_first.text}"
+        )
+        assert bob_first.json()["item_id"] == "bob-first"
+
+        bob_list = self._act_as(
+            client, "user-bob-cap", "GET", "/console/tool-favorites"
+        )
+        assert [i["item_id"] for i in bob_list.json()["items"]] == ["bob-first"]
+        alice_list = self._act_as(
+            client, "user-alice-cap", "GET", "/console/tool-favorites"
+        )
+        assert len(alice_list.json()["items"]) == MAX_TOOL_FAVORITES
+
+    def test_user_b_add_cannot_resurrect_user_as_removed_favorite(
+        self, client: TestClient
+    ) -> None:
+        """The tombstone lookup's ``user_sub`` filter, proven through
+        the real route with two distinct real subs: alice adds then
+        removes a key; bob adds the SAME key. Bob gets his own row and
+        alice's tombstone stays deleted. Neuter the ``user_sub`` clause
+        on the ``tombstoned`` select and alice's removed favorite
+        reappears in her list carrying bob's ``tenant_id``."""
+        self._act_as(
+            client,
+            "user-alice-tomb",
+            "POST",
+            "/console/tool-favorites",
+            json={"item_type": "tool", "item_id": "shared-tomb", "tenant_id": "alice"},
+        )
+        removed = self._act_as(
+            client,
+            "user-alice-tomb",
+            "DELETE",
+            "/console/tool-favorites/tool/shared-tomb",
+        )
+        assert removed.status_code == 204
+
+        bob_add = self._act_as(
+            client,
+            "user-bob-tomb",
+            "POST",
+            "/console/tool-favorites",
+            json={"item_type": "tool", "item_id": "shared-tomb", "tenant_id": "bob"},
+        )
+        assert bob_add.status_code == 200
+
+        alice_list = self._act_as(
+            client, "user-alice-tomb", "GET", "/console/tool-favorites"
+        )
+        alice_ids = [i["item_id"] for i in alice_list.json()["items"]]
+        assert "shared-tomb" not in alice_ids, (
+            "bob's add resurrected alice's soft-deleted tool-favorite — the "
+            "user_sub filter in the add's tombstone lookup is missing/neutered"
+        )
+        bob_list = self._act_as(
+            client, "user-bob-tomb", "GET", "/console/tool-favorites"
+        )
+        bob_items = {i["item_id"]: i for i in bob_list.json()["items"]}
+        assert bob_items["shared-tomb"]["tenant_id"] == "bob"
+
     def test_hostile_body_user_sub_cannot_hijack_another_users_row(
         self, client: TestClient
     ) -> None:
