@@ -1,0 +1,232 @@
+"""``ConsoleDomain[T]`` — what a domain DECLARES, and nothing more.
+
+A domain is a small descriptor handed TO a sealed store (composition, not
+inheritance): it names its ORM model, its client key, its writable value
+columns, its ordering, and a few overridable hooks. It never receives the
+store, a session factory, an ``AsyncSession`` or an ORM row — every hook
+sees plain ``dict`` snapshots and returns plain ``dict``s, which the base
+validates before they touch a row. That is the "narrowed seam" of ADDENDUM
+A §2: there is no attribute on a domain through which the unguarded
+resource can be reached, because the domain is never given one.
+
+What a hook can and cannot do:
+
+* :meth:`cap` — an optional per-user cap on ACTIVE rows. The COUNT that
+  enforces it is the BASE's user-scoped aggregate; a domain never writes
+  its own (``lesson-aggregate-queries-must-be-user-scoped-20260913``).
+* :meth:`defaults` / :meth:`merge` — shape the VALUE columns of an insert /
+  update. Output naming a RESERVED column is refused
+  (:class:`ConsoleStoreForbiddenFieldError`); output naming an unknown
+  column is refused (:class:`ConsoleStoreDomainError`).
+* :meth:`equality_filters` — extra ``column == value`` predicates composed
+  INTO the guarded query with AND. It can only NARROW; it cannot name a
+  reserved column, so it cannot widen past ``user_sub``.
+* :meth:`to_item` — serialize a row snapshot (a plain dict copy) to the
+  domain's item type ``T``.
+
+The template members (``snapshot_columns``, ``has_session_id``,
+``order_columns``, ``order_directions``) are sealed: a subclass redefining
+them is refused at class-creation time.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from typing import Any, ClassVar, Generic, TypeVar, final
+
+from audittrace.services.console_store._context import (
+    REQUIRED_MODEL_COLUMNS,
+    RESERVED_COLUMNS,
+)
+from audittrace.services.console_store._cursor import Direction, coercer_for
+from audittrace.services.console_store._errors import ConsoleStoreDomainError
+from audittrace.services.console_store._sealing import seal_members
+
+# Reserved columns a domain MAY order by (always non-null, so paging is
+# total). Key columns are also allowed; value columns are not (nullable
+# values make keyset comparison undefined).
+ORDERABLE_RESERVED: frozenset[str] = frozenset({"id", "created_at_ms", "updated_at_ms"})
+
+_SEALED_DOMAIN_MEMBERS: frozenset[str] = frozenset(
+    {"snapshot_columns", "has_session_id", "order_columns", "order_directions"}
+)
+
+# PEP 484 TypeVar (not PEP 695 native syntax, per the ratified spec's own
+# "Generic ABC via typing.Generic[T] (PEP 484)" instruction): the repo's
+# pre-commit mypy hook is pinned to v1.8.0, which predates PEP 695 support
+# and cannot parse `class Foo[T]:` at all — it silently treats the class as
+# non-generic, so every parameterized use (`ConsoleDomain[dict[str, Any]]`)
+# then fails with "expects no type arguments". This is the actual
+# mechanically-enforced gate (CI has no separate mypy step; the local
+# pre-commit hook IS the gate), so PEP 484 syntax is not just spec-faithful
+# here, it is required for `git commit` to succeed at all.
+T = TypeVar("T")
+
+
+class ConsoleDomain(Generic[T], ABC):  # noqa: UP046 - see the T = TypeVar comment above
+    """Declarative descriptor of one console domain (see module docstring)."""
+
+    name: ClassVar[str]
+    model: ClassVar[type[Any]]
+    key_columns: ClassVar[tuple[str, ...]]
+    value_columns: ClassVar[tuple[str, ...]]
+    order_by: ClassVar[tuple[tuple[str, Direction], ...]]
+    default_list_limit: ClassVar[int] = 25
+    max_list_limit: ClassVar[int] = 200
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        seal_members(cls, sealed_members=_SEALED_DOMAIN_MEMBERS)
+
+    # ── overridable hooks ────────────────────────────────────────────────
+
+    def cap(self) -> int | None:
+        """Maximum ACTIVE rows per user, or ``None`` for uncapped."""
+        return None
+
+    def defaults(self, key: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Value-column defaults for a brand-new row (``key`` is read-only
+        context). Columns not defaulted and not supplied insert as
+        ``None``."""
+        return {}
+
+    def merge(
+        self, current: Mapping[str, Any], patch: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """How an update applies: ``current`` holds the row's value columns,
+        ``patch`` the caller's. Default: the patch wins for the columns it
+        names."""
+        return {**current, **patch}
+
+    def equality_filters(self) -> Mapping[str, Any]:
+        """Extra ``column == value`` predicates AND-ed into every query."""
+        return {}
+
+    @abstractmethod
+    def to_item(self, row: Mapping[str, Any]) -> T:
+        """Serialize a row snapshot (plain dict) into the item type."""
+
+    # ── sealed template members ──────────────────────────────────────────
+
+    @final
+    def snapshot_columns(self) -> tuple[str, ...]:
+        """Every column the base reads off a row: the reserved columns the
+        model carries, then key, then value columns."""
+        reserved = tuple(c for c in REQUIRED_MODEL_COLUMNS) + (
+            ("session_id",) if self.has_session_id() else ()
+        )
+        return reserved + tuple(self.key_columns) + tuple(self.value_columns)
+
+    @final
+    def has_session_id(self) -> bool:
+        return hasattr(self.model, "session_id")
+
+    @final
+    def order_columns(self) -> tuple[str, ...]:
+        return tuple(column for column, _ in self.order_by)
+
+    @final
+    def order_directions(self) -> tuple[Direction, ...]:
+        return tuple(direction for _, direction in self.order_by)
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ConsoleStoreDomainError(message)
+
+
+def validate_domain(domain: ConsoleDomain[Any]) -> None:
+    """Refuse an invalid descriptor BEFORE the store does any I/O.
+
+    Falsifiable: neuter the reserved-column check and a hostile domain that
+    declares ``value_columns=("user_sub",)`` gets to write another user's
+    ``user_sub`` (``tests/test_console_store_hostile.py``).
+    """
+    _require(isinstance(domain, ConsoleDomain), "domain must be a ConsoleDomain")
+    name = getattr(domain, "name", None)
+    _require(isinstance(name, str) and bool(name.strip()), "domain.name must be set")
+    model = getattr(domain, "model", None)
+    _require(isinstance(model, type), f"{name}: domain.model must be an ORM class")
+
+    keys = tuple(getattr(domain, "key_columns", ()))
+    values = tuple(getattr(domain, "value_columns", ()))
+    _require(bool(keys), f"{name}: key_columns must name at least one column")
+    _require(
+        all(isinstance(c, str) and c for c in keys + values),
+        f"{name}: column names must be non-empty strings",
+    )
+    reserved_hit = sorted((set(keys) | set(values)) & RESERVED_COLUMNS)
+    _require(
+        not reserved_hit,
+        f"{name}: reserved column(s) may not be key/value columns: {reserved_hit}",
+    )
+    _require(
+        not (set(keys) & set(values)),
+        f"{name}: key_columns and value_columns must be disjoint",
+    )
+    _require(len(set(keys)) == len(keys), f"{name}: duplicate key column")
+    _require(len(set(values)) == len(values), f"{name}: duplicate value column")
+
+    missing = [
+        c for c in REQUIRED_MODEL_COLUMNS + keys + values if not hasattr(model, c)
+    ]
+    _require(not missing, f"{name}: ORM model lacks column(s): {missing}")
+
+    order_by = tuple(getattr(domain, "order_by", ()))
+    _require(bool(order_by), f"{name}: order_by must name at least one column")
+    orderable = ORDERABLE_RESERVED | set(keys)
+    for entry in order_by:
+        _require(
+            isinstance(entry, tuple) and len(entry) == 2,
+            f"{name}: order_by entries must be (column, direction)",
+        )
+        column, direction = entry
+        _require(column in orderable, f"{name}: cannot order by {column!r}")
+        _require(direction in ("asc", "desc"), f"{name}: bad direction {direction!r}")
+        try:
+            coercer_for(getattr(model, column).type.python_type)
+        except (AttributeError, NotImplementedError, TypeError) as exc:
+            raise ConsoleStoreDomainError(
+                f"{name}: ordering column {column!r} has an unsupported type"
+            ) from exc
+    ordered = {column for column, _ in order_by}
+    _require(
+        "id" in ordered or set(keys) <= ordered,
+        f"{name}: order_by must include 'id' or every key column (total order)",
+    )
+
+    default_limit = getattr(domain, "default_list_limit", 0)
+    max_limit = getattr(domain, "max_list_limit", 0)
+    _require(
+        isinstance(default_limit, int) and isinstance(max_limit, int),
+        f"{name}: list limits must be ints",
+    )
+    _require(1 <= default_limit <= max_limit, f"{name}: 1 <= default <= max limit")
+
+    validate_cap(domain)
+    validate_equality_filters(domain)
+
+
+def validate_cap(domain: ConsoleDomain[Any]) -> int | None:
+    """``cap()`` must return ``None`` or a positive int — checked on EVERY
+    call, not only at construction, since a hook is a live method."""
+    cap = domain.cap()
+    _require(
+        cap is None
+        or (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1),
+        f"{domain.name}: cap() must return None or a positive int",
+    )
+    return cap
+
+
+def validate_equality_filters(domain: ConsoleDomain[Any]) -> dict[str, Any]:
+    """``equality_filters()`` may only name key/value columns — checked on
+    EVERY call. A reserved column here would be an attempt to touch the
+    ``user_sub`` predicate; refused."""
+    filters = domain.equality_filters()
+    _require(isinstance(filters, Mapping), f"{domain.name}: equality_filters must map")
+    allowed = set(domain.key_columns) | set(domain.value_columns)
+    bad = sorted(set(filters) - allowed)
+    _require(not bad, f"{domain.name}: equality_filters may not name {bad}")
+    return dict(filters)
