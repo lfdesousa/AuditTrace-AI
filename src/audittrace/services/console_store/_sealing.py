@@ -74,7 +74,7 @@ def seal_subclass(cls: type, *, sealed_members: Iterable[str]) -> None:
     """Refuse ``cls`` unless its class body executes inside the package and
     redefines none of ``sealed_members``.
 
-    Falsifiable: ``tests/test_console_store_hostile.py`` defines subclasses
+    Falsifiable: ``tests/test_console_store_sealed_classes.py`` defines subclasses
     outside the package and asserts the class statement itself raises;
     neuter this function into a no-op and those hostile subclasses come to
     life and read another user's row.

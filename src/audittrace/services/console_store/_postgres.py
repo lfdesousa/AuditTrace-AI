@@ -107,7 +107,6 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
     ) -> None:
         super().__init__(domain)
         self._sessions = _GuardedSessions(session_factory)
-        self._model = domain.model
 
     # ── the guarded query builder (sealed) ───────────────────────────────
 
@@ -119,7 +118,7 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
         key: Mapping[str, Any] | None = None,
         active_only: bool = True,
     ) -> Select[Any]:
-        model = self._model
+        model = self._domain.model
         stmt = select(model).where(model.user_sub == user_sub)
         if active_only:
             stmt = stmt.where(model.deleted_at_ms.is_(None))
@@ -150,7 +149,7 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
             setattr(row, column, value)
 
     def _ordered(self, stmt: Select[Any]) -> Select[Any]:
-        model = self._model
+        model = self._domain.model
         clauses = [
             getattr(model, column).asc()
             if direction == "asc"
@@ -185,7 +184,9 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
         cursor_values = self._cursor_values(cursor)
         stmt = self._scoped_select(user_sub)
         if cursor_values is not None:
-            columns = [getattr(self._model, c) for c in self._domain.order_columns()]
+            columns = [
+                getattr(self._domain.model, c) for c in self._domain.order_columns()
+            ]
             stmt = stmt.where(
                 keyset_predicate(
                     columns, self._domain.order_directions(), cursor_values
@@ -253,7 +254,7 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
                         )
                         row = tombstoned
                     else:
-                        row = self._model(
+                        row = self._domain.model(
                             **self._insert_values(
                                 stamp, validated_key, validated_values
                             )
@@ -295,7 +296,7 @@ class PostgresConsoleStore(ConsoleStoreBase[T]):
         validated_keys = self._validated_keys(keys)
         if not validated_keys:
             return []
-        model = self._model
+        model = self._domain.model
         key_columns = self._domain.key_columns
         stmt = self._scoped_select(user_sub).where(
             or_(

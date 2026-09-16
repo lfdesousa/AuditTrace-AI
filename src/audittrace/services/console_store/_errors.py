@@ -23,7 +23,7 @@ class ConsoleStoreSealedError(TypeError, ConsoleStoreError):
 
     This is the runtime backing for PEP 591's ``@final``, which is advisory
     (type-checker only). Falsifiable: neuter ``seal_subclass`` and
-    ``tests/test_console_store_hostile.py`` shows a hostile subclass reading
+    ``tests/test_console_store_sealed_classes.py`` shows a hostile subclass reading
     another user's row.
     """
 

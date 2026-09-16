@@ -18,11 +18,23 @@ makes those methods safe is CONCRETE here and sealed:
 Sealing (``_sealing.seal_subclass``) refuses any subclass defined outside
 this package and any in-package redefinition of the members listed in
 ``SEALED_STORE_MEMBERS``. ``@final`` covers the type checker; the seal
-covers runtime. ``_domain`` gets its OWN check in ``__setattr__`` (it is
-set once at construction, after ``validate_domain()`` runs, and is refused
-on any later reassignment — found + closed during this build's ADDENDUM A
-surface enumeration). Both are exercised by
-``tests/test_console_store_hostile.py``.
+covers runtime. Every OTHER instance attribute (``_domain``, and on
+:class:`PostgresConsoleStore`, ``_sessions``/``_model``) is write-once:
+set exactly once in ``__init__`` and refused on any later reassignment
+(``__setattr__`` below) — ``_domain``'s check was found + closed during the
+WU-A ADDENDUM A pass; ``_sessions``/``_model`` were found during this fix
+round's F1 "enumerate reachable MUTATION" pass (same class of hole, not
+previously enumerated). All are exercised by
+``tests/test_console_store_sealed_classes.py`` + ``tests/test_console_store_domain_descriptor_sealed.py``.
+
+**F1 (fix round 1, 2026-09-15): the domain DESCRIPTOR is now also sealed**
+(``_domain.py::ConsoleDomain.__setattr__``) — closing the pointer here was
+not enough, because ``ConsoleStoreBase.domain`` hands out the descriptor
+BY REFERENCE and a read-only property protects only the binding, never the
+referent. See ``_domain.py`` for the defect and the fix. As defence in
+depth (not reachable today, since the descriptor is now immutable, but a
+future accessor or construction path might leak a mutable one): the write
+path also refuses, LOUDLY, at the point of use — see ``_insert_values``.
 """
 
 from __future__ import annotations
@@ -69,6 +81,7 @@ SEALED_STORE_MEMBERS: frozenset[str] = frozenset(
         "_validated_keys",
         "_validated_values",
         "_hook_output",
+        "_refuse_reserved_value_columns",
         "_insert_values",
         "_update_values",
         "_delete_values",
@@ -122,25 +135,33 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Refuse shadowing a sealed member on an INSTANCE (``store.
-        _scoped_select = evil``), AND refuse re-pointing ``_domain`` at a
-        different descriptor after construction (``store._domain = evil``).
+        _scoped_select = evil``), AND refuse reassigning ANY instance
+        attribute once it has been set (write-once) — ``store._domain =
+        evil``, but equally ``store._sessions = evil`` or ``store._model =
+        evil`` on :class:`~audittrace.services.console_store._postgres.
+        PostgresConsoleStore`.
 
-        ``_domain`` is not itself a template helper, so it is not in
-        ``SEALED_STORE_MEMBERS`` — but ``validate_domain()`` runs exactly
-        ONCE, in ``__init__``. Without this check, swapping ``_domain``
-        post-construction reaches every write path with a descriptor that
-        never passed that one-time structural check (e.g. one declaring a
-        RESERVED column as a ``value_column``), silently clobbering the
-        base's own stamp for that column when the domain's ``defaults()``
-        doesn't mention it. Falsifiable: neuter this branch and a store
-        whose ``_domain`` is swapped after construction accepts such a
-        descriptor. (``object.__setattr__`` / ``__dict__`` writes still
-        work; disclosed residual, same family as the sealed-member one.)"""
+        Generalised (fix round 1, F1 enumeration) from a ``_domain``-only
+        check: ``_domain`` is not itself a template helper, so it is not in
+        ``SEALED_STORE_MEMBERS`` — but neither are ``_sessions`` / ``_model``,
+        and both were found, during this round's "enumerate reachable
+        MUTATION, not reachable names" pass, to be reassignable exactly like
+        ``_domain`` was (``store._model = Evil`` swaps the ORM class
+        ``_scoped_select`` queries against — an unscoped read against
+        whatever the caller pointed it at; proven by direct reproduction
+        before this check was written). A domain/session-factory/model is
+        validated or injected exactly ONCE, in ``__init__``; write-once for
+        every instance attribute is the general form of that guarantee,
+        closing the whole class rather than one name at a time. Falsifiable:
+        neuter this branch and a store whose ``_domain``/``_sessions``/
+        ``_model`` is swapped after construction accepts the swap.
+        (``object.__setattr__`` / ``__dict__`` writes still work; disclosed
+        residual, same family as the sealed-member one.)"""
         if name in SEALED_STORE_MEMBERS:
             raise ConsoleStoreSealedError(f"{type(self).__qualname__}.{name} is sealed")
-        if name == "_domain" and "_domain" in self.__dict__:
+        if name in self.__dict__:
             raise ConsoleStoreSealedError(
-                f"{type(self).__qualname__}.domain is set once at "
+                f"{type(self).__qualname__}.{name} is set once at "
                 "construction and cannot be reassigned"
             )
         super().__setattr__(name, value)
@@ -289,12 +310,35 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         return dict(produced)
 
     @final
+    def _refuse_reserved_value_columns(self) -> None:
+        """F1 item 2 — defence in depth: refuse, LOUDLY, at the point every
+        write path TRUSTS ``self._domain.value_columns``, if it collides
+        with a base-owned reserved column. Not reachable today (the
+        descriptor is immutable — ``_domain.py::ConsoleDomain.__setattr__``
+        — and ``validate_domain()`` already refuses this at construction),
+        but it protects against what (1) alone does not: a domain that
+        declares the collision from the start via a FUTURE construction
+        path that skips ``validate_domain()``, or a future accessor that
+        leaks a mutable descriptor. Silent last-write-wins over a
+        base-stamped column is forbidden — this is what F1 exploited
+        (``_base.py``'s insert loop nulled ``trace_id`` with no error, no
+        log)."""
+        collision = sorted(set(self._domain.value_columns) & RESERVED_COLUMNS)
+        if collision:
+            raise ConsoleStoreForbiddenFieldError(
+                f"{self._domain.name}: value_columns declares reserved "
+                f"column(s) {collision} — refusing to let a domain silently "
+                "overwrite a base-stamped column"
+            )
+
+    @final
     def _insert_values(
         self, stamp: WriteStamp, key: Mapping[str, Any], values: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Full column assignment for a brand-new row. Reserved columns
         come from ``stamp`` by direct assignment — a value or hook cannot
         reach them (both were validated to exclude reserved names)."""
+        self._refuse_reserved_value_columns()
         defaults = self._hook_output(self._domain.defaults(dict(key)), hook="defaults")
         row: dict[str, Any] = {
             "id": str(uuid.uuid4()),
@@ -323,6 +367,7 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         """Column assignment for an update (or a D13 un-tombstone when
         ``resurrect``). The domain's ``merge`` hook sees ONLY the value
         columns of the current row."""
+        self._refuse_reserved_value_columns()
         current_values = {c: current[c] for c in self._domain.value_columns}
         merged = self._hook_output(
             self._domain.merge(current_values, dict(values)), hook="merge"

@@ -33,7 +33,9 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
+import warnings
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
@@ -126,13 +128,32 @@ def _resolve_admin_url() -> str | None:
 
 _ADMIN_URL = _resolve_admin_url()
 
-pytestmark = pytest.mark.skipif(
-    _ADMIN_URL is None,
-    reason=(
-        "No test Postgres available: set AUDITTRACE_TEST_POSTGRES_URL or make "
-        "Docker available so a throwaway postgres:16 can be started."
-    ),
+# A2 (fix round 1): a bare ``skipif`` degrades "4 passed" to "4 skipped" on a
+# TARGETED run of this file with no failure and no obviously-loud signal —
+# `make test`'s zero-skip gate (`scripts/check-no-skipped-tests.py`) catches
+# it on a FULL run, but SQLite does not enforce RLS
+# (`feedback_unit_tests_miss_rls`), so a targeted run of just this file is
+# the one place this specific proof could silently vanish and look, at a
+# glance, indistinguishable from "the proof ran and passed". Make the
+# degradation impossible to miss: a ``UserWarning`` (shown in pytest's
+# warnings summary on EVERY run, targeted or full, per ``pytest`` filterwarnings
+# not silencing it — see ``pyproject.toml``) plus a stderr banner at
+# collection time, in addition to the skip itself.
+_SKIP_REASON = (
+    "REAL-Postgres RLS proof SKIPPED (all 4 tests in this file) — Docker "
+    "and AUDITTRACE_TEST_POSTGRES_URL are both unavailable. SQLite does not "
+    "enforce RLS: this proof is REQUIRED, not optional, before the "
+    "console-store RLS claim can be trusted. Set AUDITTRACE_TEST_POSTGRES_URL "
+    "or make Docker available so a throwaway postgres:16 can be started."
 )
+if _ADMIN_URL is None:
+    warnings.warn(_SKIP_REASON, UserWarning, stacklevel=1)
+    print(
+        f"\n{'=' * 78}\n[RLS-PROOF-SKIPPED] {_SKIP_REASON}\n{'=' * 78}\n",
+        file=sys.stderr,
+    )
+
+pytestmark = pytest.mark.skipif(_ADMIN_URL is None, reason=_SKIP_REASON)
 
 
 def _rls_ddl(table: str) -> list[str]:

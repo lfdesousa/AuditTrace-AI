@@ -27,6 +27,50 @@ What a hook can and cannot do:
 The template members (``snapshot_columns``, ``has_session_id``,
 ``order_columns``, ``order_directions``) are sealed: a subclass redefining
 them is refused at class-creation time.
+
+**F1 (fix round 1, 2026-09-15): the descriptor itself is sealed, not just
+the pointer to it.** ``ConsoleStoreBase.domain`` hands out a live reference
+to the exact instance ``validate_domain()`` checked at construction. Before
+this fix that instance was ordinary — ``store.domain.value_columns =
+(*store.domain.value_columns, "trace_id")`` reassigned the instance
+attribute, superseding the one-time check with a descriptor that never
+passed it, and ``_base.py``'s insert loop then silently overwrote the
+base's own ``trace_id`` stamp with ``None`` (M5 / EU AI Act Art 12). A read-
+only *property* protects the binding; it never protects the referent. Every
+:class:`ConsoleDomain` instance now refuses ANY attribute set or delete,
+unconditionally, for its entire lifetime (``__setattr__`` /
+``__delattr__`` below) — handing out an immutable object by reference is
+safe, so ``ConsoleStoreBase.domain`` needs no further narrowing.
+
+**Why hand-written, not ``@dataclass(frozen=True)``** (the shape the fix
+spec recommends as a starting point): tried first, and falsified by direct
+reproduction before shipping — not assumed to work. Every column here
+(``value_columns``, ``key_columns``, ``order_by``, ...) is a ``ClassVar``,
+so a domain's dataclass ``fields()`` tuple is ALWAYS empty; CPython's
+generated frozen ``__setattr__`` is ``if type(self) is cls or name in
+{<fields>}: raise FrozenInstanceError(...); else: super(cls, self).
+__setattr__(name, value)`` (``dataclasses._frozen_get_del_attr``), and with
+zero fields the ``or name in {...}`` half never fires, so EVERY subclass
+instance (i.e. every real domain — ``ConsoleDomain`` itself is never
+instantiated) falls through to the ``super(cls, self)`` branch and the
+assignment SUCCEEDS. Adding ``slots=True`` makes it worse, not better: it
+rebuilds the class object after generating ``__setattr__``, so the ``cls``
+the generated function closed over is the discarded pre-slots class — even
+a direct instance of the (final) class then hits ``TypeError: super(type,
+obj): obj must be an instance or subtype of type`` instead of the intended
+``FrozenInstanceError``. Both reproduced with a minimal zero-field example
+before this module was written (`lesson-unpinnable-claim-check-your-own-
+techniques-20260915` — a claim about a technique is a claim requiring
+proof, the same class of error this lesson exists to stop). The hand-
+written seal below is unconditional for every instance regardless of
+subclass or field count, and mirrors the already-reviewed, already-PASSED
+pattern in :class:`~audittrace.services.console_store._base.
+ConsoleStoreBase.__setattr__`.
+
+Residual, disclosed (same family as ``ConsoleStoreBase``'s): direct
+``object.__setattr__(domain, name, value)`` or a ``__dict__`` write still
+succeeds — deliberate circumvention, not the ordinary-Python hurry-mode
+path this seal exists for.
 """
 
 from __future__ import annotations
@@ -40,7 +84,10 @@ from audittrace.services.console_store._context import (
     RESERVED_COLUMNS,
 )
 from audittrace.services.console_store._cursor import Direction, coercer_for
-from audittrace.services.console_store._errors import ConsoleStoreDomainError
+from audittrace.services.console_store._errors import (
+    ConsoleStoreDomainError,
+    ConsoleStoreSealedError,
+)
 from audittrace.services.console_store._sealing import seal_members
 
 # Reserved columns a domain MAY order by (always non-null, so paging is
@@ -78,6 +125,26 @@ class ConsoleDomain(Generic[T], ABC):  # noqa: UP046 - see the T = TypeVar comme
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         seal_members(cls, sealed_members=_SEALED_DOMAIN_MEMBERS)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """F1: refuse EVERY instance attribute set, unconditionally — see
+        the module docstring for the defect this closes and why this is
+        hand-written rather than ``@dataclass(frozen=True)``. There is no
+        legitimate instance-attribute write to protect: every real domain
+        (this class is never instantiated directly) declares its columns,
+        order and hooks entirely at the CLASS level, which this does not
+        touch — ``class Foo(ConsoleDomain): value_columns = (...)`` sets a
+        class attribute via ``type.__new__``, never this method."""
+        raise ConsoleStoreSealedError(
+            f"{type(self).__qualname__}.{name} is part of a validated "
+            "domain descriptor and cannot be set after class definition"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise ConsoleStoreSealedError(
+            f"{type(self).__qualname__}.{name} is part of a validated "
+            "domain descriptor and cannot be deleted"
+        )
 
     # ── overridable hooks ────────────────────────────────────────────────
 
@@ -141,7 +208,7 @@ def validate_domain(domain: ConsoleDomain[Any]) -> None:
 
     Falsifiable: neuter the reserved-column check and a hostile domain that
     declares ``value_columns=("user_sub",)`` gets to write another user's
-    ``user_sub`` (``tests/test_console_store_hostile.py``).
+    ``user_sub`` (``tests/test_console_store_hostile_domain_hooks.py``).
     """
     _require(isinstance(domain, ConsoleDomain), "domain must be a ConsoleDomain")
     name = getattr(domain, "name", None)
