@@ -84,9 +84,9 @@ DECISIONS_COLLECTION = "decisions"
 #
 # Deliberately NO recall@25 PERCENTAGE is pinned here (fix-round-2 stated
 # "~5.88%" and it was wrong by ~2x when a reviewer re-ran the same
-# committed harness the same day — the true number that run was 0.00%
-# excl-today / 0.00% incl-today; a THIRD run at fix-round-3, corpus grown
-# to 4348 rows/777 docs, also measured 0.00% at k=25 both ways). A
+# committed harness the same day — that run measured 2.94% at k=25; a
+# THIRD run at fix-round-3, corpus grown to 4348 rows/777 docs, measured
+# 0.00% at k=25 both excl-today and incl-today). A
 # recency-ordered recall@k at a SMALL k is dominated by which handful of
 # documents happen to sit at the very front of the list at run time, so
 # it moves run-to-run as the corpus's most-recent few rows change — it
