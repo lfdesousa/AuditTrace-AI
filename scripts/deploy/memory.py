@@ -75,6 +75,19 @@ DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 # The decisions collection is where deploy lessons are indexed (the ``collections``
 # default of :func:`log_deploy_record`), so recall reads it back.
 DECISIONS_COLLECTION = "decisions"
+# WU-1 fix-round-2 (2026-09-17, F9): this constant is UNCHANGED by the D15
+# fix — every caller that omits ``limit`` (i.e. the default fleet recall
+# path) still gets only 25 rows. Post-fix those 25 rows are DOCUMENTS
+# rather than chunks (a real improvement — no more single-record crowding),
+# but the corpus has hundreds of distinct decisions-layer documents, so 25
+# is still a small slice: recall@25 measured ~5.88% on a 34-pair labelled
+# set 2026-09-17 (see ``scripts/eval-recall-at-k.py``). The operator raises
+# this per-dispatch today (``limit=300`` pasted into every brief by hand,
+# per the governing spec's own framing) rather than this default being
+# raised — left that way deliberately, since a much larger default would
+# make EVERY recall (including throwaway ones) pull hundreds of manifest
+# rows. Not fixed by this WU — WU-2 (ranking) is the intended fix for "the
+# right 25", not a bigger 25.
 DEFAULT_RECALL_LIMIT = 25
 
 # ── build-outcome tagging (corpus-hygiene guard, 2026-08-21) ──────────────────
@@ -400,6 +413,18 @@ def recall_deploy_lessons(
     is best-effort and ``query`` is logging-only (never used to filter/rank), so
     a caller omitting it should degrade to "no intent recorded", not crash the
     whole recall-before step of the ADR-059 loop.
+
+    **Granularity — deliberately unpinned (WU-1 fix-round-2, 2026-09-17,
+    F8).** ``GET /memory/semantic``'s default flipped from one row per
+    ChromaDB chunk to one row per DOCUMENT (the D15 fix this docstring's
+    own "recency echo chamber" framing describes). This helper reads
+    manifest rows — ``title``/``key``/timestamps — never per-chunk
+    ``content``, so it does NOT pass ``granularity=chunk`` to pin the old
+    view: it deliberately inherits the server's default, which means this
+    exact helper is the primary beneficiary of the fix (``limit=300`` now
+    surfaces up to 300 DISTINCT lessons instead of 300 chunks that used to
+    collapse to a handful of large build records). See
+    ``test_recall_deliberately_does_not_pin_granularity``.
     """
     try:
         base = _normalize_front_door(resolve_front_door(front_door))

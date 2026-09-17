@@ -111,6 +111,30 @@ def test_recall_default_limit_is_five():
     assert memory.DEFAULT_RECALL_LIMIT == 5
 
 
+def test_recall_deliberately_does_not_pin_granularity(monkeypatch):
+    """WU-1 fix-round-2 (F8): the round-1 build record's consumer
+    enumeration missed this call site (``scripts/release/memory.py``'s own
+    STEP-2 recall helper, the release-agent's equivalent of
+    ``scripts.deploy.memory.recall_deploy_lessons``). Same deliberate
+    decision as that sibling test: this helper reads manifest rows
+    (titles/keys/timestamps), never per-chunk content, so it is left
+    UNPINNED — it inherits ``GET /memory/semantic``'s document-grouped
+    default rather than requesting the legacy ``granularity=chunk`` view,
+    and benefits automatically from the D15 fix (fewer, more DISTINCT
+    lessons per ``limit``) rather than being frozen to the old chunk-level
+    shape."""
+    _clear_env_token(monkeypatch)
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_release_lessons("q", front_door=FRONT, token=TOKEN)
+    call = fake.calls[0]
+    assert "granularity" not in call["query"], (
+        "recall_release_lessons must not pin a granularity — it deliberately "
+        f"inherits the server's document-grouped default: {call['query']}"
+    )
+
+
 # ── recall: every failure returns [] and never raises ───────────────────────────
 
 

@@ -2835,6 +2835,58 @@ async def _gather_whole_document(
     return chunk_ids, chunk_docs
 
 
+def _reassemble_chunk_sequence(
+    chunk_docs: list[Any], overlap: int = CHUNK_OVERLAP
+) -> str:
+    """WU-1 fix-round-2 (closes the round-1 F1 reject — ``?whole_document=
+    true`` duplicated every chunk overlap instead of reconstructing the
+    document). De-overlap and concatenate a CONTIGUOUS chunk sequence
+    (index 0..N, as produced by :func:`_gather_whole_document`) back into
+    the ORIGINAL text, BYTE-EXACT.
+
+    **Why dropping a flat ``overlap`` characters off every chunk after the
+    first is exact, not approximate.** ``_chunk_text`` advances by
+    ``CHUNK_SIZE - CHUNK_OVERLAP`` characters per chunk (``start = end -
+    overlap``), so consecutive full-size chunks share exactly their last/
+    first ``overlap`` characters. The one case that looks like it could
+    break this — the document's TAIL, where later chunks get truncated —
+    does not: whenever an earlier chunk ``i`` is itself shorter than
+    ``CHUNK_SIZE`` (i.e. truncated because it reached the end of the
+    text), the NEXT chunk ``i+1`` is provably no longer than the true
+    overlap between them (algebraically, chunk ``i+1``'s length equals
+    exactly that overlap — it is a pure suffix of chunk ``i``, contributing
+    zero new characters). Python slicing clamps ``chunk[overlap:]`` to
+    ``""`` whenever ``len(chunk) <= overlap``, which is precisely correct
+    in that case: dropping "more than the chunk has" removes all of it,
+    which is right because all of it was already covered by the previous
+    chunk. So the same one-line rule is exact whether or not the tail is
+    truncated — see the WU-1 fix-round-2 build record for the worked
+    numeric proof.
+
+    **Two known, documented limits** (properties of the chunking scheme
+    itself, not introduced here — both are non-goals for THIS fix):
+
+    * Assumes ``overlap`` (``CHUNK_OVERLAP`` at call time) matches the
+      value used when the document was ORIGINALLY chunked. If that
+      constant is ever changed, documents indexed under the old value
+      need re-indexing before a whole-document read of them stays exact
+      under the new value — this function has no way to detect a stale
+      value from the chunk content alone.
+    * Assumes the fetched chunk sequence is CONTIGUOUS, i.e. no physical
+      chunk was silently dropped by ``_chunk_text``'s ``if chunk.strip():``
+      guard (which happens only for a >= ``CHUNK_SIZE``-character run of
+      pure whitespace inside the source document — not observed in real
+      build records/specs). A skipped chunk would shift later chunks out
+      of arithmetic lockstep with their id index in a way this function
+      cannot detect from the fetched text alone.
+    """
+    if not chunk_docs:
+        return ""
+    parts = [chunk_docs[0].page_content]
+    parts.extend(doc.page_content[overlap:] for doc in chunk_docs[1:])
+    return "".join(parts)
+
+
 @router.get("/semantic/{collection}/{document_id}")
 async def read_semantic(
     collection: str,
@@ -2896,7 +2948,7 @@ async def read_semantic(
             cache="n/a",
         )
         return {
-            "content": "\n\n".join(d.page_content for d in chunk_docs),
+            "content": _reassemble_chunk_sequence(chunk_docs),
             "metadata": front_matter.metadata,
             "manifest": entry.to_dict() if entry is not None else None,
             "chunk_count": len(chunk_docs),

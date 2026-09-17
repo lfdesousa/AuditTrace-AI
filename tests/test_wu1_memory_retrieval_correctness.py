@@ -168,9 +168,24 @@ def _fold_markdown(
 # A big-enough body to span multiple ``_chunk_text`` chunks (CHUNK_SIZE=1500,
 # CHUNK_OVERLAP=200) — computed from the real chunker, never hand-counted,
 # so a chunking-parameter change can't silently desync this fixture from
-# reality.
+# reality. UNIFORM by design (every char is 'x') — fine for the COUNT-only
+# assertions in ``TestDocumentCountDedup``/``TestHonestPagination`` below,
+# but round-1 review (F1) proved a uniform fixture is USELESS for proving
+# byte-exact reconstruction: duplication, misordering and omission are all
+# invisible when every position holds the same character. Whole-document
+# CONTENT assertions use ``_DISTINCT_BODY`` instead — see its docstring.
 _BIG_BODY = ("x" * 60 + "\n") * 120
 _BIG_CHUNK_COUNT = len(_chunk_text(_BIG_BODY))
+
+# WU-1 fix-round-2 (F1): every position in this fixture is UNIQUELY
+# identifiable (a zero-padded running index), so duplication (a repeated
+# index), misordering (indices out of sequence) and omission (a missing
+# index) are all directly observable in the reconstructed text — unlike
+# ``_BIG_BODY`` above. Long enough to span multiple ``_chunk_text`` chunks
+# AND to exercise a truncated-tail chunk (see ``_reassemble_chunk_sequence``
+# docstring for why the tail case matters).
+_DISTINCT_BODY = "".join(f"[{i:06d}]\n" for i in range(1400))
+_DISTINCT_CHUNK_COUNT = len(_chunk_text(_DISTINCT_BODY))
 
 
 class TestDocumentCountDedup:
@@ -305,28 +320,75 @@ class TestWholeDocumentRead:
     def test_whole_document_joins_every_chunk_in_order(
         self, client: TestClient
     ) -> None:
-        _fold_markdown(client, "big-record.md", _BIG_BODY.encode())
+        """WU-1 fix-round-2 (F1): asserts BYTE EQUALITY against the
+        original text on a DISTINCT-CONTENT fixture (every position
+        uniquely identifiable), not substring containment on a uniform
+        fixture — round-1's ``chunk_text in body["content"]`` check on
+        ``_BIG_BODY`` (all 'x's) could not have detected the round-1 bug
+        (every chunk-overlap boundary duplicated: reconstructed length was
+        `+200 chars per boundary` too long) because a repeated 'x' run
+        looks identical to a correct one. This fixture would fail loudly
+        under the round-1 defect: a duplicated overlap re-inserts an
+        already-seen bracketed index, which breaks byte equality."""
+        _fold_markdown(client, "distinct-record.md", _DISTINCT_BODY.encode())
 
         chunk_list = client.get(
             "/memory/semantic?collection=decisions&granularity=chunk"
         ).json()["items"]
-        assert len(chunk_list) == _BIG_CHUNK_COUNT
+        assert len(chunk_list) == _DISTINCT_CHUNK_COUNT
+        assert _DISTINCT_CHUNK_COUNT > 1, (
+            "fixture must span >1 chunk for this test to mean anything"
+        )
 
         # Request the LAST chunk's id — the fix must still walk back to
-        # chunk 0 and assemble the FULL document, not just tail-serve the
-        # requested id.
+        # chunk 0 and reconstruct the document byte-exact, not just
+        # tail-serve the requested id.
         last_document_id = chunk_list[-1]["key"].split("/", 1)[1]
         r = client.get(
             f"/memory/semantic/decisions/{last_document_id}?whole_document=true"
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["chunk_count"] == _BIG_CHUNK_COUNT
-        assert len(body["chunk_keys"]) == _BIG_CHUNK_COUNT
-        # Every original chunk's content must appear in the assembled body.
-        real_chunks = _chunk_text(_BIG_BODY)
-        for chunk_text in real_chunks:
-            assert chunk_text in body["content"]
+        assert body["chunk_count"] == _DISTINCT_CHUNK_COUNT
+        assert len(body["chunk_keys"]) == _DISTINCT_CHUNK_COUNT
+        assert body["content"] == _DISTINCT_BODY, (
+            "whole_document=true must reconstruct the ORIGINAL bytes exactly "
+            "(no duplicated overlap, no gap, no reordering)"
+        )
+
+    def test_whole_document_reconstructs_a_build_record_byte_exact(
+        self, client: TestClient
+    ) -> None:
+        """Regression for round-1 F1: the round-1 bug's own worked example
+        was THIS WU's build record itself ("a real obstacle to the Layer-2
+        build-record verification every reviewer performs" — the
+        docstring's stated use case). Mimics a real build record's shape
+        (YAML front matter + several distinctly-worded Markdown sections)
+        so duplication/misordering/omission are all observable, and reads
+        it back whole-document, asserting byte equality end to end."""
+        sections = [
+            "---\nspec_ref: fixture-spec.md\nspec_hash: sha256:deadbeef\n---\n\n",
+            "# Build record — regression fixture\n\n",
+            "## Skills loaded\n\n" + ("PYTHON-ENGINEERING skill detail line.\n" * 25),
+            "## What was built\n\n" + ("Implementation detail line.\n" * 25),
+            "## Gates\n\n" + ("make test passed, coverage line.\n" * 25),
+            "## Commit\n\nabc123def456 on a feature branch.\n",
+        ]
+        build_record_text = "".join(sections)
+        assert len(_chunk_text(build_record_text)) > 1, (
+            "fixture must span >1 chunk for this test to mean anything"
+        )
+
+        _fold_markdown(client, "regression-build-record.md", build_record_text.encode())
+        chunk_list = client.get(
+            "/memory/semantic?collection=decisions&granularity=chunk"
+        ).json()["items"]
+        matches = [i for i in chunk_list if i["title"] == "regression-build-record.md"]
+        any_id = matches[0]["key"].split("/", 1)[1]
+
+        r = client.get(f"/memory/semantic/decisions/{any_id}?whole_document=true")
+        assert r.status_code == 200, r.text
+        assert r.json()["content"] == build_record_text
 
     def test_whole_document_false_default_returns_single_chunk_unchanged(
         self, client: TestClient
@@ -540,6 +602,42 @@ class TestKeyShapeTrap:
     def test_genuinely_missing_file_still_404s(self, client: TestClient) -> None:
         r = client.get("/memory/episodic/does-not-exist.md")
         assert r.status_code == 404
+
+    def test_foreign_sub_prefix_400s_never_resolves_to_callers_own_file(
+        self, client: TestClient
+    ) -> None:
+        """WU-1 fix-round-2 (F5): round-1's guards #10/#11 proved
+        ``_strip_known_key_prefixes`` passes an UNRECOGNIZED prefix through
+        unchanged (the documented ``pass through unchanged`` guarantee),
+        but nothing exercised the CALLER-BOUND-PREFIX property that
+        guarantee exists to protect: a plausible over-strip bug
+        (``return raw.rsplit("/", 1)[-1]``) would leave every existing
+        assertion green while silently resolving a FOREIGN-sub-prefixed
+        key down to a bare filename — which the read route would then
+        happily look up under the CALLER's OWN account. If the caller
+        happens to own a file of that same name, the over-strip bug
+        returns THAT file's content instead of 400, which is a
+        content-confusion hole, not merely a missed-guard gap.
+
+        Creates a same-named file under the CALLER's own account first, so
+        a defective implementation that resolves the foreign key to "just
+        the bare name under whoever is asking" would return live content
+        (a false 200) rather than a 404 that could look accidentally
+        correct."""
+        own = client.post(
+            "/memory/episodic",
+            json={"filename": "victim.md", "content": "the CALLER's own content"},
+        )
+        assert own.status_code == 200, own.text
+
+        foreign_key = "someone-else-entirely/episodic/victim.md"
+        r = client.get(f"/memory/episodic/{foreign_key}")
+        assert r.status_code == 400, (
+            f"a foreign-sub-prefixed key must 400 (fail closed), never "
+            f"silently resolve to the caller's own same-named file: "
+            f"{r.status_code} {r.text}"
+        )
+        assert "the CALLER's own content" not in r.text
 
     def test_full_upload_key_round_trips_through_read_procedural(
         self, client: TestClient
