@@ -38,16 +38,23 @@ Curator's call site was updated to request ``granularity=chunk`` explicitly
 (see that module's ``list_semantic_collection``) rather than relying on
 whatever the default happened to be.
 
-**Other known consumers of the new default (WU-1 fix-round-3, F14).**
+**Other known consumers of the new default (WU-1 fix-round-3 F14, fix-round-4
+F23 — enumerated by grepping the repo for callers of the route, not by
+reasoning about it).**
 ``scripts/deploy/memory.py::recall_deploy_lessons`` and
 ``scripts/release/memory.py::recall_release_lessons`` DELIBERATELY inherit
-the document-grouped default (see both functions' docstrings). Two MORE
-real consumers were found reading ``GET /memory/semantic`` with no
-``granularity`` param at all, so they too inherit this default:
-``bff/memory_proxy.py`` (transparent forward — see that module's
-docstring) and the LibreChat fork's
+the document-grouped default (see both functions' docstrings). Real
+consumers found reading ``GET /memory/semantic`` with no ``granularity``
+param at all, so they too inherit this default: ``bff/memory_proxy.py``
+(transparent forward — see that module's docstring); the LibreChat fork's
 ``api/server/services/AuditTraceMemory/index.js::getAllUserMemories``
-(the human-facing Souvenirs panel). Neither is a security or data-loss
+(the human-facing Souvenirs panel); and — fix-round-4, F23 — the
+**canonical interactive human path**, Bruno's
+``bruno/audittrace/memory/semantic/01-list.bru`` and
+``01b-list-paged.bru`` (both plain ``GET {{baseUrl}}/memory/semantic``,
+no ``granularity`` query param). ``docs/guides/memory-backoffice.md``'s
+endpoint matrix has been corrected to say so (previously documented the
+route as plain "List", silent on the default's shape). None of these is a
 concern (the representative row's ``key`` still addresses a real,
 authorized chunk — see :func:`group_semantic_chunks_by_document`'s
 docstring on which chunk is chosen), but a multi-chunk document now shows

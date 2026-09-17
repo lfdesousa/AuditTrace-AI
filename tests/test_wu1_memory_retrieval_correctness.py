@@ -192,9 +192,24 @@ def _load_index_chromadb_module() -> Any:
     """Load ``scripts/index-chromadb.py`` by file path (the hyphen makes it
     unimportable as a dotted module — mirrors
     ``tests/test_scan_dlq_cli.py::_load_module`` for the sibling
-    hyphenated-script pattern). No side effects at import time: the
-    script's only top-level statements above ``if __name__ ==
-    "__main__":`` are stdlib imports + constant/function definitions."""
+    hyphenated-script pattern).
+
+    WU-1 fix-round-4 (F21) correction: the script's top-level statements
+    are NOT limited to stdlib imports + constant/function definitions —
+    line 43 is ``logging.basicConfig(level=logging.INFO, ...)``, a real
+    call with a real side effect (it mutates the root logger's level and
+    installs a ``StreamHandler`` when the root logger has none yet —
+    verified directly: outside pytest this call moves the root logger
+    30->20 and adds a handler). It is inert HERE specifically because
+    ``logging.basicConfig`` no-ops whenever the root logger already has
+    at least one handler, and pytest's own logging plugin has already
+    attached its capture handler(s) to the root logger before any test
+    module executes (verified: 4 handlers present, level unchanged,
+    before this loader ever runs). That is a stated DEPENDENCY on
+    pytest's logging plugin having run first, not an accident this
+    docstring is silent about — a bare ``python -c`` import of this
+    module (no pytest, no pre-existing root handler) WOULD observe the
+    side effect."""
     import importlib.util
     from importlib.machinery import SourceFileLoader
     from pathlib import Path
@@ -732,3 +747,148 @@ class TestKeyShapeTrap:
         r = client.get(f"/memory/procedural/{full_key}")
         assert r.status_code == 200, r.text
         assert r.json()["content"] == "skill trap"
+
+
+def _load_eval_recall_module() -> Any:
+    """Load ``scripts/eval-recall-at-k.py`` by file path — same
+    hyphenated-script pattern as :func:`_load_index_chromadb_module`
+    above. WU-1 fix-round-4 (F24): the harness's own honesty machinery
+    (``SAME_SESSION_TITLES``, the excl-today-first framing, ``_corpus_pin``)
+    had NO test at all — the script sits outside the coverage-gated
+    ``scripts/`` subset (see ``pyproject.toml``'s ``[tool.coverage.run]
+    source`` comment) and had no test file, so a future edit could
+    silently stop excluding same-session writes with nothing to catch
+    it. This loader makes the module's real functions and real frozen
+    data importable for a unit test without a live front door."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "scripts" / "eval-recall-at-k.py"
+    loader = SourceFileLoader("audittrace_eval_recall_at_k", str(path))
+    spec = importlib.util.spec_from_loader("audittrace_eval_recall_at_k", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class TestSameSessionExclusionHonesty:
+    """WU-1 fix-round-4, F24: a REAL test for the excl-today honesty
+    machinery in ``scripts/eval-recall-at-k.py``, replacing the
+    fix-round-3 evidence file's tautological "non-vacuity" (emptying
+    ``SAME_SESSION_TITLES`` and observing excl == incl is true by set
+    arithmetic alone — it exercises no code). This drives the REAL
+    ``run()`` end to end (network fetch monkeypatched, everything else
+    real: the real ``SAME_SESSION_TITLES``/``LABELLED_PAIRS`` frozen
+    data, the real ``dedupe_semantic_chunks``/
+    ``group_semantic_chunks_by_document``, the real ``_recall_at_k``
+    formula inside ``run()``), and asserts on the ACTUAL printed
+    percentages — captured values, not a bare ``pytest.raises``."""
+
+    def test_excl_today_drops_a_same_session_hit_run_reproduces_it(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mod = _load_eval_recall_module()
+
+        # Real overlap, not synthesised: this title is BOTH a genuine
+        # SAME_SESSION_TITLES member AND a genuine LABELLED_PAIRS target
+        # in the shipped module — verified against the module's own data
+        # rather than asserted independently of it.
+        same_session_hit = "lesson-coverage-is-a-floor-not-a-proof-20260917.md"
+        assert same_session_hit in mod.SAME_SESSION_TITLES
+        assert same_session_hit in {title for _q, title in mod.LABELLED_PAIRS}
+
+        # A tiny synthetic corpus: the same-session title ranked FIRST
+        # (most-recent), three unrelated filler documents behind it, and
+        # crucially NO other LABELLED_PAIRS title present — so this one
+        # title is the corpus's only scoreable pair, making the exclusion
+        # effect land as a clean 100% -> 0% swing rather than a diluted
+        # one.
+        def _fake_fetch(front_door, token, collection, insecure):
+            titles = [same_session_hit, "filler-a.md", "filler-b.md", "filler-c.md"]
+            return [
+                {
+                    "key": f"decisions/{i:016x}",
+                    "title": t,
+                    "discovered": False,
+                    "size_bytes": 10,
+                    "created_at_ms": 1000 - i,
+                }
+                for i, t in enumerate(titles)
+            ]
+
+        monkeypatch.setattr(mod, "_fetch_all_chunk_rows", _fake_fetch)
+        monkeypatch.setattr(mod, "_resolve_token", lambda _token: "fake-token")
+
+        exit_code = mod.run("https://example.invalid", "decisions", True)
+        assert exit_code == 0
+
+        out = capsys.readouterr().out
+        k4_line = next(
+            line for line in out.splitlines() if line.strip().startswith("4 |")
+        )
+        excl_today_before, excl_today_after, incl_today_before, incl_today_after = (
+            cell.strip().rstrip("%") for cell in k4_line.split("|")[1:]
+        )
+
+        # The captured VALUES: excluding the same-session title removes
+        # the corpus's only scoreable pair from BOTH excl-today columns
+        # (F25 -- the honest view now has its own BEFORE, not just AFTER),
+        # so excl-today BEFORE and AFTER both measure 0.00% while
+        # incl-today (which still counts it) measures 100.00% at k=4 -- a
+        # real, non-tautological numeric assertion on ``run()``'s actual
+        # output, not on the constants in isolation.
+        assert float(excl_today_before) == 0.0
+        assert float(excl_today_after) == 0.0
+        assert float(incl_today_after) == 100.0
+        assert float(incl_today_before) == 100.0
+
+    def test_excl_today_matches_incl_today_when_no_same_session_titles_score(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Companion case: when the corpus's scored pair is NOT a
+        same-session title, exclusion changes nothing -- confirming the
+        prior test's 100->0 swing is caused by the exclusion, not by an
+        unrelated difference between the two code paths."""
+        mod = _load_eval_recall_module()
+
+        non_session_title = next(
+            title
+            for _q, title in mod.LABELLED_PAIRS
+            if title not in mod.SAME_SESSION_TITLES
+        )
+
+        def _fake_fetch(front_door, token, collection, insecure):
+            titles = [non_session_title, "filler-a.md", "filler-b.md", "filler-c.md"]
+            return [
+                {
+                    "key": f"decisions/{i:016x}",
+                    "title": t,
+                    "discovered": False,
+                    "size_bytes": 10,
+                    "created_at_ms": 1000 - i,
+                }
+                for i, t in enumerate(titles)
+            ]
+
+        monkeypatch.setattr(mod, "_fetch_all_chunk_rows", _fake_fetch)
+        monkeypatch.setattr(mod, "_resolve_token", lambda _token: "fake-token")
+
+        exit_code = mod.run("https://example.invalid", "decisions", True)
+        assert exit_code == 0
+
+        out = capsys.readouterr().out
+        k4_line = next(
+            line for line in out.splitlines() if line.strip().startswith("4 |")
+        )
+        excl_today_before, excl_today_after, incl_today_before, incl_today_after = (
+            cell.strip().rstrip("%") for cell in k4_line.split("|")[1:]
+        )
+        assert (
+            float(excl_today_before)
+            == float(excl_today_after)
+            == float(incl_today_before)
+            == float(incl_today_after)
+            == 100.0
+        )

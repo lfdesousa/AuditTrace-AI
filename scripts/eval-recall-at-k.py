@@ -403,20 +403,32 @@ def run(front_door: str, collection: str, insecure: bool) -> int:
         )
 
     print(
-        f"{'k':>5} | {'excl-today AFTER':>17} | {'incl-today BEFORE':>18} "
-        f"| {'incl-today AFTER':>17}"
+        f"{'k':>5} | {'excl-today BEFORE':>18} | {'excl-today AFTER':>17} "
+        f"| {'incl-today BEFORE':>18} | {'incl-today AFTER':>17}"
     )
-    print("-" * 68)
+    print("-" * 89)
     for k in K_VALUES:
-        excl_after_hits, excl_denom = _recall_at_k(after_titles, expected_excl_today, k)
+        # WU-1 fix-round-4 (F25): excl-today BEFORE alongside excl-today
+        # AFTER — the prior table's only BEFORE/AFTER comparison lived in
+        # the incl-today columns, the MOST volatile ones (same-session
+        # writes inflate them). The honest (excl-today) comparison now has
+        # its own BEFORE, computed the same way as incl-today's (same
+        # ``before_titles`` view, ``expected_excl_today`` denominator).
+        excl_before_hits, excl_denom = _recall_at_k(
+            before_titles, expected_excl_today, k
+        )
+        excl_after_hits, _excl_denom = _recall_at_k(
+            after_titles, expected_excl_today, k
+        )
         before_hits, denom = _recall_at_k(before_titles, expected, k)
         after_hits, _denom = _recall_at_k(after_titles, expected, k)
+        excl_before_pct = 100.0 * excl_before_hits / excl_denom if excl_denom else 0.0
         excl_after_pct = 100.0 * excl_after_hits / excl_denom if excl_denom else 0.0
         before_pct = 100.0 * before_hits / denom if denom else 0.0
         after_pct = 100.0 * after_hits / denom if denom else 0.0
         print(
-            f"{k:>5} | {excl_after_pct:>16.2f}% | {before_pct:>17.2f}% "
-            f"| {after_pct:>16.2f}%"
+            f"{k:>5} | {excl_before_pct:>17.2f}% | {excl_after_pct:>16.2f}% "
+            f"| {before_pct:>17.2f}% | {after_pct:>16.2f}%"
         )
     return 0
 
