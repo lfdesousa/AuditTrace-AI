@@ -87,6 +87,10 @@ from audittrace.routes.memory_md_manifest import _flush_md_manifest
 from audittrace.routes.memory_promote import (
     promote_session_to_durable as _promote_session_to_durable,
 )
+from audittrace.routes.memory_semantic_documents import (
+    dedupe_semantic_chunks,
+    group_semantic_chunks_by_document,
+)
 from audittrace.services.embedder import embed_via_nomic
 from audittrace.services.episodic import EpisodicService
 from audittrace.services.index_routing import collection_for_key
@@ -205,6 +209,33 @@ def _doc_id(collection: str, source: str, chunk_idx: int) -> str:
     """Generate a deterministic document ID."""
     raw = f"{collection}:{source}:{chunk_idx}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# WU-1 (SPEC-2026-09-17-memory-retrieval-and-learning-loop-telemetry, closes
+# D15 item 2 — whole-document read). A generous safety cap on how many
+# chunks ``_iter_document_chunk_ids`` will ever probe for one document: real
+# build records/specs folded by ``_index_md_objects`` at
+# ``CHUNK_SIZE=1500`` have not been observed needing more than a few dozen
+# chunks, so this cap exists to bound worst-case work (a malformed/huge
+# title should not make a single read loop indefinitely), not because any
+# real document is expected to approach it.
+_MAX_DOCUMENT_CHUNKS = 500
+
+
+def _iter_document_chunk_ids(collection: str, title: str) -> list[str]:
+    """The deterministic chunk-id SEQUENCE for one folded document.
+
+    ``_doc_id`` is a pure function of ``(collection, source, chunk_idx)`` —
+    the SAME formula ``_index_md_objects`` uses to name each chunk it
+    writes. Given just the document's ``title`` (== the original
+    filename), chunk 0's id — the front-matter chunk — is directly
+    computable with no hash-guessing, closing the WU-1 obstacle: "front
+    matter (chunk 0) is reachable only via the deterministic ``_doc_id``
+    hash — a real obstacle to the Layer-2 build-record verification every
+    reviewer performs." See ``read_semantic``'s ``whole_document`` mode,
+    the documented consumer of this sequence.
+    """
+    return [_doc_id(collection, title, i) for i in range(_MAX_DOCUMENT_CHUNKS)]
 
 
 def _get_minio_client() -> Any:
@@ -1571,6 +1602,35 @@ def _validate_filename_or_400(filename: str, layer: str) -> None:
         )
 
 
+def _strip_known_key_prefixes(raw: str, layer: str, user_id: str) -> str:
+    """WU-1 (2026-09-17, closes D15 item 4 — "the key-shape trap").
+
+    ``POST /memory/upload``'s response ``key`` (and ``POST
+    /memory/index``'s ``?file=`` param) use the FULL, sub-prefixed shape
+    ``"{user_id}/{layer}/{name}"``; the read/update/delete routes have
+    always taken the BARE ``name``. Pasting the upload key into a read
+    route used to 404 with no hint (a live 404 on 2026-09-15). Rather than
+    only documenting the trap, this makes the READ routes tolerant of
+    either shape: a caller-supplied value starting with the caller's own
+    ``"{user_id}/{layer}/"`` or the bare ``"{layer}/"`` prefix has that
+    prefix stripped before the bare-filename validation/lookup runs; a
+    value that matches neither prefix is passed through unchanged (the
+    pre-WU-1 behaviour), so an already-bare filename is never altered.
+
+    Scoped to the READ path only (write/update/delete routes are
+    deliberately left unchanged in this WU — widening the MUTATION
+    surface's key parsing is a separate, higher-stakes decision than
+    making a read more forgiving).
+    """
+    sub_prefix = f"{user_id}/{layer}/"
+    layer_prefix = f"{layer}/"
+    if raw.startswith(sub_prefix):
+        return raw[len(sub_prefix) :]
+    if raw.startswith(layer_prefix):
+        return raw[len(layer_prefix) :]
+    return raw
+
+
 # ── /memory/episodic ────────────────────────────────────────────────────────
 
 
@@ -1865,7 +1925,7 @@ async def list_episodic(
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/episodic/{filename}")
+@router.get("/episodic/{filename:path}")
 async def read_episodic(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:episodic:read"]),
@@ -1880,7 +1940,14 @@ async def read_episodic(
     private-first-then-corpus by ``service.read`` (WU-B2), so a 404
     here means genuinely missing (not a cross-user disclosure). The
     manifest metadata block is additionally scoped by
-    ``_manifest_visible`` — see its docstring for why."""
+    ``_manifest_visible`` — see its docstring for why.
+
+    WU-1 (2026-09-17, closes D15 item 4): the path parameter is
+    ``{filename:path}`` (accepts embedded ``/``) and
+    ``_strip_known_key_prefixes`` normalizes an upload/index-shaped key
+    (``"{user_id}/episodic/{name}"`` or ``"episodic/{name}"``) down to the
+    bare filename BEFORE validation — see that helper's docstring."""
+    filename = _strip_known_key_prefixes(filename, "episodic", user.user_id)
     _validate_filename_or_400(filename, "episodic")
     service = get_episodic_service()
     manifest = get_memory_manifest_service()
@@ -2126,7 +2193,7 @@ async def list_procedural(
     return {"items": page, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/procedural/{filename}")
+@router.get("/procedural/{filename:path}")
 async def read_procedural(
     filename: str,
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:procedural:read"]),
@@ -2136,7 +2203,10 @@ async def read_procedural(
     request: Request,  # type: ignore[type-arg, unused-ignore]
 ) -> dict[str, Any]:
     """ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
-    ``read_episodic`` — see its docstring."""
+    ``read_episodic`` — see its docstring. WU-1 (2026-09-17, D15 item 4):
+    same key-shape tolerance as ``read_episodic`` — see
+    ``_strip_known_key_prefixes``."""
+    filename = _strip_known_key_prefixes(filename, "procedural", user.user_id)
     _validate_filename_or_400(filename, "procedural")
     service = get_procedural_service()
     manifest = get_memory_manifest_service()
@@ -2626,6 +2696,18 @@ async def list_semantic(
         description="Page size (max 500).",
     ),
     offset: int = Query(0, ge=0, description="Zero-based pagination offset."),
+    granularity: Literal["document", "chunk"] = Query(
+        "document",
+        description=(
+            "'document' (default, WU-1 2026-09-17 — closes D15): de-duplicate "
+            "chunk rows by their shared 'title' before sort/paginate, so "
+            "'limit' means N DOCUMENTS, not N chunks — a multi-chunk record "
+            "used to crowd smaller/older ones out of the same limit window. "
+            "'chunk' restores the pre-WU-1 raw per-ChromaDB-row view (one row "
+            "per physical id) for callers that walk rows individually, e.g. "
+            "scripts/curator/runner.py's intake."
+        ),
+    ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
     *,
@@ -2653,7 +2735,18 @@ async def list_semantic(
     of ownership scoping, D3's operator/curator-tier gate additionally
     drops any CORPUS-tier item (tracked or discovered) the caller
     lacks ``memory:corpus:<collection>:read`` for
-    (`_filter_corpus_read_gate`)."""
+    (`_filter_corpus_read_gate`).
+
+    WU-1 (2026-09-17, closes D15 — see ``routes/memory_semantic_documents``
+    module docstring for the full defect writeup): the merged chunk-level
+    ``items`` are de-duplicated (two discovery paths can otherwise surface
+    the SAME physical ChromaDB row under two differently-prefixed keys) and
+    then, by default, grouped by document (``title``) BEFORE
+    ``_sort_and_paginate`` runs — so ``limit``/``offset``/``total`` all
+    operate on documents, not chunks. The response always reports BOTH
+    ``total_documents`` and ``total_chunks`` regardless of ``granularity``,
+    so a caller can tell the two numbers apart (the exact confusion that
+    caused the D15 defect: 25 chunks silently meant 4 documents)."""
     manifest = get_memory_manifest_service()
     entries: list[ManifestEntry] = await manifest.list_for_layer(
         "semantic", include_deleted=include_deleted, caller=user
@@ -2663,8 +2756,16 @@ async def list_semantic(
         entries = [e for e in entries if e.key.startswith(prefix)]
     items = await _merge_semantic_with_chroma(entries, collection, user)
     items = _filter_corpus_read_gate(items, user)
+    chunk_items = dedupe_semantic_chunks(items)
+    total_chunks = len(chunk_items)
+    if granularity == "chunk":
+        view_items = chunk_items
+        total_documents = len(group_semantic_chunks_by_document(chunk_items))
+    else:
+        view_items = group_semantic_chunks_by_document(chunk_items)
+        total_documents = len(view_items)
     page, total = _sort_and_paginate(
-        items, sort=sort, order=order, limit=limit, offset=offset
+        view_items, sort=sort, order=order, limit=limit, offset=offset
     )
     schedule_read_audit(
         background_tasks,
@@ -2679,13 +2780,78 @@ async def list_semantic(
         total,
         cache="n/a",
     )
-    return {"items": page, "total": total, "limit": limit, "offset": offset}
+    return {
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "granularity": granularity,
+        "total_documents": total_documents,
+        "total_chunks": total_chunks,
+    }
+
+
+async def _gather_whole_document(
+    service: Any,
+    user: UserContext,
+    collection: str,
+    document_id: str,
+    doc: Any,
+) -> tuple[list[str], list[Any]]:
+    """WU-1 (closes D15 item 2 — whole-document read). Reconstruct every
+    chunk of the document ``doc`` (already fetched at ``document_id``)
+    belongs to, via the deterministic ``_iter_document_chunk_ids``
+    sequence, so the caller gets chunk 0 (the front matter) regardless of
+    which chunk id it originally asked for.
+
+    Returns ``(chunk_keys, chunk_docs)`` in chunk-index order. Falls back
+    to the single already-fetched ``doc`` when it carries no
+    ``title``/``source`` metadata to reconstruct the sequence from (e.g. a
+    direct ``POST /memory/semantic`` write with no title) — a document we
+    genuinely cannot re-derive the sequence for is still returned, just as
+    itself rather than as an error.
+    """
+    title = doc.metadata.get("title") or doc.metadata.get("source")
+    if not isinstance(title, str) or not title:
+        return [document_id], [doc]
+    chunk_ids: list[str] = []
+    chunk_docs: list[Any] = []
+    for chunk_id in _iter_document_chunk_ids(collection, title):
+        candidate = (
+            doc
+            if chunk_id == document_id
+            else await service.get_document(user, collection, chunk_id)
+        )
+        if candidate is None:
+            break
+        chunk_ids.append(chunk_id)
+        chunk_docs.append(candidate)
+    if not chunk_ids:
+        # The deterministic sequence never reproduced the requested chunk
+        # (e.g. a legacy row whose title predates this hash scheme) —
+        # degrade to the single chunk we DID find rather than an empty
+        # "document".
+        return [document_id], [doc]
+    return chunk_ids, chunk_docs
 
 
 @router.get("/semantic/{collection}/{document_id}")
 async def read_semantic(
     collection: str,
     document_id: str,
+    whole_document: bool = Query(
+        False,
+        description=(
+            "WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct "
+            "and return EVERY chunk of this document (starting from chunk "
+            "0 / the front matter, via the deterministic chunk-id sequence "
+            "keyed off the document's title) instead of just the single "
+            "chunk at 'document_id' — the documented whole-document read "
+            "mode. 'content' becomes the chunks joined in order; "
+            "'metadata'/'manifest' describe chunk 0. Default false "
+            "preserves the pre-WU-1 single-chunk response."
+        ),
+    ),
     _auth: dict[str, Any] = Security(validate_jwt, scopes=["memory:semantic:read"]),
     user: UserContext = Depends(require_user),
     *,
@@ -2706,9 +2872,38 @@ async def read_semantic(
         raise HTTPException(status_code=404, detail="semantic doc not found")
     if doc.metadata.get("tier") == "corpus":
         _require_corpus_scope(user, collection, "read")
-    entry: ManifestEntry | None = await manifest.get(
-        "semantic", _semantic_key(collection, document_id)
-    )
+
+    if whole_document:
+        chunk_ids, chunk_docs = await _gather_whole_document(
+            service, user, collection, document_id, doc
+        )
+        front_matter = chunk_docs[0]
+        entry = await manifest.get("semantic", _semantic_key(collection, chunk_ids[0]))
+        if entry is not None and not _manifest_visible(entry, user):
+            entry = None
+        schedule_read_audit(
+            background_tasks,
+            user=user,
+            op="read",
+            layer="semantic",
+            collection=collection,
+            key=document_id,
+        )
+        emit_recall_telemetry(
+            classify_recall_source_from_request(request),
+            collection,
+            len(chunk_docs),
+            cache="n/a",
+        )
+        return {
+            "content": "\n\n".join(d.page_content for d in chunk_docs),
+            "metadata": front_matter.metadata,
+            "manifest": entry.to_dict() if entry is not None else None,
+            "chunk_count": len(chunk_docs),
+            "chunk_keys": [_semantic_key(collection, cid) for cid in chunk_ids],
+        }
+
+    entry = await manifest.get("semantic", _semantic_key(collection, document_id))
     if entry is not None and not _manifest_visible(entry, user):
         entry = None
     schedule_read_audit(

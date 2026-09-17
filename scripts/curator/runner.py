@@ -753,9 +753,20 @@ def list_semantic_collection(
     list (NOT a vector search — see the module docstring's §CORRECTION note).
     Best-effort: a non-200 response contributes nothing rather than aborting
     intake (the fleet keeps writing; a partial intake still curates what it
-    can)."""
+    can).
+
+    ``granularity=chunk`` (WU-1, 2026-09-17): as of the D15 fix,
+    ``GET /memory/semantic`` DEFAULTS to grouping rows by document, but this
+    walk needs one row per physical ChromaDB id — C2 Intake fetches each
+    row's OWN content individually via ``read_semantic_doc(collection,
+    document_id)`` and C3-C7 tag/dedup/promote/verify it at that same
+    per-chunk granularity. Requesting the legacy chunk view explicitly
+    keeps this contract unchanged instead of silently inheriting whatever
+    the server's default happens to be."""
     base = _normalize_front_door(cfg.front_door)
-    query = urlencode({"collection": collection, "limit": cfg.list_limit})
+    query = urlencode(
+        {"collection": collection, "limit": cfg.list_limit, "granularity": "chunk"}
+    )
     status, body = _http_request(
         "GET",
         f"{base}/memory/semantic?{query}",
