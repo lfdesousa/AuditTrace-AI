@@ -25,15 +25,35 @@ identical to the methodology both the round-1 builder and the round-1
 reviewer independently used and cross-checked (round-1 REJECT verdict,
 F3: "the mechanism claim is fully reproduced").
 
-**BEFORE vs AFTER, precisely:**
+**BEFORE vs AFTER, precisely (WU-1 fix-round-3, F18 correction).** Both
+views are computed from the SAME `chunk_rows` AFTER
+``dedupe_semantic_chunks`` (the cross-path physical-id dedup) has already
+been applied once, in :func:`run`, below — that dedup is itself a WU-1
+addition, so BEFORE here is **"the raw per-chunk view with the new
+cross-path dedup applied, but WITHOUT document-grouping"**, not a literal
+byte-for-byte replay of what the pre-WU-1 server's HTTP response
+contained. Applying the SAME first-stage dedup to both sides is
+deliberate — it isolates the one variable this WU changed (grouping),
+rather than conflating it with a second, unrelated defect this WU also
+happened to fix — but it means the BEFORE column is not exactly "the
+pre-WU-1 shape" and this file no longer claims that it is.
 
-* **BEFORE** — the raw per-chunk view (`granularity=chunk`, i.e. the
-  pre-WU-1 shape), first *k* CHUNK rows in recency order. A document
-  "hits" at *k* if ANY of its chunks appears in the first *k* chunk rows.
-* **AFTER** — the SAME fetched rows run through the shipped
-  ``dedupe_semantic_chunks`` + ``group_semantic_chunks_by_document``
-  (the real functions ``list_semantic`` calls, imported here — not
-  reimplemented), first *k* DOCUMENT rows in recency order.
+* **BEFORE** — the deduped per-chunk view (`granularity=chunk`), first
+  *k* CHUNK rows in recency order. A document "hits" at *k* if ANY of its
+  chunks appears in the first *k* chunk rows.
+* **AFTER** — the SAME deduped rows run through the shipped
+  ``group_semantic_chunks_by_document`` (the real function ``list_semantic``
+  calls, imported here — not reimplemented), first *k* DOCUMENT rows in
+  recency order.
+
+**AFTER is at least as good as BEFORE at every measured k, not
+"strictly" better at every k** (WU-1 fix-round-3, F19 correction): at
+k=4, both are typically 0.00% (too small a window for either view to
+surface a labelled document) — the mechanism only shows a measurable
+advantage from around k=25 upward, where document-grouping stops
+"spending" the window on multiple chunks of the same few large records.
+Report the actual numbers; do not round that up to "dominates at every
+k".
 
 **The labelled set** (34 pairs, >= the spec's "at least 30") is drawn from
 real, indexed decisions-layer documents from the last ~10 days of fleet
@@ -63,9 +83,11 @@ spirit as ``scripts/eval-memory-modes.py``, not shipped decision logic.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -241,6 +263,25 @@ LABELLED_PAIRS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# WU-1 fix-round-3 (F11): the three titles below were indexed by THIS
+# session (fix-round-1/round-2, same 2026-09-17 date), hours before this
+# harness runs against the live corpus. A recency-ordered recall@k
+# necessarily ranks the newest documents highest, so scoring against
+# same-session writes measures "did I just index this minutes ago", not
+# "does the fix generalise" — a recency artefact, not cherry-picking (the
+# selection rule that produced LABELLED_PAIRS is otherwise honest and
+# exhaustive: every real lesson doc in the corpus, per the round-2
+# evidence). Reported SEPARATELY as excl-today below rather than silently
+# dropped from LABELLED_PAIRS, so both numbers stay reproducible from one
+# run and the artefact is visible, not hidden.
+SAME_SESSION_TITLES: frozenset[str] = frozenset(
+    {
+        "lesson-coverage-is-a-floor-not-a-proof-20260917.md",
+        "lesson-immutability-primitives-are-field-level-20260917.md",
+        "lesson-sealing-mutation-is-not-sealing-value-20260917.md",
+    }
+)
+
 
 def _fetch_all_chunk_rows(
     front_door: str, token: str, collection: str, insecure: bool
@@ -294,6 +335,19 @@ def _recall_at_k(
     return hits, len(expected_titles)
 
 
+def _corpus_pin(chunk_rows: list[dict]) -> str:
+    """WU-1 fix-round-3 (F13): a short, deterministic fingerprint of the
+    FETCHED corpus (every row's stable chunk identity, sorted, then
+    hashed) so a later re-run can tell — WITHOUT re-fetching or trusting a
+    printed row count alone — whether it saw the SAME corpus snapshot or
+    a drifted one. Row count alone is not enough: the corpus can gain N
+    rows and lose N different ones between two runs and still print the
+    same count."""
+    identities = sorted(str(r.get("key") or "") for r in chunk_rows)
+    digest = hashlib.sha256("\n".join(identities).encode()).hexdigest()
+    return digest[:16]
+
+
 def run(front_door: str, collection: str, insecure: bool) -> int:
     token = _resolve_token(None)
     if not token:
@@ -304,11 +358,18 @@ def run(front_door: str, collection: str, insecure: bool) -> int:
         )
         return 2
 
+    run_started_at = datetime.now(UTC).isoformat(timespec="seconds")
+    print(f"run started: {run_started_at}")
+
     chunk_rows = _fetch_all_chunk_rows(front_door, token, collection, insecure)
     chunk_rows = dedupe_semantic_chunks(
         chunk_rows
     )  # cross-path dedup, both views share it
-    print(f"fetched {len(chunk_rows)} de-duplicated chunk rows from {collection!r}")
+    corpus_pin = _corpus_pin(chunk_rows)
+    print(
+        f"fetched {len(chunk_rows)} de-duplicated chunk rows from {collection!r} "
+        f"(corpus pin: {corpus_pin})"
+    )
 
     before_titles = [r.get("title") or "" for r in chunk_rows]
     documents = group_semantic_chunks_by_document(chunk_rows)
@@ -329,14 +390,34 @@ def run(front_door: str, collection: str, insecure: bool) -> int:
         f"(>= 30 required by spec: {'OK' if len(LABELLED_PAIRS) >= 30 else 'SHORT'})\n"
     )
 
-    print(f"{'k':>5} | {'recall@k BEFORE':>16} | {'recall@k AFTER':>15}")
-    print("-" * 45)
+    # WU-1 fix-round-3 (F11): report excl-today FIRST — same-session writes
+    # (see SAME_SESSION_TITLES) are recency artefacts, not signal about
+    # whether the fix generalises. incl-today is reported alongside so the
+    # magnitude of the artefact stays visible rather than hidden.
+    excluded_today = expected & SAME_SESSION_TITLES
+    expected_excl_today = expected - SAME_SESSION_TITLES
+    if excluded_today:
+        print(
+            f"same-session writes excluded from the excl-today row below "
+            f"({len(excluded_today)}): {sorted(excluded_today)}\n"
+        )
+
+    print(
+        f"{'k':>5} | {'excl-today AFTER':>17} | {'incl-today BEFORE':>18} "
+        f"| {'incl-today AFTER':>17}"
+    )
+    print("-" * 68)
     for k in K_VALUES:
+        excl_after_hits, excl_denom = _recall_at_k(after_titles, expected_excl_today, k)
         before_hits, denom = _recall_at_k(before_titles, expected, k)
         after_hits, _denom = _recall_at_k(after_titles, expected, k)
+        excl_after_pct = 100.0 * excl_after_hits / excl_denom if excl_denom else 0.0
         before_pct = 100.0 * before_hits / denom if denom else 0.0
         after_pct = 100.0 * after_hits / denom if denom else 0.0
-        print(f"{k:>5} | {before_pct:>15.2f}% | {after_pct:>14.2f}%")
+        print(
+            f"{k:>5} | {excl_after_pct:>16.2f}% | {before_pct:>17.2f}% "
+            f"| {after_pct:>16.2f}%"
+        )
     return 0
 
 

@@ -37,6 +37,23 @@ the default could not silently change shape out from under it; the
 Curator's call site was updated to request ``granularity=chunk`` explicitly
 (see that module's ``list_semantic_collection``) rather than relying on
 whatever the default happened to be.
+
+**Other known consumers of the new default (WU-1 fix-round-3, F14).**
+``scripts/deploy/memory.py::recall_deploy_lessons`` and
+``scripts/release/memory.py::recall_release_lessons`` DELIBERATELY inherit
+the document-grouped default (see both functions' docstrings). Two MORE
+real consumers were found reading ``GET /memory/semantic`` with no
+``granularity`` param at all, so they too inherit this default:
+``bff/memory_proxy.py`` (transparent forward — see that module's
+docstring) and the LibreChat fork's
+``api/server/services/AuditTraceMemory/index.js::getAllUserMemories``
+(the human-facing Souvenirs panel). Neither is a security or data-loss
+concern (the representative row's ``key`` still addresses a real,
+authorized chunk — see :func:`group_semantic_chunks_by_document`'s
+docstring on which chunk is chosen), but a multi-chunk document now shows
+a whole-document ``size_bytes`` against a single-chunk ``key`` in that
+panel — tracked as a follow-up in the private backlog, not fixed by this
+WU (out of this repo's diff).
 """
 
 from __future__ import annotations

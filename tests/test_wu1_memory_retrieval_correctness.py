@@ -188,6 +188,84 @@ _DISTINCT_BODY = "".join(f"[{i:06d}]\n" for i in range(1400))
 _DISTINCT_CHUNK_COUNT = len(_chunk_text(_DISTINCT_BODY))
 
 
+def _load_index_chromadb_module() -> Any:
+    """Load ``scripts/index-chromadb.py`` by file path (the hyphen makes it
+    unimportable as a dotted module — mirrors
+    ``tests/test_scan_dlq_cli.py::_load_module`` for the sibling
+    hyphenated-script pattern). No side effects at import time: the
+    script's only top-level statements above ``if __name__ ==
+    "__main__":`` are stdlib imports + constant/function definitions."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "scripts" / "index-chromadb.py"
+    loader = SourceFileLoader("audittrace_index_chromadb", str(path))
+    spec = importlib.util.spec_from_loader("audittrace_index_chromadb", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class TestChunkParameterAgreement:
+    """WU-1 fix-round-3, F17: ``CHUNK_SIZE``/``CHUNK_OVERLAP`` are
+    duplicated across ``routes/memory.py`` and ``scripts/index-chromadb.py``
+    with only a "must match" COMMENT — no test previously pinned the two
+    modules' values, or ``_reassemble_chunk_sequence``'s dependence on them
+    actually agreeing. A drift here is silent corruption, not an error: a
+    document chunked under one module's parameters and reassembled
+    assuming the other's produces a wrong-but-plausible string, and
+    ``validate_build_record`` (``scripts/deploy/build_record.py``) has no
+    way to detect it from the corrupted text alone.
+    """
+
+    def test_chunk_size_and_overlap_match_across_both_indexers(self) -> None:
+        """The actual falsifiable assert: if either module's constant is
+        ever edited without the other, this test goes RED before any
+        document is silently mis-reassembled."""
+        legacy = _load_index_chromadb_module()
+        assert m.CHUNK_SIZE == legacy.CHUNK_SIZE, (
+            "routes/memory.py CHUNK_SIZE and scripts/index-chromadb.py "
+            "CHUNK_SIZE have drifted apart — whole-document reassembly of "
+            "a document chunked by one and read back assuming the other "
+            "silently corrupts the result"
+        )
+        assert m.CHUNK_OVERLAP == legacy.CHUNK_OVERLAP, (
+            "routes/memory.py CHUNK_OVERLAP and scripts/index-chromadb.py "
+            "CHUNK_OVERLAP have drifted apart — _reassemble_chunk_sequence "
+            "drops the wrong number of characters per chunk boundary, "
+            "producing silent duplication or silent data loss"
+        )
+
+    def test_overlap_drift_silently_corrupts_reassembly(self) -> None:
+        """Non-vacuity for the assert above: demonstrates WHY it matters,
+        not just that the constants match today. A document chunked with
+        ``overlap=300`` (simulating a stale/legacy indexer value that has
+        drifted from today's) and reassembled assuming today's
+        ``CHUNK_OVERLAP=200`` comes back a DIFFERENT length than the
+        original — silently duplicated text, no exception raised — the
+        exact failure mode F17 named. Measured on a 6750-char fixture:
+        reassembles to 7250 chars (500 extra = 5 chunk boundaries under-
+        dropping the 100-char difference each)."""
+        body = "".join(f"[{i:06d}]\n" for i in range(750))  # 6750 chars
+        chunks_drifted = _chunk_text(body, chunk_size=m.CHUNK_SIZE, overlap=300)
+        assert len(chunks_drifted) > 1
+
+        class _FakeDoc:
+            def __init__(self, page_content: str) -> None:
+                self.page_content = page_content
+
+        reassembled = m._reassemble_chunk_sequence(
+            [_FakeDoc(c) for c in chunks_drifted], overlap=m.CHUNK_OVERLAP
+        )
+        assert len(reassembled) == len(body) + 500
+        assert reassembled != body, (
+            "expected an overlap-parameter mismatch to silently duplicate "
+            "text in the reassembled output instead of failing loudly"
+        )
+
+
 class TestDocumentCountDedup:
     """WU-1 item 1 — ``limit`` counts documents, not chunks."""
 

@@ -2879,9 +2879,18 @@ def _reassemble_chunk_sequence(
       build records/specs). A skipped chunk would shift later chunks out
       of arithmetic lockstep with their id index in a way this function
       cannot detect from the fetched text alone.
+    Not defensive against an empty ``chunk_docs``: the sole caller
+    (``read_semantic``) only ever reaches this function after
+    :func:`_gather_whole_document` has run, which itself always returns
+    at least one doc (its own ``if not chunk_ids:`` fallback degrades to
+    ``[document_id], [doc]`` rather than an empty pair — see that
+    function's docstring) — an empty ``chunk_docs`` here would mean
+    :func:`_gather_whole_document`'s own invariant broke, which this
+    function is not positioned to guard against. (WU-1 fix-round-3, F16:
+    a prior ``if not chunk_docs: return ""`` here was unreachable — no
+    test could distinguish it from dead code — and has been removed
+    rather than kept as a guard that guards nothing.)
     """
-    if not chunk_docs:
-        return ""
     parts = [chunk_docs[0].page_content]
     parts.extend(doc.page_content[overlap:] for doc in chunk_docs[1:])
     return "".join(parts)

@@ -75,19 +75,33 @@ DEFAULT_TOKEN_FILE = Path.home() / ".config" / "audittrace" / "tokens.json"
 # The decisions collection is where deploy lessons are indexed (the ``collections``
 # default of :func:`log_deploy_record`), so recall reads it back.
 DECISIONS_COLLECTION = "decisions"
-# WU-1 fix-round-2 (2026-09-17, F9): this constant is UNCHANGED by the D15
-# fix — every caller that omits ``limit`` (i.e. the default fleet recall
-# path) still gets only 25 rows. Post-fix those 25 rows are DOCUMENTS
-# rather than chunks (a real improvement — no more single-record crowding),
-# but the corpus has hundreds of distinct decisions-layer documents, so 25
-# is still a small slice: recall@25 measured ~5.88% on a 34-pair labelled
-# set 2026-09-17 (see ``scripts/eval-recall-at-k.py``). The operator raises
-# this per-dispatch today (``limit=300`` pasted into every brief by hand,
-# per the governing spec's own framing) rather than this default being
-# raised — left that way deliberately, since a much larger default would
-# make EVERY recall (including throwaway ones) pull hundreds of manifest
-# rows. Not fixed by this WU — WU-2 (ranking) is the intended fix for "the
-# right 25", not a bigger 25.
+# WU-1 fix-round-3 (2026-09-17, F11 correction): this constant is
+# UNCHANGED by the D15 fix — every caller that omits ``limit`` (i.e. the
+# default fleet recall path) still gets only 25 rows. Post-fix those 25
+# rows are DOCUMENTS rather than chunks (a real improvement — no more
+# single-record crowding), but the corpus has hundreds of distinct
+# decisions-layer documents, so 25 is still a small slice.
+#
+# Deliberately NO recall@25 PERCENTAGE is pinned here (fix-round-2 stated
+# "~5.88%" and it was wrong by ~2x when a reviewer re-ran the same
+# committed harness the same day — the true number that run was 0.00%
+# excl-today / 0.00% incl-today; a THIRD run at fix-round-3, corpus grown
+# to 4348 rows/777 docs, also measured 0.00% at k=25 both ways). A
+# recency-ordered recall@k at a SMALL k is dominated by which handful of
+# documents happen to sit at the very front of the list at run time, so
+# it moves run-to-run as the corpus's most-recent few rows change — it
+# is reporting the corpus's momentary shape, not a stable property of
+# this fix. Re-run ``scripts/eval-recall-at-k.py`` for TODAY's number
+# (it prints a corpus pin so a re-run can tell whether the corpus it saw
+# matches); do not copy a percentage from this comment into a report.
+#
+# The operator raises the effective window per-dispatch today
+# (``limit=300`` pasted into every brief by hand, per the governing
+# spec's own framing) rather than this default being raised — left that
+# way deliberately, since a much larger default would make EVERY recall
+# (including throwaway ones) pull hundreds of manifest rows. Not fixed by
+# this WU — WU-2 (ranking) is the intended fix for "the right 25", not a
+# bigger 25.
 DEFAULT_RECALL_LIMIT = 25
 
 # ── build-outcome tagging (corpus-hygiene guard, 2026-08-21) ──────────────────

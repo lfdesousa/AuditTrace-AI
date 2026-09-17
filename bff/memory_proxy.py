@@ -15,6 +15,19 @@ exchanged token doesn't already carry: no shared key, no cross-user
 query, no ``$or`` / global escape added at this layer. Isolation (RLS,
 per-user manifest scoping, ADR-062) is entirely the memory API's job;
 this module only forwards bytes with a different bearer token.
+
+**Query-string transparency + WU-1 (2026-09-17, D15).** Because this proxy
+forwards ``query_string`` byte-for-byte, a caller that omits
+``granularity`` on ``GET /memory/semantic`` inherits WHATEVER the
+orchestrator's own default is — this module has no opinion and needs no
+change when that default moves (it moved to ``document`` under WU-1). Two
+real consumers ride this path with no explicit ``granularity``: the
+LibreChat fork's ``AuditTraceMemory`` service (``getAllUserMemories`` /
+``api/server/services/AuditTraceMemory/index.js``) and any other client of
+this proxy that doesn't set the param — both are DELIBERATELY out of this
+module's scope (see the WU-1/D15 fix-round-3 follow-up in the private
+backlog for the fork-side consequence, a non-security display-field
+inconsistency).
 """
 
 from __future__ import annotations
