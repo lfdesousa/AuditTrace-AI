@@ -63,15 +63,55 @@ from audittrace.services.console_store import (
     ConsoleDomain,
     ConsoleStoreForbiddenFieldError,
     ConsoleStoreSealedError,
+    DomainContract,
     PostgresConsoleStore,
 )
 from audittrace.services.console_store import _base as _base_module
+from audittrace.services.console_store._context import REQUIRED_MODEL_COLUMNS
 from tests.console_store.support import KEY_A, _raw
 from tests.console_store_fixture_domain import SqliteHarness, WidgetDomain
 
 
 def _span_trace_id(span: Any) -> str:
     return format(span.get_span_context().trace_id, "032x")
+
+
+def _contract_skipping_the_reserved_column_check(
+    domain: ConsoleDomain[Any],
+) -> DomainContract:
+    """SPEC ADDENDUM D, fix round 3: ``ConsoleStoreBase.__init__`` now
+    caches a :class:`DomainContract` (``validate_domain()``'s return
+    value) instead of trusting a live ``self._domain`` read — see
+    ``_domain.py``'s module docstring, "Fifth hop". The pre-ADDENDUM-D
+    simulation here (``monkeypatch.setattr(_base_module, "validate_domain",
+    lambda domain: None)``) no longer models the SAME future-construction-
+    path threat: with a cached contract, ``lambda domain: None`` makes
+    ``self._contract`` ``None`` and every helper crashes with
+    ``AttributeError`` before Guard C ever runs — a different failure than
+    the one this test is about. This builds a ``DomainContract`` the SAME
+    way ``validate_domain()`` does, EXCEPT it skips the reserved-column
+    check, so it reaches Guard C exactly as the pre-ADDENDUM-D no-op did —
+    same threat model (a future path that builds/caches a contract without
+    validating it), adapted to the new plumbing."""
+    keys = tuple(domain.key_columns)
+    values = tuple(domain.value_columns)
+    has_session_id = hasattr(domain.model, "session_id")
+    reserved_prefix = tuple(REQUIRED_MODEL_COLUMNS) + (
+        ("session_id",) if has_session_id else ()
+    )
+    return DomainContract(
+        name=domain.name,
+        model=domain.model,
+        key_columns=keys,
+        value_columns=values,
+        order_by=tuple(domain.order_by),
+        default_list_limit=domain.default_list_limit,
+        max_list_limit=domain.max_list_limit,
+        has_session_id=has_session_id,
+        snapshot_columns=reserved_prefix + keys + values,
+        order_columns=tuple(c for c, _ in domain.order_by),
+        order_directions=tuple(d for _, d in domain.order_by),
+    )
 
 
 # ── Guard A: the descriptor itself refuses every attribute set/delete ───────
@@ -387,9 +427,11 @@ class TestDomainClassLevelSealed:
 class _ReservedValueColumnDomain(WidgetDomain):
     """Declares ``trace_id`` (nullable, reserved) as a value column — the
     exact shape ``validate_domain()`` refuses at construction. Used ONLY
-    with ``validate_domain`` monkeypatched to a no-op, simulating a FUTURE
-    construction path that skips it (Guard A closes the only OTHER route
-    to this shape — runtime mutation — completely; see
+    with ``validate_domain`` monkeypatched (via
+    ``_contract_skipping_the_reserved_column_check`` above) to skip its
+    reserved-column check, simulating a FUTURE construction path that
+    builds/caches a :class:`DomainContract` without it (Guard A closes the
+    only OTHER route to this shape — runtime mutation — completely; see
     ``TestDomainDescriptorSealed`` above)."""
 
     name = "hostile_reserved_value_column"
@@ -412,7 +454,11 @@ class TestReservedColumnRefusedAtPointOfUse:
     async def test_refuses_a_domain_that_bypassed_construction_validation(
         self, harness: SqliteHarness, bob: UserContext, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(_base_module, "validate_domain", lambda domain: None)
+        monkeypatch.setattr(
+            _base_module,
+            "validate_domain",
+            _contract_skipping_the_reserved_column_check,
+        )
         store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
             _ReservedValueColumnDomain(), harness.factory
         )
@@ -438,7 +484,11 @@ class TestReservedColumnRefusedAtPointOfUse:
         at once, Addendum B Req 1) — it is the end-to-end reproduction of
         the ORIGINAL headline defect, kept alongside the per-guard proofs
         above rather than instead of them."""
-        monkeypatch.setattr(_base_module, "validate_domain", lambda domain: None)
+        monkeypatch.setattr(
+            _base_module,
+            "validate_domain",
+            _contract_skipping_the_reserved_column_check,
+        )
         # ``_refuse_reserved_value_columns`` is a SEALED_STORE_MEMBERS entry
         # — ``ConsoleStoreBase``'s own metaclass refuses an ordinary
         # ``setattr`` on it (proven in ``test_console_store_sealed_

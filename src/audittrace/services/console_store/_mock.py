@@ -68,7 +68,7 @@ class MockConsoleStore(ConsoleStoreBase[T]):
 
     @final
     def _snapshot(self, row: Mapping[str, Any]) -> dict[str, Any]:
-        return {column: row[column] for column in self._domain.snapshot_columns()}
+        return {column: row[column] for column in self._contract.snapshot_columns}
 
     @final
     def _assign(self, row: dict[str, Any], assignment: Mapping[str, Any]) -> None:
@@ -76,7 +76,7 @@ class MockConsoleStore(ConsoleStoreBase[T]):
 
     def _ordered(self, rows: Sequence[dict[str, Any]]) -> builtins.list[dict[str, Any]]:
         out = list(rows)
-        for column, direction in reversed(self._domain.order_by):
+        for column, direction in reversed(self._contract.order_by):
             out.sort(key=itemgetter(column), reverse=(direction == "desc"))
         return out
 
@@ -102,8 +102,8 @@ class MockConsoleStore(ConsoleStoreBase[T]):
         cursor_values = self._cursor_values(cursor)
         rows = self._ordered(self._scoped_rows(user_sub))
         if cursor_values is not None:
-            columns = self._domain.order_columns()
-            directions = self._domain.order_directions()
+            columns = self._contract.order_columns
+            directions = self._contract.order_directions
             rows = [
                 row
                 for row in rows
@@ -136,7 +136,7 @@ class MockConsoleStore(ConsoleStoreBase[T]):
             return self._to_item(self._snapshot(row))
         cap = self._cap()
         if cap is not None and len(self._scoped_rows(stamp.user_sub)) >= cap:
-            raise ConsoleStoreCapExceededError(self._domain.name, cap)
+            raise ConsoleStoreCapExceededError(self._contract.name, cap)
         tombstoned = self._scoped_rows(
             stamp.user_sub, key=validated_key, active_only=False
         )

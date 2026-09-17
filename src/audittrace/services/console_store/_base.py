@@ -11,8 +11,10 @@ makes those methods safe is CONCRETE here and sealed:
 * ``_validated_key`` / ``_validated_values`` / ``_validated_keys`` — refuse
   reserved (server-stamped) columns and unknown columns BEFORE any I/O.
 * ``_insert_values`` / ``_update_values`` / ``_delete_values`` — the only
-  builders of column assignments; they stamp the reserved columns
-  unconditionally (direct assignment, never ``setdefault``).
+  builders of column assignments; they stamp the reserved columns by
+  direct assignment (never ``setdefault``) and iterate the CACHED
+  ``self._contract.value_columns``, never a live re-read (F6, SPEC
+  ADDENDUM D — see ``_domain.py``'s "Fifth hop").
 * ``_page`` / ``_cursor_values`` — the shared keyset pagination.
 
 Sealing (``_sealing.seal_subclass``) refuses any subclass defined outside
@@ -35,12 +37,12 @@ not enough, because ``ConsoleStoreBase.domain`` hands out the descriptor
 BY REFERENCE and a read-only property protects only the binding, never the
 referent. See ``_domain.py`` for the defect and the fix.
 ``_refuse_reserved_value_columns`` (below) is a SECOND, LOAD-BEARING guard
-at the point every write path trusts ``self._domain.value_columns`` — see
-its own docstring for why it is not "defence in depth" (SPEC ADDENDUM C
-R5: a fix-round-1 reviewer reached its protected code with ZERO
-monkeypatch, via the "third hop" ``_domain.py`` documents, before that hop
-was closed; the label this module carried before this round mislabelled
-it, inviting its own deletion — THE INVERSE).
+at the point every write path trusts ``value_columns`` (now ``self.
+_contract.value_columns`` — SPEC ADDENDUM D) — see its own docstring for
+why it is not "defence in depth" (SPEC ADDENDUM C R5: a fix-round-1
+reviewer reached its protected code with ZERO monkeypatch, via the "third
+hop" ``_domain.py`` documents; the label this module carried before that
+round mislabelled it, inviting its own deletion — THE INVERSE).
 
 **SPEC ADDENDUM C (fix round 2, 2026-09-17), R2: this metaclass's own
 hooks are now sealed too.** ``_SealedMeta`` guarded ``SEALED_STORE_MEMBERS``
@@ -53,6 +55,22 @@ ABCMeta``, which removes ``_SealedMeta`` from dispatch entirely. Both
 routes are now refused by adding those three names to
 ``SEALED_STORE_MEMBERS`` itself, so the same check that guards every other
 sealed member guards the guard.
+
+**SPEC ADDENDUM D (fix round 3, 2026-09-17), R1/R3: MUTATION vs VALUE, a
+second axis.** Every guard above answers "can this be MUTATED?" (axis 1).
+F6 (``_domain.py``, "Fifth hop") showed that is half the question for a
+domain's declarative surfaces: axis 2 is "does a read always return the
+SAME value, and what PINS that?" :func:`~audittrace.services.console_store.
+_domain_validate.validate_domain` reads each one EXACTLY ONCE into a
+:class:`~audittrace.services.console_store._domain_validate.
+DomainContract`; ``__init__`` caches it as ``self._contract`` (write-once,
+same guard as ``self._domain``/``self._sessions``), and every sealed
+helper below reads ``self._contract.X``, never ``self._domain.X`` again.
+Axis 1's guards stay independently load-bearing for OTHER consumers of
+``store.domain`` (introspection, a future caller). Full per-surface table
+(all seven fields, both axes): the fix-round-3 evidence file — not
+duplicated here to keep this module under the PYTHON-ENGINEERING §11
+500-LOC trigger.
 """
 
 from __future__ import annotations
@@ -76,8 +94,8 @@ from audittrace.services.console_store._cursor import (
     decode_cursor,
     encode_cursor,
 )
-from audittrace.services.console_store._domain import (
-    ConsoleDomain,
+from audittrace.services.console_store._domain import ConsoleDomain
+from audittrace.services.console_store._domain_validate import (
     validate_cap,
     validate_domain,
     validate_equality_filters,
@@ -204,7 +222,9 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         super().__setattr__(name, value)
 
     def __init__(self, domain: ConsoleDomain[T]) -> None:
-        validate_domain(domain)
+        # SPEC ADDENDUM D R1: self._contract caches the one-time read;
+        # self._domain stays only for the DYNAMIC hooks (module docstring).
+        self._contract = validate_domain(domain)
         self._domain = domain
 
     @property
@@ -268,11 +288,18 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
 
     @final
     def _cap(self) -> int | None:
-        return validate_cap(self._domain)
+        return validate_cap(self._domain, name=self._contract.name)
 
     @final
     def _filters(self) -> dict[str, Any]:
-        return validate_equality_filters(self._domain)
+        # SPEC ADDENDUM D R1: allow-list is the CACHED contract, not a
+        # fresh self._domain.key_columns/value_columns read.
+        return validate_equality_filters(
+            self._domain,
+            name=self._contract.name,
+            key_columns=self._contract.key_columns,
+            value_columns=self._contract.value_columns,
+        )
 
     @final
     def _validated_key(self, key: Mapping[str, Any]) -> dict[str, Any]:
@@ -283,27 +310,27 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         reserved = sorted(set(key) & RESERVED_COLUMNS)
         if reserved:
             raise ConsoleStoreForbiddenFieldError(
-                f"{self._domain.name}: key may not carry server-stamped "
+                f"{self._contract.name}: key may not carry server-stamped "
                 f"column(s): {reserved}"
             )
-        expected = set(self._domain.key_columns)
+        expected = set(self._contract.key_columns)
         if set(key) != expected:
             raise ValueError(
-                f"{self._domain.name}: key must name exactly "
+                f"{self._contract.name}: key must name exactly "
                 f"{sorted(expected)}, got {sorted(key)}"
             )
         if any(value is None for value in key.values()):
-            raise ValueError(f"{self._domain.name}: key columns may not be None")
-        return {column: key[column] for column in self._domain.key_columns}
+            raise ValueError(f"{self._contract.name}: key columns may not be None")
+        return {column: key[column] for column in self._contract.key_columns}
 
     @final
     def _validated_keys(
         self, keys: Sequence[Mapping[str, Any]]
     ) -> builtins.list[dict[str, Any]]:
-        if len(keys) > self._domain.max_list_limit:
+        if len(keys) > self._contract.max_list_limit:
             raise ValueError(
-                f"{self._domain.name}: batch_get accepts at most "
-                f"{self._domain.max_list_limit} keys"
+                f"{self._contract.name}: batch_get accepts at most "
+                f"{self._contract.max_list_limit} keys"
             )
         return [self._validated_key(key) for key in keys]
 
@@ -316,12 +343,14 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         reserved = sorted(set(values) & RESERVED_COLUMNS)
         if reserved:
             raise ConsoleStoreForbiddenFieldError(
-                f"{self._domain.name}: values may not carry server-stamped "
+                f"{self._contract.name}: values may not carry server-stamped "
                 f"column(s): {reserved}"
             )
-        unknown = sorted(set(values) - set(self._domain.value_columns))
+        unknown = sorted(set(values) - set(self._contract.value_columns))
         if unknown:
-            raise ValueError(f"{self._domain.name}: unknown value column(s): {unknown}")
+            raise ValueError(
+                f"{self._contract.name}: unknown value column(s): {unknown}"
+            )
         return dict(values)
 
     @final
@@ -331,45 +360,39 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         security/traceability fields — refused."""
         if not isinstance(produced, Mapping):
             raise ConsoleStoreDomainError(
-                f"{self._domain.name}: hook {hook}() must return a mapping"
+                f"{self._contract.name}: hook {hook}() must return a mapping"
             )
         reserved = sorted(set(produced) & RESERVED_COLUMNS)
         if reserved:
             raise ConsoleStoreForbiddenFieldError(
-                f"{self._domain.name}: hook {hook}() may not set server-stamped "
+                f"{self._contract.name}: hook {hook}() may not set server-stamped "
                 f"column(s): {reserved}"
             )
-        unknown = sorted(set(produced) - set(self._domain.value_columns))
+        unknown = sorted(set(produced) - set(self._contract.value_columns))
         if unknown:
             raise ConsoleStoreDomainError(
-                f"{self._domain.name}: hook {hook}() named unknown column(s): {unknown}"
+                f"{self._contract.name}: hook {hook}() named unknown column(s): {unknown}"
             )
         return dict(produced)
 
     @final
     def _refuse_reserved_value_columns(self) -> None:
         """F1 item 2 — LOAD-BEARING, not defence in depth (SPEC ADDENDUM C
-        R5, relabelled fix round 2, per THE INVERSE: a guard is redundant
-        only when NEUTERING IT ALONE is shown harmless, and neutering this
-        one alone, before the "third hop" in ``_domain.py`` was closed,
-        reached the FULL original F1 harm with ZERO monkeypatch — an
-        ordinary domain subclass overriding ``ConsoleDomain.__setattr__``
-        defeated Guard A entirely, and this was the SOLE remaining barrier).
-        Refuses, LOUDLY, at the point every write path TRUSTS
-        ``self._domain.value_columns``, if it collides with a base-owned
-        reserved column — whatever route got a bad descriptor there:
-        ``validate_domain()`` refuses this at ordinary construction, and the
-        domain/metaclass seals in ``_domain.py`` close the mutation routes
-        known today, but a FUTURE construction path that skips
-        ``validate_domain()``, or a future accessor that leaks a mutable
-        descriptor, would reach this with nothing else standing in front of
-        it. Silent last-write-wins over a base-stamped column is forbidden
-        — this is what F1 exploited (``_base.py``'s insert loop nulled
-        ``trace_id`` with no error, no log)."""
-        collision = sorted(set(self._domain.value_columns) & RESERVED_COLUMNS)
+        R5, per THE INVERSE: neutering this one alone, before the "third
+        hop" in ``_domain.py`` was closed, reached the FULL F1 harm with
+        ZERO monkeypatch). Refuses, LOUDLY, if ``value_columns`` collides
+        with a base-owned reserved column — whatever route got a bad
+        descriptor there: a FUTURE construction path that skips
+        ``validate_domain()`` (SPEC ADDENDUM D's disclosed residual) would
+        reach this with nothing else in front of it. Checks the CACHED
+        ``self._contract.value_columns`` — the SAME tuple ``_insert_
+        values``'s row loop below actually uses, never a live
+        ``self._domain.value_columns`` that could answer differently
+        (F6, ``_domain.py``'s "Fifth hop")."""
+        collision = sorted(set(self._contract.value_columns) & RESERVED_COLUMNS)
         if collision:
             raise ConsoleStoreForbiddenFieldError(
-                f"{self._domain.name}: value_columns declares reserved "
+                f"{self._contract.name}: value_columns declares reserved "
                 f"column(s) {collision} — refusing to let a domain silently "
                 "overwrite a base-stamped column"
             )
@@ -391,10 +414,12 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
             "deleted_at_ms": None,
             "trace_id": stamp.trace_id,
         }
-        if self._domain.has_session_id():
+        if self._contract.has_session_id:
             row["session_id"] = stamp.session_id
         row.update(key)
-        for column in self._domain.value_columns:
+        # F6: the CACHED tuple, not self._domain.value_columns (a hostile
+        # property could answer differently here than at Guard C above).
+        for column in self._contract.value_columns:
             row[column] = values[column] if column in values else defaults.get(column)
         return row
 
@@ -411,14 +436,14 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         ``resurrect``). The domain's ``merge`` hook sees ONLY the value
         columns of the current row."""
         self._refuse_reserved_value_columns()
-        current_values = {c: current[c] for c in self._domain.value_columns}
+        current_values = {c: current[c] for c in self._contract.value_columns}
         merged = self._hook_output(
             self._domain.merge(current_values, dict(values)), hook="merge"
         )
         out: dict[str, Any] = dict(merged)
         out["updated_at_ms"] = stamp.now_ms
         out["trace_id"] = stamp.trace_id
-        if self._domain.has_session_id():
+        if self._contract.has_session_id:
             out["session_id"] = stamp.session_id
         if resurrect:
             out["deleted_at_ms"] = None
@@ -431,23 +456,23 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
             "updated_at_ms": stamp.now_ms,
             "trace_id": stamp.trace_id,
         }
-        if self._domain.has_session_id():
+        if self._contract.has_session_id:
             out["session_id"] = stamp.session_id
         return out
 
     @final
     def _clamp_limit(self, limit: int | None) -> int:
         if limit is None:
-            return self._domain.default_list_limit
-        return max(1, min(int(limit), self._domain.max_list_limit))
+            return self._contract.default_list_limit
+        return max(1, min(int(limit), self._contract.max_list_limit))
 
     @final
     def _cursor_values(self, cursor: str | None) -> builtins.list[Any] | None:
         if cursor is None:
             return None
         coercers = [
-            coercer_for(getattr(self._domain.model, column).type.python_type)
-            for column in self._domain.order_columns()
+            coercer_for(getattr(self._contract.model, column).type.python_type)
+            for column in self._contract.order_columns
         ]
         return decode_cursor(cursor, coercers)
 
@@ -466,7 +491,7 @@ class ConsoleStoreBase(Generic[T], ABC, metaclass=_SealedMeta):  # noqa: UP046
         page = list(snapshots[:effective_limit])
         items = [self._to_item(snapshot) for snapshot in page]
         next_cursor = (
-            encode_cursor([page[-1][c] for c in self._domain.order_columns()])
+            encode_cursor([page[-1][c] for c in self._contract.order_columns])
             if has_more and page
             else None
         )

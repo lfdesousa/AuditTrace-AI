@@ -39,7 +39,11 @@ from audittrace.services.console_store._cursor import (
     decode_cursor,
     encode_cursor,
 )
-from audittrace.services.console_store._domain import ConsoleDomain, validate_domain
+from audittrace.services.console_store._domain import ConsoleDomain
+from audittrace.services.console_store._domain_validate import (
+    DomainContract,
+    validate_domain,
+)
 from audittrace.services.console_store._errors import (
     ConsoleStoreCapExceededError,
     ConsoleStoreDomainError,
@@ -62,6 +66,7 @@ __all__ = [
     "ConsoleStoreScopeError",
     "ConsoleStoreSealedError",
     "Direction",
+    "DomainContract",
     "MockConsoleStore",
     "PostgresConsoleStore",
     "WriteStamp",

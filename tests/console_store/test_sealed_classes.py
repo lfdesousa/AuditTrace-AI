@@ -100,10 +100,11 @@ class TestSealedStoreClasses:
     def test_shadowing_the_new_reserved_column_guard_on_an_instance_is_refused(
         self, harness: SqliteHarness
     ) -> None:
-        """``_refuse_reserved_value_columns`` (F1 item 2, defence in depth)
-        joined ``SEALED_STORE_MEMBERS`` in this round — proves it got the
-        SAME instance-shadow protection as every other sealed template
-        helper, not a bespoke, weaker one."""
+        """``_refuse_reserved_value_columns`` (F1 item 2 — LOAD-BEARING,
+        not defence in depth; SPEC ADDENDUM C R5 relabelled it) joined
+        ``SEALED_STORE_MEMBERS`` in this round — proves it got the SAME
+        instance-shadow protection as every other sealed template helper,
+        not a bespoke, weaker one."""
         store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
             WidgetDomain(), harness.factory
         )

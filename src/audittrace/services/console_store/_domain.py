@@ -87,10 +87,17 @@ object is dispatched to the *metaclass's* ``__setattr__``, and
 as "ordinary Python" as the original F1 exploit line, and its blast
 radius is WORSE: it mutates the column tuple for every store built with
 that domain CLASS, present and future, not just the one instance a caller
-holds a reference to — and because ``self._domain.value_columns`` always
-resolves to the class attribute (a domain instance never legitimately
-carries its own instance override — the constructor never sets one), the
-mutation is invisible to any check that only inspects instances.
+holds a reference to — and, FOR AN ORDINARY ``ClassVar``, ``self._domain.
+value_columns`` always resolves to the class attribute this hop mutates (a
+domain instance never legitimately carries its own instance override — the
+constructor never sets one), so the mutation is invisible to any check
+that only inspects instances. **Corrected (SPEC ADDENDUM D, fix round 3):
+"always resolves to the class attribute" is a claim about an ORDINARY
+ClassVar, not about the READ itself** — a ``property``/``__getattribute__``
+override (the fifth hop below) makes ``self._domain.value_columns``
+resolve to a COMPUTATION every time, not a class-dict lookup, and this
+hop's fix (read once, cache on the STORE, never re-read) does not depend
+on the corrected claim being true either way.
 :class:`_DomainMeta` closes this the same way :class:`~audittrace.
 services.console_store._base._SealedMeta` closes the equivalent class-
 level monkeypatch for stores: refuse a class-level ``setattr``/
@@ -144,6 +151,110 @@ Residual, disclosed (same family as every seal in this module):
 ``__dict__``/class-``__dict__`` write, still work — deliberate
 circumvention, not the ordinary-Python hurry-mode path these seals exist
 for.
+
+**Fifth hop (SPEC ADDENDUM D, fix round 3, 2026-09-17): sealing MUTATION
+is not sealing VALUE — a stateful ``property``/``__getattribute__`` needs
+no mutation at all.** Every guard above (A/B/D + Guard C in ``_base.py``)
+answers "can ``value_columns`` be REASSIGNED after ``validate_domain()``
+ran?" None of them answers "does ``value_columns`` return the SAME value
+on every read?" ``property``/``__getattribute__``/``__get__`` were never
+in ``_SEALED_DOMAIN_MEMBERS`` (they are not attribute NAMES to refuse
+redefining — a domain legitimately may not define them anyway, since
+``ConsoleDomain`` declares ``value_columns`` etc. as plain ``ClassVar``
+annotations, not descriptors), so an ordinary subclass — the sanctioned
+extension point, same lesson as the third hop — can shape ``value_columns``
+as a property with internal counter state::
+
+    class TocTouDomain(WidgetDomain):
+        _n = 0
+        @property
+        def value_columns(self) -> tuple[str, ...]:
+            cls = type(self); n = cls.__dict__["_n"]
+            type.__setattr__(cls, "_n", n + 1)
+            return ("payload", "priority", "trace_id") if n >= 7 else ("payload", "priority")
+
+``value_columns`` was read 9 times across one construction + upsert
+before this fix: ``validate_domain()``'s reserved-column check saw the
+SAFE 2-tuple; ``_insert_values``'s row-assignment loop, several reads
+later, saw the HOSTILE 3-tuple, and silently overwrote the base's own
+``trace_id`` stamp with ``None`` — the verbatim F1 harm, with no
+monkeypatch, no ``object.__setattr__``, no metaclass swap, reproduced via
+both a ``property`` and a ``__getattribute__`` override (the defect is
+read-NONATOMICITY, not one descriptor trick). An attempt to escalate this
+to a cross-user READ (a time-varying ``model`` property remapping
+``user_sub``) FAILED — ``_scoped_select`` binds the compared value from
+``_read_sub()`` (token-derived), so the predicate cannot be steered; F6's
+harm is traceability (M5 / EU AI Act Art 12), not isolation.
+
+**The fix: read once, cache on the STORE, never re-read.** Mirroring the
+pattern ``_filters()``/``_cap()`` already use for the domain's DYNAMIC
+hooks (invoke once per call, carry the result) — generalised here to the
+five STATIC declarative surfaces (``name``, ``model``, ``key_columns``,
+``value_columns``, ``order_by``, plus the derived ``has_session_id``/
+``snapshot_columns``/``order_columns``/``order_directions``/
+``default_list_limit``/``max_list_limit``): :func:`validate_domain` now
+reads each of these EXACTLY ONCE (into a local, never re-fetched even
+within its own body), validates the captured values, and returns them as
+a :class:`DomainContract` — an immutable, plain-data snapshot.
+``ConsoleStoreBase.__init__`` stores it as ``self._contract`` (write-once,
+same generalised instance-attribute guard as ``self._domain``/
+``self._sessions``). Every sealed template helper in ``_base.py`` and
+every implementation (``_postgres.py``, ``_mock.py``) reads
+``self._contract.X`` for these five/eleven fields — NEVER
+``self._domain.X`` again. This is R1's "read it once ... and pass that
+value forward to every consumer" branch, chosen over "re-validate
+atomically at use" because these surfaces are genuinely CONSTANT for a
+store's lifetime (unlike ``cap()``/``defaults()``/``merge()``/
+``equality_filters()``/``to_item()``, which stay live-invoked via
+``self._domain.<hook>()`` on every call, exactly as before — those ARE
+meant to vary per call, and their OUTPUT is validated against the
+CACHED ``self._contract.key_columns``/``value_columns``, never against a
+fresh ``self._domain.key_columns``/``value_columns`` read).
+
+**Why this also answers R2 (constancy) without a new guard.** A
+``property``/``__getattribute__`` override can still make
+``self._domain.value_columns`` non-constant — nothing added here refuses
+that shape at class-creation time (deliberately: see "check the siblings"
+below for why a structural refusal was rejected). What closes the harm is
+that NOTHING downstream of ``validate_domain()`` ever performs that read
+again: the property's return value at the single moment
+``validate_domain()`` calls it is the value CAPTURED and PINNED in
+``self._contract``, forever, for that store instance. There is no "compare
+on use, refuse on drift" step because there is no later USE of the live
+descriptor to compare against — pinning by value and never re-reading is
+the strongest instance of R2's "pin it by value" option, not a weaker one.
+A structural refusal (reject a domain whose ``value_columns`` is a
+descriptor) was considered and rejected: it would forbid a LEGITIMATE
+future domain that computes a value column list from, e.g., a frozen
+class-level registry via a ``classmethod``-backed ``property`` — the
+read-once-and-carry fix protects the base regardless of whether the
+domain author's descriptor is honest or hostile, so the extra restriction
+would cost real flexibility for zero additional safety.
+
+**The four siblings, audited on the SAME axis (R1's own instruction —
+"the reviewer found no cross-user read through them; that is not the same
+as proving them safe"):** ``key_columns``, ``model``, ``order_by`` and
+``has_session_id`` are read off ``self._domain`` in exactly the same
+"live attribute access, no caching" shape ``value_columns`` was — grep
+confirms ``key_columns`` alone is read from four separate call sites
+across ``_base.py``/``_postgres.py`` for a single ``batch_get``. **DONE,
+not merely disclosed:** all four are pulled into the SAME
+:class:`DomainContract` capture, by the SAME single-read mechanism, for
+the SAME reason (R1 does not scope its "read once and carry" instruction
+to ``value_columns`` alone) — see ``_base.py``'s module docstring for the
+full per-surface table (both axes: what can be MUTATED and what pins the
+CONSTANT read) and the fix-round-3 evidence file for the reachability
+count each surface had before this fix.
+
+Residual, disclosed (unchanged in kind from every seal above): a future
+accessor that builds a :class:`DomainContract` BY HAND (bypassing
+:func:`validate_domain` entirely) and hands it to
+``ConsoleStoreBase.__init__`` would recreate this exact class of gap for
+whatever it captures wrong — no code can protect against a future
+caller who chooses not to call the validator. ``_refuse_reserved_value_
+columns`` (``_base.py``) stays LOAD-BEARING for exactly that future path,
+now checking the CACHED ``self._contract.value_columns`` (the same value
+every other consumer in this call actually uses), not the live domain.
 """
 
 from __future__ import annotations
@@ -152,15 +263,9 @@ from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Mapping
 from typing import Any, ClassVar, Generic, TypeVar, final
 
-from audittrace.services.console_store._context import (
-    REQUIRED_MODEL_COLUMNS,
-    RESERVED_COLUMNS,
-)
-from audittrace.services.console_store._cursor import Direction, coercer_for
-from audittrace.services.console_store._errors import (
-    ConsoleStoreDomainError,
-    ConsoleStoreSealedError,
-)
+from audittrace.services.console_store._context import REQUIRED_MODEL_COLUMNS
+from audittrace.services.console_store._cursor import Direction
+from audittrace.services.console_store._errors import ConsoleStoreSealedError
 from audittrace.services.console_store._sealing import seal_members
 
 # Reserved columns a domain MAY order by (always non-null, so paging is
@@ -354,104 +459,3 @@ class ConsoleDomain(Generic[T], ABC, metaclass=_DomainMeta):  # noqa: UP046 - se
     @final
     def order_directions(self) -> tuple[Direction, ...]:
         return tuple(direction for _, direction in self.order_by)
-
-
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ConsoleStoreDomainError(message)
-
-
-def validate_domain(domain: ConsoleDomain[Any]) -> None:
-    """Refuse an invalid descriptor BEFORE the store does any I/O.
-
-    Falsifiable: neuter the reserved-column check and a hostile domain that
-    declares ``value_columns=("user_sub",)`` gets to write another user's
-    ``user_sub`` (``tests/console_store/test_hostile_domain_hooks.py``).
-    """
-    _require(isinstance(domain, ConsoleDomain), "domain must be a ConsoleDomain")
-    name = getattr(domain, "name", None)
-    _require(isinstance(name, str) and bool(name.strip()), "domain.name must be set")
-    model = getattr(domain, "model", None)
-    _require(isinstance(model, type), f"{name}: domain.model must be an ORM class")
-
-    keys = tuple(getattr(domain, "key_columns", ()))
-    values = tuple(getattr(domain, "value_columns", ()))
-    _require(bool(keys), f"{name}: key_columns must name at least one column")
-    _require(
-        all(isinstance(c, str) and c for c in keys + values),
-        f"{name}: column names must be non-empty strings",
-    )
-    reserved_hit = sorted((set(keys) | set(values)) & RESERVED_COLUMNS)
-    _require(
-        not reserved_hit,
-        f"{name}: reserved column(s) may not be key/value columns: {reserved_hit}",
-    )
-    _require(
-        not (set(keys) & set(values)),
-        f"{name}: key_columns and value_columns must be disjoint",
-    )
-    _require(len(set(keys)) == len(keys), f"{name}: duplicate key column")
-    _require(len(set(values)) == len(values), f"{name}: duplicate value column")
-
-    missing = [
-        c for c in REQUIRED_MODEL_COLUMNS + keys + values if not hasattr(model, c)
-    ]
-    _require(not missing, f"{name}: ORM model lacks column(s): {missing}")
-
-    order_by = tuple(getattr(domain, "order_by", ()))
-    _require(bool(order_by), f"{name}: order_by must name at least one column")
-    orderable = ORDERABLE_RESERVED | set(keys)
-    for entry in order_by:
-        _require(
-            isinstance(entry, tuple) and len(entry) == 2,
-            f"{name}: order_by entries must be (column, direction)",
-        )
-        column, direction = entry
-        _require(column in orderable, f"{name}: cannot order by {column!r}")
-        _require(direction in ("asc", "desc"), f"{name}: bad direction {direction!r}")
-        try:
-            coercer_for(getattr(model, column).type.python_type)
-        except (AttributeError, NotImplementedError, TypeError) as exc:
-            raise ConsoleStoreDomainError(
-                f"{name}: ordering column {column!r} has an unsupported type"
-            ) from exc
-    ordered = {column for column, _ in order_by}
-    _require(
-        "id" in ordered or set(keys) <= ordered,
-        f"{name}: order_by must include 'id' or every key column (total order)",
-    )
-
-    default_limit = getattr(domain, "default_list_limit", 0)
-    max_limit = getattr(domain, "max_list_limit", 0)
-    _require(
-        isinstance(default_limit, int) and isinstance(max_limit, int),
-        f"{name}: list limits must be ints",
-    )
-    _require(1 <= default_limit <= max_limit, f"{name}: 1 <= default <= max limit")
-
-    validate_cap(domain)
-    validate_equality_filters(domain)
-
-
-def validate_cap(domain: ConsoleDomain[Any]) -> int | None:
-    """``cap()`` must return ``None`` or a positive int — checked on EVERY
-    call, not only at construction, since a hook is a live method."""
-    cap = domain.cap()
-    _require(
-        cap is None
-        or (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1),
-        f"{domain.name}: cap() must return None or a positive int",
-    )
-    return cap
-
-
-def validate_equality_filters(domain: ConsoleDomain[Any]) -> dict[str, Any]:
-    """``equality_filters()`` may only name key/value columns — checked on
-    EVERY call. A reserved column here would be an attempt to touch the
-    ``user_sub`` predicate; refused."""
-    filters = domain.equality_filters()
-    _require(isinstance(filters, Mapping), f"{domain.name}: equality_filters must map")
-    allowed = set(domain.key_columns) | set(domain.value_columns)
-    bad = sorted(set(filters) - allowed)
-    _require(not bad, f"{domain.name}: equality_filters may not name {bad}")
-    return dict(filters)
