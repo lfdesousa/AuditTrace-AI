@@ -74,10 +74,10 @@ def seal_subclass(cls: type, *, sealed_members: Iterable[str]) -> None:
     """Refuse ``cls`` unless its class body executes inside the package and
     redefines none of ``sealed_members``.
 
-    Falsifiable: ``tests/test_console_store_sealed_classes.py`` defines subclasses
-    outside the package and asserts the class statement itself raises;
-    neuter this function into a no-op and those hostile subclasses come to
-    life and read another user's row.
+    Falsifiable: ``tests/console_store/test_sealed_classes.py`` defines
+    subclasses outside the package and asserts the class statement itself
+    raises; neuter this function into a no-op and those hostile subclasses
+    come to life and read another user's row.
     """
     body_file = _class_statement_file()
     if body_file is None or body_file.parent != PACKAGE_DIR:

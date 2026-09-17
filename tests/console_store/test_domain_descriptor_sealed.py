@@ -35,12 +35,14 @@ least one* guard is load-bearing, F-C1's mistake):
   the fix-round-1 evidence file ("NO dedicated regression test this
   session").
 * **Guard C** — ``ConsoleStoreBase._refuse_reserved_value_columns`` (F1
-  item 2, defence in depth): refuses, LOUDLY, at the point every write path
-  TRUSTS ``value_columns``, whatever route got a bad descriptor there. With
-  Guard A closing the runtime-mutation path entirely, the only way to reach
-  Guard C's protected code in THIS codebase is a construction path that
-  skips ``validate_domain()`` — simulated below via monkeypatch, since no
-  such path exists today (proven below, ``TestReservedColumnRefusedAtPointOfUse``).
+  item 2): LOAD-BEARING, not defence in depth (SPEC ADDENDUM C R5) —
+  refuses, LOUDLY, at the point every write path TRUSTS ``value_columns``,
+  whatever route got a bad descriptor there. Before ``tests/console_store/
+  test_extension_point_sealed.py`` closed the "third hop" (an ordinary
+  domain subclass overriding ``__setattr__``), THIS guard was the SOLE
+  barrier reachable with zero monkeypatch. Even now, a construction path
+  that skips ``validate_domain()`` reaches it too — simulated below via
+  monkeypatch (proven below, ``TestReservedColumnRefusedAtPointOfUse``).
 * **Guard D** — ``_DomainMeta.__setattr__``/``__delattr__`` (the SECOND
   HOP, found this round: Guard A is an INSTANCE method and does not fire
   for ``WidgetDomain.value_columns = (...)``, a CLASS-level ClassVar
@@ -111,22 +113,34 @@ class TestDomainDescriptorSealed:
             del store.domain.value_columns
         assert store.domain.value_columns == ("payload", "priority")
 
-    def test_neutering_the_seal_lets_the_mutation_through(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_neutering_the_seal_lets_the_mutation_through(self) -> None:
         """Non-vacuity for Guard A: with ``ConsoleDomain.__setattr__``
         neutered (mirroring exactly how F1 was originally found — no other
         guard stands in front of a bare descriptor that was never wired
         into a store), the SAME mutation the test above refuses instead
         succeeds and changes LIVE state — a concrete, checkable side
         effect (the tuple itself changes), not merely "no exception was
-        raised" (A1's own complaint about a weaker proof shape)."""
-        monkeypatch.setattr(ConsoleDomain, "__setattr__", object.__setattr__)
-        domain = WidgetDomain()
-        domain.value_columns = (*domain.value_columns, "trace_id")
-        assert domain.value_columns == ("payload", "priority", "trace_id"), (
-            "neutering the seal should have let the mutation through"
-        )
+        raised" (A1's own complaint about a weaker proof shape).
+
+        SPEC ADDENDUM C R2 (fix round 2) sealed ``__setattr__`` itself as a
+        ``_SEALED_DOMAIN_CLASS_ATTRS`` member, so an ordinary
+        ``monkeypatch.setattr(ConsoleDomain, "__setattr__", ...)`` (which
+        dispatches through ``_DomainMeta.__setattr__``) is now ITSELF
+        refused — proof the class-level seal covers its own hook. Reaching
+        the neuter this test needs therefore requires the same disclosed
+        ``type.__setattr__`` bypass every other SEALED_STORE_MEMBERS-style
+        neuter in this suite uses, restored in ``finally`` regardless of
+        outcome so this test cannot leak state into any other."""
+        original = ConsoleDomain.__dict__["__setattr__"]
+        type.__setattr__(ConsoleDomain, "__setattr__", object.__setattr__)
+        try:
+            domain = WidgetDomain()
+            domain.value_columns = (*domain.value_columns, "trace_id")
+            assert domain.value_columns == ("payload", "priority", "trace_id"), (
+                "neutering the seal should have let the mutation through"
+            )
+        finally:
+            type.__setattr__(ConsoleDomain, "__setattr__", original)
 
 
 # ── Guard B: the ``_domain`` POINTER cannot be swapped post-construction ───
@@ -222,7 +236,7 @@ class TestSessionsWriteOnceSealed:
         assert store._sessions is original, "the blocked swap still took effect"
 
     def test_neutering_the_generalised_check_lets_sessions_be_swapped(
-        self, harness: SqliteHarness, monkeypatch: pytest.MonkeyPatch
+        self, harness: SqliteHarness
     ) -> None:
         """Non-vacuity: reproduces the ORIGINAL (pre-fix-round-1) shape of
         ``ConsoleStoreBase.__setattr__`` — ONLY ``_domain`` was
@@ -230,7 +244,16 @@ class TestSessionsWriteOnceSealed:
         SAME class of mutation the test above now refuses
         (``store._sessions = evil``) instead succeeding under that
         narrower, pre-fix check. A concrete side effect (``is evil``), not
-        merely "no exception was raised"."""
+        merely "no exception was raised".
+
+        SPEC ADDENDUM C R2 (fix round 2) sealed ``__setattr__`` itself as a
+        ``SEALED_STORE_MEMBERS`` member, so an ordinary
+        ``monkeypatch.setattr(ConsoleStoreBase, "__setattr__", ...)`` (which
+        dispatches through ``_SealedMeta.__setattr__``) is now ITSELF
+        refused — proof the class-level seal covers its own hook. Reaching
+        the neuter this test needs therefore requires the same disclosed
+        ``type.__setattr__`` bypass every other class-level neuter in this
+        suite uses, restored in ``finally`` regardless of outcome."""
 
         def _pre_fix_setattr(self: Any, name: str, value: Any) -> None:
             if name in _base_module.SEALED_STORE_MEMBERS:
@@ -244,18 +267,20 @@ class TestSessionsWriteOnceSealed:
                 )
             object.__setattr__(self, name, value)
 
-        monkeypatch.setattr(
-            _base_module.ConsoleStoreBase, "__setattr__", _pre_fix_setattr
-        )
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            WidgetDomain(), harness.factory
-        )
-        evil = object()
-        store._sessions = evil  # type: ignore[assignment]
-        assert store._sessions is evil, (
-            "the pre-fix (domain-only) write-once check should have let "
-            "the _sessions swap through"
-        )
+        original = _base_module.ConsoleStoreBase.__dict__["__setattr__"]
+        type.__setattr__(_base_module.ConsoleStoreBase, "__setattr__", _pre_fix_setattr)
+        try:
+            store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+                WidgetDomain(), harness.factory
+            )
+            evil = object()
+            store._sessions = evil  # type: ignore[assignment]
+            assert store._sessions is evil, (
+                "the pre-fix (domain-only) write-once check should have let "
+                "the _sessions swap through"
+            )
+        finally:
+            type.__setattr__(_base_module.ConsoleStoreBase, "__setattr__", original)
 
 
 # ── Guard D: the domain CLASS itself cannot have a descriptor attribute ────
@@ -372,11 +397,17 @@ class _ReservedValueColumnDomain(WidgetDomain):
 
 
 class TestReservedColumnRefusedAtPointOfUse:
-    """Guard C — defence in depth. Not reachable today through any real
-    code path (Guard A + ``validate_domain()`` between them close every
-    known route), so both tests simulate the one FUTURE path the spec
-    calls out: "a domain that declares the collision from the start ...
-    via a future construction path that skips ``validate_domain()``"."""
+    """Guard C — LOAD-BEARING (SPEC ADDENDUM C R5), not defence in depth.
+    Both tests below simulate ONE route to its protected code: a
+    construction path that skips ``validate_domain()`` — the FUTURE path
+    the spec calls out ("a domain that declares the collision from the
+    start ... via a future construction path that skips
+    ``validate_domain()``"), via monkeypatch, since no such construction
+    path exists today. A SEPARATE route needs no monkeypatch at all: an
+    ordinary domain subclass overriding ``__setattr__``/``__delattr__``
+    (the "third hop" — see ``test_extension_point_sealed.py``, which also
+    closes it); before that fix, this guard was the SOLE barrier reachable
+    that way with zero monkeypatch."""
 
     async def test_refuses_a_domain_that_bypassed_construction_validation(
         self, harness: SqliteHarness, bob: UserContext, monkeypatch: pytest.MonkeyPatch

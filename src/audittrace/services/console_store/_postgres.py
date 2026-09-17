@@ -25,8 +25,9 @@ network-I/O bound (PYTHON-ENGINEERING §3). The factory is process-resident
 and injected, never built per call (§2).
 
 Falsifiability of the guarded builder: drop the ``user_sub`` predicate from
-``_scoped_select`` and every two-sub test in ``tests/test_console_store_
-base.py`` observes another user's row (list/get/upsert-existence/tombstone/
+``_scoped_select`` and every two-sub test in ``tests/console_store/
+test_base_crud.py`` / ``test_base_pagination.py`` / ``test_base_stamping.py``
+observes another user's row (list/get/upsert-existence/tombstone/
 delete/batch_get/count — each has its own side-effect assertion).
 """
 
@@ -56,8 +57,44 @@ from audittrace.services.console_store._errors import (
 
 logger = logging.getLogger(__name__)
 
+# SPEC ADDENDUM C advisory A-R7 (fix round 2, 2026-09-17): the names
+# _GuardedSessions's own class-level seal must protect — mirrors
+# SEALED_STORE_MEMBERS / _SEALED_DOMAIN_CLASS_ATTRS in the same package.
+_SEALED_GUARDED_SESSIONS_MEMBERS: frozenset[str] = frozenset(
+    {"get_session_scoped", "__setattr__", "__delattr__", "__class__"}
+)
 
-class _GuardedSessions:
+
+class _GuardedSessionsMeta(type):
+    """Refuse a CLASS-level ``setattr``/``delattr`` naming a guarded-session
+    member (SPEC ADDENDUM C advisory A-R7, fix round 2). The INSTANCE-level
+    ``__setattr__``/``__delattr__`` below seal every attribute on an
+    already-built ``_GuardedSessions`` object, but a class-level write
+    (``_GuardedSessions.get_session_scoped = evil``) is dispatched to the
+    *metaclass*, not the instance method — plain ``type`` (the metaclass
+    ``_GuardedSessions`` used before this fix) does not intercept it, so
+    that ordinary one-line reassignment replaced the token-anchored opener
+    for every instance built from this class, present and future. Same
+    class of asymmetry Guard D closes for the domain descriptor, and
+    R2/R4 close for the store/domain metaclasses.
+
+    Falsifiable: neuter this and ``_GuardedSessions.get_session_scoped =
+    lambda self, user_context: None`` succeeds and every store's session
+    opener returns ``None`` instead of a scoped session.
+    """
+
+    def __setattr__(cls, name: str, value: Any) -> None:
+        if name in _SEALED_GUARDED_SESSIONS_MEMBERS:
+            raise ConsoleStoreSealedError(f"{cls.__qualname__}.{name} is sealed")
+        super().__setattr__(name, value)
+
+    def __delattr__(cls, name: str) -> None:
+        if name in _SEALED_GUARDED_SESSIONS_MEMBERS:
+            raise ConsoleStoreSealedError(f"{cls.__qualname__}.{name} is sealed")
+        super().__delattr__(name)
+
+
+class _GuardedSessions(metaclass=_GuardedSessionsMeta):
     """Owns the injected session factory and yields ONLY DB-scoped sessions.
 
     The factory is captured by the closure in ``__init__`` and is not an
@@ -68,7 +105,7 @@ class _GuardedSessions:
     role the DB itself then hides every other user's row. On SQLite (unit
     tests only) there is no RLS; the app-level ``_scoped_select`` predicate
     is the load-bearing guard there, which is why the RLS assertions also
-    run against a real Postgres (``tests/test_console_store_rls_postgres``).
+    run against a real Postgres (``tests/test_console_store_rls_postgres.py``).
 
     **F1-round self-attack finding (2026-09-17), same class as the domain
     descriptor's "second hop": ``__slots__`` limits WHICH attributes may
@@ -79,16 +116,18 @@ class _GuardedSessions:
     single-line reassignment of the slot holding the ENTIRE guarded-opener
     closure, replacing token-anchoring and RLS-GUC-pushing with anything the
     caller likes. Reproduced directly before this fix (see the build
-    record). ``__setattr__``/``__delattr__`` below refuse every attribute
-    set/delete unconditionally, mirroring :class:`~audittrace.services.
-    console_store._domain.ConsoleDomain`'s instance seal; ``__init__`` uses
-    ``object.__setattr__`` once, the same bypass every seal in this package
-    uses for its OWN one-time initialization.
+    record). ``__setattr__``/``__delattr__`` below refuse every ORDINARY
+    attribute set/delete on an INSTANCE, mirroring :class:`~audittrace.
+    services.console_store._domain.ConsoleDomain`'s instance seal;
+    ``_GuardedSessionsMeta`` above closes the matching CLASS-level hop
+    (SPEC ADDENDUM C A-R7); ``__init__`` uses ``object.__setattr__`` once,
+    the same bypass every seal in this package uses for its OWN one-time
+    initialization.
 
     Residual, disclosed: ``__closure__`` introspection on the stored
     function can recover the factory, and direct ``object.__setattr__`` /
-    ``__dict__``-shaped access still writes — deliberate circumvention, not
-    a hurry-mode path.
+    ``type.__setattr__`` / ``__dict__``-shaped access still writes —
+    deliberate circumvention, not a hurry-mode path.
     """
 
     __slots__ = ("_open",)

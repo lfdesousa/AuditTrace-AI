@@ -144,7 +144,6 @@ class TestGuardedSessionsOpenerSealed:
         self,
         harness: SqliteHarness,
         alice: UserContext,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Non-vacuity: with ``_GuardedSessions.__setattr__`` neutered to
         plain ``object.__setattr__`` (the ORIGINAL, pre-Guard-E shape), the
@@ -152,19 +151,32 @@ class TestGuardedSessionsOpenerSealed:
         replaces the ENTIRE token-anchored, RLS-scoped opener with
         whatever the caller supplies — a concrete, checkable side effect: a
         session that never pushes the RLS GUC and returns None instead of
-        a real ``AsyncSession``."""
-        monkeypatch.setattr(_GuardedSessions, "__setattr__", object.__setattr__)
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            WidgetDomain(), harness.factory
-        )
+        a real ``AsyncSession``.
 
-        async def _evil_open(user_context: UserContext) -> Any:
-            yield None  # never resolves a sub, never touches RLS
-
-        from contextlib import asynccontextmanager
-
-        store._sessions._open = asynccontextmanager(_evil_open)  # type: ignore[assignment]
-        async with store._sessions.get_session_scoped(alice) as session:
-            assert session is None, (
-                "neutering the seal should have let the opener be replaced"
+        SPEC ADDENDUM C advisory A-R7 (fix round 2) gave ``_GuardedSessions``
+        its own class-level seal (``_GuardedSessionsMeta``), so an ordinary
+        ``monkeypatch.setattr(_GuardedSessions, "__setattr__", ...)`` (which
+        dispatches through that metaclass) is now ITSELF refused — proof
+        the class-level seal covers its own hook. Reaching the neuter this
+        test needs therefore requires the same disclosed ``type.__setattr__``
+        bypass every other class-level neuter in this suite uses, restored
+        in ``finally`` regardless of outcome."""
+        original = _GuardedSessions.__dict__["__setattr__"]
+        type.__setattr__(_GuardedSessions, "__setattr__", object.__setattr__)
+        try:
+            store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+                WidgetDomain(), harness.factory
             )
+
+            async def _evil_open(user_context: UserContext) -> Any:
+                yield None  # never resolves a sub, never touches RLS
+
+            from contextlib import asynccontextmanager
+
+            store._sessions._open = asynccontextmanager(_evil_open)  # type: ignore[assignment]
+            async with store._sessions.get_session_scoped(alice) as session:
+                assert session is None, (
+                    "neutering the seal should have let the opener be replaced"
+                )
+        finally:
+            type.__setattr__(_GuardedSessions, "__setattr__", original)

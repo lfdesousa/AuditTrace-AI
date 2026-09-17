@@ -37,10 +37,14 @@ attribute, superseding the one-time check with a descriptor that never
 passed it, and ``_base.py``'s insert loop then silently overwrote the
 base's own ``trace_id`` stamp with ``None`` (M5 / EU AI Act Art 12). A read-
 only *property* protects the binding; it never protects the referent. Every
-:class:`ConsoleDomain` instance now refuses ANY attribute set or delete,
-unconditionally, for its entire lifetime (``__setattr__`` /
-``__delattr__`` below) — handing out an immutable object by reference is
-safe, so ``ConsoleStoreBase.domain`` needs no further narrowing.
+:class:`ConsoleDomain` instance refuses an ORDINARY attribute set or delete
+for its lifetime (``__setattr__`` / ``__delattr__`` below) — handing out an
+immutable object by reference is safe, so ``ConsoleStoreBase.domain`` needs
+no further narrowing. This is NOT unconditional: a subclass that redefines
+``__setattr__``/``__delattr__`` itself would have escaped it entirely — see
+the **third hop** below (SPEC ADDENDUM C, fix round 2) for why that route
+is now closed too, and the disclosed residuals (``object.__setattr__``,
+direct ``__dict__`` writes) that remain regardless.
 
 **Why hand-written, not ``@dataclass(frozen=True)``** (the shape the fix
 spec recommends as a starting point): tried first, and falsified by direct
@@ -97,6 +101,49 @@ the class object exists, and ``typing``'s ``_generic_init_subclass`` does
 the same for ``cls.__parameters__``; blocking every name breaks ordinary
 class creation for every subclass. The block is therefore by EXPLICIT
 NAME, mirroring ``SEALED_STORE_MEMBERS``, not "everything".)
+
+**Third hop (SPEC ADDENDUM C, fix round 2, 2026-09-17): the SANCTIONED
+extension mechanism itself — an ordinary domain subclass overriding the
+seal's own dunders.** A domain legitimately lives OUTSIDE this package (it
+is *the* extension point), and ``__init_subclass__`` only sealed
+``{snapshot_columns, has_session_id, order_columns, order_directions}`` —
+``__setattr__``/``__delattr__`` were not in that set, so an ordinary
+subclass, no monkeypatch, no ``object.__setattr__`` call, no metaclass
+swap, just::
+
+    class UnsealedDomain(WidgetDomain):
+        def __setattr__(self, name, value):
+            self.__dict__[name] = value
+
+defeated the FIRST hop entirely, and the verbatim F1 exploit line then
+reached ``_base.py``'s insert loop again in full (raw-DB witness: honest
+row carries the real span id, attacked row's ``trace_id`` is ``None``).
+``_SEALED_DOMAIN_MEMBERS`` below now includes ``__setattr__`` and
+``__delattr__`` themselves, so ``_refuse_redefinition`` (already the
+mechanism that seals the four template members) refuses the ``class``
+statement above at CREATION time — the control already existed; the
+member list was simply incomplete. **The lesson to internalise, not just
+patch: the sanctioned extension point is the PRIMARY attack surface, not
+an afterthought — enumerate mutations as a subclass author would write
+them, legitimate API first, exotica second.**
+
+**Fourth hop, same round: the metaclass swap.** ``_DomainMeta`` guarded
+``_SEALED_DOMAIN_CLASS_ATTRS`` but not ``__setattr__``, ``__delattr__`` or
+``__class__`` THEMSELVES — so ``WidgetDomain.__class__ = ABCMeta`` (an
+ordinary one-line class-level reassignment) silently removed
+``_DomainMeta`` from the class's dispatch, after which
+``WidgetDomain.value_columns = (...)`` — the exploit Guard D exists to
+refuse — succeeded again. A guard whose OWN hooks are reassignable is not
+a guard; it is a default. ``_SEALED_DOMAIN_CLASS_ATTRS`` now names
+``__setattr__``, ``__delattr__`` and ``__class__`` explicitly, so
+reassigning any of them at the class level is refused the same way as
+every other sealed descriptor attribute.
+
+Residual, disclosed (same family as every seal in this module):
+``object.__setattr__``/``type.__setattr__`` called directly, and a raw
+``__dict__``/class-``__dict__`` write, still work — deliberate
+circumvention, not the ordinary-Python hurry-mode path these seals exist
+for.
 """
 
 from __future__ import annotations
@@ -121,17 +168,36 @@ from audittrace.services.console_store._sealing import seal_members
 # values make keyset comparison undefined).
 ORDERABLE_RESERVED: frozenset[str] = frozenset({"id", "created_at_ms", "updated_at_ms"})
 
+# SPEC ADDENDUM C R1 (fix round 2): __setattr__/__delattr__ are sealed
+# TEMPLATE MEMBERS in their own right — a domain subclass overriding
+# either escapes the instance-level seal below entirely (the "third hop"
+# in the module docstring). _refuse_redefinition (via seal_members in
+# __init_subclass__) already refuses a subclass that redefines a name in
+# this set; adding the seal's own dunders here is what closes that hop,
+# with no new mechanism.
 _SEALED_DOMAIN_MEMBERS: frozenset[str] = frozenset(
-    {"snapshot_columns", "has_session_id", "order_columns", "order_directions"}
+    {
+        "snapshot_columns",
+        "has_session_id",
+        "order_columns",
+        "order_directions",
+        "__setattr__",
+        "__delattr__",
+    }
 )
 
 # The declarative ClassVars every domain declares (checked by
 # validate_domain() at construction) PLUS the sealed template members
-# above. Both are refused as a CLASS-level (post-creation) setattr/delattr
-# by _DomainMeta below — the second-hop closure documented in the module
-# docstring. NOT every class attribute is blocked (that breaks ABCMeta /
-# typing machinery, proven false directly, see the docstring); only these,
-# by explicit name.
+# above PLUS `__class__` (SPEC ADDENDUM C R2/R4, fix round 2: reassigning
+# the CLASS's own metaclass — ``WidgetDomain.__class__ = ABCMeta`` — is an
+# ordinary one-line class-level setattr that removes _DomainMeta from
+# dispatch entirely, the "fourth hop" in the module docstring; it is not a
+# declared ClassVar, so it is added explicitly here rather than by
+# inheriting from _SEALED_DOMAIN_MEMBERS). All of these are refused as a
+# CLASS-level (post-creation) setattr/delattr by _DomainMeta below. NOT
+# every class attribute is blocked (that breaks ABCMeta / typing
+# machinery, proven false directly, see the docstring); only these, by
+# explicit name.
 _SEALED_DOMAIN_CLASS_ATTRS: frozenset[str] = _SEALED_DOMAIN_MEMBERS | {
     "name",
     "model",
@@ -140,24 +206,31 @@ _SEALED_DOMAIN_CLASS_ATTRS: frozenset[str] = _SEALED_DOMAIN_MEMBERS | {
     "order_by",
     "default_list_limit",
     "max_list_limit",
+    "__class__",
 }
 
 
 class _DomainMeta(ABCMeta):
     """Refuse a CLASS-level ``setattr``/``delattr`` naming a domain
-    descriptor attribute (``WidgetDomain.value_columns = (...)``) —
-    closing the second hop of the F1 mutation surface. See the module
-    docstring for why this is a fixed, named set rather than an
-    unconditional block, and why the block cannot fire during ordinary
-    ``class Foo(ConsoleDomain): value_columns = (...)`` declaration (the
-    namespace dict is built BEFORE ``type.__new__`` creates the class
-    object; this metaclass never sees that as a ``setattr`` call, only a
-    REASSIGNMENT after the class already exists).
+    descriptor attribute (``WidgetDomain.value_columns = (...)``), OR the
+    seal's own hooks (``__setattr__``, ``__delattr__``, ``__class__``) —
+    closing the second AND fourth hops of the F1 mutation surface (see the
+    module docstring). This is a fixed, named set rather than a block on
+    every class attribute (the latter breaks ABCMeta/typing machinery,
+    proven false directly, see the docstring), and the block cannot fire
+    during ordinary ``class Foo(ConsoleDomain): value_columns = (...)``
+    declaration (the namespace dict is built BEFORE ``type.__new__``
+    creates the class object; this metaclass never sees that as a
+    ``setattr`` call, only a REASSIGNMENT after the class already exists).
 
     Falsifiable: neuter this and ``WidgetDomain.value_columns = (*…,
     "trace_id")`` (ordinary Python, no dunder, no ``type.__setattr__``
     call written out) succeeds and nulls ``trace_id`` on every subsequent
-    write through every store built with that domain class.
+    write through every store built with that domain class; separately,
+    ``WidgetDomain.__class__ = ABCMeta`` then re-opens the SAME exploit
+    line by removing this metaclass from dispatch — a cross-user read
+    through the public API (SPEC ADDENDUM C R2/R4), not merely a
+    class-attribute inconvenience.
     """
 
     def __setattr__(cls, name: str, value: Any) -> None:
@@ -204,20 +277,27 @@ class ConsoleDomain(Generic[T], ABC, metaclass=_DomainMeta):  # noqa: UP046 - se
         super().__init_subclass__(**kwargs)
         seal_members(cls, sealed_members=_SEALED_DOMAIN_MEMBERS)
 
+    @final
     def __setattr__(self, name: str, value: Any) -> None:
-        """F1: refuse EVERY instance attribute set, unconditionally — see
-        the module docstring for the defect this closes and why this is
+        """F1: refuse every ORDINARY instance attribute set — see the
+        module docstring for the defect this closes and why this is
         hand-written rather than ``@dataclass(frozen=True)``. There is no
         legitimate instance-attribute write to protect: every real domain
         (this class is never instantiated directly) declares its columns,
         order and hooks entirely at the CLASS level, which this does not
         touch — ``class Foo(ConsoleDomain): value_columns = (...)`` sets a
-        class attribute via ``type.__new__``, never this method."""
+        class attribute via ``type.__new__``, never this method. Sealed as
+        a TEMPLATE MEMBER itself (``_SEALED_DOMAIN_MEMBERS`` above, SPEC
+        ADDENDUM C R1): a subclass may not redefine this method, closing
+        the "third hop" the module docstring documents. Disclosed
+        residual, same family as every seal in this module: direct
+        ``object.__setattr__``/``__dict__`` writes still bypass it."""
         raise ConsoleStoreSealedError(
             f"{type(self).__qualname__}.{name} is part of a validated "
             "domain descriptor and cannot be set after class definition"
         )
 
+    @final
     def __delattr__(self, name: str) -> None:
         raise ConsoleStoreSealedError(
             f"{type(self).__qualname__}.{name} is part of a validated "
@@ -286,7 +366,7 @@ def validate_domain(domain: ConsoleDomain[Any]) -> None:
 
     Falsifiable: neuter the reserved-column check and a hostile domain that
     declares ``value_columns=("user_sub",)`` gets to write another user's
-    ``user_sub`` (``tests/test_console_store_hostile_domain_hooks.py``).
+    ``user_sub`` (``tests/console_store/test_hostile_domain_hooks.py``).
     """
     _require(isinstance(domain, ConsoleDomain), "domain must be a ConsoleDomain")
     name = getattr(domain, "name", None)
