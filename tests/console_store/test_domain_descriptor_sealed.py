@@ -2,7 +2,14 @@
 round 1 (2026-09-15), answering
 ``review-verdict-consolestorebase-wu-a-20260915.outcome-reject`` F1. Split
 from ``test_console_store_hostile.py`` (A3 — that file exceeded the
-PYTHON-ENGINEERING §11 500-LOC trigger).
+PYTHON-ENGINEERING §11 500-LOC trigger), then split AGAIN (fix round 4,
+2026-09-17, F7 advisory item 5 — this file had grown back to 533 LOC) into
+three guard-scoped files, this one covering Guards A and D. Guards B/B'
+(the ``_domain``/``_sessions`` POINTER write-once check) moved to
+``test_domain_reassignment_sealed.py``; Guard C (the reserved-column
+refusal at point of use) moved to
+``test_domain_reserved_column_guard_sealed.py``. No test body changed —
+only the file each class lives in.
 
 **The defect (see ``_domain.py`` module docstring for the full account):**
 ``ConsoleStoreBase.domain`` hands out the validated :class:`ConsoleDomain`
@@ -12,37 +19,14 @@ instance BY REFERENCE. Before this round, one line of ordinary Python —
 pointer swap, no dunder, no ``__dict__`` write) and the next insert
 silently nulled the base-stamped ``trace_id`` (M5 / EU AI Act Art 12).
 
-**Five independent guards close it (four from the fix round, plus one
-found while enumerating THIS round's own new seal — the "attack your own
-fix" pass the spec demands), each proven separately** (Addendum B Req 1 —
-one neuter per run, never a batch; a batch neuter proves only that *at
+**Two independent guards, proven separately** (Addendum B Req 1 — one
+neuter per run, never a batch; a batch neuter proves only that *at
 least one* guard is load-bearing, F-C1's mistake):
 
 * **Guard A** — ``ConsoleDomain.__setattr__``/``__delattr__``: the
   descriptor INSTANCE itself refuses every attribute set/delete. This is
   what closes the ORIGINAL exploit line, completely — proven below
   (``TestDomainDescriptorSealed``).
-* **Guard B** — ``ConsoleStoreBase.__setattr__``'s write-once check: the
-  ``_domain`` POINTER cannot be reassigned to a descriptor that never
-  passed ``validate_domain()`` (WU-A ADDENDUM A finding, generalised this
-  round — see ``_base.py``). Proven below (``TestDomainReassignmentSealed``,
-  the A1 fix).
-* **Guard B'** — the SAME generalised write-once check, for
-  :class:`~audittrace.services.console_store._postgres.PostgresConsoleStore`'s
-  OTHER instance attribute, ``_sessions`` (``_model`` was removed
-  entirely, see ``test_no_raw_resource.py``). Proven below
-  (``TestSessionsWriteOnceSealed``) — this closes the PARTIAL disclosed in
-  the fix-round-1 evidence file ("NO dedicated regression test this
-  session").
-* **Guard C** — ``ConsoleStoreBase._refuse_reserved_value_columns`` (F1
-  item 2): LOAD-BEARING, not defence in depth (SPEC ADDENDUM C R5) —
-  refuses, LOUDLY, at the point every write path TRUSTS ``value_columns``,
-  whatever route got a bad descriptor there. Before ``tests/console_store/
-  test_extension_point_sealed.py`` closed the "third hop" (an ordinary
-  domain subclass overriding ``__setattr__``), THIS guard was the SOLE
-  barrier reachable with zero monkeypatch. Even now, a construction path
-  that skips ``validate_domain()`` reaches it too — simulated below via
-  monkeypatch (proven below, ``TestReservedColumnRefusedAtPointOfUse``).
 * **Guard D** — ``_DomainMeta.__setattr__``/``__delattr__`` (the SECOND
   HOP, found this round: Guard A is an INSTANCE method and does not fire
   for ``WidgetDomain.value_columns = (...)``, a CLASS-level ClassVar
@@ -59,59 +43,14 @@ import pytest
 from opentelemetry.sdk.trace import TracerProvider
 
 from audittrace.identity import UserContext
-from audittrace.services.console_store import (
-    ConsoleDomain,
-    ConsoleStoreForbiddenFieldError,
-    ConsoleStoreSealedError,
-    DomainContract,
-    PostgresConsoleStore,
-)
-from audittrace.services.console_store import _base as _base_module
-from audittrace.services.console_store._context import REQUIRED_MODEL_COLUMNS
+from audittrace.services.console_store import ConsoleDomain, PostgresConsoleStore
+from audittrace.services.console_store._errors import ConsoleStoreSealedError
 from tests.console_store.support import KEY_A, _raw
 from tests.console_store_fixture_domain import SqliteHarness, WidgetDomain
 
 
 def _span_trace_id(span: Any) -> str:
     return format(span.get_span_context().trace_id, "032x")
-
-
-def _contract_skipping_the_reserved_column_check(
-    domain: ConsoleDomain[Any],
-) -> DomainContract:
-    """SPEC ADDENDUM D, fix round 3: ``ConsoleStoreBase.__init__`` now
-    caches a :class:`DomainContract` (``validate_domain()``'s return
-    value) instead of trusting a live ``self._domain`` read — see
-    ``_domain.py``'s module docstring, "Fifth hop". The pre-ADDENDUM-D
-    simulation here (``monkeypatch.setattr(_base_module, "validate_domain",
-    lambda domain: None)``) no longer models the SAME future-construction-
-    path threat: with a cached contract, ``lambda domain: None`` makes
-    ``self._contract`` ``None`` and every helper crashes with
-    ``AttributeError`` before Guard C ever runs — a different failure than
-    the one this test is about. This builds a ``DomainContract`` the SAME
-    way ``validate_domain()`` does, EXCEPT it skips the reserved-column
-    check, so it reaches Guard C exactly as the pre-ADDENDUM-D no-op did —
-    same threat model (a future path that builds/caches a contract without
-    validating it), adapted to the new plumbing."""
-    keys = tuple(domain.key_columns)
-    values = tuple(domain.value_columns)
-    has_session_id = hasattr(domain.model, "session_id")
-    reserved_prefix = tuple(REQUIRED_MODEL_COLUMNS) + (
-        ("session_id",) if has_session_id else ()
-    )
-    return DomainContract(
-        name=domain.name,
-        model=domain.model,
-        key_columns=keys,
-        value_columns=values,
-        order_by=tuple(domain.order_by),
-        default_list_limit=domain.default_list_limit,
-        max_list_limit=domain.max_list_limit,
-        has_session_id=has_session_id,
-        snapshot_columns=reserved_prefix + keys + values,
-        order_columns=tuple(c for c, _ in domain.order_by),
-        order_directions=tuple(d for _, d in domain.order_by),
-    )
 
 
 # ── Guard A: the descriptor itself refuses every attribute set/delete ───────
@@ -181,146 +120,6 @@ class TestDomainDescriptorSealed:
             )
         finally:
             type.__setattr__(ConsoleDomain, "__setattr__", original)
-
-
-# ── Guard B: the ``_domain`` POINTER cannot be swapped post-construction ───
-
-
-class ReservedAsValueColumnDomain(WidgetDomain):
-    """A descriptor that declares a NULLABLE reserved column (``trace_id``)
-    as writable — exactly what ``validate_domain()`` refuses at
-    construction. Only reachable by swapping ``_domain`` in AFTER
-    construction (Guard B's job), since a store built with this domain
-    directly is refused at construction.
-
-    A1 (fix round 1): the original version of this fixture declared
-    ``user_sub`` (NOT NULL) instead. Under Guard B neutered, the swap
-    succeeded and the subsequent insert then died on a NOT NULL constraint
-    BEFORE the asserted side effect (a clobbered stamp) ever executed — the
-    test REDded on "did not raise", never on the harm it claimed to guard
-    against (the review's own A1 finding). ``trace_id`` is nullable, so the
-    harm this fixture models — a silently nulled traceability stamp — is
-    now something a test could actually observe in the DB, had Guard C not
-    also been reachable at that same point (see the class docstring above).
-    """
-
-    name = "hostile_domain_swap"
-    value_columns = ("payload", "priority", "trace_id")
-
-
-class TestDomainReassignmentSealed:
-    """Guard B — generalised this round from a ``_domain``-only check to
-    every ``ConsoleStoreBase`` instance attribute (``_base.py``)."""
-
-    async def test_reassigning_domain_after_construction_is_refused(
-        self, harness: SqliteHarness
-    ) -> None:
-        domain = WidgetDomain()
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            domain, harness.factory
-        )
-        with pytest.raises(ConsoleStoreSealedError, match="cannot be reassigned"):
-            store._domain = WidgetDomain()  # type: ignore[misc]
-        assert store.domain is domain, "the reassignment attempt still took effect"
-
-    async def test_domain_swap_cannot_smuggle_a_reserved_column_past_the_one_time_check(
-        self, harness: SqliteHarness, alice: UserContext, bob: UserContext
-    ) -> None:
-        """A1 (fixed): the swap itself is refused (Guard B), proven with a
-        REAL span so the witness is the DB row's ``trace_id``, not merely
-        "an exception was raised" — the exact upgrade A1 demanded."""
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            WidgetDomain(), harness.factory
-        )
-        tracer = TracerProvider().get_tracer("f1-domain-swap")
-        with tracer.start_as_current_span("alice-write") as span:
-            alice_row = await store.upsert(alice, KEY_A, {"payload": "alice-secret"})
-            alice_trace = _span_trace_id(span)
-        with pytest.raises(ConsoleStoreSealedError):
-            store._domain = ReservedAsValueColumnDomain()  # type: ignore[misc]
-        other = {"kind": "tool", "name": "other"}
-        with tracer.start_as_current_span("bob-write") as span:
-            bob_row = await store.upsert(bob, other, {"priority": 1})
-            bob_trace = _span_trace_id(span)
-        raw = {r["id"]: r for r in await _raw(store, harness)}
-        assert raw[alice_row["id"]]["trace_id"] == alice_trace
-        assert bob_row["user_sub"] == "bob-sub"
-        assert raw[bob_row["id"]]["trace_id"] == bob_trace, (
-            "the blocked swap still let a row get written with a nulled "
-            "trace_id — traceability stamp lost (M5 / EU AI Act Art 12)"
-        )
-
-
-# ── Guard B': the SAME write-once check, for PostgresConsoleStore's OTHER ──
-# ── instance attribute, ``_sessions`` (closes a fix-round-1 PARTIAL) ────────
-
-
-class TestSessionsWriteOnceSealed:
-    """The fix-round-1 evidence file disclosed this as a GAP: the
-    generalisation from a ``_domain``-only write-once check to "every
-    instance attribute" was demonstrated manually at the REPL for
-    ``_sessions``/``_model`` but had NO dedicated, automated regression
-    test. ``_model`` was removed entirely (``test_no_raw_resource.py``),
-    so ``_sessions`` is the only remaining Postgres-specific instance
-    attribute needing its own proof."""
-
-    def test_reassigning_sessions_after_construction_is_refused(
-        self, harness: SqliteHarness
-    ) -> None:
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            WidgetDomain(), harness.factory
-        )
-        original = store._sessions
-        with pytest.raises(ConsoleStoreSealedError, match="cannot be reassigned"):
-            store._sessions = object()  # type: ignore[assignment]
-        assert store._sessions is original, "the blocked swap still took effect"
-
-    def test_neutering_the_generalised_check_lets_sessions_be_swapped(
-        self, harness: SqliteHarness
-    ) -> None:
-        """Non-vacuity: reproduces the ORIGINAL (pre-fix-round-1) shape of
-        ``ConsoleStoreBase.__setattr__`` — ONLY ``_domain`` was
-        write-once-checked, exactly as WU-A shipped it — and shows the
-        SAME class of mutation the test above now refuses
-        (``store._sessions = evil``) instead succeeding under that
-        narrower, pre-fix check. A concrete side effect (``is evil``), not
-        merely "no exception was raised".
-
-        SPEC ADDENDUM C R2 (fix round 2) sealed ``__setattr__`` itself as a
-        ``SEALED_STORE_MEMBERS`` member, so an ordinary
-        ``monkeypatch.setattr(ConsoleStoreBase, "__setattr__", ...)`` (which
-        dispatches through ``_SealedMeta.__setattr__``) is now ITSELF
-        refused — proof the class-level seal covers its own hook. Reaching
-        the neuter this test needs therefore requires the same disclosed
-        ``type.__setattr__`` bypass every other class-level neuter in this
-        suite uses, restored in ``finally`` regardless of outcome."""
-
-        def _pre_fix_setattr(self: Any, name: str, value: Any) -> None:
-            if name in _base_module.SEALED_STORE_MEMBERS:
-                raise ConsoleStoreSealedError(
-                    f"{type(self).__qualname__}.{name} is sealed"
-                )
-            if name == "_domain" and "_domain" in self.__dict__:
-                raise ConsoleStoreSealedError(
-                    f"{type(self).__qualname__}.{name} is set once at "
-                    "construction and cannot be reassigned"
-                )
-            object.__setattr__(self, name, value)
-
-        original = _base_module.ConsoleStoreBase.__dict__["__setattr__"]
-        type.__setattr__(_base_module.ConsoleStoreBase, "__setattr__", _pre_fix_setattr)
-        try:
-            store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-                WidgetDomain(), harness.factory
-            )
-            evil = object()
-            store._sessions = evil  # type: ignore[assignment]
-            assert store._sessions is evil, (
-                "the pre-fix (domain-only) write-once check should have let "
-                "the _sessions swap through"
-            )
-        finally:
-            type.__setattr__(_base_module.ConsoleStoreBase, "__setattr__", original)
 
 
 # ── Guard D: the domain CLASS itself cannot have a descriptor attribute ────
@@ -419,115 +218,3 @@ class TestDomainClassLevelSealed:
             ), "neutering the seal should have let the mutation through"
         finally:
             type.__setattr__(_ClassLevelSealDomain, "value_columns", original)
-
-
-# ── Guard C: refuse a reserved-column collision AT THE POINT OF USE ────────
-
-
-class _ReservedValueColumnDomain(WidgetDomain):
-    """Declares ``trace_id`` (nullable, reserved) as a value column — the
-    exact shape ``validate_domain()`` refuses at construction. Used ONLY
-    with ``validate_domain`` monkeypatched (via
-    ``_contract_skipping_the_reserved_column_check`` above) to skip its
-    reserved-column check, simulating a FUTURE construction path that
-    builds/caches a :class:`DomainContract` without it (Guard A closes the
-    only OTHER route to this shape — runtime mutation — completely; see
-    ``TestDomainDescriptorSealed`` above)."""
-
-    name = "hostile_reserved_value_column"
-    value_columns = ("payload", "priority", "trace_id")
-
-
-class TestReservedColumnRefusedAtPointOfUse:
-    """Guard C — LOAD-BEARING (SPEC ADDENDUM C R5), not defence in depth.
-    Both tests below simulate ONE route to its protected code: a
-    construction path that skips ``validate_domain()`` — the FUTURE path
-    the spec calls out ("a domain that declares the collision from the
-    start ... via a future construction path that skips
-    ``validate_domain()``"), via monkeypatch, since no such construction
-    path exists today. A SEPARATE route needs no monkeypatch at all: an
-    ordinary domain subclass overriding ``__setattr__``/``__delattr__``
-    (the "third hop" — see ``test_extension_point_sealed.py``, which also
-    closes it); before that fix, this guard was the SOLE barrier reachable
-    that way with zero monkeypatch."""
-
-    async def test_refuses_a_domain_that_bypassed_construction_validation(
-        self, harness: SqliteHarness, bob: UserContext, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            _base_module,
-            "validate_domain",
-            _contract_skipping_the_reserved_column_check,
-        )
-        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-            _ReservedValueColumnDomain(), harness.factory
-        )
-        with pytest.raises(ConsoleStoreForbiddenFieldError, match="reserved"):
-            await store.upsert(bob, KEY_A, {"priority": 1})
-        assert await _raw(store, harness) == [], (
-            "Guard C refused the write but a row was written anyway"
-        )
-
-    async def test_reproduction_without_guard_c_the_stamp_is_nulled(
-        self,
-        harness: SqliteHarness,
-        alice: UserContext,
-        bob: UserContext,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """THE combined reproduction: with construction validation bypassed
-        (as above) AND Guard C ALSO neutered, the write that Guard C
-        refused above now SUCCEEDS and silently nulls ``trace_id`` — a raw
-        DB read is the witness, alongside an HONEST row (a normal store,
-        neither guard touched) that carries the real span id. This is not
-        a per-guard non-vacuity proof on its own (two things are neutered
-        at once, Addendum B Req 1) — it is the end-to-end reproduction of
-        the ORIGINAL headline defect, kept alongside the per-guard proofs
-        above rather than instead of them."""
-        monkeypatch.setattr(
-            _base_module,
-            "validate_domain",
-            _contract_skipping_the_reserved_column_check,
-        )
-        # ``_refuse_reserved_value_columns`` is a SEALED_STORE_MEMBERS entry
-        # — ``ConsoleStoreBase``'s own metaclass refuses an ordinary
-        # ``setattr`` on it (proven in ``test_console_store_sealed_
-        # classes.py``), so ``monkeypatch.setattr`` cannot reach it either.
-        # Bypass the SAME way the sealed-classes tests do to restore a
-        # sealed member: ``type.__setattr__`` directly.
-        original = _base_module.ConsoleStoreBase.__dict__[
-            "_refuse_reserved_value_columns"
-        ]
-        type.__setattr__(
-            _base_module.ConsoleStoreBase,
-            "_refuse_reserved_value_columns",
-            lambda self: None,
-        )
-        try:
-            honest_store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-                WidgetDomain(), harness.factory
-            )
-            hostile_store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
-                _ReservedValueColumnDomain(), harness.factory
-            )
-            tracer = TracerProvider().get_tracer("f1-reproduction")
-            with tracer.start_as_current_span("honest-write") as span:
-                honest_row = await honest_store.upsert(
-                    alice, KEY_A, {"payload": "real"}
-                )
-                honest_trace = _span_trace_id(span)
-            with tracer.start_as_current_span("hostile-write"):
-                hostile_row = await hostile_store.upsert(bob, KEY_A, {"priority": 1})
-            honest_raw = {r["id"]: r for r in await _raw(honest_store, harness)}
-            hostile_raw = {r["id"]: r for r in await _raw(hostile_store, harness)}
-        finally:
-            type.__setattr__(
-                _base_module.ConsoleStoreBase,
-                "_refuse_reserved_value_columns",
-                original,
-            )
-        assert honest_raw[honest_row["id"]]["trace_id"] == honest_trace
-        assert hostile_raw[hostile_row["id"]]["trace_id"] is None, (
-            "expected the unguarded write to null trace_id — if this "
-            "fails, a guard that should be neutered here is still active"
-        )

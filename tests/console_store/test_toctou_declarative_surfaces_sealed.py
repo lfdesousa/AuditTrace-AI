@@ -27,16 +27,52 @@ re-proving one mechanism per field it protects). What is verified here,
 per sibling, is that the STORE actually uses the cached value under a
 live attack shape, with a real assertion on the write's outcome — not a
 bare equality check on the domain's own attribute.
+
+**CORRECTED (fix round 4, SPEC F7, 2026-09-17): the paragraph above was
+checked and found FALSE for ``has_session_id`` — proven and retracted,
+not merely reworded.** ``has_session_id`` has its OWN distinct downstream
+consumer: ``_insert_values`` / ``_update_values`` / ``_delete_values``
+each branch on ``self._contract.has_session_id`` to decide whether
+``session_id`` is stamped AT ALL, a separate call site from the one
+``value_columns`` feeds. Neutering the SHARED ``validate_domain()``
+capture mechanism via ``value_columns`` therefore proves nothing about
+whether ``has_session_id`` is independently load-bearing at ITS OWN use
+site. Worse: the assertion this file originally shipped for it
+(``"session_id" in raw[row["id"]]``) was a dict-key-presence tautology —
+``SqliteHarness.raw_rows()`` builds every row from the fixture's
+``WIDGET_COLUMNS``, which names ``"session_id"`` unconditionally, so the
+key is present whether or not a live re-read of ``model`` would have
+nulled the STAMPED VALUE — and could not have gone RED for the claimed
+reason regardless of what code it ran against
+(``feedback_vacuous_neuter_test_antipattern``).
+``TestHasSessionIdNonVacuous`` below now proves it directly: a per-field
+method-neuter (mirroring ``test_toctou_value_columns_sealed.py``'s
+pattern — ``value_columns`` stays cached, only ``has_session_id`` is
+served live, one neuter per run per Addendum B Req 1) reproduces the SAME
+harm CLASS as F6 — a silently dropped M5 / EU AI Act Art 12 traceability
+stamp, ``session_id`` this time instead of ``trace_id`` — with a raw-DB
+value witness, RED under the neuter, GREEN restored on a fresh store.
+
+``key_columns``, ``model`` and ``order_by`` are UNAFFECTED by this
+correction: their existing assertions already compare a real WRITTEN
+value (``raw[...]["name"] == "web-search"``, ``raw[...]["trace_id"] ==
+expected_trace``, an insertion-order-derived list ordering) rather than
+attribute presence, so the "one shared capture mechanism, verified per
+sibling by a real outcome assertion" claim continues to hold for those
+three.
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from opentelemetry.sdk.trace import TracerProvider
 
 from audittrace.identity import UserContext
-from audittrace.services.console_store import PostgresConsoleStore
+from audittrace.services.console_store import PostgresConsoleStore, bind_session_id
+from audittrace.services.console_store import _base as _base_module
+from audittrace.services.console_store._context import WriteStamp
 from tests.console_store.support import KEY_A, _raw
 from tests.console_store_fixture_domain import SqliteHarness, WidgetDomain, WidgetRow
 
@@ -221,16 +257,85 @@ class TestHasSessionIdPinned:
         assert not hasattr(store.domain.model, "session_id"), (
             "the fixture must actually be hostile post-construction"
         )
+        bind_session_id("sess-honest-0001")
         row = await store.upsert(alice, KEY_A, {"payload": "alice-secret"})
         raw = {r["id"]: r for r in await _raw(store, harness)}
-        # snapshot_columns (cached) still names session_id, and the row
-        # actually carries the column — a live re-read of model would have
-        # flipped has_session_id() to False and stopped stamping it.
-        assert "session_id" in raw[row["id"]], (
+        # A REAL value witness, not dict-key presence (WIDGET_COLUMNS names
+        # "session_id" unconditionally, so `"session_id" in raw[...]` is
+        # true regardless of what got STAMPED there — see the corrected
+        # module docstring above). A live re-read of model would have
+        # flipped has_session_id() to False and left the column None.
+        assert raw[row["id"]]["session_id"] == "sess-honest-0001", (
             "a live re-read of model would have dropped session_id from "
-            "the cached snapshot/stamping shape"
+            "the cached snapshot/stamping shape, leaving the column None"
         )
-        assert row["id"] is not None
+
+
+def _insert_values_reading_has_session_id_live(
+    self: Any, stamp: WriteStamp, key: Any, values: Any
+) -> dict[str, Any]:
+    """``ConsoleStoreBase._insert_values`` with ONLY ``has_session_id``
+    read live off ``self._domain`` — ``value_columns`` and every other
+    field stay CACHED (``self._contract``), isolating ``has_session_id``
+    alone (Addendum B Req 1: one neuter per run, mirroring
+    ``test_toctou_value_columns_sealed.py``'s
+    ``_old_insert_values_reading_live_domain``, which isolates
+    ``value_columns`` the same way)."""
+    self._refuse_reserved_value_columns()
+    defaults = self._hook_output(self._domain.defaults(dict(key)), hook="defaults")
+    row: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "user_sub": stamp.user_sub,
+        "created_at_ms": stamp.now_ms,
+        "updated_at_ms": stamp.now_ms,
+        "deleted_at_ms": None,
+        "trace_id": stamp.trace_id,
+    }
+    if self._domain.has_session_id():  # the live re-read under test
+        row["session_id"] = stamp.session_id
+    row.update(key)
+    for column in self._contract.value_columns:  # stays cached, not under test
+        row[column] = values[column] if column in values else defaults.get(column)
+    return row
+
+
+class TestHasSessionIdNonVacuous:
+    """Non-vacuity for ``has_session_id``, answering F7: reproduces the
+    SAME harm class F6 proved for ``value_columns`` (a silently dropped
+    M5 / EU AI Act Art 12 stamp), one field at a time."""
+
+    async def test_neutering_the_read_once_fix_drops_session_id_silently(
+        self, harness: SqliteHarness, alice: UserContext
+    ) -> None:
+        original = _base_module.ConsoleStoreBase.__dict__["_insert_values"]
+        type.__setattr__(
+            _base_module.ConsoleStoreBase,
+            "_insert_values",
+            _insert_values_reading_has_session_id_live,
+        )
+        try:
+            hostile_store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+                TocTouSessionIdDomain(), harness.factory
+            )
+            bind_session_id("sess-hostile-0001")
+            row = await hostile_store.upsert(alice, KEY_A, {"payload": "attack"})
+            raw = {r["id"]: r for r in await _raw(hostile_store, harness)}
+            assert raw[row["id"]]["session_id"] is None, (
+                "neutering the read-once fix should have let the model "
+                "TOCTOU silently drop the session_id stamp"
+            )
+        finally:
+            type.__setattr__(_base_module.ConsoleStoreBase, "_insert_values", original)
+        assert _base_module.ConsoleStoreBase.__dict__["_insert_values"] is original
+
+        # Restored: a FRESH store (fresh counter) proves the fix is back.
+        fixed_store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            TocTouSessionIdDomain(), harness.factory
+        )
+        bind_session_id("sess-honest-0002")
+        row2 = await fixed_store.upsert(alice, KEY_A, {"payload": "alice-secret-2"})
+        raw2 = {r["id"]: r for r in await _raw(fixed_store, harness)}
+        assert raw2[row2["id"]]["session_id"] == "sess-honest-0002"
 
 
 # ── the sealed template members themselves stay directly testable ─────────
