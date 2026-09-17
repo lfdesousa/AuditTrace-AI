@@ -12,19 +12,28 @@ instance BY REFERENCE. Before this round, one line of ordinary Python —
 pointer swap, no dunder, no ``__dict__`` write) and the next insert
 silently nulled the base-stamped ``trace_id`` (M5 / EU AI Act Art 12).
 
-**Three independent guards close it, each proven separately** (Addendum B
-Req 1 — one neuter per run, never a batch; a batch neuter proves only that
-*at least one* guard is load-bearing, F-C1's mistake):
+**Five independent guards close it (four from the fix round, plus one
+found while enumerating THIS round's own new seal — the "attack your own
+fix" pass the spec demands), each proven separately** (Addendum B Req 1 —
+one neuter per run, never a batch; a batch neuter proves only that *at
+least one* guard is load-bearing, F-C1's mistake):
 
 * **Guard A** — ``ConsoleDomain.__setattr__``/``__delattr__``: the
-  descriptor itself refuses every attribute set/delete. This is what
-  closes the ORIGINAL exploit line, completely — proven below
+  descriptor INSTANCE itself refuses every attribute set/delete. This is
+  what closes the ORIGINAL exploit line, completely — proven below
   (``TestDomainDescriptorSealed``).
 * **Guard B** — ``ConsoleStoreBase.__setattr__``'s write-once check: the
   ``_domain`` POINTER cannot be reassigned to a descriptor that never
   passed ``validate_domain()`` (WU-A ADDENDUM A finding, generalised this
   round — see ``_base.py``). Proven below (``TestDomainReassignmentSealed``,
   the A1 fix).
+* **Guard B'** — the SAME generalised write-once check, for
+  :class:`~audittrace.services.console_store._postgres.PostgresConsoleStore`'s
+  OTHER instance attribute, ``_sessions`` (``_model`` was removed
+  entirely, see ``test_no_raw_resource.py``). Proven below
+  (``TestSessionsWriteOnceSealed``) — this closes the PARTIAL disclosed in
+  the fix-round-1 evidence file ("NO dedicated regression test this
+  session").
 * **Guard C** — ``ConsoleStoreBase._refuse_reserved_value_columns`` (F1
   item 2, defence in depth): refuses, LOUDLY, at the point every write path
   TRUSTS ``value_columns``, whatever route got a bad descriptor there. With
@@ -32,6 +41,12 @@ Req 1 — one neuter per run, never a batch; a batch neuter proves only that
   Guard C's protected code in THIS codebase is a construction path that
   skips ``validate_domain()`` — simulated below via monkeypatch, since no
   such path exists today (proven below, ``TestReservedColumnRefusedAtPointOfUse``).
+* **Guard D** — ``_DomainMeta.__setattr__``/``__delattr__`` (the SECOND
+  HOP, found this round: Guard A is an INSTANCE method and does not fire
+  for ``WidgetDomain.value_columns = (...)``, a CLASS-level ClassVar
+  reassignment — see the ``_domain.py`` module docstring for the full
+  account of why this is a distinct mutation surface from Guard A's, not
+  a duplicate of it). Proven below (``TestDomainClassLevelSealed``).
 """
 
 from __future__ import annotations
@@ -180,6 +195,165 @@ class TestDomainReassignmentSealed:
             "the blocked swap still let a row get written with a nulled "
             "trace_id — traceability stamp lost (M5 / EU AI Act Art 12)"
         )
+
+
+# ── Guard B': the SAME write-once check, for PostgresConsoleStore's OTHER ──
+# ── instance attribute, ``_sessions`` (closes a fix-round-1 PARTIAL) ────────
+
+
+class TestSessionsWriteOnceSealed:
+    """The fix-round-1 evidence file disclosed this as a GAP: the
+    generalisation from a ``_domain``-only write-once check to "every
+    instance attribute" was demonstrated manually at the REPL for
+    ``_sessions``/``_model`` but had NO dedicated, automated regression
+    test. ``_model`` was removed entirely (``test_no_raw_resource.py``),
+    so ``_sessions`` is the only remaining Postgres-specific instance
+    attribute needing its own proof."""
+
+    def test_reassigning_sessions_after_construction_is_refused(
+        self, harness: SqliteHarness
+    ) -> None:
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            WidgetDomain(), harness.factory
+        )
+        original = store._sessions
+        with pytest.raises(ConsoleStoreSealedError, match="cannot be reassigned"):
+            store._sessions = object()  # type: ignore[assignment]
+        assert store._sessions is original, "the blocked swap still took effect"
+
+    def test_neutering_the_generalised_check_lets_sessions_be_swapped(
+        self, harness: SqliteHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-vacuity: reproduces the ORIGINAL (pre-fix-round-1) shape of
+        ``ConsoleStoreBase.__setattr__`` — ONLY ``_domain`` was
+        write-once-checked, exactly as WU-A shipped it — and shows the
+        SAME class of mutation the test above now refuses
+        (``store._sessions = evil``) instead succeeding under that
+        narrower, pre-fix check. A concrete side effect (``is evil``), not
+        merely "no exception was raised"."""
+
+        def _pre_fix_setattr(self: Any, name: str, value: Any) -> None:
+            if name in _base_module.SEALED_STORE_MEMBERS:
+                raise ConsoleStoreSealedError(
+                    f"{type(self).__qualname__}.{name} is sealed"
+                )
+            if name == "_domain" and "_domain" in self.__dict__:
+                raise ConsoleStoreSealedError(
+                    f"{type(self).__qualname__}.{name} is set once at "
+                    "construction and cannot be reassigned"
+                )
+            object.__setattr__(self, name, value)
+
+        monkeypatch.setattr(
+            _base_module.ConsoleStoreBase, "__setattr__", _pre_fix_setattr
+        )
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            WidgetDomain(), harness.factory
+        )
+        evil = object()
+        store._sessions = evil  # type: ignore[assignment]
+        assert store._sessions is evil, (
+            "the pre-fix (domain-only) write-once check should have let "
+            "the _sessions swap through"
+        )
+
+
+# ── Guard D: the domain CLASS itself cannot have a descriptor attribute ────
+# ── reassigned after definition — the SECOND HOP of F1, found this round ───
+
+
+class _ClassLevelSealDomain(WidgetDomain):
+    """A throwaway domain subclass — tests mutate ITS class attribute, not
+    the shared ``WidgetDomain``'s, so a neuter-and-restore cycle here can
+    never leak state into any other test in this file."""
+
+    name = "class_level_seal_probe"
+
+
+class TestDomainClassLevelSealed:
+    """Guard D. ``ConsoleDomain.__setattr__`` (Guard A) is an INSTANCE
+    method: Python calls it for ``domain.value_columns = ...`` but NOT for
+    ``WidgetDomain.value_columns = ...`` (an attribute set ON THE CLASS
+    OBJECT, dispatched to the metaclass). Before this round ``ConsoleDomain``
+    used plain ``ABCMeta``, so that second, class-level hop was wide open —
+    ordinary Python, no dunder, exactly as "hurry-mode" as the original F1
+    line, with WORSE blast radius (it mutates every store built with that
+    domain class, not just one held reference). See the ``_domain.py``
+    module docstring for the full account, including why the fix is a
+    fixed, NAMED set of blocked attributes rather than an unconditional
+    block (the latter breaks ABCMeta/typing class-creation machinery,
+    verified false directly before this shape was chosen)."""
+
+    def test_class_level_reassignment_is_refused(self) -> None:
+        original = _ClassLevelSealDomain.value_columns
+        with pytest.raises(ConsoleStoreSealedError):
+            _ClassLevelSealDomain.value_columns = (*original, "trace_id")
+        assert _ClassLevelSealDomain.value_columns == original, (
+            "the blocked class-level mutation attempt still took effect"
+        )
+
+    def test_class_level_deletion_is_refused(self) -> None:
+        with pytest.raises(ConsoleStoreSealedError):
+            del _ClassLevelSealDomain.value_columns
+        assert _ClassLevelSealDomain.value_columns == ("payload", "priority")
+
+    def test_non_descriptor_class_attributes_are_still_settable_and_deletable(
+        self,
+    ) -> None:
+        """The block is by EXPLICIT NAME (see the module docstring), not
+        "every class attribute" — an ordinary, non-descriptor class
+        attribute is unaffected, the same distinction
+        ``test_non_sealed_class_attributes_are_still_settable_and_deletable``
+        proves for store classes."""
+        _ClassLevelSealDomain.scratch_marker = 1  # type: ignore[attr-defined]
+        assert _ClassLevelSealDomain.scratch_marker == 1  # type: ignore[attr-defined]
+        del _ClassLevelSealDomain.scratch_marker  # type: ignore[attr-defined]
+        assert not hasattr(_ClassLevelSealDomain, "scratch_marker")
+
+    async def test_class_level_reassignment_would_have_nulled_trace_id(
+        self, harness: SqliteHarness, alice: UserContext
+    ) -> None:
+        """The refused class-level mutation still leaves an ordinary write
+        stamping ``trace_id`` correctly — a raw DB read as witness, not
+        merely "an exception was raised" (A1's own upgrade, applied here
+        too)."""
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            _ClassLevelSealDomain(), harness.factory
+        )
+        with pytest.raises(ConsoleStoreSealedError):
+            _ClassLevelSealDomain.value_columns = (
+                *_ClassLevelSealDomain.value_columns,
+                "trace_id",
+            )
+        tracer = TracerProvider().get_tracer("f1-class-level-mutation")
+        with tracer.start_as_current_span("alice-write") as span:
+            row = await store.upsert(alice, KEY_A, {"payload": "alice-secret"})
+            expected_trace = _span_trace_id(span)
+        raw = {r["id"]: r for r in await _raw(store, harness)}
+        assert raw[row["id"]]["trace_id"] == expected_trace
+
+    def test_neutering_the_class_level_seal_lets_the_mutation_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-vacuity: with ``_DomainMeta.__setattr__`` neutered to plain
+        ``type.__setattr__`` (the ORIGINAL, pre-Guard-D behaviour), the SAME
+        mutation the tests above refuse instead succeeds and changes state
+        visible to every future instance of the class — a concrete,
+        checkable side effect, restored in ``finally`` regardless of
+        outcome so this test cannot leak state into any other."""
+        from audittrace.services.console_store import _domain as _domain_module
+
+        monkeypatch.setattr(_domain_module._DomainMeta, "__setattr__", type.__setattr__)
+        original = _ClassLevelSealDomain.value_columns
+        try:
+            _ClassLevelSealDomain.value_columns = (*original, "trace_id")
+            assert _ClassLevelSealDomain.value_columns == (
+                "payload",
+                "priority",
+                "trace_id",
+            ), "neutering the seal should have let the mutation through"
+        finally:
+            type.__setattr__(_ClassLevelSealDomain, "value_columns", original)
 
 
 # ── Guard C: refuse a reserved-column collision AT THE POINT OF USE ────────

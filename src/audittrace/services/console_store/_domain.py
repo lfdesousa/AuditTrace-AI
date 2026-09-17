@@ -71,11 +71,37 @@ Residual, disclosed (same family as ``ConsoleStoreBase``'s): direct
 ``object.__setattr__(domain, name, value)`` or a ``__dict__`` write still
 succeeds — deliberate circumvention, not the ordinary-Python hurry-mode
 path this seal exists for.
+
+**Second hop, found while enumerating THIS round (not the original F1
+report, a self-found extension of the same principle): the class-level
+ClassVar itself.** ``ConsoleDomain.__setattr__`` above is an INSTANCE
+method — Python only calls it for ``domain.value_columns = ...``. It is
+NOT called for ``WidgetDomain.value_columns = (...)`` (a class-level
+reassignment of the ClassVar), because setting an attribute on a class
+object is dispatched to the *metaclass's* ``__setattr__``, and
+``ConsoleDomain`` had none (plain ``ABCMeta``). That one-liner is exactly
+as "ordinary Python" as the original F1 exploit line, and its blast
+radius is WORSE: it mutates the column tuple for every store built with
+that domain CLASS, present and future, not just the one instance a caller
+holds a reference to — and because ``self._domain.value_columns`` always
+resolves to the class attribute (a domain instance never legitimately
+carries its own instance override — the constructor never sets one), the
+mutation is invisible to any check that only inspects instances.
+:class:`_DomainMeta` closes this the same way :class:`~audittrace.
+services.console_store._base._SealedMeta` closes the equivalent class-
+level monkeypatch for stores: refuse a class-level ``setattr``/
+``delattr`` naming a domain descriptor attribute. (An unconditional
+class-level block was tried first and falsifies immediately — ``ABCMeta.
+__new__`` itself does ``cls.__abstractmethods__ = frozenset(...)`` AFTER
+the class object exists, and ``typing``'s ``_generic_init_subclass`` does
+the same for ``cls.__parameters__``; blocking every name breaks ordinary
+class creation for every subclass. The block is therefore by EXPLICIT
+NAME, mirroring ``SEALED_STORE_MEMBERS``, not "everything".)
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Mapping
 from typing import Any, ClassVar, Generic, TypeVar, final
 
@@ -99,6 +125,58 @@ _SEALED_DOMAIN_MEMBERS: frozenset[str] = frozenset(
     {"snapshot_columns", "has_session_id", "order_columns", "order_directions"}
 )
 
+# The declarative ClassVars every domain declares (checked by
+# validate_domain() at construction) PLUS the sealed template members
+# above. Both are refused as a CLASS-level (post-creation) setattr/delattr
+# by _DomainMeta below — the second-hop closure documented in the module
+# docstring. NOT every class attribute is blocked (that breaks ABCMeta /
+# typing machinery, proven false directly, see the docstring); only these,
+# by explicit name.
+_SEALED_DOMAIN_CLASS_ATTRS: frozenset[str] = _SEALED_DOMAIN_MEMBERS | {
+    "name",
+    "model",
+    "key_columns",
+    "value_columns",
+    "order_by",
+    "default_list_limit",
+    "max_list_limit",
+}
+
+
+class _DomainMeta(ABCMeta):
+    """Refuse a CLASS-level ``setattr``/``delattr`` naming a domain
+    descriptor attribute (``WidgetDomain.value_columns = (...)``) —
+    closing the second hop of the F1 mutation surface. See the module
+    docstring for why this is a fixed, named set rather than an
+    unconditional block, and why the block cannot fire during ordinary
+    ``class Foo(ConsoleDomain): value_columns = (...)`` declaration (the
+    namespace dict is built BEFORE ``type.__new__`` creates the class
+    object; this metaclass never sees that as a ``setattr`` call, only a
+    REASSIGNMENT after the class already exists).
+
+    Falsifiable: neuter this and ``WidgetDomain.value_columns = (*…,
+    "trace_id")`` (ordinary Python, no dunder, no ``type.__setattr__``
+    call written out) succeeds and nulls ``trace_id`` on every subsequent
+    write through every store built with that domain class.
+    """
+
+    def __setattr__(cls, name: str, value: Any) -> None:
+        if name in _SEALED_DOMAIN_CLASS_ATTRS:
+            raise ConsoleStoreSealedError(
+                f"{cls.__qualname__}.{name} is a domain descriptor attribute "
+                "and cannot be reassigned on the class after definition"
+            )
+        super().__setattr__(name, value)
+
+    def __delattr__(cls, name: str) -> None:
+        if name in _SEALED_DOMAIN_CLASS_ATTRS:
+            raise ConsoleStoreSealedError(
+                f"{cls.__qualname__}.{name} is a domain descriptor attribute "
+                "and cannot be deleted from the class after definition"
+            )
+        super().__delattr__(name)
+
+
 # PEP 484 TypeVar (not PEP 695 native syntax, per the ratified spec's own
 # "Generic ABC via typing.Generic[T] (PEP 484)" instruction): the repo's
 # pre-commit mypy hook is pinned to v1.8.0, which predates PEP 695 support
@@ -111,7 +189,7 @@ _SEALED_DOMAIN_MEMBERS: frozenset[str] = frozenset(
 T = TypeVar("T")
 
 
-class ConsoleDomain(Generic[T], ABC):  # noqa: UP046 - see the T = TypeVar comment above
+class ConsoleDomain(Generic[T], ABC, metaclass=_DomainMeta):  # noqa: UP046 - see the T = TypeVar comment above
     """Declarative descriptor of one console domain (see module docstring)."""
 
     name: ClassVar[str]
