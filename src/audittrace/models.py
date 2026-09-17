@@ -958,3 +958,53 @@ class ConsoleToolFavoriteListResponse(BaseModel):
     ``MAX_TOOL_FAVORITES``), oldest-first."""
 
     items: list[ConsoleToolFavoriteItem] = Field(default_factory=list)
+
+
+# ── Console-ACL (Sovereign Authorization Layer EPIC, WU-1 — READ ─────────
+# PATH ONLY) ────────────────────────────────────────────────────────────
+#
+# Every response answers "what can/does the CALLER (token-derived) see" —
+# no request model here carries a principal_id/principal_type field a
+# caller could use to ask about a DIFFERENT principal
+# (feedback_never_trust_caller_metadata_for_security_fields, epic
+# invariant 5). No write model exists yet (WU-2).
+
+
+class ConsoleAclEffectivePermissionsResponse(BaseModel):
+    """Response from ``GET /console/acl/{resource_type}/{resource_id}/
+    permissions`` — the CALLER's combined (bitwise-OR'd) effective
+    permission bitmask on the resource. ``0`` means no matching,
+    non-expired grant exists (deny-by-default)."""
+
+    perm_bits: int = Field(..., ge=0)
+
+
+class ConsoleAclHasPermissionResponse(BaseModel):
+    """Response from ``GET /console/acl/{resource_type}/{resource_id}/
+    has-permission``."""
+
+    has_permission: bool
+
+
+class ConsoleAclBatchPermissionsRequest(BaseModel):
+    """Request body for ``POST /console/acl/{resource_type}/
+    permissions/batch`` — bounded at 200 ids, same cap as every other
+    console-* batch route."""
+
+    resource_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ConsoleAclBatchPermissionsResponse(BaseModel):
+    """Response from the batch-permissions route. ``permissions`` omits
+    any ``resource_id`` with no matching, non-expired grant (never
+    present with value ``0``) — mirrors the service layer's ``Map``
+    semantics."""
+
+    permissions: dict[str, int] = Field(default_factory=dict)
+
+
+class ConsoleAclResourceIdsResponse(BaseModel):
+    """Response shape shared by the accessible/public/sole-owned
+    resource-id routes."""
+
+    resource_ids: list[str] = Field(default_factory=list)

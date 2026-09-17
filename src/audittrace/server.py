@@ -20,6 +20,7 @@ from audittrace.dependencies import (
 )
 from audittrace.logging_config import setup_logging
 from audittrace.routes import admin, audit, chat, context, health, mcp, memory, session
+from audittrace.routes.console_acl import router as console_acl_router
 from audittrace.routes.console_agents import router as console_agents_router
 from audittrace.routes.console_chat_projects import (
     router as console_chat_projects_router,
@@ -858,6 +859,17 @@ def create_app() -> FastAPI:
         console_tool_favorites_router,
         prefix="/console/tool-favorites",
         tags=["console-tool-favorites"],
+    )
+    # Sovereign Authorization Layer EPIC, WU-1 (READ PATH ONLY) — the
+    # console-ACL store's REST surface (effective-permissions/has-
+    # permission/accessible/public/sole-owned), RLS-isolated. Every
+    # answer is scoped to the caller's own resolved principal set (self
+    # + public); no write route exists yet (WU-2). Additive-only,
+    # distinct from every other /console/* mount above.
+    app.include_router(
+        console_acl_router,
+        prefix="/console/acl",
+        tags=["console-acl"],
     )
     # `/system/*` (not `/admin/*`) because Keycloak owns `/admin/*`
     # under the same Istio gateway (templates/istio/virtualservice-

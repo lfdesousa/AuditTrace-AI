@@ -25,6 +25,11 @@ from audittrace.db.postgres import (
 )
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
+from audittrace.services.console_acl import (
+    ConsoleAclEntriesService,
+    MockConsoleAclEntriesService,
+    PostgresConsoleAclEntriesService,
+)
 from audittrace.services.console_agents import (
     ConsoleAgentsService,
     MockConsoleAgentsService,
@@ -462,6 +467,13 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         )
     )
 
+    # ACL domain (Sovereign Authorization Layer EPIC, WU-1 — READ PATH
+    # ONLY, migration 031). Same session factory as console_tool_
+    # favorites above. No write method exists yet (WU-2).
+    console_acl: ConsoleAclEntriesService = PostgresConsoleAclEntriesService(
+        session_factory=pg_factory.get_session_factory(),
+    )
+
     # Memory-layer manifest (CRUD backoffice — migration 009 + the
     # /memory/<layer> REST endpoints). Postgres-backed; same session
     # factory as conversational since the table is in the same DB.
@@ -511,6 +523,7 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
     container._instances["console_agents"] = console_agents
     container._instances["console_conversation_tags"] = console_conversation_tags
     container._instances["console_tool_favorites"] = console_tool_favorites
+    container._instances["console_acl"] = console_acl
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
 
@@ -787,6 +800,17 @@ def get_console_tool_favorites_service() -> ConsoleToolFavoritesService:
 
 
 @log_call(logger=logger)
+def get_console_acl_service() -> ConsoleAclEntriesService:
+    """Get the console-ACL service (dependency injection).
+
+    Sovereign Authorization Layer EPIC, WU-1 (READ PATH ONLY) — the
+    RLS-isolated store ``routes/console_acl.py`` reads through. No
+    write path exists yet (WU-2).
+    """
+    return cast(ConsoleAclEntriesService, container._instances["console_acl"])
+
+
+@log_call(logger=logger)
 def get_procedural_service() -> ProceduralService:
     """Get procedural memory service (dependency injection). Added by
     ADR-025 Phase 2 so the ``recall_skills`` memory tool handler can
@@ -852,6 +876,7 @@ def _register_mock_memory_services() -> None:
     console_agents = MockConsoleAgentsService()
     console_conversation_tags = MockConsoleConversationTagsService()
     console_tool_favorites = MockConsoleToolFavoritesService()
+    console_acl = MockConsoleAclEntriesService()
     memory_manifest = MockMemoryManifestService()
     context_builder = DefaultContextBuilder(
         episodic=episodic,
@@ -872,6 +897,7 @@ def _register_mock_memory_services() -> None:
     container._instances["console_agents"] = console_agents
     container._instances["console_conversation_tags"] = console_conversation_tags
     container._instances["console_tool_favorites"] = console_tool_favorites
+    container._instances["console_acl"] = console_acl
     container._instances["memory_manifest"] = memory_manifest
     container._instances["context_builder"] = context_builder
     # ADR-052 — Mock trust store + Static builder pointed at a
@@ -980,5 +1006,10 @@ def create_test_container() -> DependencyContainer:
         PostgresConsoleToolFavoritesService(
             session_factory=pg_factory.get_session_factory(),
         )
+    )
+    # ACL domain (Sovereign Authorization Layer EPIC, WU-1) — same
+    # rationale as console_tool_favorites above.
+    test_container._instances["console_acl"] = PostgresConsoleAclEntriesService(
+        session_factory=pg_factory.get_session_factory(),
     )
     return test_container

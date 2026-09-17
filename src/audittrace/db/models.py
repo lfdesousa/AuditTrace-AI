@@ -24,14 +24,17 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -1160,5 +1163,221 @@ class ConsoleToolFavorite(Base):
             "item_type",
             "item_id",
             name="uq_console_tool_favorites_user_item",
+        ),
+    )
+
+
+class ConsoleAclEntry(Base):
+    """The ``console_acl_entries`` store — WU-1 (read path only) of the
+    Sovereign Authorization Layer EPIC (migration 031): AuditTrace's
+    first-party, RLS-isolated replacement for LibreChat's Mongo
+    ``AclEntry`` collection
+    (``packages/data-schemas/src/schema/aclEntry.ts``), per the ratified
+    spec (``2026-09-17-SPEC-sovereign-authorization-layer-acl-WU0-
+    ratified-candidate.md``) and its operator ratification
+    (``2026-09-18-SPEC-ADDENDUM-I-...``).
+
+    **READ PATH ONLY.** No write method touches this table in WU-1 — no
+    row exists until WU-2 lands ``grantPermission``/etc. This model and
+    migration exist so the read methods (``services/console_acl.py``)
+    have a real table + RLS policy to query against.
+
+    **RELATIONAL, never JSONB, for every access-decision column** — the
+    epic's data-modelling rule (RLS needs a real column; "prove who
+    could see this on date X" is an indexed query; a JSONB containment
+    scan cannot be shown to a regulator as an enforced control). There
+    is deliberately NO ``metadata`` JSONB column — ungrounded in the
+    live schema/any method signature (Deliverable 3).
+
+    **`principal_type` EXCLUDES ``group`` — enforced by
+    ``ck_console_acl_entries_principal_type``, a DB-level CHECK, not an
+    application-code branch** (operator ADDENDUM I ruling 1: "no
+    group-principal grant may be created or honoured on the sovereign
+    path until group membership is itself sovereign" — a config flag is
+    not an enforced control, ``feedback_config_flag_not_enforced_
+    control``). An INSERT attempting ``principal_type='group'`` is
+    refused by Postgres itself, fails closed and loudly (a raw
+    ``IntegrityError``, never a silent no-op).
+
+    **`principal_id` is polymorphic in the SOURCE** (Mongo
+    ``Schema.Types.Mixed`` — ObjectId for users, canonical string for
+    roles) — stored here as ``text`` holding the canonical string form,
+    with ``principal_model`` as the discriminator
+    (``ck_console_acl_entries_principal_model_matches_type`` pins the
+    pairing so a ROLE can never coerce into a USER row or vice versa —
+    Deliverable 4 finding #2).
+
+    **``PrincipalType.PUBLIC`` rows carry NO principal id** — modelled
+    as an explicit ``NULL`` under
+    ``ck_console_acl_entries_public_principal_null`` (never "key
+    absent" — "key missing" and "deliberately public" must be
+    distinguishable at the schema level, Deliverable 4 finding #1) PLUS
+    a partial unique index (``uq_console_acl_entries_public_resource``)
+    so at most one PUBLIC row exists per ``(resource_type,
+    resource_id)``.
+
+    **``perm_bits`` is an INTEGER bitmask** (``MAX_PERM_BITS`` = 15 =
+    ``VIEW|EDIT|DELETE|SHARE``), range-checked by
+    ``ck_console_acl_entries_perm_bits_range``. Every read method uses
+    native ``&`` containment (``(perm_bits & :bit) = :bit``) — NEVER
+    ``=`` for containment (Deliverable 4 finding #3; the live Mongo
+    ``ownerContact.js`` anti-pattern this fixes). The single documented,
+    deliberate exception is the byte-for-byte ``aggregateAclEntries``
+    site-1 fold (``get_owner_principal_ids`` in the service module),
+    which preserves the live Mongo pipeline's own exact-equality
+    semantics pending an explicit, separate operator decision — see
+    that method's docstring.
+
+    **``expired_at_ms``: filtered on read, NEVER purged** (operator
+    ADDENDUM I ruling 2). Mongo carries a live TTL index
+    (``expireAfterSeconds: 0``) with no Postgres-native equivalent; the
+    operator ruled against a scheduled purge — the retained row IS the
+    audit trail. Every AUTHORIZATION-DECISION read method (
+    ``has_permission``/``get_effective_permissions*``/
+    ``find_accessible_resources``/``find_public_resource_ids``/
+    ``get_sole_owned_resource_ids``/``get_owner_principal_ids``) filters
+    ``expired_at_ms IS NULL OR expired_at_ms > :now_ms``; the AUDIT-read
+    methods (``find_entries_by_*``) deliberately do NOT — an expired
+    grant must stay queryable for audit while being excluded from every
+    authorization decision, and those are two different queries, tested
+    separately (``tests/test_console_acl_service.py``). **Growth
+    expectation:** rows accumulate by design — no CronJob, no TTL
+    emulation, no chart change (there is deliberately no downgrade path
+    back to a purge job; a future purge would need its own, separately
+    ratified spec). ``ix_console_acl_entries_expired_at`` keeps the
+    expiry filter cheap as the table grows.
+
+    **No soft-delete.** The live Mongo schema has no soft-delete field
+    either — ``deleteAclEntries`` is a real ``deleteMany``. WU-1/WU-2
+    mirror that: revocation (WU-2) is a HARD delete; the audit row (a
+    SEPARATE mechanism, not a tombstone column here) is what preserves
+    history (invariant 8).
+
+    **RLS is NOT "owner-only"** (unlike every other console-* domain in
+    this module) — ACL rows exist precisely to let ANOTHER principal see
+    something, so the ``USING`` clause (migration 031) is:
+    ``user_sub = current_user_id() OR (principal_type='user' AND
+    principal_id = current_user_id()) OR principal_type='public'``.
+    ``tenant_id`` is carried as an ADDITIONAL column, never the isolation
+    boundary by itself (Deliverable 4 finding #4 — two users sharing a
+    ``tenant_id`` with no row naming either as owner/principal/public
+    must both see zero rows for each other's resources). The ``WITH
+    CHECK`` clause stays owner-only (``user_sub = current_user_id()``)
+    since only the resource owner may create a grant (WU-2). SQLite
+    (unit tests) has no RLS — ``PostgresConsoleAclEntriesService``
+    mirrors the SAME OR-predicate explicitly at the service layer so a
+    dropped filter is caught by the SQLite suite too
+    (``feedback_unit_tests_miss_rls``).
+
+    ``resource_id``/``resource_type`` carry no FK — same non-FK
+    cross-table-reference convention as every other console-* domain
+    (e.g. ``ConsoleAgent.project_ids``); the resource itself may live in
+    ``console_agents``, a future ``console_prompt_groups``, etc., and
+    validating the reference is explicitly out of this WU's scope.
+    """
+
+    __tablename__ = "console_acl_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    # Resource OWNER's Keycloak `sub` — the RLS anchor. No FK, same
+    # rationale as every other user_id/user_sub column in this module
+    # (§15 — identity is Keycloak-owned).
+    user_sub: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # 'user' | 'public' | 'role' — NEVER 'group' (CHECK below).
+    principal_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Canonical string form of the principal id (ObjectId-shaped for
+    # users, a role name for roles). NULL only for PUBLIC.
+    principal_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 'User' | 'Role' discriminator — NULL only for PUBLIC. Pins the
+    # principal_id round-trip so a USER and a ROLE with a
+    # textually-identical id can never coerce into one another
+    # (Deliverable 4 finding #2).
+    principal_model: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    perm_bits: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # FK-by-convention only (no real FK — AccessRole is a WU-3 store).
+    role_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Sparse — flagged by WU-0 as "confirm dead-or-live"; carried
+    # forward unused pending that confirmation, never dropped silently.
+    inherited_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The acting principal's sub at grant time (may differ from
+    # user_sub, e.g. an admin granting on another user's behalf) — WU-2
+    # stamps this from the token, never from the request body.
+    granted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    granted_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL = never expires. Filtered on every authorization-decision
+    # read (see class docstring); never purged (ruling 2).
+    expired_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # W3C-traceparent-derived trace_id from the originating request
+    # (EU AI Act Art 12 traceability) — same convention as every other
+    # console-* domain.
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "principal_type IN ('user', 'public', 'role')",
+            name="ck_console_acl_entries_principal_type",
+        ),
+        CheckConstraint(
+            "(principal_type = 'public' AND principal_id IS NULL "
+            "AND principal_model IS NULL) OR "
+            "(principal_type != 'public' AND principal_id IS NOT NULL "
+            "AND principal_model IS NOT NULL)",
+            name="ck_console_acl_entries_public_principal_null",
+        ),
+        CheckConstraint(
+            "(principal_type = 'user' AND principal_model = 'User') OR "
+            "(principal_type = 'role' AND principal_model = 'Role') OR "
+            "(principal_type = 'public' AND principal_model IS NULL)",
+            name="ck_console_acl_entries_principal_model_matches_type",
+        ),
+        CheckConstraint(
+            "perm_bits >= 0 AND perm_bits <= 15",
+            name="ck_console_acl_entries_perm_bits_range",
+        ),
+        Index(
+            "uq_console_acl_entries_public_resource",
+            "resource_type",
+            "resource_id",
+            unique=True,
+            postgresql_where=text("principal_type = 'public'"),
+            sqlite_where=text("principal_type = 'public'"),
+        ),
+        Index(
+            "ix_console_acl_entries_principal_resource",
+            "principal_id",
+            "principal_type",
+            "resource_type",
+            "resource_id",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_resource_principal",
+            "resource_id",
+            "principal_type",
+            "principal_id",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_principal_permbits",
+            "principal_id",
+            "perm_bits",
+            "resource_type",
+            "tenant_id",
+        ),
+        Index(
+            "ix_console_acl_entries_public_lookup",
+            "principal_type",
+            "resource_type",
+            "perm_bits",
+            "resource_id",
+        ),
+        Index(
+            "ix_console_acl_entries_expired_at",
+            "expired_at_ms",
         ),
     )
