@@ -6,6 +6,15 @@ Proves the store never exposes a session factory / engine attribute, that
 digging out the guarded session opener still anchors to the token-resolved
 sub, that a domain never receives the store, and that no public hook
 signature exposes a session parameter.
+
+**Fix round 1 self-attack finding (2026-09-17):** ``store._sessions`` is
+already disclosed-reachable (the test above proves the opener stays
+token-anchored even when dug out); ``TestGuardedSessionsOpenerSealed``
+below proves the SLOT ITSELF (``_sessions._open``, the closure holding the
+entire guarded-opener logic) cannot be reassigned once dug out — closing
+a second-hop mutation surface in the exact shape F1 and Guard D closed for
+the domain descriptor (``__slots__`` limits WHICH attributes may exist; it
+does not, by itself, make an existing one write-once).
 """
 
 from __future__ import annotations
@@ -13,15 +22,21 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from audittrace.db.rls import set_current_user_id
 from audittrace.identity import UserContext
-from audittrace.services.console_store import ConsoleDomain, ConsoleStoreScopeError
+from audittrace.services.console_store import (
+    ConsoleDomain,
+    ConsoleStoreScopeError,
+    ConsoleStoreSealedError,
+)
 from audittrace.services.console_store._postgres import (
     PostgresConsoleStore,
     _GuardedSessions,
 )
+from tests.console_store.support import KEY_A, _raw
 from tests.console_store_fixture_domain import SqliteHarness, WidgetDomain
 
 
@@ -85,3 +100,71 @@ class TestNoRawResourceOnTheSurface:
             params = inspect.signature(getattr(ConsoleDomain, name)).parameters
             for p in params.values():
                 assert "session" not in p.name.lower()
+
+
+class TestGuardedSessionsOpenerSealed:
+    """Guard E (fix round 1, 2026-09-17 self-attack finding). Independent
+    of Guard B (``store._sessions = evil`` — the store-level write-once
+    check): this is about the slot INSIDE the already-dug-out
+    ``_GuardedSessions`` object."""
+
+    async def test_reassigning_the_opener_slot_is_refused(
+        self, harness: SqliteHarness, alice: UserContext
+    ) -> None:
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            WidgetDomain(), harness.factory
+        )
+        original = store._sessions._open
+        with pytest.raises(ConsoleStoreSealedError, match="cannot be reassigned"):
+            store._sessions._open = lambda user_context: None  # type: ignore[assignment]
+        assert store._sessions._open is original, (
+            "the blocked reassignment attempt still took effect"
+        )
+        # Business continues normally: a real write still opens a properly
+        # token-anchored, RLS-scoped session (raw DB read as witness).
+        tracer = TracerProvider().get_tracer("guard-e-opener-reassignment")
+        with tracer.start_as_current_span("alice-write") as span:
+            row = await store.upsert(alice, KEY_A, {"payload": "alice-secret"})
+            expected_trace = format(span.get_span_context().trace_id, "032x")
+        raw = {r["id"]: r for r in await _raw(store, harness)}
+        assert raw[row["id"]]["trace_id"] == expected_trace
+
+    async def test_deleting_the_opener_slot_is_refused(
+        self, harness: SqliteHarness, alice: UserContext
+    ) -> None:
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            WidgetDomain(), harness.factory
+        )
+        with pytest.raises(ConsoleStoreSealedError, match="cannot be deleted"):
+            del store._sessions._open
+        async with store._sessions.get_session_scoped(alice) as session:
+            assert isinstance(session, AsyncSession)
+
+    async def test_neutering_the_opener_seal_lets_it_be_swapped(
+        self,
+        harness: SqliteHarness,
+        alice: UserContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-vacuity: with ``_GuardedSessions.__setattr__`` neutered to
+        plain ``object.__setattr__`` (the ORIGINAL, pre-Guard-E shape), the
+        SAME reassignment the tests above refuse instead succeeds and
+        replaces the ENTIRE token-anchored, RLS-scoped opener with
+        whatever the caller supplies — a concrete, checkable side effect: a
+        session that never pushes the RLS GUC and returns None instead of
+        a real ``AsyncSession``."""
+        monkeypatch.setattr(_GuardedSessions, "__setattr__", object.__setattr__)
+        store: PostgresConsoleStore[dict[str, Any]] = PostgresConsoleStore(
+            WidgetDomain(), harness.factory
+        )
+
+        async def _evil_open(user_context: UserContext) -> Any:
+            yield None  # never resolves a sub, never touches RLS
+
+        from contextlib import asynccontextmanager
+
+        store._sessions._open = asynccontextmanager(_evil_open)  # type: ignore[assignment]
+        async with store._sessions.get_session_scoped(alice) as session:
+            assert session is None, (
+                "neutering the seal should have let the opener be replaced"
+            )

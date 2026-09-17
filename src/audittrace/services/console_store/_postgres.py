@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import builtins
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, TypeVar, final
 
@@ -51,6 +51,7 @@ from audittrace.services.console_store._domain import ConsoleDomain
 from audittrace.services.console_store._errors import (
     ConsoleStoreCapExceededError,
     ConsoleStoreError,
+    ConsoleStoreSealedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,12 +69,35 @@ class _GuardedSessions:
     tests only) there is no RLS; the app-level ``_scoped_select`` predicate
     is the load-bearing guard there, which is why the RLS assertions also
     run against a real Postgres (``tests/test_console_store_rls_postgres``).
+
+    **F1-round self-attack finding (2026-09-17), same class as the domain
+    descriptor's "second hop": ``__slots__`` limits WHICH attributes may
+    exist, it does not make an existing one write-once.** ``store._sessions``
+    is already a disclosed-reachable object (``test_no_raw_resource.py``
+    proves the opener stays token-anchored even when dug out); before this
+    round, nothing stopped ``store._sessions._open = evil`` — an ordinary,
+    single-line reassignment of the slot holding the ENTIRE guarded-opener
+    closure, replacing token-anchoring and RLS-GUC-pushing with anything the
+    caller likes. Reproduced directly before this fix (see the build
+    record). ``__setattr__``/``__delattr__`` below refuse every attribute
+    set/delete unconditionally, mirroring :class:`~audittrace.services.
+    console_store._domain.ConsoleDomain`'s instance seal; ``__init__`` uses
+    ``object.__setattr__`` once, the same bypass every seal in this package
+    uses for its OWN one-time initialization.
+
     Residual, disclosed: ``__closure__`` introspection on the stored
-    function can recover the factory — deliberate circumvention, not a
-    hurry-mode path.
+    function can recover the factory, and direct ``object.__setattr__`` /
+    ``__dict__``-shaped access still writes — deliberate circumvention, not
+    a hurry-mode path.
     """
 
     __slots__ = ("_open",)
+
+    # Class-level annotation (not a class-level VALUE — no default is
+    # given) so mypy knows the slot exists: __init__ below assigns it via
+    # ``object.__setattr__``, not ``self._open = ...``, which is otherwise
+    # mypy's only signal that a slotted attribute is defined.
+    _open: Callable[[UserContext], AbstractAsyncContextManager[AsyncSession]]
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         @asynccontextmanager
@@ -86,7 +110,18 @@ class _GuardedSessions:
                 await set_rls_user_id(session, user_sub)
                 yield session
 
-        self._open = _open
+        object.__setattr__(self, "_open", _open)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise ConsoleStoreSealedError(
+            f"{type(self).__qualname__}.{name} is set once at construction "
+            "and cannot be reassigned"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise ConsoleStoreSealedError(
+            f"{type(self).__qualname__}.{name} cannot be deleted"
+        )
 
     def get_session_scoped(
         self, user_context: UserContext

@@ -22,10 +22,20 @@ rewritten, as the honest record of what was WIP). Answers
    file). Added one, and its neuter proof shows Guard B is ONE generalised
    check protecting BOTH `_domain` and `_sessions`, not two independent
    guards (see the per-guard table).
-3. **The withdrawn spec recommendation** — reproduced the falsifying case
+3. **Guard E (new)** — a second self-attack finding, this time on
+   `PostgresConsoleStore._sessions` rather than the domain: `store._sessions`
+   is already disclosed-reachable (`test_no_raw_resource.py`), and BEFORE
+   this round nothing stopped `store._sessions._open = evil` —
+   `__slots__` fixes WHICH attributes an object may carry, it does not, by
+   itself, make an existing one write-once. `_open` is the ENTIRE
+   guarded-opener closure (token-anchoring + RLS-GUC-push); replacing it
+   is a full RLS bypass via one ordinary line. Closed with
+   `_GuardedSessions.__setattr__`/`__delattr__`, mirroring `ConsoleDomain`'s
+   instance seal.
+4. **The withdrawn spec recommendation** — reproduced the falsifying case
    for `@dataclass(frozen=True, slots=True)` on a `ClassVar`-only domain,
    matching the addendum's claim exactly (script + captured output below).
-4. **100% coverage on `_domain.py`** — the new metaclass's non-sealed
+5. **100% coverage on `_domain.py`** — the new metaclass's non-sealed
    pass-through branch (`__delattr__`'s `super().__delattr__(name)` for a
    non-descriptor name) had no test; added one.
 
@@ -49,6 +59,7 @@ four neuters above.
 | **B** — `ConsoleStoreBase.__setattr__`'s generalised write-once check | `store._domain = evil` AND `store._sessions = evil` — ONE check, not two | Removed the `if name in self.__dict__: raise` branch entirely | `TestDomainReassignmentSealed::test_reassigning_domain_after_construction_is_refused`, `::test_domain_swap_cannot_smuggle_a_reserved_column_past_the_one_time_check`, `TestSessionsWriteOnceSealed::test_reassigning_sessions_after_construction_is_refused` — 3 failed, 10 passed | IDENTICAL | 13 passed |
 | **C** — `ConsoleStoreBase._refuse_reserved_value_columns` (point-of-use) | A domain that names a reserved column in `value_columns` via a construction path that skipped `validate_domain()` | Replaced the body with `pass` (collision check removed), leaving Guard A/B/`validate_domain()` intact | `TestReservedColumnRefusedAtPointOfUse::test_refuses_a_domain_that_bypassed_construction_validation` — 1 failed, 12 passed | IDENTICAL | 13 passed |
 | **D** — `_DomainMeta.__setattr__`/`__delattr__` (class-level, NEW this round) | `WidgetDomain.value_columns = (...)` (the SECOND HOP) | Replaced both methods' bodies with `super().__setattr__`/`super().__delattr__` pass-through | `TestDomainClassLevelSealed::test_class_level_reassignment_is_refused`, `::test_class_level_deletion_is_refused`, `::test_class_level_reassignment_would_have_nulled_trace_id`, `::test_neutering_the_class_level_seal_lets_the_mutation_through` — 4 failed, 9 passed | IDENTICAL | 13 passed |
+| **E** — `_GuardedSessions.__setattr__`/`__delattr__` (NEW this round, `_postgres.py`) | `store._sessions._open = evil` (replacing the entire guarded-opener closure) | Replaced both methods' bodies with `object.__setattr__`/`object.__delattr__` pass-through | `tests/console_store/test_no_raw_resource.py::TestGuardedSessionsOpenerSealed::test_reassigning_the_opener_slot_is_refused`, `::test_deleting_the_opener_slot_is_refused` — 2 failed, 5 passed | IDENTICAL | 7 passed |
 
 **FINDING, disclosed per the spec's own "no absolutes without proof"
 instruction:** Guard B is **REDUNDANT-BUT-EXTENDED, not two guards**. The
@@ -85,6 +96,34 @@ performs the SAME shape of proof for the new class-level exploit line
 (`ConsoleStoreSealedError`), and a subsequent real write through an active
 OTel span still stamps `trace_id` correctly, verified via a raw DB read
 (`_raw(store, harness)`), not a bare `raises` assertion.
+
+**Disclosed residual on Guard D, verified this session (not asserted):**
+`type.__setattr__(WidgetDomain, "value_columns", (...))`, called directly,
+bypasses `_DomainMeta.__setattr__` (it invokes the grandparent
+implementation, skipping the override) — same family as every other
+`object.__setattr__`/`type.__setattr__`-direct residual already disclosed
+in this package. Reproduced and immediately reverted, this session:
+
+```
+$ .venv/bin/python -c "
+from tests.console_store_fixture_domain import WidgetDomain
+print('before', WidgetDomain.value_columns)
+try:
+    WidgetDomain.value_columns = ('evil',)
+except Exception as e:
+    print('normal setattr blocked:', type(e).__name__, e)
+type.__setattr__(WidgetDomain, 'value_columns', ('evil-direct',))
+print('after type.__setattr__ direct:', WidgetDomain.value_columns)
+type.__setattr__(WidgetDomain, 'value_columns', ('payload','priority'))
+"
+before ('payload', 'priority')
+normal setattr blocked: ConsoleStoreSealedError WidgetDomain.value_columns is a domain descriptor attribute and cannot be reassigned on the class after definition
+after type.__setattr__ direct: ('evil-direct',)
+```
+
+Restored to `('payload', 'priority')` in the same script; re-ran
+`tests/console_store/test_domain_descriptor_sealed.py` immediately after
+— 14 passed, confirming no state leaked into the shared fixture domain.
 
 ## Falsifying the withdrawn spec recommendation — reproducible, not asserted
 
@@ -195,13 +234,13 @@ The hand-written `__setattr__`/`__delattr__` shipped in `26a9d85` (kept,
 not simplified) is confirmed as the correct shape by this reproduction,
 not merely argued in a docstring.
 
-## mypy / ruff / frozen-invariant checks (this session)
+## mypy / ruff / frozen-invariant checks (this session, final state incl. Guard E)
 
 ```
 $ .venv/bin/mypy src/audittrace/services/console_store/ tests/console_store/ tests/test_console_store_rls_postgres.py
 Success: no issues found in 20 source files
 
-$ .venv/bin/pre-commit run mypy --files src/audittrace/services/console_store/_domain.py tests/console_store/test_domain_descriptor_sealed.py
+$ .venv/bin/pre-commit run mypy --files src/audittrace/services/console_store/_domain.py src/audittrace/services/console_store/_postgres.py tests/console_store/test_domain_descriptor_sealed.py tests/console_store/test_no_raw_resource.py
 mypy.....................................................................Passed
 
 $ .venv/bin/ruff check src/audittrace/services/console_store/ tests/console_store/
@@ -213,12 +252,23 @@ $ .venv/bin/ruff format --check src/audittrace/services/console_store/ tests/con
 $ git diff --stat ac5f4fa -- src/audittrace/routes/ src/audittrace/dependencies.py src/audittrace/db/ charts/
 (empty)
 
-$ wc -l src/audittrace/services/console_store/_domain.py tests/console_store/test_domain_descriptor_sealed.py
+$ wc -l src/audittrace/services/console_store/_domain.py src/audittrace/services/console_store/_postgres.py tests/console_store/test_domain_descriptor_sealed.py tests/console_store/test_no_raw_resource.py
   377 src/audittrace/services/console_store/_domain.py
+  359 src/audittrace/services/console_store/_postgres.py
   452 tests/console_store/test_domain_descriptor_sealed.py
+  170 tests/console_store/test_no_raw_resource.py
 ```
 
-## Full targeted run (this session, final state, --cov-report=term-missing)
+**mypy note:** the initial Guard E shape (`object.__setattr__(self, "_open",
+_open)` in `__init__`, replacing `self._open = _open`) lost mypy's slot-
+attribute inference (`"_GuardedSessions" has no attribute "_open"` +
+`Returning Any from function declared to return AbstractAsyncContextManager`).
+Fixed by adding an explicit class-level type annotation
+(`_open: Callable[[UserContext], AbstractAsyncContextManager[AsyncSession]]`)
+— an annotation-only statement, no value, so it does not collide with
+`__slots__`. Caught and fixed before commit, not left as a gap.
+
+## Full targeted run (this session, final state incl. Guard E, --cov-report=term-missing)
 
 ```
 $ .venv/bin/pytest tests/console_store/ tests/test_console_store_rls_postgres.py \
@@ -226,16 +276,17 @@ $ .venv/bin/pytest tests/console_store/ tests/test_console_store_rls_postgres.py
     tests/test_console_tool_favorites_service.py tests/bff/test_console_tool_favorites.py \
     tests/bff/test_console_tool_favorites_scopes.py -q --cov-report=term-missing
 ...
-src/audittrace/services/console_store/_base.py                149      0     26      0   100%
+src/audittrace/services/console_store/__init__.py              9      0      0      0   100%
+src/audittrace/services/console_store/_base.py                149      0     46      0   100%
 src/audittrace/services/console_store/_context.py               42      0      6      0   100%
 src/audittrace/services/console_store/_cursor.py                55      0     20      0   100%
 src/audittrace/services/console_store/_domain.py               108      0      8      0   100%
 src/audittrace/services/console_store/_errors.py                11      0      0      0   100%
 src/audittrace/services/console_store/_mock.py                 107      0     24      0   100%
-src/audittrace/services/console_store/_postgres.py             149      0     26      0   100%
+src/audittrace/services/console_store/_postgres.py             154      0     26      0   100%
 src/audittrace/services/console_store/_sealing.py                36      0     12      0   100%
 src/audittrace/services/console_tool_favorites.py                65      0      6      0   100%
-============================= 279 passed in 43.05s =============================
+============================= 282 passed in 53.62s =============================
 ```
 
 Real-Postgres RLS (Docker, `postgres:16` ephemeral container, non-superuser
@@ -251,11 +302,13 @@ Ran, this session (not asserted from memory):
 $ grep -noE "\b(cannot|never|un-?enumerated)\b.{0,80}" \
     src/audittrace/services/console_store/_domain.py \
     src/audittrace/services/console_store/_base.py \
+    src/audittrace/services/console_store/_postgres.py \
     tests/console_store/test_domain_descriptor_sealed.py \
-    tests/console_store/test_sealed_classes.py
+    tests/console_store/test_sealed_classes.py \
+    tests/console_store/test_no_raw_resource.py
 ```
 
-53 hits. Read every one: each is either (a) describing what a NAMED,
+59 hits. Read every one: each is either (a) describing what a NAMED,
 TESTED guard refuses, immediately followed by or adjacent to the test that
 establishes it (e.g. `"...cannot be reassigned on the class after
 definition"` — Guard D's error message, proven in the per-guard table
@@ -269,3 +322,21 @@ evidence (`review-verdict-consolestorebase-wu-a-20260915`,
 exactly once", "can never be superseded", "left un-enumerated", "no
 un-enumerated". This check is itself falsifiable and was actually run
 (command above), not asserted.
+
+## Full `make test` (whole suite, ~19 min, this session)
+
+Run 1 (state: commit `2c851e8`, i.e. Guard A/B/C/D closed, Guard E not yet
+added):
+
+```
+================= 5379 passed, 2 warnings in 926.55s (0:15:26) =================
+🔒 Enforcing per-file coverage gate (each component >= 90%)...
+per-file coverage gate: PASS (153 files checked, lines >= 90%, branches >= 90% on 129 file(s) with branches)
+🚫 Enforcing zero-skip policy...
+[no-skip-check] No skipped tests in junit.xml. Good.
+✅ Tests passed
+```
+
+Run 2 (final state, Guard E included) is captured in the build record
+logged to the memory server — see that record for the final `make test`
+summary line, since Guard E was added and committed after this run.
