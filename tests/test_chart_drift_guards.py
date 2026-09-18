@@ -4038,9 +4038,13 @@ class TestAllScopesRegisteredInControlPlane:
     provisioner script — a scope Keycloak can never mint, permanently
     403ing every route that requires it, with no operator fix short of
     a code change. Only hand-written PER-SCOPE tests caught prior
-    instances of this class (#370); this guard closes it generically so
-    the NEXT new scope cannot repeat F1 even if nobody remembers to add
-    a bespoke governance class for it.
+    instances of this class (#370); sub-invariants 1 and 2 below close
+    the two REALM axes of that class generically. Sub-invariant 3 does
+    **NOT** close the PROVISIONER axis generically — see its own
+    docstring and the "Residual risk" paragraph below; this was
+    overclaimed in fix round 1's commit message (``14711b3``, since
+    corrected — see the fix-round-2 commit) and in an earlier draft of
+    this docstring.
 
     Three sub-invariants, each independently falsifiable:
 
@@ -4051,14 +4055,38 @@ class TestAllScopesRegisteredInControlPlane:
        optional) to at least one client in BOTH realm files — a scope
        that is declared but bound to nobody is exactly as unmintable as
        one that was never declared.
-    3. **Provisioner parity** — the combined ensure-loop array set (the
-       union of every ``*_SCOPES`` array folded into the
-       ``for SCOPE in ... ; do`` "ensure each scope exists" loop) is
-       IDENTICAL between ``scripts/setup-memory-scopes.sh`` and the
-       chart's in-cluster Job ConfigMap — this generalises the many
-       hand-written ``test_provisioner_arrays_match_and_exact`` guards
-       above into one check that also covers any FUTURE domain nobody
-       wrote a bespoke class for.
+    3. **Provisioner parity ONLY — NOT an ``ALL_SCOPES`` membership
+       check.** The combined ensure-loop array set (the union of every
+       ``*_SCOPES`` array folded into the ``for SCOPE in ... ; do``
+       "ensure each scope exists" loop) is IDENTICAL between
+       ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+       ConfigMap — this generalises the many hand-written
+       ``test_provisioner_arrays_match_and_exact`` guards above into one
+       check that the TWO PROVISIONERS AGREE WITH EACH OTHER. It never
+       asserts ``ALL_SCOPES ⊆ (script_union | cm_union)``, and
+       deliberately so: several genuine ``ALL_SCOPES`` entries (the core
+       chat/query/audit scopes — ``audittrace:query``,
+       ``audittrace:context``, ``audittrace:index``, ``audittrace:audit``,
+       ``audittrace:scan:retrigger``, ``memory:episodic:read``,
+       ``memory:procedural:read``, ``memory:upload:write``) legitimately
+       belong to NO memory-scopes provisioner at all; forcing them into
+       ``setup-memory-scopes.sh`` to satisfy a strict subset check would
+       be a worse outcome than an honest, narrower parity-only guard.
+
+       **Residual risk (explicit, not closed by this class):** a FUTURE
+       scope added to ``ALL_SCOPES`` AND declared in both realm files
+       AND bound to a client (satisfying sub-invariants 1 and 2) but
+       added to NEITHER provisioner script's ``*_SCOPES`` arrays passes
+       this class's sub-invariant 3 outright — the two provisioners
+       still agree (both omit it). On a FRESH cluster the realm import
+       mints the clientScope and the omission is invisible; on an
+       EXISTING cluster upgraded via the provisioner Job (the only path
+       that runs post-install), the scope is never created and any
+       route that requires it 403s permanently — this is F1's exact
+       failure mode, on the upgrade path, surviving this guard. Closing
+       it requires a per-scope ownership map (which provisioner, if
+       any, owns each ``ALL_SCOPES`` entry) and is tracked as a
+       follow-up WU, not attempted here.
 
     **Non-vacuity, proved by hand during the fix round** (not
     re-executed by this class, which would be a guard testing itself):
