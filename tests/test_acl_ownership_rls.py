@@ -45,6 +45,46 @@ test's before/after evidence, plus §2's H-1/H-2 hypotheses:**
    refused at the DB layer too (fail-closed parity with
    ``services/console_acl/_ownership.py``); the SELECT contract
    (WU-1's read path) is unchanged.
+
+**Fix round 1 additions (spec §3.4's UPDATE case, F1/F2/F3 of the
+reviewer's REJECT):**
+
+3. **UPDATE-side ``resource_id`` escalation** — the sibling of §1's
+   INSERT escalation, proven per resolved resource_type individually
+   (``test_update_resource_id_escalation_is_blocked_for_agent``/
+   ``..._for_prompt_group``) plus its 'before' counterpart
+   (``test_update_resource_id_hijack_via_legitimately_owned_row``). The
+   original build's real-Postgres suite proved INSERT and DELETE but
+   never exercised this UPDATE case behaviourally — a reviewer neuter
+   of migration 032's UPDATE ownership subquery only went RED on a
+   rendered-SQL TEXT pin (``test_console_acl_ownership_migration.py``),
+   with all 11 real-Postgres tests staying GREEN. A text pin is not a
+   behavioural guard; these tests are.
+4. **The corrected H-2 story** — ``test_h2_general_takeover_blocked_
+   even_when_attacker_repoints_to_owned_resource`` replaces a FALSE
+   claim an earlier evidence draft made (that the UPDATE ``WITH CHECK``
+   ownership subquery makes the owner-only ``USING`` clause "redundant"
+   for H-2). It is not: an attacker who ALSO repoints ``resource_id``
+   to a resource they legitimately own satisfies the ownership
+   subquery too, so ``WITH CHECK`` alone would pass that combination.
+   The owner-only ``USING`` clause is the ONLY general defence against
+   ACL-row ownership takeover; this test proves it directly.
+5. **The public-resource-squatting DoS variant** (a bonus finding) —
+   ``uq_console_acl_entries_public_resource`` allows at most one public
+   row per resource; before this WU an attacker's escalation-INSERT
+   could squat a victim's resource FIRST, so the victim's own
+   legitimate public grant then fails on the unique constraint
+   (``test_resource_squatting_blocks_the_legitimate_owner``). Closed as
+   a side effect of closing the escalation itself
+   (``test_squatting_is_prevented_so_the_owner_can_still_grant_publicly``).
+
+**What "unbypassable" means here, precisely.** This file proves
+migration 032 is unbypassable WHERE POSTGRES RLS IS ENFORCED — that is
+what a real, non-superuser-role-gated Postgres demonstrates. It does
+NOT, and cannot, prove anything about whether RLS is actually enforced
+at runtime on any given deployment; that is an operational property of
+the target cluster, not of this migration. See the build record for
+the open, out-of-scope production finding this qualifies.
 """
 
 from __future__ import annotations
@@ -388,6 +428,43 @@ async def _seed_owner_resources(factory: Any) -> None:
         await session.commit()
 
 
+async def _seed_attacker_resources(factory: Any) -> None:
+    """Attacker creates one agent and one prompt group, each owned by
+    ``_ATTACKER`` — used by the UPDATE-side resource_id-escalation tests
+    (fix round 1, F1): the attacker legitimately owns THESE resources,
+    so a grant naming them passes the ownership subquery at INSERT
+    time; the attack under test is UPDATE-ing that legitimate row's
+    ``resource_id`` to point at a resource the attacker does NOT own."""
+    agents = Base.metadata.tables["console_agents"]
+    groups = Base.metadata.tables["console_prompt_groups"]
+    async with factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": _ATTACKER},
+        )
+        await session.execute(
+            insert(agents).values(
+                id="agent-row-attacker",
+                agent_id="agent-attacker",
+                user_sub=_ATTACKER,
+                name="Attacker's Own Agent",
+                created_at_ms=0,
+                updated_at_ms=0,
+            )
+        )
+        await session.execute(
+            insert(groups).values(
+                id="group-row-attacker",
+                group_id="group-attacker",
+                user_sub=_ATTACKER,
+                name="Attacker's Own Group",
+                created_at_ms=0,
+                updated_at_ms=0,
+            )
+        )
+        await session.commit()
+
+
 async def _insert_grant(
     factory: Any,
     *,
@@ -462,6 +539,24 @@ async def _current_owner(factory: Any, as_user: str, row_id: str) -> str:
         )
         result = await session.execute(
             text("SELECT user_sub FROM console_acl_entries WHERE id = :id"),
+            {"id": row_id},
+        )
+        return str(result.scalar_one())
+
+
+async def _current_resource_id(factory: Any, as_user: str, row_id: str) -> str:
+    """The row's ACTUAL ``resource_id`` column value, read as
+    ``as_user`` — same rationale as :func:`_current_owner`, applied to
+    the OTHER field an ownership-takeover attack can move (fix round 1,
+    F1/F2): visibility alone cannot distinguish "resource_id unchanged"
+    from "resource_id was hijacked to point elsewhere"."""
+    async with factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": as_user},
+        )
+        result = await session.execute(
+            text("SELECT resource_id FROM console_acl_entries WHERE id = :id"),
             {"id": row_id},
         )
         return str(result.scalar_one())
@@ -565,6 +660,83 @@ class TestBeforeFix:
             == _ATTACKER
         ), "H-2 confirmed: the row's user_sub column now names the attacker"
 
+    async def test_update_resource_id_hijack_via_legitimately_owned_row(
+        self, app_factory_before: Any
+    ) -> None:
+        """Fix round 1, F1: the UPDATE-side sibling of §1's INSERT
+        escalation. Attacker creates a grant naming a resource they
+        LEGITIMATELY own (``agent-attacker``), then UPDATEs that SAME
+        row's ``resource_id`` to point at the victim's resource
+        (``agent-1``) instead — migration 031's WITH CHECK only
+        re-checks ``user_sub`` (unchanged here), never ``resource_id``,
+        so the hijack succeeds."""
+        await _seed_owner_resources(app_factory_before)
+        await _seed_attacker_resources(app_factory_before)
+        await _insert_grant(
+            app_factory_before,
+            as_user=_ATTACKER,
+            row_id="attacker-owned-row",
+            user_sub=_ATTACKER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-attacker",
+        )
+        async with app_factory_before() as session:
+            await session.execute(
+                text("SELECT set_config('app.current_user_id', :uid, true)"),
+                {"uid": _ATTACKER},
+            )
+            result = await session.execute(
+                text(
+                    "UPDATE console_acl_entries SET resource_id = 'agent-1' "
+                    "WHERE id = 'attacker-owned-row'"
+                )
+            )
+            await session.commit()
+        assert result.rowcount == 1, (
+            "UPDATE-side escalation confirmed: attacker hijacked their own "
+            "row's resource_id onto the victim's resource"
+        )
+        assert (
+            await _current_resource_id(
+                app_factory_before, _ATTACKER, "attacker-owned-row"
+            )
+            == "agent-1"
+        )
+
+    async def test_resource_squatting_blocks_the_legitimate_owner(
+        self, app_factory_before: Any
+    ) -> None:
+        """Bonus finding (reviewer, fix round 1): ``uq_console_acl_
+        entries_public_resource`` allows at most ONE public row per
+        ``(resource_type, resource_id)``. Since §1's escalation lets an
+        attacker insert a PUBLIC grant on a resource they do not own,
+        an attacker can 'squat' the victim's resource FIRST — and the
+        victim's own, entirely legitimate attempt to create their own
+        public grant on their own resource then fails with a unique-
+        constraint violation. A DoS variant of the same root cause,
+        not a separate hole."""
+        await _seed_owner_resources(app_factory_before)
+        await _insert_grant(
+            app_factory_before,
+            as_user=_ATTACKER,
+            row_id="squatter-row",
+            user_sub=_ATTACKER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-1",  # owned by _OWNER — the squat
+        )
+        with pytest.raises(DBAPIError):
+            await _insert_grant(
+                app_factory_before,
+                as_user=_OWNER,
+                row_id="legitimate-owner-row",
+                user_sub=_OWNER,
+                principal_type="public",
+                resource_type="agent",
+                resource_id="agent-1",
+            )
+
 
 # ═══════════════════════════ AFTER — migration 032 ══════════════════════════
 
@@ -662,6 +834,137 @@ class TestAfterFix:
         assert (
             await _current_owner(app_factory_after, _OWNER, "public-row-2") == _OWNER
         ), "ownership unchanged: the row's user_sub column still names the owner"
+
+    async def test_h2_general_takeover_blocked_even_when_attacker_repoints_to_owned_resource(
+        self, app_factory_after: Any
+    ) -> None:
+        """Fix round 1, F2 correction: the ORIGINAL H-2 test above only
+        varies ``user_sub`` while leaving ``resource_id`` pointed at the
+        victim's resource — which the ownership subquery alone WOULD
+        catch, and an earlier draft of this evidence wrongly generalised
+        that into "the WITH CHECK ownership subquery makes the owner-
+        only USING clause redundant for H-2". That claim is FALSE: an
+        attacker who ALSO repoints ``resource_id`` to a resource they
+        legitimately own (here, ``agent-attacker``) satisfies the
+        ownership subquery too, so WITH CHECK alone would pass this
+        combination. This test proves what actually stops it: the
+        owner-only ``USING`` clause denies the attacker even SELECTing
+        the victim-owned row for UPDATE in the first place, regardless
+        of what the SET clause contains — the ownership subquery is
+        never even reached."""
+        await _seed_owner_resources(app_factory_after)
+        await _seed_attacker_resources(app_factory_after)
+        await _insert_grant(
+            app_factory_after,
+            as_user=_OWNER,
+            row_id="public-row-3",
+            user_sub=_OWNER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        async with app_factory_after() as session:
+            await session.execute(
+                text("SELECT set_config('app.current_user_id', :uid, true)"),
+                {"uid": _ATTACKER},
+            )
+            result = await session.execute(
+                text(
+                    "UPDATE console_acl_entries "
+                    "SET user_sub = :attacker, resource_id = 'agent-attacker' "
+                    "WHERE id = 'public-row-3'"
+                ),
+                {"attacker": _ATTACKER},
+            )
+            await session.commit()
+        assert result.rowcount == 0, (
+            "the general takeover (repointing BOTH user_sub AND resource_id "
+            "to something the attacker owns) is still blocked by USING alone"
+        )
+        assert await _current_owner(app_factory_after, _OWNER, "public-row-3") == _OWNER
+        assert (
+            await _current_resource_id(app_factory_after, _OWNER, "public-row-3")
+            == "agent-1"
+        )
+
+    async def test_update_resource_id_escalation_is_blocked_for_agent(
+        self, app_factory_after: Any
+    ) -> None:
+        """Fix round 1, F1 (blocking): the UPDATE-side sibling of the
+        INSERT escalation, proven per resolved resource_type
+        individually. Attacker creates a grant naming a resource they
+        LEGITIMATELY own (passes the INSERT-time ownership subquery),
+        then tries to UPDATE that same row's ``resource_id`` onto the
+        victim's resource. The RED this guards against lands on the
+        refused write (a real DBAPIError) or the row's resource_id
+        VALUE — never on rendered SQL text."""
+        await _seed_owner_resources(app_factory_after)
+        await _seed_attacker_resources(app_factory_after)
+        await _insert_grant(
+            app_factory_after,
+            as_user=_ATTACKER,
+            row_id="attacker-owned-row",
+            user_sub=_ATTACKER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-attacker",
+        )
+        with pytest.raises(DBAPIError, match="row-level security"):
+            async with app_factory_after() as session:
+                await session.execute(
+                    text("SELECT set_config('app.current_user_id', :uid, true)"),
+                    {"uid": _ATTACKER},
+                )
+                await session.execute(
+                    text(
+                        "UPDATE console_acl_entries SET resource_id = 'agent-1' "
+                        "WHERE id = 'attacker-owned-row'"
+                    )
+                )
+                await session.commit()
+        assert (
+            await _current_resource_id(
+                app_factory_after, _ATTACKER, "attacker-owned-row"
+            )
+            == "agent-attacker"
+        ), "the row's resource_id must remain the attacker's own agent"
+
+    async def test_update_resource_id_escalation_is_blocked_for_prompt_group(
+        self, app_factory_after: Any
+    ) -> None:
+        """Per resolved resource_type, individually (same rationale as
+        the agent variant above) — a dead ownership check for JUST
+        promptGroup on UPDATE must not hide behind agent's pass."""
+        await _seed_owner_resources(app_factory_after)
+        await _seed_attacker_resources(app_factory_after)
+        await _insert_grant(
+            app_factory_after,
+            as_user=_ATTACKER,
+            row_id="attacker-owned-group-row",
+            user_sub=_ATTACKER,
+            principal_type="public",
+            resource_type="promptGroup",
+            resource_id="group-attacker",
+        )
+        with pytest.raises(DBAPIError, match="row-level security"):
+            async with app_factory_after() as session:
+                await session.execute(
+                    text("SELECT set_config('app.current_user_id', :uid, true)"),
+                    {"uid": _ATTACKER},
+                )
+                await session.execute(
+                    text(
+                        "UPDATE console_acl_entries SET resource_id = 'group-1' "
+                        "WHERE id = 'attacker-owned-group-row'"
+                    )
+                )
+                await session.commit()
+        assert (
+            await _current_resource_id(
+                app_factory_after, _ATTACKER, "attacker-owned-group-row"
+            )
+            == "group-attacker"
+        ), "the row's resource_id must remain the attacker's own group"
 
     async def test_owner_can_still_grant_on_their_own_agent(
         self, app_factory_after: Any
@@ -765,3 +1068,42 @@ class TestAfterFix:
         assert await _row_count(app_factory_after, _VIEWER, where_private) == 1
         assert await _row_count(app_factory_after, _ATTACKER, where_private) == 0
         assert await _row_count(app_factory_after, None, where_private) == 0
+
+    async def test_squatting_is_prevented_so_the_owner_can_still_grant_publicly(
+        self, app_factory_after: Any
+    ) -> None:
+        """Bonus finding (reviewer, fix round 1) — the AFTER half of
+        the squatting DoS variant: the attacker's squat attempt itself
+        is refused (the same escalation-INSERT guard, already proven
+        above), so it never occupies
+        ``uq_console_acl_entries_public_resource``'s one-public-row
+        slot and the legitimate owner's own public grant succeeds
+        without a unique-constraint conflict."""
+        await _seed_owner_resources(app_factory_after)
+        with pytest.raises(DBAPIError, match="row-level security"):
+            await _insert_grant(
+                app_factory_after,
+                as_user=_ATTACKER,
+                row_id="squatter-row",
+                user_sub=_ATTACKER,
+                principal_type="public",
+                resource_type="agent",
+                resource_id="agent-1",  # owned by _OWNER — the squat attempt
+            )
+        # The squat never landed — the owner's own public grant on the
+        # SAME resource_id now succeeds cleanly.
+        await _insert_grant(
+            app_factory_after,
+            as_user=_OWNER,
+            row_id="legitimate-owner-row",
+            user_sub=_OWNER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        assert (
+            await _row_count(
+                app_factory_after, _OWNER, "WHERE id = 'legitimate-owner-row'"
+            )
+            == 1
+        )
