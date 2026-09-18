@@ -45,6 +45,13 @@ ENDPOINTS = {
     "chat": SCRIPTS_DIR / "start-chat-llama.sh",
     "embed": SCRIPTS_DIR / "start-embed-llama.sh",
     "summarizer": SCRIPTS_DIR / "start-summarizer-llama.sh",
+    # review round 1 F8: the enumeration (`systemctl list-unit-files
+    # 'llama-*'`, never `list-units`, which hides `disabled` units) found
+    # two more llama-server units on this host that were "one `systemctl
+    # start` away" from an unauthenticated endpoint. Same effective-
+    # invocation proof applies to their launchers.
+    "fleet": SCRIPTS_DIR / "start-fleet-llama.sh",
+    "mistral": SCRIPTS_DIR / "start-mistral-llama.sh",
 }
 
 _LOCK_LIB_ANCHOR = 'LLAMA_LOCK_FLAGS=(--host 127.0.0.1 --api-key-file "$LLAMA_API_KEY_FILE" --no-webui)'
@@ -93,6 +100,10 @@ def _run_launcher(
     file — the fail-closed path)."""
     model = tmp_path / "model.gguf"
     model.touch()
+    # start-fleet-llama.sh additionally requires a chat-template file;
+    # harmless to always provide it (the other launchers ignore the var).
+    chat_template = tmp_path / "template.jinja"
+    chat_template.touch()
     capture = tmp_path / "capture.txt"
     if key_file is None:
         key_file = _make_key_file(tmp_path)
@@ -100,6 +111,7 @@ def _run_launcher(
         **os.environ,
         "LLAMA_BIN": str(_make_stub_llama_bin(tmp_path)),
         "MODEL_PATH": str(model),
+        "CHAT_TEMPLATE": str(chat_template),
         "LLAMA_API_KEY_FILE": str(key_file),
         "CAPTURE_FILE": str(capture),
     }

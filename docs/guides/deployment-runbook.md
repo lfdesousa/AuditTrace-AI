@@ -141,10 +141,18 @@ for semantic search.
 
 ## Step 10: Start LLM servers
 
-⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** every
-llama-server on this host binds `127.0.0.1` (never `0.0.0.0`), requires
+⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** every launcher
+script below binds `127.0.0.1` (never `0.0.0.0`), requires
 `--api-key-file` (never a literal key — `ps` can read argv), and disables
-the web UI (`--no-webui`). Provision the shared key file once:
+the web UI (`--no-webui`) — **once you have actually installed the
+locked-down units.** This is the intended, tested end state, not a
+standing fact about a host you haven't applied it to yet: a host still
+running its pre-WU-4 units (or a systemd drop-in that re-declares
+`ExecStart=` with `--host 0.0.0.0` — see
+`scripts/apply-llama-endpoint-locks.sh`'s drop-in reconciliation step) is
+still fully exposed until `scripts/apply-llama-endpoint-locks.sh` runs and
+`systemctl show -p ExecStart <unit>` (the EFFECTIVE value, never the unit
+file's text) confirms it. Provision the shared key file once:
 
 ```bash
 install -d -m700 "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"
@@ -205,14 +213,29 @@ curl -sk -H "Authorization: Bearer $BEARER" \
     https://localhost/interactions?limit=5 | jq .
 ```
 
-**M3 WU-4 lock verification** (each llama-server, loopback only from here on):
+**M3 WU-4 lock verification** (each llama-server, loopback only once locked):
 
 ```bash
 ss -ltnp | grep -E ':(11435|11436|11437)'   # must show 127.0.0.1, never 0.0.0.0
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11435/v1/models   # 401, no key
-curl -s -o /dev/null -w '%{http_code}\n' \
+systemctl show -p ExecStart llama-server    # the EFFECTIVE value — a
+                                             # conflicting drop-in can make
+                                             # the unit FILE lie about this
+
+# ⚠ do NOT verify against `GET /v1/models` (or `/health`) — llama.cpp
+# keeps both public even with an API key configured (upstream behaviour,
+# not a gap; see docs/ADR-030-session-summarizer.md's "known exceptions").
+# A correctly-locked server returns 200 there, so it cannot tell you the
+# lock is live — it would read a correct lock as a failure. Use a real
+# inference call instead:
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}' \
+    http://127.0.0.1:11435/v1/chat/completions                              # 401, no key
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
     -H "Authorization: Bearer $(cat "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"/llama-api-key.txt)" \
-    http://127.0.0.1:11435/v1/models                                        # 200, keyed
+    -H 'Content-Type: application/json' \
+    -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}' \
+    http://127.0.0.1:11435/v1/chat/completions                              # 200, keyed
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11435/            # 404, webui disabled
 ```
 

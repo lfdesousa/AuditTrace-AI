@@ -34,6 +34,14 @@ MODEL_PATH="${MODEL_PATH:-$HOME/models/Qwen_Qwen3.8-27B-Q4_K_M.gguf}"
 PORT="${PORT:-11435}"
 CTX_SIZE="${CTX_SIZE:-163840}"
 GPU_LAYERS="${GPU_LAYERS:-99}"
+# review round 1 F10: with no --alias, llama-server's permanently-public
+# `/v1/models` (see llama-lock-flags.lib.sh's header — that endpoint is
+# public even when locked, an upstream exception) falls back to the raw
+# --model PATH as the model id, disclosing the local username, the model
+# name, AND its quantisation to anyone on the endpoint's network. The
+# embed launcher already avoided this (--alias nomic-embed-text); give
+# chat the same parity.
+ALIAS="${ALIAS:-qwen3.8-27b}"
 
 if [[ ! -x "$LLAMA_BIN" ]]; then
   echo "error: llama-server binary not found at $LLAMA_BIN" >&2
@@ -56,4 +64,5 @@ exec "$LLAMA_BIN" \
   --threads 8 --metrics \
   --reasoning-format none \
   --jinja \
-  --spec-type draft-mtp --spec-draft-n-max 4
+  --spec-type draft-mtp --spec-draft-n-max 4 \
+  --alias "$ALIAS"

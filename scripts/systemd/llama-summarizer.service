@@ -13,10 +13,16 @@
 # should make — but it is a PERFORMANCE/behaviour change, and this WU's
 # explicit scope is "who may reach the endpoint, nothing about what it
 # computes." So this reference unit's ExecStart matches TODAY's live
-# flags byte-for-byte and only appends the three locks; the script
-# (already fixed in this WU per the spec's defect description) stays
-# available as a documented, tested, DIFFERENT invocation for whenever
-# that separate drift gets its own fix.
+# flags byte-for-byte plus FOUR additions, not three: the locks (host,
+# api-key-file, no-webui) AND --alias (review round 1 F10 — with no
+# --alias, the permanently-public `/v1/models` disclosed the raw --model
+# PATH, i.e. this host's username, model name, AND quantisation; --alias
+# is a disclosure decision, not a computation one, so it stayed in scope
+# for a security-only WU unlike the ctx-size/cache-type/batch-size drift
+# below). The script (already fixed in this WU per the spec's defect
+# description) stays available as a documented, tested, DIFFERENT
+# invocation for whenever that separate performance drift gets its own
+# fix.
 
 [Unit]
 Description=llama.cpp Summariser Server (Mistral 7B — M3 WU-4 isolation locks)
@@ -29,23 +35,30 @@ Group=lfdesousa
 
 ExecStartPre=/usr/local/bin/wait-for-vulkan-gpu.sh
 
-# Byte-for-byte the current live unit's flags (verified via
-# `systemctl cat llama-summarizer` at WU-4 build time) plus the three
-# locks — LLAMA_API_KEY_FILE resolves via scripts/llama-lock-flags.lib.sh's
-# same default as the other two units, sourced through an inline exec
-# here rather than the script (see the scope note above), so lock 2
-# still fails closed with the same clear error if the key file is
-# missing.
+# Byte-for-byte the current live unit's flags AND binary (verified via
+# `systemctl show -p ExecStart llama-summarizer` at fix-round-1 time:
+# review round 1 F2 caught that this file previously pointed at
+# ~/opt/llamacpp/llama-server — an OLDER ROCm build, 8568, March — while
+# the live process actually runs the SAME Vulkan build every other unit
+# on this host does, ~/build/llama.cpp/build-vulkan-new/bin/llama-server,
+# build 10288. That is a backend swap on a unit whose own scope note
+# says it changes "nothing about what it computes" — fixed by pointing
+# at the live binary) plus the three locks — LLAMA_API_KEY_FILE resolves
+# via scripts/llama-lock-flags.lib.sh's same default as the other two
+# units, sourced through an inline exec here rather than the script (see
+# the scope note above), so lock 2 still fails closed with the same
+# clear error if the key file is missing.
 Environment=LLAMA_API_KEY_FILE=/home/lfdesousa/work/audittrace-private/secrets/llama-api-key.txt
 ExecStart=/bin/bash -c '\
   set -euo pipefail; \
   KEY_FILE="${LLAMA_API_KEY_FILE}"; \
   if [[ ! -f "$KEY_FILE" ]]; then echo "error: llama API key file not found at $KEY_FILE" >&2; exit 1; fi; \
-  exec /home/lfdesousa/opt/llamacpp/llama-server \
+  exec /home/lfdesousa/build/llama.cpp/build-vulkan-new/bin/llama-server \
     --model /home/lfdesousa/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf \
     --ctx-size 8192 \
     --n-gpu-layers 10 \
     --host 127.0.0.1 --api-key-file "$KEY_FILE" --no-webui \
+    --alias mistral-7b-summarizer \
     --port 11437'
 
 Restart=on-failure

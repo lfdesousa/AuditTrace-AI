@@ -1,0 +1,53 @@
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18) — REFERENCE COPY.
+# See scripts/systemd/llama-server.service's header for the install
+# process.
+#
+# review round 1, F8: this unit is currently `disabled`
+# (`systemctl list-unit-files 'llama-*'`), so `scripts/apply-llama-
+# endpoint-locks.sh` installs this LOCKED definition without starting or
+# enabling it — a future `systemctl start llama-mistral-server` now comes
+# up locked instead of on `--host 0.0.0.0` with no key and no
+# `--no-webui`.
+#
+# ⚠ Known, pre-existing, out-of-scope conflict (not introduced by this
+# WU): this unit's port (11437) collides with the currently-ACTIVE
+# llama-summarizer.service. This WU only adds isolation locks; it does
+# not renumber ports or resolve the collision.
+#
+# Behavioural change from the pre-WU-4 unit: NONE (same model,
+# quantisation, ROCm env vars, GPU offload, context size). Security
+# change ONLY: bind 127.0.0.1, require --api-key-file, disable the web
+# UI, and set --alias (all four in scripts/start-mistral-llama.sh, which
+# now OWNS the ExecStart flags; the ROCm Environment= directives below
+# stay here since the script does not need to know about them — see that
+# script's header).
+
+[Unit]
+Description=llama.cpp Server (Mistral-Small-3.1-24B :11437) — A/B testing (ADR-015) — M3 WU-4 isolation locks
+After=network.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+# ROCm — mirrors llama-server.service (required for gfx1151)
+Environment="GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+Environment="HSA_OVERRIDE_GFX_VERSION=11.5.1"
+Environment="GPU_MAX_HEAP_SIZE=100"
+Environment="GPU_MAX_ALLOC_PERCENT=100"
+
+# All flags (model, ctx, GPU offload, AND the four isolation locks) live
+# in the script now — see its header for every env var override.
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/start-mistral-llama.sh
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-mistral-server
+
+[Install]
+WantedBy=multi-user.target

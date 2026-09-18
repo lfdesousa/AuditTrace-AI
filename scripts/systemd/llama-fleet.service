@@ -1,0 +1,43 @@
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18) — REFERENCE COPY.
+# See scripts/systemd/llama-server.service's header for the install
+# process.
+#
+# review round 1, F8: this unit is currently `disabled`
+# (`systemctl list-unit-files 'llama-*'`), so `scripts/apply-llama-
+# endpoint-locks.sh` installs this LOCKED definition without starting or
+# enabling it — a future `systemctl start llama-fleet` now comes up
+# locked instead of on `--host 0.0.0.0` with no key and no `--no-webui`.
+#
+# Behavioural change from the pre-WU-4 unit: NONE (same model, same
+# quantisation, same GPU offload, same chat template). Security change
+# ONLY: bind 127.0.0.1, require --api-key-file, disable the web UI, and
+# set --alias (all four in scripts/start-fleet-llama.sh, which now OWNS
+# the ExecStart flags).
+
+[Unit]
+Description=llama.cpp Server (Mistral-Small-3.1-24B fleet builder - Vulkan Backend, tool-calling — M3 WU-4 isolation locks)
+# Mirror of llama-server.service (Qwen). Serves the SDLC-fleet
+# builder/reviewer with real tool-calling on the Vulkan build. Co-resides
+# with the prod trio (~16.5 GB @ 32k ctx; ~45 GB total of 64 GB unified).
+# See runbooks/15.
+After=network.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+# Same GPU-or-nothing guard as prod: block until Vulkan enumerates the
+# iGPU, else the model silently loads on CPU (10-40x slower).
+ExecStartPre=/usr/local/bin/wait-for-vulkan-gpu.sh
+
+# All flags (model, ctx, GPU offload, chat template, AND the four
+# isolation locks) live in the script now — see its header for every env
+# var override.
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/start-fleet-llama.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

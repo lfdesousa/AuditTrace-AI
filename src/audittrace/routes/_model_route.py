@@ -16,6 +16,25 @@ interactive chat path, rather than inventing a parallel mechanism.
 Kept as a standalone module — deliberately pure and side-effect free —
 so it carries its own ≥90% per-file coverage independent of the much
 larger ``chat.py``/``_memory_tool_loop.py`` call sites that consume it.
+
+**Disclosed, deliberately deferred gap (M3 WU-4 review round 1, F11,
+non-blocking).** Every ``chat.py`` call site sends ``settings.
+llama_api_key`` (ONE shared key) regardless of which upstream this
+function resolves to — so a ``model_routes`` entry pointing at a
+different host, including a hypothetical third-party upstream, would
+receive the SAME bearer credential the primary ``llama_url`` endpoint
+uses. Today's actual ``model_routes`` values are other locked-down
+endpoints on this SAME host and SAME trust boundary (``llama-fleet``
+``:11438``, ``llama-mistral-server`` ``:11437`` — see
+``scripts/systemd/llama-fleet.service`` / ``llama-mistral-server.
+service``, also brought under the WU-4 locks), so there is no live
+credential-leak today. Per-route keys (~3 new ``Settings`` fields plus
+rewiring every ``llama_auth_headers(settings.llama_api_key)`` call site
+to look up the key for ``resolve_chat_upstream``'s OWN resolved host)
+is a real, judged, ~day-sized follow-up — deliberately NOT bundled into
+this security-only fix round to keep it reviewable, not because the
+class of risk is dismissed. Track before ``model_routes`` is ever
+pointed at a host outside this box's trust boundary.
 """
 
 from __future__ import annotations

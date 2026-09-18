@@ -15,8 +15,11 @@
 # tests/test_llama_endpoint_isolation_locks.py) instead of duplicating
 # them inline here, which is exactly how this unit and
 # scripts/start-summarizer-llama.sh had already drifted from each other
-# before this WU. Security change ONLY: bind 127.0.0.1, require
-# --api-key-file, disable the web UI (all three in the script).
+# before this WU. Security/disclosure changes ONLY: bind 127.0.0.1,
+# require --api-key-file, disable the web UI, and set --alias so the
+# permanently-public `/v1/models` no longer discloses the raw --model
+# PATH (username + model name + quantisation — review round 1 F10); none
+# of the four touches what the model computes (all four in the script).
 
 [Unit]
 Description=llama.cpp Server (chat / tool-loop — M3 WU-4 isolation locks)

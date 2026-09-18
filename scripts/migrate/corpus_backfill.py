@@ -536,7 +536,18 @@ async def _amain(argv: list[str] | None = None) -> int:
 
     async def _embed(text: str) -> list[float]:
         vectors = await embed_via_nomic(
-            [text], embed_url=settings.embed_url, model=settings.embed_model
+            [text],
+            embed_url=settings.embed_url,
+            model=settings.embed_model,
+            # M3 WU-4 (llama endpoint isolation locks): the embed server now
+            # requires a bearer key once locked (see
+            # scripts/llama-lock-flags.lib.sh). This is the 8th consumer of
+            # the embed endpoint the WU-4 enumeration originally missed
+            # (review round 1, F3) — without this, the backfill's own embed
+            # calls 401 the moment an operator runs
+            # scripts/apply-llama-endpoint-locks.sh. Empty (the default)
+            # sends no header, matching today's unauthenticated embed server.
+            api_key=settings.embed_api_key,
         )
         return vectors[0]
 

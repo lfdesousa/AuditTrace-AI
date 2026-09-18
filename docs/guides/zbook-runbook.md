@@ -58,11 +58,16 @@ for the CA to land in Firefox's trust store.
 
 ### 3. llama.cpp as `systemd --user` units
 
-⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** every
-llama-server must bind `127.0.0.1` (never `0.0.0.0`), require
-`--api-key-file`, and disable the web UI (`--no-webui`) — see
-`scripts/llama-lock-flags.lib.sh` for why each flag is shaped the way it
-is. Provision a key first:
+⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** the units
+below bind `127.0.0.1` (never `0.0.0.0`), require `--api-key-file`, and
+disable the web UI (`--no-webui`) — see `scripts/llama-lock-flags.lib.sh`
+for why each flag is shaped the way it is. This is the intended state for
+the units you write in this step, not a standing fact about the host: the
+equivalent PRODUCTION units are only locked once
+`scripts/apply-llama-endpoint-locks.sh` has actually run AND
+`systemctl show -p ExecStart <unit>` (the EFFECTIVE value, never the unit
+file's text — a conflicting drop-in can override it) confirms it.
+Provision a key first:
 
 ```bash
 install -d -m700 "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"
@@ -109,10 +114,19 @@ on the backend to the same file's contents (see `.env.example`), then
 verify:
 
 ```bash
-curl -o /dev/null -s -w '%{http_code}\n' http://localhost:11435/v1/models       # 401 keyless
+# ⚠ do NOT verify against `GET /v1/models` — llama.cpp keeps it (and
+# `/health`) public even with an API key configured (upstream behaviour,
+# not a gap). A correctly-locked server returns 200 there, so it cannot
+# tell you the lock is live. Use a real inference call instead:
+curl -o /dev/null -s -w '%{http_code}\n' -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}' \
+    http://localhost:11435/v1/chat/completions                                  # 401 keyless
 KEY=$(cat "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}/llama-api-key.txt")
-curl -o /dev/null -s -w '%{http_code}\n' -H "Authorization: Bearer $KEY" \
-    http://localhost:11435/v1/models                                            # 200 keyed
+curl -o /dev/null -s -w '%{http_code}\n' -X POST -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}' \
+    http://localhost:11435/v1/chat/completions                                  # 200 keyed
 ```
 
 ### 4. Sibling docker-compose stacks

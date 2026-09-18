@@ -283,16 +283,31 @@ component wired to the `conversationalSvc`).
 
 - **M3 WU-4 (2026-09-18, llama endpoint isolation locks)** — the
   summariser endpoint (`:11437`) was launched with `--host 0.0.0.0`, no
-  `--api-key`, and no `--no-webui`, same as the other two llama-server
-  processes on this host (`:11435` chat, `:11436` embed). Fixed: all
-  three now bind `127.0.0.1`, require `--api-key-file`, and disable the
-  web UI — see `scripts/llama-lock-flags.lib.sh` and
-  `AUDITTRACE_SUMMARIZER_API_KEY`. Enumeration also surfaced that this
-  unit's LIVE `ExecStart` had already drifted from
-  `scripts/start-summarizer-llama.sh` (different `--ctx-size`, missing
-  `--cache-type-k/v`/`--batch-size`/`--alias`) — left unreconciled as
-  out of scope for a security-only WU; see
-  `scripts/systemd/llama-summarizer.service`'s header.
+  `--api-key`, and no `--no-webui`, same as three of the other four
+  llama-server units `systemctl list-unit-files 'llama-*'` enumerates on
+  this host (`:11435` chat, `:11436` embed, and the two currently
+  `disabled` units `llama-fleet` `:11438` and `llama-mistral-server`
+  `:11437` — never trust `systemctl list-units`, which hides disabled
+  units and undercounted this enumeration in review round 1). **Fixed in
+  code, NOT yet live**: the versioned reference units in
+  `scripts/systemd/` now all bind `127.0.0.1`, require
+  `--api-key-file`, and disable the web UI — see
+  `scripts/llama-lock-flags.lib.sh` and `AUDITTRACE_SUMMARIZER_API_KEY` —
+  but the actual host units stay on their pre-WU-4 (unlocked) definition
+  until an operator with real sudo runs
+  `scripts/apply-llama-endpoint-locks.sh` and confirms with
+  `systemctl show -p ExecStart <unit>` (the EFFECTIVE value — a
+  conflicting drop-in, e.g. the permanent Qwen3.8-27B+MTP override on
+  `llama-server`, can make the unit FILE's text lie about this).
+  Enumeration also surfaced that this unit's LIVE `ExecStart` had already
+  drifted from `scripts/start-summarizer-llama.sh` (different
+  `--ctx-size`, missing `--cache-type-k/v`/`--batch-size`/`--alias`) —
+  left unreconciled as out of scope for a security-only WU; see
+  `scripts/systemd/llama-summarizer.service`'s header. That reference
+  unit's `llama-server` binary was also corrected to match the live
+  Vulkan build (`build-vulkan-new`, not the older ROCm build under
+  `~/opt/llamacpp`) so its "byte-for-byte the current live flags" claim
+  is actually true.
 - **Eval re-run** after Part 1: `scripts/eval-memory-modes.py
   --n-per-mode 10`, new `docs/eval-memory-modes-YYYYMMDD.md`.
 - **Eval re-run** after Part 2: full `N=100` across 6 categories,
