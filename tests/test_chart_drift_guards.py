@@ -4043,8 +4043,17 @@ class TestAllScopesRegisteredInControlPlane:
     **NOT** close the PROVISIONER axis generically — see its own
     docstring and the "Residual risk" paragraph below; this was
     overclaimed in fix round 1's commit message (``14711b3``, since
-    corrected — see the fix-round-2 commit) and in an earlier draft of
-    this docstring.
+    corrected — see the fix-round-2 commit ``2efd21a``) and in an
+    earlier draft of this docstring. Fix round 2's own correction then
+    mis-enumerated the "genuinely absent" set as 8 entries — an
+    orchestrator error (a substring match against the raw script text,
+    which spuriously matched two scopes that only appear inside a
+    ``#`` comment on line 189, never as a quoted array element) that
+    propagated into this docstring and the fix-round-2 build record.
+    Fix round 3 (``F5``) re-derived the set from quoted array
+    membership only (this class's own ``_ensure_loop_scope_union`` /
+    ``_array_contents``, never a text-substring check) and corrected it
+    to 10; see the split below.
 
     Three sub-invariants, each independently falsifiable:
 
@@ -4064,29 +4073,56 @@ class TestAllScopesRegisteredInControlPlane:
        ``test_provisioner_arrays_match_and_exact`` guards above into one
        check that the TWO PROVISIONERS AGREE WITH EACH OTHER. It never
        asserts ``ALL_SCOPES ⊆ (script_union | cm_union)``, and
-       deliberately so: several genuine ``ALL_SCOPES`` entries (the core
-       chat/query/audit scopes — ``audittrace:query``,
-       ``audittrace:context``, ``audittrace:index``, ``audittrace:audit``,
-       ``audittrace:scan:retrigger``, ``memory:episodic:read``,
-       ``memory:procedural:read``, ``memory:upload:write``) legitimately
-       belong to NO memory-scopes provisioner at all; forcing them into
-       ``setup-memory-scopes.sh`` to satisfy a strict subset check would
-       be a worse outcome than an honest, narrower parity-only guard.
+       deliberately so. As of this round, 10 ``ALL_SCOPES`` entries sit
+       outside ``(script_union | cm_union)`` (32 entries, of
+       ``ALL_SCOPES``'s 42) — they split into two groups, not one:
 
-       **Residual risk (explicit, not closed by this class):** a FUTURE
-       scope added to ``ALL_SCOPES`` AND declared in both realm files
-       AND bound to a client (satisfying sub-invariants 1 and 2) but
-       added to NEITHER provisioner script's ``*_SCOPES`` arrays passes
-       this class's sub-invariant 3 outright — the two provisioners
-       still agree (both omit it). On a FRESH cluster the realm import
-       mints the clientScope and the omission is invisible; on an
-       EXISTING cluster upgraded via the provisioner Job (the only path
-       that runs post-install), the scope is never created and any
-       route that requires it 403s permanently — this is F1's exact
-       failure mode, on the upgrade path, surviving this guard. Closing
-       it requires a per-scope ownership map (which provisioner, if
-       any, owns each ``ALL_SCOPES`` entry) and is tracked as a
-       follow-up WU, not attempted here.
+       - **8 legitimately belong to no memory-scopes provisioner at
+         all** — the core chat/query/audit scopes: ``audittrace:query``,
+         ``audittrace:context``, ``audittrace:index``, ``audittrace:audit``,
+         ``audittrace:scan:retrigger``, ``memory:episodic:read``,
+         ``memory:procedural:read``, ``memory:upload:write``. Forcing
+         these into ``setup-memory-scopes.sh`` to satisfy a strict
+         subset check would misfile them into the wrong script — a
+         worse outcome than an honest, narrower parity-only guard.
+       - **2 are live candidates for the residual risk below, not
+         established as legitimately absent** — ``memory:semantic:read``
+         and ``memory:conversational:read-own``. Both are READ-OWN-style
+         memory-domain scopes; the provisioner script's own comment
+         above ``MEMORY_SESSION_READ_SCOPES`` (line 189) calls
+         ``memory:session:read-own`` *"a READ-OWN scope, same family as
+         memory:conversational:read-own/memory:semantic:read"* — and
+         that sibling, ``memory:session:read-own``, IS provisioned
+         (``MEMORY_SESSION_READ_SCOPES``). The script's own comment
+         treats this family as provisioner-owned; these two members of
+         the family are simply missing from the array. This is named as
+         a candidate, not asserted as a defect — no test in this class
+         requires provisioning either — but the "legitimately belongs
+         nowhere" framing does NOT apply to these two, and asserting
+         otherwise is not supported by the evidence above.
+
+       **Residual risk (explicit, not closed by this class): two live
+       instances on `main` today, not merely a future possibility.**
+       Any scope added to ``ALL_SCOPES`` AND declared in both realm
+       files AND bound to a client (satisfying sub-invariants 1 and 2)
+       but added to NEITHER provisioner script's ``*_SCOPES`` arrays
+       passes this class's sub-invariant 3 outright — the two
+       provisioners still agree (both omit it). ``memory:semantic:read``
+       and ``memory:conversational:read-own`` are exactly that today:
+       declared + bound (sub-invariants 1 and 2 pass for both), yet
+       absent from both provisioners' ensure-loop arrays. On a FRESH
+       cluster the realm import mints the clientScope and the omission
+       is invisible; on an EXISTING cluster upgraded via the
+       provisioner Job (the only path that runs post-install), the
+       scope is never (re-)created if it were ever removed and
+       re-added, and any route that requires it would 403 permanently
+       on that path — this is F1's exact failure mode, on the upgrade
+       path, surviving this guard. Closing it requires a per-scope
+       ownership map (which provisioner, if any, owns each
+       ``ALL_SCOPES`` entry) and is tracked as a follow-up WU, not
+       attempted here; that follow-up should also settle whether these
+       two scopes ought to be added to ``MEMORY_SESSION_READ_SCOPES``'s
+       family outright.
 
     **Non-vacuity, proved by hand during the fix round** (not
     re-executed by this class, which would be a guard testing itself):
