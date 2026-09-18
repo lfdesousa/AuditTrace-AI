@@ -85,6 +85,33 @@ class TestMigrationFile:
         assert "ck_console_acl_entries_perm_bits_range" in text
         assert "perm_bits >= 0 AND perm_bits <= 15" in text
 
+    def test_perm_bits_check_constraint_upper_bound_matches_max_perm_bits(
+        self,
+    ) -> None:
+        """WU-1 fix round 1, A2 — pin the CHECK's upper bound to the
+        LIVE ``MAX_PERM_BITS`` constant (derived, not hand-typed), so a
+        fifth bit added to ``services/console_acl/__init__.py`` without
+        a matching migration bump is caught here instead of silently
+        desyncing the CHECK from the app's own idea of the max value."""
+        import re
+
+        from audittrace.services.console_acl import MAX_PERM_BITS
+
+        text = _text()
+        match = re.search(r"perm_bits >= 0 AND perm_bits <= (\d+)", text)
+        assert match is not None, (
+            "the perm_bits range CHECK literal has changed shape — "
+            "update this guard's regex"
+        )
+        migration_upper_bound = int(match.group(1))
+        assert migration_upper_bound == MAX_PERM_BITS, (
+            f"migration 031's CHECK upper bound ({migration_upper_bound}) "
+            f"has desynced from MAX_PERM_BITS ({MAX_PERM_BITS}) — bumping "
+            "one without the other silently lets an out-of-range "
+            "perm_bits value through the DB CHECK or wrongly refuses a "
+            "value the app considers valid."
+        )
+
     def test_partial_unique_public_index_present(self) -> None:
         text = _text()
         assert "uq_console_acl_entries_public_resource" in text

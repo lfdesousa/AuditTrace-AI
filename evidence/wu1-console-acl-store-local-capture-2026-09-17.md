@@ -178,15 +178,39 @@ constraint makes the two formulations equivalent (no row can ever have
 literal is therefore defense-in-depth, not the load-bearing guard; the
 CHECK constraint is. Restored `cmp`-identical.
 
-**Guard 2 — bitmask containment vs equality, PER BIT.** Neutered
-`_contains_bit` (Postgres, `perm_bits == bit` instead of `& bit == bit`)
-and `_mock`'s equivalent inline check, one implementation per run:
-`TestBitmaskContainment::test_containment_grants_when_bit_is_set_among_
-others` went RED for EACH of the 4 bits independently (VIEW=1, EDIT=2,
-DELETE=4, SHARE=8) on both implementations (8 RED results total across 2
-runs), while the "denies when bit absent" tests stayed GREEN (equality
-still denies correctly there — confirming the neuter targeted
-containment specifically). Restored `cmp`-identical both times.
+**Guard 2 — bitmask containment vs equality, PER BIT.** CORRECTED IN FIX
+ROUND 1 (F2): the original pass below described this guard in terms of
+"2 implementations" as if each implementation had ONE containment call
+site. That is true for Postgres (a single shared `_contains_bit` helper,
+5 call sites, one neuter covers all 5 genuinely) but FALSE for the Mock,
+which inlines the containment check separately at FIVE distinct call
+sites (`has_permission`, `find_accessible_resources`,
+`find_public_resource_ids`, and TWO in `get_sole_owned_resource_ids`).
+The original run only neutered/tested the Mock's `has_permission` site;
+the other four were unfalsified, and three of them (marked below) were
+proven vacuous by the independent reviewer before this fix round added
+per-site tests and re-ran the neuter PER SITE, never aggregated
+(`feedback_neuter_guards_individually_never_batched`).
+
+Per-site neuter table (fix round 1, this run's numbers — `cmp`-restored
+after each row):
+
+| Site | Location | Test(s) | RED count |
+|---|---|---|---|
+| Postgres — `_contains_bit` (shared, 5 call sites) | `_postgres.py:83,137,221,250,278,296` | `TestBitmaskContainment` (all `[postgres]` params) | 4 |
+| Mock — `has_permission` | `_mock.py:167` | `TestBitmaskContainment` (`[mock]` params) | 4 |
+| Mock — `find_accessible_resources` | `_mock.py:243` | `TestFindAccessibleResourcesBitmaskContainment::test_containment_grants_when_bit_is_set_among_others` (NEW, fix round 1) | 4 |
+| Mock — `find_public_resource_ids` | `_mock.py:271` | `TestFindPublicResourceIdsBitmaskContainment::test_containment_grants_when_bit_is_set_among_others` (NEW, fix round 1) | 4 |
+| Mock — `get_sole_owned_resource_ids` loop 1 | `_mock.py:298` | `TestSoleOwnedResourceIds::test_not_sole_owner_when_another_user_holds_delete` (pre-existing; DELETE only) | 1 |
+| Mock — `get_sole_owned_resource_ids` loop 2 | `_mock.py:313` | `TestSoleOwnedResourceIds::test_not_sole_owner_when_competitor_holds_delete_among_other_bits` (NEW, fix round 1; DELETE only) | 1 |
+
+Each row's neuter (equality in place of `&`-containment) and restore was
+run and `cmp`-verified individually, never batched. The "denies when bit
+absent" counterpart tests stayed GREEN throughout every neuter above
+(equality still denies correctly there — confirming each neuter targeted
+containment specifically, not the whole predicate). No aggregate/total
+figure is reported anywhere in this corrected section — see the per-site
+table above for every number.
 
 **Guard 3 — principal-pair binding.** First neuter attempt
 (`_principals_clause`'s non-public branch dropping the `principal_id`

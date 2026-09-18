@@ -338,6 +338,151 @@ class TestBitmaskContainment:
         assert bits == (PERMISSION_BIT_VIEW | PERMISSION_BIT_EDIT)
 
 
+# ── Guard #2b — bitmask containment on find_accessible_resources ─────────
+#
+# WU-1 fix round 1, F2: ``TestBitmaskContainment`` above only exercises
+# ``has_permission``. The Mock has FIVE containment call sites total
+# (_mock.py:167 has_permission, :243 find_accessible_resources, :271
+# find_public_resource_ids, :298 sole-owned loop 1, :313 sole-owned
+# loop 2) and the reviewer proved THREE of them vacuous — an aggregate
+# "8 RED x 2 implementations" total masked that
+# find_accessible_resources/find_public_resource_ids/sole-owned-loop-2
+# had NO per-bit containment test at all
+# (feedback_neuter_guards_individually_never_batched). Re-tabled PER
+# SITE below, never per-implementation.
+
+
+class TestFindAccessibleResourcesBitmaskContainment:
+    """Site 2/5 — ``find_accessible_resources`` (_mock.py, the
+    ``(row.perm_bits & required_permission_bit) != required_permission_bit``
+    check). Same superset-grants / subset-denies shape as
+    ``TestBitmaskContainment``, one test per bit, never batched."""
+
+    @pytest.mark.parametrize(
+        "bit",
+        [
+            PERMISSION_BIT_VIEW,
+            PERMISSION_BIT_EDIT,
+            PERMISSION_BIT_DELETE,
+            PERMISSION_BIT_SHARE,
+        ],
+    )
+    async def test_containment_grants_when_bit_is_set_among_others(
+        self, harness, user_context, bit
+    ) -> None:
+        resource_id = f"res-accessible-bit-{bit}"
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            principal_model="User",
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=MAX_PERM_BITS,
+        )
+        ids = await harness.service.find_accessible_resources(
+            user_context, "agent", bit
+        )
+        assert resource_id in ids, (
+            f"bit {bit} present among others but find_accessible_resources "
+            "did not grant — containment broken (equality-style rot)"
+        )
+
+    @pytest.mark.parametrize(
+        "bit",
+        [
+            PERMISSION_BIT_VIEW,
+            PERMISSION_BIT_EDIT,
+            PERMISSION_BIT_DELETE,
+            PERMISSION_BIT_SHARE,
+        ],
+    )
+    async def test_containment_denies_when_bit_is_absent(
+        self, harness, user_context, bit
+    ) -> None:
+        resource_id = f"res-accessible-missing-bit-{bit}"
+        other_bits = MAX_PERM_BITS & ~bit
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            principal_model="User",
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=other_bits,
+        )
+        ids = await harness.service.find_accessible_resources(
+            user_context, "agent", bit
+        )
+        assert resource_id not in ids, (
+            f"bit {bit} absent but find_accessible_resources falsely "
+            "reported the resource accessible (equality-style rot)"
+        )
+
+
+class TestFindPublicResourceIdsBitmaskContainment:
+    """Site 3/5 — ``find_public_resource_ids`` (_mock.py, the PUBLIC
+    total-exposure surface). Same superset-grants / subset-denies
+    shape, one test per bit, never batched."""
+
+    @pytest.mark.parametrize(
+        "bit",
+        [
+            PERMISSION_BIT_VIEW,
+            PERMISSION_BIT_EDIT,
+            PERMISSION_BIT_DELETE,
+            PERMISSION_BIT_SHARE,
+        ],
+    )
+    async def test_containment_grants_when_bit_is_set_among_others(
+        self, harness, user_context, bit
+    ) -> None:
+        resource_id = f"res-public-bit-{bit}"
+        await harness.seed(
+            user_sub="owner-public-containment",
+            principal_type="public",
+            principal_id=None,
+            principal_model=None,
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=MAX_PERM_BITS,
+        )
+        ids = await harness.service.find_public_resource_ids(user_context, "agent", bit)
+        assert resource_id in ids, (
+            f"bit {bit} present among others but find_public_resource_ids "
+            "did not grant — containment broken (equality-style rot)"
+        )
+
+    @pytest.mark.parametrize(
+        "bit",
+        [
+            PERMISSION_BIT_VIEW,
+            PERMISSION_BIT_EDIT,
+            PERMISSION_BIT_DELETE,
+            PERMISSION_BIT_SHARE,
+        ],
+    )
+    async def test_containment_denies_when_bit_is_absent(
+        self, harness, user_context, bit
+    ) -> None:
+        resource_id = f"res-public-missing-bit-{bit}"
+        other_bits = MAX_PERM_BITS & ~bit
+        await harness.seed(
+            user_sub="owner-public-containment",
+            principal_type="public",
+            principal_id=None,
+            principal_model=None,
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=other_bits,
+        )
+        ids = await harness.service.find_public_resource_ids(user_context, "agent", bit)
+        assert resource_id not in ids, (
+            f"bit {bit} absent but find_public_resource_ids falsely "
+            "reported the resource publicly accessible (equality-style rot)"
+        )
+
+
 # ── Guard #3 — principal-pair binding ────────────────────────────────────
 
 
@@ -770,6 +915,74 @@ class TestSoleOwnedResourceIds:
         ids = await harness.service.get_sole_owned_resource_ids(user_context, ["agent"])
         assert ids == []
 
+    async def test_not_sole_owner_when_competitor_holds_delete_among_other_bits(
+        self, harness, user_context
+    ) -> None:
+        """WU-1 fix round 1, F2 — site 5/5, the multi_owner cross-check
+        loop. ``test_not_sole_owner_when_another_user_holds_delete``
+        above seeds the competitor with ``perm_bits=PERMISSION_BIT_DELETE``
+        EXACTLY — indistinguishable from an equality check. Here the
+        competitor's DELETE bit is a SUPERSET (MAX_PERM_BITS) so an
+        equality-neutered loop 2 (``row.perm_bits != PERMISSION_BIT_DELETE``)
+        would WRONGLY skip the competitor and misreport the caller as
+        sole owner — a privilege-escalation-shaped false grant."""
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            principal_model="User",
+            resource_type="agent",
+            resource_id="res-shared-delete-superset",
+            perm_bits=OWNER_PERMISSION_BITS,
+        )
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id="co-owner-superset",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="res-shared-delete-superset",
+            perm_bits=MAX_PERM_BITS,
+        )
+        ids = await harness.service.get_sole_owned_resource_ids(user_context, ["agent"])
+        assert "res-shared-delete-superset" not in ids, (
+            "a co-owner holding DELETE among OTHER bits was not counted "
+            "as a competing owner — sole-owned loop 2 containment is "
+            "equality-style rot, not containment"
+        )
+
+    async def test_sole_owner_when_competitor_lacks_delete_among_other_bits(
+        self, harness, user_context
+    ) -> None:
+        """Mirror of the test above: a competitor holding every OTHER
+        bit but NOT delete must NOT count as a competing owner — the
+        caller remains sole owner. Proves loop 2 isn't over-eager
+        either (denies-when-absent, same discipline as
+        TestBitmaskContainment)."""
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            principal_model="User",
+            resource_type="agent",
+            resource_id="res-sole-competitor-no-delete",
+            perm_bits=OWNER_PERMISSION_BITS,
+        )
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id="competitor-no-delete",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="res-sole-competitor-no-delete",
+            perm_bits=MAX_PERM_BITS & ~PERMISSION_BIT_DELETE,
+        )
+        ids = await harness.service.get_sole_owned_resource_ids(user_context, ["agent"])
+        assert "res-sole-competitor-no-delete" in ids, (
+            "a competitor genuinely lacking DELETE was still counted as "
+            "a competing owner — sole-owned loop 2 is over-eager"
+        )
+
 
 # ── get_owner_principal_ids — the aggregateAclEntries site-1 fold ────────
 
@@ -878,6 +1091,37 @@ class TestOwnerPrincipalIds:
         assert (
             await harness.service.get_owner_principal_ids(user_context, "agent", [])
             == {}
+        )
+
+    async def test_owner_branch_alone_makes_a_grant_to_someone_else_visible(
+        self, harness, user_context
+    ) -> None:
+        """WU-1 fix round 1, A1 — the RLS mirror's OWNER branch
+        (``row.user_sub == user_context.user_id`` / Postgres
+        ``user_sub = current_setting(...)``) is unfalsified alone in
+        every OTHER test here: they all set ``user_sub == principal_id``,
+        so branch 2 (direct-principal match) would ALSO make the row
+        visible even with the owner branch deleted. This row breaks
+        that: the caller GRANTED OWNER_PERMISSION_BITS to someone else
+        entirely — visible ONLY via "you granted this, you may see who
+        it went to", never via "you ARE the principal". Deleting the
+        owner branch must make this resource's owner unresolvable."""
+        await harness.seed(
+            user_sub=user_context.user_id,
+            principal_type="user",
+            principal_id="someone-else-entirely",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="res-owner-branch-alone",
+            perm_bits=OWNER_PERMISSION_BITS,
+        )
+        owners = await harness.service.get_owner_principal_ids(
+            user_context, "agent", ["res-owner-branch-alone"]
+        )
+        assert owners == {"res-owner-branch-alone": "someone-else-entirely"}, (
+            "the caller granted OWNER_PERMISSION_BITS to another "
+            "principal but could not resolve it — the RLS mirror's "
+            "owner branch is not doing its job"
         )
 
 
