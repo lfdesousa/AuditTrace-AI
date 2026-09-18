@@ -789,6 +789,27 @@ class TestSameSessionExclusionHonesty:
     def test_excl_today_drops_a_same_session_hit_run_reproduces_it(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """WU-1 fix-round-5, F26: the round-4 fixture had exactly ONE
+        scoreable pair, and it WAS the same-session title -- so
+        ``expected_excl_today`` (``expected - SAME_SESSION_TITLES``) was
+        EMPTY, ``excl_denom`` was 0, and both excl-today percentages took
+        the ``... if excl_denom else 0.0`` literal fallback branch
+        unconditionally. ``excl_after_hits`` was computed but never
+        divided or observed -- a broken ``after_titles``/expected-set
+        argument for the excl-today AFTER column (the one carrying this
+        WU's headline 38.71%/48.39% numbers) could regress with this test
+        staying GREEN throughout (round-4 reviewer REJECT, F26).
+
+        Fixed here with a SECOND, non-session labelled pair
+        (``non_session_hit``) so ``expected_excl_today`` is non-empty
+        (``excl_denom == 2``) and BOTH excl-today columns perform a real
+        division. ``non_session_hit`` sits inside the k=4 window (so it
+        is a hit in every column); ``non_session_hit_out_of_window``
+        sits outside it (so it is a miss at k=4) -- giving a genuine,
+        non-trivial 1-hit-of-2 fraction rather than an all-or-nothing
+        0%/100% that a degenerate denominator could also produce by
+        accident.
+        """
         mod = _load_eval_recall_module()
 
         # Real overlap, not synthesised: this title is BOTH a genuine
@@ -799,14 +820,34 @@ class TestSameSessionExclusionHonesty:
         assert same_session_hit in mod.SAME_SESSION_TITLES
         assert same_session_hit in {title for _q, title in mod.LABELLED_PAIRS}
 
-        # A tiny synthetic corpus: the same-session title ranked FIRST
-        # (most-recent), three unrelated filler documents behind it, and
-        # crucially NO other LABELLED_PAIRS title present — so this one
-        # title is the corpus's only scoreable pair, making the exclusion
-        # effect land as a clean 100% -> 0% swing rather than a diluted
-        # one.
+        # Two genuine, distinct non-session LABELLED_PAIRS titles -- real
+        # module data, not synthesised strings -- so expected_excl_today
+        # has TWO members and the fixture is non-degenerate (F26).
+        non_session_titles = [
+            title
+            for _q, title in mod.LABELLED_PAIRS
+            if title not in mod.SAME_SESSION_TITLES
+        ]
+        non_session_hit, non_session_hit_out_of_window = non_session_titles[:2]
+        assert non_session_hit != non_session_hit_out_of_window
+
+        # A synthetic corpus, most-recent-first: the same-session title
+        # and one non-session title rank inside the k=4 window; a second
+        # non-session title and three fillers rank behind it, outside the
+        # k=4 window. This makes expected_excl_today = {non_session_hit,
+        # non_session_hit_out_of_window} (denom 2) with exactly ONE of
+        # the two inside the k=4 window (a real 1/2 = 50.00% at k=4, not
+        # an all-or-nothing 0%/100% a zero-denominator fallback could
+        # also produce).
         def _fake_fetch(front_door, token, collection, insecure):
-            titles = [same_session_hit, "filler-a.md", "filler-b.md", "filler-c.md"]
+            titles = [
+                same_session_hit,
+                non_session_hit,
+                "filler-a.md",
+                "filler-b.md",
+                "filler-c.md",
+                non_session_hit_out_of_window,
+            ]
             return [
                 {
                     "key": f"decisions/{i:016x}",
@@ -832,17 +873,23 @@ class TestSameSessionExclusionHonesty:
             cell.strip().rstrip("%") for cell in k4_line.split("|")[1:]
         )
 
-        # The captured VALUES: excluding the same-session title removes
-        # the corpus's only scoreable pair from BOTH excl-today columns
-        # (F25 -- the honest view now has its own BEFORE, not just AFTER),
-        # so excl-today BEFORE and AFTER both measure 0.00% while
-        # incl-today (which still counts it) measures 100.00% at k=4 -- a
-        # real, non-tautological numeric assertion on ``run()``'s actual
-        # output, not on the constants in isolation.
-        assert float(excl_today_before) == 0.0
-        assert float(excl_today_after) == 0.0
-        assert float(incl_today_after) == 100.0
-        assert float(incl_today_before) == 100.0
+        # The captured VALUES, from a NON-DEGENERATE denominator
+        # (excl_denom == 2 by construction -- two distinct non-session
+        # titles, distinctness asserted above): at k=4 the window holds
+        # {same_session_hit, non_session_hit, filler-a, filler-b} —
+        # excl-today (denominator {non_session_hit,
+        # non_session_hit_out_of_window}) hits exactly ONE of two ->
+        # 50.00%, real division not a fallback; incl-today (denominator
+        # {same_session_hit, non_session_hit, non_session_hit_out_of_
+        # window}) hits TWO of three -> 66.67%. The two figures differ
+        # (50.00 vs 66.67) BECAUSE excluding the same-session title drops
+        # a real hit from the denominator-and-numerator both — the
+        # honest exclusion effect, on a fraction that actually exercises
+        # the arithmetic rather than falling back to a literal.
+        assert float(excl_today_before) == 50.0
+        assert float(excl_today_after) == 50.0
+        assert float(incl_today_before) == 66.67
+        assert float(incl_today_after) == 66.67
 
     def test_excl_today_matches_incl_today_when_no_same_session_titles_score(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

@@ -49,11 +49,22 @@ pre-WU-1 shape" and this file no longer claims that it is.
 **AFTER is at least as good as BEFORE at every measured k, not
 "strictly" better at every k** (WU-1 fix-round-3, F19 correction): at
 k=4, both are typically 0.00% (too small a window for either view to
-surface a labelled document) — the mechanism only shows a measurable
-advantage from around k=25 upward, where document-grouping stops
-"spending" the window on multiple chunks of the same few large records.
-Report the actual numbers; do not round that up to "dominates at every
-k".
+surface a labelled document). Report the actual numbers; do not round
+that up to "dominates at every k".
+
+**The default-limit no-op (WU-1 fix-round-5, F28 correction).** An
+earlier version of this docstring claimed "a measurable advantage from
+around k=25 upward" — that claim is FALSE and is corrected here: the
+branch's own committed round-3 and round-4 captures show k=25 at
+0.00% in every column, identically to k=4, with the first non-zero
+advantage appearing at k=100. Since ``scripts/deploy/memory.py``'s
+``DEFAULT_RECALL_LIMIT`` is 25 (the limit every caller gets when it
+omits ``limit``), **the honest reading is that at the default recall
+window this fix changes nothing measurable; the gain from
+document-grouping is real only at k=100 and above**, i.e. only for
+callers that explicitly raise ``limit`` past the default. Do not state
+or imply an advantage "around k=25" in any report derived from this
+script.
 
 **The labelled set** (34 pairs, >= the spec's "at least 30") is drawn from
 real, indexed decisions-layer documents from the last ~10 days of fleet
