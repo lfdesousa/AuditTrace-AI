@@ -64,14 +64,16 @@ CHART_DIR = REPO_ROOT / "charts" / "audittrace"
 CHART_VALUES_FILE = CHART_DIR / "values.yaml"
 LAPTOP_VALUES_FILE = CHART_DIR / "values-laptop.yaml"
 
-# The real, committed digests this repo pins today (values.yaml, WU-6 Part
-# C re-pin, 2026-09-10) — asserted against directly so a regression that
-# silently stops reading them is caught, not just "some string present".
+# The real, committed digests this repo pins today (values.yaml, Phase-E
+# re-pin, 2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-mongo-audit.md,
+# superseding the WU-6 Part C 2026-09-10 pair) — asserted against directly
+# so a regression that silently stops reading them is caught, not just
+# "some string present".
 _REAL_LIBRECHAT_DIGEST = (
-    "sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
+    "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
 )
 _REAL_BFF_DIGEST = (
-    "sha256:e15af5a03581d521492b01ad1d7a2ac521b55dc9aa2773bcfa3344b6db2e54b7"
+    "sha256:b9cc31e78b50b5535cafc204a2ba30179677a707ea1ee77d63c8f80042741d55"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
