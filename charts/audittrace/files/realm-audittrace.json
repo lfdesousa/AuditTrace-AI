@@ -278,6 +278,13 @@
       }
     },
     {
+      "name": "memory:acl:read-own",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "audittrace:scan:retrigger",
       "protocol": "openid-connect",
       "attributes": {
@@ -846,6 +853,7 @@
         "memory:agents:read-own",
         "memory:conversation_tags:read-own",
         "memory:tool_favorites:read-own",
+        "memory:acl:read-own",
         "profile",
         "email"
       ],

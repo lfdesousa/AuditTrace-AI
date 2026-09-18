@@ -264,6 +264,16 @@ ALL_SCOPES: dict[str, str] = {
         "no access to another user's tool-favorites (RLS-enforced) and "
         "no access to any other memory layer."
     ),
+    "memory:acl:read-own": (
+        "Read effective permissions, accessible/public/sole-owned "
+        "resource ids from the console-ACL store (Sovereign "
+        "Authorization Layer EPIC, WU-1 — READ PATH ONLY) — the "
+        "RLS-isolated store backing LibreChat's AclEntry records. "
+        "Every answer is scoped to the CALLER's own resolved principal "
+        "set (self + public); group principals are disabled at the "
+        "schema level. No write path exists yet (WU-2), and this scope "
+        "grants no access to any other memory layer."
+    ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "
         "pipeline (ADR-048). Distinct from memory:episodic:write because "

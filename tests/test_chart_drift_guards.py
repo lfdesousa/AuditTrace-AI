@@ -3843,6 +3843,440 @@ class TestOpencodeClientScopesUnchangedByToolFavorites:
             )
 
 
+class TestKeycloakAclReadOwnScopeGovernance:
+    """Sovereign Authorization Layer EPIC, WU-1 (2026-09-17, READ PATH
+    ONLY, fix round 1 / F1) — the console-ACL READ-OWN provisioning
+    half: ``memory:acl:read-own`` reaches ``audittrace-librechat`` as a
+    DEFAULT scope, via a dedicated ``MEMORY_ACL_READ_SCOPES`` array +
+    bind loop kept SEPARATE from every other scope array in this
+    script. There is no write half yet (WU-1 is read-only; WU-2 adds
+    ``memory:acl:write`` later), so unlike every prior domain there is
+    no sibling ``...WriteScopeGovernance`` class to borrow a
+    ``_FORBIDDEN`` set from — it is self-contained here.
+
+    Falsifiable, same shape as
+    ``TestKeycloakToolFavoritesReadOwnScopeGovernance``:
+
+    * ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+      ConfigMap declaring divergent/incomplete ``MEMORY_ACL_READ_SCOPES``
+      arrays fails ``test_provisioner_arrays_match_and_exact``;
+    * either provisioner's dedicated bind loop targeting a client other
+      than ``audittrace-librechat`` fails ``test_bind_loop_targets_only_librechat``;
+    * ``audittrace:admin`` (or any write/corpus scope) appearing in either
+      provisioner's ``MEMORY_ACL_READ_SCOPES`` array fails
+      ``test_never_forbidden_scope_in_acl_read_scopes``.
+    """
+
+    _EXPECTED_ACL_READ_SCOPES: frozenset[str] = frozenset({"memory:acl:read-own"})
+
+    _OTHER_END_USER_CLIENTS: tuple[str, ...] = (
+        "audittrace-opencode",
+        "audittrace-webui",
+    )
+
+    _FORBIDDEN: frozenset[str] = frozenset(
+        {
+            "audittrace:admin",
+            "audittrace:assessment:ingest",
+            "audittrace:scan:retrigger",
+            "memory:acl:write",
+            "memory:episodic:write",
+            "memory:procedural:write",
+            "memory:semantic:write",
+            "memory:session:write",
+            "memory:conversations:write",
+            "memory:presets:write",
+            "memory:prompts:write",
+            "memory:chat_projects:write",
+            "memory:files:write",
+            "memory:agents:write",
+            "memory:conversation_tags:write",
+            "memory:tool_favorites:write",
+            "memory:corpus:decisions:read",
+            "memory:corpus:decisions:write",
+            "memory:corpus:skills:read",
+            "memory:corpus:skills:write",
+            "memory:corpus:semantic:read",
+            "memory:corpus:semantic:write",
+        }
+    )
+
+    @staticmethod
+    def _acl_read_scopes_in(text: str) -> set[str]:
+        m = re.search(r"MEMORY_ACL_READ_SCOPES=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                "MEMORY_ACL_READ_SCOPES=( ... ) block not found — the "
+                "Sovereign Authorization Layer EPIC's ACL domain "
+                "requires a dedicated array, separate from every other "
+                "scope array in this script."
+            )
+        return set(re.findall(r'"(memory:[^"]+)"', m.group(1)))
+
+    @staticmethod
+    def _acl_read_bind_loop_body(text: str) -> str:
+        m = re.search(
+            r'for SCOPE in "\$\{MEMORY_ACL_READ_SCOPES\[@\]\}"; do(.*?)\bdone\b',
+            text,
+            re.S,
+        )
+        if m is None:
+            raise AssertionError(
+                "MEMORY_ACL_READ_SCOPES bind loop (`for SCOPE in "
+                '"${MEMORY_ACL_READ_SCOPES[@]}"; do ... done`) not '
+                "found — the ACL domain requires a bind loop scoped to "
+                "audittrace-librechat only, separate from every other "
+                "loop."
+            )
+        return m.group(1)
+
+    def test_provisioner_arrays_match_and_exact(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_scopes = self._acl_read_scopes_in(script_path.read_text())
+        cm_scopes = self._acl_read_scopes_in(cm_path.read_text())
+
+        assert script_scopes == cm_scopes == self._EXPECTED_ACL_READ_SCOPES, (
+            "Drift: scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml have "
+            "divergent/incomplete MEMORY_ACL_READ_SCOPES arrays. Script: "
+            f"{sorted(script_scopes)}. ConfigMap: {sorted(cm_scopes)}. "
+            f"Expected: {sorted(self._EXPECTED_ACL_READ_SCOPES)}."
+        )
+
+    def test_bind_loop_targets_only_librechat(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            loop_body = self._acl_read_bind_loop_body(path.read_text())
+            assert "audittrace-librechat" in loop_body, (
+                f"{label}: the MEMORY_ACL_READ_SCOPES bind loop does not "
+                "bind to audittrace-librechat."
+            )
+            for forbidden_client in self._OTHER_END_USER_CLIENTS:
+                assert forbidden_client not in loop_body, (
+                    f"{label}: the MEMORY_ACL_READ_SCOPES bind loop "
+                    f"references {forbidden_client!r} — scoped to "
+                    "audittrace-librechat only."
+                )
+
+    def test_never_forbidden_scope_in_acl_read_scopes(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        for path, label in ((script_path, "script"), (cm_path, "configmap")):
+            scopes = self._acl_read_scopes_in(path.read_text())
+            offenders = scopes & self._FORBIDDEN
+            assert not offenders, (
+                f"{label}: MEMORY_ACL_READ_SCOPES illegally carries "
+                f"{sorted(offenders)} — this array grants ONLY the "
+                "read-own scope, nothing write/durable/corpus/admin."
+            )
+
+
+class TestOpencodeClientScopesUnchangedByAcl:
+    """STANDING REQUIREMENT (requirement-mongo-repl-regression-safety-
+    opencode-e2e), extended to the Sovereign Authorization Layer EPIC:
+    ``memory:acl:read-own`` is ADDITIVE on ``audittrace-librechat`` ONLY
+    — this class asserts ``audittrace-opencode``'s full scope set (both
+    realm files, both defaultClientScopes and optionalClientScopes)
+    never gains it. Mirrors
+    ``TestOpencodeClientScopesUnchangedByToolFavorites``.
+    """
+
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset({"memory:acl:read-own"})
+
+    @staticmethod
+    def _client(realm: dict, client_id: str) -> dict:
+        for c in realm["clients"]:
+            if c["clientId"] == client_id:
+                return c
+        raise AssertionError(f"{client_id} is missing from the realm.")
+
+    def test_opencode_scope_set_never_gains_acl_scope(self) -> None:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        for label, realm in (
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ):
+            c = self._client(realm, "audittrace-opencode")
+            both = set(c.get("defaultClientScopes", [])) | set(
+                c.get("optionalClientScopes", [])
+            )
+            offenders = both & self._FORBIDDEN_ON_OPENCODE
+            assert not offenders, (
+                f"{label}: audittrace-opencode was granted {sorted(offenders)} "
+                "— the ACL domain scope is additive on audittrace-librechat "
+                "ONLY (standing regression-safety requirement); OpenCode's "
+                "client must stay untouched."
+            )
+
+
+class TestAllScopesRegisteredInControlPlane:
+    """Sovereign ACL WU-1 fix round 1, F1 — the generic guard the
+    reviewer asked for: EVERY scope declared in ``auth.py::ALL_SCOPES``
+    (the app's single source of truth for what a scope MEANS) must
+    actually be reachable from a real cluster. Before this class,
+    F1 could add a Python-only ``ALL_SCOPES`` entry
+    (``memory:acl:read-own``) that existed in NO realm file and NO
+    provisioner script — a scope Keycloak can never mint, permanently
+    403ing every route that requires it, with no operator fix short of
+    a code change. Only hand-written PER-SCOPE tests caught prior
+    instances of this class (#370); sub-invariants 1 and 2 below close
+    the two REALM axes of that class generically. Sub-invariant 3 does
+    **NOT** close the PROVISIONER axis generically — see its own
+    docstring and the "Residual risk" paragraph below; this was
+    overclaimed in fix round 1's commit message (``14711b3``, since
+    corrected — see the fix-round-2 commit ``2efd21a``) and in an
+    earlier draft of this docstring. Fix round 2's own correction then
+    mis-enumerated the "genuinely absent" set as 8 entries — an
+    orchestrator error (a substring match against the raw script text,
+    which spuriously matched two scopes that only appear inside a
+    ``#`` comment on line 189, never as a quoted array element) that
+    propagated into this docstring and the fix-round-2 build record.
+    Fix round 3 (``F5``) re-derived the set from quoted array
+    membership only (this class's own ``_ensure_loop_scope_union`` /
+    ``_array_contents``, never a text-substring check) and corrected it
+    to 10; see the split below.
+
+    Three sub-invariants, each independently falsifiable:
+
+    1. **Declared** — every ``ALL_SCOPES`` key exists as a
+       ``clientScopes[].name`` entry in BOTH realm files (the dev-import
+       JSON and the chart-rendered realm ConfigMap).
+    2. **Bound** — every ``ALL_SCOPES`` key is granted (default OR
+       optional) to at least one client in BOTH realm files — a scope
+       that is declared but bound to nobody is exactly as unmintable as
+       one that was never declared.
+    3. **Provisioner parity ONLY — NOT an ``ALL_SCOPES`` membership
+       check.** The combined ensure-loop array set (the union of every
+       ``*_SCOPES`` array folded into the ``for SCOPE in ... ; do``
+       "ensure each scope exists" loop) is IDENTICAL between
+       ``scripts/setup-memory-scopes.sh`` and the chart's in-cluster Job
+       ConfigMap — this generalises the many hand-written
+       ``test_provisioner_arrays_match_and_exact`` guards above into one
+       check that the TWO PROVISIONERS AGREE WITH EACH OTHER. It never
+       asserts ``ALL_SCOPES ⊆ (script_union | cm_union)``, and
+       deliberately so. As of this round, 10 ``ALL_SCOPES`` entries sit
+       outside ``(script_union | cm_union)`` (32 entries, of
+       ``ALL_SCOPES``'s 42) — they split into two groups, not one:
+
+       - **8 legitimately belong to no memory-scopes provisioner at
+         all** — the core chat/query/audit scopes: ``audittrace:query``,
+         ``audittrace:context``, ``audittrace:index``, ``audittrace:audit``,
+         ``audittrace:scan:retrigger``, ``memory:episodic:read``,
+         ``memory:procedural:read``, ``memory:upload:write``. Forcing
+         these into ``setup-memory-scopes.sh`` to satisfy a strict
+         subset check would misfile them into the wrong script — a
+         worse outcome than an honest, narrower parity-only guard.
+       - **2 are live candidates for the residual risk below, not
+         established as legitimately absent** — ``memory:semantic:read``
+         and ``memory:conversational:read-own``. Both are READ-OWN-style
+         memory-domain scopes; the provisioner script's own comment
+         above ``MEMORY_SESSION_READ_SCOPES`` (line 189) calls
+         ``memory:session:read-own`` *"a READ-OWN scope, same family as
+         memory:conversational:read-own/memory:semantic:read"* — and
+         that sibling, ``memory:session:read-own``, IS provisioned
+         (``MEMORY_SESSION_READ_SCOPES``). The script's own comment
+         treats this family as provisioner-owned; these two members of
+         the family are simply missing from the array. This is named as
+         a candidate, not asserted as a defect — no test in this class
+         requires provisioning either — but the "legitimately belongs
+         nowhere" framing does NOT apply to these two, and asserting
+         otherwise is not supported by the evidence above.
+
+       **Residual risk (explicit, not closed by this class): two live
+       instances on `main` today, not merely a future possibility.**
+       Any scope added to ``ALL_SCOPES`` AND declared in both realm
+       files AND bound to a client (satisfying sub-invariants 1 and 2)
+       but added to NEITHER provisioner script's ``*_SCOPES`` arrays
+       passes this class's sub-invariant 3 outright — the two
+       provisioners still agree (both omit it). ``memory:semantic:read``
+       and ``memory:conversational:read-own`` are exactly that today:
+       declared + bound (sub-invariants 1 and 2 pass for both), yet
+       absent from both provisioners' ensure-loop arrays. On a FRESH
+       cluster the realm import mints the clientScope and the omission
+       is invisible; on an EXISTING cluster upgraded via the
+       provisioner Job (the only path that runs post-install), the
+       scope is never (re-)created if it were ever removed and
+       re-added, and any route that requires it would 403 permanently
+       on that path — this is F1's exact failure mode, on the upgrade
+       path, surviving this guard. Closing it requires a per-scope
+       ownership map (which provisioner, if any, owns each
+       ``ALL_SCOPES`` entry) and is tracked as a follow-up WU, not
+       attempted here; that follow-up should also settle whether these
+       two scopes ought to be added to ``MEMORY_SESSION_READ_SCOPES``'s
+       family outright.
+
+    **Non-vacuity, proved by hand during the fix round** (not
+    re-executed by this class, which would be a guard testing itself):
+    deleting the ``memory:acl:read-own`` clientScope declaration from
+    ``keycloak/realm-audittrace.json`` alone flips
+    ``test_every_scope_declared_in_both_realms`` RED (missing in that
+    one file); additionally removing it from
+    ``defaultClientScopes``/``optionalClientScopes`` on every client
+    flips ``test_every_scope_bound_to_some_client`` RED even with the
+    declaration restored; deleting ``MEMORY_ACL_READ_SCOPES`` from only
+    one of the two provisioner files flips
+    ``test_provisioner_ensure_loop_sets_match`` RED. All three restored
+    to the tree's real (``cmp``-identical) state afterward.
+
+    **New finding surfaced by this guard, tracked NOT silently fixed**
+    (WU-1 fix round 1, out of this WU's mandate — binding an admin-
+    grade scope to a client is a security decision, not a drive-by):
+    ``test_every_scope_bound_to_some_client`` independently discovered
+    that ``audittrace:scan:retrigger`` and ``memory:upload:write`` are
+    ALREADY declared clientScopes in BOTH realm files today, on `main`,
+    with ZERO client (default or optional) holding either — pre-
+    existing and unrelated to the ACL domain. Exempted here (narrowly,
+    by name, proven by the same query this guard runs) so the ACL fix
+    doesn't silently absorb an unrelated remediation; see
+    ``_PRE_EXISTING_UNBOUND_SCOPES`` below. Follow-up: a dedicated WU
+    must decide which client(s) should hold these and bind them (or
+    deprecate the scopes if genuinely dead), then delete this
+    exemption.
+    """
+
+    # Proven pre-existing (see class docstring) — NOT part of the ACL
+    # domain this fix round touches. Deliberately exempted by NAME so
+    # the exemption cannot silently grow to cover a scope this WU
+    # actually owns (see test_exemption_list_is_narrow below, which
+    # would fail if memory:acl:* ever landed in this set).
+    _PRE_EXISTING_UNBOUND_SCOPES: frozenset[str] = frozenset(
+        {"audittrace:scan:retrigger", "memory:upload:write"}
+    )
+
+    # The combined "ensure each scope exists" loop's array-reference
+    # list is identical text in both files (see
+    # TestKeycloakOpencodeMemoryWriteScopes docstring on why these two
+    # files must mirror each other) — this pattern extracts that FIRST
+    # `for SCOPE in "${A[@]}" "${B[@]}" ...; do` header specifically
+    # (the ensure-loop, which folds in TWO OR MORE arrays), not any of
+    # the later single-array bind loops (each references exactly one).
+    _ENSURE_LOOP_HEADER_RE = re.compile(
+        r'for SCOPE in ((?:"\$\{[A-Z_]+\[@\]\}"\s*){2,}); do'
+    )
+    _ARRAY_REF_RE = re.compile(r"\$\{([A-Z_]+)\[@\]\}")
+
+    @staticmethod
+    def _array_contents(text: str, array_name: str) -> set[str]:
+        m = re.search(rf"\b{array_name}=\(([^)]*)\)", text)
+        if m is None:
+            raise AssertionError(
+                f"array {array_name} referenced by the ensure-loop header "
+                "but never declared in this file."
+            )
+        return set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    @classmethod
+    def _ensure_loop_scope_union(cls, text: str) -> set[str]:
+        m = cls._ENSURE_LOOP_HEADER_RE.search(text)
+        if m is None:
+            raise AssertionError(
+                "the 'ensure each scope exists' for-loop header was not "
+                "found — provisioner script structure changed; update "
+                "this guard's regex."
+            )
+        array_names = cls._ARRAY_REF_RE.findall(m.group(1))
+        assert array_names, "no array references parsed out of the ensure-loop header"
+        union: set[str] = set()
+        for name in array_names:
+            union |= cls._array_contents(text, name)
+        return union
+
+    @staticmethod
+    def _both_realms() -> list[tuple[str, dict]]:
+        top_level = json.loads(
+            (REPO_ROOT / "keycloak" / "realm-audittrace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        chart_rendered = _rendered_realm_json(_render())
+        return [
+            ("keycloak/realm-audittrace.json", top_level),
+            (
+                "charts/audittrace/files/realm-audittrace.json (rendered)",
+                chart_rendered,
+            ),
+        ]
+
+    def test_every_scope_declared_in_both_realms(self) -> None:
+        from audittrace.auth import ALL_SCOPES
+
+        for label, realm in self._both_realms():
+            declared = {s.get("name") for s in realm.get("clientScopes", []) or []}
+            missing = set(ALL_SCOPES) - declared
+            assert not missing, (
+                f"{label}: ALL_SCOPES entries with NO matching "
+                f"clientScopes[].name declaration: {sorted(missing)} — "
+                "Keycloak can never mint these on a fresh realm import; "
+                "add a clientScopes object for each in BOTH realm files."
+            )
+
+    def test_every_scope_bound_to_some_client(self) -> None:
+        from audittrace.auth import ALL_SCOPES
+
+        for label, realm in self._both_realms():
+            bound: set[str] = set()
+            for c in realm.get("clients", []) or []:
+                bound |= set(c.get("defaultClientScopes") or [])
+                bound |= set(c.get("optionalClientScopes") or [])
+            missing = set(ALL_SCOPES) - bound - self._PRE_EXISTING_UNBOUND_SCOPES
+            assert not missing, (
+                f"{label}: ALL_SCOPES entries declared as clientScopes "
+                f"but bound to NO client (default or optional): "
+                f"{sorted(missing)} — a scope nobody can request is "
+                "exactly as unreachable as one that was never declared; "
+                "bind it (default or optional, as the domain's read/"
+                "write discipline requires) to its intended client."
+            )
+
+    def test_exemption_list_is_narrow(self) -> None:
+        """Non-vacuity floor on the exemption itself: it must name
+        EXACTLY the two pre-existing scopes proven unbound (see class
+        docstring), never grow to swallow a scope this WU (or any
+        future one) actually owns — in particular, no ``memory:acl:*``
+        entry may ever appear here."""
+        assert self._PRE_EXISTING_UNBOUND_SCOPES == frozenset(
+            {"audittrace:scan:retrigger", "memory:upload:write"}
+        )
+        assert not any(
+            s.startswith("memory:acl:") for s in self._PRE_EXISTING_UNBOUND_SCOPES
+        )
+
+    def test_provisioner_ensure_loop_sets_match(self) -> None:
+        repo_root = CHART_DIR.parent.parent
+        script_path = repo_root / "scripts" / "setup-memory-scopes.sh"
+        cm_path = (
+            CHART_DIR / "templates" / "keycloak" / "configmap-memory-scopes-script.yaml"
+        )
+        script_union = self._ensure_loop_scope_union(script_path.read_text())
+        cm_union = self._ensure_loop_scope_union(cm_path.read_text())
+        assert script_union == cm_union, (
+            "Drift: the ensure-loop's combined array set diverges between "
+            "scripts/setup-memory-scopes.sh and "
+            "templates/keycloak/configmap-memory-scopes-script.yaml. "
+            f"Only in script: {sorted(script_union - cm_union)}. Only in "
+            f"configmap: {sorted(cm_union - script_union)}."
+        )
+
+
 class TestCorpusScopeGovernance:
     """ADR-062 WU-A2/A3 — granular ``memory:corpus:<collection>:{read,write}``
     scopes for Layer 5 (the Shared Corpus), one read/write pair per recall
@@ -4855,6 +5289,12 @@ class TestLibrechatConsoleClient:
             # favorites store's read-own scope. DEFAULT, same read-own
             # family as memory:conversation_tags:read-own above.
             "memory:tool_favorites:read-own",
+            # Sovereign Authorization Layer EPIC, WU-1 (2026-09-17,
+            # READ PATH ONLY) — the console-ACL store's read-own
+            # scope. DEFAULT, same read-own family as
+            # memory:tool_favorites:read-own above. No write
+            # counterpart exists yet (WU-2).
+            "memory:acl:read-own",
             # M3-WU-3b (D3) — standard OIDC scopes the LibreChat console
             # needs for its own identity claims (LibreChat's
             # OPENID_SCOPE="openid profile email offline_access").

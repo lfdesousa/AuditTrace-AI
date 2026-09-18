@@ -314,9 +314,18 @@ MEMORY_TOOL_FAVORITES_READ_SCOPES=(
   "memory:tool_favorites:read-own"
 )
 
+# Sovereign Authorization Layer EPIC, WU-1 (2026-09-17, READ PATH ONLY)
+# — the console-ACL store's read-own scope. Bound as DEFAULT to
+# audittrace-librechat — same rationale as
+# MEMORY_TOOL_FAVORITES_READ_SCOPES above. No write array exists yet:
+# WU-1 is read-only (WU-2 adds memory:acl:write later).
+MEMORY_ACL_READ_SCOPES=(
+  "memory:acl:read-own"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}" "${MEMORY_ACL_READ_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -545,6 +554,14 @@ done
 # console-conversation-tags read-own bind above.
 echo "▶ binding console-tool-favorites read-own scope to client audittrace-librechat (default)..."
 for SCOPE in "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "default"
+done
+
+# ----- Bind the console-ACL READ-OWN scope (Sovereign Authorization Layer EPIC, WU-1) -----
+# audittrace-librechat only, as DEFAULT — same rationale as the
+# console-tool-favorites read-own bind above.
+echo "▶ binding console-acl read-own scope to client audittrace-librechat (default)..."
+for SCOPE in "${MEMORY_ACL_READ_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "default"
 done
 

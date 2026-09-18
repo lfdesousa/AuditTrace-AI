@@ -150,6 +150,81 @@ components:
       - file
       title: Body_upload_memory_file_memory_upload_post
       type: object
+    ConsoleAclBatchPermissionsRequest:
+      description: 'Request body for ``POST /console/acl/{resource_type}/
+
+        permissions/batch`` — bounded at 200 ids, same cap as every other
+
+        console-* batch route.'
+      properties:
+        resource_ids:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          title: Resource Ids
+          type: array
+      required:
+      - resource_ids
+      title: ConsoleAclBatchPermissionsRequest
+      type: object
+    ConsoleAclBatchPermissionsResponse:
+      description: 'Response from the batch-permissions route. ``permissions`` omits
+
+        any ``resource_id`` with no matching, non-expired grant (never
+
+        present with value ``0``) — mirrors the service layer''s ``Map``
+
+        semantics.'
+      properties:
+        permissions:
+          additionalProperties:
+            type: integer
+          title: Permissions
+          type: object
+      title: ConsoleAclBatchPermissionsResponse
+      type: object
+    ConsoleAclEffectivePermissionsResponse:
+      description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
+
+        permissions`` — the CALLER''s combined (bitwise-OR''d) effective
+
+        permission bitmask on the resource. ``0`` means no matching,
+
+        non-expired grant exists (deny-by-default).'
+      properties:
+        perm_bits:
+          minimum: 0.0
+          title: Perm Bits
+          type: integer
+      required:
+      - perm_bits
+      title: ConsoleAclEffectivePermissionsResponse
+      type: object
+    ConsoleAclHasPermissionResponse:
+      description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
+
+        has-permission``.'
+      properties:
+        has_permission:
+          title: Has Permission
+          type: boolean
+      required:
+      - has_permission
+      title: ConsoleAclHasPermissionResponse
+      type: object
+    ConsoleAclResourceIdsResponse:
+      description: 'Response shape shared by the accessible/public/sole-owned
+
+        resource-id routes.'
+      properties:
+        resource_ids:
+          items:
+            type: string
+          title: Resource Ids
+          type: array
+      title: ConsoleAclResourceIdsResponse
+      type: object
     ConsoleAgentBatchGetRequest:
       description: 'Request body for ``POST /console/agents/batch-get`` — fetch the
 
@@ -2204,6 +2279,11 @@ components:
             audittrace:query: Issue chat completions and inference queries
             audittrace:scan:retrigger: Force a re-scan of an object in the ingestion content-control pipeline (ADR-048 operator
               surface). Admin-grade; never granted by default.
+            memory:acl:read-own: Read effective permissions, accessible/public/sole-owned resource ids from the console-ACL
+              store (Sovereign Authorization Layer EPIC, WU-1 — READ PATH ONLY) — the RLS-isolated store backing LibreChat's
+              AclEntry records. Every answer is scoped to the CALLER's own resolved principal set (self + public); group principals
+              are disabled at the schema level. No write path exists yet (WU-2), and this scope grants no access to any other
+              memory layer.
             memory:agents:read-own: 'Read your own agents (and batch-get-by-ids) from the console-agents store (Agents domain,
               MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s Agent records. Own-agents-only: sharing/marketplace
               is out of scope. Grants no access to another user''s agents or to any other memory layer.'
@@ -2352,6 +2432,248 @@ paths:
       summary: Create Assessment
       tags:
       - audit
+  /console/acl/{resource_type}/accessible:
+    get:
+      description: 'Resource ids the CALLER can access with at least ``bit``
+
+        (self + public), unbounded (no ``resource_ids`` candidate filter
+
+        at this route — the full-scan form).'
+      operationId: find_accessible_resources_console_acl__resource_type__accessible_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Find Accessible Resources
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/permissions/batch:
+    post:
+      description: 'Batch form of :func:`get_effective_permissions` — one round
+
+        trip for many resource ids. A POST (not a GET with repeated query
+
+        params) so the (potentially large) id list travels in the body;
+
+        this is a READ operation despite the verb, gated on the READ
+
+        scope, never a write scope (WU-1 has none).'
+      operationId: get_effective_permissions_batch_console_acl__resource_type__permissions_batch_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclBatchPermissionsRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclBatchPermissionsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Effective Permissions Batch
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/public:
+    get:
+      description: 'Resource ids PUBLICLY accessible with at least ``bit`` — the
+
+        same answer for any authenticated caller.'
+      operationId: find_public_resource_ids_console_acl__resource_type__public_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Find Public Resource Ids
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/sole-owned:
+    get:
+      description: Resource ids where the CALLER is the SOLE holder of DELETE.
+      operationId: get_sole_owned_resource_ids_console_acl__resource_type__sole_owned_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclResourceIdsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Sole Owned Resource Ids
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/has-permission:
+    get:
+      description: 'Whether the CALLER holds AT LEAST ``bit`` (containment, never
+
+        equality) on the resource.'
+      operationId: has_permission_console_acl__resource_type___resource_id__has_permission_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          title: Resource Id
+          type: string
+      - in: query
+        name: bit
+        required: true
+        schema:
+          maximum: 15
+          minimum: 1
+          title: Bit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclHasPermissionResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Has Permission
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/permissions:
+    get:
+      description: 'The CALLER''s combined effective permission bitmask on the
+
+        resource. ``0`` (never an error) when no matching, non-expired
+
+        grant exists — deny-by-default.'
+      operationId: get_effective_permissions_console_acl__resource_type___resource_id__permissions_get
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          title: Resource Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEffectivePermissionsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:read-own
+      summary: Get Effective Permissions
+      tags:
+      - console-acl
   /console/agents:
     get:
       description: 'List the CALLER''s OWN (non-deleted) agents, newest-first,
