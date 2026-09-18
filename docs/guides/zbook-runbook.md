@@ -58,6 +58,18 @@ for the CA to land in Firefox's trust store.
 
 ### 3. llama.cpp as `systemd --user` units
 
+⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** every
+llama-server must bind `127.0.0.1` (never `0.0.0.0`), require
+`--api-key-file`, and disable the web UI (`--no-webui`) — see
+`scripts/llama-lock-flags.lib.sh` for why each flag is shaped the way it
+is. Provision a key first:
+
+```bash
+install -d -m700 "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"
+( umask 177 && openssl rand -hex 32 > \
+    "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}/llama-api-key.txt" )
+```
+
 Put the following under `~/.config/systemd/user/`. Adjust `--model` paths
 to where you unpacked Qwen3.6-27B-Q4_K_M (`~/models/` per session memory).
 
@@ -70,7 +82,9 @@ After=default.target
 
 [Service]
 ExecStart=%h/bin/llama-server \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
+  --api-key-file %h/work/audittrace-private/secrets/llama-api-key.txt \
+  --no-webui \
   --port 11435 \
   --model %h/models/Qwen_Qwen3.6-27B-Q4_K_M.gguf \
   --ctx-size 8192
@@ -81,7 +95,8 @@ WantedBy=default.target
 ```
 
 Repeat for `llama-embed.service` (port 11436, embedding model) and
-`llama-summarizer.service` (port 11437, summarizer model). Then:
+`llama-summarizer.service` (port 11437, summarizer model) — same three
+extra flags each time. Then:
 
 ```bash
 systemctl --user daemon-reload
@@ -89,10 +104,15 @@ systemctl --user enable --now llama-chat llama-embed llama-summarizer
 loginctl enable-linger $USER     # keep services alive after logout
 ```
 
-Verify:
+Set `AUDITTRACE_LLAMA_API_KEY` / `_EMBED_API_KEY` / `_SUMMARIZER_API_KEY`
+on the backend to the same file's contents (see `.env.example`), then
+verify:
 
 ```bash
-curl http://localhost:11435/v1/models
+curl -o /dev/null -s -w '%{http_code}\n' http://localhost:11435/v1/models       # 401 keyless
+KEY=$(cat "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}/llama-api-key.txt")
+curl -o /dev/null -s -w '%{http_code}\n' -H "Authorization: Bearer $KEY" \
+    http://localhost:11435/v1/models                                            # 200 keyed
 ```
 
 ### 4. Sibling docker-compose stacks

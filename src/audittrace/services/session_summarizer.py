@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.config import Settings
 from audittrace.db.models import InteractionRecord, SessionRecord
+from audittrace.routes._llama_client import llama_auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -664,8 +665,14 @@ class SessionSummarizer:
         return str(message.get("content") or "")
 
     def _ensure_client(self) -> httpx.AsyncClient:
-        if self._http_client is None:  # pragma: no cover - production-only path
-            self._http_client = httpx.AsyncClient()
+        if self._http_client is None:
+            # M3 WU-4 — every call this worker makes (/props, /tokenize,
+            # /chat/completions) goes through this one client, so setting
+            # the Authorization header here as a client default covers
+            # all three in one place; empty key sends no header.
+            self._http_client = httpx.AsyncClient(
+                headers=llama_auth_headers(self._settings.summarizer_api_key)
+            )
         return self._http_client
 
     # ── dialect-aware helpers ──────────────────────────────────────────

@@ -281,6 +281,18 @@ component wired to the `conversationalSvc`).
 
 ### Follow-ups
 
+- **M3 WU-4 (2026-09-18, llama endpoint isolation locks)** — the
+  summariser endpoint (`:11437`) was launched with `--host 0.0.0.0`, no
+  `--api-key`, and no `--no-webui`, same as the other two llama-server
+  processes on this host (`:11435` chat, `:11436` embed). Fixed: all
+  three now bind `127.0.0.1`, require `--api-key-file`, and disable the
+  web UI — see `scripts/llama-lock-flags.lib.sh` and
+  `AUDITTRACE_SUMMARIZER_API_KEY`. Enumeration also surfaced that this
+  unit's LIVE `ExecStart` had already drifted from
+  `scripts/start-summarizer-llama.sh` (different `--ctx-size`, missing
+  `--cache-type-k/v`/`--batch-size`/`--alias`) — left unreconciled as
+  out of scope for a security-only WU; see
+  `scripts/systemd/llama-summarizer.service`'s header.
 - **Eval re-run** after Part 1: `scripts/eval-memory-modes.py
   --n-per-mode 10`, new `docs/eval-memory-modes-YYYYMMDD.md`.
 - **Eval re-run** after Part 2: full `N=100` across 6 categories,

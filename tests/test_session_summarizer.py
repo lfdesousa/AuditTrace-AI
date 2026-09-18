@@ -1490,3 +1490,36 @@ class TestUnlabelledCodeFence:
         assert _parse_llm_response(
             '```JSON\n{"summary": "upper", "key_points": []}\n```'
         ) == {"summary": "upper", "key_points": []}
+
+
+class TestEnsureClientAuthHeader:
+    """M3 WU-4 (llama endpoint isolation locks) — the lazily-created
+    production httpx client must carry the summariser bearer key as a
+    client-default header, covering every call this worker makes
+    (/props, /tokenize, /chat/completions) from one place. Every OTHER
+    test in this file injects ``http_client=`` explicitly, which bypasses
+    ``_ensure_client()`` entirely — these two exercise that path directly."""
+
+    @pytest.mark.asyncio
+    async def test_no_key_configured_sends_no_header(self, pg_factory):
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+        )
+        client = summariser._ensure_client()
+        try:
+            assert "authorization" not in client.headers
+        finally:
+            await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_key_configured_sends_bearer_header(self, pg_factory):
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_api_key="summariser-secret"),
+            session_factory=pg_factory.get_session_factory(),
+        )
+        client = summariser._ensure_client()
+        try:
+            assert client.headers["authorization"] == "Bearer summariser-secret"
+        finally:
+            await client.aclose()

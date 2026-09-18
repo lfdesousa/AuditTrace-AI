@@ -1,0 +1,55 @@
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18) — REFERENCE COPY.
+# See scripts/systemd/llama-server.service's header for the install
+# process.
+#
+# ⚠ SCOPE NOTE — deliberately NOT delegating to
+# scripts/start-summarizer-llama.sh here, unlike the chat/embed units.
+# Task-Zero enumeration (WU-4 build record) found this unit's LIVE
+# ExecStart had already drifted from that script before this WU: the
+# live process runs --ctx-size 8192 with NO --cache-type-k/v,
+# --batch-size, --ubatch-size, --threads, --metrics, --alias, or
+# --reasoning-format, while the script defaults to --ctx-size 32768
+# with all of those set. Reconciling that drift is a real fix this repo
+# should make — but it is a PERFORMANCE/behaviour change, and this WU's
+# explicit scope is "who may reach the endpoint, nothing about what it
+# computes." So this reference unit's ExecStart matches TODAY's live
+# flags byte-for-byte and only appends the three locks; the script
+# (already fixed in this WU per the spec's defect description) stays
+# available as a documented, tested, DIFFERENT invocation for whenever
+# that separate drift gets its own fix.
+
+[Unit]
+Description=llama.cpp Summariser Server (Mistral 7B — M3 WU-4 isolation locks)
+After=network.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+ExecStartPre=/usr/local/bin/wait-for-vulkan-gpu.sh
+
+# Byte-for-byte the current live unit's flags (verified via
+# `systemctl cat llama-summarizer` at WU-4 build time) plus the three
+# locks — LLAMA_API_KEY_FILE resolves via scripts/llama-lock-flags.lib.sh's
+# same default as the other two units, sourced through an inline exec
+# here rather than the script (see the scope note above), so lock 2
+# still fails closed with the same clear error if the key file is
+# missing.
+Environment=LLAMA_API_KEY_FILE=/home/lfdesousa/work/audittrace-private/secrets/llama-api-key.txt
+ExecStart=/bin/bash -c '\
+  set -euo pipefail; \
+  KEY_FILE="${LLAMA_API_KEY_FILE}"; \
+  if [[ ! -f "$KEY_FILE" ]]; then echo "error: llama API key file not found at $KEY_FILE" >&2; exit 1; fi; \
+  exec /home/lfdesousa/opt/llamacpp/llama-server \
+    --model /home/lfdesousa/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf \
+    --ctx-size 8192 \
+    --n-gpu-layers 10 \
+    --host 127.0.0.1 --api-key-file "$KEY_FILE" --no-webui \
+    --port 11437'
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

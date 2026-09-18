@@ -27,6 +27,8 @@ import logging
 
 import httpx
 
+from audittrace.routes._llama_client import llama_auth_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,7 @@ async def embed_via_nomic(
     model: str = "nomic-embed-text",
     client: httpx.AsyncClient | None = None,
     max_attempts: int = 3,
+    api_key: str = "",
 ) -> list[list[float]]:
     """Embed ``texts`` on the dedicated nomic-embed-server (ADR-047).
 
@@ -70,7 +73,12 @@ async def embed_via_nomic(
     :class:`EmbeddingServerError` once attempts are exhausted.
 
     ``client`` is injectable for tests; in production the module-level
-    pooled :class:`httpx.AsyncClient` is reused.
+    pooled :class:`httpx.AsyncClient` is reused — it is a
+    process-lifetime singleton with no ``settings`` access at
+    construction time, so ``api_key`` (M3 WU-4) is sent as a per-request
+    header here rather than a client-default; empty (the default) sends
+    no header, matching an unauthenticated embed server (today's
+    behaviour).
     """
     if not texts:
         return []
@@ -78,11 +86,12 @@ async def embed_via_nomic(
     url = embed_url.rstrip("/") + "/embeddings"
     cl = client or _embed_client_singleton()
     payload = {"model": model, "input": texts}
+    headers = llama_auth_headers(api_key)
 
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = await cl.post(url, json=payload)
+            resp = await cl.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()["data"]
             ordered = sorted(data, key=lambda d: d.get("index", 0))

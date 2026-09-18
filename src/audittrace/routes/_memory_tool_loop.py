@@ -46,7 +46,7 @@ import httpx
 from opentelemetry import trace
 
 from audittrace.identity import UserContext
-from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS
+from audittrace.routes._llama_client import LLAMA_HTTPX_LIMITS, llama_auth_headers
 from audittrace.routes._model_route import upstream_host
 from audittrace.tools import get_tool_by_name, invoke_tool
 
@@ -447,6 +447,7 @@ async def run_memory_tool_loop(
     session_id: str,
     max_iterations: int,
     timeout_seconds: int = 120,
+    llama_api_key: str = "",
 ) -> tuple[dict[str, Any], list[PendingToolCall]]:
     """Run the proxy-internal tool-call loop and return the final body.
 
@@ -456,6 +457,10 @@ async def run_memory_tool_loop(
     for its own POSTs because it needs to inspect every tool_calls
     block; the caller is responsible for rendering the final body as
     SSE if the original request asked for streaming.
+
+    ``llama_api_key`` (M3 WU-4) is forwarded as ``Authorization: Bearer``
+    on every POST this loop makes; empty (the default) sends no header,
+    matching an unauthenticated llama-server (today's behaviour).
 
     Returns ``(final_body, pending_audit_rows)``. The caller flushes
     ``pending_audit_rows`` after ``_persist_interaction`` returns the
@@ -510,6 +515,7 @@ async def run_memory_tool_loop(
                     connect=10.0, read=timeout_seconds, write=30.0, pool=10.0
                 ),
                 limits=LLAMA_HTTPX_LIMITS,
+                headers=llama_auth_headers(llama_api_key),
             ) as client:
                 response = await _post_with_tool_parse_retry(
                     client, llama_url, proxy_payload

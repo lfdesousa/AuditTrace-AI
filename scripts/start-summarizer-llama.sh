@@ -4,13 +4,23 @@
 # Mirrors the Qwen chat server launch pattern, with Q4 KV cache and
 # a smaller context window tuned for 15-min idle sessions.
 #
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18): binds loopback
+# only, requires an API key, and disables the web UI — see
+# scripts/llama-lock-flags.lib.sh for why each flag is shaped the way it
+# is. The consumer side (this backend's outbound calls) is wired via
+# AUDITTRACE_SUMMARIZER_API_KEY (src/audittrace/config.py).
+#
 # Usage:
 #   scripts/start-summarizer-llama.sh                  # foreground
 #   scripts/start-summarizer-llama.sh &                # background
 #   LLAMA_BIN=/path/to/llama-server scripts/...        # override binary
 #   MODEL_PATH=/path/to/other.gguf scripts/...         # override model
+#   LLAMA_API_KEY_FILE=/path/to/key scripts/...        # override key file
 
 set -euo pipefail
+
+# shellcheck source=llama-lock-flags.lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/llama-lock-flags.lib.sh"
 
 LLAMA_BIN="${LLAMA_BIN:-$HOME/opt/llamacpp/llama-server}"
 MODEL_PATH="${MODEL_PATH:-$HOME/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf}"
@@ -47,7 +57,8 @@ fi
 
 exec "$LLAMA_BIN" \
   --model "$MODEL_PATH" \
-  --port "$PORT" --host 0.0.0.0 \
+  --port "$PORT" \
+  "${LLAMA_LOCK_FLAGS[@]}" \
   --ctx-size "$CTX_SIZE" \
   --batch-size 1024 --ubatch-size 256 \
   --cache-type-k q4_0 --cache-type-v q4_0 \

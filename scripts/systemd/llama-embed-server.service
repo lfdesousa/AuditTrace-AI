@@ -1,0 +1,28 @@
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18) — REFERENCE COPY.
+# See scripts/systemd/llama-server.service's header for the install
+# process and the "no behaviour change beyond who may reach the port"
+# guarantee.
+
+[Unit]
+Description=llama.cpp Embedding Server (nomic-embed-text :11436 — M3 WU-4 isolation locks)
+After=network.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+# All flags (model, CPU-only offload, AND the four isolation locks) live
+# in the script now — see its header for every env var override.
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/start-embed-llama.sh
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-embed-server
+
+[Install]
+WantedBy=multi-user.target

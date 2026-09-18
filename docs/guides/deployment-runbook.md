@@ -141,33 +141,42 @@ for semantic search.
 
 ## Step 10: Start LLM servers
 
-### Main chat server (Qwen 3.6-35B-A3B)
+⚠ **M3 WU-4 (llama endpoint isolation locks, 2026-09-18):** every
+llama-server on this host binds `127.0.0.1` (never `0.0.0.0`), requires
+`--api-key-file` (never a literal key — `ps` can read argv), and disables
+the web UI (`--no-webui`). Provision the shared key file once:
 
 ```bash
-# systemd service (recommended)
+install -d -m700 "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"
+( umask 177 && openssl rand -hex 32 > \
+    "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}/llama-api-key.txt" )
+```
+
+Then set the matching `AUDITTRACE_LLAMA_API_KEY` / `AUDITTRACE_EMBED_API_KEY`
+/ `AUDITTRACE_SUMMARIZER_API_KEY` (same file's contents) on the backend —
+see `.env.example`. All three launcher scripts below source
+`scripts/llama-lock-flags.lib.sh` for the shared lock flags; see that
+file's header for why each flag is shaped the way it is.
+
+### Main chat server (Qwen)
+
+```bash
+# systemd service (recommended) — install scripts/systemd/llama-server.service
+# (ExecStart delegates to scripts/start-chat-llama.sh) then:
 sudo systemctl start llama-server
 
 # Or manually:
-llama-server \
-    --model ~/models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf \
-    --ctx-size 65536 --batch-size 1024 --ubatch-size 256 \
-    --cache-type-k q4_0 --cache-type-v q4_0 \
-    --n-gpu-layers 99 --flash-attn on --threads 8 \
-    --metrics --host 0.0.0.0 --reasoning-format none --port 11435
+scripts/start-chat-llama.sh
 ```
 
 ### Embedding server (nomic-embed-text)
 
 ```bash
+# systemd service (recommended) — install scripts/systemd/llama-embed-server.service
 sudo systemctl start llama-embed-server
 
 # Or manually:
-llama-server \
-    --model ~/models/nomic-embed-text-v1.5.Q8_0.gguf \
-    --port 11436 --host 0.0.0.0 --embeddings --pooling mean \
-    --n-gpu-layers 0 --ctx-size 8192 --batch-size 8192 \
-    --ubatch-size 2048 --threads 4 --parallel 4 \
-    --alias nomic-embed-text --log-disable
+scripts/start-embed-llama.sh
 ```
 
 ### Summariser server (Mistral 7B)
@@ -194,6 +203,17 @@ curl -sk -H "Authorization: Bearer $BEARER" \
 # Audit trail
 curl -sk -H "Authorization: Bearer $BEARER" \
     https://localhost/interactions?limit=5 | jq .
+```
+
+**M3 WU-4 lock verification** (each llama-server, loopback only from here on):
+
+```bash
+ss -ltnp | grep -E ':(11435|11436|11437)'   # must show 127.0.0.1, never 0.0.0.0
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11435/v1/models   # 401, no key
+curl -s -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $(cat "${SECRETS_DIR:-$HOME/work/audittrace-private/secrets}"/llama-api-key.txt)" \
+    http://127.0.0.1:11435/v1/models                                        # 200, keyed
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11435/            # 404, webui disabled
 ```
 
 ## Step 12: Observability stack (optional)

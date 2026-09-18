@@ -1,0 +1,46 @@
+# M3 WU-4 (llama endpoint isolation locks, 2026-09-18) — REFERENCE COPY.
+#
+# The live unit is /etc/systemd/system/llama-server.service (root-owned,
+# outside this repo). This file is the versioned, reviewable source of
+# truth the operator installs FROM — apply with
+# scripts/apply-llama-endpoint-locks.sh (requires sudo; this repo's
+# builder/reviewer instruments do not have host root and cannot install
+# this themselves — see the WU-4 build record's "operator action
+# required" section).
+#
+# Behavioural change from the pre-WU-4 unit: NONE. Same model, same
+# quantisation, same GPU offload, same MTP self-speculative decoding
+# flags — see scripts/start-chat-llama.sh, which now OWNS the ExecStart
+# flags (single source of truth, tested by
+# tests/test_llama_endpoint_isolation_locks.py) instead of duplicating
+# them inline here, which is exactly how this unit and
+# scripts/start-summarizer-llama.sh had already drifted from each other
+# before this WU. Security change ONLY: bind 127.0.0.1, require
+# --api-key-file, disable the web UI (all three in the script).
+
+[Unit]
+Description=llama.cpp Server (chat / tool-loop — M3 WU-4 isolation locks)
+After=network.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=lfdesousa
+Group=lfdesousa
+
+# GPU-or-nothing guard (2026-06-02): block startup until Vulkan enumerates
+# the RADV iGPU — see scripts/llama-gpu-status.sh.
+ExecStartPre=/usr/local/bin/wait-for-vulkan-gpu.sh
+
+# All flags (model, ctx, GPU offload, MTP, AND the four isolation locks)
+# live in the script now — see its header for every env var override.
+# Path matches this host's existing convention (every other live unit on
+# this box hardcodes an absolute /home/lfdesousa/... path too — this is
+# host-specific bare-metal config, not the AuditTrace-AI product's own
+# portability surface).
+ExecStart=/home/lfdesousa/work/AuditTrace-AI/scripts/start-chat-llama.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

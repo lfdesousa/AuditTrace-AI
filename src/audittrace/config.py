@@ -87,10 +87,26 @@ class Settings(BaseSettings):
     # mistral` Service (--set externalLLM.mistral.enabled=true), e.g.:
     #   {"mistral": "http://audittrace-llm-mistral:11438/v1"}
     model_routes: dict[str, str] = {}
+    # M3 WU-4 (llama endpoint isolation locks) — bearer key sent as
+    # ``Authorization: Bearer <key>`` on every outbound call to
+    # ``llama_url``. Empty string (the default) sends no header, matching
+    # this repo's existing "empty secret = feature off" convention
+    # (``minio_secret_key``, ``langfuse_secret_key``) so an environment
+    # that has not yet provisioned a key keeps working against an
+    # unauthenticated llama-server. Once the launcher scripts under
+    # ``scripts/start-*-llama.sh`` are given ``--api-key-file``, this MUST
+    # be set to the same value or every chat/tool-loop call starts
+    # returning 401. Never a literal in git — populate via
+    # ``AUDITTRACE_LLAMA_API_KEY`` (env) read from a key file at process
+    # start, never on argv.
+    llama_api_key: str = ""
     embed_url: str = "http://host.docker.internal:11436/v1"
     # ADR-047 — embedding always runs on the dedicated nomic-embed-server;
     # the request gateway hosts no in-process model. 768-dim.
     embed_model: str = "nomic-embed-text"
+    # M3 WU-4 — bearer key for the dedicated embed server, same
+    # empty-means-off convention as ``llama_api_key`` above.
+    embed_api_key: str = ""
 
     # ChromaDB configuration (server mode — ADR-020)
     chroma_url: str = "http://localhost:8000"
@@ -247,6 +263,9 @@ class Settings(BaseSettings):
     # crashes.
     summarizer_url: str = "http://host.docker.internal:11437/v1"
     summarizer_model: str = "mistral-7b-summarizer"
+    # M3 WU-4 — bearer key for the dedicated summariser server, same
+    # empty-means-off convention as ``llama_api_key`` above.
+    summarizer_api_key: str = ""
 
     # Optional dedicated database URL for the summariser worker. The
     # main memory-server connects as the non-superuser ``audittrace_app``

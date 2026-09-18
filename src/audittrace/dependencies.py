@@ -489,6 +489,8 @@ def _register_memory_services(settings: Settings, pg_factory: PostgresFactory) -
         # ADR-062 §6 (WU-A5) — recall honours the manifest soft-delete
         # tombstone; see ChromaSemanticService._filter_soft_deleted.
         manifest=memory_manifest,
+        # M3 WU-4 — llama endpoint isolation locks.
+        embed_api_key=settings.embed_api_key,
     )
 
     context_builder = DefaultContextBuilder(
