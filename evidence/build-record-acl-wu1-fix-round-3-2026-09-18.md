@@ -14,22 +14,33 @@ recall_evidence: STEP-2 query 'sovereign ACL absent-scope enumeration substring-
   confirming the memory server remains healthy and this round's dispatch (the orchestrator's
   F5 finding) is durably recorded server-side.
 log_key: 0b0cdd4d-04c3-428f-ab9d-37b47429c381/episodic/build-record-acl-wu1-fix-round-3-2026-09-18.md
-index_status: '{"collections": {"decisions": 9}, "duration_s": 0.29, "status": "indexed",
-  "total_chunks": 9}'
+index_status: '{"collections": {"decisions": 15}, "duration_s": 0.46, "status": "indexed",
+  "total_chunks": 15}'
 branch: feat/sovereign-acl-read-path
-commit: 06165897597d1b50a4d0af84118b2eb79b361531
-gates: "make test: PASS (5650 passed, 0 failed, 0 skipped in 673.93s; zero-skip policy\
-  \ enforced by scripts/check-no-skipped-tests.py per junit.xml). Per-file coverage\
-  \ gate: PASS (157 files checked, lines >= 90% AND branches >= 90% on 133 file(s)\
-  \ with branches \u2014 per register D22, PASS/FAIL cited, not file/line counts).\
-  \ ruff check: clean (repo-wide, via make lint). ruff format --check: clean (406\
-  \ files already formatted, repo-wide, via make lint). semgrep: 0 findings (2 rules,\
-  \ 222 files scanned). mypy: clean on tests/test_chart_drift_guards.py (the only\
-  \ file this round's diff touched). make helm-lint: not re-run this round \u2014\
-  \ chart unchanged (docstring/build-record-only round; single alembic head b3f8a1c6d9e2\
-  \ re-confirmed via `alembic heads`, no new migration). Integration gate: not run\
-  \ this round \u2014 no product route or runtime behaviour changed (docstring correction\
-  \ only, no test-behaviour change)."
+commit: 89ca43a2d6ef9d3066fb29617c293b9dc99c3a20
+gates: "POST-REBASE (main @ 08e3f81, PR #353 merged) \u2014 see the Rebase note section\
+  \ for the full detail. make test: PASS (5694 passed, 0 failed, 0 skipped in 721.72s;\
+  \ zero-skip policy enforced by scripts/check-no-skipped-tests.py per junit.xml).\
+  \ Per-file coverage gate: PASS (156 files checked, lines >= 90% AND branches >=\
+  \ 90% on 132 file(s) with branches \u2014 per register D22, PASS/FAIL cited, not\
+  \ file/line counts). ruff check: clean (repo-wide, via make lint). ruff format --check:\
+  \ clean (409 files already formatted, repo-wide, via make lint). semgrep: 0 findings\
+  \ (2 rules, 224 files scanned). mypy: clean on tests/test_chart_drift_guards.py\
+  \ and src/audittrace/services/console_acl/_postgres.py. make helm-lint: PASS (1\
+  \ chart linted, 0 failed; vaultSecretFileGuard present in 3 workloads) \u2014 run\
+  \ for confirmation though the chart content is byte-identical pre- and post-rebase\
+  \ (verified via diff of the two touched chart files at the pre-rebase and post-rebase\
+  \ tips). Single alembic head: b3f8a1c6d9e2, re-confirmed post-rebase (main added\
+  \ no migration). OpenAPI: regenerated via `make openapi-export` on the rebased tree\
+  \ \u2014 zero diff against the rebase's own textual merge of the two generated files,\
+  \ confirming it was correct; `test_openapi_drift.py` 4/4 PASS. Integration gate:\
+  \ not run this round \u2014 no product route or runtime behaviour changed (docstring\
+  \ correction only, no test-behaviour change; the OpenAPI regeneration is additive-only,\
+  \ see Rebase note). PRE-REBASE numbers (superseded by the above, kept here only\
+  \ as historical record \u2014 do not cite as current): make test 5650 passed in\
+  \ 673.93s; per-file coverage gate PASS on 157 files checked, 133 with branches;\
+  \ mypy clean on tests/test_chart_drift_guards.py only; helm-lint not re-run (chart\
+  \ believed unchanged, not yet verified byte-identical)."
 ---
 
 # Build record — Sovereign ACL WU-1, fix round 3 (2026-09-18)
@@ -217,3 +228,107 @@ retraction in a new commit rather than a rewrite of `2efd21a` or
 `14711b3`), split honestly rather than asserting the two candidates
 belong nowhere, de-future-tensed the residual-risk paragraph, and did
 not make leg (3) strict.
+
+## Rebase note (2026-09-18, post fix-round-3 PASS)
+
+Independent review **PASSED** fix round 3 with its own independent
+re-derivation of the enumeration (own parser, not this branch's
+`_ensure_loop_scope_union`) reaching the identical result (32/32,
+equal, 42, absent 10, names matching), the badge ruled **earned**, the
+8-vs-2 split ruled honest and not over-corrected, the residual risk
+ruled properly present-tense, and the retraction ruled verbatim in
+both artefacts with `2efd21a`/`14711b3` left unrewritten. Before push,
+the branch was rebased onto `main @ 08e3f81` (PR #353 —
+`feat/memory-retrieval-correctness`, D15 recall-limit-configurable) at
+the coordinator's direction.
+
+**SHA remap (rebase moved these; messages verified byte-identical,
+`diff <(git log -1 --format=%B <old>) <(git log -1 --format=%B <new>)`
+empty for all four):**
+
+| Commit (by role) | Pre-rebase SHA | Post-rebase SHA |
+|---|---|---|
+| WU-1 fix round 1 (`fix(acl): ...`) | `14711b3` | `6f18d27` |
+| Fix-round-1 build record | `6a3d6c4` | `df3c117` |
+| F3 retraction (`docs(acl): retract ...`) | `2efd21a` | `c86e6ed` |
+| Fix-round-2 build record | `7c6648c` | `aa73250` |
+| F5 correction (`docs(acl): correct ...`) | `0616589` | `89ca43a` |
+| This build record (round 3) | `356d309` | `77c8fbc` (pre-rebase-note) |
+
+No commit was squashed or amended; the rebase only replayed each
+commit onto the new base. The front-matter `commit:` field above has
+been updated to the post-rebase SHA of the F5 correction commit
+(`89ca43a`) it always referred to — the prose elsewhere in this file
+still cites the pre-rebase SHAs for the events it narrates (they are
+historically accurate for what was true when written); this table is
+the map from those to their current identities.
+
+**File-set overlap, resolved by regeneration, not hand-merge.** Two
+GENERATED files were touched by both sides: `docs/reference/audittrace/
+openapi.yaml` and `tests/fixtures/openapi.snapshot.yaml`. The rebase's
+own textual merge applied cleanly (git reported no conflict — this
+branch's `/console/acl/*` paths and main's `#353` change are
+non-overlapping insertions in the underlying YAML). Per instruction,
+this was **verified by regenerating, not trusted from the textual
+merge**: ran `make openapi-export` (which reruns
+`tests/test_openapi_drift.py` with `OPENAPI_SNAPSHOT_UPDATE=1`) on the
+rebased tree. Result: `git status --short` showed **zero diff** —
+the regenerated bytes are identical to what the rebase's merge already
+produced, confirming the merge was correct rather than merely
+plausible.
+
+Diff of the regenerated `docs/reference/audittrace/openapi.yaml`
+against pre-rebase `main` (`git diff 08e3f81 HEAD --
+docs/reference/audittrace/openapi.yaml`), captured live:
+
+| Check | Result |
+|---|---|
+| Lines removed | **0** (only the `---` diff header itself matches `^-`) |
+| Lines added | 322 |
+| New paths | **exactly 6**: `/console/acl/{resource_type}/accessible`, `/console/acl/{resource_type}/permissions/batch`, `/console/acl/{resource_type}/public`, `/console/acl/{resource_type}/sole-owned`, `/console/acl/{resource_type}/{resource_id}/has-permission`, `/console/acl/{resource_type}/{resource_id}/permissions` |
+| Paths removed or modified | 0 |
+| `/v1/chat/completions` | no hunk in the diff touches it — byte-identical |
+
+`tests/test_openapi_drift.py` on the regenerated pair:
+`test_openapi_snapshot_matches`, `test_vendored_spec_matches_snapshot`,
+`test_critical_paths_present`, `test_metadata_is_current` — **4
+passed**.
+
+**Full gates re-run on the rebased tree** (own numbers, captured live,
+not carried over from pre-rebase — see the front-matter `gates` field
+above for the authoritative post-rebase figures; the pre-rebase
+figures it also lists are explicitly labelled superseded, not restated
+as current):
+
+- `make test`: **5694 passed, 0 failed, 0 skipped** in 721.72s.
+- Per-file coverage gate: **PASS** (156 files checked, lines ≥
+  90% AND branches ≥ 90% on 132 files with branches — PASS/FAIL
+  only, per D22).
+- `make lint`: semgrep 0 findings (2 rules / 224 files), ruff check
+  clean, ruff format clean (409 files).
+- `mypy` on both touched files (`tests/test_chart_drift_guards.py`,
+  `src/audittrace/services/console_acl/_postgres.py`): clean.
+- `make helm-lint`: **PASS** (1 chart linted, 0 failed;
+  `vaultSecretFileGuard` present in 3 workloads) — run for
+  confirmation even though the chart's own content is confirmed
+  byte-identical pre- and post-rebase (`diff` of
+  `charts/audittrace/files/realm-audittrace.json` and
+  `charts/audittrace/templates/keycloak/configmap-memory-scopes-script.yaml`
+  between the pre-rebase tip `356d309` and the post-rebase tip
+  `77c8fbc`: **identical** both files). The diff against `main`
+  (26 insertions) is pre-existing branch content from WU-1 fix round 1,
+  not something the rebase introduced.
+- Single alembic head: `b3f8a1c6d9e2`, re-confirmed via `alembic
+  heads` on the rebased tree — main added no migration, verified
+  rather than assumed.
+- Concurrency discipline: checked `free -g` / `ps -eo args | grep -E
+  'pytest|jest'` before starting the rebase and before each full
+  `make test` run; no concurrent full suite was in flight either time.
+
+**Deviations:** none. Regenerated rather than hand-merged the two
+generated files as instructed; confirmed additive-only + the six
+paths + `/v1/chat/completions` untouched before trusting the merge;
+re-ran every gate on the rebased tree rather than restating pre-rebase
+numbers; did not rewrite or squash `14711b3`, `2efd21a`, `0616589`, or
+`356d309`'s messages (see the SHA-remap table). Not pushed — the
+coordinator pushes and writes the PR body.
