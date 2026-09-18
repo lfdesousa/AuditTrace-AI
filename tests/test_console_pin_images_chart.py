@@ -52,6 +52,18 @@ does not re-verify against the live registry (no network dependency in
 the test suite); it guards that the chart renders the pinned values
 faithfully.
 
+**Superseded at the Phase-E re-pin (2026-09-18, spec 2026-09-18-SPEC-e2e-
+deploy-and-mongo-audit.md):** BFF moved to ``1.27.0`` /
+``sha256:b9cc31e7...`` (``bff/`` gained the v1.27.0 console proxies — 19
+files / +2222/-6 lines vs v1.26.0) and the fork moved from ``c879b74`` to
+``768de61`` / ``sha256:4db01e94...`` (the fork's seven merged chokepoint
+shims, PRs #5-#14, all postdate ``c879b74``). Both re-verified via TWO
+independent registry reads (GET + HEAD) against
+``registry-1.docker.io`` — see this WU's build record for the transcript.
+This module's assertions below reflect the current, ``768de61``/``1.27.0``
+pins; the WU-6 Part C values above are retained as historical narrative
+only, not as the live pin.
+
 Anchors: ``feedback_no_more_drifts``, ``feedback_vacuous_neuter_test_antipattern``,
 ``feedback_ratified_spec_immutable``, ``feedback_no_static_host_ip_pin_resolve_by_name``.
 """
@@ -172,13 +184,13 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"BFF image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":1.26.0"), f"unexpected BFF tag: {repo_tag!r}"
+        assert repo_tag.endswith(":1.27.0"), f"unexpected BFF tag: {repo_tag!r}"
 
     def test_bff_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["bff"]["image"]["digest"]
         assert pinned == (
-            "sha256:e15af5a03581d521492b01ad1d7a2ac521b55dc9aa2773bcfa3344b6db2e54b7"
+            "sha256:b9cc31e78b50b5535cafc204a2ba30179677a707ea1ee77d63c8f80042741d55"
         ), f"BFF digest in values.yaml drifted from the verified pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _bff_image(resources).endswith(f"@{pinned}")
@@ -193,16 +205,14 @@ class TestBothImagesRenderWithDigest:
         repo_tag, _, digest = image.partition("@")
         assert digest, f"LibreChat image {image!r} carries no @digest suffix"
         assert _SHA256_RE.match(digest), f"malformed digest {digest!r}"
-        assert repo_tag.endswith(":c879b74"), f"unexpected LibreChat tag: {repo_tag!r}"
+        assert repo_tag.endswith(":768de61"), f"unexpected LibreChat tag: {repo_tag!r}"
 
     def test_librechat_digest_matches_pinned_values_digest(self) -> None:
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         pinned = values["console"]["librechat"]["image"]["digest"]
         assert pinned == (
-            "sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
-        ), (
-            f"LibreChat digest in values.yaml drifted from the WU-6 Part C pin: {pinned!r}"
-        )
+            "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
+        ), f"LibreChat digest in values.yaml drifted from the Phase-E pin: {pinned!r}"
         resources = _render(_CONSOLE_ENABLED)
         assert _librechat_image(resources).endswith(f"@{pinned}")
 
@@ -247,7 +257,7 @@ class TestBffDigestPlumbing:
             f"suffix entirely, got {image!r} — the conditional either "
             "isn't guarding the digest, or a stale value leaked through"
         )
-        assert image == "docker.io/lfds/audittrace-librechat-bff:1.26.0"
+        assert image == "docker.io/lfds/audittrace-librechat-bff:1.27.0"
 
     def test_restore_setting_digest_brings_the_suffix_back(self) -> None:
         custom_digest = "sha256:" + "ab" * 32
@@ -422,8 +432,8 @@ class TestD2FourAndEAndHCoexist:
             gate["image"]
             == main["image"]
             == (
-                "docker.io/lfds/audittrace-librechat:c879b74"
-                "@sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
+                "docker.io/lfds/audittrace-librechat:768de61"
+                "@sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
             )
         )
 

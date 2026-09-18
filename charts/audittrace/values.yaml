@@ -886,18 +886,27 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.26.0"
-      # WU-6 Part C (2026-09-10) — the published INDEX digest for
-      # docker.io/lfds/audittrace-librechat-bff:1.26.0, confirmed live on
-      # Docker Hub 2026-09-10 via a manifest GET on hub.docker.com
-      # (never fabricated; publish.yml built it on the v1.26.0 tag push,
-      # 2026-09-07T20:14Z). Mirrors the console.librechat.image
-      # digest-pin pattern below. When Part B's release pipeline publishes
-      # a new version this reconciles to whatever digest THAT publish
-      # produces — never hand-edited without re-verifying against the
-      # registry. When set, the rendered image ref becomes
-      # `<repository>:<tag>@<digest>` (deployment-bff.yaml).
-      digest: "sha256:e15af5a03581d521492b01ad1d7a2ac521b55dc9aa2773bcfa3344b6db2e54b7"
+      tag: "1.27.0"
+      # Phase-E re-pin (2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-
+      # mongo-audit.md) — the published INDEX digest for
+      # docker.io/lfds/audittrace-librechat-bff:1.27.0, confirmed live on
+      # Docker Hub 2026-09-18 via TWO independent manifest reads
+      # (registry-1.docker.io GET and HEAD, Accept negotiated for the OCI
+      # index; both returned `Docker-Content-Digest` and a
+      # `content-type: application/vnd.oci.image.index.v1+json` body — the
+      # manifest-list/index digest, never a child-manifest digest — never
+      # fabricated or copied from an operator-supplied value on trust).
+      # Bumped from `1.26.0` because `bff/` gained the v1.27.0 console
+      # proxies (presets, prompts, tool-favorites) — 19 files / +2222
+      # lines / -6 lines between `v1.26.0` and `v1.27.0` (confirmed via
+      # `git diff --shortstat v1.26.0 v1.27.0 -- bff/`), which the
+      # v1.26.0-era BFF image cannot serve. Mirrors the
+      # console.librechat.image digest-pin pattern below. When Part B's
+      # release pipeline publishes a new version this reconciles to
+      # whatever digest THAT publish produces — never hand-edited without
+      # re-verifying against the registry. When set, the rendered image
+      # ref becomes `<repository>:<tag>@<digest>` (deployment-bff.yaml).
+      digest: "sha256:b9cc31e78b50b5535cafc204a2ba30179677a707ea1ee77d63c8f80042741d55"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -929,25 +938,38 @@ console:
   # folded in), and the fork image is pushed to Docker Hub. This is our fork,
   # not upstream — the sovereign memory adapter
   # (`api/server/services/AuditTraceMemory/config.js`) lives inside it,
-  # reading the three env vars rendered below. Frozen at `c879b74`; any
-  # further fork code change is a new tag + digest, never an in-place
-  # mutation of this pin. Re-pinned from `0f08e22` via WU-6 Part C
-  # (2026-09-10) — the digest was verified against Docker Hub at that time.
+  # reading the three env vars rendered below. Re-pinned to `768de61` at the
+  # Phase-E re-pin (2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-mongo-
+  # audit.md) — `c879b74` (2026-09-10) predates every one of the fork's
+  # seven chokepoint shims (PRs #5-#14: conversations, presets, prompts,
+  # chat-projects, files, conversation-tags, tool-favorites, confirmed via
+  # `git log --oneline c879b74..768de61` on `lfds/LibreChat`), so it could
+  # not serve the sovereign path this WU activates. Frozen at `768de61`;
+  # any further fork code change is a new tag + digest, never an in-place
+  # mutation of this pin. Re-pinned from `c879b74` via this Phase-E step —
+  # the digest was verified against Docker Hub at that time.
   librechat:
     image:
       repository: docker.io/lfds/audittrace-librechat
-      tag: "c879b74"
-      # WU-6 Part C (2026-09-10) — pinned so the deploy is reproducible with
-      # no live `docker pull ... && docker inspect` compute step. This is the
-      # pushed INDEX digest for
-      # docker.io/lfds/audittrace-librechat:c879b74 (built + pushed
-      # 2026-09-10T07:53Z, confirmed live via a manifest GET on
-      # hub.docker.com). Bumped from 0f08e22 to close the deferred WU-3
-      # deliverable-4 (fork now carries WU-3 composer→/console/files repoint,
-      # merged fork PR #4). A future bump moves it, like any pinned digest
-      # (operator verifies against the registry, never fabricated). When set,
-      # the rendered image ref becomes `<repository>:<tag>@<digest>`.
-      digest: "sha256:edd23f45e60810e3d4ab94e7fe2429d802867a0a2ab284ecbad09596b0490527"
+      tag: "768de61"
+      # Phase-E re-pin (2026-09-18) — pinned so the deploy is reproducible
+      # with no live `docker pull ... && docker inspect` compute step. This
+      # is the pushed INDEX digest for
+      # docker.io/lfds/audittrace-librechat:768de61, confirmed live on
+      # Docker Hub 2026-09-18 via TWO independent manifest reads
+      # (registry-1.docker.io GET and HEAD, Accept negotiated for the OCI
+      # index; both returned `Docker-Content-Digest` and a
+      # `content-type: application/vnd.oci.image.index.v1+json` body — the
+      # manifest-list/index digest, never a child-manifest digest — never
+      # fabricated or copied from an operator-supplied value on trust).
+      # Bumped from `c879b74` to activate the fork's seven merged
+      # chokepoint shims (fork PRs #5-#14) against the chart's
+      # already-`"sovereign"` `memoryBackend` flag below — see this WU's
+      # build record for the blast-radius note. A future bump moves it,
+      # like any pinned digest (operator verifies against the registry,
+      # never fabricated). When set, the rendered image ref becomes
+      # `<repository>:<tag>@<digest>`.
+      digest: "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
     # M3-WU-D2-4 — the fork's sovereign-backend switch. The fork's
     # config.js reads AUDITTRACE_MEMORY_BACKEND and selects the sovereign
     # one-brain path ONLY when it is exactly "sovereign" — any other value
