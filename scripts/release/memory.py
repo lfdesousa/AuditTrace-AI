@@ -291,6 +291,15 @@ def recall_release_lessons(
     fabricate client-side relevance — it returns the decisions-layer items as
     the server ordered them (most-recent-first), leaving selection to the
     agent that reads them.
+
+    **Granularity — deliberately unpinned (WU-1 fix-round-2, 2026-09-17,
+    F8).** Same decision as the sibling ``scripts.deploy.memory.
+    recall_deploy_lessons``: ``GET /memory/semantic``'s default flipped
+    from one row per ChromaDB chunk to one row per DOCUMENT (the D15 fix).
+    This helper reads manifest rows only, so it does NOT pass
+    ``granularity=chunk`` — it inherits the document-grouped default and
+    benefits from it (fewer, more DISTINCT lessons per ``limit``). See
+    ``test_recall_deliberately_does_not_pin_granularity``.
     """
     try:
         base = _normalize_front_door(front_door)

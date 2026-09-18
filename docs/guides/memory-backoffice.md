@@ -43,7 +43,7 @@ Items keyed by `<collection>/<document_id>`:
 | Method | Path | Required scope | Notes |
 |--------|------|----------------|-------|
 | POST | `/memory/semantic` | `memory:semantic:write` | Body: `{collection, document_id, text, metadata?, title?}`. Upsert into ChromaDB. |
-| GET | `/memory/semantic` | `memory:semantic:read` | List. `?collection=<name>` to filter by collection. |
+| GET | `/memory/semantic` | `memory:semantic:read` | List, one row per DOCUMENT by default (WU-1, 2026-09-17) — a multi-chunk file's chunks are grouped under one row; `?granularity=chunk` returns the old one-row-per-chunk shape. `?collection=<name>` to filter by collection. |
 | GET | `/memory/semantic/{collection}/{document_id}` | `memory:semantic:read` | Read. |
 | PUT | `/memory/semantic/{collection}/{document_id}` | `memory:semantic:write` | Replace text + metadata. |
 | DELETE | `/memory/semantic/{collection}/{document_id}` | `memory:semantic:write` | Soft-delete; `?hard=true` also removes from ChromaDB. |

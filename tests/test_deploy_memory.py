@@ -107,6 +107,35 @@ def test_recall_returns_lessons(monkeypatch):
     assert call["headers"]["Authorization"] == f"Bearer {TOKEN}"
 
 
+def test_recall_deliberately_does_not_pin_granularity(monkeypatch):
+    """WU-1 fix-round-2 (F8): round-1 shipped ``GET /memory/semantic``'s
+    ``granularity`` default flip (chunk -> document) without a test
+    pinning what this, the fleet's OWN STEP-2 recall helper, now receives.
+    The round-1 reviewer judged the effect benign-to-beneficial — this
+    helper reads MANIFEST rows (titles/keys/timestamps), never per-chunk
+    ``content``, and the new document-grouped default is EXACTLY the fix
+    the fleet needs: ``limit=300`` now returns up to 300 DISTINCT lessons
+    instead of 300 chunks that used to collapse to a handful of large
+    build records (the D15 defect this whole spec exists to close). So the
+    decision, made explicitly here rather than left implicit: this helper
+    does NOT pass ``granularity=chunk`` — it deliberately inherits
+    whatever the server's default is, so it benefits automatically from
+    future retrieval-quality improvements to that default. Regression:
+    if a future change added an explicit ``granularity`` param here, this
+    test would need updating in lockstep — that is the point of pinning
+    it."""
+    _clear_env_token(monkeypatch)
+    fake = _install(
+        monkeypatch, {"/memory/semantic": (200, json.dumps({"items": []}).encode())}
+    )
+    recall_deploy_lessons("q", front_door=FRONT, token=TOKEN)
+    call = fake.calls[0]
+    assert "granularity" not in call["query"], (
+        "recall_deploy_lessons must not pin a granularity — it deliberately "
+        f"inherits the server's document-grouped default: {call['query']}"
+    )
+
+
 def test_recall_works_without_a_query_argument(monkeypatch):
     """SPEC-wu1b (2026-08-07) — live symptom: a fleet caller invoked
     ``memory.recall_deploy_lessons(front_door=..., insecure=...)`` (no

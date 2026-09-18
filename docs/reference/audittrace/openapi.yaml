@@ -4468,7 +4468,18 @@ paths:
 
         manifest metadata block is additionally scoped by
 
-        ``_manifest_visible`` — see its docstring for why.'
+        ``_manifest_visible`` — see its docstring for why.
+
+
+        WU-1 (2026-09-17, closes D15 item 4): the path parameter is
+
+        ``{filename:path}`` (accepts embedded ``/``) and
+
+        ``_strip_known_key_prefixes`` normalizes an upload/index-shaped key
+
+        (``"{user_id}/episodic/{name}"`` or ``"episodic/{name}"``) down to the
+
+        bare filename BEFORE validation — see that helper''s docstring.'
       operationId: read_episodic_memory_episodic__filename__get
       parameters:
       - in: path
@@ -4824,7 +4835,11 @@ paths:
     get:
       description: 'ADR-062 Phase B (WU-B4): same manifest-visibility scoping as
 
-        ``read_episodic`` — see its docstring.'
+        ``read_episodic`` — see its docstring. WU-1 (2026-09-17, D15 item 4):
+
+        same key-shape tolerance as ``read_episodic`` — see
+
+        ``_strip_known_key_prefixes``.'
       operationId: read_procedural_memory_procedural__filename__get
       parameters:
       - in: path
@@ -5005,7 +5020,28 @@ paths:
 
         lacks ``memory:corpus:<collection>:read`` for
 
-        (`_filter_corpus_read_gate`).'
+        (`_filter_corpus_read_gate`).
+
+
+        WU-1 (2026-09-17, closes D15 — see ``routes/memory_semantic_documents``
+
+        module docstring for the full defect writeup): the merged chunk-level
+
+        ``items`` are de-duplicated (two discovery paths can otherwise surface
+
+        the SAME physical ChromaDB row under two differently-prefixed keys) and
+
+        then, by default, grouped by document (``title``) BEFORE
+
+        ``_sort_and_paginate`` runs — so ``limit``/``offset``/``total`` all
+
+        operate on documents, not chunks. The response always reports BOTH
+
+        ``total_documents`` and ``total_chunks`` regardless of ``granularity``,
+
+        so a caller can tell the two numbers apart (the exact confusion that
+
+        caused the D15 defect: 25 chunks silently meant 4 documents).'
       operationId: list_semantic_memory_semantic_get
       parameters:
       - description: Filter to a single collection if set.
@@ -5072,6 +5108,24 @@ paths:
           minimum: 0
           title: Offset
           type: integer
+      - description: '''document'' (default, WU-1 2026-09-17 — closes D15): de-duplicate chunk rows by their shared ''title''
+          before sort/paginate, so ''limit'' means N DOCUMENTS, not N chunks — a multi-chunk record used to crowd smaller/older
+          ones out of the same limit window. ''chunk'' restores the pre-WU-1 raw per-ChromaDB-row view (one row per physical
+          id) for callers that walk rows individually, e.g. scripts/curator/runner.py''s intake.'
+        in: query
+        name: granularity
+        required: false
+        schema:
+          default: document
+          description: '''document'' (default, WU-1 2026-09-17 — closes D15): de-duplicate chunk rows by their shared ''title''
+            before sort/paginate, so ''limit'' means N DOCUMENTS, not N chunks — a multi-chunk record used to crowd smaller/older
+            ones out of the same limit window. ''chunk'' restores the pre-WU-1 raw per-ChromaDB-row view (one row per physical
+            id) for callers that walk rows individually, e.g. scripts/curator/runner.py''s intake.'
+          enum:
+          - document
+          - chunk
+          title: Granularity
+          type: string
       responses:
         '200':
           content:
@@ -5239,6 +5293,23 @@ paths:
         schema:
           title: Document Id
           type: string
+      - description: 'WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct and return EVERY chunk of this document
+          (starting from chunk 0 / the front matter, via the deterministic chunk-id sequence keyed off the document''s title)
+          instead of just the single chunk at ''document_id'' — the documented whole-document read mode. ''content'' becomes
+          the chunks joined in order; ''metadata''/''manifest'' describe chunk 0. Default false preserves the pre-WU-1 single-chunk
+          response.'
+        in: query
+        name: whole_document
+        required: false
+        schema:
+          default: false
+          description: 'WU-1 (2026-09-17, closes D15 item 2): when true, reconstruct and return EVERY chunk of this document
+            (starting from chunk 0 / the front matter, via the deterministic chunk-id sequence keyed off the document''s title)
+            instead of just the single chunk at ''document_id'' — the documented whole-document read mode. ''content'' becomes
+            the chunks joined in order; ''metadata''/''manifest'' describe chunk 0. Default false preserves the pre-WU-1 single-chunk
+            response.'
+          title: Whole Document
+          type: boolean
       responses:
         '200':
           content:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import urllib.parse
 
 import pytest
 
@@ -877,6 +878,40 @@ def test_list_semantic_collection_no_items_key(monkeypatch, tmp_path):
         crun, "_http_request", lambda *a, **k: (200, json.dumps({}).encode())
     )
     assert list_semantic_collection(_cfg(tmp_path), "tok", "decisions") == []
+
+
+def test_list_semantic_collection_requests_chunk_granularity(monkeypatch, tmp_path):
+    """WU-1 fix-round-2 (F2): round-1's ONLY compatibility control for
+    ``GET /memory/semantic``'s ONE real ``granularity=chunk`` consumer had
+    NO test — ``test_wu1_memory_retrieval_correctness.py``'s
+    ``test_granularity_chunk_restores_the_pre_wu1_raw_view`` exercises the
+    ROUTE, never this call site, and every OTHER test in this module that
+    touches ``list_semantic_collection`` monkeypatches the function itself
+    (wholesale), so its outbound query string was never built or asserted
+    by any test. This test calls the REAL ``list_semantic_collection`` and
+    asserts on the URL it hands to ``_http_request`` — the actual query
+    string, not a stand-in for it. Neutering the ``"granularity": "chunk"``
+    entry (e.g. dropping it, or requesting ``"document"``) must fail this
+    test; see the WU-1 fix-round-2 build record's guard table for the
+    live neuter proof."""
+    captured_urls: list[str] = []
+
+    def _fake_http_request(method, url, *args, **kwargs):
+        captured_urls.append(url)
+        return 200, json.dumps({"items": []}).encode()
+
+    monkeypatch.setattr(crun, "_http_request", _fake_http_request)
+    list_semantic_collection(_cfg(tmp_path), "tok", "decisions")
+
+    assert len(captured_urls) == 1
+    parsed = urllib.parse.urlparse(captured_urls[0])
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query["granularity"] == ["chunk"], (
+        f"list_semantic_collection must request the raw per-chunk view "
+        f"explicitly, not inherit the server's document-grouped default: "
+        f"{captured_urls[0]!r}"
+    )
+    assert query["collection"] == ["decisions"]
 
 
 def test_read_semantic_doc_ok(monkeypatch, tmp_path):
