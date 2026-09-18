@@ -168,18 +168,40 @@ restored files (verified with `cmp` before/after each round); no batch
 neuter was used. **N2 was split this round (fix round 1, F3) — the
 original build ran it as a single combined UPDATE+DELETE `USING` edit,
 which is what produced F2's wrong conclusion; N2a and N2b below are
-the correctly isolated re-runs.**
+the correctly isolated re-runs.** **"Reproduce with" names the exact
+command scope** (fix round 1, non-blocking reviewer observation) so a
+reader can re-run any row without guessing which file/test it applies
+to; every count below was re-captured this round from that command's
+own output (`tests/test_acl_ownership_rls.py` currently holds 17
+tests; `tests/test_console_acl_ownership.py` holds 15 — except where
+noted, N5's neuter itself changes that file's effective test count,
+explained in its row).
 
-| # | Guard | Neuter | RED (what failed) | Restored |
-|---|---|---|---|---|
-| N1 | Migration 032 INSERT ownership subquery | Dropped `AND {_OWNERSHIP_SUBQUERY}` from the INSERT `WITH CHECK`, real migration file | `test_escalation_insert_on_agent_is_blocked`, `test_escalation_insert_on_prompt_group_is_blocked`, `test_unmapped_resource_type_is_refused_at_the_db_layer` (3 failed) | `cmp` clean |
-| N2a | Migration 032 UPDATE owner-only `USING`, ALONE | Widened ONLY the UPDATE policy's `USING` back to the broad predicate; DELETE untouched | `test_h2_update_ownership_takeover_is_blocked` (raises `ProgrammingError: new row violates row-level security policy` — the WITH CHECK ownership subquery still rejects THIS narrow variant, since `resource_id` is unchanged and the attacker doesn't own it) AND `test_h2_general_takeover_blocked_even_when_attacker_repoints_to_owned_resource` (`rowcount == 1` — the GENERAL variant, where the attacker also repoints `resource_id` to a resource they own, now SUCCEEDS) — 2 failed | `cmp` clean |
-| N2b | Migration 032 DELETE owner-only `USING`, ALONE | Widened ONLY the DELETE policy's `USING` back to the broad predicate; UPDATE untouched | ONLY `test_h1_delete_of_public_row_by_non_owner_is_blocked` (`rowcount == 1` not `0`) — 1 failed, all 14 siblings green | `cmp` clean |
-| N3 | Migration 032 fail-closed for unmapped `resource_type` | Added `resource_type NOT IN ('agent','promptGroup') OR (...)` to the ownership subquery (simulated a "default-permit" bug) | ONLY `test_unmapped_resource_type_is_refused_at_the_db_layer` (1 failed) — all sibling `TestAfterFix` tests stayed green, proving this guard is independently tested, not piggy-backing on another's pass | `cmp` clean |
-| N4 | `owns()` fail-closed (`_ownership.py`) | `raise UnknownResourceTypeError(...)` → `return False` | All 6 `TestUnknownResourceTypeFailsClosed` tests (parametrized ×4 + 2) — `Failed: DID NOT RAISE UnknownResourceTypeError` | `cmp` clean |
-| N5 | Per-`resource_type` dispatch, `promptGroup` arm | Removed `"promptGroup": _owns_prompt_group` from `_OWNERSHIP_RESOLVERS` | ONLY the 3 `TestOwnsPromptGroup` tests + 2 enumeration tests (5 failed) — all 3 `TestOwnsAgent` tests stayed green, proving a dead resolver arm for ONE type cannot hide behind another type's pass | `cmp` clean |
-| N6 | Migration 032 SELECT read-path regression guard | Dropped the `principal_type = 'user' AND principal_id = ...` disjunct from `_SELECT_USING` | ONLY `test_select_read_path_contract_is_unchanged` (1 failed, private-row visibility to its named principal went from 1 to 0) | `cmp` clean |
-| N7 | Migration 032 UPDATE ownership subquery (fix round 1, F1) | Dropped `AND {_OWNERSHIP_SUBQUERY}` from the UPDATE `WITH CHECK` ALONE; `USING` left intact | ONLY `test_update_resource_id_escalation_is_blocked_for_agent` and `..._for_prompt_group` (2 failed, `Failed: DID NOT RAISE DBAPIError`) — `test_h2_general_takeover_blocked_even_when_attacker_repoints_to_owned_resource` stays GREEN under this neuter, confirming it is genuinely protected by `USING`, not by this subquery | `cmp` clean |
+| # | Guard | Neuter | RED (what failed) | Reproduce with | Restored |
+|---|---|---|---|---|---|
+| N1 | Migration 032 INSERT ownership subquery | Dropped `AND {_OWNERSHIP_SUBQUERY}` from the INSERT `WITH CHECK`, real migration file | `test_escalation_insert_on_agent_is_blocked`, `test_escalation_insert_on_prompt_group_is_blocked`, `test_unmapped_resource_type_is_refused_at_the_db_layer`, `test_squatting_is_prevented_so_the_owner_can_still_grant_publicly` (the last added fix round 1 — it also depends on the escalation-INSERT guard) | `pytest tests/test_acl_ownership_rls.py -q` → `4 failed, 13 passed` | `cmp` clean |
+| N2a | Migration 032 UPDATE owner-only `USING`, ALONE | Widened ONLY the UPDATE policy's `USING` back to the broad predicate; DELETE untouched | `test_h2_update_ownership_takeover_is_blocked` (raises `ProgrammingError: new row violates row-level security policy` — the WITH CHECK ownership subquery still rejects THIS narrow variant, since `resource_id` is unchanged and the attacker doesn't own it) AND `test_h2_general_takeover_blocked_even_when_attacker_repoints_to_owned_resource` (`rowcount == 1` — the GENERAL variant, where the attacker also repoints `resource_id` to a resource they own, now SUCCEEDS) | `pytest tests/test_acl_ownership_rls.py -q` → `2 failed, 15 passed` | `cmp` clean |
+| N2b | Migration 032 DELETE owner-only `USING`, ALONE | Widened ONLY the DELETE policy's `USING` back to the broad predicate; UPDATE untouched | ONLY `test_h1_delete_of_public_row_by_non_owner_is_blocked` (`rowcount == 1` not `0`) | `pytest tests/test_acl_ownership_rls.py -q` → `1 failed, 16 passed` | `cmp` clean |
+| N3 | Migration 032 fail-closed for unmapped `resource_type` | Added `resource_type NOT IN ('agent','promptGroup') OR (...)` to the ownership subquery (simulated a "default-permit" bug) | ONLY `test_unmapped_resource_type_is_refused_at_the_db_layer` — all sibling `TestAfterFix` tests stayed green, proving this guard is independently tested, not piggy-backing on another's pass | `pytest tests/test_acl_ownership_rls.py -q` → `1 failed, 16 passed` | `cmp` clean |
+| N4 | `owns()` fail-closed (`_ownership.py`) | `raise UnknownResourceTypeError(...)` → `return False` | All 6 `TestUnknownResourceTypeFailsClosed` tests (parametrized ×4 + 2) — `Failed: DID NOT RAISE UnknownResourceTypeError` | `pytest tests/test_console_acl_ownership.py -q` → `6 failed, 9 passed` | `cmp` clean |
+| N5 | Per-`resource_type` dispatch, `promptGroup` arm | Removed `"promptGroup": _owns_prompt_group` from `_OWNERSHIP_RESOLVERS` | The 3 `TestOwnsPromptGroup` tests + 2 enumeration tests, PLUS the `test_unmigrated_resource_type_raises_named_error` parametrize list GROWS by one (`promptGroup` becomes unresolved too, since `UNRESOLVED_RESOURCE_TYPES` is computed live from the dispatch table) — the new `[promptGroup]` case PASSES (it is correctly fail-closed under the neuter), which is why the total shifts from 15 to 16 collected items. All 3 `TestOwnsAgent` tests stayed green, proving a dead resolver arm for ONE type cannot hide behind another type's pass | `pytest tests/test_console_acl_ownership.py -q` → `5 failed, 11 passed` (16 collected, not 15 — the count itself is part of the guard's own falsifiability signal) | `cmp` clean |
+| N6 | Migration 032 SELECT read-path regression guard | Dropped the `principal_type = 'user' AND principal_id = ...` disjunct from `_SELECT_USING` | ONLY `test_select_read_path_contract_is_unchanged` (private-row visibility to its named principal went from 1 to 0) | `pytest tests/test_acl_ownership_rls.py -q` → `1 failed, 16 passed` | `cmp` clean |
+| N7 | Migration 032 UPDATE ownership subquery (fix round 1, F1) | Dropped `AND {_OWNERSHIP_SUBQUERY}` from the UPDATE `WITH CHECK` ALONE; `USING` left intact | ONLY `test_update_resource_id_escalation_is_blocked_for_agent` and `..._for_prompt_group` (`Failed: DID NOT RAISE DBAPIError`) — `test_h2_general_takeover_blocked_even_when_attacker_repoints_to_owned_resource` stays GREEN under this neuter, confirming it is genuinely protected by `USING`, not by this subquery | `pytest tests/test_acl_ownership_rls.py -q` → `2 failed, 15 passed` | `cmp` clean |
+| R8a | Per-`resource_type` independence, `agent` arm (credited to the independent review — not run in fix round 0/1, added here per the reviewer's instruction to record the strongest proof that exists) | Forced the ownership subquery's `agent` branch always-`TRUE` (dropped its `EXISTS` clause entirely — any `resource_id` claimed under `resource_type='agent'` passes) | `test_escalation_insert_on_agent_is_blocked`, `test_update_resource_id_escalation_is_blocked_for_agent`, `test_squatting_is_prevented_so_the_owner_can_still_grant_publicly` (agent-scoped) — every `..._prompt_group`/promptGroup-scoped test stayed GREEN | `pytest tests/test_acl_ownership_rls.py -q` → `3 failed, 14 passed` | `cmp` clean |
+| R8b | Per-`resource_type` independence, `promptGroup` arm (credited to the independent review, mirror of R8a) | Forced the ownership subquery's `promptGroup` branch always-`TRUE` (dropped its `EXISTS` clause entirely) | ONLY `test_escalation_insert_on_prompt_group_is_blocked` and `test_update_resource_id_escalation_is_blocked_for_prompt_group` — every agent-scoped test (including `test_squatting_is_prevented_so_the_owner_can_still_grant_publicly`) stayed GREEN | `pytest tests/test_acl_ownership_rls.py -q` → `2 failed, 15 passed` | `cmp` clean |
+
+R8a/R8b are stronger per-`resource_type` independence evidence than
+N1/N7 alone: N1/N7 prove the whole subquery is load-bearing; R8a/R8b
+prove EACH `resource_type`'s branch is independently load-bearing —
+forcing one arm permanently open never lets the other arm's tests go
+green-by-accident, which is the strongest form of "a dead resolver arm
+for one type cannot hide behind another type's pass" this file
+carries. Post-verification: both migration 032 and
+`services/console_acl/_ownership.py` are confirmed byte-identical to
+the original build after all of N1–N7/R8a/R8b (`sha256sum` after the
+last restore: `9a796580b5f25ba993d1d0933071223f0bf967211c88b6998542a25a0d7052bb`
+and `875846cb7bd29ad11ca54ae322d811bb283a6aca867b7af7e7613690ad749277`
+respectively — unchanged since round 0).
 
 **Corrected finding (fix round 1, F2) — the earlier claim in this
 section was FALSE and is retracted, not merely reworded.** N2a proves
@@ -199,35 +221,99 @@ lesson: N2's ORIGINAL (fix round 0) form batched the UPDATE and DELETE
 `SET user_sub=..., resource_id=...` variant — the batching is what let
 the wrong generalisation stand uncaught.
 
-## 5. What "unbypassable" means, precisely (fix round 1, F4)
+## 5. What "unbypassable" means, precisely (fix round 1, F4; SUPERSEDED 2026-09-18 — see the amendment banner below)
 
-The build record and this file both stand by migration 032 being
-proven unbypassable **where Postgres RLS is enforced** — that is
-exactly what N1–N7 above demonstrate against a real, non-superuser
-Postgres role. **That is not the same claim as "protects production
-today."** Two facts qualify it, both pre-existing and out of this WU's
-scope:
+> **⚠ SUPERSEDED (2026-09-18, factual amendment after PASS — not a new
+> build round).** The section below, as written during fix round 1,
+> is retained VERBATIM beneath this banner rather than deleted — this
+> project keeps its wrong calls visible
+> (`feedback_decision_log_is_append_only_keep_the_wrong_ones`). It
+> said Postgres RLS "may not be enforcing at runtime on the live
+> deployment" and, on that premise, that "WU-2a protects nothing
+> today." **That premise was wrong and has been retracted.** The
+> orchestrator's original HIGH finding rested on reading a COMMITTED
+> Keycloak realm file as live runtime state and concluding a test
+> user was newer than it actually is; the finding
+> (`~/work/audittrace-private/evidence/2026-09-18-FINDING-postgres-rls-appears-inert-in-production.md`)
+> has been RETRACTED and re-seeded with the original text preserved
+> beneath its own banner. A decisive front-door test, run by the
+> operator with a REAL second-subject token, confirms the opposite of
+> what fix round 1 assumed:
+>
+> ```
+> GET /memory/conversational?limit=1000   as auditor-b (sub 094ef0ae…)
+> HTTP 200   total = 8
+>    094ef0ae-f071-41a7-ad87-b602762829b4   8
+> VERDICT: RLS ENFORCING
+> ```
+>
+> Zero of the other user's 505 rows leaked; every row returned was
+> auditor-b's own. **Postgres RLS IS enforcing on the live cluster.**
+> Corollary for THIS WU: migration 032's DB-level control does not
+> merely hold "where RLS is enforced" as a hypothetical — RLS IS
+> enforced on the running cluster, so **migration 032's protection
+> lands on that cluster today**, subject only to point 2 below (which
+> was never contingent on the RLS question and remains true
+> unchanged). See §5-amended immediately below for the corrected
+> text.
 
-1. There is an open, HIGH-severity finding that Postgres RLS **may not
-   be enforcing at runtime on the live deployment**
-   (`~/work/audittrace-private/evidence/2026-09-18-FINDING-postgres-rls-appears-inert-in-production.md`,
-   2026-09-18). If RLS is inert at runtime, migration 032's policies
-   are inert with it — **WU-2a protects nothing today** on a cluster
-   in that state. This WU does not cause, worsen, or fix that finding;
-   it is recorded here so this evidence is never read as a runtime
-   guarantee it cannot make.
-2. `services/console_acl/_ownership.py`'s `owns()` has **zero
-   production callers** as of this WU — WU-2b (the write path) has not
-   shipped. So even independent of the RLS-enforcement question, the
-   application-layer resolver currently protects nothing either,
-   simply because nothing calls it yet.
+**Original fix-round-1 text (WRONG on point 1, kept for the record):**
 
-One thing DOES survive the RLS-inert finding: `get_agent`
-(`services/console_agents.py:346-361`) and `get_group`
+> The build record and this file both stand by migration 032 being
+> proven unbypassable **where Postgres RLS is enforced** — that is
+> exactly what N1–N7 above demonstrate against a real, non-superuser
+> Postgres role. **That is not the same claim as "protects production
+> today."** Two facts qualify it, both pre-existing and out of this
+> WU's scope:
+>
+> 1. There is an open, HIGH-severity finding that Postgres RLS **may
+>    not be enforcing at runtime on the live deployment**
+>    (`~/work/audittrace-private/evidence/2026-09-18-FINDING-postgres-rls-appears-inert-in-production.md`,
+>    2026-09-18). If RLS is inert at runtime, migration 032's policies
+>    are inert with it — **WU-2a protects nothing today** on a
+>    cluster in that state. This WU does not cause, worsen, or fix
+>    that finding; it is recorded here so this evidence is never read
+>    as a runtime guarantee it cannot make.
+> 2. `services/console_acl/_ownership.py`'s `owns()` has **zero
+>    production callers** as of this WU — WU-2b (the write path) has
+>    not shipped. So even independent of the RLS-enforcement
+>    question, the application-layer resolver currently protects
+>    nothing either, simply because nothing calls it yet.
+>
+> One thing DOES survive the RLS-inert finding: `get_agent`
+> (`services/console_agents.py:346-361`) and `get_group`
+> (`services/console_prompts.py:359-375`), which `owns()` delegates
+> to, filter `user_sub` **explicitly in the SQL `WHERE` clause**, not
+> only via RLS — so `owns()`'s answer is correct even on a cluster
+> where RLS is not enforcing, once WU-2b gives it a caller.
+
+## 5-amended. What "unbypassable" means, precisely (CURRENT, 2026-09-18)
+
+Migration 032 is proven unbypassable against a real, non-superuser
+Postgres role — that is exactly what N1–N7 above demonstrate. **This
+is no longer a contingent claim.** Postgres RLS enforcement on the
+live cluster is CONFIRMED by live front-door evidence (the
+`auditor-b` two-subject test quoted above, operator-run,
+2026-09-18) — so migration 032's DB-level control **does land on the
+running cluster today**, not merely "where RLS is enforced" as an
+unverified hypothetical.
+
+**One qualification remains, unchanged from fix round 1 and never
+contingent on the RLS question:** `services/console_acl/_ownership.py`'s
+`owns()` has **zero production callers** as of this WU — WU-2b (the
+write path) has not shipped, so nothing in production calls `owns()`
+yet. The DB-level policy (migration 032, now confirmed live and
+enforcing) is therefore **the only LIVE control** today; the
+application-layer resolver is built and correct but dormant until
+WU-2b wires a caller to it.
+
+`get_agent` (`services/console_agents.py:346-361`) and `get_group`
 (`services/console_prompts.py:359-375`), which `owns()` delegates to,
-filter `user_sub` **explicitly in the SQL `WHERE` clause**, not only
-via RLS — so `owns()`'s answer is correct even on a cluster where RLS
-is not enforcing, once WU-2b gives it a caller.
+filter `user_sub` explicitly in the SQL `WHERE` clause in addition to
+RLS — belt-and-suspenders, not load-bearing given RLS is now confirmed
+enforcing, but worth keeping on record since it means `owns()`'s
+answer would stay correct even in a hypothetical future regression of
+RLS enforcement, once WU-2b gives it a caller.
 
 ## 6. Full local test suite (Rule 1 — Verification)
 
