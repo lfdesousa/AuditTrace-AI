@@ -21,8 +21,9 @@ exercises the guard directly (``TestForgedIdentityIsRefused``) rather
 than asserting on a bypass that never went through the writer's own API.
 F2: N3's two tests called ``record_denial`` AFTER the aborted transaction
 had already fully rolled back, so "survives the rollback" held for an
-unrelated reason (no overlap ever existed). Fixed by calling
-``record_denial`` WHILE the failed flush's transaction is still open.
+unrelated reason (no overlap ever existed). Fixed round 1 by calling
+``record_denial`` WHILE the failed flush's transaction was still open —
+**corrected further in round 2, see below.**
 F3: nothing exercised ``record_denial``'s own ``trace_id`` derivation —
 fixed by ``TestDenialTraceIdDerivation``. F4: nothing pinned
 ``EVENT_CLASS_ACL_AUTHZ`` — fixed by ``TestEventClassPinning``. F5:
@@ -37,29 +38,66 @@ neuter did not itself set, plus a manual edit-and-restore neuter of the
 real derivation call sites (documented in the build evidence, same
 methodology as N7's).
 
+**Fix round 2 (independent review REJECT, narrow — 3 findings, all
+"the code is right and the claim about it is wrong").**
+
+* **B1/F6b** — round 1's F6 covered ``record()`` only; the evidence file
+  claimed ``record_denial()`` was "indirectly covered by the SAME
+  N7/F3 neuters" — FALSE (those neuters change the ``trace_id`` VALUE,
+  never what the hash COVERS). Fixed by
+  ``test_denial_content_hash_verifies_with_a_real_non_null_trace_id``.
+* **B2/F2 correction** — an engine-event trace showed aiosqlite's DBAPI
+  driver issues ``BEGIN``/``ROLLBACK`` around the failed ``flush()``
+  itself, so by the time ``record_denial`` runs, the DB-level
+  transaction has ALREADY rolled back — only the ORM ``Session`` object
+  is still pending its own ``rollback()`` call. The round-1 claim that
+  "``db``'s transaction is STILL OPEN" was wrong about the DATABASE
+  (right only about the ORM session). ``TestDenialRowSurvivesRollback``
+  is renamed and its docstring corrected: it proves ORM-session-level
+  independence on aiosqlite; genuine DB-level transaction overlap is
+  proven on Postgres alone (SQLite cannot have two writers overlap at
+  all — a real held-open transaction there hits "database is locked").
+* **B3/F4 correction** — CPython interns identifier-like string
+  literals, so ``is`` on ``"acl_authz"`` cannot distinguish an imported
+  name from a locally re-typed copy: restoring the EXACT round-1 defect
+  (a local ``EVENT_CLASS_ACL_AUTHZ = "acl_authz"`` in this module) left
+  ``_audit.EVENT_CLASS_ACL_AUTHZ is memory_scan.EVENT_CLASS_ACL_AUTHZ``
+  ``True`` and the whole suite GREEN.
+  ``test_audit_module_imports_the_canonical_constant_not_a_copy`` is
+  REMOVED (not repaired — no runtime property distinguishes the two
+  cases). The structural fix (``_audit.py`` importing the constant
+  rather than defining it) stands; a DRIFTED VALUE is still caught by
+  ``test_literal_value_is_exactly_acl_authz`` and
+  ``TestEventClassValues`` — only the identity-based *test* was the
+  problem.
+
 **Per-guard neuter table (see the build record for the run log; PG-side
 rows live in the sibling file's own table):**
 
 * **N1** — ``TestRecordSuccess`` — audit row on a successful write, full
   payload + content_hash coverage asserted.
 * **N2** — ``TestRecordDenial`` — audit row on a denied write, separately.
-* **N3** (aiosqlite half; PG half in ``test_acl_ownership_rls.py``) —
-  ``TestDenialRowSurvivesRollback``, denial written WHILE the aborted
-  transaction is still open.
+* **N3** (aiosqlite half — ORM-session independence only, see
+  ``TestDenialRowSurvivesRollback``'s docstring; PG half in
+  ``test_acl_ownership_rls.py`` proves genuine DB-level overlap) —
+  ``TestDenialRowSurvivesRollback``.
 * **N4** (the writer's half — no operation exists yet, see the module
   docstring) — ``TestFailClosed``.
 * **N7** — ``TestTraceIdDerivation`` — the §4.3 NULL-trace-trap proof for
   ``record()``.
 * **F1/N8** — ``TestForgedIdentityIsRefused`` — a forged ``UserContext``
-  THROUGH the writer's own API is refused when the ambient identity is
-  bound; ``TestUserIdAndGrantedByDerivation`` keeps the positive VALUE
-  assertion and the raw-INSERT-bypass (a DIFFERENT question — the
-  writer's own API was never exercised there).
+  THROUGH the writer's own API is refused WHEN THE AMBIENT REQUEST
+  CONTEXTVAR IS BOUND (the normal request path); ``TestUserIdAndGranted
+  ByDerivation`` keeps the positive VALUE assertion and the
+  raw-INSERT-bypass (a DIFFERENT question — the writer's own API was
+  never exercised there).
 * **F3** — ``TestDenialTraceIdDerivation`` — the §4.3 proof for
   ``record_denial()``.
-* **F4** — ``TestEventClassPinning``.
+* **F4** — ``TestEventClassPinning`` (the literal-value pin; the
+  identity-based test is REMOVED per B3 above).
 * **F5** — ``TestSessionIdDerivation``.
-* **F6** — ``TestContentHashCoversANonNullTraceId``.
+* **F6/F6b** — ``TestContentHashCoversANonNullTraceId`` — now covers
+  BOTH ``record()`` and ``record_denial()``.
 """
 
 from __future__ import annotations
@@ -281,14 +319,33 @@ class TestDenialRowSurvivesRollback:
     in, taking any in-transaction row with it; the denial row, written in
     its OWN independent transaction, must NOT be taken down with it.
 
-    Fix round 1 (F2) — the ordering IS the proof: ``record_denial`` runs
-    WHILE the aborted transaction (still holding the failed INSERT) has
-    NOT yet been rolled back. Calling it only after the caller's
-    transaction has already fully ended (the first cut's mistake) proves
-    nothing about overlap — the denial row would "survive" for the
-    unrelated reason that nothing was ever concurrent."""
+    Fix round 2 (F2 correction) — what this test actually proves on
+    aiosqlite, precisely, after an engine-event trace: aiosqlite's DBAPI
+    driver issues ``BEGIN``/``ROLLBACK`` around the failed ``flush()``
+    itself, so by the time ``record_denial`` runs, the underlying SQLite
+    transaction has ALREADY been rolled back at the DB level — only the
+    SQLAlchemy ORM ``Session`` object (``db``) is still "pending
+    rollback" from the ORM's own point of view. The round-1 comment
+    claiming "``db``'s transaction is STILL OPEN here" was WRONG about
+    the DATABASE; it is correct only about the ORM SESSION. Genuine
+    DB-level transaction overlap — the actual thing §5.2 requires the
+    denial row to survive — is NOT reproducible on SQLite: forcing the
+    transaction to stay open at the DB level (a Core-level ``execute``
+    instead of a flush) makes ``record_denial``'s independent session
+    hit ``database is locked``, because SQLite cannot have two writers
+    overlapping at all, aborted or not. This test proves
+    ORM-SESSION-level independence only (``record_denial`` never reuses
+    ``db``'s own ``Session`` object) — the guard is still real and still
+    fails when neutered (forcing ``record_denial`` to write via ``db``
+    itself makes both assertions below go RED), but the DB-level overlap
+    claim is proven on Postgres ALONE
+    (``tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+    test_n3_denial_row_survives_an_rls_aborted_transaction``, where
+    Postgres does NOT auto-rollback an aborted transaction — the client
+    must issue ``ROLLBACK`` explicitly, so the transaction genuinely
+    stays open at the DB level until this test does so)."""
 
-    async def test_denial_row_survives_the_still_open_aborted_transaction(
+    async def test_denial_row_survives_while_the_orm_session_is_still_pending_rollback(
         self, client, user_context
     ) -> None:
         session_factory = await _open_db()
@@ -313,13 +370,22 @@ class TestDenialRowSurvivesRollback:
             with pytest.raises(IntegrityError):
                 await db.flush()
 
-            # `db`'s transaction is STILL OPEN here — the failed flush has
-            # not been rolled back yet. `record_denial` opens its OWN,
-            # completely independent session/transaction and must succeed
-            # regardless of `db`'s aborted state. This overlap is the
-            # actual guard §5.2 requires; the first cut's tests called
-            # `record_denial` only AFTER `db`'s `async with` block had
-            # already exited and rolled back, so no overlap ever existed.
+            # `db`, the SQLAlchemy ORM Session, is still "pending
+            # rollback" here (fix round 2 correction: on aiosqlite the
+            # underlying DB-level transaction has ALREADY been rolled
+            # back by the driver at the failed flush() itself — an
+            # engine-event trace confirms `BEGIN`/`ROLLBACK` around the
+            # flush; only the ORM session object is still awaiting its
+            # own `rollback()` call). `record_denial` opens its OWN,
+            # completely independent Session/connection and must succeed
+            # regardless of `db`'s pending-rollback state — proving
+            # ORM-session-level independence (never reuses `db` itself).
+            # Genuine DB-level transaction overlap is NOT reproducible on
+            # SQLite (a real held-open write transaction would make this
+            # second write hit "database is locked"); that claim is
+            # proven on Postgres alone — see the class docstring and
+            # test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+            # test_n3_denial_row_survives_an_rls_aborted_transaction.
             denial = await record_denial(
                 user_context=user_context,
                 op="grantPermission",
@@ -590,20 +656,31 @@ class TestDenialTraceIdDerivation:
 class TestEventClassPinning:
     """F4 — nothing pinned ``EVENT_CLASS_ACL_AUTHZ`` before this: a
     neuter of the STRING VALUE (e.g. ``"acl_authx"``) stayed GREEN across
-    the whole suite. Pins the literal, its membership in the closed set,
-    and the object-identity between ``_audit.py``'s import and
-    ``memory_scan.py``'s canonical constant (closing the drift the first
-    cut's false "imported everywhere it is registered" docstring claim
-    papered over — ACL WU-1's F1 in new clothes)."""
+    the whole suite. Pins the literal and its membership in the closed
+    set, closing the drift the first cut's false "imported everywhere it
+    is registered" docstring claim papered over — ACL WU-1's F1 in new
+    clothes.
+
+    Fix round 2 (B3) — a THIRD test used to assert
+    ``_audit.EVENT_CLASS_ACL_AUTHZ is memory_scan.EVENT_CLASS_ACL_AUTHZ``
+    as "proof" ``_audit.py`` imports rather than re-defines the constant.
+    It is REMOVED: CPython interns identifier-like string literals, so a
+    local ``EVENT_CLASS_ACL_AUTHZ = "acl_authz"`` re-typed directly in
+    ``_audit.py`` (the EXACT round-1 defect) is ``is``-identical to the
+    canonical constant anyway — the test cannot tell an import from a
+    copy, ever, for this string. No runtime check can distinguish them;
+    the structural fix (grep ``_audit.py`` for a bare
+    ``EVENT_CLASS_ACL_AUTHZ = "acl_authz"`` assignment, or read the
+    import statement) is a code-review property, not a test property.
+    ``test_literal_value_is_exactly_acl_authz`` and
+    ``TestEventClassValues`` (``tests/test_memory_routes.py``) are what
+    actually catch a DRIFTED VALUE, which is the risk that matters."""
 
     def test_literal_value_is_exactly_acl_authz(self) -> None:
         assert EVENT_CLASS_ACL_AUTHZ == "acl_authz"
 
     def test_constant_is_a_member_of_the_closed_set(self) -> None:
         assert EVENT_CLASS_ACL_AUTHZ in memory_scan._EVENT_CLASS_VALUES
-
-    def test_audit_module_imports_the_canonical_constant_not_a_copy(self) -> None:
-        assert _audit.EVENT_CLASS_ACL_AUTHZ is memory_scan.EVENT_CLASS_ACL_AUTHZ
 
 
 class TestSessionIdDerivation:
@@ -686,7 +763,17 @@ class TestContentHashCoversANonNullTraceId:
     payload while leaving it in the persisted row would be invisible to a
     NULL-only check (``None`` hashes the same either way in practice only
     by coincidence of the field being absent from BOTH branches — this
-    test removes that coincidence by exercising a REAL, non-null value)."""
+    test removes that coincidence by exercising a REAL, non-null value).
+
+    Fix round 2 (F6b) — round 1 covered ``record()`` only and the
+    evidence file claimed ``record_denial()`` was "indirectly covered by
+    the SAME N7/F3 neuters" — FALSE: those neuters change the ``trace_id``
+    VALUE; they assert nothing about what the hash COVERS. Forcing
+    ``record_denial``'s ``trace_id`` to ``None`` while the persisted row
+    keeps a real one left the suite GREEN (55 passed) because no test
+    computed ``verify_content_hash`` on a denial row with a non-null
+    trace. ``test_denial_content_hash_verifies_with_a_real_non_null_
+    trace_id`` below closes that gap directly."""
 
     async def test_content_hash_verifies_with_a_real_non_null_trace_id(
         self, client, user_context
@@ -708,6 +795,29 @@ class TestContentHashCoversANonNullTraceId:
                     acl_entry_ids=["acl-1"],
                 )
                 await db.commit()
+
+        assert row.trace_id == captured
+        assert row.trace_id is not None
+        assert integrity.verify_content_hash(row) is True
+
+    async def test_denial_content_hash_verifies_with_a_real_non_null_trace_id(
+        self, client, user_context
+    ) -> None:
+        """F6b — the ``record_denial`` half of F6, missing in round 1."""
+        tracer = TracerProvider().get_tracer("acl-audit-writer-denial-hash-tests")
+        with tracer.start_as_current_span("acl-denial-hash-write") as span:
+            captured = format(span.get_span_context().trace_id, "032x")
+            row = await record_denial(
+                user_context=user_context,
+                op="grantPermission",
+                principal_type="user",
+                principal_id="p1",
+                resource_type="agent",
+                resource_id="agent-denial-hash-trace",
+                perm_bits=1,
+                failure_class=FAILURE_CLASS_ACL_DENIED_POLICY,
+                predicate_or_attempted_row={},
+            )
 
         assert row.trace_id == captured
         assert row.trace_id is not None

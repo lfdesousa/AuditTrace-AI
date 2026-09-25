@@ -44,13 +44,22 @@ arbitrary, uncross-checked value
   ``user_id``, and — the part the first cut of this module skipped —
   refuses (``ConsoleStoreScopeError``) when ``user_context.user_id``
   DISAGREES with ``db.rls.current_user_id()``, the Postgres-RLS request
-  ContextVar ``auth.require_user`` binds once per request. A forged
-  ``UserContext`` with a mismatched ``user_id`` is refused BEFORE any
-  session opens — never a bare string parameter reconstructed from
-  who-knows-where, and never trusted merely because it is non-empty.
-  2b-core-B never models "grant on another user's behalf" — that is
-  always the acting caller. Proven by the forged-``UserContext``
-  neuters described below, not by inspection.
+  ContextVar ``auth.require_user`` binds once per request, **WHEN THAT
+  CONTEXTVAR IS BOUND**. A forged ``UserContext`` with a mismatched
+  ``user_id`` is refused BEFORE any session opens on every real request
+  path (``require_user`` always binds the ContextVar first) — never a
+  bare string parameter reconstructed from who-knows-where, and never
+  trusted merely because it is non-empty. When the ContextVar is
+  UNBOUND (only non-request code — background workers, unit tests —
+  runs this way; per :func:`resolve_user_sub`'s own documented design,
+  "the token-resolved ``user_id`` governs" in that case, NOT a defect),
+  this cross-check is a no-op and the caller-supplied
+  ``user_context.user_id`` reaches the database layer instead, where
+  Postgres RLS (migration 005's ``WITH CHECK`` on ``interactions``) is
+  the layer that refuses a mismatch — see :func:`record_denial`'s own
+  docstring's §5.4 note. 2b-core-B never models "grant on another
+  user's behalf" — that is always the acting caller. Proven by the
+  forged-``UserContext`` neuters described below, not by inspection.
 * ``session_id`` — ``console_store.current_session_id()``, the M5
   request-scoped ContextVar (``NULL`` today; invariant 8 / decision D-R
   keeps it mandatory-NULL until the M5 retrofit wires ``X-Session-Id``).
@@ -254,7 +263,11 @@ async def record(
     identity (:func:`~audittrace.services.console_store.resolve_user_sub`)
     rather than trusted at face value — a forged ``user_context`` with a
     mismatched ``user_id`` raises :class:`~audittrace.services.
-    console_store.ConsoleStoreScopeError` before any session I/O.
+    console_store.ConsoleStoreScopeError` before any session I/O, WHEN
+    THE AMBIENT REQUEST CONTEXTVAR IS BOUND (every real request path via
+    ``require_user``). See the module docstring's §3.2 section for the
+    unbound case (non-request code only), where Postgres RLS is the
+    layer that refuses a mismatch instead.
     """
     user_id = resolve_user_sub(user_context)
     trace_id = current_trace_id_hex()
@@ -326,7 +339,14 @@ async def record_denial(
     (:func:`~audittrace.services.console_store.resolve_user_sub`) before
     anything else — a forged ``user_context`` with a mismatched
     ``user_id`` raises :class:`~audittrace.services.console_store.
-    ConsoleStoreScopeError` before any session I/O.
+    ConsoleStoreScopeError` before any session I/O, WHEN THE AMBIENT
+    ContextVar IS BOUND. When it is unbound (non-request code only —
+    every real request via ``require_user`` binds it), the mismatch
+    check is a no-op by :func:`resolve_user_sub`'s own design and
+    migration 005's RLS ``WITH CHECK`` on ``interactions`` is the layer
+    that refuses instead (see §5.4 below) — this is the SAME §5.4
+    "no ambient identity gets a WITH CHECK refusal" fail-closed path,
+    not a separate identity guard.
 
     Opens a fresh session via ``get_postgres_factory().get_session_
     factory()`` and commits it directly (§5 — see the module docstring's

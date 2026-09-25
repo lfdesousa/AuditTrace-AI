@@ -1,4 +1,4 @@
-# Evidence — Sovereign Authorization Layer, ACL 2b-core-B audit writer, local capture (2026-09-25, fix round 1)
+# Evidence — Sovereign Authorization Layer, ACL 2b-core-B audit writer, local capture (2026-09-25, fix round 2)
 
 **Scope of this evidence file.** ACL 2b-core-B
 (`2026-09-25-SPEC-acl-2b-core-B-audit-writer-CONSOLIDATED-v2.md`,
@@ -10,12 +10,15 @@ unmeetable here by construction; this file satisfies Rule 1
 (Verification) and gives the harness-level Rule-3-shaped capture, same
 precedent as WU-2a's own routeless evidence file.
 
-**This is fix round 1, after an independent-review REJECT with 7
-findings, one (F1) a real security defect.** §0 below states plainly
-what was wrong in round 1 and corrects it — no claim from the round-1
-evidence file is silently restated; every corrected claim is marked.
+**This is fix round 2, after an independent-review REJECT with 3 narrow
+findings** (round 1 fixed 7 findings including a real security defect,
+F1; round 1's mechanics — `make test`, coverage, ruff/mypy, frozen
+invariants, no trailers — all held independently in the reviewer's own
+venv; round 2's findings are entirely about CLAIMS being wrong even
+where the underlying code was right). §0a is round 1's original
+"what was wrong" section (kept for history); §0b below is round 2's.
 
-## 0. What round 1 got wrong, and the fix (F1–F7)
+## 0a. What round 1 got wrong, and the fix (F1–F7)
 
 **F1 (SECURITY).** The round-1 `_audit.py` took a `user_context`
 parameter and only checked it for emptiness — it never cross-checked it
@@ -102,22 +105,107 @@ reviewer's own run, "1 failed" — round 1 used a hard-coded 32-hex string
 instead, which flips 2 tests, not 1 — both are shown below for the
 record).
 
+## 0b. What round 2 got wrong, and the fix (B1/B2/B3) — "the code is right and the claim about it is wrong"
+
+**B1 (F6, not actually closed in round 1).** Round 1's F6 fix covered
+`record()` only. This evidence file's round-1 §1 table row for F6 said
+`record_denial()` was "indirectly covered by the SAME N7/F3 neuters" —
+**FALSE**: those neuters change the `trace_id` VALUE; they assert
+nothing about what the hash COVERS. Forcing `record_denial`'s
+`content_hash` to be computed with `trace_id` forced to `None` WHILE the
+persisted row kept its real (non-null) `trace_id` left the whole suite
+GREEN. **Fixed**: `TestContentHashCoversANonNullTraceId::
+test_denial_content_hash_verifies_with_a_real_non_null_trace_id`
+(new, aiosqlite). Verified live: applying that exact neuter (a
+`_hash_fields = {**fields, "trace_id": None}` substitution feeding
+`_content_hash`, row keeping the real `trace_id`) failed exactly this
+one new test, 26 others in the file unaffected; restored, `diff -q`
+byte-identical.
+
+**B2 (F2, the aiosqlite claim was false as written).** Round 1's N3
+aiosqlite test comment said *"`db`'s transaction is STILL OPEN here —
+the failed flush has not been rolled back yet."* This was WRONG about
+the DATABASE: aiosqlite's DBAPI driver issues `BEGIN`/`ROLLBACK` around
+the failed `flush()` itself, so the DB-level transaction has ALREADY
+rolled back by the time `record_denial` runs; only the SQLAlchemy ORM
+`Session` object is still "pending rollback" from the ORM's own point of
+view. Genuine DB-level transaction overlap is impossible to reproduce on
+SQLite at all — holding a transaction open at the DB level (a Core
+`execute` a second writer must wait behind) makes the second write hit
+`database is locked`, because SQLite cannot have two writers overlap,
+aborted or not. **The guard itself was never wrong** — both N3 aiosqlite
+assertions still go RED if `record_denial` is forced to write via the
+caller's own session (proven: see §3b below). **Fixed**: the test is
+renamed
+(`test_denial_row_survives_while_the_orm_session_is_still_pending_
+rollback`), its docstring and the module docstring now state plainly
+that aiosqlite proves ORM-SESSION-level independence only; genuine
+DB-level overlap is proven on Postgres ALONE, where an aborted
+transaction is NOT auto-rolled-back by the driver — the client must
+issue `ROLLBACK` explicitly, so the transaction genuinely stays open at
+the DB level.
+
+**B3 (F4, the identity test proved nothing).** CPython interns
+identifier-like string literals. Restoring the EXACT round-1 defect — a
+local `EVENT_CLASS_ACL_AUTHZ = "acl_authz"` copy re-typed directly in
+`_audit.py`, instead of the import — left
+`_audit.EVENT_CLASS_ACL_AUTHZ is memory_scan.EVENT_CLASS_ACL_AUTHZ`
+**`True`** and the whole suite GREEN, because CPython's string interning
+makes the local copy and the imported name reference the SAME cached
+string object for this exact literal. `test_audit_module_imports_the_
+canonical_constant_not_a_copy` proved nothing about imports — no runtime
+`is`-check on a string literal can distinguish "imported" from
+"re-typed" in CPython. **Fixed**: that test is REMOVED, not repaired.
+The structural fix (`_audit.py` importing `EVENT_CLASS_ACL_AUTHZ` from
+`routes/memory_scan.py` rather than defining its own copy) stands — it
+is still the right thing to do, and a genuinely DRIFTED VALUE (e.g. a
+typo) is still caught by `test_literal_value_is_exactly_acl_authz` and
+`TestEventClassValues` (`tests/test_memory_routes.py`) — but "does
+`_audit.py` import rather than copy" is a code-review property, not a
+test property, for this specific kind of literal.
+
+**Non-blocking, folded in:**
+
+- Forged-identity docstrings (module docstring, `record()`,
+  `record_denial()`) now say "WHEN THE AMBIENT CONTEXTVAR IS BOUND" —
+  unbound (non-request code only) the forged row's cross-check is a
+  documented no-op (`resolve_user_sub`'s own design: "the
+  token-resolved `user_id` governs" when unbound), not a defect, and
+  Postgres RLS is the layer that refuses a mismatch in that case
+  instead.
+- The Postgres "unbound ContextVar" test previously lived in
+  `TestForgedUserIdRefusedOnPostgres` as if it were forged-identity
+  specific. It is not: with the ContextVar unbound, RLS refuses ANY
+  subject, forged or legitimate — there is nothing forgery-specific
+  about that refusal. Moved to `TestAuditWriterRealPostgres` and renamed
+  `test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not`,
+  named for what it actually proves (the same §5.4 fail-closed path as
+  its sibling N4 test).
+- The build record's gates line no longer cites `_audit.py`'s coverage
+  as a count ("100%/100%") beside the D22 note — PASS/FAIL only, per
+  D22, is now the ONLY thing cited for coverage.
+- The F2 falsifiability proof is now a COMMITTED, real pytest test
+  (`test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds`,
+  `tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres`) rather
+  than an uncommitted throwaway script — see §3b.
+
 ## 1. Per-guard neuter table (N1–N8 plus F1/F3/F4/F5/F6), `cmp`-verified restore
 
 | Guard | Test(s) | Mechanism | RED confirmed | Restored |
 |---|---|---|---|---|
 | N1 — success row, full payload | `TestRecordSuccess` (aiosqlite) / `test_n1_...` (PG) | Direct behavioural assertion against a real write (no fault injected — this guard IS the happy path) | n/a by design | n/a |
 | N2 — denial row, separately | `TestRecordDenial` (aiosqlite) / `test_n2_...` (PG) | Direct behavioural assertion against a real denial write | n/a by design | n/a |
-| N3 — denial survives rollback | `TestDenialRowSurvivesRollback` (aiosqlite, CHECK abort, denial called WHILE the flush's transaction is open) / `test_n3_...` (PG, real RLS `WITH CHECK` abort, same overlap) | The abort itself is the fault; falsifiability proven separately via the "shared session" simulation (§0/F2 above) | YES (BAD-pattern simulation) | n/a (simulation was throwaway, not applied to the shipped module) |
+| N3 — denial survives rollback | `TestDenialRowSurvivesRollback` (aiosqlite — ORM-SESSION independence only, see B2 correction §0b) / `test_n3_denial_row_survives_an_rls_aborted_transaction` (PG — genuine DB-level RLS abort overlap) | Aiosqlite: the ORM session is pending-rollback when `record_denial` runs (DB-level transaction already closed by the driver). PG: the DB-level transaction is genuinely still open (Postgres does not auto-rollback) | YES — falsifiability now proven by a COMMITTED test, `test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds` (§3b) | n/a (that test simulates the bad pattern inline; the shipped `_audit.py` is never modified by it) |
 | N4 — writer raises, fail-closed | `TestFailClosed` (aiosqlite+PG) + `test_n4_no_ambient_identity_...` (PG) | Monkeypatched `_content_hash`/`get_postgres_factory` to raise; separately, a swallowing `try/except` wrapped `record_denial`'s `db.commit()` | YES — `test_n4_no_ambient_identity_...` failed under the swallow-neuter | YES — `diff -q` byte-identical restore |
 | N5 — append-only trigger, behavioural | `TestAppendOnlyTriggerNeuter` | `DROP TRIGGER interactions_append_only` (admin connection) | YES — UPDATE succeeded while dropped | YES — single `CREATE TRIGGER`; `pg_trigger` (tgname **+** `pg_get_triggerdef`, fix round 1 — name-only comparison replaced) compared to the pre-drop capture, exact match |
 | N6 — §10.1 limitation pin | `TestCrossSubjectAuditReadIsImpossible` (exactly one test) | Not neutered — neutering a limitation-pin would fabricate a "control", contradicting its purpose | n/a by design | n/a |
 | N7 — `record()`'s trace_id derivation | `TestTraceIdDerivation` | Replaced `current_trace_id_hex()`'s call site with **`None`** (spec's literal — round 1 used a hard-coded 32-hex string, corrected here) | YES — exactly 1 of 2 tests fails with `None` (the positive match test; the NULL-trap test is unaffected since it already expects `None`). The hard-coded-hex variant (round 1's neuter) fails BOTH tests — reproduced below for the record | YES — `diff -q` byte-identical restore |
 | F3 — `record_denial()`'s trace_id derivation | `TestDenialTraceIdDerivation` | Replaced `record_denial`'s `current_trace_id_hex()` call site with `None` | YES — 1 of 2 tests fails (25 of 26 total file tests still pass) | YES — `diff -q` byte-identical restore |
-| F1/N8 — forged `UserContext` refused | `TestForgedIdentityIsRefused` (aiosqlite) / `test_record_denial_refuses_a_forged_user_context_when_ambient_identity_bound` + `test_record_denial_with_unbound_contextvar_is_refused_by_rls` (PG) | Reverted `resolve_user_sub` calls to the round-1 bare-emptiness check (both call sites) | YES — both aiosqlite forged-context tests fail (`DID NOT RAISE ConsoleStoreScopeError`) | YES — `diff -q` byte-identical restore |
+| F1/N8 — forged `UserContext` refused (bound ContextVar — the forgery-specific guard) | `TestForgedIdentityIsRefused` (aiosqlite) / `test_record_denial_refuses_a_forged_user_context_when_ambient_identity_bound` (PG) | Reverted `resolve_user_sub` calls to the round-1 bare-emptiness check (both call sites) | YES — both aiosqlite forged-context tests fail (`DID NOT RAISE ConsoleStoreScopeError`) | YES — `diff -q` byte-identical restore |
+| N4 (not forgery-specific — round 2 correction, B/non-blocking) — unbound ContextVar refuses ANY subject | `test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not` (PG, `TestAuditWriterRealPostgres` — moved from `TestForgedUserIdRefusedOnPostgres`, renamed) | n/a — direct behavioural assertion; the same §5.4 fail-closed path as `test_n4_no_ambient_identity_...` | n/a by design | n/a |
 | F4 — `EVENT_CLASS_ACL_AUTHZ` pinning | `TestEventClassPinning` | Changed `memory_scan.py`'s constant to `"acl_authx"` | YES — `test_literal_value_is_exactly_acl_authz` fails | YES — `diff -q` byte-identical restore |
 | F5 — `session_id` derivation | `TestSessionIdDerivation` | Hard-coded `session_id = None` at both call sites | YES — both stamping tests fail | YES — `diff -q` byte-identical restore |
-| F6 — content_hash, non-null trace_id | `TestContentHashCoversANonNullTraceId` | Covered by the SAME N7/F3 neuters above (trace_id excluded from the hash while present on the row would diverge) | Indirectly covered — not neutered separately | n/a |
+| F6/B1 — content_hash, non-null trace_id, BOTH `record()` and `record_denial()` | `TestContentHashCoversANonNullTraceId` (2 tests, round 2 adds the `record_denial` half) | `_hash_fields = {**fields, "trace_id": None}` fed to `_content_hash` while the row keeps its real `trace_id` | YES — the `record_denial` variant fails exactly the new test, 26 others unaffected | YES — `diff -q` byte-identical restore |
 
 All neuters against `src/audittrace/services/console_acl/_audit.py` and
 `src/audittrace/routes/memory_scan.py` were applied via `cp` to a
@@ -159,29 +247,58 @@ the value in BOTH the active-span AND no-span cases, so BOTH
 `TestTraceIdDerivation` tests failed — a stronger neuter than the spec
 asked for, but not the one the spec named, hence the discrepancy.
 
-## 4. Full verbose runs, this box, 2026-09-25, unmodified (post-fix) code
+## 3b. F2's falsifiability proof, now a committed test (B2 non-blocking fix)
+
+`tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds`
+replaces the round-1 uncommitted throwaway script. It provokes a real
+RLS abort (mismatched `user_sub` INSERT into `console_acl_entries`),
+then — on the SAME still-aborted session — attempts a raw INSERT
+simulating what a "shared session" `record_denial` would do; this
+raises Postgres's own `current transaction is aborted` error (asserted
+via `pytest.raises`). It then repeats the identical abort on a SEPARATE
+session and calls the REAL, unmodified `record_denial`, which succeeds.
+Run, this box, 2026-09-25:
+
+```
+$ .venv/bin/pytest tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds -v --no-cov
+tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds PASSED
+============================== 1 passed in 1.54s ===============================
+```
+
+This test does not modify `_audit.py` — it simulates the forbidden
+pattern INLINE with raw SQL, so it is a genuine regression guard against
+a future `record_denial` change that reuses the caller's session,
+without ever touching the shipped module during a normal test run.
+
+## 4. Full verbose runs, this box, 2026-09-25, unmodified (post-fix-round-2) code
 
 ```
 $ .venv/bin/pytest tests/test_console_acl_audit_writer.py -v --no-cov
 collected 26 items
 ... (26 passed — TestRecordSuccess x2, TestRecordDenial x3,
-     TestDenialRowSurvivesRollback x1, TestFailClosed x3,
-     TestTraceIdDerivation x2, TestDenialTraceIdDerivation x2,
-     TestEventClassPinning x3, TestSessionIdDerivation x3,
-     TestContentHashCoversANonNullTraceId x1,
-     TestForgedIdentityIsRefused x3, TestUserIdAndGrantedByDerivation x3)
-============================== 26 passed in 2.2s ===============================
+     TestDenialRowSurvivesRollback x1 (renamed, B2),
+     TestFailClosed x3, TestTraceIdDerivation x2,
+     TestDenialTraceIdDerivation x2, TestEventClassPinning x2
+     (identity test REMOVED, B3), TestSessionIdDerivation x3,
+     TestContentHashCoversANonNullTraceId x2 (record_denial half
+     added, B1), TestForgedIdentityIsRefused x3,
+     TestUserIdAndGrantedByDerivation x3)
+============================== 26 passed in 2.34s ==============================
 
 $ .venv/bin/pytest tests/test_acl_ownership_rls.py -v --no-cov
-collected 28 items
-... (17 pre-existing WU-2a tests UNCHANGED + 11 ACL-2b-core-B tests, all PASSED)
-============================== 28 passed in 8.65s ==============================
+collected 29 items
+... (17 pre-existing WU-2a tests UNCHANGED + 12 ACL-2b-core-B tests
+     (test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds
+     and test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not
+     added this round), all PASSED)
+============================== 29 passed in 3.80s ==============================
 ```
 
-`git diff main -- tests/test_acl_ownership_rls.py`: 787 insertions, **0
+`git diff main -- tests/test_acl_ownership_rls.py`: 911 insertions, **0
 deletions** (the §2 frozen-exception requirement, re-verified after fix
-round 1). `git diff main -- src/audittrace/migrations/versions/032_....py`:
-empty (migration 032 untouched).
+round 2 — was 787/0 after round 1). `git diff main -- src/audittrace/
+migrations/versions/032_....py`: empty (migration 032 untouched).
 
 ## 5. Single alembic head (§11's exact requirement)
 
@@ -237,3 +354,15 @@ account of protection against a forged UserContext THROUGH the writer**
 test answers a different, narrower question (bypassing the writer
 entirely), while `TestForgedIdentityIsRefused` is what actually protects
 the writer's own API surface.
+
+**Round 2 additions to this section.** Round 1's claim that a forged
+`user_context` is refused "before any session opens" carried no
+qualifier — corrected (module docstring, `record()`, `record_denial()`)
+to state this holds WHEN THE AMBIENT CONTEXTVAR IS BOUND (every real
+request path); unbound (non-request code only), the cross-check is a
+documented no-op and Postgres RLS is the layer that refuses instead.
+Round 1's N3 aiosqlite comment ("`db`'s transaction is STILL OPEN") is
+corrected per B2 above. Round 1's F4 "proof" via object identity
+(`_audit.EVENT_CLASS_ACL_AUTHZ is memory_scan.EVENT_CLASS_ACL_AUTHZ`) is
+retracted per B3 above — CPython string interning makes that check
+incapable of proving what it claimed.

@@ -1485,6 +1485,120 @@ class TestAuditWriterRealPostgres:
         finally:
             set_current_user_id(None)
 
+    async def test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        """The F2 falsifiability proof, COMMITTED (fix round 2 — a
+        reviewer noted this claim previously depended on an uncommitted
+        throwaway script; "a claim that needs a script should have a
+        test"). Simulates the "tempting fix" §5.4 forbids — a
+        ``record_denial`` that reused the CALLER's still-aborted session
+        instead of opening its own — inline, against a real aborted
+        transaction, and shows it fails with Postgres's own
+        "current transaction is aborted" error, while the REAL writer
+        (independent session, unmodified) succeeds under the identical
+        conditions."""
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            # BAD PATTERN — a hypothetical record_denial that shares the
+            # caller's session instead of opening its own. Both the abort
+            # and the write attempt are Core-level (text()) statements on
+            # the SAME session, mirroring test_n3's own abort mechanism —
+            # an ORM flush of a newly-added pending object behaves
+            # differently (SQLAlchemy marks the whole ORM Session
+            # "pending rollback" immediately, raising its OWN
+            # PendingRollbackError on ANY further use, which would mask
+            # the actual DB-level "transaction is aborted" error this
+            # test needs to demonstrate).
+            async with factory() as db:
+                with pytest.raises(DBAPIError, match="row-level security"):
+                    await db.execute(
+                        text(
+                            "INSERT INTO console_acl_entries "
+                            "(id, user_sub, principal_type, principal_id, "
+                            "principal_model, resource_type, resource_id, "
+                            "perm_bits, granted_at_ms, created_at_ms, "
+                            "updated_at_ms) "
+                            "VALUES (:id, :user_sub, 'user', :pid, 'User', "
+                            "'agent', :rid, 1, 0, 0, 0)"
+                        ),
+                        {
+                            "id": str(uuid.uuid4()),
+                            "user_sub": _ATTACKER,  # mismatched — RLS aborts
+                            "pid": "p1",
+                            "rid": "agent-f2-falsify-bad",
+                        },
+                    )
+
+                with pytest.raises(DBAPIError, match="current transaction is aborted"):
+                    await db.execute(
+                        text(
+                            "INSERT INTO interactions "
+                            "(project, source, question, answer, "
+                            "prompt_tokens, completion_tokens, timestamp, "
+                            "user_id, status, failure_class, event_class) "
+                            "VALUES ('console-acl', 'console-acl', "
+                            "'denial-shared-session-bad-pattern', '{}', 0, "
+                            "0, '2026-09-25T00:00:00+00:00', :uid, "
+                            "'failed', 'acl_denied_policy', 'acl_authz')"
+                        ),
+                        {"uid": owner.user_id},
+                    )
+                await db.rollback()
+
+            # GOOD PATTERN — the REAL writer, unmodified, independent
+            # session, under the identical abort conditions.
+            async with factory() as db2:
+                with pytest.raises(DBAPIError, match="row-level security"):
+                    await db2.execute(
+                        text(
+                            "INSERT INTO console_acl_entries "
+                            "(id, user_sub, principal_type, principal_id, "
+                            "principal_model, resource_type, resource_id, "
+                            "perm_bits, granted_at_ms, created_at_ms, "
+                            "updated_at_ms) "
+                            "VALUES (:id, :user_sub, 'user', :pid, 'User', "
+                            "'agent', :rid, 1, 0, 0, 0)"
+                        ),
+                        {
+                            "id": str(uuid.uuid4()),
+                            "user_sub": _ATTACKER,
+                            "pid": "p1",
+                            "rid": "agent-f2-falsify-good",
+                        },
+                    )
+
+                with _wired_postgres_factory(factory):
+                    denial = await _audit.record_denial(
+                        user_context=owner,
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id="p1",
+                        resource_type="agent",
+                        resource_id="agent-f2-falsify-good",
+                        perm_bits=99,
+                        failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                        predicate_or_attempted_row={},
+                    )
+                await db2.rollback()
+
+            async with factory() as fresh:
+                denial_count = (
+                    await fresh.execute(
+                        text("SELECT count(*) FROM interactions WHERE id = :id"),
+                        {"id": denial.id},
+                    )
+                ).scalar_one()
+                assert denial_count == 1, (
+                    "the real (independent-session) writer must succeed "
+                    "under the identical conditions the shared-session "
+                    "pattern just failed under"
+                )
+        finally:
+            set_current_user_id(None)
+
     async def test_n4_writer_raises_on_a_broken_audit_write(
         self,
         interactions_harness: _InteractionsHarness,
@@ -1551,6 +1665,39 @@ class TestAuditWriterRealPostgres:
                     principal_id="p1",
                     resource_type="agent",
                     resource_id="agent-no-guc",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={},
+                )
+
+    async def test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        """Fix round 2 correction — this test used to live in
+        ``TestForgedUserIdRefusedOnPostgres`` as if it exercised a
+        forged-identity-SPECIFIC guard. It does not: with the ambient
+        ContextVar unbound, ``resolve_user_sub``'s mismatch check is a
+        no-op by its own documented design (there is nothing to compare
+        against), so the caller-supplied ``user_context.user_id`` reaches
+        the database layer unchanged — and migration 005's RLS refuses
+        it REGARDLESS of whether that subject is forged or perfectly
+        legitimate. This is the SAME §5.4 fail-closed path as the sibling
+        test above, demonstrated with an (irrelevantly) forged subject to
+        make the point that forging buys an attacker nothing extra here —
+        the refusal is unconditional on identity, conditional only on the
+        ContextVar being unbound."""
+        factory = interactions_harness.factory
+        forged = _new_user_context("attacker-unbound-forged-pg")
+        # Deliberately NEVER call set_current_user_id.
+        with _wired_postgres_factory(factory):
+            with pytest.raises(DBAPIError, match="row-level security"):
+                await _audit.record_denial(
+                    user_context=forged,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-unbound-forged-pg",
                     perm_bits=1,
                     failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
                     predicate_or_attempted_row={},
@@ -1786,27 +1933,26 @@ class TestCrossSubjectAuditReadIsImpossible:
 
 
 class TestForgedUserIdRefusedOnPostgres:
-    """The Postgres half of the forged-identity guards. Three DISTINCT
-    scenarios, each catching the forgery at a DIFFERENT layer — fix
-    round 1 added the first two; the raw-INSERT-bypass test already
-    existed:
+    """The Postgres half of the forged-identity guards. Two DISTINCT
+    scenarios, each catching the forgery at a DIFFERENT layer (fix
+    round 2 correction: a THIRD test used to live here claiming to
+    exercise "the unbound-ContextVar forged case" — it is REMOVED from
+    this class and reframed as what it actually is: an N4 fail-closed
+    test, moved to ``TestAuditWriterRealPostgres`` — see that class'
+    ``test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not``.
+    With the ContextVar unbound, RLS refuses ANY subject, forged or
+    legitimate; there is nothing forged-identity-SPECIFIC about that
+    refusal, so naming it as an F1 test was misleading):
 
     1. ``test_record_denial_refuses_a_forged_user_context_when_ambient_
        identity_bound`` — the ambient ContextVar IS bound to the real
        caller; a forged ``UserContext`` passed THROUGH the writer's own
        API is refused by the APP-level cross-check
        (``console_store.resolve_user_sub``) BEFORE any session opens —
-       RLS is never even reached.
-    2. ``test_record_denial_with_unbound_contextvar_is_refused_by_rls`` —
-       the ambient ContextVar is UNBOUND, so ``resolve_user_sub``'s
-       cross-check is a no-op (per its own docstring: "the token-resolved
-       user_id governs" when unbound) and a forged subject sails through
-       the APP layer. This test verifies the SECOND, independent layer:
-       with no ContextVar bound, ``db/rls.py``'s ``after_begin`` listener
-       never emits ``set_config``, so migration 005's ``WITH CHECK
-       (user_id = current_setting(...))`` compares the forged subject
-       against an unset GUC and refuses it at the DATABASE layer.
-    3. ``test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls`` —
+       RLS is never even reached. THIS is the forged-identity-specific
+       guard: it is the mismatch between the bound identity and the
+       forged one that trips it, not merely the absence of an identity.
+    2. ``test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls`` —
        the writer's API is bypassed ENTIRELY with a raw INSERT (no
        ``resolve_user_sub`` call happens at all, by construction); RLS is
        the ONLY layer in play here, unconditionally. The aiosqlite
@@ -1848,28 +1994,6 @@ class TestForgedUserIdRefusedOnPostgres:
                 )
             ).scalar_one()
             assert count == 0, "the forged write must never land"
-
-    async def test_record_denial_with_unbound_contextvar_is_refused_by_rls(
-        self, interactions_harness: _InteractionsHarness
-    ) -> None:
-        factory = interactions_harness.factory
-        forged = _new_user_context("attacker-unbound-forged-pg")
-        # Deliberately NEVER call set_current_user_id — the ContextVar is
-        # unbound, so resolve_user_sub's cross-check is a no-op and the
-        # forged subject reaches the DB layer. RLS is what catches it.
-        with _wired_postgres_factory(factory):
-            with pytest.raises(DBAPIError, match="row-level security"):
-                await _audit.record_denial(
-                    user_context=forged,
-                    op="grantPermission",
-                    principal_type="user",
-                    principal_id="p1",
-                    resource_type="agent",
-                    resource_id="agent-unbound-forged-pg",
-                    perm_bits=1,
-                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
-                    predicate_or_attempted_row={},
-                )
 
     async def test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls(
         self, interactions_harness: _InteractionsHarness
