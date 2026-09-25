@@ -65,11 +65,22 @@ _SCAN_STATUS_CODES: frozenset[str] = frozenset(
 # "acl_authz" — Sovereign Authorization Layer EPIC, ACL 2b-core-B: every
 # sovereign ACL write attempt (successful or denied) emits a first-class
 # audit row via ``services/console_acl/_audit.py``. Registered at FOUR
-# sites (this frozenset, routes/memory.py's re-export, routes/audit.py's
-# Query description, db/models.py's column docstring) — registering in
-# only one of the four was ACL WU-1's F1 defect in new clothes.
+# sites (this module's own ``EVENT_CLASS_ACL_AUTHZ`` constant below,
+# routes/memory.py's re-export, routes/audit.py's Query description,
+# db/models.py's column docstring) — registering in only one of the four
+# was ACL WU-1's F1 defect in new clothes. ``EVENT_CLASS_ACL_AUTHZ`` is a
+# NAMED, PUBLIC constant (not a bare literal buried in the frozenset
+# below) specifically so ``services/console_acl/_audit.py`` can IMPORT
+# it rather than duplicate the string — a fix-round-1 correction: the
+# original cut defined its own separate ``"acl_authz"`` literal in
+# ``_audit.py`` with a docstring claiming it was "imported everywhere it
+# is registered", which was false (this module used to carry only a
+# bare literal). A duplicated literal is exactly the drift risk ACL
+# WU-1's F1 already proved this codebase does not get for free.
+EVENT_CLASS_ACL_AUTHZ = "acl_authz"
+
 _EVENT_CLASS_VALUES: frozenset[str] = frozenset(
-    {"interaction", "security", "assessment", "memory_access", "acl_authz"}
+    {"interaction", "security", "assessment", "memory_access", EVENT_CLASS_ACL_AUTHZ}
 )
 
-__all__ = ["_SCAN_STATUS_CODES", "_EVENT_CLASS_VALUES"]
+__all__ = ["_EVENT_CLASS_VALUES", "_SCAN_STATUS_CODES", "EVENT_CLASS_ACL_AUTHZ"]

@@ -140,6 +140,7 @@ from audittrace.db.postgres import PostgresFactory  # noqa: E402
 from audittrace.db.rls import set_current_user_id  # noqa: E402
 from audittrace.identity import UserContext  # noqa: E402
 from audittrace.services.console_acl import _audit  # noqa: E402
+from audittrace.services.console_store import ConsoleStoreScopeError  # noqa: E402
 
 
 def _free_port() -> int:
@@ -1404,13 +1405,21 @@ class TestAuditWriterRealPostgres:
     ) -> None:
         """N3, PG half — the ``031:97-100`` CHECK is proven on aiosqlite
         already; here the abort is a REAL RLS ``WITH CHECK`` refusal
-        (owner-only INSERT guard, migration 031) — "RLS on PG"."""
+        (owner-only INSERT guard, migration 031) — "RLS on PG".
+
+        Fix round 1 (F2) — the ordering IS the proof: ``record_denial``
+        runs INSIDE the SAME ``async with factory() as db:`` block as the
+        failed INSERT, WHILE that transaction is still open (aborted, not
+        yet rolled back). The first cut called ``record_denial`` only
+        after the ``async with`` block had already exited (which rolls
+        back on the raised exception), so no overlap ever existed and
+        "survives the rollback" held for an unrelated reason."""
         factory = interactions_harness.factory
         owner = _new_user_context(_OWNER)
         set_current_user_id(owner.user_id)
         try:
-            with pytest.raises(DBAPIError, match="row-level security"):
-                async with factory() as db:
+            async with factory() as db:
+                with pytest.raises(DBAPIError, match="row-level security"):
                     await db.execute(
                         text(
                             "INSERT INTO console_acl_entries "
@@ -1430,21 +1439,29 @@ class TestAuditWriterRealPostgres:
                             "rid": "agent-rls-abort",
                         },
                     )
-                    await db.commit()
 
-            with _wired_postgres_factory(factory):
-                denial = await _audit.record_denial(
-                    user_context=owner,
-                    op="grantPermission",
-                    principal_type="user",
-                    principal_id=_VIEWER,
-                    resource_type="agent",
-                    resource_id="agent-rls-abort",
-                    perm_bits=1,
-                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
-                    predicate_or_attempted_row={"resource_id": "agent-rls-abort"},
-                    db_error_class="row-level security",
-                )
+                # `db`'s transaction is STILL OPEN (Postgres has marked it
+                # aborted, but no ROLLBACK has been issued yet). A writer
+                # that shared this session would itself raise
+                # "current transaction is aborted" on the very next
+                # statement — only a genuinely INDEPENDENT session
+                # (opened by record_denial's own get_postgres_factory()
+                # call) can succeed here.
+                with _wired_postgres_factory(factory):
+                    denial = await _audit.record_denial(
+                        user_context=owner,
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id=_VIEWER,
+                        resource_type="agent",
+                        resource_id="agent-rls-abort",
+                        perm_bits=1,
+                        failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                        predicate_or_attempted_row={"resource_id": "agent-rls-abort"},
+                        db_error_class="row-level security",
+                    )
+
+                await db.rollback()  # now clean up the still-pending abort
 
             async with factory() as fresh:
                 acl_count = (
@@ -1462,7 +1479,9 @@ class TestAuditWriterRealPostgres:
                         {"id": denial.id},
                     )
                 ).scalar_one()
-                assert denial_count == 1, "the denial row must survive the RLS abort"
+                assert denial_count == 1, (
+                    "the denial row must survive the STILL-OPEN RLS abort"
+                )
         finally:
             set_current_user_id(None)
 
@@ -1622,14 +1641,14 @@ class TestAppendOnlyTriggerNeuter:
                 before = sorted(
                     conn.execute(
                         text(
-                            "SELECT tgname FROM pg_trigger WHERE "
-                            "tgrelid = 'interactions'::regclass AND NOT tgisinternal"
+                            "SELECT tgname, pg_get_triggerdef(oid) FROM pg_trigger "
+                            "WHERE tgrelid = 'interactions'::regclass "
+                            "AND NOT tgisinternal"
                         )
-                    )
-                    .scalars()
-                    .all()
+                    ).all()
                 )
-            assert "interactions_append_only" in before
+            before_names = [row[0] for row in before]
+            assert "interactions_append_only" in before_names
 
             # NEUTER — drop only the interactions trigger (016 creates a
             # SECOND one on tool_calls, untouched here).
@@ -1668,15 +1687,18 @@ class TestAppendOnlyTriggerNeuter:
                 after = sorted(
                     conn.execute(
                         text(
-                            "SELECT tgname FROM pg_trigger WHERE "
-                            "tgrelid = 'interactions'::regclass AND NOT tgisinternal"
+                            "SELECT tgname, pg_get_triggerdef(oid) FROM pg_trigger "
+                            "WHERE tgrelid = 'interactions'::regclass "
+                            "AND NOT tgisinternal"
                         )
-                    )
-                    .scalars()
-                    .all()
+                    ).all()
                 )
+            # Compare BOTH name AND full definition (pg_get_triggerdef) —
+            # a name-only comparison would miss a restore that recreates
+            # the trigger with a DIFFERENT timing/function/event and
+            # still happens to reuse the same name.
             assert after == before, (
-                "cmp-verified restore — pg_trigger must match exactly"
+                "cmp-verified restore — pg_trigger name+definition must match exactly"
             )
         finally:
             admin.dispose()
@@ -1764,12 +1786,90 @@ class TestCrossSubjectAuditReadIsImpossible:
 
 
 class TestForgedUserIdRefusedOnPostgres:
-    """N8's Postgres half — the aiosqlite counterpart in ``tests/
-    test_console_acl_audit_writer.py`` shows the SAME raw INSERT,
-    bypassing the writer entirely, succeeds silently with no RLS. Here,
-    migration 005's RLS ``WITH CHECK`` on ``interactions`` refuses it —
-    the structural rule (no parameter on the writer's own API) is what
-    protects the aiosqlite path; RLS is what protects this one."""
+    """The Postgres half of the forged-identity guards. Three DISTINCT
+    scenarios, each catching the forgery at a DIFFERENT layer — fix
+    round 1 added the first two; the raw-INSERT-bypass test already
+    existed:
+
+    1. ``test_record_denial_refuses_a_forged_user_context_when_ambient_
+       identity_bound`` — the ambient ContextVar IS bound to the real
+       caller; a forged ``UserContext`` passed THROUGH the writer's own
+       API is refused by the APP-level cross-check
+       (``console_store.resolve_user_sub``) BEFORE any session opens —
+       RLS is never even reached.
+    2. ``test_record_denial_with_unbound_contextvar_is_refused_by_rls`` —
+       the ambient ContextVar is UNBOUND, so ``resolve_user_sub``'s
+       cross-check is a no-op (per its own docstring: "the token-resolved
+       user_id governs" when unbound) and a forged subject sails through
+       the APP layer. This test verifies the SECOND, independent layer:
+       with no ContextVar bound, ``db/rls.py``'s ``after_begin`` listener
+       never emits ``set_config``, so migration 005's ``WITH CHECK
+       (user_id = current_setting(...))`` compares the forged subject
+       against an unset GUC and refuses it at the DATABASE layer.
+    3. ``test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls`` —
+       the writer's API is bypassed ENTIRELY with a raw INSERT (no
+       ``resolve_user_sub`` call happens at all, by construction); RLS is
+       the ONLY layer in play here, unconditionally. The aiosqlite
+       counterpart in ``tests/test_console_acl_audit_writer.py`` shows
+       this SAME raw INSERT succeeds silently there (no RLS on aiosqlite)."""
+
+    async def test_record_denial_refuses_a_forged_user_context_when_ambient_identity_bound(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        forged = _new_user_context("attacker-forged-subject-pg")
+        set_current_user_id(_OWNER)  # ambient identity: the REAL caller
+        try:
+            with _wired_postgres_factory(factory):
+                with pytest.raises(
+                    ConsoleStoreScopeError, match="disagrees with the RLS"
+                ):
+                    await _audit.record_denial(
+                        user_context=forged,  # mismatched vs. the bound _OWNER
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id="p1",
+                        resource_type="agent",
+                        resource_id="agent-forged-pg",
+                        perm_bits=1,
+                        failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                        predicate_or_attempted_row={},
+                    )
+        finally:
+            set_current_user_id(None)
+
+        async with factory() as fresh:
+            count = (
+                await fresh.execute(
+                    text(
+                        "SELECT count(*) FROM interactions "
+                        "WHERE user_id = 'attacker-forged-subject-pg'"
+                    )
+                )
+            ).scalar_one()
+            assert count == 0, "the forged write must never land"
+
+    async def test_record_denial_with_unbound_contextvar_is_refused_by_rls(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        forged = _new_user_context("attacker-unbound-forged-pg")
+        # Deliberately NEVER call set_current_user_id — the ContextVar is
+        # unbound, so resolve_user_sub's cross-check is a no-op and the
+        # forged subject reaches the DB layer. RLS is what catches it.
+        with _wired_postgres_factory(factory):
+            with pytest.raises(DBAPIError, match="row-level security"):
+                await _audit.record_denial(
+                    user_context=forged,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-unbound-forged-pg",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={},
+                )
 
     async def test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls(
         self, interactions_harness: _InteractionsHarness

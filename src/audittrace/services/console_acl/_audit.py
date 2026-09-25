@@ -14,41 +14,60 @@ refused. Rows are **``InteractionRecord``** (``db/models.py``, table
 audit-schema freeze (additive, no migration needed, see ``event_class``
 below).
 
-**§3.2 — the derivation rule is the control, and it is why this module
-takes NO ``trace_id``, NO ``session_id``, NO ``user_id``, NO
-``granted_by``, NO ``user_sub`` parameter.** The precedent this module
-deliberately does NOT copy, ``services/memory_audit.py:130``, accepts
-``trace_id`` as an *optional* parameter
-(``trace_id if trace_id is not None else _current_trace_id_hex()``) — a
-writer built that way is satisfied by a **test-supplied** value without
-ever exercising choke-stamping, and a caller could later pass a
-caller-controlled trace. Here, every security-relevant / traceability
-column is derived from the ACTIVE REQUEST CONTEXT, never from an
-argument a caller could set to an arbitrary value
+**§3.2 — the derivation rule is the control, and this module takes NO
+``trace_id``, NO ``session_id``, NO ``granted_by``, NO ``user_sub``
+parameter — and the ``user_context`` it DOES take is CROSS-CHECKED, not
+trusted at face value.** (Fix round 1 correction: the first cut of this
+module accepted ``user_context`` and only checked it for emptiness,
+never against the ambient RLS identity — an independent reviewer forged
+a ``UserContext`` and both :func:`record` and :func:`record_denial`
+happily persisted the attacker's subject as ``user_id``/``granted_by``.
+Spec §3.2 exists to make exactly that impossible; this module now
+enforces it, not merely documents it.)
+
+The precedent this module deliberately does NOT copy,
+``services/memory_audit.py:130``, accepts ``trace_id`` as an *optional*
+parameter (``trace_id if trace_id is not None else
+_current_trace_id_hex()``) — a writer built that way is satisfied by a
+**test-supplied** value without ever exercising choke-stamping, and a
+caller could later pass a caller-controlled trace. Here, every
+security-relevant / traceability column is derived from the ACTIVE
+REQUEST CONTEXT, never from an argument a caller could set to an
+arbitrary, uncross-checked value
 (``feedback_never_trust_caller_metadata_for_security_fields``):
 
-* ``user_id`` / ``granted_by`` — both ``user_context.user_id``, the
-  SAME authenticated :class:`~audittrace.identity.UserContext` the
-  caller already resolved via ``require_user`` (never a bare string
-  parameter reconstructed from who-knows-where — the same reasoning
-  ``services/console_acl/_ownership.py`` gives for threading the real
-  ``UserContext`` through rather than a synthetic one). 2b-core-B never
-  models "grant on another user's behalf" — that is always the acting
-  caller.
-* ``session_id`` — ``console_store._context.current_session_id()``, the
-  M5 request-scoped ContextVar (``NULL`` today; invariant 8 / decision
-  D-R keeps it mandatory-NULL until the M5 retrofit wires
-  ``X-Session-Id``).
-* ``trace_id`` — ``console_store._context.current_trace_id_hex()``, the
-  SAME OpenTelemetry-span derivation ``routes/chat.py::
+* ``user_id`` / ``granted_by`` — both resolved via
+  :func:`~audittrace.services.console_store.resolve_user_sub`, the SAME
+  choke ``services/console_store/_context.py`` uses for every other
+  console-* domain: it takes the caller's authenticated
+  :class:`~audittrace.identity.UserContext`, refuses an empty
+  ``user_id``, and — the part the first cut of this module skipped —
+  refuses (``ConsoleStoreScopeError``) when ``user_context.user_id``
+  DISAGREES with ``db.rls.current_user_id()``, the Postgres-RLS request
+  ContextVar ``auth.require_user`` binds once per request. A forged
+  ``UserContext`` with a mismatched ``user_id`` is refused BEFORE any
+  session opens — never a bare string parameter reconstructed from
+  who-knows-where, and never trusted merely because it is non-empty.
+  2b-core-B never models "grant on another user's behalf" — that is
+  always the acting caller. Proven by the forged-``UserContext``
+  neuters described below, not by inspection.
+* ``session_id`` — ``console_store.current_session_id()``, the M5
+  request-scoped ContextVar (``NULL`` today; invariant 8 / decision D-R
+  keeps it mandatory-NULL until the M5 retrofit wires ``X-Session-Id``).
+* ``trace_id`` — ``console_store.current_trace_id_hex()``, the SAME
+  OpenTelemetry-span derivation ``routes/chat.py::
   _current_trace_id_hex`` uses for ``interactions.trace_id`` — ``None``
   when no span is active (the laptop telemetry no-op default). Proven
-  by **N7**: replace this call with a hard-coded ``None`` and the §4.1
-  reconstruction match MUST go RED.
+  for BOTH :func:`record` and :func:`record_denial` by span-scoped
+  tests: replace the call with ``None`` and the §4.1 reconstruction
+  match MUST go RED.
 
-Proven by **N7/N8** (this module's own test suite), never by code
-inspection alone (``feedback_unpinnable_claim_check_your_own_
-techniques``).
+Every one of the above is proven by an EDIT-AND-RESTORE neuter of this
+module's own source (change the derivation, watch the existing VALUE
+assertion go RED, restore, watch it go GREEN again) — never by a
+monkeypatch that supplies the exact value the test then asserts back
+(self-fulfilling, proves nothing;
+``feedback_unpinnable_claim_check_your_own_techniques``).
 
 **§5 — denial rows commit in an INDEPENDENT transaction, never a
 parameter-supplied identity.** :func:`record_denial` opens its OWN
@@ -103,25 +122,34 @@ from audittrace.db.models import InteractionRecord
 from audittrace.dependencies import get_postgres_factory
 from audittrace.identity import UserContext
 from audittrace.integrity import content_hash as _content_hash
+from audittrace.routes.memory_scan import EVENT_CLASS_ACL_AUTHZ
 from audittrace.services.console_acl import (
     PERMISSION_BIT_DELETE,
     PERMISSION_BIT_EDIT,
     PERMISSION_BIT_SHARE,
     PERMISSION_BIT_VIEW,
 )
-from audittrace.services.console_store._context import (
+from audittrace.services.console_store import (
     current_session_id,
     current_trace_id_hex,
+    resolve_user_sub,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── §7 — the event_class literal, ONE constant, imported everywhere it is
-# registered (memory_scan.py's closed set, memory.py's re-export, audit.py's
-# and models.py's documentation) so the four sites can never independently
-# drift on the string itself. 9 chars — `acl_authorization` (17) would
-# overflow `interactions.event_class` (String(16)).
-EVENT_CLASS_ACL_AUTHZ = "acl_authz"
+# ── §7 — the event_class literal. IMPORTED from routes/memory_scan.py
+# (the canonical owner of the interactions.event_class closed set), NOT
+# a locally re-typed literal — fix round 1 correction: the first cut
+# defined its OWN ``"acl_authz"`` literal here, with a docstring
+# claiming it was "imported everywhere it is registered", which was
+# false (memory_scan.py carried an independent bare literal). Importing
+# the SAME object closes that drift risk structurally, the same way
+# routes/memory.py's ``_EVENT_CLASS_VALUES = _scan._EVENT_CLASS_VALUES``
+# re-export does. The value is REGISTERED at four sites (memory_scan.py's
+# canonical constant + closed-set frozenset, routes/memory.py's
+# re-export, routes/audit.py's Query description, db/models.py's column
+# docstring); this module CONSUMES the canonical constant rather than
+# adding a fifth, independent copy.
 
 # §3.1 — project/source constants. `source` gives a filter that isolates
 # this class independently of `event_class` itself (defence in depth if the
@@ -193,18 +221,6 @@ def _question(
     return f"op={op} principal={principal} resource={resource} bits={perm_bits} tenant={tenant}"
 
 
-def _require_user_id(user_context: UserContext) -> str:
-    """Fail-closed: never persist an ACL audit row with no owner — it
-    would be permanently unreadable under RLS (mirrors
-    ``services/memory_audit.py::_build_row``'s identical guard)."""
-    if not user_context.user_id:
-        raise ValueError(
-            "ACL audit event has no user_id on the resolved UserContext; "
-            "refusing to persist an unattributable audit row"
-        )
-    return user_context.user_id
-
-
 async def record(
     db: AsyncSession,
     *,
@@ -233,10 +249,14 @@ async def record(
 
     Every identity/traceability column is derived here, at the choke —
     see the module docstring's §3.2 section. No parameter on this
-    signature can supply ``user_id``, ``granted_by``, ``session_id`` or
-    ``trace_id``.
+    signature can supply ``granted_by``, ``session_id`` or ``trace_id``,
+    and ``user_context`` itself is cross-checked against the ambient RLS
+    identity (:func:`~audittrace.services.console_store.resolve_user_sub`)
+    rather than trusted at face value — a forged ``user_context`` with a
+    mismatched ``user_id`` raises :class:`~audittrace.services.
+    console_store.ConsoleStoreScopeError` before any session I/O.
     """
-    user_id = _require_user_id(user_context)
+    user_id = resolve_user_sub(user_context)
     trace_id = current_trace_id_hex()
     session_id = current_session_id()
     granted_by = user_id  # §3.2 — same source as user_id, never a parameter.
@@ -302,6 +322,12 @@ async def record_denial(
     ``failure_class`` MUST be one of :data:`ACL_DENIAL_FAILURE_CLASSES`
     — refused loudly (``ValueError``), never silently coerced.
 
+    ``user_context`` is cross-checked against the ambient RLS identity
+    (:func:`~audittrace.services.console_store.resolve_user_sub`) before
+    anything else — a forged ``user_context`` with a mismatched
+    ``user_id`` raises :class:`~audittrace.services.console_store.
+    ConsoleStoreScopeError` before any session I/O.
+
     Opens a fresh session via ``get_postgres_factory().get_session_
     factory()`` and commits it directly (§5 — see the module docstring's
     §5 section for why this must NOT share the caller's transaction, and
@@ -314,7 +340,7 @@ async def record_denial(
             f"failure_class={failure_class!r} is not in the closed ACL "
             f"denial set {sorted(ACL_DENIAL_FAILURE_CLASSES)!r}"
         )
-    user_id = _require_user_id(user_context)
+    user_id = resolve_user_sub(user_context)
     trace_id = current_trace_id_hex()
     session_id = current_session_id()
 
