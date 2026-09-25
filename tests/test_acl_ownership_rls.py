@@ -122,6 +122,25 @@ from audittrace.db.rls import install_rls_listener
 _APP_ROLE = "acl_wu2a_app"
 _APP_PASSWORD = "acl_wu2a_pw"  # noqa: S105 - throwaway container credential
 
+# ── ACL 2b-core-B additions-only imports (§2 exception). Deliberately
+# placed HERE, after the first non-import statement above, rather than
+# merged into the top-of-file import block: merging would make ruff's
+# import-sort check (I001) want to reorder/re-wrap the EXISTING lines
+# above (e.g. collapsing ``from audittrace.db.rls import
+# install_rls_listener`` into a multi-name import), which would show as
+# a REMOVED line under §2's "removed lines = 0" restriction. This block
+# is its own, independently-sorted import group instead.
+import contextlib  # noqa: E402
+import json  # noqa: E402
+import uuid  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+
+from audittrace import dependencies  # noqa: E402
+from audittrace.db.postgres import PostgresFactory  # noqa: E402
+from audittrace.db.rls import set_current_user_id  # noqa: E402
+from audittrace.identity import UserContext  # noqa: E402
+from audittrace.services.console_acl import _audit  # noqa: E402
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -1107,3 +1126,671 @@ class TestAfterFix:
             )
             == 1
         )
+
+
+# ═════════════════ ACL 2b-core-B — the sovereign audit writer ═════════════
+# REAL-Postgres proof for services/console_acl/_audit.py's guards that need
+# actual RLS/CHECK/trigger enforcement (the aiosqlite param lives in
+# tests/test_console_acl_audit_writer.py). §9: "N1-N4 assert on the ORM
+# interactions table (aiosqlite param AND real PG)"; N5/N6 are Postgres-only
+# by nature; N8's forged-identity note needs both sides to make its point.
+# §2 exception: additions only — everything above this section is untouched
+# (git diff on removed lines above this point is 0).
+#
+# Identity here is bound via ``set_current_user_id`` (the ContextVar +
+# ``after_begin`` listener — the REAL production path) rather than the
+# WU-2a helpers' hand-set ``SELECT set_config(...)`` per session — §5.4's
+# explicit instruction: "N3 runs with set_current_user_id() set, not a
+# hand-set GUC."
+#
+# A SEPARATE schema builder (``_build_interactions_schema``): the WU-2a
+# builder above only creates console_agents/console_prompt_groups +
+# console_acl_entries (031/032). This WU's subject is ``interactions``
+# (migrations 002, 003, 004, 005, 007, 008, 012, 015, 016, 017 — §8's exact
+# list) plus console_acl_entries (031 only — N3's abort scenario does not
+# need 032's ownership tightening). ``sessions``/``memory_items`` are
+# minimal STUB tables: migrations 003 and 012 each ALTER a table this WU
+# does not otherwise care about (003 adds ``sessions.user_id``; 012 adds
+# ``memory_items.scan_status``) — running the REAL migration file (never
+# hand-retyping its DDL, per §8's closing instruction) requires the
+# ALTER's target table to exist first. The stub's own shape plays no role
+# in any guard exercised here.
+#
+# Per-guard neuter table (PG side only — aiosqlite side is the sibling
+# file's own table):
+#
+# | guard | PG test |
+# |---|---|
+# | N1 | ``TestAuditWriterRealPostgres::test_n1_...`` |
+# | N2 | ``TestAuditWriterRealPostgres::test_n2_...`` |
+# | N3 | ``TestAuditWriterRealPostgres::test_n3_...`` |
+# | N4 | ``TestAuditWriterRealPostgres::test_n4_...`` |
+# | N5 | ``TestAppendOnlyTriggerNeuter`` |
+# | N6 | ``TestCrossSubjectAuditReadIsImpossible`` (exactly one test) |
+# | N8 | ``TestForgedUserIdRefusedOnPostgres`` |
+
+_INTERACTIONS_MIGRATION_FILES: tuple[str, ...] = (
+    "002_create_interactions_table.py",
+    "003_multi_user_identity.py",
+    "004_drop_local_users_for_keycloak.py",
+    "005_enable_rls_policies.py",
+    "007_add_interaction_failure_columns.py",
+    "008_add_interactions_trace_id.py",
+    "012_add_event_class_and_scan_status.py",
+    "015_add_interactions_created_at.py",
+    "016_append_only_audit_rows.py",
+    "017_add_interactions_content_hash.py",
+)
+
+
+def _build_interactions_schema() -> str:
+    """Fresh throwaway schema holding ``interactions``/``tool_calls``
+    (built by running the REAL migration files listed in §8, in the
+    exact order Alembic itself would apply them) plus
+    ``console_acl_entries`` (migration 031, for N3's abort scenario) —
+    connected AS THE APP ROLE, same NOBYPASSRLS discipline as
+    :func:`_build_schema`. Returns the schema name; the caller owns
+    dropping it."""
+    assert _ADMIN_URL is not None
+    admin = create_engine(_ADMIN_URL, pool_pre_ping=True)
+    name = f"acl_2b_core_b_{datetime.now().strftime('%H%M%S_%f')}"
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{_APP_ROLE}') THEN
+                        CREATE ROLE {_APP_ROLE} LOGIN PASSWORD '{_APP_PASSWORD}'
+                            NOSUPERUSER NOBYPASSRLS;
+                    END IF;
+                END$$
+                """
+            )
+        )
+        conn.execute(text(f'CREATE SCHEMA "{name}"'))
+        conn.execute(text(f'GRANT USAGE ON SCHEMA "{name}" TO {_APP_ROLE}'))
+        conn.execute(text(f'SET search_path TO "{name}"'))
+        # Minimal stub targets for 003's / 012's ALTER — see the section
+        # docstring above for why these are stubs, not the real ORM shape.
+        conn.execute(text("CREATE TABLE sessions (id VARCHAR(36) PRIMARY KEY)"))
+        conn.execute(text("CREATE TABLE memory_items (id VARCHAR(36) PRIMARY KEY)"))
+        for filename in _INTERACTIONS_MIGRATION_FILES:
+            _run_migration_upgrade(conn, filename)
+        _run_migration_upgrade(conn, "031_create_console_acl_entries.py")
+        for table_name in ("interactions", "tool_calls", "console_acl_entries"):
+            conn.execute(
+                text(
+                    f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{name}".{table_name} '
+                    f"TO {_APP_ROLE}"
+                )
+            )
+        # `interactions.id`/`tool_calls` PKs are sequence-backed
+        # (Integer autoincrement) — INSERT needs USAGE on the sequence
+        # too, not just the table grant above.
+        conn.execute(
+            text(f'GRANT USAGE ON ALL SEQUENCES IN SCHEMA "{name}" TO {_APP_ROLE}')
+        )
+    admin.dispose()
+    return name
+
+
+@dataclass
+class _InteractionsHarness:
+    """The schema name (needed by N5's admin-level DROP/CREATE TRIGGER —
+    the app role does not own the table) plus the app-role session
+    factory."""
+
+    schema: str
+    factory: Any
+
+
+@pytest_asyncio.fixture
+async def interactions_harness() -> Any:
+    """Async session factory, connected AS THE APP ROLE, scoped to a
+    throwaway schema holding the REAL interactions/tool_calls/
+    console_acl_entries schema (§8's exact migration list)."""
+    schema = _build_interactions_schema()
+    factory = _app_session_factory(schema)
+    install_rls_listener()
+    try:
+        yield _InteractionsHarness(schema=schema, factory=factory)
+    finally:
+        await factory.kw["bind"].dispose()
+        _drop_schema(schema)
+
+
+class _StaticPostgresFactory(PostgresFactory):
+    """Minimal concrete :class:`PostgresFactory` wrapping an already-built
+    ``async_sessionmaker`` — wires ``_audit.record_denial``'s internal
+    ``get_postgres_factory()`` call to THIS test's throwaway schema,
+    exactly the way production DI wires it to the real one."""
+
+    def __init__(self, session_factory: Any) -> None:
+        self._session_factory = session_factory
+
+    def get_engine(self) -> Any:
+        raise NotImplementedError("not exercised by _audit.record_denial")
+
+    def get_session_factory(self) -> Any:
+        return self._session_factory
+
+
+@contextlib.contextmanager
+def _wired_postgres_factory(factory: Any) -> Any:
+    """Wire ``get_postgres_factory()`` to ``factory`` for the duration of
+    the block. ``conftest.py``'s autouse ``_reset_global_container``
+    fixture clears the container before the NEXT test regardless; this
+    also restores whatever was registered before, for tests that run
+    other DI-dependent code in the same body."""
+    previous = dependencies.container._instances.get("postgres_factory")
+    dependencies.container._instances["postgres_factory"] = _StaticPostgresFactory(
+        factory
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            dependencies.container._instances.pop("postgres_factory", None)
+        else:
+            dependencies.container._instances["postgres_factory"] = previous
+
+
+def _new_user_context(sub: str) -> UserContext:
+    return UserContext(user_id=sub, username=sub, agent_type="test", scopes=())
+
+
+class TestAuditWriterRealPostgres:
+    """N1/N2/N3/N4 — the REAL-Postgres half of ``services/console_acl/
+    _audit.py``'s guards (aiosqlite half: ``tests/
+    test_console_acl_audit_writer.py``)."""
+
+    async def test_n1_successful_write_produces_a_full_payload_row(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            async with factory() as db:
+                row = await _audit.record(
+                    db,
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="principal-1",
+                    resource_type="agent",
+                    resource_id="agent-pg-1",
+                    perm_bits=3,
+                    acl_entry_ids=["acl-pg-1"],
+                )
+                await db.commit()
+                row_id = row.id
+
+            async with factory() as fresh:
+                stored = (
+                    (
+                        await fresh.execute(
+                            text(
+                                "SELECT user_id, event_class, status, failure_class, "
+                                "answer, content_hash FROM interactions WHERE id = :id"
+                            ),
+                            {"id": row_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+        finally:
+            set_current_user_id(None)
+
+        assert stored["user_id"] == _OWNER
+        assert stored["event_class"] == _audit.EVENT_CLASS_ACL_AUTHZ
+        assert stored["status"] == "success"
+        assert stored["failure_class"] is None
+        answer = json.loads(stored["answer"])
+        assert answer["granted_by"] == _OWNER
+        assert answer["acl_entry_ids"] == ["acl-pg-1"]
+        assert stored["content_hash"] is not None
+
+    async def test_n2_denied_write_produces_a_failed_row(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            with _wired_postgres_factory(factory):
+                row = await _audit.record_denial(
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-pg-denied",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={"resource_id": "agent-pg-denied"},
+                    db_error_class="IntegrityError",
+                )
+
+            async with factory() as fresh:
+                stored = (
+                    (
+                        await fresh.execute(
+                            text(
+                                "SELECT status, failure_class, answer, error_detail "
+                                "FROM interactions WHERE id = :id"
+                            ),
+                            {"id": row.id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+        finally:
+            set_current_user_id(None)
+
+        assert stored["status"] == "failed"
+        assert stored["failure_class"] == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
+        assert stored["answer"] == "{}"
+        detail = json.loads(stored["error_detail"])
+        assert detail["predicate_or_attempted_row"] == {
+            "resource_id": "agent-pg-denied"
+        }
+
+    async def test_n3_denial_row_survives_an_rls_aborted_transaction(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        """N3, PG half — the ``031:97-100`` CHECK is proven on aiosqlite
+        already; here the abort is a REAL RLS ``WITH CHECK`` refusal
+        (owner-only INSERT guard, migration 031) — "RLS on PG"."""
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            with pytest.raises(DBAPIError, match="row-level security"):
+                async with factory() as db:
+                    await db.execute(
+                        text(
+                            "INSERT INTO console_acl_entries "
+                            "(id, user_sub, principal_type, principal_id, "
+                            "principal_model, resource_type, resource_id, "
+                            "perm_bits, granted_at_ms, created_at_ms, updated_at_ms) "
+                            "VALUES (:id, :user_sub, 'user', :pid, 'User', "
+                            "'agent', :rid, 1, 0, 0, 0)"
+                        ),
+                        {
+                            "id": str(uuid.uuid4()),
+                            # Mismatched vs. the bound identity (_OWNER) —
+                            # migration 031's WITH CHECK (user_sub =
+                            # current_setting(...)) refuses this INSERT.
+                            "user_sub": _ATTACKER,
+                            "pid": _VIEWER,
+                            "rid": "agent-rls-abort",
+                        },
+                    )
+                    await db.commit()
+
+            with _wired_postgres_factory(factory):
+                denial = await _audit.record_denial(
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id=_VIEWER,
+                    resource_type="agent",
+                    resource_id="agent-rls-abort",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={"resource_id": "agent-rls-abort"},
+                    db_error_class="row-level security",
+                )
+
+            async with factory() as fresh:
+                acl_count = (
+                    await fresh.execute(
+                        text(
+                            "SELECT count(*) FROM console_acl_entries "
+                            "WHERE resource_id = 'agent-rls-abort'"
+                        )
+                    )
+                ).scalar_one()
+                assert acl_count == 0, "the RLS-refused ACL insert must not have landed"
+                denial_count = (
+                    await fresh.execute(
+                        text("SELECT count(*) FROM interactions WHERE id = :id"),
+                        {"id": denial.id},
+                    )
+                ).scalar_one()
+                assert denial_count == 1, "the denial row must survive the RLS abort"
+        finally:
+            set_current_user_id(None)
+
+    async def test_n4_writer_raises_on_a_broken_audit_write(
+        self,
+        interactions_harness: _InteractionsHarness,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """N4, PG half — the writer's own half (see the module docstring
+        for the caller-half forward obligation)."""
+
+        def _raise(*_args: object, **_kwargs: object) -> str:
+            raise RuntimeError("content_hash broken for this test")
+
+        monkeypatch.setattr(_audit, "_content_hash", _raise)
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            with pytest.raises(RuntimeError, match="content_hash broken"):
+                async with factory() as db:
+                    await _audit.record(
+                        db,
+                        user_context=owner,
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id="p1",
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        perm_bits=1,
+                        acl_entry_ids=["acl-1"],
+                    )
+            with _wired_postgres_factory(factory):
+                with pytest.raises(RuntimeError, match="content_hash broken"):
+                    await _audit.record_denial(
+                        user_context=owner,
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id="p1",
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        perm_bits=1,
+                        failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                        predicate_or_attempted_row={},
+                    )
+        finally:
+            set_current_user_id(None)
+
+    async def test_n4_no_ambient_identity_gets_with_check_refusal_which_propagates(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        """§5.4's exact scenario: a writer opening its own session with NO
+        GUC bound (the ContextVar is ``None`` — no ``require_user`` ran)
+        gets a ``WITH CHECK`` refusal from migration 005's RLS policy on
+        ``interactions`` itself, and that refusal propagates — fail
+        closed, never a silent downgrade. ``set_current_user_id`` is
+        deliberately NEVER called in this test."""
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        assert set_current_user_id.__module__ == "audittrace.db.rls"  # sanity
+        with _wired_postgres_factory(factory):
+            with pytest.raises(DBAPIError, match="row-level security"):
+                await _audit.record_denial(
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-no-guc",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={},
+                )
+
+
+class TestAppendOnlyTriggerNeuter:
+    """N5 — migration 016's append-only trigger, proven BEHAVIOURALLY as
+    the NOBYPASSRLS role (the only existing test,
+    ``test_migration_append_only.py:41-44``, is a DDL text pin — barred
+    as a RED target by §9), then neutered by ``DROP TRIGGER`` to show the
+    mutation succeeds, then restored via the single ``CREATE TRIGGER``
+    statement (re-running ``upgrade()`` alone FAILS — 016 creates TWO
+    triggers and only one is dropped here). ``pg_trigger`` is compared to
+    the pre-drop capture — the ``cmp``-verified restore §9 requires."""
+
+    async def test_trigger_blocks_update_and_delete_as_nobypassrls(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            async with factory() as db:
+                row = await _audit.record(
+                    db,
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-trigger",
+                    perm_bits=1,
+                    acl_entry_ids=["a1"],
+                )
+                await db.commit()
+                row_id = row.id
+
+            with pytest.raises(DBAPIError, match="append-only"):
+                async with factory() as db:
+                    await db.execute(
+                        text(
+                            "UPDATE interactions SET answer = 'tampered' WHERE id = :id"
+                        ),
+                        {"id": row_id},
+                    )
+                    await db.commit()
+
+            with pytest.raises(DBAPIError, match="append-only"):
+                async with factory() as db:
+                    await db.execute(
+                        text("DELETE FROM interactions WHERE id = :id"), {"id": row_id}
+                    )
+                    await db.commit()
+        finally:
+            set_current_user_id(None)
+
+    async def test_neutering_the_trigger_lets_the_mutation_succeed_then_restore(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        schema = interactions_harness.schema
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+
+        set_current_user_id(owner.user_id)
+        try:
+            async with factory() as db:
+                row = await _audit.record(
+                    db,
+                    user_context=owner,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-trigger-neuter",
+                    perm_bits=1,
+                    acl_entry_ids=["a1"],
+                )
+                await db.commit()
+                row_id = row.id
+        finally:
+            set_current_user_id(None)
+
+        admin = create_engine(_ADMIN_URL, pool_pre_ping=True)
+        try:
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{schema}"'))
+                before = sorted(
+                    conn.execute(
+                        text(
+                            "SELECT tgname FROM pg_trigger WHERE "
+                            "tgrelid = 'interactions'::regclass AND NOT tgisinternal"
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            assert "interactions_append_only" in before
+
+            # NEUTER — drop only the interactions trigger (016 creates a
+            # SECOND one on tool_calls, untouched here).
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{schema}"'))
+                conn.execute(
+                    text("DROP TRIGGER interactions_append_only ON interactions")
+                )
+
+            set_current_user_id(owner.user_id)
+            try:
+                async with factory() as db:
+                    await db.execute(
+                        text(
+                            "UPDATE interactions SET answer = 'tampered-while-neutered' "
+                            "WHERE id = :id"
+                        ),
+                        {"id": row_id},
+                    )
+                    await db.commit()  # succeeds — the guard is gone
+            finally:
+                set_current_user_id(None)
+
+            # RESTORE — the single CREATE TRIGGER statement (NOT
+            # upgrade(), which would try to recreate BOTH triggers and
+            # fail on the still-present tool_calls one).
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{schema}"'))
+                conn.execute(
+                    text(
+                        "CREATE TRIGGER interactions_append_only "
+                        "BEFORE UPDATE OR DELETE ON interactions "
+                        "FOR EACH ROW EXECUTE FUNCTION audittrace_append_only()"
+                    )
+                )
+                after = sorted(
+                    conn.execute(
+                        text(
+                            "SELECT tgname FROM pg_trigger WHERE "
+                            "tgrelid = 'interactions'::regclass AND NOT tgisinternal"
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            assert after == before, (
+                "cmp-verified restore — pg_trigger must match exactly"
+            )
+        finally:
+            admin.dispose()
+
+        # The guard is re-enforced after restore.
+        set_current_user_id(owner.user_id)
+        try:
+            with pytest.raises(DBAPIError, match="append-only"):
+                async with factory() as db:
+                    await db.execute(
+                        text(
+                            "UPDATE interactions SET answer = 'should-fail-again' "
+                            "WHERE id = :id"
+                        ),
+                        {"id": row_id},
+                    )
+                    await db.commit()
+        finally:
+            set_current_user_id(None)
+
+
+class TestCrossSubjectAuditReadIsImpossible:
+    """§10.1 — PINS the limitation, never "proves" it as a control: a
+    denial row stamped with subject A's ``user_id`` is invisible to
+    subject B (INCLUDING an auditor) because per-subject RLS on
+    ``interactions`` is the only boundary and there is no BYPASSRLS
+    administrative plane (§10.2). Exactly ONE test, named so it can
+    never be misread as a passing security check — "0 rows visible"
+    here means "an auditor using the ordinary scope literally cannot
+    reconstruct subject A's ACL denial", not "isolation works"."""
+
+    async def test_this_pins_a_limitation_subject_b_sees_zero_of_subject_as_denial_rows(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        subject_a = _new_user_context(_OWNER)
+
+        set_current_user_id(subject_a.user_id)
+        try:
+            with _wired_postgres_factory(factory):
+                denial = await _audit.record_denial(
+                    user_context=subject_a,
+                    op="grantPermission",
+                    principal_type="user",
+                    principal_id="p1",
+                    resource_type="agent",
+                    resource_id="agent-subject-a",
+                    perm_bits=1,
+                    failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={"resource_id": "agent-subject-a"},
+                )
+        finally:
+            set_current_user_id(None)
+
+        # Subject A sees their own row.
+        set_current_user_id(subject_a.user_id)
+        try:
+            async with factory() as db:
+                own_count = (
+                    await db.execute(
+                        text("SELECT count(*) FROM interactions WHERE id = :id"),
+                        {"id": denial.id},
+                    )
+                ).scalar_one()
+        finally:
+            set_current_user_id(None)
+        assert own_count == 1
+
+        # Subject B — an ordinary audittrace:audit-scoped subject, no
+        # different from an auditor — sees ZERO of it. Not a control
+        # being verified: a limitation being pinned (§10.1's exact
+        # sentence belongs in the build record / PR body verbatim).
+        set_current_user_id(_ATTACKER)
+        try:
+            async with factory() as db:
+                other_count = (
+                    await db.execute(
+                        text("SELECT count(*) FROM interactions WHERE id = :id"),
+                        {"id": denial.id},
+                    )
+                ).scalar_one()
+        finally:
+            set_current_user_id(None)
+        assert other_count == 0
+
+
+class TestForgedUserIdRefusedOnPostgres:
+    """N8's Postgres half — the aiosqlite counterpart in ``tests/
+    test_console_acl_audit_writer.py`` shows the SAME raw INSERT,
+    bypassing the writer entirely, succeeds silently with no RLS. Here,
+    migration 005's RLS ``WITH CHECK`` on ``interactions`` refuses it —
+    the structural rule (no parameter on the writer's own API) is what
+    protects the aiosqlite path; RLS is what protects this one."""
+
+    async def test_a_forged_user_id_bypassing_the_writer_is_refused_by_rls(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        factory = interactions_harness.factory
+        set_current_user_id(_OWNER)
+        try:
+            with pytest.raises(DBAPIError, match="row-level security"):
+                async with factory() as db:
+                    await db.execute(
+                        text(
+                            "INSERT INTO interactions "
+                            "(project, source, question, answer, prompt_tokens, "
+                            "completion_tokens, timestamp, user_id, status, "
+                            "event_class) "
+                            "VALUES ('console-acl', 'console-acl', 'forged', '{}', "
+                            "0, 0, '2026-09-25T00:00:00+00:00', :forged_user_id, "
+                            "'success', 'acl_authz')"
+                        ),
+                        {"forged_user_id": _ATTACKER},
+                    )
+                    await db.commit()
+        finally:
+            set_current_user_id(None)

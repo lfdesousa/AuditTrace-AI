@@ -62,8 +62,14 @@ _SCAN_STATUS_CODES: frozenset[str] = frozenset(
 # delete emits a first-class audit row so "reading the recorder is
 # recorded" extends to the recorder's own knowledge base, not just chat
 # completions. Written by ``services/memory_audit.py``.
+# "acl_authz" — Sovereign Authorization Layer EPIC, ACL 2b-core-B: every
+# sovereign ACL write attempt (successful or denied) emits a first-class
+# audit row via ``services/console_acl/_audit.py``. Registered at FOUR
+# sites (this frozenset, routes/memory.py's re-export, routes/audit.py's
+# Query description, db/models.py's column docstring) — registering in
+# only one of the four was ACL WU-1's F1 defect in new clothes.
 _EVENT_CLASS_VALUES: frozenset[str] = frozenset(
-    {"interaction", "security", "assessment", "memory_access"}
+    {"interaction", "security", "assessment", "memory_access", "acl_authz"}
 )
 
 __all__ = ["_SCAN_STATUS_CODES", "_EVENT_CLASS_VALUES"]

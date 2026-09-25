@@ -124,10 +124,14 @@ async def list_interactions(
         None,
         description=(
             "Filter by event_class: 'interaction' | 'security' | 'assessment' "
-            "| 'memory_access' (ADR-048 / ADR-058 / ADR-062 §5). Pull a whole "
-            "recorded self-assessment with event_class=assessment & "
+            "| 'memory_access' | 'acl_authz' (ADR-048 / ADR-058 / ADR-062 §5 / "
+            "the Sovereign Authorization Layer EPIC). Pull a whole recorded "
+            "self-assessment with event_class=assessment & "
             "session_id=<assessment_id>; pull every /memory/* access with "
-            "event_class=memory_access."
+            "event_class=memory_access; pull every sovereign ACL write "
+            "attempt (granted or denied) with event_class=acl_authz. NOTE: "
+            "there is no trace_id filter — match trace_id in the returned "
+            "body instead."
         ),
     ),
     limit: int = Query(100, ge=1, le=1000, description="Max rows (1-1000)."),

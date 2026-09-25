@@ -117,6 +117,16 @@ from audittrace.services.write_telemetry import emit_chunks_indexed, emit_memory
 _PDF_WARNING_CODES = _pdf._PDF_WARNING_CODES
 _SIGNATURE_STATUS_CODES = _pdf._SIGNATURE_STATUS_CODES
 _SCAN_STATUS_CODES = _scan._SCAN_STATUS_CODES
+# Re-export, not a copy — a live reference to the SAME frozenset object
+# memory_scan.py owns. `TestEventClassValues` (tests/test_memory_routes.py)
+# imports `_EVENT_CLASS_VALUES` from HERE, so this is the site that must
+# actually see any new value (registering canonically in memory_scan.py
+# alone, without this re-export resolving to the SAME object, was ACL
+# WU-1's F1 defect in new clothes). Because this binds the object itself
+# rather than duplicating its members, `acl_authz` (Sovereign
+# Authorization Layer EPIC, ACL 2b-core-B) is visible here automatically
+# the moment memory_scan.py's frozenset includes it — no separate edit
+# needed at this line, and the pinning test is what proves it.
 _EVENT_CLASS_VALUES = _scan._EVENT_CLASS_VALUES
 _PDFA_PART_RE = _pdf._PDFA_PART_RE
 _PDFA_CONFORMANCE_RE = _pdf._PDFA_CONFORMANCE_RE
