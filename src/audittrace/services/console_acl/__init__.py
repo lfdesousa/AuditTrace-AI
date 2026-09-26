@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 from audittrace.identity import UserContext
@@ -134,6 +135,25 @@ OWNER_PERMISSION_BITS = MAX_PERM_BITS
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+@dataclass(frozen=True)
+class AclGrantOp:
+    """One ``bulk_write_acl_entries`` op — exactly :func:`grant_permission`'s
+    keyword fields (ACL 2b-core-A1 spec §3), frozen so a caller cannot
+    mutate an op mid-batch. Mirrors the ONLY op shape the fork's callers
+    build (``PermissionService.js:849-856``'s ``updateOne{filter,
+    update:{$set:{...}}, upsert:true}``) — ``$setOnInsert`` is
+    deliberately NOT a second op mode (spec §3's disclosed limitation)."""
+
+    principal_type: str
+    principal_id: str | None
+    resource_type: str
+    resource_id: str
+    perm_bits: int
+    role_id: str | None = None
+    expired_at_ms: int | None = None
+    tenant_id: str | None = None
 
 
 def _caller_principals(user_context: UserContext) -> list[tuple[str, str | None]]:
@@ -274,6 +294,97 @@ class ConsoleAclEntriesService(ABC):
         """The ``aggregateAclEntries`` SITE-1 fold — see
         ``_postgres.py``'s implementation docstring for the full
         rationale (the one documented exact-equality exception)."""
+
+    # ── ACL 2b-core-A — the write path. All FIVE declared here together
+    # so the interface is fixed once (2b-core-A1 spec §1): A1 implements
+    # grant_permission/bulk_write_acl_entries; the other three raise
+    # NotImplementedError on BOTH implementations until 2b-core-A2 — a
+    # disclosed, real gap (zero production callers of any of the five
+    # exist in src/ today; no route reaches them until 2c). Every
+    # signature takes user_context FIRST, like every read method above,
+    # and carries NO granted_by/user_sub/granted_at/session/trace_id
+    # parameter — those are always server-derived (S-2, spec §3).
+
+    @abstractmethod
+    async def grant_permission(
+        self,
+        user_context: UserContext,
+        *,
+        principal_type: str,
+        principal_id: str | None,
+        resource_type: str,
+        resource_id: str,
+        perm_bits: int,
+        role_id: str | None = None,
+        expired_at_ms: int | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """O-6 expire-and-insert (spec §5.1): expire any active row at
+        the SAME key, then insert a new row. Returns the NEW row."""
+
+    @abstractmethod
+    async def revoke_permission(
+        self,
+        user_context: UserContext,
+        *,
+        principal_type: str,
+        principal_id: str | None,
+        resource_type: str,
+        resource_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Expire the active row(s) at the given key (spec §5.5 —
+        expire-by-predicate, never a hard delete). Returns
+        ``{"expired_ids": [...], "visible_matched_count": n}``. **2b-
+        core-A1 ships this as ``NotImplementedError`` on both
+        implementations — 2b-core-A2 builds it** (spec §1 scope split,
+        ADDENDUM U-6)."""
+
+    @abstractmethod
+    async def modify_permission_bits(
+        self,
+        user_context: UserContext,
+        *,
+        principal_type: str,
+        principal_id: str | None,
+        resource_type: str,
+        resource_id: str,
+        add_bits: int | None = None,
+        remove_bits: int | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """O-6 expire-and-insert with the bits recomputed (spec §9 #7 —
+        never an in-place ``UPDATE ... SET perm_bits``). Returns the NEW
+        row, or ``None`` when no active row matched. **2b-core-A1 ships
+        this as ``NotImplementedError`` on both implementations — 2b-
+        core-A2 builds it** (ADDENDUM U-6)."""
+
+    @abstractmethod
+    async def bulk_write_acl_entries(
+        self,
+        user_context: UserContext,
+        ops: list[AclGrantOp],
+    ) -> dict[str, Any]:
+        """O-4 — ALL-OR-NOTHING, one transaction, no savepoint (spec
+        §5.4): any op refused rolls back every op in the batch,
+        including already-staged success audit rows. Returns
+        ``{"acl_entry_ids": [...], "expired_ids": [...]}`` across every
+        op."""
+
+    @abstractmethod
+    async def delete_acl_entries(
+        self,
+        user_context: UserContext,
+        predicates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Expire-by-predicate, CALLER-SCOPED (spec §5.5 / A-FWD-1): an
+        unowned row is silently omitted from the UPDATE under migration
+        032's owner-only ``USING``, never refused. Returns
+        ``{"expired_ids": [...], "visible_matched_count": n}``. An
+        unknown predicate key, an empty list, or an empty dict raises
+        ``ValueError`` before any I/O. **2b-core-A1 ships this as
+        ``NotImplementedError`` on both implementations — 2b-core-A2
+        builds it** (ADDENDUM U-6)."""
 
 
 from audittrace.services.console_acl._mock import (  # noqa: E402

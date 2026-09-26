@@ -336,3 +336,168 @@ class TestLiveSchemaGuards:
                 )
             )
             await session.commit()
+
+
+# ── Migration 033 (ACL 2b-core-A1) — O-3 unique-active-grant index +
+# Q-4 no-delete trigger ───────────────────────────────────────────────────
+
+_MIGRATION_033 = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "audittrace"
+    / "migrations"
+    / "versions"
+    / "033_acl_active_grant_unique_and_no_delete.py"
+)
+
+
+def _text_033() -> str:
+    return _MIGRATION_033.read_text(encoding="utf-8")
+
+
+class TestMigration033File:
+    def test_migration_exists(self) -> None:
+        assert _MIGRATION_033.is_file()
+
+    def test_single_alembic_head(self) -> None:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        repo_root = Path(__file__).resolve().parent.parent
+        cfg = Config(str(repo_root / "alembic.ini"))
+        cfg.set_main_option(
+            "script_location", str(repo_root / "src" / "audittrace" / "migrations")
+        )
+        script = ScriptDirectory.from_config(cfg)
+        heads = script.get_heads()
+        assert len(heads) == 1, f"expected a single alembic head, got {heads!r}"
+
+    def test_chains_onto_migration_032(self) -> None:
+        assert 'down_revision: str | Sequence[str] | None = "742a8b743c94"' in (
+            _text_033()
+        )
+
+    def test_postgres_guarded_for_the_trigger_half(self) -> None:
+        assert "_is_postgres" in _text_033()
+
+    def test_o3_active_grant_index_present(self) -> None:
+        text = _text_033()
+        assert "uq_console_acl_entries_active_grant" in text
+        assert "expired_at_ms IS NULL" in text
+        assert "postgresql_nulls_not_distinct=True" in text
+        for column in (
+            "principal_type",
+            "principal_id",
+            "resource_type",
+            "resource_id",
+            "tenant_id",
+        ):
+            assert f'"{column}"' in text
+
+    def test_q4_no_delete_trigger_reuses_016s_function(self) -> None:
+        text = _text_033()
+        assert '_NO_DELETE_TRIGGER = "console_acl_entries_no_delete"' in text
+        assert "BEFORE DELETE ON {_TABLE}" in text
+        assert '_APPEND_ONLY_FUNCTION = "audittrace_append_only"' in text
+        # Never re-defines the function (016 owns it) — no CREATE
+        # FUNCTION / CREATE OR REPLACE FUNCTION statement here.
+        assert "CREATE OR REPLACE FUNCTION" not in text
+        assert "CREATE FUNCTION" not in text
+
+    def test_downgrade_never_drops_016s_function(self) -> None:
+        text = _text_033()
+        downgrade_body = text.split("def downgrade()")[1]
+        assert "DROP FUNCTION" not in downgrade_body
+
+    def test_downgrade_drops_trigger_and_index(self) -> None:
+        text = _text_033()
+        downgrade_body = text.split("def downgrade()")[1]
+        assert "DROP TRIGGER IF EXISTS {_NO_DELETE_TRIGGER}" in downgrade_body
+        assert "drop_index" in downgrade_body
+
+
+# ── Live (SQLite-enforced) O-3 guard — the aiosqlite-provable half ───────
+
+
+@pytest_asyncio.fixture
+async def pg_factory_033():
+    factory = InMemoryPostgresFactory()
+    await factory.create_schema()
+    return factory
+
+
+def _acl_row(**overrides):
+    row = {
+        "id": "row-033-1",
+        "user_sub": "owner-033",
+        "principal_type": "user",
+        "principal_id": "principal-033",
+        "principal_model": "User",
+        "resource_type": "agent",
+        "resource_id": "res-033",
+        "perm_bits": 1,
+        "granted_at_ms": 0,
+        "created_at_ms": 0,
+        "updated_at_ms": 0,
+        "expired_at_ms": None,
+        "tenant_id": "tenant-033",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestMigration033LiveSchemaGuard:
+    """O-3's index exists on aiosqlite (``Base.metadata.create_all`` via
+    ``InMemoryPostgresFactory``, not the migration file) — proven with a
+    NON-NULL ``tenant_id`` (SQLite's default NULLS DISTINCT semantics
+    don't apply there, so this IS a real, falsifiable proof). The
+    NULL-``tenant_id`` case is DISCLOSED as unproven on aiosqlite (033's
+    own docstring, spec §4) — asserted here as a NON-collision, not
+    silently skipped."""
+
+    async def test_duplicate_active_grant_with_a_tenant_id_is_refused(
+        self, pg_factory_033
+    ) -> None:
+        session_factory = pg_factory_033.get_session_factory()
+        async with session_factory() as session:
+            session.add(ConsoleAclEntry(**_acl_row(id="d1")))
+            await session.commit()
+        async with session_factory() as session:
+            session.add(ConsoleAclEntry(**_acl_row(id="d2")))
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+    async def test_expired_row_does_not_collide_with_a_new_active_one(
+        self, pg_factory_033
+    ) -> None:
+        session_factory = pg_factory_033.get_session_factory()
+        async with session_factory() as session:
+            session.add(ConsoleAclEntry(**_acl_row(id="e1", expired_at_ms=123)))
+            await session.commit()
+        async with session_factory() as session:
+            session.add(ConsoleAclEntry(**_acl_row(id="e2")))
+            await session.commit()
+
+    async def test_null_tenant_id_does_not_collide_on_aiosqlite(
+        self, pg_factory_033
+    ) -> None:
+        """DISCLOSED — spec §4: "the O-3 constraint is unproven on the
+        aiosqlite path (NULLS DISTINCT)". This test pins that FACT (two
+        active rows with ``tenant_id IS NULL`` do NOT collide here),
+        never claims it as the real guard — the real guard is
+        Postgres-only (``tests/test_acl_write_path_rls.py``, neuter #9a)."""
+        session_factory = pg_factory_033.get_session_factory()
+        async with session_factory() as session:
+            session.add(
+                ConsoleAclEntry(
+                    **_acl_row(id="n1", resource_id="res-null-tenant", tenant_id=None)
+                )
+            )
+            await session.commit()
+        async with session_factory() as session:
+            session.add(
+                ConsoleAclEntry(
+                    **_acl_row(id="n2", resource_id="res-null-tenant", tenant_id=None)
+                )
+            )
+            await session.commit()  # succeeds on SQLite — the disclosed gap

@@ -90,7 +90,10 @@ def _mock_rls_visible(row: _MockAclEntry, user_context: UserContext) -> bool:
     return row.principal_type == PRINCIPAL_TYPE_PUBLIC
 
 
-class MockConsoleAclEntriesService(ConsoleAclEntriesService):
+from audittrace.services.console_acl._mock_write import _MockAclWrites  # noqa: E402
+
+
+class MockConsoleAclEntriesService(_MockAclWrites, ConsoleAclEntriesService):
     """In-process mock for unit tests that don't wire a Postgres
     factory. Test setup inserts rows directly via :meth:`seed_entry` —
     there is no upsert method (WU-1 is read-only)."""

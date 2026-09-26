@@ -25,6 +25,7 @@ from audittrace.services.console_acl import (
     _caller_principals,
     _now_ms,
 )
+from audittrace.services.console_acl._postgres_write import _PostgresAclWrites
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ def _rls_mirror_clause(user_context: UserContext) -> Any:
     )
 
 
-class PostgresConsoleAclEntriesService(ConsoleAclEntriesService):
+class PostgresConsoleAclEntriesService(_PostgresAclWrites, ConsoleAclEntriesService):
     """PostgreSQL-backed console-ACL service (WU-1, read path only)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):

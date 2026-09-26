@@ -1252,11 +1252,17 @@ class ConsoleAclEntry(Base):
     ratified spec). ``ix_console_acl_entries_expired_at`` keeps the
     expiry filter cheap as the table grows.
 
-    **No soft-delete.** The live Mongo schema has no soft-delete field
-    either — ``deleteAclEntries`` is a real ``deleteMany``. WU-1/WU-2
-    mirror that: revocation (WU-2) is a HARD delete; the audit row (a
-    SEPARATE mechanism, not a tombstone column here) is what preserves
-    history (invariant 8).
+    **No soft-delete column — but NOT a hard delete either (superseded
+    by ADDENDUM I ruling 2 / ACL 2b-core-A migration 033).** The live
+    Mongo schema has no soft-delete field and ``deleteAclEntries`` is a
+    real ``deleteMany`` there; the sovereign store deliberately does
+    NOT mirror that. ``revoke_permission``/``delete_acl_entries`` (2b-
+    core-A2) EXPIRE the row (``expired_at_ms`` set, Q-4) and RETAIN it —
+    the row IS the audit trail (ruling 2), not a separate tombstone.
+    Migration 033 additionally makes a real ``DELETE`` against this
+    table impossible on Postgres (a ``BEFORE DELETE`` trigger reusing
+    016's ``audittrace_append_only()``), so "hard delete" is not just
+    unused by application code, it is refused at the database.
 
     **RLS is NOT "owner-only"** (unlike every other console-* domain in
     this module) — ACL rows exist precisely to let ANOTHER principal see
@@ -1307,9 +1313,12 @@ class ConsoleAclEntry(Base):
     # Sparse — flagged by WU-0 as "confirm dead-or-live"; carried
     # forward unused pending that confirmation, never dropped silently.
     inherited_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    # The acting principal's sub at grant time (may differ from
-    # user_sub, e.g. an admin granting on another user's behalf) — WU-2
-    # stamps this from the token, never from the request body.
+    # The acting principal's sub at grant time — ALWAYS equal to
+    # user_sub (2b-core-A never models "grant on another user's
+    # behalf"; S-2/§3.2 — token-derived, never a request-body
+    # parameter). Carried as its own column rather than reusing
+    # user_sub because the audit-trail precedent
+    # (services/console_acl/_audit.py) names both independently.
     granted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     granted_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # NULL = never expires. Filtered on every authorization-decision
@@ -1384,5 +1393,21 @@ class ConsoleAclEntry(Base):
         Index(
             "ix_console_acl_entries_expired_at",
             "expired_at_ms",
+        ),
+        # O-3 (ACL 2b-core-A1, migration 033) — at most one ACTIVE grant
+        # per (principal_type, principal_id, resource_type, resource_id,
+        # tenant_id); an EXPIRED row (Q-4) never counts. See migration
+        # 033's docstring for the NULLS NOT DISTINCT / aiosqlite caveat.
+        Index(
+            "uq_console_acl_entries_active_grant",
+            "principal_type",
+            "principal_id",
+            "resource_type",
+            "resource_id",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("expired_at_ms IS NULL"),
+            sqlite_where=text("expired_at_ms IS NULL"),
+            postgresql_nulls_not_distinct=True,
         ),
     )
