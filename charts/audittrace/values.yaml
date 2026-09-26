@@ -653,18 +653,36 @@ rabbitmq:
 minio:
   enabled: true
   image:
-    # Repinned 2026-09-12 off Docker Hub `minio/minio:latest` after
-    # Docker Hub removed anonymous pull for the MinIO org (finding
-    # finding-minio-dockerhub-anon-pull-removed-20260912.md). Pin exact
-    # dated tags, never `:latest`.
-    repository: quay.io/minio/minio
-    tag: RELEASE.2025-04-22T22-12-26Z
+    # MIRRORED 2026-09-26 to ghcr.io. History: repinned 2026-09-12 off
+    # Docker Hub after it removed anonymous pull for the MinIO org
+    # (finding-minio-dockerhub-anon-pull-removed-20260912.md); quay.io
+    # then closed the same way (finding-minio-quay-anon-pull-removed-
+    # 20260926.md) — BOTH public registries now 401 anonymously, even
+    # for `:latest`. Repinning to a third public registry is not a fix;
+    # mirroring is. Same pattern as audittrace-postgresql / -redis /
+    # -rabbitmq. Pin exact dated tags, never `:latest`.
+    #
+    # PACKAGE IS PRIVATE, like the other mirrors: CI reaches it because
+    # GITHUB_TOKEN has packages:read AND the package's "Manage Actions
+    # access" allowlist includes this repo. A NEW mirror is unreachable
+    # from CI until that allowlist entry is added — the push is only
+    # half the job.
+    #
+    # SINGLE-ARCH (linux/amd64). Upstream was a multi-arch index; the
+    # mirror was retagged from the local amd64 copy, which is all that
+    # could be obtained once upstream closed. GHA runners and the
+    # laptop are amd64, so this holds today — an arm64 target would
+    # need the arm64 layer re-mirrored, and upstream can no longer
+    # supply it.
+    repository: ghcr.io/lfdesousa/audittrace-minio
+    tag: RELEASE.2025-04-22T22-12-26Z-frozen-sep26
   mcImage:
     # Bucket-init Job (templates/minio/job-bucket-init.yaml) client
     # image. `mc` has its own release-tag scheme (not aligned with the
     # server's dated tags) — pinned independently, same rule applies.
-    repository: quay.io/minio/mc
-    tag: RELEASE.2025-04-16T18-13-26Z
+    # Mirrored to ghcr.io 2026-09-26 for the reason above.
+    repository: ghcr.io/lfdesousa/audittrace-mc
+    tag: RELEASE.2025-04-16T18-13-26Z-frozen-sep26
   auth:
     rootUser: minioadmin
     rootPassword: ""
