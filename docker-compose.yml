@@ -173,7 +173,9 @@ services:
   chromadb:
     # Chart's chromadb is in-chart (not a subchart). Pin matches
     # `charts/audittrace/values.yaml::chromadb.image.tag`.
-    image: chromadb/chroma:1.5.7
+    # Mirrored to ghcr.io 2026-09-26 so compose and the chart pull the
+    # same bytes from a registry we control. See the MinIO finding.
+    image: ghcr.io/lfdesousa/audittrace-chroma:1.5.7-frozen-sep26
     container_name: audittrace-chromadb
     ports:
       - "18000:8000"
