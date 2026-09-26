@@ -281,17 +281,33 @@ async def _write_denial(
     exc: Exception,
     tenant_id: str | None = None,
     failure_class_override: str | None = None,
+    db_error_class_override: str | None = None,
 ) -> AclWriteRefused:
     """Takes NO session and touches none (spec §5.0): ``_classify(exc)``
     (or the caller's override, for the two cases — past-expiry and
     bulk-rollback — whose ``failure_class`` is determined by WHERE the
     refusal happened, not by the exception's own text) -> ``_audit.
     record_denial(...)`` -> returns the named error to raise. The ONLY
-    caller of ``record_denial`` in this module."""
+    caller of ``record_denial`` in this module.
+
+    **``db_error_class`` follows ratified spec §5.6, never a bare
+    ``type(exc).__name__`` (a corrected, previously undisclosed
+    departure caught on review — B5).** A ``failure_class_override``
+    means the call site KNOWS the ratified literal for that override
+    (past-expiry: the app-level literal ``"app:past_expiry"``, passed
+    explicitly as ``db_error_class_override``) OR it does NOT know one
+    (bulk-rollback: §5.6 says "as above", i.e. the SAME derivation
+    ``_classify`` performs for the generic case — SQLSTATE when
+    present, else constraint name, else exception class name) — so
+    ``db_error_class`` still comes from ``_classify(exc)``'s second
+    element unless a caller explicitly supplies the literal."""
     _audit = _acl_audit()
     if failure_class_override is not None:
         failure_class = failure_class_override
-        db_error_class = type(exc).__name__
+        if db_error_class_override is not None:
+            db_error_class = db_error_class_override
+        else:
+            _, db_error_class = _classify(exc)
     else:
         failure_class, db_error_class = _classify(exc)
     await _audit.record_denial(
@@ -363,6 +379,11 @@ class _PostgresAclWrites:
                 exc=past_expiry_exc,
                 tenant_id=tenant_id,
                 failure_class_override=_audit.FAILURE_CLASS_ACL_DENIED_PAST_EXPIRY,
+                # spec §5.6's ratified literal — there is no real DB
+                # exception here (refused before any I/O), so
+                # type(exc).__name__ ("ValueError") would be a made-up
+                # value; the spec names the exact string instead.
+                db_error_class_override="app:past_expiry",
             ) from past_expiry_exc
 
         attempted = {

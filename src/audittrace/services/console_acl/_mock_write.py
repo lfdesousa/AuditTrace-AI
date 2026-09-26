@@ -127,12 +127,23 @@ async def _mock_denial(
     attempted: Any,
     failure_class: str,
     tenant_id: str | None = None,
+    db_error_class: str | None = None,
 ) -> AclWriteRefused:
     """The mock's counterpart to ``_postgres_write._write_denial`` — no
     exception to classify (every mock refusal is an APP-LEVEL check, not
-    a DB error), so the caller names ``failure_class`` directly."""
+    a DB error), so the caller names ``failure_class`` directly.
+
+    ``db_error_class`` follows ratified spec §5.6 when the caller knows
+    the literal (past-expiry: ``"app:past_expiry"``; principal-type: the
+    constraint name the mock stands in for,
+    ``"ck_console_acl_entries_principal_type"``, spec §7). When the
+    caller does not supply one (bulk-rollback, whose underlying cause
+    the mock does not distinguish), falls back to a disclosed
+    ``"mock:<failure_class>"`` placeholder — never a value that could be
+    mistaken for a real Postgres one."""
     _audit = _acl_audit()
-    db_error_class = f"mock:{failure_class}"
+    if db_error_class is None:
+        db_error_class = f"mock:{failure_class}"
     await _audit.record_denial(
         user_context=user_context,
         op=op,
@@ -206,6 +217,7 @@ class _MockAclWrites:
                 attempted={"expired_at_ms": expired_at_ms, "now_ms": stamp.now_ms},
                 failure_class=_audit.FAILURE_CLASS_ACL_DENIED_PAST_EXPIRY,
                 tenant_id=tenant_id,
+                db_error_class="app:past_expiry",
             )
 
         # R-8 — the mock's stand-in for migration 031's DB CHECK.
@@ -221,6 +233,7 @@ class _MockAclWrites:
                 attempted=attempted,
                 failure_class=_audit.FAILURE_CLASS_ACL_DENIED_PRINCIPAL_TYPE,
                 tenant_id=tenant_id,
+                db_error_class="ck_console_acl_entries_principal_type",
             )
 
         expired_ids = [
@@ -236,8 +249,13 @@ class _MockAclWrites:
                 tenant_id=tenant_id,
             )
         ]
+        # Undo log for the N4 failure path below — restores the EXACT
+        # prior updated_at_ms, never a hardcoded 0 (a partial mutation
+        # must not survive a failed audit write, S3).
+        prior_updated_at_ms: dict[str, int] = {}
         for row in self._entries:
             if row.id in expired_ids:
+                prior_updated_at_ms[row.id] = row.updated_at_ms
                 row.expired_at_ms = stamp.now_ms
                 row.updated_at_ms = stamp.now_ms
 
@@ -285,7 +303,7 @@ class _MockAclWrites:
                 for row in self._entries:
                     if row.id in expired_ids:
                         row.expired_at_ms = None
-                        row.updated_at_ms = 0
+                        row.updated_at_ms = prior_updated_at_ms[row.id]
                 await _audit.record_denial(
                     user_context=user_context,
                     op="grantPermission",

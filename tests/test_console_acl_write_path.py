@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import uuid
 
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -34,6 +36,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 
 from audittrace import dependencies
+from audittrace.db.models import ConsoleAclEntry
 from audittrace.services.console_acl import (
     MAX_PERM_BITS,
     PERMISSION_BIT_DELETE,
@@ -72,6 +75,26 @@ def _match_one_by_resource(rows: list[dict], resource_id: str) -> dict:
     matches = [r for r in rows if f":{resource_id}" in r["question"]]
     assert len(matches) == 1, "a 200 with no matched row is a FAIL (spec §10)"
     return matches[0]
+
+
+async def _old_row_expired_at_ms(
+    service: ConsoleAclEntriesService, row_id: str
+) -> int | None:
+    """Read a SPECIFIC row's ``expired_at_ms`` directly — the read-path
+    service methods filter expired rows out by design (ruling 2), so
+    they can never show whether the OLD row was actually expired versus
+    simply outranked; this is the only way to see it. Works on both
+    implementations: the mock never persists ACL rows to a DB (only its
+    audit rows do), so it is read from ``service._entries`` directly."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = next(e for e in service._entries if e.id == row_id)
+        return row.expired_at_ms
+    pg = dependencies.get_postgres_factory()
+    async with pg.get_session_factory()() as db:
+        result = await db.execute(
+            sa.select(ConsoleAclEntry.expired_at_ms).where(ConsoleAclEntry.id == row_id)
+        )
+        return result.scalar_one()
 
 
 @pytest_asyncio.fixture
@@ -240,6 +263,9 @@ class TestGrantPermissionDenials:
         assert (
             excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_PAST_EXPIRY
         )
+        # B5 — pinned on the EMITTED row, not the model: spec §5.6's
+        # ratified literal, not type(exc).__name__ ("ValueError").
+        assert excinfo.value.db_error_class == "app:past_expiry"
         rows = [
             r
             for r in _interactions(client)
@@ -247,6 +273,8 @@ class TestGrantPermissionDenials:
             and "agent-past-expiry" in r["question"]
         ]
         assert len(rows) == 1
+        detail = json.loads(rows[0]["error_detail"])
+        assert detail["db_error_class"] == "app:past_expiry"
 
     async def test_principal_type_outside_allowed_set_is_refused_by_name(
         self, service, client, user_context
@@ -264,6 +292,7 @@ class TestGrantPermissionDenials:
             excinfo.value.failure_class
             == _audit.FAILURE_CLASS_ACL_DENIED_PRINCIPAL_TYPE
         )
+        assert excinfo.value.db_error_class == "ck_console_acl_entries_principal_type"
         rows = [
             r
             for r in _interactions(client)
@@ -271,6 +300,8 @@ class TestGrantPermissionDenials:
             and "agent-group-refused" in r["question"]
         ]
         assert len(rows) == 1
+        detail = json.loads(rows[0]["error_detail"])
+        assert detail["db_error_class"] == "ck_console_acl_entries_principal_type"
 
     async def test_denied_write_never_lands_the_acl_row(
         self, service, user_context
@@ -428,6 +459,51 @@ class TestExpireAndInsert:
             user_context, "agent", "agent-regrant"
         )
         assert effective == 5, "only the NEW row's bits are effective"
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None, (
+            "the OLD row must actually be expired, not merely outranked — "
+            "5 is a SUPERSET of 1, so effective==5 alone cannot tell a "
+            "genuinely-expired old row from one _expire_active silently "
+            "skipped (B2 — 1-then-5 is invisible to a batched assertion)"
+        )
+
+    async def test_downgrade_regrant_expires_the_old_row_and_new_bits_are_exact(
+        self, service, user_context
+    ) -> None:
+        """B2 — the closing test a superset re-grant (1 then 5) cannot
+        provide: a DOWNGRADE re-grant (15 then 1). If ``_expire_active``
+        were skipped, or matched nothing, the OLD row (bits=15) would
+        remain active and OR into the effective mask, making
+        effective == 15 (or 15|1 == 15) instead of the new grant's own
+        1 — and the old row's own ``expired_at_ms`` would still be
+        ``None``. Both are asserted directly, not inferred from a
+        superset."""
+        first = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-downgrade-regrant",
+            perm_bits=15,
+        )
+        second = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-downgrade-regrant",
+            perm_bits=1,
+        )
+        assert second["id"] != first["id"]
+        effective = await service.get_effective_permissions(
+            user_context, "agent", "agent-downgrade-regrant"
+        )
+        assert effective == 1, (
+            "a leftover active bits=15 row would make this 15, not 1 — "
+            "the load-bearing assertion this guard actually needs"
+        )
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None, "the OLD (bits=15) row must be expired"
 
     async def test_identical_bits_still_expires_and_inserts(
         self, service, user_context
@@ -548,8 +624,12 @@ class TestBulkWriteAclEntries:
 
 class TestTraceIdLink:
     async def test_acl_row_and_audit_row_share_a_trace_id(
-        self, pg_service, user_context
+        self, pg_service, client, user_context
     ) -> None:
+        """T — the two-key link. B3's finding: a prior round of this test
+        never read ``interactions.trace_id`` at all (only counted
+        matching rows), so setting ``_audit.record``'s trace_id to
+        ``None`` left it green. Asserts the ACTUAL equality now."""
         provider = TracerProvider()
         exporter = InMemorySpanExporter()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -569,14 +649,20 @@ class TestTraceIdLink:
         int(trace_id_hex, 16)
         assert row["trace_id"] == trace_id_hex
 
+        stored = _match_one_by_resource(_interactions(client), "agent-trace-link")
+        assert stored["trace_id"] is not None, "a NULL match is never a valid match"
+        assert stored["trace_id"] == trace_id_hex == row["trace_id"]
+
 
 # ── _classify — the closed mapping's own branches, direct unit tests ────
 # (spec §5.6, corrected by a measurement recorded in _postgres_write.py's
 # module docstring: BOTH constraint names classify to
 # acl_denied_principal_type; WHICH ONE appears is a real-Postgres-only
-# fact — exercised behaviourally on real PG in the harness file,
-# exercised HERE at the unit level so this module's own branches are
-# covered without needing a live Postgres for every case.)
+# fact — exercised THROUGH grant_permission on real PG by
+# tests/test_acl_write_path_rls.py::TestR8GroupPrincipalRefused::
+# test_service_refuses_group_principal_on_real_pg (and its joint-neuter
+# sibling), exercised HERE at the unit level so this module's own
+# branches are covered without needing a live Postgres for every case.)
 
 
 from audittrace.services.console_acl import _postgres_write  # noqa: E402
@@ -875,3 +961,52 @@ class TestMockExpireLoopSkipsNonMatchingRows:
         assert untouched_effective == 1
         restored = next(e for e in mock_service._entries if e.id == pre_existing["id"])
         assert restored.expired_at_ms is None
+
+
+# ── S4 — the module docstring's autoflush-version-independence claim,
+# with an in-tree instrument (not just prose) confirming it holds on
+# THIS venv's resolved SQLAlchemy (measured 2.1.1 at build time; V-1's
+# own table only measured 2.0.51/2.1.0) ──────────────────────────────────
+
+
+class TestAutoflushIsMeasuredOnThisVenv:
+    async def test_expire_active_construct_triggers_autoflush_of_a_pending_row(
+        self, user_context
+    ) -> None:
+        """``_expire_active``'s ORM-enabled ``sa.update(ConsoleAclEntry)``
+        must autoflush a PENDING, invalid ``add()``-ed row before its own
+        UPDATE executes — the property ADDENDUM V-1 measured on
+        2.0.51/2.1.0 and this module's docstring claims "re-verified
+        functionally" on 2.1.1. Probed directly: a pending row violating
+        ``ck_console_acl_entries_perm_bits_range`` is never explicitly
+        flushed; if ``_expire_active`` did NOT autoflush, its own UPDATE
+        would run cleanly (0 rows matched) and return an EMPTY list —
+        instead it raises, because the pending row's autoflush fires
+        first and fails."""
+        pg = dependencies.get_postgres_factory()
+        async with pg.get_session_factory()() as db:
+            db.add(
+                ConsoleAclEntry(
+                    id=str(uuid.uuid4()),
+                    user_sub=user_context.user_id,
+                    principal_type="user",
+                    principal_id="p-autoflush-probe",
+                    principal_model="User",
+                    resource_type="agent",
+                    resource_id="agent-autoflush-probe",
+                    perm_bits=99,  # violates ck_console_acl_entries_perm_bits_range
+                    granted_at_ms=0,
+                    created_at_ms=0,
+                    updated_at_ms=0,
+                )
+            )
+            with pytest.raises(Exception, match="perm_bits_range|CHECK constraint"):
+                await _postgres_write._expire_active(
+                    db,
+                    principal_type="user",
+                    principal_id="someone-else-entirely",
+                    resource_type="agent",
+                    resource_id="agent-autoflush-probe-unrelated-key",
+                    tenant_id=None,
+                    now_ms=1,
+                )

@@ -27,10 +27,14 @@ by ``tests/test_mcp_rls_isolation.py:78`` importing from
 
 **SQLAlchemy / asyncpg / aiosqlite versions of THIS build's venv**
 (recorded once, per spec §2 Fact 2 / ADDENDUM U-7/V-5 — every mechanism
-claim below carries this): see ``test_venv_versions_are_recorded`` — the
-literal values are asserted there so a future venv resolving different
-versions fails loudly instead of silently invalidating this file's
-measurements.
+claim below carries this): see
+``TestVenvVersionsRecorded::test_versions`` — it asserts each version
+string is non-empty (so a broken/uninstalled package fails the run) and
+PRINTS the literal values into this run's own output for the build
+record to cite verbatim; it does NOT pin them to specific numbers (that
+would make this file fail on every routine dependency bump), so a venv
+resolving DIFFERENT versions does not fail this test — the build record
+is where a version discrepancy must be checked and disclosed.
 """
 
 from __future__ import annotations
@@ -44,12 +48,14 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import create_engine, event, insert, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from audittrace.db.models import Base, ConsoleAclEntry
 from audittrace.db.rls import install_rls_listener, set_current_user_id
 from audittrace.services.console_acl import AclGrantOp, _audit, _postgres_write
 from audittrace.services.console_acl._errors import (
     AclBulkRolledBackError,
+    AclPrincipalTypeRefused,
     AclWriteRefused,
 )
 from audittrace.services.console_acl._postgres import PostgresConsoleAclEntriesService
@@ -193,7 +199,8 @@ def _interactions_rows(admin: Any, schema: str, *, resource_id: str) -> list[dic
             (
                 conn.execute(
                     text(
-                        "SELECT status, failure_class, answer, error_detail, question "
+                        "SELECT status, failure_class, answer, error_detail, "
+                        "question, trace_id "
                         "FROM interactions WHERE question LIKE :pat"
                     ),
                     {"pat": f"%:{resource_id}%"},
@@ -207,17 +214,25 @@ def _interactions_rows(admin: Any, schema: str, *, resource_id: str) -> list[dic
 
 def _backend_state(admin: Any, schema: str) -> str | None:
     """``pg_stat_activity.state`` for the harness's OWN backend — used
-    for the (rollback events, backend state) pair (ADDENDUM X-1). Reads
-    via ``application_name`` set by the app engine's connection args is
-    unavailable here, so this reads the single active backend against
-    the throwaway schema's database (the harness is single-connection
-    per test by construction — one ``async with factory() as db:``
-    block at a time)."""
+    for the (rollback events, backend state) pair (ADDENDUM X-1).
+
+    **S5, disclosed limitation, not fully closed here:** this reads the
+    most recently active ``client backend`` on the SAME database,
+    excluding background workers (autovacuum, walwriter, ...) that
+    would otherwise be mistaken for the harness's own connection — it
+    does NOT filter by an exact PID (the harness's session never
+    surfaces its own backend PID to this helper, and threading one
+    through every call site was judged out of scope for a should-fix).
+    Correct ONLY under this file's own single-connection-per-test
+    discipline (one ``async with factory() as db:`` block active at a
+    time) — NOT safe if this suite were ever run with parallel workers
+    sharing one throwaway schema."""
     with admin.connect() as conn:
         row = conn.execute(
             text(
                 "SELECT state FROM pg_stat_activity "
                 "WHERE datname = current_database() "
+                "AND backend_type = 'client backend' "
                 "AND state != 'idle' AND pid != pg_backend_pid() "
                 "ORDER BY query_start DESC LIMIT 1"
             )
@@ -229,7 +244,8 @@ def _backend_state(admin: Any, schema: str) -> str | None:
         row = conn.execute(
             text(
                 "SELECT state FROM pg_stat_activity "
-                "WHERE datname = current_database() AND pid != pg_backend_pid() "
+                "WHERE datname = current_database() "
+                "AND backend_type = 'client backend' AND pid != pg_backend_pid() "
                 "ORDER BY query_start DESC LIMIT 1"
             )
         ).first()
@@ -371,6 +387,55 @@ def _rollback_listener(sync_engine: Any) -> tuple[list[bool], Any, Any]:
     return events, sync_engine, _on_rollback
 
 
+class _RollbackSplitProbe:
+    """Wraps ``AsyncSession.rollback`` (via ``monkeypatch``) to snapshot,
+    for EVERY call the wrapped method makes to ``db.rollback()``:
+    ``(rollback events fired BEFORE this call, backend state BEFORE this
+    call, rollback events fired DURING/by this call)`` — i.e. the exact
+    "at catch" / "further" split spec §6.2 / ADDENDUM X-1 describe.
+
+    **This closes a REJECTED deviation.** A prior round of this file
+    claimed the split "can never be observed" once instrumentation sits
+    outside `grant_permission`/`bulk_write_acl_entries` (both call their
+    OWN `await db.rollback()` internally before re-raising). That claim
+    was FALSE — wrapping `AsyncSession.rollback` itself observes exactly
+    the moment those internal calls happen, from OUTSIDE the method,
+    with no code change to production. The independent reviewer
+    measured this with the same ~15-line technique and reproduced the
+    predicted pairs `(1, 'idle', 0)` (shape 1) and `(0, 'idle in
+    transaction (aborted)', 1)` (shape 3) on real ``postgres:16``."""
+
+    def __init__(
+        self, harness: Any, admin: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.events: list[bool] = []
+        self.snapshots: list[tuple[int, str | None, int]] = []
+        self._admin = admin
+        self._harness = harness
+        sync_engine = harness.factory.kw["bind"].sync_engine
+        self._sync_engine = sync_engine
+        event.listen(sync_engine, "rollback", self._on_rollback)
+        original_rollback = AsyncSession.rollback
+        probe = self
+
+        async def _wrapped_rollback(
+            session: AsyncSession, *args: object, **kwargs: object
+        ) -> Any:
+            at_catch = len(probe.events)
+            state = _backend_state(admin, harness.schema)
+            result = await original_rollback(session, *args, **kwargs)
+            probe.snapshots.append((at_catch, state, len(probe.events) - at_catch))
+            return result
+
+        monkeypatch.setattr(AsyncSession, "rollback", _wrapped_rollback)
+
+    def _on_rollback(self, _connection: object) -> None:
+        self.events.append(True)
+
+    def close(self) -> None:
+        event.remove(self._sync_engine, "rollback", self._on_rollback)
+
+
 # ── The abort-shape derivation — shape (3): a refusal AT _expire_active
 # (a Core-level UPDATE, no flush) ─────────────────────────────────────────
 
@@ -382,17 +447,16 @@ class TestShapeThreeExpireActiveRefusal:
     then a re-grant's ``_expire_active`` UPDATE touches that row and
     032's UPDATE ``WITH CHECK`` (``deleted_at_ms IS NULL``) refuses it.
 
-    **Instrumented at the PRIMITIVE level (``_expire_active`` called
-    directly), not through the full ``grant_permission`` orchestration
-    — measured, not assumed, why: ``grant_permission`` itself calls
-    ``await db.rollback()`` inside its own except block BEFORE
-    re-raising, so instrumenting at the service-method boundary can
-    never observe "events at catch" separately from "events after the
-    method's own explicit rollback" — both moments collapse into one
-    by the time control returns to the test. The primitive-level test
-    below is what actually exercises spec §6.2/ADDENDUM X-1's pair; a
-    separate behavioural test below confirms the full method's
-    externally-observable contract (denial row, ACL row absent)."""
+    **Two levels of proof.** The first test below instruments
+    ``_expire_active`` DIRECTLY (the PRIMITIVE level) to isolate the
+    SQLAlchemy/driver mechanism from this module's own exception
+    handling. The second test proves the SAME pair through the FULL
+    ``grant_permission`` method, externally, via ``_RollbackSplitProbe``
+    (a wrapper on ``AsyncSession.rollback`` — spec §6.2 / ADDENDUM X-1's
+    split IS observable from outside the method; an earlier round of
+    this file wrongly claimed otherwise, REJECTED on review and
+    corrected here, matching the independent reviewer's own
+    measurement)."""
 
     async def test_shape_at_the_primitive_level(self, write_harness, sp_pin) -> None:
         owner = _new_user_context(_OWNER)
@@ -453,7 +517,7 @@ class TestShapeThreeExpireActiveRefusal:
             admin.dispose()
 
     async def test_the_full_method_denies_by_name_and_leaves_no_acl_row(
-        self, write_harness, sp_pin
+        self, write_harness, sp_pin, monkeypatch
     ) -> None:
         owner = _new_user_context(_OWNER)
         admin = _admin_engine()
@@ -492,6 +556,7 @@ class TestShapeThreeExpireActiveRefusal:
                     )
                 )
 
+            probe = _RollbackSplitProbe(write_harness, admin, monkeypatch)
             set_current_user_id(owner.user_id)
             try:
                 with pytest.raises(AclWriteRefused) as excinfo:
@@ -505,6 +570,13 @@ class TestShapeThreeExpireActiveRefusal:
                     )
             finally:
                 set_current_user_id(None)
+                probe.close()
+
+            # ADDENDUM X-1's Core-refusal pair, proven THROUGH the full
+            # method (not the primitive above): zero events at catch,
+            # backend left aborted, exactly one further event from the
+            # method's OWN explicit db.rollback().
+            assert probe.snapshots[-1] == (0, "idle in transaction (aborted)", 1)
 
             assert excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
             rows = _interactions_rows(
@@ -530,6 +602,18 @@ class TestShapeThreeExpireActiveRefusal:
 
 
 class TestShapeOneFlushRefusal:
+    """The first test below is an INSTRUMENT-SANITY probe — it calls no
+    production code, only a raw ``db.add()``/``db.flush()`` against
+    ``ConsoleAclEntry`` directly, to measure SQLAlchemy's OWN
+    connection-level behaviour for a flush refusal in isolation from
+    this package's exception handling (the independent reviewer's own
+    characterisation, correct). The SECOND test is the real proof:
+    spec §6.3(1)'s attacker-grant scenario (an attacker grants a
+    permission naming the OWNER's resource; 032's INSERT ``WITH CHECK``
+    refuses it) run through the FULL ``grant_permission`` method, with
+    ``_RollbackSplitProbe`` proving the identical shape-(1) pair
+    externally."""
+
     async def test_flush_refusal_pair_and_the_further_split(
         self, write_harness, sp_pin
     ) -> None:
@@ -576,6 +660,54 @@ class TestShapeOneFlushRefusal:
             finally:
                 set_current_user_id(None)
                 event.remove(sync_engine, "rollback", listener)
+        finally:
+            admin.dispose()
+
+    async def test_full_method_insert_refusal_split_attacker_grant(
+        self, write_harness, sp_pin, monkeypatch
+    ) -> None:
+        """spec §6.3(1): the attacker grants on the OWNER's agent — 032's
+        INSERT ``WITH CHECK`` (ownership subquery) refuses it. Proven
+        THROUGH ``grant_permission`` (never A's own code opening a
+        savepoint — ``sp_pin`` still applies), with the split-probe
+        showing the identical shape-(1) pair the primitive-level test
+        above measures in isolation."""
+        attacker = _new_user_context(_ATTACKER)
+        admin = _admin_engine()
+        try:
+            probe = _RollbackSplitProbe(write_harness, admin, monkeypatch)
+            set_current_user_id(attacker.user_id)
+            try:
+                with pytest.raises(AclWriteRefused) as excinfo:
+                    await write_harness.service.grant_permission(
+                        attacker,
+                        principal_type="user",
+                        principal_id=_VIEWER,
+                        resource_type="agent",
+                        resource_id="agent-1",  # OWNER's resource
+                        perm_bits=1,
+                    )
+            finally:
+                set_current_user_id(None)
+                probe.close()
+
+            assert probe.snapshots[-1] == (1, "idle", 0), (
+                "shape (1): one event at catch, backend idle, no further "
+                "event after the method's own explicit rollback"
+            )
+            assert excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
+            # B5 — pinned on the EMITTED row: measured on real postgres:16,
+            # the RLS refusal's SQLSTATE is insufficient_privilege (42501),
+            # matching spec §5.6's "SQLSTATE when present" rule — never
+            # type(exc).__name__ ("ProgrammingError").
+            assert excinfo.value.db_error_class == "42501"
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-1"
+            )
+            denial_rows = [r for r in rows if r["status"] == "failed"]
+            assert len(denial_rows) == 1
+            detail = json.loads(denial_rows[0]["error_detail"])
+            assert detail["db_error_class"] == "42501"
         finally:
             admin.dispose()
 
@@ -776,6 +908,87 @@ class TestDuplicateGrantThenExpireKillsBit:
         finally:
             admin.dispose()
 
+    async def _double_grant_downgrade(
+        self, write_harness: Any, admin: Any, *, resource_id: str, tenant_id: str | None
+    ) -> None:
+        """A GENUINE double grant through the service (B2 — the reviewer's
+        finding: no test in this file ever called ``grant_permission``
+        twice), downgrading 15 -> 1, with the given ``tenant_id``.
+        Asserts the OLD row is expired (direct SELECT — O-3's key is
+        scoped by ``tenant_id`` too) and the new row's bits are exact."""
+        owner = _new_user_context(_OWNER)
+        viewer = _new_user_context(_VIEWER)
+        set_current_user_id(owner.user_id)
+        try:
+            first = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id=resource_id,
+                perm_bits=15,
+                tenant_id=tenant_id,
+            )
+            second = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id=resource_id,
+                perm_bits=1,
+                tenant_id=tenant_id,
+            )
+        finally:
+            set_current_user_id(None)
+        assert second["id"] != first["id"]
+
+        with admin.begin() as conn:
+            conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+            old_expired_at_ms = conn.execute(
+                text("SELECT expired_at_ms FROM console_acl_entries WHERE id = :id"),
+                {"id": first["id"]},
+            ).scalar_one()
+        assert old_expired_at_ms is not None, (
+            f"the OLD (bits=15) row must be expired (tenant_id={tenant_id!r})"
+        )
+
+        set_current_user_id(viewer.user_id)
+        try:
+            effective = await write_harness.service.get_effective_permissions(
+                viewer, "agent", resource_id
+            )
+        finally:
+            set_current_user_id(None)
+        assert effective == 1, (
+            f"a leftover active bits=15 row would make this 15 "
+            f"(tenant_id={tenant_id!r})"
+        )
+
+    async def test_double_grant_downgrade_through_the_service_tenant_id_null(
+        self, write_harness, sp_pin
+    ) -> None:
+        admin = _admin_engine()
+        try:
+            await self._double_grant_downgrade(
+                write_harness, admin, resource_id="agent-1", tenant_id=None
+            )
+        finally:
+            admin.dispose()
+
+    async def test_double_grant_downgrade_through_the_service_tenant_id_set(
+        self, write_harness, sp_pin
+    ) -> None:
+        admin = _admin_engine()
+        try:
+            await self._double_grant_downgrade(
+                write_harness,
+                admin,
+                resource_id="agent-1",
+                tenant_id="tenant-double-grant",
+            )
+        finally:
+            admin.dispose()
+
 
 # ── #11 — R-8, group principals refused at the DB — WITH the measured
 # constraint-redundancy finding (see _postgres_write.py's module
@@ -877,40 +1090,131 @@ class TestR8GroupPrincipalRefused:
         finally:
             admin.dispose()
 
-    async def test_joint_neuter_of_both_constraints_lands_the_group_row(
+    async def test_service_refuses_group_principal_on_real_pg(
         self, write_harness, sp_pin
     ) -> None:
+        """B4 — the guard proven THROUGH the service, not a raw INSERT
+        with a hand-set ``principal_model='Group'`` (the service always
+        sends ``principal_model=NULL`` for an unrecognised type —
+        ``_principal_model``'s documented fallback). Asserts the error
+        class, ``failure_class``, ``db_error_class``, that no ACL row
+        landed, and exactly one denial row."""
+        owner = _new_user_context(_OWNER)
         admin = _admin_engine()
         try:
-            before_type = self._constraint_def(
-                admin, write_harness.schema, "ck_console_acl_entries_principal_type"
+            set_current_user_id(owner.user_id)
+            try:
+                with pytest.raises(AclPrincipalTypeRefused) as excinfo:
+                    await write_harness.service.grant_permission(
+                        owner,
+                        principal_type="group",
+                        principal_id="grp-service",
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        perm_bits=1,
+                    )
+            finally:
+                set_current_user_id(None)
+
+            assert (
+                excinfo.value.failure_class
+                == _audit.FAILURE_CLASS_ACL_DENIED_PRINCIPAL_TYPE
             )
-            before_model = self._constraint_def(
-                admin,
-                write_harness.schema,
+            assert excinfo.value.db_error_class in (
+                "ck_console_acl_entries_principal_type",
                 "ck_console_acl_entries_principal_model_matches_type",
             )
-            assert before_type is not None
-            assert before_model is not None
 
             with admin.begin() as conn:
                 conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
-                conn.execute(
+                count = conn.execute(
                     text(
-                        "ALTER TABLE console_acl_entries "
-                        "DROP CONSTRAINT ck_console_acl_entries_principal_type"
+                        "SELECT count(*) FROM console_acl_entries "
+                        "WHERE principal_type = 'group'"
                     )
-                )
-                conn.execute(
-                    text(
-                        "ALTER TABLE console_acl_entries DROP CONSTRAINT "
-                        "ck_console_acl_entries_principal_model_matches_type"
-                    )
-                )
+                ).scalar_one()
+            assert count == 0, "no ACL row must land"
+
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-1"
+            )
+            denial_rows = [
+                r
+                for r in rows
+                if r["failure_class"] == _audit.FAILURE_CLASS_ACL_DENIED_PRINCIPAL_TYPE
+                and "group:grp-service" in r["question"]
+            ]
+            assert len(denial_rows) == 1
+        finally:
             admin.dispose()
 
-            # RED — the group row now LANDS.
-            self._attempt_group_insert(admin, write_harness.schema)
+    async def test_joint_neuter_of_both_constraints_lands_the_group_row(
+        self, write_harness, sp_pin
+    ) -> None:
+        """The joint neuter is proven THROUGH the service too (B4): once
+        the constraints are gone, ``grant_permission(principal_type=
+        'group', ...)`` — the SAME call
+        ``test_service_refuses_group_principal_on_real_pg`` proves is
+        refused above — now SUCCEEDS. That is what "the joint neuter
+        must turn the guard's own test red" means; demonstrated here by
+        running the identical call under the neutered schema.
+
+        **A THIRD constraint, measured while wiring this test to the
+        SERVICE rather than a raw INSERT:** the service always sends
+        ``principal_model=None`` for an unrecognised ``principal_type``
+        (``_principal_model``'s documented fallback — spec 5.3 forbids
+        an app-level pre-check, so the value is whatever falls out of
+        the dispatch table). A non-``public`` row with a NULL
+        ``principal_model`` ALSO violates
+        ``ck_console_acl_entries_public_principal_null`` (its second
+        OR-branch requires ``principal_model IS NOT NULL`` for any
+        non-public type) — independently of the other two. This
+        constraint was invisible to the raw-INSERT probe above (which
+        hand-sets ``principal_model='Group'``, a non-NULL value,
+        satisfying it) — a different call SHAPE exposes a different
+        member of the redundant set. All three are dropped/restored
+        here, cmp-verified."""
+        admin = _admin_engine()
+        try:
+            constraint_names = (
+                "ck_console_acl_entries_principal_type",
+                "ck_console_acl_entries_principal_model_matches_type",
+                "ck_console_acl_entries_public_principal_null",
+            )
+            before = {
+                name: self._constraint_def(admin, write_harness.schema, name)
+                for name in constraint_names
+            }
+            assert all(before.values())
+
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                for name in constraint_names:
+                    conn.execute(
+                        text(f"ALTER TABLE console_acl_entries DROP CONSTRAINT {name}")
+                    )
+            admin.dispose()
+
+            # RED — proven THROUGH the service (B4): the SAME call that
+            # raised AclPrincipalTypeRefused above now succeeds instead.
+            owner = _new_user_context(_OWNER)
+            set_current_user_id(owner.user_id)
+            try:
+                row = await write_harness.service.grant_permission(
+                    owner,
+                    principal_type="group",
+                    principal_id="grp-joint-neuter",
+                    resource_type="agent",
+                    resource_id="agent-1",
+                    perm_bits=1,
+                )
+            finally:
+                set_current_user_id(None)
+            assert row["principal_type"] == "group", (
+                "the joint neuter lets the service's own grant_permission "
+                "land a group-principal row — this is the guard's own "
+                "test going RED, not a raw-INSERT bypass"
+            )
             admin.dispose()
 
             # 033's no-delete trigger refuses ANY delete (any role) —
@@ -940,7 +1244,7 @@ class TestR8GroupPrincipalRefused:
                 )
             admin.dispose()
 
-            # RESTORE both, cmp-verified.
+            # RESTORE all three, cmp-verified.
             with admin.begin() as conn:
                 conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
                 conn.execute(
@@ -959,18 +1263,23 @@ class TestR8GroupPrincipalRefused:
                         "(principal_type = 'public' AND principal_model IS NULL))"
                     )
                 )
+                conn.execute(
+                    text(
+                        "ALTER TABLE console_acl_entries ADD CONSTRAINT "
+                        "ck_console_acl_entries_public_principal_null CHECK ("
+                        "(principal_type = 'public' AND principal_id IS NULL "
+                        "AND principal_model IS NULL) OR "
+                        "(principal_type != 'public' AND principal_id IS NOT NULL "
+                        "AND principal_model IS NOT NULL))"
+                    )
+                )
             admin.dispose()
 
-            after_type = self._constraint_def(
-                admin, write_harness.schema, "ck_console_acl_entries_principal_type"
-            )
-            after_model = self._constraint_def(
-                admin,
-                write_harness.schema,
-                "ck_console_acl_entries_principal_model_matches_type",
-            )
-            assert after_type == before_type
-            assert after_model == before_model
+            after = {
+                name: self._constraint_def(admin, write_harness.schema, name)
+                for name in constraint_names
+            }
+            assert after == before
         finally:
             admin.dispose()
 
@@ -1074,18 +1383,18 @@ class TestNoDeleteTriggerNeuter:
 
 class TestBulkOpIndexVariants:
     async def test_variant_a_insert_refusal_flush_pair(
-        self, write_harness, sp_pin
+        self, write_harness, sp_pin, monkeypatch
     ) -> None:
         """Variant (a): op 1 (of 3) refuses at its OWN flush (shape 1) —
         an unmapped resource_type means _expire_active matches nothing,
         so the INSERT itself is what 032's WITH CHECK refuses (its
         ownership subquery evaluates FALSE for any unmapped
-        resource_type)."""
+        resource_type). Asserts the FULL ADDENDUM X-1 pair (at-catch +
+        further) via ``_RollbackSplitProbe``, not merely a total count."""
         owner = _new_user_context(_OWNER)
         admin = _admin_engine()
         try:
-            sync_engine = write_harness.factory.kw["bind"].sync_engine
-            events, _, listener = _rollback_listener(sync_engine)
+            probe = _RollbackSplitProbe(write_harness, admin, monkeypatch)
             ops = [
                 AclGrantOp(
                     principal_type="user",
@@ -1115,15 +1424,19 @@ class TestBulkOpIndexVariants:
                     await write_harness.service.bulk_write_acl_entries(owner, ops)
             finally:
                 set_current_user_id(None)
-                event.remove(sync_engine, "rollback", listener)
+                probe.close()
 
-            assert events == [True], "flush-refusal pair: exactly one event at catch"
-            state = _backend_state(admin, write_harness.schema)
-            assert state == "idle"
+            assert probe.snapshots[-1] == (1, "idle", 0), (
+                "flush-refusal pair: one event at catch, idle, no further"
+            )
             rows = _interactions_rows(admin, write_harness.schema, resource_id="mcp-1")
             denial = [r for r in rows if r["status"] == "failed"][0]
             detail = json.loads(denial["error_detail"])
             assert detail["predicate_or_attempted_row"]["op_index"] == 1
+            # B5 — bulk's db_error_class follows §5.6's "as above" rule
+            # (SQLSTATE when present) even though failure_class is
+            # overridden to acl_denied_bulk_rollback; measured 42501.
+            assert detail["db_error_class"] == "42501"
 
             for resource_id in ("agent-1", "agent-3"):
                 rows = _interactions_rows(
@@ -1134,11 +1447,12 @@ class TestBulkOpIndexVariants:
             admin.dispose()
 
     async def test_variant_b_expire_refusal_core_pair(
-        self, write_harness, sp_pin
+        self, write_harness, sp_pin, monkeypatch
     ) -> None:
         """Variant (b): op 1 (of 2) refuses at its OWN _expire_active
         UPDATE (shape 3) — the resource is soft-deleted, so re-granting
-        the same key hits 032's UPDATE WITH CHECK."""
+        the same key hits 032's UPDATE WITH CHECK. Asserts the FULL
+        ADDENDUM X-1 Core-refusal pair via ``_RollbackSplitProbe``."""
         owner = _new_user_context(_OWNER)
         admin = _admin_engine()
         try:
@@ -1160,10 +1474,8 @@ class TestBulkOpIndexVariants:
                         "WHERE agent_id = 'agent-1'"
                     )
                 )
-            admin.dispose()
 
-            sync_engine = write_harness.factory.kw["bind"].sync_engine
-            events, _, listener = _rollback_listener(sync_engine)
+            probe = _RollbackSplitProbe(write_harness, admin, monkeypatch)
             ops = [
                 AclGrantOp(
                     principal_type="user",
@@ -1179,16 +1491,11 @@ class TestBulkOpIndexVariants:
                     await write_harness.service.bulk_write_acl_entries(owner, ops)
             finally:
                 set_current_user_id(None)
-                event.remove(sync_engine, "rollback", listener)
+                probe.close()
 
-            # NOTE — bulk_write_acl_entries calls its OWN db.rollback()
-            # internally before re-raising (same as grant_permission),
-            # so "events at catch" here observes AFTER that internal
-            # call, not before it; the precise (0, aborted)-vs-(1, idle)
-            # SPLIT for this shape is proven at the primitive level by
-            # TestShapeThreeExpireActiveRefusal above. This test's job
-            # is op_index precision for the Core-refusal case.
-            assert events, "a rollback happened somewhere in the refusal path"
+            assert probe.snapshots[-1] == (0, "idle in transaction (aborted)", 1), (
+                "Core-refusal pair: zero events at catch, aborted, one further"
+            )
 
             rows = _interactions_rows(
                 admin, write_harness.schema, resource_id="agent-1"
@@ -1211,14 +1518,10 @@ class TestAFBulkFlushNeuter:
         owner = _new_user_context(_OWNER)
         admin = _admin_engine()
         try:
-            original_flush = None
-
             # NEUTER — patch AsyncSession.flush to a no-op FOR THE
             # DURATION of this bulk call only, so op i's own refusal no
             # longer surfaces inside iteration i (relies on the NEXT
             # op's autoflush instead, which is off by one).
-            from sqlalchemy.ext.asyncio import AsyncSession
-
             original_flush = AsyncSession.flush
 
             async def _noop_flush(self: Any, *args: object, **kwargs: object) -> None:
@@ -1370,6 +1673,11 @@ class TestTraceIdLinkRealPostgres:
             )
             success_rows = [r for r in rows if r["status"] == "success"]
             assert len(success_rows) == 1
+            # B3 — the load-bearing assertion a prior round never made:
+            # read interactions.trace_id itself and match it, not merely
+            # count rows (which stays green even with trace_id=None).
+            assert success_rows[0]["trace_id"] is not None
+            assert success_rows[0]["trace_id"] == trace_id_hex == row["trace_id"]
         finally:
             admin.dispose()
 
@@ -1387,25 +1695,27 @@ class TestP4ShapeTwoHelperSurvives:
         helper, not of A's own code, which never opens one)."""
         owner = _new_user_context(_OWNER)
         admin = _admin_engine()
+        sync_engine = write_harness.factory.kw["bind"].sync_engine
+        sp_events: dict[str, list[bool]] = {
+            "savepoint": [],
+            "rollback_savepoint": [],
+        }
+        rb_events: list[bool] = []
+
+        def _on_savepoint(c: object, n: object) -> None:
+            sp_events["savepoint"].append(True)
+
+        def _on_rollback_savepoint(c: object, n: object, ctx: object) -> None:
+            sp_events["rollback_savepoint"].append(True)
+
+        def _on_rollback(c: object) -> None:
+            rb_events.append(True)
+
+        event.listen(sync_engine, "savepoint", _on_savepoint)
+        event.listen(sync_engine, "rollback_savepoint", _on_rollback_savepoint)
+        event.listen(sync_engine, "rollback", _on_rollback)
         try:
             set_current_user_id(owner.user_id)
-            sync_engine = write_harness.factory.kw["bind"].sync_engine
-            sp_events: dict[str, list[bool]] = {
-                "savepoint": [],
-                "rollback_savepoint": [],
-            }
-            rb_events: list[bool] = []
-            event.listen(
-                sync_engine,
-                "savepoint",
-                lambda c, n: sp_events["savepoint"].append(True),
-            )
-            event.listen(
-                sync_engine,
-                "rollback_savepoint",
-                lambda c, n, ctx: sp_events["rollback_savepoint"].append(True),
-            )
-            event.listen(sync_engine, "rollback", lambda c: rb_events.append(True))
 
             async with write_harness.factory() as db:
                 db.add(
@@ -1463,6 +1773,15 @@ class TestP4ShapeTwoHelperSurvives:
 
                 await db.commit()  # the outer, legitimate INSERT commits
 
+            # S2 — the denial row must ACTUALLY have landed (_write_denial
+            # was called directly above, not silently); read it back from
+            # a fresh session, on the denial_factory's own schema.
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-p4-refused"
+            )
+            denial_rows = [r for r in rows if r["status"] == "failed"]
+            assert len(denial_rows) == 1
+
             viewer = _new_user_context(_VIEWER)
             set_current_user_id(viewer.user_id)
             effective = await write_harness.service.get_effective_permissions(
@@ -1471,4 +1790,7 @@ class TestP4ShapeTwoHelperSurvives:
             assert effective == 1, "the outer grant must still commit"
         finally:
             set_current_user_id(None)
+            event.remove(sync_engine, "savepoint", _on_savepoint)
+            event.remove(sync_engine, "rollback_savepoint", _on_rollback_savepoint)
+            event.remove(sync_engine, "rollback", _on_rollback)
             admin.dispose()
