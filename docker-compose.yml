@@ -312,14 +312,14 @@ services:
     restart: unless-stopped
 
   minio:
-    # ADR-027 — S3-compatible storage. Chart pin is
-    # `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z` (upstream — NOT
-    # bitnami). Preserved here so compose matches. Repinned 2026-09-12
-    # off Docker Hub `minio/minio:latest` after Docker Hub removed
-    # anonymous pull for the MinIO org (finding
-    # finding-minio-dockerhub-anon-pull-removed-20260912.md) — pin exact
-    # dated tags, never `:latest`.
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # ADR-027 — S3-compatible storage. Chart pin is the same image, so
+    # compose and the chart exercise identical bytes. MIRRORED to ghcr.io
+    # 2026-09-26: Docker Hub removed anonymous pull for the MinIO org on
+    # 2026-09-12 (we repinned to quay.io), and quay.io then closed the
+    # same way — both now 401 anonymously, even for `:latest`. See
+    # finding-minio-quay-anon-pull-removed-20260926.md. Pin exact dated
+    # tags, never `:latest`.
+    image: ghcr.io/lfdesousa/audittrace-minio:RELEASE.2025-04-22T22-12-26Z-frozen-sep26
     container_name: audittrace-minio
     command: server /data --console-address ":9001"
     environment:
