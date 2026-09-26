@@ -6999,8 +6999,18 @@ class TestEventClassValues:
         # consumer; ``assessment`` is added by ADR-058's recursive
         # self-audit (the recorder recording its own security review);
         # ``memory_access`` is added by ADR-062 §5 (WU-A4) — every
-        # /memory/* read/list/write/delete emits a first-class audit row.
-        expected = {"interaction", "security", "assessment", "memory_access"}
+        # /memory/* read/list/write/delete emits a first-class audit row;
+        # ``acl_authz`` is added by the Sovereign Authorization Layer
+        # EPIC's ACL 2b-core-B — every sovereign ACL write attempt
+        # (granted or denied) emits a first-class audit row via
+        # ``services/console_acl/_audit.py``.
+        expected = {
+            "interaction",
+            "security",
+            "assessment",
+            "memory_access",
+            "acl_authz",
+        }
         assert _EVENT_CLASS_VALUES == expected
 
 

@@ -122,13 +122,18 @@ class InteractionRecord(Base):
     # span context; indexed because the lookup pattern is "find rows by
     # trace_id". 32-char lowercase hex string per OTel format.
     trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    # Migration 012 (2026-05-10, ADR-048 PR-B1): closed-set
-    # ``{"interaction", "security"}``. ``interaction`` (legacy implicit)
-    # is the chat-completion / tool-call default; ``security`` is added
-    # by PR-B4's verdict consumer to distinguish content-control verdict
+    # Migration 012 (2026-05-10, ADR-048 PR-B1): closed-set, now
+    # ``{"interaction", "security", "assessment", "memory_access",
+    # "acl_authz"}``. ``interaction`` (legacy implicit) is the
+    # chat-completion / tool-call default; ``security`` is added by
+    # PR-B4's verdict consumer to distinguish content-control verdict
     # rows from interaction rows so SOC tooling can alert on
-    # ``rejected_malware`` outcomes without scanning every row. Pinned
-    # by ``tests/test_memory_routes.py::TestEventClassValues``.
+    # ``rejected_malware`` outcomes without scanning every row.
+    # ``assessment`` (ADR-058) and ``memory_access`` (ADR-062 §5) extend
+    # the set additively. ``acl_authz`` (Sovereign Authorization Layer
+    # EPIC, ACL 2b-core-B) is every sovereign ACL write attempt —
+    # granted or denied — written by ``services/console_acl/_audit.py``.
+    # Pinned by ``tests/test_memory_routes.py::TestEventClassValues``.
     event_class: Mapped[str | None] = mapped_column(
         String(16), nullable=True, index=True
     )
