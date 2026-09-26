@@ -55,24 +55,47 @@ methodology as N7's).
   rollback fires as a **SQLAlchemy** connection-level event, not
   something the aiosqlite driver does on its own — and a matching probe
   against the real Postgres harness shows the SAME thing happens there:
-  **SQLAlchemy rolls back the connection when an ORM ``flush()`` fails,
-  on ANY database.** The real difference between the two N3 tests was
-  never SQLite-vs-Postgres — it is **HOW each test aborts**: this
-  aiosqlite test aborts via an ORM ``flush()`` (so only the ORM
-  ``Session`` is left "pending rollback" — the connection itself was
-  already rolled back by SQLAlchemy), while the Postgres N3 test
-  (`tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+  **when a flush fails OUTSIDE a savepoint, SQLAlchemy rolls back the
+  connection, on ANY database.** The real difference between the two N3
+  tests was never SQLite-vs-Postgres — it is **HOW each test aborts**:
+  this aiosqlite test aborts via an ORM ``flush()`` with no savepoint
+  active (so only the ORM ``Session`` is left "pending rollback" — the
+  connection itself was already rolled back by SQLAlchemy), while the
+  Postgres N3 test (`tests/test_acl_ownership_rls.py::
+  TestAuditWriterRealPostgres::
   test_n3_denial_row_survives_an_rls_aborted_transaction`) aborts via a
   Core-level ``execute(text(...))``, which leaves the transaction
   genuinely OPEN AND ABORTED at the database level (no flush occurs, so
-  SQLAlchemy never rolls it back on its own). **This distinction matters
-  for 2b-core-A**, whose write methods will flush ORM objects: on
-  Postgres, a refusal raised by a flush will ALREADY have closed the
-  transaction before a denial writer runs — a NEW Postgres test below
-  (``test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_
-  have`` in the sibling PG file) checks this directly rather than
-  assuming it, since assuming it is exactly the mistake round 1 and
-  round 2 both made.
+  SQLAlchemy never rolls it back on its own).
+
+* **Fix round 4 correction (round 3's "on ANY database" was ALSO
+  overgeneralised — an independent reviewer measured a THIRD shape this
+  file did not test).** Round 3 stated the flush-rollback mechanism as
+  an unqualified law. It is not: **a flush inside an active
+  ``session.begin_nested()`` sends only ``ROLLBACK TO SAVEPOINT``** —
+  the OUTER transaction stays open, NOT aborted, and any earlier writes
+  in it remain pending and committable. A second subtlety:
+  ``begin_nested()`` itself first **autoflushes already-pending
+  objects BEFORE opening the savepoint**, so an object ``add()``-ed
+  BEFORE ``begin_nested()`` is flushed OUTSIDE the savepoint and still
+  triggers a full connection rollback — the outcome depends on where
+  the ``add``/flush sits relative to the savepoint boundary. **The
+  correct, three-shape statement**, replacing every prior "on ANY
+  database" claim in this file: (1) a flush OUTSIDE any savepoint rolls
+  back the whole connection, on any dialect; (2) a flush INSIDE an
+  active ``begin_nested()`` rolls back only to the savepoint — the
+  outer transaction stays open and usable; (3) a Core ``execute()`` with
+  no flush at all leaves the transaction open AND aborted (no
+  SQLAlchemy-initiated rollback occurs). **This distinction matters for
+  2b-core-A**, whose write methods will flush ORM objects and may use
+  ``begin_nested()`` for bulk-atomicity (spec O-4,
+  ``acl_denied_bulk_rollback``): the forward obligation is to verify
+  ``record_denial``'s behaviour against 2b-core-A's ACTUAL abort shape
+  (plain flush / savepoint-scoped flush / Core execute), never to
+  assume one shape's proof transfers to another — see the build
+  record's forward-obligation list for the shape-qualified statement of
+  this obligation (not only here, so a future builder reading the build
+  record's own "What was NOT done" list hits it directly).
 * **B3/F4 correction** — CPython interns identifier-like string
   literals, so ``is`` on ``"acl_authz"`` cannot distinguish an imported
   name from a locally re-typed copy: restoring the EXACT round-1 defect
@@ -338,34 +361,46 @@ class TestDenialRowSurvivesRollback:
     Fix round 3 correction (round 2's replacement mechanism was ALSO
     wrong — round 1 said "the transaction is STILL OPEN", round 2 said
     "aiosqlite's DBAPI driver issues the ROLLBACK" and contrasted that
-    with "Postgres does NOT auto-rollback"; both are false). **SQLAlchemy
-    rolls back the connection when an ORM ``flush()`` fails, on ANY
-    database** — this is not aiosqlite-specific, and it is SQLAlchemy
-    doing it, not the DBAPI driver. Instrumented below (not merely
-    asserted) via a connection-level ``"rollback"`` event listener: this
-    test's failed ``flush()`` fires that event, proving the rollback
-    happened, before ``record_denial`` ever runs. The REAL difference
-    between this test and the Postgres N3 test is HOW EACH ONE ABORTS:
-    this test aborts via an ORM ``flush()`` (so only the ORM ``Session``
-    object — ``db`` — is left "pending rollback"; the CONNECTION itself
-    was already rolled back by SQLAlchemy), while
+    with "Postgres does NOT auto-rollback"; both are false).
+    **Fix round 4 correction (round 3's replacement was ALSO
+    overgeneralised — an independent reviewer measured a shape round 3
+    never tested).** The correct, THREE-SHAPE statement: (1) a flush
+    OUTSIDE any active savepoint rolls back the WHOLE connection, on any
+    dialect; (2) a flush INSIDE an active ``session.begin_nested()``
+    sends only ``ROLLBACK TO SAVEPOINT`` — the OUTER transaction stays
+    open and usable, and ``begin_nested()`` itself first autoflushes any
+    already-pending objects OUTSIDE the savepoint, so where an ``add()``
+    sits relative to the savepoint boundary changes the outcome; (3) a
+    Core ``execute()`` with no flush at all leaves the transaction open
+    AND aborted (no SQLAlchemy-initiated rollback). This test exercises
+    shape (1) — an ORM ``flush()`` with no savepoint active. Instrumented
+    below (not merely asserted) via a connection-level ``"rollback"``
+    event listener: this test's failed ``flush()`` fires that event,
+    proving the rollback happened, before ``record_denial`` ever runs.
+    The REAL difference between this test and the Postgres N3 test is
+    HOW EACH ONE ABORTS: this test uses shape (1) (so only the ORM
+    ``Session`` object — ``db`` — is left "pending rollback"; the
+    CONNECTION itself was already rolled back by SQLAlchemy), while
     ``tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
-    test_n3_denial_row_survives_an_rls_aborted_transaction`` aborts via a
-    Core-level ``execute(text(...))`` with no flush, which leaves the
-    transaction genuinely OPEN AND ABORTED at the database level (no
-    flush ever runs, so SQLAlchemy has nothing to roll back on its own).
-    This test proves ORM-SESSION-level independence (``record_denial``
+    test_n3_denial_row_survives_an_rls_aborted_transaction`` uses shape
+    (3) (Core ``execute(text(...))``, no flush, transaction genuinely
+    OPEN AND ABORTED at the database level). This test proves
+    ORM-SESSION-level independence under shape (1) (``record_denial``
     never reuses ``db``'s own ``Session`` object) — the guard is still
     real and still fails when neutered (forcing ``record_denial`` to
-    write via ``db`` itself makes both assertions below go RED). It does
-    **NOT** prove genuine DB-level transaction overlap — that requires
-    the transaction to still be open, which a flush-based abort does not
-    leave behind, on any database. See
+    write via ``db`` itself makes both assertions below go RED — see the
+    build evidence for the reviewer-measured and builder-reproduced
+    transcripts; this file's own committed tests do not include that
+    neuter, since it requires an edit to ``_audit.py`` this WU does not
+    ship). It does **NOT** prove genuine DB-level transaction overlap
+    under shape (3), and says nothing at all about shape (2). See
     ``tests/test_acl_ownership_rls.py``'s
     ``test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_
-    have`` for what happens on Postgres when the abort IS a flush (the
-    shape 2b-core-A's future write methods will actually use) — that
-    test states its own finding plainly rather than assuming one."""
+    have`` for shape (1) measured directly on Postgres — that test
+    states its own finding plainly rather than assuming one, and 2b-core-
+    A must independently verify against WHICHEVER shape its own write
+    methods actually use (see the build record's forward-obligation
+    list, shape-qualified there too)."""
 
     async def test_denial_row_survives_while_the_orm_session_is_still_pending_rollback(
         self, client, user_context
@@ -406,10 +441,15 @@ class TestDenialRowSurvivesRollback:
                 # connection-level "rollback" event when the failed
                 # flush() above rolls back the connection. This is
                 # SQLAlchemy's own behaviour, not something the aiosqlite
-                # DBAPI driver does independently, and it is not
-                # SQLite-specific (a matching probe on the real Postgres
-                # harness shows the same event fires there for a
-                # flush-based abort — see
+                # DBAPI driver does independently. This is shape (1) — a
+                # flush with NO active savepoint — of the three shapes
+                # the class docstring names (fix round 4: shape (2), a
+                # flush INSIDE begin_nested(), rolls back only to the
+                # savepoint and does NOT fire this event; shape (1) is
+                # not "any dialect" in the sense of "any abort shape",
+                # only "any dialect for THIS shape" — a matching probe on
+                # the real Postgres harness shows the same event fires
+                # there for the SAME shape-(1) flush-based abort — see
                 # test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
                 # test_n3_variant_aborting_via_orm_flush_the_shape_2b_
                 # core_a_will_have). By the time we reach here, the
@@ -422,10 +462,10 @@ class TestDenialRowSurvivesRollback:
                 # regardless of `db`'s pending-rollback state — proving
                 # ORM-session-level independence (never reuses `db`
                 # itself). This is a DIFFERENT abort shape from the
-                # Postgres N3 test, which aborts via a Core `execute`
-                # (no flush) and so leaves its transaction genuinely OPEN
-                # AND ABORTED at the database level — see the class
-                # docstring.
+                # Postgres N3 test, which uses shape (3) — a Core
+                # `execute` with no flush — and so leaves its transaction
+                # genuinely OPEN AND ABORTED at the database level — see
+                # the class docstring.
                 assert rollback_events, (
                     "SQLAlchemy must have rolled back the connection "
                     "when the flush failed — this is what makes `db` "

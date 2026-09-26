@@ -1626,18 +1626,37 @@ class TestAuditWriterRealPostgres:
         via a connection-level ``"rollback"`` event (not assumed), what
         actually happens on Postgres when the abort is a flush.
 
-        **Finding, stated plainly, not assumed:** a failed ORM ``flush()``
-        rolls back the Postgres connection immediately — SAME as
-        aiosqlite (``tests/test_console_acl_audit_writer.py::
-        TestDenialRowSurvivesRollback``). This is NOT a SQLite-specific
-        behaviour; it is SQLAlchemy's own flush-error handling, on any
-        database. **Consequence for 2b-core-A:** a future write method
-        that flushes an ACL-entry INSERT and has it refused will find the
-        transaction ALREADY CLOSED by the time it calls a denial writer —
-        the genuinely-open-and-aborted scenario
-        ``test_n3_denial_row_survives_an_rls_aborted_transaction`` proves
-        survival under is the Core-``execute`` shape, not the
-        ORM-``flush`` shape 2b-core-A will actually have. This is a
+        **Fix round 4 correction: round 3's OWN finding was ALSO
+        overgeneralised** ("on any database" as if it covered every abort
+        shape). An independent reviewer measured a THIRD shape this test
+        does not exercise: a flush INSIDE an active
+        ``session.begin_nested()`` sends only ``ROLLBACK TO SAVEPOINT``
+        — the outer transaction stays open and usable, and
+        ``begin_nested()`` itself first autoflushes any already-pending
+        objects OUTSIDE the savepoint. **The correct, three-shape
+        statement:** (1) a flush with no savepoint active rolls back the
+        WHOLE connection (what THIS test measures); (2) a flush inside
+        ``begin_nested()`` rolls back only to the savepoint, leaving the
+        outer transaction open; (3) a Core ``execute()`` with no flush
+        leaves the transaction open AND aborted (the sibling
+        ``test_n3_denial_row_survives_an_rls_aborted_transaction``).
+
+        **Finding, stated plainly, not assumed, for shape (1) only:** a
+        failed ORM ``flush()`` with no savepoint active rolls back the
+        Postgres connection immediately — SAME as aiosqlite
+        (``tests/test_console_acl_audit_writer.py::
+        TestDenialRowSurvivesRollback``) for this SAME shape; this is not
+        a SQLite-versus-Postgres difference, it is SQLAlchemy's own
+        flush-error handling for shape (1) specifically. **Consequence
+        for 2b-core-A:** a future write method that flushes an ACL-entry
+        INSERT with NO savepoint active, and has it refused, will find
+        the transaction ALREADY CLOSED by the time it calls a denial
+        writer. If 2b-core-A instead uses ``begin_nested()`` for bulk
+        atomicity (spec O-4, ``acl_denied_bulk_rollback``), shape (2)
+        applies instead and the transaction stays open — 2b-core-A must
+        verify against ITS OWN actual abort shape (see the build
+        record's forward-obligation list, shape-qualified there too),
+        never assume one shape's proof transfers to another. This is a
         finding for 2b-core-A's own build, not a defect in this WU."""
         factory = interactions_harness.factory
         owner = _new_user_context(_OWNER)
@@ -1674,11 +1693,13 @@ class TestAuditWriterRealPostgres:
                     await db.flush()
 
                 assert rollback_events, (
-                    "FINDING: a failed ORM flush() did NOT roll back the "
-                    "Postgres connection immediately — if this fires, "
-                    "the flush-based abort leaves the transaction "
-                    "genuinely open on Postgres (unlike aiosqlite) and "
-                    "the docstring above is wrong; investigate before "
+                    "FINDING: a failed ORM flush() with no savepoint "
+                    "active did NOT roll back the connection immediately "
+                    "— if this fires, THIS shape (flush, no savepoint) no "
+                    "longer matches shape (1) in the docstring above "
+                    "(shape (2), a savepoint-scoped flush, is EXPECTED to "
+                    "leave the transaction open — that is a different "
+                    "test, not this assertion firing); investigate before "
                     "changing this assertion"
                 )
 
@@ -1698,6 +1719,21 @@ class TestAuditWriterRealPostgres:
                 await db.rollback()  # clean up the ORM session's own pending state
 
             async with factory() as fresh:
+                acl_count = (
+                    await fresh.execute(
+                        text(
+                            "SELECT count(*) FROM console_acl_entries "
+                            "WHERE resource_id = 'agent-orm-flush-variant'"
+                        )
+                    )
+                ).scalar_one()
+                assert acl_count == 0, (
+                    "the flush-refused ACL insert must not have landed "
+                    "(spec N3 requires both halves; the primary "
+                    "test_n3_denial_row_survives_an_rls_aborted_transaction "
+                    "already asserts this — this variant asserts it too "
+                    "rather than relying on the sibling test alone)"
+                )
                 denial_count = (
                     await fresh.execute(
                         text("SELECT count(*) FROM interactions WHERE id = :id"),
