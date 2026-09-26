@@ -44,7 +44,7 @@ dependencies = [
     "langfuse>=4.0.0,<5.0.0",
     "openai>=1.12.0",
     "alembic>=1.13.0",
-    "sqlalchemy>=2.0.25",
+    "sqlalchemy[asyncio]>=2.0.25",
     # asyncpg = production async Postgres driver. psycopg2-binary kept for
     # Alembic + the sync RLS oracle test (out-of-band of the request loop).
     # aiosqlite = async SQLite for the in-memory test engine.
