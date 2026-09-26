@@ -197,7 +197,7 @@ services:
   keycloak:
     # Chart-aligned (quay.io/keycloak/keycloak:24.0 — already
     # matched pre-B7; preserved here).
-    image: quay.io/keycloak/keycloak:24.0
+    image: ghcr.io/lfdesousa/audittrace-keycloak:24.0-frozen-sep26
     container_name: audittrace-keycloak
     command: start-dev --import-realm --health-enabled=true
     depends_on:
@@ -286,7 +286,10 @@ services:
     # — if he prefers we keep bitnami at any cost, we'd need to step
     # back and audit the bitnami libfile source to find the missing
     # override hook (or fork the image).
-    image: rabbitmq:3.13-management-alpine
+    # Upstream tag was FLOATING. Frozen at what it resolved to on
+    # 2026-09-26,
+    # sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
+    image: ghcr.io/lfdesousa/audittrace-rabbitmq-mgmt:3.13-management-alpine-frozen-sep26
     container_name: audittrace-rabbitmq
     environment:
       # Upstream conventions: RABBITMQ_DEFAULT_USER/PASS/VHOST.
@@ -383,7 +386,7 @@ services:
   # See AGENTS.md "docker-compose stack — B7 step 1 rebuild" for the
   # full compose-vs-helm posture rationale.
   vault:
-    image: hashicorp/vault:1.20.1
+    image: ghcr.io/lfdesousa/audittrace-vault:1.20.1-frozen-sep26
     container_name: audittrace-vault
     profiles: ["vault"]
     cap_add:
@@ -413,7 +416,7 @@ services:
   # Config files committed under config/compose/{otel-collector,tempo,
   # loki,grafana}/ — minimum-viable single-binary configs.
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.102.0
+    image: ghcr.io/lfdesousa/audittrace-otel-collector:0.102.0-frozen-sep26
     container_name: audittrace-otel-collector
     profiles: ["obs"]
     command: ["--config=/etc/otelcol/config.yaml"]
@@ -427,7 +430,7 @@ services:
     restart: unless-stopped
 
   tempo:
-    image: grafana/tempo:2.5.0
+    image: ghcr.io/lfdesousa/audittrace-tempo:2.5.0-frozen-sep26
     container_name: audittrace-tempo
     profiles: ["obs"]
     command: ["-config.file=/etc/tempo/tempo.yaml"]
@@ -441,7 +444,7 @@ services:
     restart: unless-stopped
 
   loki:
-    image: grafana/loki:3.0.0
+    image: ghcr.io/lfdesousa/audittrace-loki:3.0.0-frozen-sep26
     container_name: audittrace-loki
     profiles: ["obs"]
     command: ["-config.file=/etc/loki/loki-config.yaml"]
@@ -455,7 +458,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:10.4.0
+    image: ghcr.io/lfdesousa/audittrace-grafana:10.4.0-frozen-sep26
     container_name: audittrace-grafana
     profiles: ["obs"]
     environment:
@@ -500,7 +503,11 @@ services:
     restart: unless-stopped
 
   langfuse-web:
-    image: langfuse/langfuse:2
+    # Upstream tag was FLOATING (major only): the same `up` on two
+    # machines could get different bytes. Frozen at what `:2`
+    # resolved to on 2026-09-26,
+    # sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    image: ghcr.io/lfdesousa/audittrace-langfuse:2-frozen-sep26
     container_name: audittrace-langfuse-web
     profiles: ["langfuse"]
     depends_on:
@@ -525,7 +532,10 @@ services:
   # cc-side PR-A14). clamd is the malware scanner — ≥1 GB RAM floor
   # per the PR-A11 OOMKill forensic; profile-only because of cost.
   cc-clamd:
-    image: clamav/clamav:1.4
+    # Upstream tag was FLOATING (minor). Frozen at what `1.4` resolved
+    # to on 2026-09-26,
+    # sha256:383f77291d9e3f8d2fc72da805d37895dfbe86844dc91c3520d5ff194922292d
+    image: ghcr.io/lfdesousa/audittrace-clamav:1.4-frozen-sep26
     container_name: audittrace-cc-clamd
     profiles: ["content-control"]
     healthcheck:
@@ -564,7 +574,10 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: traefik:v3.6
+    # Upstream tag was FLOATING (minor). Frozen at what `v3.6` resolved
+    # to on 2026-09-26,
+    # sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d
+    image: ghcr.io/lfdesousa/audittrace-traefik:v3.6-frozen-sep26
     container_name: audittrace-traefik
     ports:
       - "443:443"
