@@ -82,11 +82,15 @@ methodology as N7's).
   the ``add``/flush sits relative to the savepoint boundary. **The
   correct, three-shape statement**, replacing every prior "on ANY
   database" claim in this file: (1) a flush OUTSIDE any savepoint rolls
-  back the whole connection, on any dialect; (2) a flush INSIDE an
-  active ``begin_nested()`` rolls back only to the savepoint — the
-  outer transaction stays open and usable; (3) a Core ``execute()`` with
-  no flush at all leaves the transaction open AND aborted (no
-  SQLAlchemy-initiated rollback occurs). **This distinction matters for
+  back the whole connection — both dialects measured; (2) a flush
+  INSIDE an active ``begin_nested()`` rolls back only to the savepoint
+  — the outer transaction stays open and usable; (3) a Core
+  ``execute()`` with no flush at all leaves the transaction open AND
+  aborted **on Postgres** (no SQLAlchemy-initiated rollback occurs) —
+  **on aiosqlite the transaction stays open and is NOT aborted; the
+  next statement succeeds.** Whether a failed statement poisons the
+  transaction is decided by the database server, not by SQLAlchemy.
+  **This distinction matters for
   2b-core-A**, whose write methods will flush ORM objects and may use
   ``begin_nested()`` for bulk-atomicity (spec O-4,
   ``acl_denied_bulk_rollback``): the forward obligation is to verify
@@ -365,14 +369,18 @@ class TestDenialRowSurvivesRollback:
     **Fix round 4 correction (round 3's replacement was ALSO
     overgeneralised — an independent reviewer measured a shape round 3
     never tested).** The correct, THREE-SHAPE statement: (1) a flush
-    OUTSIDE any active savepoint rolls back the WHOLE connection, on any
-    dialect; (2) a flush INSIDE an active ``session.begin_nested()``
-    sends only ``ROLLBACK TO SAVEPOINT`` — the OUTER transaction stays
-    open and usable, and ``begin_nested()`` itself first autoflushes any
-    already-pending objects OUTSIDE the savepoint, so where an ``add()``
-    sits relative to the savepoint boundary changes the outcome; (3) a
-    Core ``execute()`` with no flush at all leaves the transaction open
-    AND aborted (no SQLAlchemy-initiated rollback). This test exercises
+    OUTSIDE any active savepoint rolls back the WHOLE connection — both
+    dialects measured; (2) a flush INSIDE an active
+    ``session.begin_nested()`` sends only ``ROLLBACK TO SAVEPOINT`` —
+    the OUTER transaction stays open and usable, and ``begin_nested()``
+    itself first autoflushes any already-pending objects OUTSIDE the
+    savepoint, so where an ``add()`` sits relative to the savepoint
+    boundary changes the outcome; (3) a Core ``execute()`` with no
+    flush at all leaves the transaction open AND aborted **on
+    Postgres** (no SQLAlchemy-initiated rollback) — **on aiosqlite the
+    transaction stays open and is NOT aborted; the next statement
+    succeeds** (whether a failed statement poisons the transaction is
+    decided by the database server, not by SQLAlchemy). This test exercises
     shape (1) — an ORM ``flush()`` with no savepoint active. Instrumented
     below (not merely asserted) via a connection-level ``"rollback"``
     event listener: this test's failed ``flush()`` fires that event,
@@ -387,12 +395,19 @@ class TestDenialRowSurvivesRollback:
     OPEN AND ABORTED at the database level). This test proves
     ORM-SESSION-level independence under shape (1) (``record_denial``
     never reuses ``db``'s own ``Session`` object) — the guard is still
-    real and still fails when neutered (forcing ``record_denial`` to
-    write via ``db`` itself makes both assertions below go RED — see the
-    build evidence for the reviewer-measured and builder-reproduced
-    transcripts; this file's own committed tests do not include that
-    neuter, since it requires an edit to ``_audit.py`` this WU does not
-    ship). It does **NOT** prove genuine DB-level transaction overlap
+    real and still fails when neutered, measured as two DISTINCT
+    failures, not one: a neuter that makes ``record_denial`` share the
+    caller's own already-pending-rollback ``Session`` fails AT THE
+    ``record_denial`` CALL ITSELF with ``PendingRollbackError`` —
+    raised before either assertion below is reached, with
+    ``rollback_events`` already having passed by then; a separate
+    neuter that instead has ``record_denial`` commit via a fresh flush
+    on that same shared session fails the ``denial_rows`` assertion
+    specifically (``rollback_events`` still passes). See the build
+    evidence (N3b) for the reviewer-measured transcripts of both
+    neuters; this file's own committed tests do not include either
+    neuter, since both require an edit to ``_audit.py`` this WU does
+    not ship. It does **NOT** prove genuine DB-level transaction overlap
     under shape (3), and says nothing at all about shape (2). See
     ``tests/test_acl_ownership_rls.py``'s
     ``test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_

@@ -288,7 +288,7 @@ from a separate connection, and the server statement log):
 | Core `session.execute(text(...))` | `'idle in transaction (aborted)'` | 0 | `InFailedSQLTransactionError` |
 | ORM flush INSIDE `begin_nested()` | `'idle in transaction'` (OPEN, not aborted) | 0 | OK, usable |
 | aiosqlite ORM flush | n/a | 1 | `PendingRollbackError` |
-| aiosqlite Core `execute` | n/a | 0 | OK (SQLite never aborts the txn on a constraint error) |
+| aiosqlite Core `execute` | n/a | 0 | OK (did not abort on this CHECK violation) |
 
 Call chain, identical on both dialects for the flush-no-savepoint case:
 `Session.flush` (orm/session.py:4353) → `_flush`:4489 →
@@ -318,16 +318,23 @@ introduced independently.
 "ALREADY CLOSED" claim in §0c above and everywhere else in this repo:**
 
 1. A flush with **no active savepoint** rolls back the WHOLE connection
-   — SQLAlchemy's own behaviour, on any dialect. (What round 3's two
-   tests actually measure — this part of round 3's claim IS true.)
+   — SQLAlchemy's own behaviour, both dialects measured. (What round
+   3's two tests actually measure — this part of round 3's claim IS
+   true.)
 2. A flush **inside an active `session.begin_nested()`** sends only
    `ROLLBACK TO SAVEPOINT` — the OUTER transaction stays open, NOT
    aborted, and usable; any earlier writes in it remain pending and
    committable. **Round 3 never tested this shape and its universal
    wording is false for it.**
 3. A Core `execute()` with **no flush at all** leaves the transaction
-   open AND aborted — no SQLAlchemy-initiated rollback occurs (the
-   pre-existing `test_n3_denial_row_survives_an_rls_aborted_transaction`).
+   open AND aborted **on Postgres** — no SQLAlchemy-initiated rollback
+   occurs (the pre-existing
+   `test_n3_denial_row_survives_an_rls_aborted_transaction`). **On
+   aiosqlite this same shape does NOT abort the transaction — the
+   next statement succeeds (table row above).** Whether a failed
+   statement poisons the transaction is a decision made by the
+   database server, not by SQLAlchemy — round 3's wording named no
+   database for this shape and was read as universal; it is not.
 
 **A second subtlety** (found when the reviewer's first savepoint neuter
 came out unexpectedly GREEN): `begin_nested()` itself first autoflushes
