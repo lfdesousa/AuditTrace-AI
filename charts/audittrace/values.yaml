@@ -598,6 +598,9 @@ redis:
       # explicit sunset holding org — the likeliest next casualty
       # after MinIO closed on BOTH public registries in a
       # fortnight. Mirrored while still pullable, not after.
+      # MULTI-ARCH (linux/amd64, linux/arm64) — copied
+      # registry-to-registry with `docker buildx imagetools create`,
+      # which preserves the upstream index. Verified on the mirror.
       registry: ghcr.io
       repository: lfdesousa/audittrace-redis-exporter
       # Tag MUST be pinned here: the subchart otherwise supplies its
@@ -832,6 +835,8 @@ chromadb:
   persistPath: /data
   image:
     # MIRRORED to ghcr.io 2026-09-26 — see the MinIO finding.
+    # MULTI-ARCH (linux/amd64, linux/arm64), copied
+    # registry-to-registry via `imagetools create`. Verified.
     repository: ghcr.io/lfdesousa/audittrace-chroma
     tag: "1.5.7-frozen-sep26"
   port: 8000
