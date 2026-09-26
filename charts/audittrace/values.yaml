@@ -594,7 +594,18 @@ redis:
     # repo) at pinned NodePort 30921.
     enabled: true
     image:
-      repository: bitnamilegacy/redis-exporter
+      # MIRRORED to ghcr.io 2026-09-26. `bitnamilegacy` is an
+      # explicit sunset holding org — the likeliest next casualty
+      # after MinIO closed on BOTH public registries in a
+      # fortnight. Mirrored while still pullable, not after.
+      # MULTI-ARCH (linux/amd64, linux/arm64) — copied
+      # registry-to-registry with `docker buildx imagetools create`,
+      # which preserves the upstream index. Verified on the mirror.
+      registry: ghcr.io
+      repository: lfdesousa/audittrace-redis-exporter
+      # Tag MUST be pinned here: the subchart otherwise supplies its
+      # own default tag, which does not exist in our mirror.
+      tag: 1.62.0-debian-12-r2-frozen-sep26
 
 # -- RabbitMQ (ADR-057, ADR-048 scan-control broker) ───────────────────
 # Bitnami subchart wiring for the AMQP broker that carries scan
@@ -823,8 +834,11 @@ chromadb:
   #     kubectl exec <chromadb-pod> -- cat /config.yaml
   persistPath: /data
   image:
-    repository: chromadb/chroma
-    tag: "1.5.7"
+    # MIRRORED to ghcr.io 2026-09-26 — see the MinIO finding.
+    # MULTI-ARCH (linux/amd64, linux/arm64), copied
+    # registry-to-registry via `imagetools create`. Verified.
+    repository: ghcr.io/lfdesousa/audittrace-chroma
+    tag: "1.5.7-frozen-sep26"
   port: 8000
   persistence:
     size: 10Gi
