@@ -401,12 +401,12 @@ class TestDenialRowSurvivesRollback:
     ``record_denial`` CALL ITSELF with ``PendingRollbackError`` —
     raised before either assertion below is reached, with
     ``rollback_events`` already having passed by then; a separate
-    neuter that instead has ``record_denial`` commit via a fresh flush
-    on that same shared session fails the ``denial_rows`` assertion
+    neuter that changes ``record_denial``'s own commit, on its own
+    independent session, to a flush fails the ``denial_rows`` assertion
     specifically (``rollback_events`` still passes). See the build
     evidence (N3b) for the reviewer-measured transcripts of both
     neuters; this file's own committed tests do not include either
-    neuter, since both require an edit to ``_audit.py`` this WU does
+    neuter, since both change ``_audit.py``'s behaviour, which this WU does
     not ship. It does **NOT** prove genuine DB-level transaction overlap
     under shape (3), and says nothing at all about shape (2). See
     ``tests/test_acl_ownership_rls.py``'s
@@ -461,8 +461,8 @@ class TestDenialRowSurvivesRollback:
                 # the class docstring names (fix round 4: shape (2), a
                 # flush INSIDE begin_nested(), rolls back only to the
                 # savepoint and does NOT fire this event; shape (1) is
-                # not "any dialect" in the sense of "any abort shape",
-                # only "any dialect for THIS shape" — a matching probe on
+                # not universal across abort shapes — it is shape (1)
+                # specifically, both dialects measured — a matching probe on
                 # the real Postgres harness shows the same event fires
                 # there for the SAME shape-(1) flush-based abort — see
                 # test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
