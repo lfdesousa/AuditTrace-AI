@@ -46,17 +46,33 @@ methodology as N7's).
   N7/F3 neuters" — FALSE (those neuters change the ``trace_id`` VALUE,
   never what the hash COVERS). Fixed by
   ``test_denial_content_hash_verifies_with_a_real_non_null_trace_id``.
-* **B2/F2 correction** — an engine-event trace showed aiosqlite's DBAPI
-  driver issues ``BEGIN``/``ROLLBACK`` around the failed ``flush()``
-  itself, so by the time ``record_denial`` runs, the DB-level
-  transaction has ALREADY rolled back — only the ORM ``Session`` object
-  is still pending its own ``rollback()`` call. The round-1 claim that
-  "``db``'s transaction is STILL OPEN" was wrong about the DATABASE
-  (right only about the ORM session). ``TestDenialRowSurvivesRollback``
-  is renamed and its docstring corrected: it proves ORM-session-level
-  independence on aiosqlite; genuine DB-level transaction overlap is
-  proven on Postgres alone (SQLite cannot have two writers overlap at
-  all — a real held-open transaction there hits "database is locked").
+* **B2 correction (round 2's OWN replacement claim was ALSO wrong)** —
+  round 2 attributed the observed ``BEGIN``/``ROLLBACK`` to "aiosqlite's
+  DBAPI driver" and contrasted it with "Postgres does NOT auto-rollback"
+  — a SQLite-versus-Postgres claim. **Both halves were wrong.** A
+  connection-level ``event.listen(engine, "rollback", ...)`` probe
+  (added below, so this is now instrumented, not asserted) shows the
+  rollback fires as a **SQLAlchemy** connection-level event, not
+  something the aiosqlite driver does on its own — and a matching probe
+  against the real Postgres harness shows the SAME thing happens there:
+  **SQLAlchemy rolls back the connection when an ORM ``flush()`` fails,
+  on ANY database.** The real difference between the two N3 tests was
+  never SQLite-vs-Postgres — it is **HOW each test aborts**: this
+  aiosqlite test aborts via an ORM ``flush()`` (so only the ORM
+  ``Session`` is left "pending rollback" — the connection itself was
+  already rolled back by SQLAlchemy), while the Postgres N3 test
+  (`tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+  test_n3_denial_row_survives_an_rls_aborted_transaction`) aborts via a
+  Core-level ``execute(text(...))``, which leaves the transaction
+  genuinely OPEN AND ABORTED at the database level (no flush occurs, so
+  SQLAlchemy never rolls it back on its own). **This distinction matters
+  for 2b-core-A**, whose write methods will flush ORM objects: on
+  Postgres, a refusal raised by a flush will ALREADY have closed the
+  transaction before a denial writer runs — a NEW Postgres test below
+  (``test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_
+  have`` in the sibling PG file) checks this directly rather than
+  assuming it, since assuming it is exactly the mistake round 1 and
+  round 2 both made.
 * **B3/F4 correction** — CPython interns identifier-like string
   literals, so ``is`` on ``"acl_authz"`` cannot distinguish an imported
   name from a locally re-typed copy: restoring the EXACT round-1 defect
@@ -109,7 +125,7 @@ from dataclasses import replace
 import pytest
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 
 from audittrace import integrity
@@ -319,87 +335,118 @@ class TestDenialRowSurvivesRollback:
     in, taking any in-transaction row with it; the denial row, written in
     its OWN independent transaction, must NOT be taken down with it.
 
-    Fix round 2 (F2 correction) — what this test actually proves on
-    aiosqlite, precisely, after an engine-event trace: aiosqlite's DBAPI
-    driver issues ``BEGIN``/``ROLLBACK`` around the failed ``flush()``
-    itself, so by the time ``record_denial`` runs, the underlying SQLite
-    transaction has ALREADY been rolled back at the DB level — only the
-    SQLAlchemy ORM ``Session`` object (``db``) is still "pending
-    rollback" from the ORM's own point of view. The round-1 comment
-    claiming "``db``'s transaction is STILL OPEN here" was WRONG about
-    the DATABASE; it is correct only about the ORM SESSION. Genuine
-    DB-level transaction overlap — the actual thing §5.2 requires the
-    denial row to survive — is NOT reproducible on SQLite: forcing the
-    transaction to stay open at the DB level (a Core-level ``execute``
-    instead of a flush) makes ``record_denial``'s independent session
-    hit ``database is locked``, because SQLite cannot have two writers
-    overlapping at all, aborted or not. This test proves
-    ORM-SESSION-level independence only (``record_denial`` never reuses
-    ``db``'s own ``Session`` object) — the guard is still real and still
-    fails when neutered (forcing ``record_denial`` to write via ``db``
-    itself makes both assertions below go RED), but the DB-level overlap
-    claim is proven on Postgres ALONE
-    (``tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
-    test_n3_denial_row_survives_an_rls_aborted_transaction``, where
-    Postgres does NOT auto-rollback an aborted transaction — the client
-    must issue ``ROLLBACK`` explicitly, so the transaction genuinely
-    stays open at the DB level until this test does so)."""
+    Fix round 3 correction (round 2's replacement mechanism was ALSO
+    wrong — round 1 said "the transaction is STILL OPEN", round 2 said
+    "aiosqlite's DBAPI driver issues the ROLLBACK" and contrasted that
+    with "Postgres does NOT auto-rollback"; both are false). **SQLAlchemy
+    rolls back the connection when an ORM ``flush()`` fails, on ANY
+    database** — this is not aiosqlite-specific, and it is SQLAlchemy
+    doing it, not the DBAPI driver. Instrumented below (not merely
+    asserted) via a connection-level ``"rollback"`` event listener: this
+    test's failed ``flush()`` fires that event, proving the rollback
+    happened, before ``record_denial`` ever runs. The REAL difference
+    between this test and the Postgres N3 test is HOW EACH ONE ABORTS:
+    this test aborts via an ORM ``flush()`` (so only the ORM ``Session``
+    object — ``db`` — is left "pending rollback"; the CONNECTION itself
+    was already rolled back by SQLAlchemy), while
+    ``tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+    test_n3_denial_row_survives_an_rls_aborted_transaction`` aborts via a
+    Core-level ``execute(text(...))`` with no flush, which leaves the
+    transaction genuinely OPEN AND ABORTED at the database level (no
+    flush ever runs, so SQLAlchemy has nothing to roll back on its own).
+    This test proves ORM-SESSION-level independence (``record_denial``
+    never reuses ``db``'s own ``Session`` object) — the guard is still
+    real and still fails when neutered (forcing ``record_denial`` to
+    write via ``db`` itself makes both assertions below go RED). It does
+    **NOT** prove genuine DB-level transaction overlap — that requires
+    the transaction to still be open, which a flush-based abort does not
+    leave behind, on any database. See
+    ``tests/test_acl_ownership_rls.py``'s
+    ``test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_
+    have`` for what happens on Postgres when the abort IS a flush (the
+    shape 2b-core-A's future write methods will actually use) — that
+    test states its own finding plainly rather than assuming one."""
 
     async def test_denial_row_survives_while_the_orm_session_is_still_pending_rollback(
         self, client, user_context
     ) -> None:
-        session_factory = await _open_db()
-        async with session_factory() as db:
-            db.add(
-                ConsoleAclEntry(
-                    id=str(uuid.uuid4()),
-                    user_sub=user_context.user_id,
+        pg = get_postgres_factory()
+        session_factory = pg.get_session_factory()
+        sync_engine = pg.get_engine().sync_engine
+        rollback_events: list[bool] = []
+
+        def _on_rollback(_conn: object) -> None:
+            rollback_events.append(True)
+
+        event.listen(sync_engine, "rollback", _on_rollback)
+        try:
+            async with session_factory() as db:
+                db.add(
+                    ConsoleAclEntry(
+                        id=str(uuid.uuid4()),
+                        user_sub=user_context.user_id,
+                        principal_type="user",
+                        principal_id="p1",
+                        principal_model="User",
+                        resource_type="agent",
+                        resource_id="agent-check-violation",
+                        # Violates ck_console_acl_entries_perm_bits_range
+                        # (031:97-100) on BOTH dialects.
+                        perm_bits=99,
+                        granted_at_ms=0,
+                        created_at_ms=0,
+                        updated_at_ms=0,
+                    )
+                )
+                with pytest.raises(IntegrityError):
+                    await db.flush()
+
+                # INSTRUMENTED, not asserted (fix round 3 — a claim that
+                # needs a script should be a test): SQLAlchemy fires a
+                # connection-level "rollback" event when the failed
+                # flush() above rolls back the connection. This is
+                # SQLAlchemy's own behaviour, not something the aiosqlite
+                # DBAPI driver does independently, and it is not
+                # SQLite-specific (a matching probe on the real Postgres
+                # harness shows the same event fires there for a
+                # flush-based abort — see
+                # test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+                # test_n3_variant_aborting_via_orm_flush_the_shape_2b_
+                # core_a_will_have). By the time we reach here, the
+                # CONNECTION has already been rolled back; only the ORM
+                # `Session` object (`db`) is still "pending rollback"
+                # from the ORM's own point of view (it will not let us
+                # reuse it for further work until we call `db.rollback()`
+                # below). `record_denial` opens its OWN, completely
+                # independent Session/connection and must succeed
+                # regardless of `db`'s pending-rollback state — proving
+                # ORM-session-level independence (never reuses `db`
+                # itself). This is a DIFFERENT abort shape from the
+                # Postgres N3 test, which aborts via a Core `execute`
+                # (no flush) and so leaves its transaction genuinely OPEN
+                # AND ABORTED at the database level — see the class
+                # docstring.
+                assert rollback_events, (
+                    "SQLAlchemy must have rolled back the connection "
+                    "when the flush failed — this is what makes `db` "
+                    "merely ORM-session-pending, not DB-transaction-open"
+                )
+                denial = await record_denial(
+                    user_context=user_context,
+                    op="grantPermission",
                     principal_type="user",
                     principal_id="p1",
-                    principal_model="User",
                     resource_type="agent",
                     resource_id="agent-check-violation",
-                    # Violates ck_console_acl_entries_perm_bits_range
-                    # (031:97-100) on BOTH dialects.
                     perm_bits=99,
-                    granted_at_ms=0,
-                    created_at_ms=0,
-                    updated_at_ms=0,
+                    failure_class=FAILURE_CLASS_ACL_DENIED_POLICY,
+                    predicate_or_attempted_row={"perm_bits": 99},
+                    db_error_class="IntegrityError",
                 )
-            )
-            with pytest.raises(IntegrityError):
-                await db.flush()
 
-            # `db`, the SQLAlchemy ORM Session, is still "pending
-            # rollback" here (fix round 2 correction: on aiosqlite the
-            # underlying DB-level transaction has ALREADY been rolled
-            # back by the driver at the failed flush() itself — an
-            # engine-event trace confirms `BEGIN`/`ROLLBACK` around the
-            # flush; only the ORM session object is still awaiting its
-            # own `rollback()` call). `record_denial` opens its OWN,
-            # completely independent Session/connection and must succeed
-            # regardless of `db`'s pending-rollback state — proving
-            # ORM-session-level independence (never reuses `db` itself).
-            # Genuine DB-level transaction overlap is NOT reproducible on
-            # SQLite (a real held-open write transaction would make this
-            # second write hit "database is locked"); that claim is
-            # proven on Postgres alone — see the class docstring and
-            # test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
-            # test_n3_denial_row_survives_an_rls_aborted_transaction.
-            denial = await record_denial(
-                user_context=user_context,
-                op="grantPermission",
-                principal_type="user",
-                principal_id="p1",
-                resource_type="agent",
-                resource_id="agent-check-violation",
-                perm_bits=99,
-                failure_class=FAILURE_CLASS_ACL_DENIED_POLICY,
-                predicate_or_attempted_row={"perm_bits": 99},
-                db_error_class="IntegrityError",
-            )
-
-            await db.rollback()  # now clean up the still-pending failure
+                await db.rollback()  # clean up the ORM session's own pending state
+        finally:
+            event.remove(sync_engine, "rollback", _on_rollback)
 
         async with session_factory() as fresh:
             acl_rows = (
@@ -427,7 +474,8 @@ class TestDenialRowSurvivesRollback:
                 .all()
             )
             assert len(denial_rows) == 1, (
-                "the denial row must survive the STILL-OPEN aborted transaction"
+                "the denial row must survive the caller's still-pending "
+                "ORM session state"
             )
 
 

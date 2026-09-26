@@ -135,7 +135,10 @@ import json  # noqa: E402
 import uuid  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 
+from sqlalchemy import event  # noqa: E402
+
 from audittrace import dependencies  # noqa: E402
+from audittrace.db.models import ConsoleAclEntry  # noqa: E402
 from audittrace.db.postgres import PostgresFactory  # noqa: E402
 from audittrace.db.rls import set_current_user_id  # noqa: E402
 from audittrace.identity import UserContext  # noqa: E402
@@ -1488,16 +1491,26 @@ class TestAuditWriterRealPostgres:
     async def test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds(
         self, interactions_harness: _InteractionsHarness
     ) -> None:
-        """The F2 falsifiability proof, COMMITTED (fix round 2 — a
-        reviewer noted this claim previously depended on an uncommitted
-        throwaway script; "a claim that needs a script should have a
-        test"). Simulates the "tempting fix" §5.4 forbids — a
-        ``record_denial`` that reused the CALLER's still-aborted session
-        instead of opening its own — inline, against a real aborted
-        transaction, and shows it fails with Postgres's own
-        "current transaction is aborted" error, while the REAL writer
-        (independent session, unmodified) succeeds under the identical
-        conditions."""
+        """The F2 falsifiability DEMONSTRATION, COMMITTED (fix round 2 —
+        a reviewer noted this claim previously depended on an
+        uncommitted throwaway script; "a claim that needs a script
+        should have a test"). Simulates the "tempting fix" §5.4
+        forbids — a ``record_denial`` that reused the CALLER's
+        still-aborted session instead of opening its own — inline,
+        against a real aborted transaction, and shows it fails with
+        Postgres's own "current transaction is aborted" error, while the
+        REAL writer (independent session, unmodified) succeeds under the
+        identical conditions.
+
+        Round 3 correction (non-blocking): this is a DEMONSTRATION, not
+        a regression guard — its "bad" half never calls
+        ``_audit.record_denial`` at all (it is raw SQL asserting a
+        Postgres property), so no future regression IN THE WRITER can
+        turn it red; its "good" half duplicates the coverage
+        ``test_n3_denial_row_survives_an_rls_aborted_transaction``
+        already provides. Kept because it makes the underlying Postgres
+        behaviour concrete and readable, not because it adds a distinct
+        guard."""
         factory = interactions_harness.factory
         owner = _new_user_context(_OWNER)
         set_current_user_id(owner.user_id)
@@ -1598,6 +1611,106 @@ class TestAuditWriterRealPostgres:
                 )
         finally:
             set_current_user_id(None)
+
+    async def test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_have(
+        self, interactions_harness: _InteractionsHarness
+    ) -> None:
+        """Fix round 3 — round 1 and round 2 both ASSUMED how an
+        ORM-flush-based abort behaves, and both assumptions were wrong
+        (round 1: "the transaction is still open"; round 2: "aiosqlite's
+        driver rolls it back, Postgres does not"). 2b-core-A's future
+        write methods will FLUSH ORM objects — the SAME abort shape the
+        aiosqlite N3 test uses, NOT the Core-level ``execute`` this
+        file's ``test_n3_denial_row_survives_an_rls_aborted_transaction``
+        uses to hold the transaction open. This test checks, INSTRUMENTED
+        via a connection-level ``"rollback"`` event (not assumed), what
+        actually happens on Postgres when the abort is a flush.
+
+        **Finding, stated plainly, not assumed:** a failed ORM ``flush()``
+        rolls back the Postgres connection immediately — SAME as
+        aiosqlite (``tests/test_console_acl_audit_writer.py::
+        TestDenialRowSurvivesRollback``). This is NOT a SQLite-specific
+        behaviour; it is SQLAlchemy's own flush-error handling, on any
+        database. **Consequence for 2b-core-A:** a future write method
+        that flushes an ACL-entry INSERT and has it refused will find the
+        transaction ALREADY CLOSED by the time it calls a denial writer —
+        the genuinely-open-and-aborted scenario
+        ``test_n3_denial_row_survives_an_rls_aborted_transaction`` proves
+        survival under is the Core-``execute`` shape, not the
+        ORM-``flush`` shape 2b-core-A will actually have. This is a
+        finding for 2b-core-A's own build, not a defect in this WU."""
+        factory = interactions_harness.factory
+        owner = _new_user_context(_OWNER)
+        sync_engine = factory.kw["bind"].sync_engine
+        rollback_events: list[bool] = []
+
+        def _on_rollback(_conn: object) -> None:
+            rollback_events.append(True)
+
+        event.listen(sync_engine, "rollback", _on_rollback)
+        set_current_user_id(owner.user_id)
+        try:
+            async with factory() as db:
+                db.add(
+                    ConsoleAclEntry(
+                        id=str(uuid.uuid4()),
+                        user_sub=owner.user_id,
+                        principal_type="user",
+                        principal_id="p1",
+                        principal_model="User",
+                        resource_type="agent",
+                        resource_id="agent-orm-flush-variant",
+                        # Violates ck_console_acl_entries_perm_bits_range
+                        # (031:97-100) — the SAME CHECK the aiosqlite N3
+                        # test uses, so this is the identical abort shape,
+                        # on Postgres.
+                        perm_bits=99,
+                        granted_at_ms=0,
+                        created_at_ms=0,
+                        updated_at_ms=0,
+                    )
+                )
+                with pytest.raises(DBAPIError):
+                    await db.flush()
+
+                assert rollback_events, (
+                    "FINDING: a failed ORM flush() did NOT roll back the "
+                    "Postgres connection immediately — if this fires, "
+                    "the flush-based abort leaves the transaction "
+                    "genuinely open on Postgres (unlike aiosqlite) and "
+                    "the docstring above is wrong; investigate before "
+                    "changing this assertion"
+                )
+
+                with _wired_postgres_factory(factory):
+                    denial = await _audit.record_denial(
+                        user_context=owner,
+                        op="grantPermission",
+                        principal_type="user",
+                        principal_id="p1",
+                        resource_type="agent",
+                        resource_id="agent-orm-flush-variant",
+                        perm_bits=99,
+                        failure_class=_audit.FAILURE_CLASS_ACL_DENIED_POLICY,
+                        predicate_or_attempted_row={"perm_bits": 99},
+                    )
+
+                await db.rollback()  # clean up the ORM session's own pending state
+
+            async with factory() as fresh:
+                denial_count = (
+                    await fresh.execute(
+                        text("SELECT count(*) FROM interactions WHERE id = :id"),
+                        {"id": denial.id},
+                    )
+                ).scalar_one()
+                assert denial_count == 1, (
+                    "the denial row must survive regardless of which "
+                    "abort shape triggered it"
+                )
+        finally:
+            set_current_user_id(None)
+            event.remove(sync_engine, "rollback", _on_rollback)
 
     async def test_n4_writer_raises_on_a_broken_audit_write(
         self,

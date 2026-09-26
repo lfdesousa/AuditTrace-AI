@@ -1,4 +1,4 @@
-# Evidence — Sovereign Authorization Layer, ACL 2b-core-B audit writer, local capture (2026-09-25, fix round 2)
+# Evidence — Sovereign Authorization Layer, ACL 2b-core-B audit writer, local capture (2026-09-25/26, fix round 3)
 
 **Scope of this evidence file.** ACL 2b-core-B
 (`2026-09-25-SPEC-acl-2b-core-B-audit-writer-CONSOLIDATED-v2.md`,
@@ -10,13 +10,17 @@ unmeetable here by construction; this file satisfies Rule 1
 (Verification) and gives the harness-level Rule-3-shaped capture, same
 precedent as WU-2a's own routeless evidence file.
 
-**This is fix round 2, after an independent-review REJECT with 3 narrow
-findings** (round 1 fixed 7 findings including a real security defect,
-F1; round 1's mechanics — `make test`, coverage, ruff/mypy, frozen
-invariants, no trailers — all held independently in the reviewer's own
-venv; round 2's findings are entirely about CLAIMS being wrong even
-where the underlying code was right). §0a is round 1's original
-"what was wrong" section (kept for history); §0b below is round 2's.
+**This is fix round 3, after a ONE-BLOCKER independent-review REJECT.**
+Round 1 fixed 7 findings including a real security defect (F1). Round 2
+fixed 3 narrower findings (B1/B2/B3), all "the code is right and the
+claim about it is wrong" — and B1/B3 and every non-blocking item from
+that round were accepted as closed, verified independently by a 23-row
+neuter table in the reviewer's own venv. **Round 2's OWN replacement
+claim for B2 was ALSO wrong** — see §0c. §0a is round 1's original
+history; §0b is round 2's; §0c (this round) corrects §0b's own mistake.
+Nothing is silently edited: each round's wrong claim stays visible,
+annotated, next to its correction — this project's append-only-decision-
+log discipline applied to a build record.
 
 ## 0a. What round 1 got wrong, and the fix (F1–F7)
 
@@ -122,21 +126,25 @@ test_denial_content_hash_verifies_with_a_real_non_null_trace_id`
 one new test, 26 others in the file unaffected; restored, `diff -q`
 byte-identical.
 
-**B2 (F2, the aiosqlite claim was false as written).** Round 1's N3
-aiosqlite test comment said *"`db`'s transaction is STILL OPEN here —
-the failed flush has not been rolled back yet."* This was WRONG about
-the DATABASE: aiosqlite's DBAPI driver issues `BEGIN`/`ROLLBACK` around
-the failed `flush()` itself, so the DB-level transaction has ALREADY
-rolled back by the time `record_denial` runs; only the SQLAlchemy ORM
-`Session` object is still "pending rollback" from the ORM's own point of
-view. Genuine DB-level transaction overlap is impossible to reproduce on
-SQLite at all — holding a transaction open at the DB level (a Core
-`execute` a second writer must wait behind) makes the second write hit
-`database is locked`, because SQLite cannot have two writers overlap,
-aborted or not. **The guard itself was never wrong** — both N3 aiosqlite
-assertions still go RED if `record_denial` is forced to write via the
-caller's own session (proven: see §3b below). **Fixed**: the test is
-renamed
+**B2 (F2, the aiosqlite claim was false as written).** ⚠ **This
+paragraph's OWN mechanism claim was ALSO wrong — see §0c below for the
+correction. Kept verbatim, not silently edited, per this project's
+append-only-decision-log discipline: a correction is a new claim, and
+the wrong one stays visible next to it.** Round 1's N3 aiosqlite test
+comment said *"`db`'s transaction is STILL OPEN here — the failed flush
+has not been rolled back yet."* This was WRONG about the DATABASE:
+aiosqlite's DBAPI driver issues `BEGIN`/`ROLLBACK` around the failed
+`flush()` itself, so the DB-level transaction has ALREADY rolled back by
+the time `record_denial` runs; only the SQLAlchemy ORM `Session` object
+is still "pending rollback" from the ORM's own point of view. Genuine
+DB-level transaction overlap is impossible to reproduce on SQLite at
+all — holding a transaction open at the DB level (a Core `execute` a
+second writer must wait behind) makes the second write hit `database is
+locked`, because SQLite cannot have two writers overlap, aborted or not.
+**The guard itself was never wrong** — both N3 aiosqlite assertions
+still go RED if `record_denial` is forced to write via the caller's own
+session (proven: see §3b below). **Fixed (round 2, since further
+corrected — §0c)**: the test is renamed
 (`test_denial_row_survives_while_the_orm_session_is_still_pending_
 rollback`), its docstring and the module docstring now state plainly
 that aiosqlite proves ORM-SESSION-level independence only; genuine
@@ -187,7 +195,66 @@ test property, for this specific kind of literal.
 - The F2 falsifiability proof is now a COMMITTED, real pytest test
   (`test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds`,
   `tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres`) rather
-  than an uncommitted throwaway script — see §3b.
+  than an uncommitted throwaway script — see §3b. ⚠ **Round 3 softens
+  this to "demonstrated"** — see §0c.
+
+## 0c. Fix round 3 — round 2's B2 correction was ALSO wrong ("a correction is a new claim")
+
+Round 2 replaced round 1's false claim ("the transaction is STILL OPEN")
+with ANOTHER false claim: *"aiosqlite's DBAPI **driver** issues
+`BEGIN`/`ROLLBACK`"*, contrasted with *"Postgres does NOT
+auto-rollback."* Both halves were wrong, and the build record cited "an
+engine-event trace" as showing the driver did it — **that trace never
+showed that.**
+
+**The corrected mechanism, INSTRUMENTED this round, not asserted:**
+
+> **SQLAlchemy rolls back the connection when an ORM `flush()` fails, on
+> ANY database.** This is not aiosqlite-specific and it is not the DBAPI
+> driver doing it — it is SQLAlchemy's own flush-error handling. The
+> REAL difference between the two N3 tests was never SQLite-vs-Postgres;
+> it is **HOW EACH ONE ABORTS**: the aiosqlite test aborts via an ORM
+> `flush()`, so only the ORM `Session` object is left "pending
+> rollback" (the connection itself was already rolled back by
+> SQLAlchemy). The Postgres `test_n3_denial_row_survives_an_rls_aborted_
+> transaction` aborts via a Core-level `execute(text(...))` with no
+> flush, which leaves the transaction genuinely OPEN AND ABORTED at the
+> database level (SQLAlchemy has nothing to roll back on its own,
+> because no flush ran).
+
+**Instrumented, not asserted, in two places:**
+
+1. `tests/test_console_acl_audit_writer.py::TestDenialRowSurvivesRollback::
+   test_denial_row_survives_while_the_orm_session_is_still_pending_rollback`
+   now attaches a connection-level `event.listen(engine, "rollback",
+   ...)` listener BEFORE the failed `flush()`, and asserts the event
+   fired — proving, not asserting in prose, that SQLAlchemy rolled back
+   the connection.
+2. NEW: `tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
+   test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_have`
+   — the SAME instrumentation, on the real Postgres harness, aborting
+   via an ORM `flush()` (the shape 2b-core-A's future write methods will
+   actually use, unlike the Core-`execute` abort the pre-existing N3 PG
+   test uses). Run, this box, 2026-09-25:
+
+```
+$ .venv/bin/pytest tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_have -v --no-cov
+tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_variant_aborting_via_orm_flush_the_shape_2b_core_a_will_have PASSED
+============================== 1 passed in 1.55s ===============================
+```
+
+**The finding, stated plainly (a finding for 2b-core-A's own build, not
+a defect in this WU):** the `rollback` event fires on Postgres too — a
+failed ORM `flush()` rolls back the connection immediately, on Postgres
+exactly as on aiosqlite. **Consequence:** a future 2b-core-A write
+method that flushes an ACL-entry INSERT and has it refused will find the
+transaction ALREADY CLOSED by the time it calls a denial writer — the
+genuinely-open-and-aborted scenario the pre-existing PG N3 test proves
+survival under is the Core-`execute` abort shape, not the ORM-`flush`
+shape 2b-core-A will actually have. 2b-core-A's own build should verify
+`record_denial`'s independent-session behaviour against ITS actual
+abort shape (flush-based), not assume the Core-`execute` proof
+transfers.
 
 ## 1. Per-guard neuter table (N1–N8 plus F1/F3/F4/F5/F6), `cmp`-verified restore
 
@@ -195,7 +262,7 @@ test property, for this specific kind of literal.
 |---|---|---|---|---|
 | N1 — success row, full payload | `TestRecordSuccess` (aiosqlite) / `test_n1_...` (PG) | Direct behavioural assertion against a real write (no fault injected — this guard IS the happy path) | n/a by design | n/a |
 | N2 — denial row, separately | `TestRecordDenial` (aiosqlite) / `test_n2_...` (PG) | Direct behavioural assertion against a real denial write | n/a by design | n/a |
-| N3 — denial survives rollback | `TestDenialRowSurvivesRollback` (aiosqlite — ORM-SESSION independence only, see B2 correction §0b) / `test_n3_denial_row_survives_an_rls_aborted_transaction` (PG — genuine DB-level RLS abort overlap) | Aiosqlite: the ORM session is pending-rollback when `record_denial` runs (DB-level transaction already closed by the driver). PG: the DB-level transaction is genuinely still open (Postgres does not auto-rollback) | YES — falsifiability now proven by a COMMITTED test, `test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds` (§3b) | n/a (that test simulates the bad pattern inline; the shipped `_audit.py` is never modified by it) |
+| N3 — denial survives rollback | `TestDenialRowSurvivesRollback` (aiosqlite — flush-based abort, ORM-session independence) / `test_n3_denial_row_survives_an_rls_aborted_transaction` (PG — Core-`execute`-based abort, genuine DB-level overlap) / `test_n3_variant_aborting_via_orm_flush_...` (PG — flush-based abort, the 2b-core-A shape, §0c) | The abort SHAPE, not the dialect, is what differs: an ORM `flush()` failure makes SQLAlchemy roll back the connection immediately, on EITHER dialect (instrumented via a `"rollback"` connection event in both the aiosqlite and the new PG-flush test); a Core `execute()` failure with no flush leaves the transaction genuinely open-and-aborted at the DB level (the pre-existing PG test) | YES — the connection-level rollback event fires and is asserted in both flush-based tests; the shared-session simulation (§3b) DEMONSTRATES (not "proves" — see §3b's own softened wording) the independent-session requirement | n/a (no source file is modified by any of these tests) |
 | N4 — writer raises, fail-closed | `TestFailClosed` (aiosqlite+PG) + `test_n4_no_ambient_identity_...` (PG) | Monkeypatched `_content_hash`/`get_postgres_factory` to raise; separately, a swallowing `try/except` wrapped `record_denial`'s `db.commit()` | YES — `test_n4_no_ambient_identity_...` failed under the swallow-neuter | YES — `diff -q` byte-identical restore |
 | N5 — append-only trigger, behavioural | `TestAppendOnlyTriggerNeuter` | `DROP TRIGGER interactions_append_only` (admin connection) | YES — UPDATE succeeded while dropped | YES — single `CREATE TRIGGER`; `pg_trigger` (tgname **+** `pg_get_triggerdef`, fix round 1 — name-only comparison replaced) compared to the pre-drop capture, exact match |
 | N6 — §10.1 limitation pin | `TestCrossSubjectAuditReadIsImpossible` (exactly one test) | Not neutered — neutering a limitation-pin would fabricate a "control", contradicting its purpose | n/a by design | n/a |
@@ -247,18 +314,17 @@ the value in BOTH the active-span AND no-span cases, so BOTH
 `TestTraceIdDerivation` tests failed — a stronger neuter than the spec
 asked for, but not the one the spec named, hence the discrepancy.
 
-## 3b. F2's falsifiability proof, now a committed test (B2 non-blocking fix)
+## 3b. F2's falsifiability demonstration, now committed (B2 non-blocking fix, softened per round-3 review)
 
 `tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::
 test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds`
-replaces the round-1 uncommitted throwaway script. It provokes a real
-RLS abort (mismatched `user_sub` INSERT into `console_acl_entries`),
+replaces the round-1/round-2 uncommitted throwaway script. It provokes a
+real RLS abort (mismatched `user_sub` INSERT into `console_acl_entries`),
 then — on the SAME still-aborted session — attempts a raw INSERT
-simulating what a "shared session" `record_denial` would do; this
-raises Postgres's own `current transaction is aborted` error (asserted
-via `pytest.raises`). It then repeats the identical abort on a SEPARATE
-session and calls the REAL, unmodified `record_denial`, which succeeds.
-Run, this box, 2026-09-25:
+simulating what a "shared session" `record_denial` would do; this raises
+Postgres's own `current transaction is aborted` error. It then repeats
+the identical abort on a SEPARATE session and calls the REAL, unmodified
+`record_denial`, which succeeds. Run, this box, 2026-09-25:
 
 ```
 $ .venv/bin/pytest tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds -v --no-cov
@@ -266,38 +332,51 @@ tests/test_acl_ownership_rls.py::TestAuditWriterRealPostgres::test_n3_a_shared_s
 ============================== 1 passed in 1.54s ===============================
 ```
 
-This test does not modify `_audit.py` — it simulates the forbidden
-pattern INLINE with raw SQL, so it is a genuine regression guard against
-a future `record_denial` change that reuses the caller's session,
-without ever touching the shipped module during a normal test run.
+**Round 3 correction (non-blocking, folded in): this test DEMONSTRATES
+the property; it does not "prove" or act as a regression "guard" the way
+round 2's wording claimed.** Its "bad" half is raw SQL asserting a
+Postgres PROPERTY (a shared, already-aborted session cannot be used) —
+it never calls `_audit.record_denial` at all, so no future regression in
+the WRITER can turn this half red. Its "good" half calls the real writer
+under the same abort, but that is not new coverage:
+`test_n3_denial_row_survives_an_rls_aborted_transaction` already proves
+the writer succeeds under a Core-`execute` abort. What WOULD actually
+redden all three N3-family tests is neutering the writer itself (making
+`record_denial` reuse the caller's session) — which is exactly what
+§2/§0a's F1 neuter methodology and the `TestFailClosed` monkeypatches
+already do for OTHER guards, and which this specific test does not do.
+This test is retained as a permanent, readable DEMONSTRATION of the
+underlying Postgres behaviour the guard depends on — valuable for a
+future reader, but not itself a redundant-with-`test_n3` regression
+guard.
 
-## 4. Full verbose runs, this box, 2026-09-25, unmodified (post-fix-round-2) code
+## 4. Full verbose runs, this box, 2026-09-25, unmodified (post-fix-round-3) code
 
 ```
 $ .venv/bin/pytest tests/test_console_acl_audit_writer.py -v --no-cov
 collected 26 items
 ... (26 passed — TestRecordSuccess x2, TestRecordDenial x3,
-     TestDenialRowSurvivesRollback x1 (renamed, B2),
+     TestDenialRowSurvivesRollback x1 (instrumented with a
+     connection-level rollback-event assertion, round 3),
      TestFailClosed x3, TestTraceIdDerivation x2,
      TestDenialTraceIdDerivation x2, TestEventClassPinning x2
      (identity test REMOVED, B3), TestSessionIdDerivation x3,
      TestContentHashCoversANonNullTraceId x2 (record_denial half
      added, B1), TestForgedIdentityIsRefused x3,
      TestUserIdAndGrantedByDerivation x3)
-============================== 26 passed in 2.34s ==============================
+============================== 26 passed in 2.47s ==============================
 
 $ .venv/bin/pytest tests/test_acl_ownership_rls.py -v --no-cov
-collected 29 items
-... (17 pre-existing WU-2a tests UNCHANGED + 12 ACL-2b-core-B tests
-     (test_n3_a_shared_session_would_fail_where_the_real_writer_succeeds
-     and test_n4_unbound_ambient_identity_refuses_any_subject_forged_or_not
-     added this round), all PASSED)
-============================== 29 passed in 3.80s ==============================
+collected 30 items
+... (17 pre-existing WU-2a tests UNCHANGED + 13 ACL-2b-core-B tests —
+     round 3 adds test_n3_variant_aborting_via_orm_flush_the_shape_2b_
+     core_a_will_have, all PASSED)
+============================== 30 passed in 3.93s ==============================
 ```
 
-`git diff main -- tests/test_acl_ownership_rls.py`: 911 insertions, **0
+`git diff main -- tests/test_acl_ownership_rls.py`: 1024 insertions, **0
 deletions** (the §2 frozen-exception requirement, re-verified after fix
-round 2 — was 787/0 after round 1). `git diff main -- src/audittrace/
+round 3 — was 911/0 after round 2). `git diff main -- src/audittrace/
 migrations/versions/032_....py`: empty (migration 032 untouched).
 
 ## 5. Single alembic head (§11's exact requirement)
