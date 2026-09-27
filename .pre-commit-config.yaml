@@ -26,7 +26,7 @@ repos:
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.8.0
+    rev: v2.3.1
     hooks:
       - id: mypy
         additional_dependencies:
@@ -41,6 +41,10 @@ repos:
           # two gates agree on whether `type: ignore` comments are needed
           # (was a 2026-05-03 stabilisation pickup).
           - minio
+          # langfuse is a runtime dep: without it the hook type-checks the
+          # untyped fallback `_lf_observe` shim in routes/chat.py and mypy >=2
+          # reports [untyped-decorator] that local `make lint` never sees.
+          - langfuse>=4.0.0,<5.0.0
           # ADR-006 — audittrace-object-storage ships py.typed from
           # v0.1.1; include it so pre-commit's mypy resolves the ABC
           # types and downstream subclass checks succeed.
