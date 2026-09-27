@@ -12,8 +12,11 @@ None`` (ADDENDUM Y-1/AB-1(1)): a time-limited grant must be superseded
 by a re-grant exactly as a NULL-expiry one is. **MEASURED this round —
 a plain top-level import of that ONE name is NOT safe**, unlike
 ADDENDUM AB-1(1)'s prediction: it reproduces the SAME pinned
-pre-commit mypy hook (v1.8.0) cold-cache failure the B6 block below
-documents for ``AclGrantOp``/``_MockAclEntry`` — resolving ``_mock.py``
+pre-commit mypy hook cold-cache failure the B6 block below documents
+for ``AclGrantOp``/``_MockAclEntry`` (the mechanism is a resolution
+cycle, not tied to any one mypy release — the pinned hook's version is
+whatever the repo's ``.pre-commit-config.yaml`` names at the time)
+— resolving ``_mock.py``
 as a dependency of THIS module (to type-check the new import) makes
 mypy unable to determine ``_MockAclWrites``' own decorated mixin
 methods' types, in a self-referential cycle. :func:`_not_expired_fn`
@@ -96,8 +99,9 @@ if TYPE_CHECKING:
     # ``_postgres_write.py``'s identical block: a module-level
     # (unconditionally executed) import of a name from
     # ``audittrace.services.console_acl`` (the PACKAGE's own
-    # ``__init__.py``) makes the pinned pre-commit mypy hook (v1.8.0)
-    # fail from a cold cache on this file's `@log_call`-decorated mixin
+    # ``__init__.py``) makes the pinned pre-commit mypy hook (whichever
+    # version ``.pre-commit-config.yaml`` names) fail from a cold cache
+    # on this file's `@log_call`-decorated mixin
     # methods, because resolving ``__init__.py`` pulls in ``_mock.py``
     # (its own bottom import block) as a dependency. A
     # ``TYPE_CHECKING``-only import of the SAME name does not trigger

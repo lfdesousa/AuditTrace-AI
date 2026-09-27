@@ -9,16 +9,15 @@ survived a re-grant untouched, because the write path's expire
 predicate (``expired_at_ms IS NULL``) was narrower than the read
 path's own active predicate (``expired_at_ms IS NULL OR expired_at_ms
 > now``). ADDENDUM AB's fix makes the write path DERIVE the read
-path's predicate instead of re-spelling it — but five successive
+path's predicate instead of re-spelling it — but successive
 STRUCTURAL pins on that derivation each fell to an escape that
 preserved the code's SHAPE while breaking its BEHAVIOUR: a divergent
-spelling (v1), deleting the predicate outright (v2), keeping the
-derived call but discarding its result (e1), a lifetime threshold
-(e2k), and a lapse grace (eG) — recorded in ADDENDUM AD-1/AE-1/AF-1.
-**This grid is the correctness guard those five neuters proved a
-structural pin cannot be** (ADDENDUM AD-1(3)): every future escape on
-this property is tested against THIS file, never answered with a
-sixth structural pin.
+spelling, deleting the predicate outright, keeping the derived call
+but discarding its result, a lifetime threshold, and a lapse grace —
+recorded in ADDENDUM AD-1/AE-1/AF-1. **This grid is the correctness
+guard those neuters proved a structural pin cannot be** (ADDENDUM
+AD-1(3)): every future escape on this property is tested against THIS
+file, never answered with a sixth structural pin.
 
 **The grid.** The predicate under test reads ONLY ``expired_at_ms``
 against ``now_ms``, so the grid walks both axes it can read:
@@ -29,13 +28,12 @@ against ``now_ms``, so the grid walks both axes it can read:
   **lapsed**: R1 has already lapsed by the time W2 runs, and must stay
   UNTOUCHED by every later write at the same key
 * near-future ``G = -1``: R1 is still active by exactly 1 ms when W2
-  runs, and must be SUPERSEDED at W2's clock (ADDENDUM Y-1) — this is
-  ADDENDUM Y's original ``now+1h`` scenario, generalised across all six
-  lifetimes and sampled at the boundary Y-T1 does not (spec's own
-  ``Y-T1`` test, kept separately in ``tests/test_acl_write_path_rls.py``,
-  asserts the SAME supersession through the READ path —
-  ``get_effective_permissions``/``has_permission`` — which this grid
-  does not exercise; neither instrument makes the other redundant).
+  runs, and must be SUPERSEDED at W2's clock (ADDENDUM Y-1) — this
+  samples the BOUNDARY only (one ms before R1's own scheduled expiry,
+  regardless of its lifetime). It does NOT sample a predecessor that
+  is SOLIDLY inside its active window with a long time still to run —
+  that is the separate "still active" variant below, required
+  alongside this grid, not replaced by it.
 
 History at one key, the SITE under test (``grant`` or ``bulk``)
 performs W2 and W3:
@@ -54,35 +52,46 @@ a fresh Postgres session as the owner, under RLS) — never from the
 test's own clock variable. A precondition assert on every cell —
 ``s2 - R1.expired_at_ms == G`` and ``R1.expired_at_ms -
 R1.created_at_ms == L`` and ``s3 == s2 + 1`` — makes each cell a
-MEASUREMENT of what was actually WRITTEN, correcting ADDENDUM AE's
-prose claim that "any delta works" for a sleep-seeded lapsed row: a
-fixed sleep delta bounds the lifetime the variant exercises (every
-threshold above it escapes undetected), which is exactly why the grid
-walks the lifetime axis with a clock seam instead.
+MEASUREMENT of what was actually WRITTEN: a fixed sleep delta bounds
+the lifetime a variant exercises (every threshold above it escapes
+undetected), which is exactly why the grid walks the lifetime axis
+with a clock seam instead of a sleep.
 
-**Provenance.** Ported from the independent reviewer's own probe
-(ADDENDUM AF's evidence directory,
-``2026-09-27-AF-lapsed-clock-grid/test_af_lapsed_clock.py``, byte
-content sha256 ``cea4bc59…``, its ``SHA256SUMS`` file sha256
-``399d7b51…`` — both verified against the evidence on disk before this
-file was written) — re-derived cell for cell against THIS repo's own
-fixtures and naming conventions (ADDENDUM AF: "the builder carries it
-byte-for-byte or re-derives it cell for cell").
+**Provenance.** Derived from the reviewer's own probe used during the
+independent spec-gate review of this property's chain (verified
+byte-for-byte against the reviewer's evidence before use, per that
+review's own instruction to carry it "byte-for-byte or re-derive it
+cell for cell") — re-derived here cell for cell against THIS repo's
+own fixtures and naming conventions.
 
-**NULL-expiry variant.** The grid above only ever seeds R1 with a
-concrete (possibly future) ``expired_at_ms`` — the THIRD required
-predecessor variant, R1 with ``expired_at_ms=None`` (ADDENDUM AD-1(1);
-"unchanged" by every later addendum), has the SAME three-write history
-shape as the near-future cell above (a NULL-expiry row is active until
-explicitly superseded, exactly like one with a still-future
-``expired_at_ms`` — the only difference is what the PREDECESSOR's own
-``expired_at_ms`` reads as before W2). The EXISTING ``TestExpireAndInsert``
-tests in ``tests/test_console_acl_write_path.py`` prove the (a)/(b)
-shape for a TWO-write history (W1 then W2 only) — they do NOT prove
-that R1 stays untouched by a THIRD write once already expired, which
-is exactly the property v2/e1/e2/e2k/eG break. ``test_ac_t_hist_null_variant_*``
-below closes that gap: same W1/W2/W3 history as the near-future cell,
-R1 seeded with ``expired_at_ms=None``.
+**The three required predecessor variants (ADDENDUM AD-1(1), kept
+through AF):**
+
+1. **NULL-expiry** — R1 seeded with ``expired_at_ms=None``
+   (``test_ac_t_hist_null_variant_*`` below): the grid above never
+   produces this (every grid cell seeds a CONCRETE ``expired_at_ms``).
+   The EXISTING ``TestExpireAndInsert`` tests in
+   ``tests/test_console_acl_write_path.py`` prove the analogous (a)/(b)
+   shape for a TWO-write history (W1 then W2 only) — they do NOT prove
+   that R1 stays untouched by a THIRD write once already expired, which
+   is exactly the property the required neuters break. Per ADDENDUM
+   AD-1(1)'s ORIGINAL history (not the grid's later "site performs W2
+   AND W3" widening, which is specific to the clock grid): W2 is
+   ALWAYS ``grant(7)``; only W3 is the site under test.
+2. **The clock-seeded grid**, above (time-limited/lapsed + the
+   near-future boundary sample).
+3. **Time-limited, SOLIDLY still active (``now+1h``)** — R1 seeded with
+   a concrete future ``expired_at_ms`` a full hour out, W2 running
+   immediately (not one ms before the scheduled expiry): the grid's
+   near-future cells sample the BOUNDARY only, so a predicate that
+   narrows "still active" to "within a short window of its own
+   scheduled expiry" (an escape that keeps the derived call, and every
+   `AB-G`-visible spelling intact) passes the near-future cells — R1's
+   remaining lifetime there is always exactly 1 ms — while still
+   reproducing ADDENDUM Y-0's original downgrade for anything with more
+   than that window left to run. Same AD-1(1) history shape as the
+   NULL variant (W2 always ``grant(7)``; W3 is the site under test).
+   ``test_ac_t_hist_time_limited_variant_*`` below.
 """
 
 from __future__ import annotations
@@ -309,12 +318,14 @@ async def test_ac_t_hist_grid_mock(
     await _run_cell(monkeypatch, service, _ctx(_OWNER), site, case, _read, pg=False)
 
 
-# ── The NULL-expiry variant — AC-T-HIST's THIRD required predecessor
-# (ADDENDUM AD-1(1), "unchanged" through AF). Same three-write history
-# and the same near-future assertion shape (R1 is active until
-# explicitly superseded), seeded with expired_at_ms=None instead of a
-# future timestamp — the case the clock-seeded grid above never
-# produces (every grid cell seeds a CONCRETE expired_at_ms). ──────────
+# ── The NULL-expiry variant — AC-T-HIST's first required predecessor
+# (ADDENDUM AD-1(1), "unchanged" through AF). Same three-write history,
+# seeded with expired_at_ms=None instead of a future timestamp — the
+# case the clock-seeded grid above never produces (every grid cell
+# seeds a CONCRETE expired_at_ms). **W2 is ALWAYS grant(7)** (AD-1(1)'s
+# ORIGINAL shape — never site-dependent; only W3 is the site under
+# test — unlike the clock grid above, which AF widened specifically for
+# ITS OWN cells). ─────────────────────────────────────────────────────
 
 
 async def _run_null_cell(
@@ -338,7 +349,7 @@ async def _run_null_cell(
         assert created == (None, _T0), "R1 must start NULL-expiry, updated at T0"
 
         clock["t"] = _T0 + 1
-        r2, ids_w2 = await _site(service, ctx, site, 7)
+        r2 = await service.grant_permission(ctx, perm_bits=7, **_KEY)
         r2_id = r2["id"]
         rows = await read()
         s2 = rows[r2_id][3]
@@ -356,11 +367,10 @@ async def _run_null_cell(
         if pg:
             set_current_user_id(None)
 
+    assert s3 == s2 + 1, f"s3-s2={s3 - s2} (want 1)"
     assert after_w2 == (s2, s2), "RED — R1 (NULL-expiry) must be superseded by W2"
     assert after_w3 == (s2, s2), "RED — R1 must not be touched again by W3"
     assert r2_after_w3 == (s3, s3), "RED — R2 must be superseded by W3"
-    if ids_w2 is not None:
-        assert ids_w2 == [r1_id]
     if ids_w3 is not None:
         assert ids_w3 == [r2_id]
     assert set_s3 == {r2_id}
@@ -402,3 +412,107 @@ async def test_ac_t_hist_null_variant_mock(
         }
 
     await _run_null_cell(monkeypatch, service, _ctx(_OWNER), site, _read, pg=False)
+
+
+# ── The "still active" variant — AC-T-HIST's THIRD required
+# predecessor (ADDENDUM AE-1(1), kept and NOT replaced by the grid's
+# near-future boundary sample — ADDENDUM AF-1(1): "at the boundary
+# Y-T1 does not sample"). R1 has a full hour left to run when W2
+# supersedes it — nothing about R1 is close to lapsing. Same AD-1(1)
+# history shape as the NULL variant (W2 is ALWAYS grant(7)). ─────────
+
+
+async def _run_time_limited_cell(
+    monkeypatch: pytest.MonkeyPatch,
+    service: Any,
+    ctx: UserContext,
+    site: str,
+    read: _ReadFn,
+    *,
+    pg: bool,
+) -> None:
+    clock = {"t": _T0}
+    monkeypatch.setattr(_clock_module, "now_ms", lambda: clock["t"])
+
+    if pg:
+        set_current_user_id(ctx.user_id)
+    try:
+        r1_id = (
+            await service.grant_permission(
+                ctx, perm_bits=15, expired_at_ms=_T0 + _HOUR, **_KEY
+            )
+        )["id"]
+        rows = await read()
+        created = rows[r1_id][1:3]
+        assert created == (_T0 + _HOUR, _T0), "R1 must start with a full hour left"
+
+        clock["t"] = _T0 + 1  # W2 runs immediately — R1 still has ~1h left
+        r2 = await service.grant_permission(ctx, perm_bits=7, **_KEY)
+        r2_id = r2["id"]
+        rows = await read()
+        s2 = rows[r2_id][3]
+        after_w2 = rows[r1_id][1:3]
+
+        clock["t"] = s2 + 1
+        r3, ids_w3 = await _site(service, ctx, site, 3)
+        r3_id = r3["id"]
+        rows = await read()
+        s3 = rows[r3_id][3]
+        after_w3 = rows[r1_id][1:3]
+        r2_after_w3 = rows[r2_id][1:3]
+        set_s3 = {row_id for row_id, values in rows.items() if values[1] == s3}
+    finally:
+        if pg:
+            set_current_user_id(None)
+
+    assert s3 == s2 + 1, f"s3-s2={s3 - s2} (want 1)"
+    assert after_w2 == (s2, s2), (
+        "RED — R1 (still an hour from its scheduled expiry) must be "
+        "superseded by W2 regardless — Y-1 supersedes every active row, "
+        "not only one close to lapsing"
+    )
+    assert after_w3 == (s2, s2), "RED — R1 must not be touched again by W3"
+    assert r2_after_w3 == (s3, s3), "RED — R2 must be superseded by W3"
+    if ids_w3 is not None:
+        assert ids_w3 == [r2_id]
+    assert set_s3 == {r2_id}
+
+
+@pytest.mark.skipif(_ADMIN_URL is None, reason=_SKIP_REASON)
+@pytest.mark.parametrize("site", ["grant", "bulk"])
+async def test_ac_t_hist_time_limited_variant_postgres(
+    write_harness: Any,  # noqa: F811 - reused fixture, imported above
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+) -> None:
+    owner = _ctx(_OWNER)
+    await _run_time_limited_cell(
+        monkeypatch,
+        write_harness.service,
+        owner,
+        site,
+        lambda: _pg_rows(write_harness.factory, owner.user_id),
+        pg=True,
+    )
+
+
+@pytest.mark.parametrize("site", ["grant", "bulk"])
+async def test_ac_t_hist_time_limited_variant_mock(
+    client: Any, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    service = MockConsoleAclEntriesService()
+
+    async def _read() -> dict[str, _Row]:
+        return {
+            entry.id: (
+                entry.perm_bits,
+                entry.expired_at_ms,
+                entry.updated_at_ms,
+                entry.created_at_ms,
+            )
+            for entry in service._entries
+        }
+
+    await _run_time_limited_cell(
+        monkeypatch, service, _ctx(_OWNER), site, _read, pg=False
+    )

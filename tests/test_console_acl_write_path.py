@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 import uuid
 
 import pytest
@@ -95,31 +96,6 @@ async def _old_row_expired_at_ms(
             sa.select(ConsoleAclEntry.expired_at_ms).where(ConsoleAclEntry.id == row_id)
         )
         return result.scalar_one()
-
-
-async def _force_expired_at_ms(
-    service: ConsoleAclEntriesService, row_id: str, value: int | None
-) -> None:
-    """Force a SPECIFIC row's ``expired_at_ms`` directly, bypassing the
-    service entirely — the neuter primitive
-    ``TestSameBitsRegrantSpecialCaseNeuter`` uses to reproduce, on the
-    OUTPUT, exactly what a same-bits special case would have left
-    behind (there is no such branch in the source to edit — the
-    special case does not exist — so the neuter is applied post-hoc to
-    the row, then restored, cmp-verified, the same discipline spec §9
-    requires of a source-level neuter)."""
-    if isinstance(service, MockConsoleAclEntriesService):
-        row = next(e for e in service._entries if e.id == row_id)
-        row.expired_at_ms = value
-        return
-    pg = dependencies.get_postgres_factory()
-    async with pg.get_session_factory()() as db:
-        await db.execute(
-            sa.update(ConsoleAclEntry)
-            .where(ConsoleAclEntry.id == row_id)
-            .values(expired_at_ms=value)
-        )
-        await db.commit()
 
 
 @pytest_asyncio.fixture
@@ -544,13 +520,16 @@ class TestExpireAndInsert:
         still insert a new row) would sail straight through: a new row
         with a different id still lands, the OLD row is just left
         active too. The AC-T-HIST clock-seeded grid (``tests/
-        test_acl_write_path_rls.py``) can never catch that class either
-        — its history always CHANGES bits between writes (15 -> 7 -> 3)
-        by construction, so it never exercises a same-bits re-grant.
-        This is the ONE test in the whole build that does, and the
-        load-bearing assertion is the OLD row's ``expired_at_ms`` — see
-        ``TestSameBitsRegrantSpecialCaseNeuter`` below for the proof
-        that it is not vacuous."""
+        test_acl_write_path_lapsed_clock.py``) can never catch that
+        class either — its history always CHANGES bits between writes
+        (15 -> 7 -> 3) by construction, so it never exercises a
+        same-bits re-grant. This is the ONE test in the whole build
+        that does, and the load-bearing assertion is the OLD row's
+        ``expired_at_ms``. A one-line source change at the mock's
+        grant-path expire predicate (skip a row whose bits already
+        match the re-grant) reddens this test on ``[mock]`` — measured
+        as a source-level neuter and captured in the round's evidence,
+        not shipped as an in-repo tautology."""
         first = await service.grant_permission(
             user_context,
             principal_type="user",
@@ -576,62 +555,137 @@ class TestExpireAndInsert:
         )
 
 
-class TestSameBitsRegrantSpecialCaseNeuter:
-    """Gate-AF should-fix, ADDENDUM AF's evidence — closed here. The
-    clock-seeded lapsed grid (AC-T-HIST) always changes ``perm_bits``
-    between successive writes at one key, so a hypothetical "skip the
-    expire step when the re-grant's bits equal the existing active
-    row's" special case is INVISIBLE to it — no test in the grid, and
-    none of Y-T1/Y-T3, ever re-grants identical bits. This class proves
-    ``test_identical_bits_still_expires_and_inserts`` (above) is the
-    guard, and that it is load-bearing, by reproducing exactly what
-    such a special case would leave behind — the OLD row reverted to
-    active post-hoc, as if the implementation had never expired it —
-    and showing the WEAK assertion (id difference alone) stays green
-    while the STRENGTHENED one (the old row's own expiry) reddens."""
+# ── Y-T1 / Y-T1n / Y-T2 (spec Y-3, kept per ADDENDUM AE-3) — the
+# supersession of a time-limited predecessor proven through the READ
+# path (``get_effective_permissions``/``has_permission``), which
+# AC-T-HIST (the clock-seeded grid, ``tests/
+# test_acl_write_path_lapsed_clock.py``) does not exercise — it reads
+# emitted rows, never the authorization decision itself. Run on BOTH
+# implementations via the ``service`` fixture; the real-Postgres-harness
+# siblings live in ``tests/test_acl_write_path_rls.py``. ──────────────
 
-    async def test_a_same_bits_skip_would_be_invisible_to_the_id_check_alone(
+
+class TestYT1TimeLimitedGrantSupersededThroughTheReadPath:
+    async def test_y_t1_downgrade_over_a_still_future_predecessor_is_effective(
         self, service, user_context
     ) -> None:
+        """Y-T1 — a downgrade re-grant (15 -> 1) over a predecessor that
+        is STILL FUTURE (``expired_at_ms = now+1h``) must be effective
+        through the read path, exactly as the NULL-expiry sibling
+        (Y-T1n, below) already is — the defect ADDENDUM Y-0 measured was
+        this exact case reading 15/True instead of 1/False."""
+        resource_id = "agent-y-t1"
         first = await service.grant_permission(
             user_context,
             principal_type="user",
             principal_id=user_context.user_id,
             resource_type="agent",
-            resource_id="agent-same-bits-neuter",
-            perm_bits=1,
+            resource_id=resource_id,
+            perm_bits=15,
+            expired_at_ms=int(time.time() * 1000) + 3_600_000,
         )
         second = await service.grant_permission(
             user_context,
             principal_type="user",
             principal_id=user_context.user_id,
             resource_type="agent",
-            resource_id="agent-same-bits-neuter",
+            resource_id=resource_id,
             perm_bits=1,
         )
-
-        # NEUTER — simulate the same-bits special case's OUTPUT directly:
-        # revert the OLD row to active, exactly as a "skip the expire
-        # step when bits are unchanged" implementation would have left
-        # it (the real implementation has no such branch; §9's "solo
-        # neuter that stays GREEN is a finding" rule is why this is
-        # applied to the OUTPUT here rather than a source edit — there
-        # is no branch in the source to delete).
-        before = await _old_row_expired_at_ms(service, first["id"])
-        await _force_expired_at_ms(service, first["id"], None)
-
-        # The WEAK assertion the original test carried — stays GREEN
-        # under the neuter, which is exactly the gap.
         assert second["id"] != first["id"]
+        effective = await service.get_effective_permissions(
+            user_context, "agent", resource_id
+        )
+        has_bit8 = await service.has_permission(user_context, "agent", resource_id, 8)
+        assert effective == 1, (
+            "RED under the pre-Y-1 predicate: a still-future predecessor "
+            "(bits=15) would OR into the effective mask and make this 15"
+        )
+        assert has_bit8 is False
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None, "the OLD row must be superseded"
+        assert old_expired_at_ms <= int(time.time() * 1000), (
+            "superseded AT the re-grant, strictly before its originally "
+            "scheduled future expiry"
+        )
 
-        # The STRENGTHENED assertion — RED under the neuter.
-        neutered = await _old_row_expired_at_ms(service, first["id"])
-        assert neutered is None, "RED (neuter applied, expected)"
+    async def test_y_t1n_downgrade_over_a_null_expiry_predecessor_is_effective(
+        self, service, user_context
+    ) -> None:
+        """Y-T1n — the NULL-predecessor sibling B2's original test
+        already covered (functionally identical to
+        ``test_downgrade_regrant_expires_the_old_row_and_new_bits_are_exact``
+        above); kept under this name so it has its own row in the
+        per-guard table alongside Y-T1/Y-T2, per spec Y-3's three-row
+        requirement. Stays GREEN under the pre-Y-1 predicate — that is
+        the point: this sibling alone cannot see Y-0's defect, only
+        Y-T1/Y-T2 (a STILL-FUTURE predecessor) can."""
+        resource_id = "agent-y-t1n"
+        first = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=15,
+        )
+        second = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=1,
+        )
+        assert second["id"] != first["id"]
+        effective = await service.get_effective_permissions(
+            user_context, "agent", resource_id
+        )
+        has_bit8 = await service.has_permission(user_context, "agent", resource_id, 8)
+        assert effective == 1
+        assert has_bit8 is False
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None
 
-        # RESTORE, cmp-verified against the pre-neuter capture.
-        await _force_expired_at_ms(service, first["id"], before)
-        restored = await _old_row_expired_at_ms(service, first["id"])
-        assert restored == before, "restore must reproduce the pre-neuter value exactly"
+    async def test_y_t2_bulk_downgrade_over_a_still_future_predecessor_is_effective(
+        self, service, user_context
+    ) -> None:
+        """Y-T2 — Y-T1's BULK-site sibling: one ``AclGrantOp`` of 1 over
+        a direct grant of 15 with a still-future expiry, same key."""
+        resource_id = "agent-y-t2"
+        first = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=15,
+            expired_at_ms=int(time.time() * 1000) + 3_600_000,
+        )
+        result = await service.bulk_write_acl_entries(
+            user_context,
+            [
+                AclGrantOp(
+                    principal_type="user",
+                    principal_id=user_context.user_id,
+                    resource_type="agent",
+                    resource_id=resource_id,
+                    perm_bits=1,
+                )
+            ],
+        )
+        assert result["acl_entry_ids"][0] != first["id"]
+        effective = await service.get_effective_permissions(
+            user_context, "agent", resource_id
+        )
+        has_bit8 = await service.has_permission(user_context, "agent", resource_id, 8)
+        assert effective == 1, (
+            "RED under the pre-Y-1 predicate: a still-future predecessor "
+            "would OR into the effective mask and make this 15"
+        )
+        assert has_bit8 is False
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None
 
 
 # ── bulk_write_acl_entries — success + all-or-nothing (O-4) ──────────────

@@ -1881,6 +1881,119 @@ class TestYT1TimeLimitedGrantSupersededThroughTheReadPath:
             "originally scheduled expiry"
         )
 
+    async def test_y_t1n_downgrade_over_a_null_expiry_predecessor_is_effective(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        """Y-T1n — the NULL-predecessor sibling, real-Postgres half. Kept
+        alongside Y-T1/Y-T2 (spec Y-3's three-row requirement) — stays
+        GREEN under the pre-Y-1 predicate, which is the point: this
+        sibling alone cannot see ADDENDUM Y-0's defect."""
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            before = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+            )
+            after = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=1,
+            )
+            assert after["id"] != before["id"]
+        finally:
+            set_current_user_id(None)
+
+        set_current_user_id(_VIEWER)
+        try:
+            viewer = _new_user_context(_VIEWER)
+            effective = await write_harness.service.get_effective_permissions(
+                viewer, "agent", "agent-1"
+            )
+            has_bit8 = await write_harness.service.has_permission(
+                viewer, "agent", "agent-1", 8
+            )
+        finally:
+            set_current_user_id(None)
+        assert effective == 1
+        assert has_bit8 is False
+
+        set_current_user_id(owner.user_id)
+        try:
+            old_expired_at_ms = await _row_expired_at_ms(
+                write_harness.factory, before["id"]
+            )
+        finally:
+            set_current_user_id(None)
+        assert old_expired_at_ms is not None
+
+    async def test_y_t2_bulk_downgrade_over_a_still_future_predecessor_is_effective(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        """Y-T2 — Y-T1's BULK-site sibling, real-Postgres half: one
+        ``AclGrantOp`` of 1 over a direct grant of 15 with a still-future
+        expiry, same key."""
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            before = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+                expired_at_ms=int(time.time() * 1000) + 3_600_000,
+            )
+            result = await write_harness.service.bulk_write_acl_entries(
+                owner,
+                [
+                    AclGrantOp(
+                        principal_type="user",
+                        principal_id=_VIEWER,
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        perm_bits=1,
+                    )
+                ],
+            )
+            assert result["acl_entry_ids"][0] != before["id"]
+        finally:
+            set_current_user_id(None)
+
+        set_current_user_id(_VIEWER)
+        try:
+            viewer = _new_user_context(_VIEWER)
+            effective = await write_harness.service.get_effective_permissions(
+                viewer, "agent", "agent-1"
+            )
+            has_bit8 = await write_harness.service.has_permission(
+                viewer, "agent", "agent-1", 8
+            )
+        finally:
+            set_current_user_id(None)
+        assert effective == 1, (
+            "RED under the pre-Y-1 predicate: a still-future predecessor "
+            "would OR into the effective mask and make this 15"
+        )
+        assert has_bit8 is False
+
+        set_current_user_id(owner.user_id)
+        try:
+            old_expired_at_ms = await _row_expired_at_ms(
+                write_harness.factory, before["id"]
+            )
+        finally:
+            set_current_user_id(None)
+        assert old_expired_at_ms is not None
+
 
 # ── Y-T3 — Z-1's third mock site: the grant path's audit-failure
 # restore must recover a time-limited predecessor's TRUE prior state,
