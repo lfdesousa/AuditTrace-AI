@@ -81,12 +81,12 @@ def _entry_cls() -> type[_MockAclEntry]:
     _MockAclEntry`. **Mypy-only cycle, not a genuine runtime one**
     (measured: a module-level ``from audittrace.services.console_acl.
     _mock import _MockAclEntry`` here does NOT raise ``ImportError`` —
-    ``_mock.py`` defines the class before its own bottom-of-file import
-    of ``_MockAclWrites`` from this module runs, so the partially-
-    initialised module already has the attribute by the time this file
-    is reached). It is what makes mypy 1.8.0 fail to resolve
-    ``_mock.py`` from a cold cache (B6/B7,
-    ``decisions/1c03682179b87422`` / ``decisions/b608f4e9ef828027``).
+    ``_mock.py`` defines the class before its own later-in-the-file
+    import of ``_MockAclWrites`` from this module runs, so the
+    partially-initialised module already has the attribute by the time
+    this file is reached). It is what makes mypy 1.8.0 fail to resolve
+    ``_mock.py`` from a cold cache — the fix-round-2 review measured
+    this and the fix-round-3 review confirmed the twins agree on it.
     Unlike the constants below, this name is INSTANTIATED at runtime
     (not merely used in annotations), so it cannot be
     ``TYPE_CHECKING``-only; this accessor is the lazy-import equivalent

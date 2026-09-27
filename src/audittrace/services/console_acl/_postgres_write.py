@@ -136,8 +136,9 @@ def _acl_constants() -> dict[str, str | None]:
     ``console_acl`` module by the time this file is reached from
     ``__init__.py``'s bottom import block). It is what makes mypy 1.8.0
     resolve ``_postgres.py`` as a dependency and fail to determine the
-    decorated mixin methods' types, from a cold cache (B6,
-    ``decisions/1c03682179b87422`` / ``decisions/b608f4e9ef828027``).
+    decorated mixin methods' types, from a cold cache — the fix-round-2
+    review measured this and the fix-round-3 review confirmed the
+    twins agree on it.
     Called fresh on every call from :func:`_principal_model` — **not
     memoised.** There is no ``cache_info``, and
     ``_acl_constants() is _acl_constants()`` is ``False``; the dict is
