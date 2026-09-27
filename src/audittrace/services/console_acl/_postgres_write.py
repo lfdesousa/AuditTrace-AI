@@ -124,14 +124,26 @@ logger = logging.getLogger(__name__)
 
 
 def _acl_constants() -> dict[str, str | None]:
-    """Lazy import of the write path's principal-type/model constants —
-    SAME cycle and SAME fix rationale as :func:`_acl_audit` below, and
-    as the ``TYPE_CHECKING`` import above: importing these at module
-    level (even though they are plain strings, not classes) is what
-    makes mypy 1.8.0 resolve ``_postgres.py`` as a dependency and fail
-    on the decorated mixin methods, from a cold cache. Called from
-    :func:`_principal_model_by_type`, which is memoised so the import
-    (and the dict it builds) only happens once per process."""
+    """Lazy import of the write path's principal-type/model constants.
+
+    **Not the same kind of cycle as** :func:`_acl_audit` **below.**
+    ``_acl_audit``'s lazy import breaks a genuine RUNTIME import cycle
+    (a module-level import there would raise ``ImportError`` at package
+    load time — measured). This one breaks a **mypy-only** resolution
+    cycle: a module-level ``from audittrace.services.console_acl import
+    PRINCIPAL_MODEL_ROLE, ...`` here does NOT raise at runtime (measured
+    — the constants are already bound on the partially-initialised
+    ``console_acl`` module by the time this file is reached from
+    ``__init__.py``'s bottom import block). It is what makes mypy 1.8.0
+    resolve ``_postgres.py`` as a dependency and fail to determine the
+    decorated mixin methods' types, from a cold cache (B6,
+    ``decisions/1c03682179b87422`` / ``decisions/b608f4e9ef828027``).
+    Called fresh on every call from :func:`_principal_model` — **not
+    memoised.** There is no ``cache_info``, and
+    ``_acl_constants() is _acl_constants()`` is ``False``; the dict is
+    small and rebuilt each time rather than cached, since the whole
+    point of this function is only to satisfy the cold-cache mypy hook,
+    not to avoid repeated work."""
     from audittrace.services.console_acl import (  # noqa: PLC0415
         PRINCIPAL_MODEL_ROLE,
         PRINCIPAL_MODEL_USER,

@@ -78,21 +78,34 @@ logger = logging.getLogger(__name__)
 
 def _entry_cls() -> type[_MockAclEntry]:
     """Lazy import of :class:`~audittrace.services.console_acl._mock.
-    _MockAclEntry` — SAME rationale as the ``TYPE_CHECKING`` import
-    above. Unlike the constants above, this name is INSTANTIATED at
-    runtime (not merely used in annotations), so it cannot be
-    ``TYPE_CHECKING``-only; this accessor is the lazy-import
-    equivalent for a runtime-needed class."""
+    _MockAclEntry`. **Mypy-only cycle, not a genuine runtime one**
+    (measured: a module-level ``from audittrace.services.console_acl.
+    _mock import _MockAclEntry`` here does NOT raise ``ImportError`` —
+    ``_mock.py`` defines the class before its own bottom-of-file import
+    of ``_MockAclWrites`` from this module runs, so the partially-
+    initialised module already has the attribute by the time this file
+    is reached). It is what makes mypy 1.8.0 fail to resolve
+    ``_mock.py`` from a cold cache (B6/B7,
+    ``decisions/1c03682179b87422`` / ``decisions/b608f4e9ef828027``).
+    Unlike the constants below, this name is INSTANTIATED at runtime
+    (not merely used in annotations), so it cannot be
+    ``TYPE_CHECKING``-only; this accessor is the lazy-import equivalent
+    for a runtime-needed class."""
     from audittrace.services.console_acl._mock import _MockAclEntry  # noqa: PLC0415
 
     return _MockAclEntry
 
 
 def _acl_constants() -> dict[str, str | None]:
-    """Lazy import of the write path's principal-type/model constants —
-    SAME cycle and SAME fix rationale as the ``TYPE_CHECKING`` import
-    above. Memoisation is unnecessary here (this dict is tiny and built
-    fresh per call, mirroring ``_postgres_write.py``'s twin)."""
+    """Lazy import of the write path's principal-type/model constants.
+
+    **Mypy-only cycle, matching** ``_postgres_write.py``'s **twin —
+    not the genuine runtime cycle** :func:`_acl_audit` **below breaks**
+    (measured the same way: a module-level import of these constants
+    here does not raise ``ImportError`` at runtime). Called fresh on
+    every call — **not memoised** (this dict is tiny and rebuilt each
+    time; the whole point is satisfying the cold-cache mypy hook, not
+    avoiding repeated work), mirroring ``_postgres_write.py``'s twin."""
     from audittrace.services.console_acl import (  # noqa: PLC0415
         PRINCIPAL_MODEL_ROLE,
         PRINCIPAL_MODEL_USER,
