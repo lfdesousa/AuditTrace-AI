@@ -1993,6 +1993,10 @@ class TestYT1TimeLimitedGrantSupersededThroughTheReadPath:
         finally:
             set_current_user_id(None)
         assert old_expired_at_ms is not None
+        assert old_expired_at_ms <= int(time.time() * 1000), (
+            "superseded AT the bulk write, strictly before its originally "
+            "scheduled expiry (Y-3: Y-T2 asserts this the same way Y-T1 does)"
+        )
 
 
 # ── Y-T3 — Z-1's third mock site: the grant path's audit-failure

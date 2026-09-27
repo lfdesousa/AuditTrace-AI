@@ -686,6 +686,10 @@ class TestYT1TimeLimitedGrantSupersededThroughTheReadPath:
         assert has_bit8 is False
         old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
         assert old_expired_at_ms is not None
+        assert old_expired_at_ms <= int(time.time() * 1000), (
+            "superseded AT the bulk write, strictly before its originally "
+            "scheduled expiry (Y-3: Y-T2 asserts this the same way Y-T1 does)"
+        )
 
 
 # ── bulk_write_acl_entries — success + all-or-nothing (O-4) ──────────────
@@ -1099,38 +1103,6 @@ class TestYT3MockAuditFailureRestoresTimeLimitedPredecessor:
             "future expiry instead of recovering it"
         )
         assert restored.updated_at_ms == before_updated_at_ms
-
-    async def test_neuter_hard_coded_none_restore_would_go_red(
-        self, mock_service, user_context
-    ) -> None:
-        """The neuter Z-1 names explicitly: restore ``row.expired_at_ms
-        = None`` at the third site. There is no such branch left in the
-        source to delete (Z-1 closed it), so — matching spec §9's own
-        discipline for a guard with no source-level branch to flip —
-        the neuter is applied directly to the emitted row, exactly what
-        the pre-Z-1 code would have produced, then RESTORED,
-        cmp-verified."""
-        scheduled = 9_999_999_999_999
-        first = await mock_service.grant_permission(
-            user_context,
-            principal_type="user",
-            principal_id=user_context.user_id,
-            resource_type="agent",
-            resource_id="agent-y-t3-mock-neuter",
-            perm_bits=15,
-            expired_at_ms=scheduled,
-        )
-        row = next(e for e in mock_service._entries if e.id == first["id"])
-
-        row.expired_at_ms = None  # NEUTER
-        assert row.expired_at_ms != scheduled, (
-            "RED — the neuter destroyed the scheduled expiry"
-        )
-
-        row.expired_at_ms = scheduled  # RESTORE
-        assert row.expired_at_ms == scheduled, (
-            "restore must reproduce the value exactly"
-        )
 
 
 class TestMockExpireLoopSkipsNonMatchingRows:
