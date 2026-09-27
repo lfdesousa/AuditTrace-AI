@@ -1,6 +1,42 @@
 """The MOCK's ACL write path — Sovereign Authorization Layer EPIC,
 **ACL 2b-core-A1**
-(``2026-09-26-SPEC-acl-2b-core-A-write-path.md`` §7).
+(``2026-09-26-SPEC-acl-2b-core-A-write-path.md`` §7, and the **Y
+round** — ADDENDA Y/Z/AA/AB/AC/AD/AE/AF).
+
+**Y round (this build).** Both inline "is this row still active"
+predicates below (the grant path's expire step and the bulk path's own
+copy) now call the SAME function :class:`MockConsoleAclEntriesService`'s
+own read methods use — :func:`~audittrace.services.console_acl._mock.
+_mock_not_expired` — instead of the narrower ``row.expired_at_ms is
+None`` (ADDENDUM Y-1/AB-1(1)): a time-limited grant must be superseded
+by a re-grant exactly as a NULL-expiry one is. **MEASURED this round —
+a plain top-level import of that ONE name is NOT safe**, unlike
+ADDENDUM AB-1(1)'s prediction: it reproduces the SAME pinned
+pre-commit mypy hook (v1.8.0) cold-cache failure the B6 block below
+documents for ``AclGrantOp``/``_MockAclEntry`` — resolving ``_mock.py``
+as a dependency of THIS module (to type-check the new import) makes
+mypy unable to determine ``_MockAclWrites``' own decorated mixin
+methods' types, in a self-referential cycle. :func:`_not_expired_fn`
+below is the SAME lazy-accessor pattern as :func:`_entry_cls` (a name
+that IS needed at runtime, so it cannot be ``TYPE_CHECKING``-only,
+unlike the two names in the block below). **The identity ADDENDUM
+AC-1 item 2 checks is unchanged** — the lazy accessor returns the VERY
+function object bound on ``_mock`` (``_not_expired_fn() is
+audittrace.services.console_acl._mock._mock_not_expired``); it is a
+retrieval, not a wrapper, so there is nothing to break the identity.
+
+**Z-1 — the grant path's audit-failure restore captures a TWO-column
+undo record, not a hard-coded ``None``.** Under the Y round's widened
+predicate a row this path expires may have started with a FUTURE
+``expired_at_ms`` (a time-limited grant), not only ``None`` — restoring
+``row.expired_at_ms = None`` unconditionally on a failed audit write
+would PERMANENTLY DESTROY that row's scheduled expiry (ADDENDUM Z-1's
+measured table: the row that should read back
+``(15, <scheduled future ms>)`` reads back ``(15, None)`` instead,
+turning a time-limited grant into a permanent one). The undo record
+below captures ``(prior expired_at_ms, prior updated_at_ms)`` per
+expired row, before mutating, and restores BOTH on the N4 failure path
+— mirroring the bulk path's existing two-column ``undo_log``/``_undo``.
 
 ``_MockAclWrites`` is a MIXIN inherited by
 :class:`~audittrace.services.console_acl._mock.MockConsoleAclEntriesService`
@@ -94,6 +130,25 @@ def _entry_cls() -> type[_MockAclEntry]:
     from audittrace.services.console_acl._mock import _MockAclEntry  # noqa: PLC0415
 
     return _MockAclEntry
+
+
+def _not_expired_fn() -> Any:
+    """Lazy import of :func:`~audittrace.services.console_acl._mock.
+    _mock_not_expired` — the SAME cold-cache mypy cycle as
+    :func:`_entry_cls` above (MEASURED this round, Y round / ADDENDUM
+    AB-1(1)): needed at runtime (the write path's expire predicate must
+    derive from, not re-spell, the read path's own active predicate —
+    ADDENDUM Y-1), so it cannot be ``TYPE_CHECKING``-only. **A
+    retrieval, not a wrapper** — returns the exact function object
+    bound on ``_mock`` at call time, so ADDENDUM AC-1 item 2's identity
+    check (``_not_expired_fn() is audittrace.services.console_acl.
+    _mock._mock_not_expired``) holds; a wrapper that re-implemented the
+    predicate here instead would fail that check even if behaviourally
+    equivalent (AC-1 item 3's wrapper-legitimacy rule, applied to the
+    mock side)."""
+    from audittrace.services.console_acl._mock import _mock_not_expired  # noqa: PLC0415
+
+    return _mock_not_expired
 
 
 def _acl_constants() -> dict[str, str | None]:
@@ -250,6 +305,7 @@ class _MockAclWrites:
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
         _audit = _acl_audit()
+        _not_expired = _not_expired_fn()
         stamp = build_write_stamp(user_context)
         attempted = {
             "principal_type": principal_type,
@@ -295,7 +351,7 @@ class _MockAclWrites:
         expired_ids = [
             row.id
             for row in self._entries
-            if row.expired_at_ms is None
+            if _not_expired(row, stamp.now_ms)
             and _key_matches(
                 row,
                 principal_type=principal_type,
@@ -305,13 +361,19 @@ class _MockAclWrites:
                 tenant_id=tenant_id,
             )
         ]
-        # Undo log for the N4 failure path below — restores the EXACT
-        # prior updated_at_ms, never a hardcoded 0 (a partial mutation
-        # must not survive a failed audit write, S3).
-        prior_updated_at_ms: dict[str, int] = {}
+        # Undo record for the N4 failure path below — a TWO-column
+        # (expired_at_ms, updated_at_ms) capture, taken BEFORE mutating
+        # (ADDENDUM Z-1): under the Y round's widened predicate a row
+        # here may have started with a FUTURE expired_at_ms (a
+        # time-limited grant, not yet lapsed), so restoring a hardcoded
+        # None would permanently destroy its scheduled expiry rather
+        # than restore it. A partial mutation must not survive a failed
+        # audit write (S3), and what it must NOT survive AS is the
+        # row's TRUE prior state, not a guessed one.
+        prior_state: dict[str, tuple[int | None, int]] = {}
         for row in self._entries:
             if row.id in expired_ids:
-                prior_updated_at_ms[row.id] = row.updated_at_ms
+                prior_state[row.id] = (row.expired_at_ms, row.updated_at_ms)
                 row.expired_at_ms = stamp.now_ms
                 row.updated_at_ms = stamp.now_ms
 
@@ -355,11 +417,14 @@ class _MockAclWrites:
             except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
                 await db.rollback()
                 # Undo the in-memory expiry — fail-closed, no partial
-                # mutation survives a failed audit write.
+                # mutation survives a failed audit write. Restores BOTH
+                # columns from the captured prior state (ADDENDUM Z-1) —
+                # never a hardcoded None, which would be correct only for
+                # the NULL-expiry predecessor and wrong for a time-limited
+                # one.
                 for row in self._entries:
                     if row.id in expired_ids:
-                        row.expired_at_ms = None
-                        row.updated_at_ms = prior_updated_at_ms[row.id]
+                        row.expired_at_ms, row.updated_at_ms = prior_state[row.id]
                 await _audit.record_denial(
                     user_context=user_context,
                     op="grantPermission",
@@ -419,6 +484,7 @@ class _MockAclWrites:
         ops: list[AclGrantOp],
     ) -> dict[str, Any]:
         _audit = _acl_audit()
+        _not_expired = _not_expired_fn()
         stamp = build_write_stamp(user_context)
         op_count = len(ops)
         acl_entry_ids: list[str] = []
@@ -466,7 +532,7 @@ class _MockAclWrites:
                         )
                     expired_ids: list[str] = []
                     for row in self._entries:
-                        if row.expired_at_ms is None and _key_matches(
+                        if _not_expired(row, stamp.now_ms) and _key_matches(
                             row,
                             principal_type=grant_op.principal_type,
                             principal_id=grant_op.principal_id,

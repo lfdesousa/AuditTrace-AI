@@ -97,6 +97,31 @@ async def _old_row_expired_at_ms(
         return result.scalar_one()
 
 
+async def _force_expired_at_ms(
+    service: ConsoleAclEntriesService, row_id: str, value: int | None
+) -> None:
+    """Force a SPECIFIC row's ``expired_at_ms`` directly, bypassing the
+    service entirely — the neuter primitive
+    ``TestSameBitsRegrantSpecialCaseNeuter`` uses to reproduce, on the
+    OUTPUT, exactly what a same-bits special case would have left
+    behind (there is no such branch in the source to edit — the
+    special case does not exist — so the neuter is applied post-hoc to
+    the row, then restored, cmp-verified, the same discipline spec §9
+    requires of a source-level neuter)."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = next(e for e in service._entries if e.id == row_id)
+        row.expired_at_ms = value
+        return
+    pg = dependencies.get_postgres_factory()
+    async with pg.get_session_factory()() as db:
+        await db.execute(
+            sa.update(ConsoleAclEntry)
+            .where(ConsoleAclEntry.id == row_id)
+            .values(expired_at_ms=value)
+        )
+        await db.commit()
+
+
 @pytest_asyncio.fixture
 def pg_service(client) -> ConsoleAclEntriesService:
     """The container ``client`` wires (``create_test_container``) already
@@ -509,7 +534,23 @@ class TestExpireAndInsert:
         self, service, user_context
     ) -> None:
         """5.1 — a re-grant with IDENTICAL bits still expires+inserts; no
-        special case that would skip the O-3 index / audit trail."""
+        special case that would skip the O-3 index / audit trail.
+
+        **Strengthened, Y round (gate-AF should-fix).** The ONLY
+        assertion this test used to carry was ``second["id"] !=
+        first["id"]`` — which a "same-bits special case" bug (skip
+        ``_expire_active``/the mock's inline expire loop whenever the
+        re-grant's ``perm_bits`` equals the currently-active row's, but
+        still insert a new row) would sail straight through: a new row
+        with a different id still lands, the OLD row is just left
+        active too. The AC-T-HIST clock-seeded grid (``tests/
+        test_acl_write_path_rls.py``) can never catch that class either
+        — its history always CHANGES bits between writes (15 -> 7 -> 3)
+        by construction, so it never exercises a same-bits re-grant.
+        This is the ONE test in the whole build that does, and the
+        load-bearing assertion is the OLD row's ``expired_at_ms`` — see
+        ``TestSameBitsRegrantSpecialCaseNeuter`` below for the proof
+        that it is not vacuous."""
         first = await service.grant_permission(
             user_context,
             principal_type="user",
@@ -527,6 +568,70 @@ class TestExpireAndInsert:
             perm_bits=1,
         )
         assert second["id"] != first["id"]
+        old_expired_at_ms = await _old_row_expired_at_ms(service, first["id"])
+        assert old_expired_at_ms is not None, (
+            "the OLD (bits=1) row must be expired even though the NEW "
+            "row's bits are identical — a same-bits special case would "
+            "leave this None while still producing a fresh id above"
+        )
+
+
+class TestSameBitsRegrantSpecialCaseNeuter:
+    """Gate-AF should-fix, ADDENDUM AF's evidence — closed here. The
+    clock-seeded lapsed grid (AC-T-HIST) always changes ``perm_bits``
+    between successive writes at one key, so a hypothetical "skip the
+    expire step when the re-grant's bits equal the existing active
+    row's" special case is INVISIBLE to it — no test in the grid, and
+    none of Y-T1/Y-T3, ever re-grants identical bits. This class proves
+    ``test_identical_bits_still_expires_and_inserts`` (above) is the
+    guard, and that it is load-bearing, by reproducing exactly what
+    such a special case would leave behind — the OLD row reverted to
+    active post-hoc, as if the implementation had never expired it —
+    and showing the WEAK assertion (id difference alone) stays green
+    while the STRENGTHENED one (the old row's own expiry) reddens."""
+
+    async def test_a_same_bits_skip_would_be_invisible_to_the_id_check_alone(
+        self, service, user_context
+    ) -> None:
+        first = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-same-bits-neuter",
+            perm_bits=1,
+        )
+        second = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-same-bits-neuter",
+            perm_bits=1,
+        )
+
+        # NEUTER — simulate the same-bits special case's OUTPUT directly:
+        # revert the OLD row to active, exactly as a "skip the expire
+        # step when bits are unchanged" implementation would have left
+        # it (the real implementation has no such branch; §9's "solo
+        # neuter that stays GREEN is a finding" rule is why this is
+        # applied to the OUTPUT here rather than a source edit — there
+        # is no branch in the source to delete).
+        before = await _old_row_expired_at_ms(service, first["id"])
+        await _force_expired_at_ms(service, first["id"], None)
+
+        # The WEAK assertion the original test carried — stays GREEN
+        # under the neuter, which is exactly the gap.
+        assert second["id"] != first["id"]
+
+        # The STRENGTHENED assertion — RED under the neuter.
+        neutered = await _old_row_expired_at_ms(service, first["id"])
+        assert neutered is None, "RED (neuter applied, expected)"
+
+        # RESTORE, cmp-verified against the pre-neuter capture.
+        await _force_expired_at_ms(service, first["id"], before)
+        restored = await _old_row_expired_at_ms(service, first["id"])
+        assert restored == before, "restore must reproduce the pre-neuter value exactly"
 
 
 # ── bulk_write_acl_entries — success + all-or-nothing (O-4) ──────────────
@@ -882,6 +987,96 @@ class TestMockFailClosedCallerHalfUndoesExpiry:
             user_context, "agent", "agent-n4-regrant-undo"
         )
         assert effective == 1, "only the original grant survives the failed re-grant"
+
+
+class TestYT3MockAuditFailureRestoresTimeLimitedPredecessor:
+    """Y-T3 (ADDENDUM Z-1, closing BL-1 / AA-2 / AB-3) — the grant
+    path's audit-failure restore must recover a TIME-LIMITED
+    predecessor's TRUE prior state (its ORIGINAL scheduled
+    ``expired_at_ms`` and its own ``updated_at_ms``), never a
+    hard-coded ``None``. A hard-coded restore is correct only for the
+    NULL-expiry case (``TestMockFailClosedCallerHalfUndoesExpiry``,
+    above) and PERMANENTLY DESTROYS a time-limited grant's scheduled
+    expiry when it fires on this one instead (ADDENDUM Z-1's measured
+    table: the row reads back ``(15, None)`` instead of
+    ``(15, <scheduled>)``)."""
+
+    async def test_broken_audit_write_on_regrant_restores_the_scheduled_expiry(
+        self, mock_service, user_context, monkeypatch
+    ) -> None:
+        scheduled = 9_999_999_999_999  # distinguishable from both None and "now"
+        first = await mock_service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-y-t3-mock",
+            perm_bits=15,
+            expired_at_ms=scheduled,
+        )
+        before = next(e for e in mock_service._entries if e.id == first["id"])
+        before_updated_at_ms = before.updated_at_ms
+
+        original = _audit._content_hash
+        calls = {"n": 0}
+
+        def _flaky(*args: object, **kwargs: object) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("content_hash broken for this test")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(_audit, "_content_hash", _flaky)
+
+        with pytest.raises(RuntimeError, match="content_hash broken"):
+            await mock_service.grant_permission(
+                user_context,
+                principal_type="user",
+                principal_id=user_context.user_id,
+                resource_type="agent",
+                resource_id="agent-y-t3-mock",
+                perm_bits=1,
+            )
+
+        restored = next(e for e in mock_service._entries if e.id == first["id"])
+        assert restored.expired_at_ms == scheduled, (
+            "RED (Y-T3's target, pre-Z-1): a hard-coded `None` restore "
+            "would PERMANENTLY DESTROY the predecessor's scheduled "
+            "future expiry instead of recovering it"
+        )
+        assert restored.updated_at_ms == before_updated_at_ms
+
+    async def test_neuter_hard_coded_none_restore_would_go_red(
+        self, mock_service, user_context
+    ) -> None:
+        """The neuter Z-1 names explicitly: restore ``row.expired_at_ms
+        = None`` at the third site. There is no such branch left in the
+        source to delete (Z-1 closed it), so — matching spec §9's own
+        discipline for a guard with no source-level branch to flip —
+        the neuter is applied directly to the emitted row, exactly what
+        the pre-Z-1 code would have produced, then RESTORED,
+        cmp-verified."""
+        scheduled = 9_999_999_999_999
+        first = await mock_service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id=user_context.user_id,
+            resource_type="agent",
+            resource_id="agent-y-t3-mock-neuter",
+            perm_bits=15,
+            expired_at_ms=scheduled,
+        )
+        row = next(e for e in mock_service._entries if e.id == first["id"])
+
+        row.expired_at_ms = None  # NEUTER
+        assert row.expired_at_ms != scheduled, (
+            "RED — the neuter destroyed the scheduled expiry"
+        )
+
+        row.expired_at_ms = scheduled  # RESTORE
+        assert row.expired_at_ms == scheduled, (
+            "restore must reproduce the value exactly"
+        )
 
 
 class TestMockExpireLoopSkipsNonMatchingRows:

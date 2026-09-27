@@ -1,6 +1,32 @@
 """The sovereign ACL write path — Sovereign Authorization Layer EPIC,
 **ACL 2b-core-A1**
-(``2026-09-26-SPEC-acl-2b-core-A-write-path.md`` + ADDENDA U/V/W/X).
+(``2026-09-26-SPEC-acl-2b-core-A-write-path.md`` + ADDENDA U/V/W/X, and
+the **Y round** — ADDENDA Y/Z/AA/AB/AC/AD/AE/AF).
+
+**Y round (this build) — the write path now supersedes everything the
+read path considers active, not merely NULL-expiry rows.** ADDENDUM
+Y-0 measured a live authorization downgrade: a time-limited grant
+(``expired_at_ms`` in the future) survived a re-grant untouched,
+because :func:`_expire_active`'s predicate (``expired_at_ms IS NULL``)
+was narrower than the read path's active predicate (``expired_at_ms IS
+NULL OR expired_at_ms > now``, ``_postgres.py``'s ``_not_expired_
+clause``) — every row the reader counted active and the writer failed
+to expire was exactly a time-limited grant, and ``get_effective_
+permissions`` ORs all active rows, so a stale future-expiry 15 masked
+a fresh 1. ADDENDUM AB (closing the two-drift-lesson of U-1/Y-1) rules
+that the fix is a **derivation, not a second copy of the predicate**:
+:func:`_active_clause` lazily imports and returns — unmodified,
+verified by return-identity (ADDENDUM AC-1 item 3) —
+``_postgres._not_expired_clause(now_ms)``, the SAME object the read
+path's every authorization decision uses. ADDENDUM AD/AE/AF's
+``AC-T-HIST`` behavioural history-equality guard (``tests/
+test_acl_write_path_lapsed_clock.py``) is what actually proves this,
+after five structural pins fell to five successive escapes (spelling,
+deletion, result-discarding, threshold, grace) that all preserved the
+code's SHAPE while breaking its behaviour — ``AB-G``/``AB-G+`` (the
+grep and the positive call-site pin, ``tests/test_acl_write_path_rls.
+py``) are kept only as drift-detectors from ADDENDUM AD on, never as
+the correctness guard.
 
 ``_PostgresAclWrites`` is a MIXIN inherited by
 :class:`~audittrace.services.console_acl._postgres.
@@ -260,6 +286,29 @@ def _key_clause(
     return sa.and_(*clauses)
 
 
+def _active_clause(now_ms: int) -> Any:
+    """The write path's "still active" predicate — DERIVED from, never a
+    second spelling of, the read path's own active predicate (ADDENDUM
+    Y-1/AB-1(1)). A module-level import of ``audittrace.services.
+    console_acl._postgres`` here is a genuine import CYCLE (``_postgres.
+    py:28`` imports THIS module before its own ``_not_expired_clause`` is
+    defined at ``:54``) — the lazy, function-scoped import resolves in
+    every import order, which is why it is spelled this way rather than
+    at module level. **Delegates ONLY** — returns the callee's result
+    completely unmodified (ADDENDUM AC-1 item 3's wrapper-legitimacy
+    check: with a spy installed in place of ``_not_expired_clause``,
+    ``_active_clause(n)`` must record exactly ``[n]`` and return the very
+    object the spy returned, checked by identity — post-processing,
+    re-spelling or re-wrapping the clause in a further ``or_(...)`` fails
+    that check even when the compiled SQL still reads identically, which
+    is exactly the escape ADDENDUM AC's ``v3`` demonstrated)."""
+    from audittrace.services.console_acl._postgres import (  # noqa: PLC0415
+        _not_expired_clause,
+    )
+
+    return _not_expired_clause(now_ms)
+
+
 async def _expire_active(
     session: AsyncSession,
     *,
@@ -273,7 +322,16 @@ async def _expire_active(
     """ORM-enabled Core UPDATE (ADDENDUM V-1) — touches ONLY
     ``expired_at_ms``/``updated_at_ms`` (Q-4.1); never ``perm_bits``,
     ``user_sub``, ``granted_by``, ``granted_at_ms`` or the grant's own
-    ``trace_id``. Returns the ids it expired (``RETURNING id``)."""
+    ``trace_id``. Returns the ids it expired (``RETURNING id``).
+
+    **Y round (ADDENDUM Y-1/AB-1):** the predicate is :func:`_active_clause`
+    — ``expired_at_ms IS NULL OR expired_at_ms > now`` — not merely
+    ``IS NULL``: the write path must supersede EVERY row the read path
+    would still count active, including a time-limited grant that has
+    not yet lapsed, or a stale future expiry silently outlives the
+    re-grant that was meant to replace it (ADDENDUM Y-0's measured
+    downgrade). A future ``expired_at_ms`` matched here is OVERWRITTEN
+    with the moment of supersession, never left at its scheduled value."""
     stmt = (
         sa.update(ConsoleAclEntry)
         .where(
@@ -284,7 +342,7 @@ async def _expire_active(
                 resource_id=resource_id,
                 tenant_id=tenant_id,
             ),
-            ConsoleAclEntry.expired_at_ms.is_(None),
+            _active_clause(now_ms),
         )
         .values(expired_at_ms=now_ms, updated_at_ms=now_ms)
         .returning(ConsoleAclEntry.id)

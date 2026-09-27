@@ -40,13 +40,14 @@ is where a version discrepancy must be checked and disclosed.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import create_engine, event, insert, text
+from sqlalchemy import create_engine, event, insert, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,7 +59,12 @@ from audittrace.services.console_acl._errors import (
     AclPrincipalTypeRefused,
     AclWriteRefused,
 )
-from audittrace.services.console_acl._postgres import PostgresConsoleAclEntriesService
+from audittrace.services.console_acl._postgres import (
+    PostgresConsoleAclEntriesService,
+)
+from audittrace.services.console_acl._postgres import (
+    _not_expired_clause as _real_not_expired_clause,
+)
 from tests.test_acl_ownership_rls import (
     _ADMIN_URL,
     _APP_PASSWORD,
@@ -1794,3 +1800,311 @@ class TestP4ShapeTwoHelperSurvives:
             event.remove(sync_engine, "rollback_savepoint", _on_rollback_savepoint)
             event.remove(sync_engine, "rollback", _on_rollback)
             admin.dispose()
+
+
+# ── Y-T1 — a time-limited grant is superseded by a re-grant, proven
+# through the READ path (spec Y-3/ADDENDUM AF-1(1)). The clock-seeded
+# grid (tests/test_acl_write_path_lapsed_clock.py) asserts through the
+# EMITTED rows only — never through get_effective_permissions/
+# has_permission, the actual authorization decision ADDENDUM Y-0
+# measured as silently wrong. Neither instrument makes the other
+# redundant (ADDENDUM AE-3). ──────────────────────────────────────────
+
+
+async def _row_expired_at_ms(factory: Any, row_id: str) -> int | None:
+    async with factory() as session:
+        result = await session.execute(
+            select(ConsoleAclEntry.expired_at_ms).where(ConsoleAclEntry.id == row_id)
+        )
+        return result.scalar_one()
+
+
+class TestYT1TimeLimitedGrantSupersededThroughTheReadPath:
+    async def test_downgrade_over_a_still_future_predecessor_is_effective(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            before = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+                expired_at_ms=int(time.time() * 1000) + 3_600_000,
+            )
+            after = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=1,
+            )
+            assert after["id"] != before["id"]
+        finally:
+            set_current_user_id(None)
+
+        set_current_user_id(_VIEWER)
+        try:
+            viewer = _new_user_context(_VIEWER)
+            effective = await write_harness.service.get_effective_permissions(
+                viewer, "agent", "agent-1"
+            )
+            has_bit8 = await write_harness.service.has_permission(
+                viewer, "agent", "agent-1", 8
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert effective == 1, (
+            "RED under the pre-Y-1 predicate: a still-future predecessor "
+            "(bits=15) would OR into the effective mask and make this 15"
+        )
+        assert has_bit8 is False
+
+        set_current_user_id(owner.user_id)
+        try:
+            old_expired_at_ms = await _row_expired_at_ms(
+                write_harness.factory, before["id"]
+            )
+        finally:
+            set_current_user_id(None)
+        assert old_expired_at_ms is not None, (
+            "the OLD row must be superseded (expired_at_ms set), not left "
+            "at its originally scheduled future value"
+        )
+        assert old_expired_at_ms <= int(time.time() * 1000), (
+            "superseded AT the moment of the re-grant, strictly before its "
+            "originally scheduled expiry"
+        )
+
+
+# ── Y-T3 — Z-1's third mock site: the grant path's audit-failure
+# restore must recover a time-limited predecessor's TRUE prior state,
+# not a hard-coded None (ADDENDUM Z-1/AA-2/AB-3). The Postgres half is
+# the PARITY reference — no code fix was needed here (a rolled-back
+# transaction naturally restores the prior row), measured directly. ──
+
+
+class TestYT3AuditFailureRestoresTruePriorState:
+    async def test_postgres_rollback_restores_the_scheduled_future_expiry(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            scheduled = int(time.time() * 1000) + 3_600_000
+            predecessor = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+                expired_at_ms=scheduled,
+            )
+            before_updated_at_ms = await _row_updated_at_ms(
+                write_harness.factory, predecessor["id"]
+            )
+
+            async def _broken_record(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("simulated N4 audit-write failure")
+
+            monkeypatch.setattr(_audit, "record", _broken_record)
+            with pytest.raises(RuntimeError):
+                await write_harness.service.grant_permission(
+                    owner,
+                    principal_type="user",
+                    principal_id=_VIEWER,
+                    resource_type="agent",
+                    resource_id="agent-1",
+                    perm_bits=1,
+                )
+            monkeypatch.undo()
+
+            after_expired_at_ms = await _row_expired_at_ms(
+                write_harness.factory, predecessor["id"]
+            )
+            after_updated_at_ms = await _row_updated_at_ms(
+                write_harness.factory, predecessor["id"]
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert after_expired_at_ms == scheduled, (
+            "RED (Y-T3's target): the predecessor's ORIGINAL scheduled "
+            "expiry must survive the rolled-back re-grant unchanged"
+        )
+        assert after_updated_at_ms == before_updated_at_ms
+
+
+async def _row_updated_at_ms(factory: Any, row_id: str) -> int:
+    async with factory() as session:
+        result = await session.execute(
+            select(ConsoleAclEntry.updated_at_ms).where(ConsoleAclEntry.id == row_id)
+        )
+        return result.scalar_one()
+
+
+# ── AB-G / AB-G+ — kept as DRIFT-DETECTORS ONLY (ADDENDUM AD-1(2)),
+# never as the correctness guard (that is AC-T-HIST above). AB-G is a
+# grep-based documentation check; AB-G+ is the positive call-site pin —
+# both are enumerable and known to be defeatable (ADDENDUM AC-1/AD-1),
+# which is exactly why neither gates on its own. ──────────────────────
+
+
+class TestABGGrepDriftDetector:
+    def test_no_literal_is_none_spelling_remains_in_the_write_modules(self) -> None:
+        """AB-G (ADDENDUM AB-1(2), relabelled a documentation check by
+        ADDENDUM AC-1 item 4): a divergent COPY of the active predicate
+        is caught by this grep — but NOT a copy that discards the
+        derived call's result (ADDENDUM AC-1's e1) or one that widens it
+        with a threshold/grace (ADDENDUM AF's e2k/eG) — hence
+        drift-detector, not correctness guard."""
+        import re
+        from pathlib import Path
+
+        pattern = re.compile(r"expired_at_ms\.is_\(None\)|\.expired_at_ms is None")
+        base = Path("src/audittrace/services/console_acl")
+        hits = {
+            str(path): len(pattern.findall(path.read_text()))
+            for path in (base / "_postgres_write.py", base / "_mock_write.py")
+        }
+        assert sum(hits.values()) == 0, hits
+
+
+class TestABGPlusDriftDetector:
+    """AB-G+ (ADDENDUM AC-1): a POSITIVE call-site pin — every exercised
+    expire site must call THROUGH the read path's own active predicate,
+    checked by identity (mock) or by a recording spy at the reference
+    point (Postgres), never by what the compiled SQL happens to read
+    (ADDENDUM AC-1's own escape, v3, shows a re-spelled wrapper compiles
+    to identical SQL while failing this check)."""
+
+    def test_mock_write_module_binds_the_same_function_object(self) -> None:
+        """The lazy accessor (``_not_expired_fn``, not a module-level
+        name — a plain top-level import reproduces the pinned
+        pre-commit mypy hook's cold-cache cycle, MEASURED this round)
+        must still return the VERY object ``_mock`` binds — a
+        retrieval, not a wrapper."""
+        from audittrace.services.console_acl import _mock, _mock_write
+
+        assert _mock_write._not_expired_fn() is _mock._mock_not_expired
+
+    async def test_postgres_expire_active_direct_call_records_the_sentinel(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: Any
+    ) -> None:
+        calls: list[int] = []
+        real_clause = _real_not_expired_clause
+
+        def _spy(now_ms: int) -> Any:
+            calls.append(now_ms)
+            return real_clause(now_ms)
+
+        monkeypatch.setattr(
+            "audittrace.services.console_acl._postgres._not_expired_clause", _spy
+        )
+        set_current_user_id(_OWNER)
+        try:
+            async with write_harness.factory() as db:
+                await _postgres_write._expire_active(
+                    db,
+                    principal_type="user",
+                    principal_id=_VIEWER,
+                    resource_type="agent",
+                    resource_id="agent-1",
+                    tenant_id=None,
+                    now_ms=424_242,
+                )
+                await db.commit()
+        finally:
+            set_current_user_id(None)
+        assert calls == [424_242]
+
+    async def test_postgres_grant_and_bulk_sites_record_the_write_stamps_now_ms(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: Any
+    ) -> None:
+        calls: list[int] = []
+        real_clause = _real_not_expired_clause
+
+        def _spy(now_ms: int) -> Any:
+            calls.append(now_ms)
+            return real_clause(now_ms)
+
+        monkeypatch.setattr(
+            "audittrace.services.console_acl._postgres._not_expired_clause", _spy
+        )
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            # Distinct principals for the two sites — sharing one key
+            # would let the bulk site's own _expire_active supersede the
+            # grant site's row, rewriting the very stamp this test reads
+            # back afterwards.
+            grant_row = await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=1,
+            )
+            bulk_result = await write_harness.service.bulk_write_acl_entries(
+                owner,
+                [
+                    AclGrantOp(
+                        principal_type="user",
+                        principal_id=_ATTACKER,
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        perm_bits=1,
+                    )
+                ],
+            )
+            assert len(calls) >= 2, "grant and bulk must each call through the spy"
+            grant_stamp = await _row_stamp_now_ms(
+                write_harness.factory, grant_row["id"]
+            )
+            bulk_stamp = await _row_stamp_now_ms(
+                write_harness.factory, bulk_result["acl_entry_ids"][0]
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert grant_stamp in calls
+        assert bulk_stamp in calls
+
+    def test_active_clause_delegates_only_return_identity(
+        self, monkeypatch: Any
+    ) -> None:
+        """The wrapper-legitimacy check (ADDENDUM AC-1 item 3): with a
+        spy standing in for ``_not_expired_clause``, ``_active_clause``
+        must record exactly ``[n]`` and return the VERY object the spy
+        returned — not an equal-looking rebuild of it. A wrapper that
+        post-processes, re-spells or re-``or_``s the clause fails this
+        even when its compiled SQL still reads identically (ADDENDUM
+        AC-1's ``v3`` escape)."""
+        calls: list[int] = []
+        sentinel = object()
+
+        def _spy(now_ms: int) -> Any:
+            calls.append(now_ms)
+            return sentinel
+
+        monkeypatch.setattr(
+            "audittrace.services.console_acl._postgres._not_expired_clause", _spy
+        )
+        result = _postgres_write._active_clause(999)
+        assert calls == [999]
+        assert result is sentinel
+
+
+async def _row_stamp_now_ms(factory: Any, row_id: str) -> int:
+    """The write stamp's ``now_ms`` for a given row IS its
+    ``updated_at_ms`` (both the grant and bulk sites set
+    ``created_at_ms=updated_at_ms=stamp.now_ms`` on the NEW row) —
+    ADDENDUM AC-1 item 1(ii)'s membership check."""
+    return await _row_updated_at_ms(factory, row_id)
