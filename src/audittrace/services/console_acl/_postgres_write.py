@@ -82,7 +82,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -90,14 +90,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from audittrace.db.models import ConsoleAclEntry
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
-from audittrace.services.console_acl import (
-    PRINCIPAL_MODEL_ROLE,
-    PRINCIPAL_MODEL_USER,
-    PRINCIPAL_TYPE_PUBLIC,
-    PRINCIPAL_TYPE_ROLE,
-    PRINCIPAL_TYPE_USER,
-    AclGrantOp,
-)
 from audittrace.services.console_acl._errors import (
     AclBulkRolledBackError,
     AclPastExpiryError,
@@ -106,7 +98,53 @@ from audittrace.services.console_acl._errors import (
 )
 from audittrace.services.console_store import build_write_stamp
 
+if TYPE_CHECKING:
+    # B6, MEASURED (this round): a module-level (unconditionally
+    # executed) import of a name from ``audittrace.services.console_acl``
+    # — the PACKAGE's own ``__init__.py`` — makes the pinned pre-commit
+    # mypy hook (v1.8.0) fail from a COLD cache when this module is
+    # checked WITHOUT ``_postgres.py`` also in the file set: resolving
+    # ``__init__.py`` pulls in ``_postgres.py`` (its own bottom import
+    # block) as a dependency, and mypy 1.8.0 cannot then determine the
+    # type of a `@log_call`-decorated mixin method across that boundary
+    # ("Cannot determine type of ... in base class _PostgresAclWrites").
+    # Reproduced in isolation (a minimal two-file package with the same
+    # self-referential-import + decorated-mixin-method shape) and
+    # confirmed the FIX: a ``TYPE_CHECKING``-only import of the SAME name
+    # does not trigger it (mypy resolves the annotation without forcing
+    # eager cross-module attribute-type inference), whereas an identical
+    # import outside ``TYPE_CHECKING`` does, on every cold-cache run.
+    # ``AclGrantOp`` is used ONLY as a type annotation below (``ops:
+    # list[AclGrantOp]``) — under ``from __future__ import annotations``
+    # it is never evaluated at runtime, so this is the correct, and only
+    # necessary, import site for it.
+    from audittrace.services.console_acl import AclGrantOp
+
 logger = logging.getLogger(__name__)
+
+
+def _acl_constants() -> dict[str, str | None]:
+    """Lazy import of the write path's principal-type/model constants —
+    SAME cycle and SAME fix rationale as :func:`_acl_audit` below, and
+    as the ``TYPE_CHECKING`` import above: importing these at module
+    level (even though they are plain strings, not classes) is what
+    makes mypy 1.8.0 resolve ``_postgres.py`` as a dependency and fail
+    on the decorated mixin methods, from a cold cache. Called from
+    :func:`_principal_model_by_type`, which is memoised so the import
+    (and the dict it builds) only happens once per process."""
+    from audittrace.services.console_acl import (  # noqa: PLC0415
+        PRINCIPAL_MODEL_ROLE,
+        PRINCIPAL_MODEL_USER,
+        PRINCIPAL_TYPE_PUBLIC,
+        PRINCIPAL_TYPE_ROLE,
+        PRINCIPAL_TYPE_USER,
+    )
+
+    return {
+        PRINCIPAL_TYPE_USER: PRINCIPAL_MODEL_USER,
+        PRINCIPAL_TYPE_ROLE: PRINCIPAL_MODEL_ROLE,
+        PRINCIPAL_TYPE_PUBLIC: None,
+    }
 
 
 def _acl_audit() -> Any:
@@ -143,12 +181,6 @@ _PRINCIPAL_TYPE_CONSTRAINTS: tuple[str, ...] = (
 # rendered-SQL copy (barred as a RED target, spec §9).
 _CONSTRAINT_NAME_RE = re.compile(r'"([A-Za-z0-9_]+)"')
 
-_PRINCIPAL_MODEL_BY_TYPE: dict[str, str | None] = {
-    PRINCIPAL_TYPE_USER: PRINCIPAL_MODEL_USER,
-    PRINCIPAL_TYPE_ROLE: PRINCIPAL_MODEL_ROLE,
-    PRINCIPAL_TYPE_PUBLIC: None,
-}
-
 
 def _principal_model(principal_type: str) -> str | None:
     """``principal_model`` derived from ``principal_type`` — as the fork
@@ -158,7 +190,7 @@ def _principal_model(principal_type: str) -> str | None:
     (spec 5.3 — R-8 forbids an application pre-check; the control is
     migration 031's DB-level CHECK constraints). An unrecognised type
     falls back to ``None`` and is left for the database to refuse."""
-    return _PRINCIPAL_MODEL_BY_TYPE.get(principal_type)
+    return _acl_constants().get(principal_type)
 
 
 def _row_to_dict(row: ConsoleAclEntry) -> dict[str, Any]:

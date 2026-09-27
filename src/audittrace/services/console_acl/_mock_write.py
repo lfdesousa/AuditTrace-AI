@@ -43,39 +43,82 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from audittrace.identity import UserContext
 from audittrace.logging_config import log_call
-from audittrace.services.console_acl import (
-    ALLOWED_PRINCIPAL_TYPES,
-    PRINCIPAL_MODEL_ROLE,
-    PRINCIPAL_MODEL_USER,
-    PRINCIPAL_TYPE_PUBLIC,
-    PRINCIPAL_TYPE_ROLE,
-    PRINCIPAL_TYPE_USER,
-    AclGrantOp,
-)
 from audittrace.services.console_acl._errors import (
     AclBulkRolledBackError,
     AclPastExpiryError,
     AclPrincipalTypeRefused,
     AclWriteRefused,
 )
-from audittrace.services.console_acl._mock import _MockAclEntry
 from audittrace.services.console_store import build_write_stamp
+
+if TYPE_CHECKING:
+    # B6, MEASURED (this round) — SAME rationale as
+    # ``_postgres_write.py``'s identical block: a module-level
+    # (unconditionally executed) import of a name from
+    # ``audittrace.services.console_acl`` (the PACKAGE's own
+    # ``__init__.py``) makes the pinned pre-commit mypy hook (v1.8.0)
+    # fail from a cold cache on this file's `@log_call`-decorated mixin
+    # methods, because resolving ``__init__.py`` pulls in ``_mock.py``
+    # (its own bottom import block) as a dependency. A
+    # ``TYPE_CHECKING``-only import of the SAME name does not trigger
+    # it — reproduced and confirmed in isolation (see
+    # ``_postgres_write.py``'s module docstring for the full
+    # measurement). ``AclGrantOp`` is used ONLY as a type annotation
+    # below (``ops: list[AclGrantOp]``) — under ``from __future__
+    # import annotations`` it is never evaluated at runtime.
+    from audittrace.services.console_acl import AclGrantOp
+    from audittrace.services.console_acl._mock import _MockAclEntry
 
 logger = logging.getLogger(__name__)
 
-_PRINCIPAL_MODEL_BY_TYPE: dict[str, str | None] = {
-    PRINCIPAL_TYPE_USER: PRINCIPAL_MODEL_USER,
-    PRINCIPAL_TYPE_ROLE: PRINCIPAL_MODEL_ROLE,
-    PRINCIPAL_TYPE_PUBLIC: None,
-}
+
+def _entry_cls() -> type[_MockAclEntry]:
+    """Lazy import of :class:`~audittrace.services.console_acl._mock.
+    _MockAclEntry` — SAME rationale as the ``TYPE_CHECKING`` import
+    above. Unlike the constants above, this name is INSTANTIATED at
+    runtime (not merely used in annotations), so it cannot be
+    ``TYPE_CHECKING``-only; this accessor is the lazy-import
+    equivalent for a runtime-needed class."""
+    from audittrace.services.console_acl._mock import _MockAclEntry  # noqa: PLC0415
+
+    return _MockAclEntry
+
+
+def _acl_constants() -> dict[str, str | None]:
+    """Lazy import of the write path's principal-type/model constants —
+    SAME cycle and SAME fix rationale as the ``TYPE_CHECKING`` import
+    above. Memoisation is unnecessary here (this dict is tiny and built
+    fresh per call, mirroring ``_postgres_write.py``'s twin)."""
+    from audittrace.services.console_acl import (  # noqa: PLC0415
+        PRINCIPAL_MODEL_ROLE,
+        PRINCIPAL_MODEL_USER,
+        PRINCIPAL_TYPE_PUBLIC,
+        PRINCIPAL_TYPE_ROLE,
+        PRINCIPAL_TYPE_USER,
+    )
+
+    return {
+        PRINCIPAL_TYPE_USER: PRINCIPAL_MODEL_USER,
+        PRINCIPAL_TYPE_ROLE: PRINCIPAL_MODEL_ROLE,
+        PRINCIPAL_TYPE_PUBLIC: None,
+    }
+
+
+def _allowed_principal_types() -> frozenset[str]:
+    """Lazy import of ``ALLOWED_PRINCIPAL_TYPES`` — same rationale."""
+    from audittrace.services.console_acl import (  # noqa: PLC0415
+        ALLOWED_PRINCIPAL_TYPES,
+    )
+
+    return ALLOWED_PRINCIPAL_TYPES
 
 
 def _principal_model(principal_type: str) -> str | None:
-    return _PRINCIPAL_MODEL_BY_TYPE.get(principal_type)
+    return _acl_constants().get(principal_type)
 
 
 def _acl_audit() -> Any:
@@ -221,7 +264,7 @@ class _MockAclWrites:
             )
 
         # R-8 — the mock's stand-in for migration 031's DB CHECK.
-        if principal_type not in ALLOWED_PRINCIPAL_TYPES:
+        if principal_type not in _allowed_principal_types():
             raise await _mock_denial(
                 user_context=user_context,
                 op="grantPermission",
@@ -259,7 +302,7 @@ class _MockAclWrites:
                 row.expired_at_ms = stamp.now_ms
                 row.updated_at_ms = stamp.now_ms
 
-        new_row = _MockAclEntry(
+        new_row = _entry_cls()(
             id=str(uuid.uuid4()),
             user_sub=stamp.user_sub,
             principal_type=principal_type,
@@ -396,7 +439,7 @@ class _MockAclWrites:
                     "op_count": op_count,
                 }
                 try:
-                    if grant_op.principal_type not in ALLOWED_PRINCIPAL_TYPES:
+                    if grant_op.principal_type not in _allowed_principal_types():
                         raise ValueError(  # noqa: TRY301 - caught immediately below
                             f"principal_type={grant_op.principal_type!r} not allowed"
                         )
@@ -422,7 +465,7 @@ class _MockAclWrites:
                             row.expired_at_ms = stamp.now_ms
                             row.updated_at_ms = stamp.now_ms
                             expired_ids.append(row.id)
-                    new_row = _MockAclEntry(
+                    new_row = _entry_cls()(
                         id=str(uuid.uuid4()),
                         user_sub=stamp.user_sub,
                         principal_type=grant_op.principal_type,
