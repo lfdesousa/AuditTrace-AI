@@ -1264,13 +1264,16 @@ async def _raw_insert(
     expired_at_ms: int | None = None,
     created_at_ms: int = 0,
     updated_at_ms: int = 0,
+    entry_id: str | None = None,
 ) -> str:
     """Seed a row bypassing every guard (grant_permission's own O-6
     expire-and-insert would supersede a pre-existing row at the SAME
     key — some A2 fixtures need TWO simultaneously-active rows at one
     key, e.g. KSEL's ``firstrow`` scenario, which only a raw insert can
     construct). Mirrors ``tests/test_acl_write_path_rls.py``'s own "raw
-    INSERT bypassing the service" precedent."""
+    INSERT bypassing the service" precedent. ``entry_id``, when given,
+    pins the row's id (S-a's ordering test needs to control id ASCII
+    order independently of insertion order)."""
     if isinstance(service, MockConsoleAclEntriesService):
         row = service.seed_entry(
             user_sub=user_sub,
@@ -1288,13 +1291,17 @@ async def _raw_insert(
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
         )
+        if entry_id is not None:
+            entry = next(e for e in service._entries if e.id == row["id"])
+            entry.id = entry_id
+            return entry_id
         return str(row["id"])
     pg = dependencies.get_postgres_factory()
-    entry_id = str(uuid.uuid4())
+    resolved_id = entry_id if entry_id is not None else str(uuid.uuid4())
     async with pg.get_session_factory()() as db:
         db.add(
             ConsoleAclEntry(
-                id=entry_id,
+                id=resolved_id,
                 user_sub=user_sub,
                 principal_type=principal_type,
                 principal_id=principal_id,
@@ -1312,7 +1319,7 @@ async def _raw_insert(
             )
         )
         await db.commit()
-    return entry_id
+    return resolved_id
 
 
 async def _row_pair(
@@ -1821,33 +1828,50 @@ class TestDeleteAclEntries:
         assert len(after) == before + 3, "one audit row per predicate, incl. zero-match"
 
     async def test_ordering_ties_broken_by_created_at_ms_then_id(
-        self, service, user_context, monkeypatch
+        self, service, user_context
     ) -> None:
         """S-a — delete's OWN order: ``(created_at_ms, id)``, never
-        RETURNING/insertion order."""
+        RETURNING/insertion order. A genuine tie: BOTH rows share the
+        SAME ``created_at_ms``, seeded id-DESCENDING (``zzz-...``
+        before ``aaa-...``) — a plain RETURNING/insertion-order read
+        comes back ``[zzz, aaa]``; only the explicit sort produces the
+        required ``[aaa, zzz]`` (ascending id at the tie)."""
         t0 = 1_790_200_000_000
-        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
-        a = await service.grant_permission(
-            user_context,
+        zzz_id = await _raw_insert(
+            service,
+            user_sub=user_context.user_id,
             principal_type="user",
-            principal_id="v-order-a",
+            principal_id="v-order-tie-z",
+            principal_model="User",
             resource_type="agent",
-            resource_id="agent-order",
+            resource_id="agent-order-tie",
             perm_bits=1,
+            created_at_ms=t0,
+            updated_at_ms=t0,
+            entry_id="zzz-tie-row",
         )
-        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0 + 1)
-        b = await service.grant_permission(
-            user_context,
+        aaa_id = await _raw_insert(
+            service,
+            user_sub=user_context.user_id,
             principal_type="user",
-            principal_id="v-order-b",
+            principal_id="v-order-tie-a",
+            principal_model="User",
             resource_type="agent",
-            resource_id="agent-order",
+            resource_id="agent-order-tie",
             perm_bits=1,
+            created_at_ms=t0,
+            updated_at_ms=t0,
+            entry_id="aaa-tie-row",
         )
+        assert zzz_id == "zzz-tie-row"
+        assert aaa_id == "aaa-tie-row"
+
         result = await service.delete_acl_entries(
-            user_context, [{"resource_id": "agent-order"}]
+            user_context, [{"resource_id": "agent-order-tie"}]
         )
-        assert result["expired_ids"] == [a["id"], b["id"]]
+        assert result["expired_ids"] == ["aaa-tie-row", "zzz-tie-row"], (
+            "the tie must break by id ASCENDING, never insertion/RETURNING order"
+        )
 
     async def test_retains_rows_never_hard_deletes(self, service, user_context) -> None:
         """Retention (#13) on delete."""
