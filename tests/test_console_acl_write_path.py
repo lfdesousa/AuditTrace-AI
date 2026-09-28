@@ -2423,3 +2423,135 @@ class TestA2DocumentationGreps:
         DELETE on Postgres regardless; this is the "we never even try"
         half)."""
         assert self._grep(r"^\s+sa\.delete\(") == "0"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fix round 1 (the independent reviewer's REJECT verdict) — the mock/
+# aiosqlite halves of BL-2/BL-4 (the real-Postgres halves live in
+# tests/test_acl_write_path_rls.py). BL-1, BL-3 and the rest of BL-4 are
+# Postgres-only (BL-1's shape is a Postgres INSERT-constraint refusal;
+# BL-3's plan-independence concern does not exist on aiosqlite/mock).
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestBL2TenantOnSuccessAuditRowsBothImpls:
+    """BL-2 — KSEL-t/SEL's tenant carriage, asserted against the REAL
+    ``/interactions`` row's ``question`` string, on BOTH implementations
+    (the Postgres half of this class lives in
+    ``tests/test_acl_write_path_rls.py::TestBL2TenantRenderedOnSuccessAuditRows``;
+    this class is deliberately ALSO parametrized over ``service`` so the
+    mock half is covered here too)."""
+
+    async def test_revoke_success_audit_row_ends_tenant_t1(
+        self, service, client, user_context
+    ) -> None:
+        key = dict(
+            principal_type="user",
+            principal_id="v-bl2-revoke",
+            resource_type="agent",
+            resource_id="agent-bl2-revoke",
+            tenant_id="t1",
+        )
+        await service.grant_permission(user_context, perm_bits=1, **key)
+        result = await service.revoke_permission(user_context, **key)
+        assert result["visible_matched_count"] == 1
+        stored = _match_one_op(
+            _interactions(client), "revokePermission", "agent-bl2-revoke"
+        )
+        assert stored["status"] == "success"
+        assert stored["question"].endswith("tenant=t1"), stored["question"]
+
+    async def test_modify_success_audit_row_ends_tenant_t1(
+        self, service, client, user_context
+    ) -> None:
+        key = dict(
+            principal_type="user",
+            principal_id="v-bl2-modify",
+            resource_type="agent",
+            resource_id="agent-bl2-modify",
+            tenant_id="t1",
+        )
+        await service.grant_permission(user_context, perm_bits=1, **key)
+        row = await service.modify_permission_bits(user_context, add_bits=2, **key)
+        assert row is not None
+        stored = _match_one_op(
+            _interactions(client), "modifyPermissionBits", "agent-bl2-modify"
+        )
+        assert stored["status"] == "success"
+        assert stored["question"].endswith("tenant=t1"), stored["question"]
+
+
+class TestBL4NoActiveAndOwnerMirrorMock:
+    """BL-4 — ``noactive`` (mock's ``_visible_matching_rows`` without
+    the active-clause equivalent) and the owner-mirror in
+    ``_expire_matching`` (E-F/P-1b-F), both mock-only (their Postgres
+    twins are in ``test_acl_write_path_rls.py``)."""
+
+    async def test_noactive_a_lapsed_sibling_never_contributes_bits(
+        self, service, user_context
+    ) -> None:
+        key = dict(
+            principal_type="user",
+            principal_id="v-bl4-noactive",
+            resource_type="agent",
+            resource_id="agent-bl4-noactive",
+        )
+        await _raw_insert(
+            service,
+            user_sub=user_context.user_id,
+            principal_model="User",
+            perm_bits=15,
+            expired_at_ms=10,
+            created_at_ms=1,
+            updated_at_ms=10,
+            **key,
+        )
+        await _raw_insert(
+            service,
+            user_sub=user_context.user_id,
+            principal_model="User",
+            perm_bits=1,
+            expired_at_ms=None,
+            created_at_ms=2,
+            updated_at_ms=2,
+            **key,
+        )
+        row = await service.modify_permission_bits(user_context, add_bits=2, **key)
+        assert row is not None
+        assert row["perm_bits"] == 3, (
+            "old_bits must come ONLY from the ACTIVE row (1), never the "
+            "lapsed sibling's 15"
+        )
+
+    async def test_owner_mirror_public_row_visible_not_expirable(
+        self, mock_service, user_context
+    ) -> None:
+        """E-F/P-1b-F — a PUBLIC row NOT owned by the caller is VISIBLE
+        (RLS-mirror) but must NOT be expired (the owner mirror in
+        ``_expire_matching``)."""
+        other_owner = "someone-else-entirely"
+        await _raw_insert(
+            mock_service,
+            user_sub=other_owner,
+            principal_type="public",
+            principal_id=None,
+            principal_model=None,
+            resource_type="agent",
+            resource_id="agent-bl4-ef",
+            perm_bits=1,
+        )
+        result = await mock_service.revoke_permission(
+            user_context,
+            principal_type="public",
+            principal_id=None,
+            resource_type="agent",
+            resource_id="agent-bl4-ef",
+        )
+        assert result["visible_matched_count"] == 1, (
+            "the public row is VISIBLE to any caller (RLS mirror)"
+        )
+        assert result["expired_ids"] == [], (
+            "but NOT owned by user_context — the owner mirror must refuse to expire it"
+        )
+        other_row = next(e for e in mock_service._entries if e.user_sub == other_owner)
+        assert other_row.expired_at_ms is None

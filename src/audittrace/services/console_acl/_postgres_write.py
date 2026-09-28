@@ -979,6 +979,14 @@ class _PostgresAclWrites:
                             trace_id=stamp.trace_id,
                         )
                         db.add(new_row)
+                        # shape (1), spec §4.2 — flush the INSERT HERE,
+                        # inside Stage 1, so a genuine DB refusal (e.g.
+                        # 031's public-resource unique index, §8 item 12)
+                        # is classified by Stage 1's own except below
+                        # (_write_denial -> _classify -> acl_denied_policy)
+                        # and never misclassified as an N4 audit-write
+                        # failure by Stage 2's except (BL-1).
+                        await db.flush()
             except Exception as exc:  # noqa: BLE001 - reclassified below
                 await db.rollback()
                 raise await _write_denial(
