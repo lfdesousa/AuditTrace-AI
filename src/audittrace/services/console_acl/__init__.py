@@ -296,11 +296,11 @@ class ConsoleAclEntriesService(ABC):
         rationale (the one documented exact-equality exception)."""
 
     # ── ACL 2b-core-A — the write path. All FIVE declared here together
-    # so the interface is fixed once (2b-core-A1 spec §1): A1 implements
-    # grant_permission/bulk_write_acl_entries; the other three raise
-    # NotImplementedError on BOTH implementations until 2b-core-A2 — a
-    # disclosed, real gap (zero production callers of any of the five
-    # exist in src/ today; no route reaches them until 2c). Every
+    # so the interface is fixed once (2b-core-A1 spec §1): A1 built
+    # grant_permission/bulk_write_acl_entries; A2 builds the other
+    # three (revoke_permission/modify_permission_bits/
+    # delete_acl_entries) — zero production callers of any of the five
+    # exist in src/ today; no route reaches them until 2c. Every
     # signature takes user_context FIRST, like every read method above,
     # and carries NO granted_by/user_sub/granted_at/session/trace_id
     # parameter — those are always server-derived (S-2, spec §3).
@@ -333,12 +333,11 @@ class ConsoleAclEntriesService(ABC):
         resource_id: str,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """Expire the active row(s) at the given key (spec §5.5 —
-        expire-by-predicate, never a hard delete). Returns
-        ``{"expired_ids": [...], "visible_matched_count": n}``. **2b-
-        core-A1 ships this as ``NotImplementedError`` on both
-        implementations — 2b-core-A2 builds it** (spec §1 scope split,
-        ADDENDUM U-6)."""
+        """Expire the active row(s) at the given key (2b-core-A2 spec
+        §4.1 — expire-by-predicate, never a hard delete). Returns
+        ``{"expired_ids": [...], "visible_matched_count": n}``; the
+        visible count is taken BEFORE the expiring UPDATE, at the same
+        clock (E-G)."""
 
     @abstractmethod
     async def modify_permission_bits(
@@ -353,11 +352,12 @@ class ConsoleAclEntriesService(ABC):
         remove_bits: int | None = None,
         tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """O-6 expire-and-insert with the bits recomputed (spec §9 #7 —
-        never an in-place ``UPDATE ... SET perm_bits``). Returns the NEW
-        row, or ``None`` when no active row matched. **2b-core-A1 ships
-        this as ``NotImplementedError`` on both implementations — 2b-
-        core-A2 builds it** (ADDENDUM U-6)."""
+        """O-6 expire-and-insert with the bits recomputed (2b-core-A2
+        spec §4.2 — never an in-place ``UPDATE ... SET perm_bits``).
+        Returns the NEW row, or ``None`` when no active row matched.
+        Every key column of the new row, including ``tenant_id``, comes
+        from THIS call's own arguments, never from a captured row
+        (A2v3-BL-1)."""
 
     @abstractmethod
     async def bulk_write_acl_entries(
@@ -377,14 +377,16 @@ class ConsoleAclEntriesService(ABC):
         user_context: UserContext,
         predicates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Expire-by-predicate, CALLER-SCOPED (spec §5.5 / A-FWD-1): an
-        unowned row is silently omitted from the UPDATE under migration
-        032's owner-only ``USING``, never refused. Returns
-        ``{"expired_ids": [...], "visible_matched_count": n}``. An
-        unknown predicate key, an empty list, or an empty dict raises
-        ``ValueError`` before any I/O. **2b-core-A1 ships this as
-        ``NotImplementedError`` on both implementations — 2b-core-A2
-        builds it** (ADDENDUM U-6)."""
+        """Expire-by-predicate, CALLER-SCOPED (2b-core-A2 spec §4.3 /
+        A-FWD-1): an unowned row is silently omitted from the UPDATE
+        under migration 032's owner-only ``USING``, never refused.
+        Returns ``{"expired_ids": [...], "visible_matched_count": n}``.
+        An unknown predicate key, an empty list, an empty dict, a
+        non-str/empty-str value, or a predicate naming none of
+        ``principal_id``/``resource_id``/``principal_type='public'``
+        raises ``ValueError`` before any I/O. One audit row per
+        predicate; a refusal at predicate *i* rolls back every row
+        staged so far (D-A2-4/D-A2-4r)."""
 
 
 from audittrace.services.console_acl._mock import (  # noqa: E402

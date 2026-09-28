@@ -37,12 +37,42 @@ ADDENDUM U-5(iii)'s gate: ``git diff -U0 main..HEAD -- _postgres.py
 _mock.py`` must touch only import lines and the two ``class …(``
 statements — any hunk inside a READ method body is a REJECT).
 
-**Scope — A1 only (ADDENDUM U-6).** :func:`grant_permission` and
-:func:`bulk_write_acl_entries` are FULLY implemented here.
-``revoke_permission``/``modify_permission_bits``/``delete_acl_entries``
-raise :class:`NotImplementedError` — a REAL, disclosed gap: zero
-production callers of any of the five write methods exist in ``src/``
-today, no route reaches them until 2c, and 2b-core-A2 fills them in.
+**Scope — A1 + A2.** :func:`grant_permission` and
+:func:`bulk_write_acl_entries` are A1. :func:`revoke_permission`,
+:func:`modify_permission_bits` and :func:`delete_acl_entries` are
+**2b-core-A2**
+(``2026-09-28-SPEC-acl-2b-core-A2-revoke-modify-delete-CONSOLIDATED-v4.md``)
+— zero production callers of any of the five write methods exist in
+``src/`` today; no route reaches any of them until 2c.
+
+**A2's helpers (spec §4.0), one SQL spelling each, shared by every A2
+method:** :func:`_visible_ids` (C4/C8 — the "how many rows can the
+caller SEE" SELECT, always evaluated BEFORE the corresponding UPDATE,
+at the same ``stamp.now_ms``, spec E-G) and :func:`_active_rows`
+(C6 — the entity-returning twin ``modify_permission_bits`` mutates
+in place, in Python, before superseding them) both derive their
+"still active" half from :func:`_active_clause`, the SAME function
+A1's :func:`_expire_active` already used — never a second spelling.
+:func:`_expire_where` (C5/C7/C10) now holds A1's and A2's ONE UPDATE
+statement; :func:`_expire_active` is unchanged in signature and
+return value (spec S-c: A1's ``expired_ids`` RETURNING order is
+untouched) but is now a thin wrapper over :func:`_expire_where`.
+:func:`_predicate_clause` (C3, new) is :func:`delete_acl_entries`'s
+own key-matcher — **one ``==`` per key PRESENT in the caller's dict,
+never** :func:`_key_clause`'s ``.get()`` reuse, which would silently
+turn an absent key into an ``IS NULL`` match (spec §4.0's ``keyclause``
+escape).
+
+**The tenant-carriage fix (A2v3-BL-1, spec §4.2/§4.5 W1/W3).**
+``modify_permission_bits``'s new row takes **every one of its five key
+columns — including ``tenant_id`` — from the caller's ``key``
+argument, never from a captured row.** The A2v3 gate reproduced a
+defect where inserting the new row at ``tenant_id=None`` (as if the
+column were merely carried through from whatever the SELECT happened
+to return) let a LATER ``revoke_permission(tenant_id='t1')`` succeed
+against the NULL-tenant row while the original ``t1`` grant stayed
+active — a revocation that looks like it worked and does not. §7.4's
+KSEL-t rows and §7.5's W1/W2/W3 written-value class are the guards.
 
 **The abort-shape discipline (spec §0/§6, ADDENDA U-2/V-1/V-2/W-1/W-2/
 X-1) — derived from the SQLAlchemy call each statement actually makes,
@@ -205,6 +235,83 @@ def _acl_audit() -> Any:
     return _audit
 
 
+def _max_perm_bits() -> int:
+    """Lazy import of ``MAX_PERM_BITS`` — same mypy-cold-cache rationale
+    as :func:`_acl_constants` (called fresh each time; the value is a
+    single int, not worth memoising)."""
+    from audittrace.services.console_acl import MAX_PERM_BITS  # noqa: PLC0415
+
+    return MAX_PERM_BITS
+
+
+def _validate_bit_operands(add_bits: int | None, remove_bits: int | None) -> None:
+    """``modify_permission_bits``'s pre-I/O validation (spec §3, D-A2-1)
+    — a caller defect, never a database round-trip and never an audit
+    row: ``modifyPermissionBits`` writes no DB row for a rejected call.
+    Both operands ``None`` is refused (nothing to do); a non-``None``
+    operand that is not an ``int`` in ``[0, MAX_PERM_BITS]`` is refused
+    — unlike ``grant_permission``'s ``perm_bits`` (a column value the
+    DATABASE's CHECK constraint polices, spec S-4/D-A2-7), these
+    operands are combined in Python BEFORE ever reaching a column, so no
+    DB control can see a bad one (an out-of-range ``remove_bits`` can
+    still yield an in-range ``new_bits`` from garbage inputs)."""
+    if add_bits is None and remove_bits is None:
+        raise ValueError("modify_permission_bits requires add_bits and/or remove_bits")
+    max_bits = _max_perm_bits()
+    for name, value in (("add_bits", add_bits), ("remove_bits", remove_bits)):
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not (0 <= value <= max_bits)
+        ):
+            raise ValueError(f"{name}={value!r} must be an int in [0, {max_bits}]")
+
+
+# ``delete_acl_entries``'s predicate validation (spec §3, D-A2-1) — every
+# key a predicate dict may name; an unknown key is refused before any
+# I/O. Matches the five columns _key_clause/_predicate_clause read.
+_ALLOWED_PREDICATE_KEYS: frozenset[str] = frozenset(
+    {"principal_type", "principal_id", "resource_type", "resource_id", "tenant_id"}
+)
+
+
+def _validate_predicate(pred: dict[str, Any]) -> None:
+    """One ``delete_acl_entries`` predicate, validated BEFORE any I/O
+    (spec §3, D-A2-1): an empty dict, an unknown key, or a value that is
+    not a non-empty ``str`` (``None`` included) is a caller defect, not
+    an authorization event — ``ValueError``, no audit row. A predicate
+    naming none of ``principal_id``, ``resource_id`` or
+    ``principal_type='public'`` is ALSO refused — every real caller
+    shape anchors on at least one of the three (spec §3's "the four fork
+    caller shapes all do"), so a predicate that only narrows by
+    ``resource_type``/``tenant_id`` alone would be far broader than any
+    shape this method is built to serve."""
+    if not pred:
+        raise ValueError("delete_acl_entries: predicate must not be empty")
+    unknown = set(pred) - _ALLOWED_PREDICATE_KEYS
+    if unknown:
+        raise ValueError(
+            f"delete_acl_entries: unknown predicate key(s) {sorted(unknown)!r}"
+        )
+    for key, value in pred.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"delete_acl_entries: predicate[{key!r}]={value!r} must be a "
+                "non-empty str"
+            )
+    if not (
+        "principal_id" in pred
+        or "resource_id" in pred
+        or pred.get("principal_type") == "public"
+    ):
+        raise ValueError(
+            "delete_acl_entries: predicate must name principal_id, "
+            "resource_id, or principal_type='public'"
+        )
+
+
 # ── The two Postgres CHECK constraints that (redundantly — see module
 # docstring) refuse a principal_type outside {user, public, role}. Both
 # map to the SAME failure_class; which one appears in a given exception's
@@ -309,6 +416,66 @@ def _active_clause(now_ms: int) -> Any:
     return _not_expired_clause(now_ms)
 
 
+def _predicate_clause(pred: dict[str, Any]) -> Any:
+    """A2's ``delete_acl_entries`` matcher (spec §4.0, clause C3) — ONE
+    ``==`` per key PRESENT in ``pred``, never :func:`_key_clause`'s
+    ``.get()`` reuse (which turns an absent key into an ``IS NULL``
+    match — the ``keyclause`` escape spec §4.0 names by name). SQLAlchemy
+    translates ``Column == None`` to ``IS NULL`` on its own, so an
+    explicit ``None`` value in ``pred`` is still correct without a
+    manual branch — unlike :func:`_key_clause`, which spells the branch
+    out because ALL five of its keys are always present."""
+    return sa.and_(
+        *(getattr(ConsoleAclEntry, key) == value for key, value in pred.items())
+    )
+
+
+async def _visible_ids(session: AsyncSession, *, where: Any, now_ms: int) -> list[str]:
+    """The rows at ``where`` the caller can SEE (RLS ``SELECT`` policy) —
+    ``visible_matched_count``'s SELECT half (spec §4.5, clauses C4/C8).
+    Always evaluated BEFORE the corresponding :func:`_expire_where` call,
+    at the SAME ``now_ms`` (E-G) — the caller passes the SAME ``where``
+    to both, never a narrower/wider re-spelling."""
+    stmt = sa.select(ConsoleAclEntry.id).where(where, _active_clause(now_ms))
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def _active_rows(
+    session: AsyncSession, *, where: Any, now_ms: int
+) -> list[ConsoleAclEntry]:
+    """``modify_permission_bits``'s entity-returning twin of
+    :func:`_visible_ids` (spec §4.0, clause C6) — the SAME ``where``/
+    ``_active_clause`` pair, but returning the ORM entities themselves
+    so the caller can capture their columns (``expired_at_ms``,
+    ``role_id``, ``created_at_ms``, ``perm_bits``) BEFORE the UPDATE
+    that supersedes them (S-2)."""
+    stmt = sa.select(ConsoleAclEntry).where(where, _active_clause(now_ms))
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def _expire_where(
+    session: AsyncSession, *, where: Any, now_ms: int
+) -> list[tuple[str, int]]:
+    """Holds A1's and A2's ONE ``sa.update(ConsoleAclEntry)`` statement
+    (spec §4.0, clauses C5/C7/C10) — ORM-enabled Core UPDATE (ADDENDUM
+    V-1), touching ONLY ``expired_at_ms``/``updated_at_ms`` (Q-4.1).
+    Returns ``(id, created_at_ms)`` pairs in RETURNING order, unsorted —
+    :func:`_expire_active` (A1's shape, kept for grant/bulk/revoke/
+    modify) discards the second element; ``delete_acl_entries`` (the
+    only A2 caller that sorts) keeps both and orders by
+    ``(created_at_ms, id)`` itself (spec §4.3)."""
+    stmt = (
+        sa.update(ConsoleAclEntry)
+        .where(where, _active_clause(now_ms))
+        .values(expired_at_ms=now_ms, updated_at_ms=now_ms)
+        .returning(ConsoleAclEntry.id, ConsoleAclEntry.created_at_ms)
+    )
+    result = await session.execute(stmt)
+    return [(row[0], row[1]) for row in result.all()]
+
+
 async def _expire_active(
     session: AsyncSession,
     *,
@@ -331,24 +498,23 @@ async def _expire_active(
     not yet lapsed, or a stale future expiry silently outlives the
     re-grant that was meant to replace it (ADDENDUM Y-0's measured
     downgrade). A future ``expired_at_ms`` matched here is OVERWRITTEN
-    with the moment of supersession, never left at its scheduled value."""
-    stmt = (
-        sa.update(ConsoleAclEntry)
-        .where(
-            _key_clause(
-                principal_type=principal_type,
-                principal_id=principal_id,
-                resource_type=resource_type,
-                resource_id=resource_id,
-                tenant_id=tenant_id,
-            ),
-            _active_clause(now_ms),
-        )
-        .values(expired_at_ms=now_ms, updated_at_ms=now_ms)
-        .returning(ConsoleAclEntry.id)
+    with the moment of supersession, never left at its scheduled value.
+
+    **A2 (spec §4.0):** now a thin wrapper over :func:`_expire_where` —
+    same signature, same return value, same RETURNING order (S-c: A1's
+    tests assert on this order and A2 must not disturb it)."""
+    pairs = await _expire_where(
+        session,
+        where=_key_clause(
+            principal_type=principal_type,
+            principal_id=principal_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            tenant_id=tenant_id,
+        ),
+        now_ms=now_ms,
     )
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+    return [row_id for row_id, _created_at_ms in pairs]
 
 
 def _classify(exc: Exception) -> tuple[str, str]:
@@ -619,12 +785,117 @@ class _PostgresAclWrites:
         resource_id: str,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.** A real
-        gap, not a stub: zero production callers of this method exist in
-        ``src/`` today, and no route reaches it until 2c."""
-        raise NotImplementedError(
-            "revoke_permission is 2b-core-A2 scope — see ADDENDUM U-6"
-        )
+        """Expire the active row(s) at ``key`` (spec §4.1) — never a
+        hard delete (retention #13; migration 033's trigger refuses a
+        real ``DELETE`` on Postgres regardless). The visible-count
+        SELECT runs BEFORE the expiring UPDATE, at the SAME
+        ``stamp.now_ms`` (E-G) — never after."""
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+        attempted = {
+            "principal_type": principal_type,
+            "principal_id": principal_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tenant_id": tenant_id,
+        }
+
+        async with self._session_factory() as db:
+            # Stage 1 — the domain write: SELECT (visible count) then
+            # UPDATE (expire), same shape-3 abort as _expire_active
+            # alone (spec §5).
+            try:
+                where = _key_clause(
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    tenant_id=tenant_id,
+                )
+                visible_matched_count = len(
+                    await _visible_ids(db, where=where, now_ms=stamp.now_ms)
+                )
+                expired_ids = await _expire_active(
+                    db,
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    tenant_id=tenant_id,
+                    now_ms=stamp.now_ms,
+                )
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    attempted=attempted,
+                    exc=exc,
+                    tenant_id=tenant_id,
+                ) from exc
+
+            # Stage 2 — the audit row (N4, caller half).
+            try:
+                await _audit.record(
+                    db,
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    acl_entry_ids=[],
+                    expired_ids=expired_ids,
+                    visible_matched_count=visible_matched_count,
+                    expired_at_ms=None,
+                    tenant_id=tenant_id,
+                )
+                await db.flush()
+            except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                await db.rollback()
+                await _audit.record_denial(
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                    predicate_or_attempted_row=attempted,
+                    db_error_class=type(audit_exc).__name__,
+                    tenant_id=tenant_id,
+                )
+                raise
+
+            # Stage 3 — the commit.
+            try:
+                await db.commit()
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    attempted=attempted,
+                    exc=exc,
+                    tenant_id=tenant_id,
+                ) from exc
+
+            return {
+                "expired_ids": expired_ids,
+                "visible_matched_count": visible_matched_count,
+            }
 
     @log_call(logger=logger)
     async def modify_permission_bits(
@@ -639,10 +910,149 @@ class _PostgresAclWrites:
         remove_bits: int | None = None,
         tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.**"""
-        raise NotImplementedError(
-            "modify_permission_bits is 2b-core-A2 scope — see ADDENDUM U-6"
-        )
+        """O-6 expire-and-insert with the bits recomputed (spec §4.2) —
+        NEVER an in-place ``UPDATE ... SET perm_bits`` (E-B). Every key
+        column of the new row, including ``tenant_id``, comes from the
+        caller's key — never from a captured row (A2v3-BL-1, D-A2-9)."""
+        _validate_bit_operands(add_bits, remove_bits)
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+        key: dict[str, Any] = {
+            "principal_type": principal_type,
+            "principal_id": principal_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tenant_id": tenant_id,
+        }
+        attempted = {**key, "add_bits": add_bits, "remove_bits": remove_bits}
+
+        async with self._session_factory() as db:
+            where = _key_clause(**key)
+            active = await _active_rows(db, where=where, now_ms=stamp.now_ms)
+            # Captured BEFORE the UPDATE (S-2) — every active row, never
+            # active[0] (the "firstrow" escape leaks a sibling's bits).
+            scheduled = [
+                (row.id, row.expired_at_ms, row.role_id, row.created_at_ms)
+                for row in active
+            ]
+            old_bits = 0
+            for row in active:
+                old_bits |= row.perm_bits
+            new_bits = (old_bits | (add_bits or 0)) & ~(remove_bits or 0)
+
+            # Stage 1 — the domain write: expire, then (unless the race
+            # branch fires) insert the new row.
+            try:
+                expired_ids: list[str] = []
+                new_row: ConsoleAclEntry | None = None
+                inherited_expiry: int | None = None
+                if active:
+                    expired_ids = await _expire_active(db, **key, now_ms=stamp.now_ms)
+                    if expired_ids:
+                        # S-1's injection point: a concurrent expiry of
+                        # the SAME key between the SELECT above and this
+                        # UPDATE makes expired_ids == [] here — handled
+                        # as the race branch below, never as a refusal.
+                        role_id = max(scheduled, key=lambda s: s[3])[2]
+                        captured_expiries = [s[1] for s in scheduled]
+                        inherited_expiry = (
+                            None
+                            if any(e is None for e in captured_expiries)
+                            else max(e for e in captured_expiries if e is not None)
+                        )
+                        new_row = ConsoleAclEntry(
+                            id=str(uuid.uuid4()),
+                            user_sub=stamp.user_sub,
+                            principal_type=principal_type,
+                            principal_id=principal_id,
+                            principal_model=_principal_model(principal_type),
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            perm_bits=new_bits,
+                            tenant_id=tenant_id,
+                            role_id=role_id,
+                            granted_by=stamp.user_sub,
+                            granted_at_ms=stamp.now_ms,
+                            expired_at_ms=inherited_expiry,
+                            created_at_ms=stamp.now_ms,
+                            updated_at_ms=stamp.now_ms,
+                            trace_id=stamp.trace_id,
+                        )
+                        db.add(new_row)
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    attempted=attempted,
+                    exc=exc,
+                    tenant_id=tenant_id,
+                ) from exc
+
+            acl_entry_ids = [new_row.id] if new_row is not None else []
+            visible_matched_count = len(active)
+
+            # Stage 2 — the audit row (N4, caller half). Every branch
+            # (no-match / race / insert) writes perm_bits=new_bits —
+            # never 0 (S-1, D-A2-6).
+            try:
+                await _audit.record(
+                    db,
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    acl_entry_ids=acl_entry_ids,
+                    expired_ids=expired_ids,
+                    visible_matched_count=visible_matched_count,
+                    expired_at_ms=inherited_expiry,
+                    tenant_id=tenant_id,
+                )
+                await db.flush()
+            except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                await db.rollback()
+                await _audit.record_denial(
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                    predicate_or_attempted_row=attempted,
+                    db_error_class=type(audit_exc).__name__,
+                    tenant_id=tenant_id,
+                )
+                raise
+
+            # Stage 3 — the commit.
+            try:
+                await db.commit()
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    attempted=attempted,
+                    exc=exc,
+                    tenant_id=tenant_id,
+                ) from exc
+
+            return _row_to_dict(new_row) if new_row is not None else None
 
     @log_call(logger=logger)
     async def bulk_write_acl_entries(
@@ -757,7 +1167,165 @@ class _PostgresAclWrites:
         user_context: UserContext,
         predicates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.**"""
-        raise NotImplementedError(
-            "delete_acl_entries is 2b-core-A2 scope — see ADDENDUM U-6"
-        )
+        """Expire-by-predicate, CALLER-SCOPED (spec §4.3) — migration
+        032's owner-only UPDATE ``USING`` silently omits a row the
+        caller does not own from the UPDATE (never a refusal; item 4).
+        ALL the visibility SELECTs run before ANY expiring UPDATE; the
+        UPDATEs then run one predicate at a time, in order, each
+        producing its OWN audit row (D-A2-4). A refusal at predicate
+        *i* rolls back every row staged so far — zero partial success
+        (D-A2-4r)."""
+        if not predicates:
+            raise ValueError("delete_acl_entries: predicates must not be empty")
+        for pred in predicates:
+            _validate_predicate(pred)
+
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+
+        def _pred_fields(pred: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "principal_type": pred.get("principal_type", "-"),
+                "principal_id": pred.get("principal_id"),
+                "resource_type": pred.get("resource_type", "-"),
+                "resource_id": pred.get("resource_id", "-"),
+                "tenant_id": pred.get("tenant_id"),
+            }
+
+        async with self._session_factory() as db:
+            # Stage 0 — ALL the visibility SELECTs, before ANY UPDATE
+            # (spec §4.3): per-predicate counts plus the DISTINCT count
+            # over the OR of every predicate — never sum(visible_i).
+            try:
+                visible_by_predicate = [
+                    len(
+                        await _visible_ids(
+                            db,
+                            where=_predicate_clause(pred),
+                            now_ms=stamp.now_ms,
+                        )
+                    )
+                    for pred in predicates
+                ]
+                visible_all = len(
+                    await _visible_ids(
+                        db,
+                        where=sa.or_(*(_predicate_clause(pred) for pred in predicates)),
+                        now_ms=stamp.now_ms,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="deleteAclEntries",
+                    principal_type="-",
+                    principal_id=None,
+                    resource_type="-",
+                    resource_id="-",
+                    perm_bits=0,
+                    attempted={
+                        "predicate_index": None,
+                        "predicate": None,
+                        "predicate_count": len(predicates),
+                    },
+                    exc=exc,
+                    tenant_id=None,
+                ) from exc
+
+            expired_id_lists: list[list[str]] = []
+            for index, pred in enumerate(predicates):
+                fields = _pred_fields(pred)
+                attempted = {
+                    "predicate_index": index,
+                    "predicate": pred,
+                    "predicate_count": len(predicates),
+                }
+
+                # Stage 1 — this predicate's domain write (the UPDATE).
+                try:
+                    pairs = await _expire_where(
+                        db, where=_predicate_clause(pred), now_ms=stamp.now_ms
+                    )
+                except Exception as exc:  # noqa: BLE001 - reclassified below
+                    await db.rollback()
+                    raise await _write_denial(
+                        user_context=user_context,
+                        op="deleteAclEntries",
+                        perm_bits=0,
+                        attempted=attempted,
+                        exc=exc,
+                        **fields,
+                    ) from exc
+
+                # delete's own order (S-a) — (created_at_ms, id), never
+                # RETURNING/insertion order (MP's tie-break).
+                pairs.sort(key=lambda pair: (pair[1], pair[0]))
+                expired_ids_i = [row_id for row_id, _created_at_ms in pairs]
+
+                # Stage 2 — this predicate's audit row (N4, caller half).
+                try:
+                    await _audit.record(
+                        db,
+                        user_context=user_context,
+                        op="deleteAclEntries",
+                        perm_bits=0,
+                        acl_entry_ids=[],
+                        expired_ids=expired_ids_i,
+                        visible_matched_count=visible_by_predicate[index],
+                        expired_at_ms=None,
+                        **fields,
+                    )
+                    await db.flush()
+                except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                    await db.rollback()
+                    await _audit.record_denial(
+                        user_context=user_context,
+                        op="deleteAclEntries",
+                        perm_bits=0,
+                        failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                        predicate_or_attempted_row=attempted,
+                        db_error_class=type(audit_exc).__name__,
+                        **fields,
+                    )
+                    raise
+
+                expired_id_lists.append(expired_ids_i)
+
+            # Stage 3 — the commit.
+            try:
+                await db.commit()
+            except Exception as exc:  # noqa: BLE001 - reclassified below
+                await db.rollback()
+                raise await _write_denial(
+                    user_context=user_context,
+                    op="deleteAclEntries",
+                    principal_type="-",
+                    principal_id=None,
+                    resource_type="-",
+                    resource_id="-",
+                    perm_bits=0,
+                    attempted={
+                        "predicate_index": None,
+                        "predicate": None,
+                        "predicate_count": len(predicates),
+                    },
+                    exc=exc,
+                    tenant_id=None,
+                ) from exc
+
+            # #364 — every value this method returns is a plain str/int,
+            # extracted and assembled HERE, inside the session block,
+            # never read from a session-bound object after `db` closes.
+            seen: set[str] = set()
+            all_expired_ids: list[str] = []
+            for ids in expired_id_lists:
+                for entry_id in ids:
+                    if entry_id not in seen:
+                        seen.add(entry_id)
+                        all_expired_ids.append(entry_id)
+
+            return {
+                "expired_ids": all_expired_ids,
+                "visible_matched_count": visible_all,
+            }

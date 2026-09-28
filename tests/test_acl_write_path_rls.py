@@ -79,6 +79,7 @@ from tests.test_acl_ownership_rls import (
     _new_user_context,
     _owner_only_rls_ddl,
     _run_migration_upgrade,
+    _seed_attacker_resources,
     _seed_owner_resources,
     _wired_postgres_factory,
 )
@@ -2225,3 +2226,562 @@ async def _row_stamp_now_ms(factory: Any, row_id: str) -> int:
     ``created_at_ms=updated_at_ms=stamp.now_ms`` on the NEW row) —
     ADDENDUM AC-1 item 1(ii)'s membership check."""
     return await _row_updated_at_ms(factory, row_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ACL 2b-core-A2 — real-Postgres-only proofs: caller-scoped delete
+# (P-1/P-1b/P-1b-F), the sole-owner consequence (P-2), the O-7
+# interaction on revoke (P-3), the multi-predicate rollback (D-A2-4r),
+# and the three should-fix items from the spec gate (SF-A/B/C).
+# ═══════════════════════════════════════════════════════════════════════
+
+# A separate, standalone import (not merged into the top-of-file block
+# above) — this file is additions-only (spec §2): the top import block
+# is an EXISTING line this WU never touches.
+from audittrace.services.console_acl import MAX_PERM_BITS  # noqa: E402
+
+
+async def _acl_row_pair(admin: Any, schema: str, row_id: str) -> tuple[int | None, int]:
+    """``(expired_at_ms, updated_at_ms)`` for a SPECIFIC row, read as the
+    schema ADMIN (bypasses RLS entirely — the only reliable way to read
+    a row this test's own caller may not currently be authorized to
+    see, e.g. an attacker's or a different owner's row)."""
+    with admin.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{schema}"'))
+        row = conn.execute(
+            text(
+                "SELECT expired_at_ms, updated_at_ms FROM console_acl_entries "
+                "WHERE id = :id"
+            ),
+            {"id": row_id},
+        ).one()
+    return (row[0], row[1])
+
+
+async def _insert_grant_full(
+    factory: Any,
+    *,
+    as_user: str,
+    row_id: str,
+    user_sub: str,
+    principal_type: str,
+    resource_type: str,
+    resource_id: str,
+    perm_bits: int = 1,
+    principal_id: str | None = None,
+    principal_model: str | None = None,
+    tenant_id: str | None = None,
+    role_id: str | None = None,
+    expired_at_ms: int | None = None,
+    created_at_ms: int = 0,
+    updated_at_ms: int = 0,
+) -> None:
+    """Like ``tests.test_acl_ownership_rls._insert_grant`` but with
+    ``perm_bits``/``expired_at_ms``/``tenant_id``/``role_id`` exposed —
+    P-1b needs a time-limited row, KSEL-t needs a tenant + role_id."""
+    async with factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": as_user},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO console_acl_entries "
+                "(id, user_sub, principal_type, principal_id, principal_model, "
+                "resource_type, resource_id, perm_bits, tenant_id, role_id, "
+                "granted_at_ms, expired_at_ms, created_at_ms, updated_at_ms) "
+                "VALUES (:id, :user_sub, :ptype, :pid, :pmodel, "
+                ":rtype, :rid, :bits, :tenant, :role, :created, :expired, "
+                ":created, :updated)"
+            ),
+            {
+                "id": row_id,
+                "user_sub": user_sub,
+                "ptype": principal_type,
+                "pid": principal_id,
+                "pmodel": principal_model,
+                "rtype": resource_type,
+                "rid": resource_id,
+                "bits": perm_bits,
+                "tenant": tenant_id,
+                "role": role_id,
+                "created": created_at_ms,
+                "expired": expired_at_ms,
+                "updated": updated_at_ms,
+            },
+        )
+        await session.commit()
+
+
+class TestP1CallerScopedDeleteCrossOwner:
+    """P-1 — a predicate spanning a row the caller does NOT own is
+    silently OMITTED from the UPDATE (migration 032's owner-only
+    ``USING``), never refused, and the OTHER owner's row is untouched
+    from THEIR OWN session."""
+
+    async def test_predicate_spanning_another_owners_row_is_scoped(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        await _seed_attacker_resources(write_harness.factory)
+        owner = _new_user_context(_OWNER)
+
+        await _insert_grant_full(
+            write_harness.factory,
+            as_user=_OWNER,
+            row_id="row-a-owner",
+            user_sub=_OWNER,
+            principal_type="user",
+            principal_id=_VIEWER,
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        await _insert_grant_full(
+            write_harness.factory,
+            as_user=_ATTACKER,
+            row_id="row-b-attacker",
+            user_sub=_ATTACKER,
+            principal_type="user",
+            principal_id=_VIEWER,
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-attacker",
+        )
+
+        set_current_user_id(owner.user_id)
+        try:
+            result = await write_harness.service.delete_acl_entries(
+                owner, [{"principal_type": "user", "principal_id": _VIEWER}]
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert result["expired_ids"] == ["row-a-owner"]
+        assert result["visible_matched_count"] == 1, (
+            "B's row is neither owned by A nor A-as-principal nor public "
+            "— invisible to A's own SELECT too, not merely unexpirable"
+        )
+        admin = _admin_engine()
+        try:
+            b_pair = await _acl_row_pair(admin, write_harness.schema, "row-b-attacker")
+        finally:
+            admin.dispose()
+        assert b_pair[0] is None, "B's row must be untouched from B's own session"
+
+
+class TestP1bVisibleButUnexpirable:
+    """P-1b/P-1b-F — a PUBLIC row is visible to EVERY caller via RLS's
+    unconditional public ``SELECT`` branch, but the UPDATE stays
+    owner-only: ``visible_matched_count`` counts both public rows,
+    ``expired_ids`` names only the caller's own."""
+
+    async def test_public_rows_visible_count_exceeds_expired(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        await _seed_attacker_resources(write_harness.factory)
+        owner = _new_user_context(_OWNER)
+
+        await _insert_grant_full(
+            write_harness.factory,
+            as_user=_OWNER,
+            row_id="row-a-public",
+            user_sub=_OWNER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        await _insert_grant_full(
+            write_harness.factory,
+            as_user=_ATTACKER,
+            row_id="row-b-public",
+            user_sub=_ATTACKER,
+            principal_type="public",
+            resource_type="agent",
+            resource_id="agent-attacker",
+            expired_at_ms=1_900_000_000_000,  # far future — still active
+        )
+
+        set_current_user_id(owner.user_id)
+        try:
+            result = await write_harness.service.delete_acl_entries(
+                owner, [{"principal_type": "public"}]
+            )
+            effective_before_and_after = await write_harness.service.has_permission(
+                owner, "agent", "agent-attacker", 1
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert result["visible_matched_count"] == 2
+        assert result["expired_ids"] == ["row-a-public"]
+        assert effective_before_and_after is True, (
+            "B's public row on B's own agent must stay effective — the "
+            "count is a signal, never a proof of a skip (spec §4.5)"
+        )
+        admin = _admin_engine()
+        try:
+            b_pair = await _acl_row_pair(admin, write_harness.schema, "row-b-public")
+        finally:
+            admin.dispose()
+        assert b_pair[0] == 1_900_000_000_000, (
+            "B's row must be untouched, still at its ORIGINAL scheduled "
+            "expiry — never a hard delete, never re-stamped"
+        )
+
+
+class TestP2SoleOwnerConsequence:
+    """P-2 — an owner revoking their own OWNER-bits row leaves the
+    resource live and owned in its OWN sovereign store; A2 builds no
+    guard against it (2c/2d's rule)."""
+
+    async def test_owner_revokes_own_owner_row(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_OWNER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=MAX_PERM_BITS,
+            )
+            result = await write_harness.service.revoke_permission(
+                owner,
+                principal_type="user",
+                principal_id=_OWNER,
+                resource_type="agent",
+                resource_id="agent-1",
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert result["expired_ids"] != []
+        admin = _admin_engine()
+        try:
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                row = conn.execute(
+                    text(
+                        "SELECT expired_at_ms FROM console_acl_entries WHERE id = :id"
+                    ),
+                    {"id": result["expired_ids"][0]},
+                ).one()
+                assert row[0] is not None
+                agent_row = conn.execute(
+                    text(
+                        "SELECT deleted_at_ms FROM console_agents WHERE agent_id = 'agent-1'"
+                    )
+                ).one()
+                assert agent_row[0] is None, (
+                    "the resource stays live in its OWN sovereign store — "
+                    "no cascade exists in A2 (2c's rule)"
+                )
+        finally:
+            admin.dispose()
+
+
+class TestP3RevokeOnSoftDeletedResourceSFA:
+    """P-3 + **SF-A** — a revoke's own UPDATE re-verifies 032's
+    ownership subquery on EVERY row it touches: once the resource is
+    soft-deleted, even the OWNER's own revoke of their own grant is
+    refused. Seeded at tenant ``t1`` (SF-A) so the denial row's
+    ``question`` is asserted to end ``tenant=t1`` — the neuter that
+    would falsely satisfy this is dropping ``tenant_id`` from
+    ``_write_denial``'s call inside ``revoke_permission``."""
+
+    async def test_revoke_refused_and_denial_row_ends_tenant_t1(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id=_VIEWER,
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=1,
+                tenant_id="t1",
+            )
+        finally:
+            set_current_user_id(None)
+
+        admin = _admin_engine()
+        try:
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                conn.execute(
+                    text(
+                        "UPDATE console_agents SET deleted_at_ms = 1 "
+                        "WHERE agent_id = 'agent-1'"
+                    )
+                )
+
+            probe = _RollbackSplitProbe(write_harness, admin, monkeypatch)
+            set_current_user_id(owner.user_id)
+            try:
+                with pytest.raises(AclWriteRefused) as excinfo:
+                    await write_harness.service.revoke_permission(
+                        owner,
+                        principal_type="user",
+                        principal_id=_VIEWER,
+                        resource_type="agent",
+                        resource_id="agent-1",
+                        tenant_id="t1",
+                    )
+            finally:
+                set_current_user_id(None)
+                probe.close()
+
+            assert probe.snapshots[-1] == (0, "idle in transaction (aborted)", 1)
+            assert excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
+
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-1"
+            )
+            denial_rows = [
+                r
+                for r in rows
+                if r["status"] == "failed"
+                and r["question"].startswith("op=revokePermission")
+            ]
+            assert len(denial_rows) == 1
+            assert denial_rows[0]["question"].endswith("tenant=t1"), denial_rows[0][
+                "question"
+            ]
+        finally:
+            admin.dispose()
+
+
+class TestDA24RollbackAtPredicateI:
+    """D-A2-4r — three predicates, the SECOND refused (a soft-deleted
+    resource): zero rows expired, zero success rows, ONE denial row
+    with ``predicate_index == 1``."""
+
+    async def test_second_of_three_predicates_refused_rolls_back_all(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        admin = _admin_engine()
+        try:
+            agents = Base.metadata.tables["console_agents"]
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                conn.execute(
+                    insert(agents).values(
+                        id="agent-row-3",
+                        agent_id="agent-3",
+                        user_sub=_OWNER,
+                        name="Agent Three",
+                        created_at_ms=0,
+                        updated_at_ms=0,
+                    )
+                )
+
+            set_current_user_id(owner.user_id)
+            try:
+                r1 = await write_harness.service.grant_permission(
+                    owner,
+                    principal_type="user",
+                    principal_id="p-d4r-1",
+                    resource_type="agent",
+                    resource_id="agent-1",
+                    perm_bits=1,
+                )
+                r2 = await write_harness.service.grant_permission(
+                    owner,
+                    principal_type="user",
+                    principal_id="p-d4r-2",
+                    resource_type="agent",
+                    resource_id="agent-3",
+                    perm_bits=1,
+                )
+            finally:
+                set_current_user_id(None)
+
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                conn.execute(
+                    text(
+                        "UPDATE console_agents SET deleted_at_ms = 1 "
+                        "WHERE agent_id = 'agent-3'"
+                    )
+                )
+
+            set_current_user_id(owner.user_id)
+            try:
+                with pytest.raises(AclWriteRefused) as excinfo:
+                    await write_harness.service.delete_acl_entries(
+                        owner,
+                        [
+                            {"principal_id": "p-d4r-1", "resource_id": "agent-1"},
+                            {"principal_id": "p-d4r-2", "resource_id": "agent-3"},
+                            {"principal_id": "p-d4r-nonexistent"},
+                        ],
+                    )
+            finally:
+                set_current_user_id(None)
+
+            assert excinfo.value.failure_class == _audit.FAILURE_CLASS_ACL_DENIED_POLICY
+
+            r1_pair = await _acl_row_pair(admin, write_harness.schema, r1["id"])
+            r2_pair = await _acl_row_pair(admin, write_harness.schema, r2["id"])
+            assert r1_pair[0] is None, "predicate 0 must be ROLLED BACK, not committed"
+            assert r2_pair[0] is None
+
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-1"
+            )
+            delete_rows = [
+                r for r in rows if r["question"].startswith("op=deleteAclEntries")
+            ]
+            assert len(delete_rows) == 0, "zero success rows — everything rolled back"
+
+            rows_all = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-3"
+            )
+            denial_rows = [r for r in rows_all if r["status"] == "failed"]
+            assert len(denial_rows) == 1
+            error_detail = json.loads(denial_rows[0]["error_detail"])
+            attempted = error_detail["predicate_or_attempted_row"]
+            assert attempted["predicate_index"] == 1
+        finally:
+            admin.dispose()
+
+
+class TestSFCAuditFailureOnKselTKey:
+    """**SF-C** — the audit-failure test (#4, N4) run on KSEL-t's own
+    key (tenant ``t1``, ``role_id='r1'``): a broken ``_content_hash``
+    on ``modify_permission_bits`` must propagate the ORIGINAL
+    exception, leave the pre-existing row untouched, and land ONE
+    ``acl_audit_write_failed`` row whose ``question`` ends
+    ``tenant=t1``."""
+
+    async def test_broken_audit_write_on_ksel_t_key(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        key = dict(
+            principal_type="user",
+            principal_id=_VIEWER,
+            resource_type="agent",
+            resource_id="agent-1",
+            tenant_id="t1",
+        )
+        set_current_user_id(owner.user_id)
+        try:
+            m = await write_harness.service.grant_permission(
+                owner, perm_bits=7, role_id="r1", **key
+            )
+        finally:
+            set_current_user_id(None)
+
+        original = _audit._content_hash
+        calls = {"n": 0}
+
+        def _flaky(*args: object, **kwargs: object) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("content_hash broken for SF-C")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(_audit, "_content_hash", _flaky)
+
+        set_current_user_id(owner.user_id)
+        try:
+            with pytest.raises(RuntimeError, match="content_hash broken"):
+                await write_harness.service.modify_permission_bits(
+                    owner, add_bits=1, **key
+                )
+        finally:
+            set_current_user_id(None)
+
+        probe_admin = _admin_engine()
+        try:
+            pair = await _acl_row_pair(probe_admin, write_harness.schema, m["id"])
+        finally:
+            probe_admin.dispose()
+        assert pair[0] is None, "the pre-existing row must still be ACTIVE"
+
+        admin = _admin_engine()
+        try:
+            rows = _interactions_rows(
+                admin, write_harness.schema, resource_id="agent-1"
+            )
+            denial_rows = [
+                r
+                for r in rows
+                if r["failure_class"] == _audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED
+                and r["question"].startswith("op=modifyPermissionBits")
+            ]
+            assert len(denial_rows) == 1
+            assert denial_rows[0]["question"].endswith("tenant=t1"), denial_rows[0][
+                "question"
+            ]
+        finally:
+            admin.dispose()
+
+
+class TestSFBExplainCapture:
+    """**SF-B** — the real Postgres ``EXPLAIN`` of ``delete_acl_entries``'s
+    UPDATE (clause C10, ``_expire_where``), captured against a scenario
+    shaped like MP's P2 (a second predicate matching several rows).
+    Printed to stdout so the build record can cite it verbatim — this
+    test's assertion is only that ``EXPLAIN`` runs cleanly against the
+    real statement shape the write path issues, not a plan-shape pin
+    (spec §4's own AD-1(3): the correctness guards are the behavioural
+    rows, never a rendered-plan pin)."""
+
+    async def test_explain_the_delete_update_statement(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        set_current_user_id(owner.user_id)
+        try:
+            await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id="p-explain-d",
+                resource_type="promptGroup",
+                resource_id="group-1",
+                perm_bits=1,
+            )
+            await write_harness.service.grant_permission(
+                owner,
+                principal_type="user",
+                principal_id="p-explain-g",
+                resource_type="promptGroup",
+                resource_id="group-1",
+                perm_bits=1,
+            )
+        finally:
+            set_current_user_id(None)
+
+        admin = _admin_engine()
+        try:
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                conn.execute(text(f"SET ROLE {_APP_ROLE}"))
+                conn.execute(
+                    text("SELECT set_config('app.current_user_id', :uid, false)"),
+                    {"uid": _OWNER},
+                )
+                plan = conn.execute(
+                    text(
+                        "EXPLAIN UPDATE console_acl_entries "
+                        "SET expired_at_ms = 1, updated_at_ms = 1 "
+                        "WHERE resource_type = 'promptGroup' AND resource_id = 'group-1' "
+                        "AND (expired_at_ms IS NULL OR expired_at_ms > 0) "
+                        "RETURNING id, created_at_ms"
+                    )
+                ).all()
+            plan_text = "\n".join(row[0] for row in plan)
+            print("SF-B EXPLAIN (delete_acl_entries's UPDATE, MP's P2 shape):")
+            print(plan_text)
+            assert "console_acl_entries" in plan_text
+        finally:
+            admin.dispose()

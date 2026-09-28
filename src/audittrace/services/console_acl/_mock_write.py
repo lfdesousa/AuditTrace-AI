@@ -76,12 +76,35 @@ to active, newly-inserted rows never appended) as well as rolling back
 the shared audit session — mirroring the Postgres path's "a rolled-back
 write with a surviving audit row is a false record" rule at the
 in-memory layer too.
-"""
+
+**2b-core-A2** (``2026-09-28-SPEC-acl-2b-core-A2-revoke-modify-delete-
+CONSOLIDATED-v4.md``) adds :func:`revoke_permission`,
+:func:`modify_permission_bits` and :func:`delete_acl_entries`, sharing
+ONE expire seam, :func:`_expire_matching` (Z-1's class: a NEW inline
+loop per method is exactly what this replaces), plus the two read-shape
+helpers :func:`_visible_matching_ids`/:func:`_visible_matching_rows`.
+
+**The owner mirror is mandatory in the EXPIRE step, never in the COUNT
+step (P-1b-F).** Migration 032's real UPDATE ``USING`` clause is
+OWNER-ONLY (``_OWNER_ONLY_USING``) — a row the caller does not OWN
+(``user_sub``) is simply invisible to a real Postgres UPDATE, even when
+that SAME row is fully visible to a plain SELECT under the broader
+``SELECT`` policy (owner OR direct-user-principal OR public). The mock
+has no RLS, so :func:`_expire_matching` (the mock's one UPDATE-analogue)
+hard-codes ``row.user_sub == stamp.user_sub`` — dropping it makes the
+mock accept an expiry Postgres would silently skip, exactly the gap
+P-1b-F's mock half exists to catch. :func:`_visible_matching_ids`/
+:func:`_visible_matching_rows` (the mock's SELECT-analogues, shared by
+the count and by ``modify_permission_bits``'s own "active" entity set)
+use :func:`~audittrace.services.console_acl._mock._mock_rls_visible`
+instead — the SAME broader predicate a real Postgres SELECT would
+apply, never the owner-only one."""
 
 from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from audittrace.identity import UserContext
@@ -92,7 +115,7 @@ from audittrace.services.console_acl._errors import (
     AclPrincipalTypeRefused,
     AclWriteRefused,
 )
-from audittrace.services.console_store import build_write_stamp
+from audittrace.services.console_store import WriteStamp, build_write_stamp
 
 if TYPE_CHECKING:
     # B6, MEASURED (this round) — SAME rationale as
@@ -228,6 +251,157 @@ def _key_matches(
         and row.resource_id == resource_id
         and row.tenant_id == tenant_id
     )
+
+
+def _rls_visible_fn() -> Any:
+    """Lazy import of :func:`~audittrace.services.console_acl._mock.
+    _mock_rls_visible` — same mypy-cold-cache/identity-retrieval
+    rationale as :func:`_not_expired_fn` above. This is the BROADER
+    predicate (owner OR direct-user-principal OR public) a real
+    Postgres ``SELECT`` under RLS would apply — used by A2's read-shape
+    helpers below, never by :func:`_expire_matching`'s owner-only
+    mutation (P-1b-F)."""
+    from audittrace.services.console_acl._mock import _mock_rls_visible  # noqa: PLC0415
+
+    return _mock_rls_visible
+
+
+def _visible_matching_ids(
+    entries: list[_MockAclEntry],
+    user_context: UserContext,
+    stamp: WriteStamp,
+    match: Callable[[_MockAclEntry], bool],
+) -> list[str]:
+    """A2's mock SELECT-analogue for ``visible_matched_count`` (spec
+    §4.0) — RLS-mirror visible (broad), matching, and active. Never
+    owner-scoped (that narrowing belongs to :func:`_expire_matching`
+    alone, P-1b-F)."""
+    rls_visible = _rls_visible_fn()
+    not_expired = _not_expired_fn()
+    return [
+        row.id
+        for row in entries
+        if rls_visible(row, user_context)
+        and match(row)
+        and not_expired(row, stamp.now_ms)
+    ]
+
+
+def _visible_matching_rows(
+    entries: list[_MockAclEntry],
+    user_context: UserContext,
+    stamp: WriteStamp,
+    match: Callable[[_MockAclEntry], bool],
+) -> list[_MockAclEntry]:
+    """``modify_permission_bits``'s "active" entity set — the SAME rows
+    :func:`_visible_matching_ids` would count, as entities rather than
+    ids, so the caller can capture their columns before superseding
+    them (S-2)."""
+    rls_visible = _rls_visible_fn()
+    not_expired = _not_expired_fn()
+    return [
+        row
+        for row in entries
+        if rls_visible(row, user_context)
+        and match(row)
+        and not_expired(row, stamp.now_ms)
+    ]
+
+
+def _expire_matching(
+    entries: list[_MockAclEntry],
+    stamp: WriteStamp,
+    match: Callable[[_MockAclEntry], bool],
+    *,
+    undo_log: list[tuple[_MockAclEntry, int | None, int]] | None = None,
+) -> list[tuple[str, int]]:
+    """The mock's ONE expire seam for ``revoke_permission``/
+    ``modify_permission_bits``/``delete_acl_entries`` (Z-1's class — a
+    NEW inline loop per method is exactly what this replaces). Mutates
+    IN PLACE every row that is (a) still active, (b) matches ``match``,
+    AND (c) OWNED by the caller (``row.user_sub == stamp.user_sub``) —
+    the owner mirror migration 032's owner-only UPDATE ``USING`` needs
+    mirrored here (P-1b-F: without (c) the mock accepts an expiry a real
+    Postgres UPDATE would silently skip). When ``undo_log`` is given,
+    appends ``(row, prior_expired_at_ms, prior_updated_at_ms)`` for
+    EVERY row it mutates, before mutating — the N4 audit-failure path's
+    two-column restore (ADDENDUM Z-1), extended to A2's three methods.
+    Returns ``(id, created_at_ms)`` pairs in ``entries`` iteration
+    order, unsorted — ``delete_acl_entries`` (the one A2 caller that
+    needs a different order) sorts the pairs itself (spec §4.3, S-a)."""
+    not_expired = _not_expired_fn()
+    pairs: list[tuple[str, int]] = []
+    for row in entries:
+        if (
+            not_expired(row, stamp.now_ms)
+            and match(row)
+            and row.user_sub == stamp.user_sub
+        ):
+            if undo_log is not None:
+                undo_log.append((row, row.expired_at_ms, row.updated_at_ms))
+            row.expired_at_ms = stamp.now_ms
+            row.updated_at_ms = stamp.now_ms
+            pairs.append((row.id, row.created_at_ms))
+    return pairs
+
+
+def _max_perm_bits() -> int:
+    """Lazy import of ``MAX_PERM_BITS`` — same rationale as
+    ``_postgres_write.py``'s twin."""
+    from audittrace.services.console_acl import MAX_PERM_BITS  # noqa: PLC0415
+
+    return MAX_PERM_BITS
+
+
+def _validate_bit_operands(add_bits: int | None, remove_bits: int | None) -> None:
+    """``modify_permission_bits``'s pre-I/O validation (spec §3,
+    D-A2-1) — byte-identical rule to ``_postgres_write.py``'s twin,
+    duplicated rather than imported for the SAME "additions-only diff"
+    reason every other duplicated helper in this module carries."""
+    if add_bits is None and remove_bits is None:
+        raise ValueError("modify_permission_bits requires add_bits and/or remove_bits")
+    max_bits = _max_perm_bits()
+    for name, value in (("add_bits", add_bits), ("remove_bits", remove_bits)):
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not (0 <= value <= max_bits)
+        ):
+            raise ValueError(f"{name}={value!r} must be an int in [0, {max_bits}]")
+
+
+_ALLOWED_PREDICATE_KEYS: frozenset[str] = frozenset(
+    {"principal_type", "principal_id", "resource_type", "resource_id", "tenant_id"}
+)
+
+
+def _validate_predicate(pred: dict[str, Any]) -> None:
+    """``delete_acl_entries``'s predicate validation (spec §3, D-A2-1)
+    — byte-identical rule to ``_postgres_write.py``'s twin."""
+    if not pred:
+        raise ValueError("delete_acl_entries: predicate must not be empty")
+    unknown = set(pred) - _ALLOWED_PREDICATE_KEYS
+    if unknown:
+        raise ValueError(
+            f"delete_acl_entries: unknown predicate key(s) {sorted(unknown)!r}"
+        )
+    for key, value in pred.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"delete_acl_entries: predicate[{key!r}]={value!r} must be a "
+                "non-empty str"
+            )
+    if not (
+        "principal_id" in pred
+        or "resource_id" in pred
+        or pred.get("principal_type") == "public"
+    ):
+        raise ValueError(
+            "delete_acl_entries: predicate must name principal_id, "
+            "resource_id, or principal_type='public'"
+        )
 
 
 async def _mock_denial(
@@ -458,10 +632,81 @@ class _MockAclWrites:
         resource_id: str,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.**"""
-        raise NotImplementedError(
-            "revoke_permission is 2b-core-A2 scope — see ADDENDUM U-6"
+        """Mock mirror of ``_postgres_write.py``'s ``revoke_permission``
+        — same shape, no DB-analogue refusal path (the mock has no RLS/
+        CHECK for a domain write to trip on here; N4, the audit write,
+        is the only failure this method can produce)."""
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+        attempted = {
+            "principal_type": principal_type,
+            "principal_id": principal_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tenant_id": tenant_id,
+        }
+
+        def _match(row: _MockAclEntry) -> bool:
+            return _key_matches(
+                row,
+                principal_type=principal_type,
+                principal_id=principal_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+            )
+
+        visible_matched_count = len(
+            _visible_matching_ids(self._entries, user_context, stamp, _match)
         )
+        undo_log: list[tuple[_MockAclEntry, int | None, int]] = []
+        pairs = _expire_matching(self._entries, stamp, _match, undo_log=undo_log)
+        expired_ids = [row_id for row_id, _created_at_ms in pairs]
+
+        pg = _postgres_factory()
+        session_factory = pg.get_session_factory()
+        async with session_factory() as db:
+            try:
+                await _audit.record(
+                    db,
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    acl_entry_ids=[],
+                    expired_ids=expired_ids,
+                    visible_matched_count=visible_matched_count,
+                    expired_at_ms=None,
+                    tenant_id=tenant_id,
+                )
+                await db.commit()
+            except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                await db.rollback()
+                for row, prior_expired, prior_updated in reversed(undo_log):
+                    row.expired_at_ms = prior_expired
+                    row.updated_at_ms = prior_updated
+                await _audit.record_denial(
+                    user_context=user_context,
+                    op="revokePermission",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=0,
+                    failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                    predicate_or_attempted_row=attempted,
+                    db_error_class=type(audit_exc).__name__,
+                    tenant_id=tenant_id,
+                )
+                raise
+
+        return {
+            "expired_ids": expired_ids,
+            "visible_matched_count": visible_matched_count,
+        }
 
     @log_call(logger=logger)
     async def modify_permission_bits(
@@ -476,10 +721,128 @@ class _MockAclWrites:
         remove_bits: int | None = None,
         tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.**"""
-        raise NotImplementedError(
-            "modify_permission_bits is 2b-core-A2 scope — see ADDENDUM U-6"
-        )
+        """Mock mirror of ``_postgres_write.py``'s
+        ``modify_permission_bits`` — same O-6 expire-and-insert shape,
+        same tenant-carriage rule (A2v3-BL-1: every key column of the
+        new row, including ``tenant_id``, comes from the caller's key)."""
+        _validate_bit_operands(add_bits, remove_bits)
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+        attempted = {
+            "principal_type": principal_type,
+            "principal_id": principal_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tenant_id": tenant_id,
+            "add_bits": add_bits,
+            "remove_bits": remove_bits,
+        }
+
+        def _match(row: _MockAclEntry) -> bool:
+            return _key_matches(
+                row,
+                principal_type=principal_type,
+                principal_id=principal_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+            )
+
+        active = _visible_matching_rows(self._entries, user_context, stamp, _match)
+        # Captured BEFORE the expire mutation (S-2) — every active row,
+        # never active[0].
+        scheduled = [
+            (row.id, row.expired_at_ms, row.role_id, row.created_at_ms)
+            for row in active
+        ]
+        old_bits = 0
+        for row in active:
+            old_bits |= row.perm_bits
+        new_bits = (old_bits | (add_bits or 0)) & ~(remove_bits or 0)
+
+        undo_log: list[tuple[_MockAclEntry, int | None, int]] = []
+        expired_ids: list[str] = []
+        new_row: _MockAclEntry | None = None
+        inherited_expiry: int | None = None
+        if active:
+            pairs = _expire_matching(self._entries, stamp, _match, undo_log=undo_log)
+            expired_ids = [row_id for row_id, _created_at_ms in pairs]
+            if expired_ids:
+                # S-1's injection point: a concurrent expiry of the SAME
+                # key between the read above and this mutation makes
+                # expired_ids == [] here — handled as the race branch,
+                # never as a refusal.
+                role_id = max(scheduled, key=lambda s: s[3])[2]
+                captured_expiries = [s[1] for s in scheduled]
+                inherited_expiry = (
+                    None
+                    if any(e is None for e in captured_expiries)
+                    else max(e for e in captured_expiries if e is not None)
+                )
+                new_row = _entry_cls()(
+                    id=str(uuid.uuid4()),
+                    user_sub=stamp.user_sub,
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    principal_model=_principal_model(principal_type),
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    tenant_id=tenant_id,
+                    role_id=role_id,
+                    granted_by=stamp.user_sub,
+                    granted_at_ms=stamp.now_ms,
+                    expired_at_ms=inherited_expiry,
+                    created_at_ms=stamp.now_ms,
+                    updated_at_ms=stamp.now_ms,
+                )
+
+        acl_entry_ids = [new_row.id] if new_row is not None else []
+        visible_matched_count = len(active)
+
+        pg = _postgres_factory()
+        session_factory = pg.get_session_factory()
+        async with session_factory() as db:
+            try:
+                await _audit.record(
+                    db,
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    acl_entry_ids=acl_entry_ids,
+                    expired_ids=expired_ids,
+                    visible_matched_count=visible_matched_count,
+                    expired_at_ms=inherited_expiry,
+                    tenant_id=tenant_id,
+                )
+                await db.commit()
+            except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                await db.rollback()
+                for row, prior_expired, prior_updated in reversed(undo_log):
+                    row.expired_at_ms = prior_expired
+                    row.updated_at_ms = prior_updated
+                await _audit.record_denial(
+                    user_context=user_context,
+                    op="modifyPermissionBits",
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    perm_bits=new_bits,
+                    failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                    predicate_or_attempted_row=attempted,
+                    db_error_class=type(audit_exc).__name__,
+                    tenant_id=tenant_id,
+                )
+                raise
+
+        if new_row is not None:
+            self._entries.append(new_row)
+        return new_row.to_dict() if new_row is not None else None
 
     @log_call(logger=logger)
     async def bulk_write_acl_entries(
@@ -610,7 +973,99 @@ class _MockAclWrites:
         user_context: UserContext,
         predicates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """**2b-core-A2 scope (ADDENDUM U-6) — not built in A1.**"""
-        raise NotImplementedError(
-            "delete_acl_entries is 2b-core-A2 scope — see ADDENDUM U-6"
+        """Mock mirror of ``_postgres_write.py``'s ``delete_acl_entries``
+        — same caller-scoped (owner-mirror), per-predicate-audit-row,
+        rollback-everything-on-any-refusal shape."""
+        if not predicates:
+            raise ValueError("delete_acl_entries: predicates must not be empty")
+        for pred in predicates:
+            _validate_predicate(pred)
+
+        _audit = _acl_audit()
+        stamp = build_write_stamp(user_context)
+
+        def _match_factory(pred: dict[str, Any]) -> Callable[[_MockAclEntry], bool]:
+            def _match(row: _MockAclEntry) -> bool:
+                return all(getattr(row, k) == v for k, v in pred.items())
+
+            return _match
+
+        matchers = [_match_factory(pred) for pred in predicates]
+        visible_by_predicate = [
+            len(_visible_matching_ids(self._entries, user_context, stamp, matcher))
+            for matcher in matchers
+        ]
+
+        def _any_match(row: _MockAclEntry) -> bool:
+            return any(matcher(row) for matcher in matchers)
+
+        visible_all = len(
+            _visible_matching_ids(self._entries, user_context, stamp, _any_match)
         )
+
+        pg = _postgres_factory()
+        session_factory = pg.get_session_factory()
+        undo_log: list[tuple[_MockAclEntry, int | None, int]] = []
+        expired_id_lists: list[list[str]] = []
+
+        async with session_factory() as db:
+            for index, pred in enumerate(predicates):
+                fields = {
+                    "principal_type": pred.get("principal_type", "-"),
+                    "principal_id": pred.get("principal_id"),
+                    "resource_type": pred.get("resource_type", "-"),
+                    "resource_id": pred.get("resource_id", "-"),
+                    "tenant_id": pred.get("tenant_id"),
+                }
+                attempted = {
+                    "predicate_index": index,
+                    "predicate": pred,
+                    "predicate_count": len(predicates),
+                }
+                pairs = _expire_matching(
+                    self._entries, stamp, matchers[index], undo_log=undo_log
+                )
+                # delete's own order (S-a) — (created_at_ms, id).
+                pairs.sort(key=lambda pair: (pair[1], pair[0]))
+                expired_ids_i = [row_id for row_id, _created_at_ms in pairs]
+                try:
+                    await _audit.record(
+                        db,
+                        user_context=user_context,
+                        op="deleteAclEntries",
+                        perm_bits=0,
+                        acl_entry_ids=[],
+                        expired_ids=expired_ids_i,
+                        visible_matched_count=visible_by_predicate[index],
+                        expired_at_ms=None,
+                        **fields,
+                    )
+                    await db.flush()
+                except Exception as audit_exc:  # noqa: BLE001 - N4, re-raised below
+                    await db.rollback()
+                    for row, prior_expired, prior_updated in reversed(undo_log):
+                        row.expired_at_ms = prior_expired
+                        row.updated_at_ms = prior_updated
+                    await _audit.record_denial(
+                        user_context=user_context,
+                        op="deleteAclEntries",
+                        perm_bits=0,
+                        failure_class=_audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED,
+                        predicate_or_attempted_row=attempted,
+                        db_error_class=type(audit_exc).__name__,
+                        **fields,
+                    )
+                    raise
+                expired_id_lists.append(expired_ids_i)
+
+            await db.commit()
+
+        seen: set[str] = set()
+        all_expired_ids: list[str] = []
+        for ids in expired_id_lists:
+            for entry_id in ids:
+                if entry_id not in seen:
+                    seen.add(entry_id)
+                    all_expired_ids.append(entry_id)
+
+        return {"expired_ids": all_expired_ids, "visible_matched_count": visible_all}

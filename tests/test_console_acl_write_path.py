@@ -78,6 +78,20 @@ def _match_one_by_resource(rows: list[dict], resource_id: str) -> dict:
     return matches[0]
 
 
+def _match_one_op(rows: list[dict], op: str, resource_id: str) -> dict:
+    """Like ``_match_one_by_resource`` but ALSO anchors on the ``op=``
+    prefix — A2 tests grant THEN revoke/modify/delete at the SAME
+    resource_id, so a bare ``:resource_id`` substring match returns
+    more than one row."""
+    matches = [
+        r
+        for r in rows
+        if f":{resource_id}" in r["question"] and r["question"].startswith(f"op={op} ")
+    ]
+    assert len(matches) == 1, "a 200 with no matched row is a FAIL (spec §10)"
+    return matches[0]
+
+
 async def _old_row_expired_at_ms(
     service: ConsoleAclEntriesService, row_id: str
 ) -> int | None:
@@ -167,38 +181,6 @@ class TestErrorHierarchy:
         )
         assert exc.failure_class == "acl_denied_policy"
         assert exc.db_error_class == "X"
-
-
-# ── A2-scope methods ship as a REAL, disclosed gap (ADDENDUM U-6) ───────
-
-
-class TestA2ScopeIsNotImplemented:
-    async def test_revoke_permission_raises(self, service, user_context) -> None:
-        with pytest.raises(NotImplementedError, match="2b-core-A2"):
-            await service.revoke_permission(
-                user_context,
-                principal_type="user",
-                principal_id="p1",
-                resource_type="agent",
-                resource_id="a1",
-            )
-
-    async def test_modify_permission_bits_raises(self, service, user_context) -> None:
-        with pytest.raises(NotImplementedError, match="2b-core-A2"):
-            await service.modify_permission_bits(
-                user_context,
-                principal_type="user",
-                principal_id="p1",
-                resource_type="agent",
-                resource_id="a1",
-                add_bits=1,
-            )
-
-    async def test_delete_acl_entries_raises(self, service, user_context) -> None:
-        with pytest.raises(NotImplementedError, match="2b-core-A2"):
-            await service.delete_acl_entries(
-                user_context, [{"principal_type": "user", "principal_id": "p1"}]
-            )
 
 
 # ── #1 — audit row per successful write (grant) ──────────────────────────
@@ -1231,3 +1213,1189 @@ class TestAutoflushIsMeasuredOnThisVenv:
                     tenant_id=None,
                     now_ms=1,
                 )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ACL 2b-core-A2 — revoke_permission / modify_permission_bits /
+# delete_acl_entries (2026-09-28-SPEC-acl-2b-core-A2-revoke-modify-
+# delete-CONSOLIDATED-v4.md). Same discipline as A1's tests above: BOTH
+# implementations via the ``service`` fixture (``postgres`` = aiosqlite
+# via ``InMemoryPostgresFactory``, ``mock`` = a fresh mock sharing the
+# SAME wired factory), audit-row assertions through the REAL
+# ``/interactions`` route. Real-Postgres-only proofs (RLS ownership
+# scoping — P-1/P-1b/P-1b-F/P-2/P-3, the abort-shape split, D-A2-4r,
+# SF-A/B/C) live in ``tests/test_acl_write_path_rls.py``, NOT here.
+# ═══════════════════════════════════════════════════════════════════════
+
+from audittrace.identity import UserContext  # noqa: E402
+from audittrace.services.console_acl._mock_write import (  # noqa: E402
+    _expire_matching as _mock_expire_matching,
+)
+from audittrace.services.console_store import _context as _clock_module  # noqa: E402
+
+_HOUR = 3_600_000
+
+
+def _principal_ctx(sub: str) -> UserContext:
+    """A UserContext for the PRINCIPAL a grant was made TO — distinct
+    from the resource OWNER (``user_context`` fixture). Checking
+    ``get_effective_permissions`` as the OWNER would always read 0 for
+    a grant made to someone else (the owner is not automatically a
+    matching principal on their own grants — the read path's own,
+    correct behaviour, not a write-path bug); these tests need the
+    PRINCIPAL's view."""
+    return UserContext(user_id=sub, username=sub, agent_type="test", scopes=())
+
+
+async def _raw_insert(
+    service: ConsoleAclEntriesService,
+    *,
+    user_sub: str,
+    principal_type: str,
+    principal_id: str | None,
+    principal_model: str | None,
+    resource_type: str,
+    resource_id: str,
+    perm_bits: int,
+    tenant_id: str | None = None,
+    role_id: str | None = None,
+    granted_by: str | None = None,
+    granted_at_ms: int = 0,
+    expired_at_ms: int | None = None,
+    created_at_ms: int = 0,
+    updated_at_ms: int = 0,
+) -> str:
+    """Seed a row bypassing every guard (grant_permission's own O-6
+    expire-and-insert would supersede a pre-existing row at the SAME
+    key — some A2 fixtures need TWO simultaneously-active rows at one
+    key, e.g. KSEL's ``firstrow`` scenario, which only a raw insert can
+    construct). Mirrors ``tests/test_acl_write_path_rls.py``'s own "raw
+    INSERT bypassing the service" precedent."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = service.seed_entry(
+            user_sub=user_sub,
+            principal_type=principal_type,
+            principal_id=principal_id,
+            principal_model=principal_model,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            perm_bits=perm_bits,
+            tenant_id=tenant_id,
+            role_id=role_id,
+            granted_by=granted_by,
+            granted_at_ms=granted_at_ms,
+            expired_at_ms=expired_at_ms,
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+        )
+        return str(row["id"])
+    pg = dependencies.get_postgres_factory()
+    entry_id = str(uuid.uuid4())
+    async with pg.get_session_factory()() as db:
+        db.add(
+            ConsoleAclEntry(
+                id=entry_id,
+                user_sub=user_sub,
+                principal_type=principal_type,
+                principal_id=principal_id,
+                principal_model=principal_model,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                perm_bits=perm_bits,
+                tenant_id=tenant_id,
+                role_id=role_id,
+                granted_by=granted_by,
+                granted_at_ms=granted_at_ms,
+                expired_at_ms=expired_at_ms,
+                created_at_ms=created_at_ms,
+                updated_at_ms=updated_at_ms,
+            )
+        )
+        await db.commit()
+    return entry_id
+
+
+async def _row_pair(
+    service: ConsoleAclEntriesService, row_id: str
+) -> tuple[int | None, int]:
+    """``(expired_at_ms, updated_at_ms)`` for a SPECIFIC row, read from a
+    FRESH lookup — same rationale as ``_old_row_expired_at_ms`` above."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = next(e for e in service._entries if e.id == row_id)
+        return (row.expired_at_ms, row.updated_at_ms)
+    pg = dependencies.get_postgres_factory()
+    async with pg.get_session_factory()() as db:
+        result = await db.execute(
+            sa.select(
+                ConsoleAclEntry.expired_at_ms, ConsoleAclEntry.updated_at_ms
+            ).where(ConsoleAclEntry.id == row_id)
+        )
+        row = result.one()
+        return (row[0], row[1])
+
+
+# ── VAL — §3's pre-I/O ValueError shapes, no I/O, no audit row ──────────
+
+
+class TestA2PreIOValidation:
+    @pytest.mark.parametrize(
+        "predicates",
+        [
+            [],
+            [{}],
+            [{"not_a_real_key": "x"}],
+            [{"principal_id": None}],
+            [{"resource_type": "agent"}],  # names none of the three anchors
+        ],
+        ids=["empty-list", "empty-dict", "unknown-key", "none-value", "no-anchor"],
+    )
+    async def test_delete_rejects_before_any_io(
+        self, service, client, user_context, predicates
+    ) -> None:
+        before = len(_interactions(client))
+        with pytest.raises(ValueError):
+            await service.delete_acl_entries(user_context, predicates)
+        assert len(_interactions(client)) == before, (
+            "a caller defect writes NO audit row (D-A2-1)"
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"add_bits": 99},
+            {"remove_bits": -1},
+            {"add_bits": True},
+        ],
+        ids=["both-none", "add-out-of-range", "remove-negative", "bool-not-int"],
+    )
+    async def test_modify_rejects_before_any_io(
+        self, service, client, user_context, kwargs
+    ) -> None:
+        before = len(_interactions(client))
+        with pytest.raises(ValueError):
+            await service.modify_permission_bits(
+                user_context,
+                principal_type="user",
+                principal_id="p-val",
+                resource_type="agent",
+                resource_id="agent-val",
+                **kwargs,
+            )
+        assert len(_interactions(client)) == before, (
+            "a caller defect writes NO audit row (D-A2-1)"
+        )
+
+
+# ── revoke_permission — happy path, zero match, audit row (#1) ─────────
+
+
+class TestRevokePermission:
+    async def test_expires_and_returns_ids(self, service, client, user_context) -> None:
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-revoke-1",
+            resource_type="agent",
+            resource_id="agent-revoke-1",
+            perm_bits=3,
+        )
+        result = await service.revoke_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-revoke-1",
+            resource_type="agent",
+            resource_id="agent-revoke-1",
+        )
+        assert result == {"expired_ids": [row["id"]], "visible_matched_count": 1}
+        effective = await service.get_effective_permissions(
+            user_context, "agent", "agent-revoke-1"
+        )
+        assert effective == 0
+
+        stored = _match_one_op(
+            _interactions(client), "revokePermission", "agent-revoke-1"
+        )
+        assert stored["status"] == "success"
+        assert stored["question"].startswith("op=revokePermission ")
+        answer = json.loads(stored["answer"])
+        assert answer["acl_entry_ids"] == []
+        assert answer["expired_ids"] == [row["id"]]
+        assert answer["visible_matched_count"] == 1
+        assert answer["expired_at_ms"] is None
+
+    async def test_zero_match_is_a_success_row(
+        self, service, client, user_context
+    ) -> None:
+        result = await service.revoke_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-revoke-none",
+            resource_type="agent",
+            resource_id="agent-revoke-none",
+        )
+        assert result == {"expired_ids": [], "visible_matched_count": 0}
+        stored = _match_one_op(
+            _interactions(client), "revokePermission", "agent-revoke-none"
+        )
+        assert stored["status"] == "success"
+
+    async def test_retains_the_row_never_hard_deletes(
+        self, service, user_context
+    ) -> None:
+        """Retention (#13) — the row's other columns survive byte-for-
+        byte; only ``expired_at_ms``/``updated_at_ms`` change."""
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-retain",
+            resource_type="agent",
+            resource_id="agent-retain",
+            perm_bits=5,
+        )
+        await service.revoke_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-retain",
+            resource_type="agent",
+            resource_id="agent-retain",
+        )
+        if isinstance(service, MockConsoleAclEntriesService):
+            retained = next(e for e in service._entries if e.id == row["id"])
+            assert retained.perm_bits == 5
+            assert retained.expired_at_ms is not None
+        else:
+            pg = dependencies.get_postgres_factory()
+            async with pg.get_session_factory()() as db:
+                result = await db.execute(
+                    sa.select(ConsoleAclEntry).where(ConsoleAclEntry.id == row["id"])
+                )
+                retained = result.scalar_one()
+                assert retained.perm_bits == 5
+                assert retained.expired_at_ms is not None
+
+
+# ── modify_permission_bits — bits recompute, per-bit (#6), no-match
+# (D-A2-2), same-bits (7s), never in-place (#7), race branch (S-1) ─────
+
+
+class TestModifyPermissionBits:
+    @pytest.mark.parametrize("bit", [1, 2, 4, 8])
+    async def test_each_bit_is_added_individually(
+        self, service, user_context, bit: int
+    ) -> None:
+        resource_id = f"agent-modify-add-{bit}"
+        await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-modify",
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=0,
+        )
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-modify",
+            resource_type="agent",
+            resource_id=resource_id,
+            add_bits=bit,
+        )
+        assert row is not None
+        assert row["perm_bits"] == bit
+        effective = await service.get_effective_permissions(
+            _principal_ctx("v-modify"), "agent", resource_id
+        )
+        assert (effective & bit) == bit
+
+    @pytest.mark.parametrize("bit", [1, 2, 4, 8])
+    async def test_each_bit_is_removed_individually(
+        self, service, user_context, bit: int
+    ) -> None:
+        resource_id = f"agent-modify-remove-{bit}"
+        await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-modify",
+            resource_type="agent",
+            resource_id=resource_id,
+            perm_bits=MAX_PERM_BITS,
+        )
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-modify",
+            resource_type="agent",
+            resource_id=resource_id,
+            remove_bits=bit,
+        )
+        assert row is not None
+        assert row["perm_bits"] == MAX_PERM_BITS & ~bit
+        effective = await service.get_effective_permissions(
+            _principal_ctx("v-modify"), "agent", resource_id
+        )
+        assert (effective & bit) == 0
+
+    async def test_no_active_row_returns_none_and_writes_one_success_row(
+        self, service, client, user_context
+    ) -> None:
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-modify-none",
+            resource_type="agent",
+            resource_id="agent-modify-none",
+            add_bits=2,
+            remove_bits=1,
+        )
+        assert row is None
+        stored = _match_one_op(
+            _interactions(client), "modifyPermissionBits", "agent-modify-none"
+        )
+        assert stored["status"] == "success"
+        answer = json.loads(stored["answer"])
+        assert answer["perm_bits"] == 2  # (0 | 2) & ~1
+        assert answer["acl_entry_ids"] == []
+        assert answer["expired_ids"] == []
+        assert answer["visible_matched_count"] == 0
+        assert answer["expired_at_ms"] is None
+
+    async def test_same_bits_still_expires_and_inserts(
+        self, service, user_context
+    ) -> None:
+        """7s — adding a bit already held still expires the old row and
+        inserts a NEW one with the same bits and a DIFFERENT id."""
+        old = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-samebits",
+            resource_type="agent",
+            resource_id="agent-samebits",
+            perm_bits=5,
+        )
+        new = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-samebits",
+            resource_type="agent",
+            resource_id="agent-samebits",
+            add_bits=1,  # already held
+        )
+        assert new is not None
+        assert new["id"] != old["id"]
+        assert new["perm_bits"] == 5
+        old_pair = await _row_pair(service, old["id"])
+        assert old_pair[0] is not None, "the old row must be expired, not left active"
+
+    async def test_never_an_in_place_update_both_rows_on_the_table(
+        self, service, user_context
+    ) -> None:
+        """#7 — old row expired AT the stamp with its ORIGINAL bits
+        still on it; new row carries the NEW bits, a different id."""
+        old = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-inplace",
+            resource_type="agent",
+            resource_id="agent-inplace",
+            perm_bits=MAX_PERM_BITS,
+        )
+        new = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-inplace",
+            resource_type="agent",
+            resource_id="agent-inplace",
+            remove_bits=MAX_PERM_BITS & ~1,
+        )
+        assert new is not None
+        assert new["perm_bits"] == 1
+        assert new["id"] != old["id"]
+        old_pair = await _row_pair(service, old["id"])
+        assert old_pair[0] is not None
+        if isinstance(service, MockConsoleAclEntriesService):
+            old_row = next(e for e in service._entries if e.id == old["id"])
+            assert old_row.perm_bits == MAX_PERM_BITS, (
+                "the OLD row's perm_bits must be untouched — modify never "
+                "writes UPDATE ... SET perm_bits"
+            )
+
+    async def test_inherited_expiry_null_predecessor(
+        self, service, user_context
+    ) -> None:
+        """7i — a NULL-expiry predecessor's inheritance is NULL."""
+        await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-inherit-null",
+            resource_type="agent",
+            resource_id="agent-inherit-null",
+            perm_bits=1,
+        )
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-inherit-null",
+            resource_type="agent",
+            resource_id="agent-inherit-null",
+            add_bits=2,
+        )
+        assert row is not None
+        assert row["expired_at_ms"] is None
+
+    async def test_inherited_expiry_time_limited_predecessor(
+        self, service, monkeypatch, user_context
+    ) -> None:
+        """7i — a time-limited predecessor's SCHEDULED expiry is
+        inherited — captured BEFORE the UPDATE, never re-read after
+        (which would read ``stamp.now_ms`` instead, ADDENDUM 7i(b))."""
+        t0 = 1_790_100_000_000
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
+        await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-inherit-tl",
+            resource_type="agent",
+            resource_id="agent-inherit-tl",
+            perm_bits=1,
+            expired_at_ms=t0 + _HOUR,
+        )
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0 + 1)
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-inherit-tl",
+            resource_type="agent",
+            resource_id="agent-inherit-tl",
+            add_bits=2,
+        )
+        assert row is not None
+        assert row["expired_at_ms"] == t0 + _HOUR
+
+    async def test_race_branch_expire_returns_nothing_to_insert(
+        self, service, client, user_context, monkeypatch
+    ) -> None:
+        """S-1's injection point: wrap ``_expire_active``/
+        ``_expire_matching`` so the SAME key is expired by a SECOND
+        caller between the read and the UPDATE — the real call then
+        sees ``expired_ids == []`` even though ``active`` was non-empty,
+        and must insert NOTHING, write one success row with
+        ``perm_bits=new_bits`` (never 0) and return ``None``."""
+        await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-race",
+            resource_type="agent",
+            resource_id="agent-race",
+            perm_bits=1,
+        )
+
+        if isinstance(service, MockConsoleAclEntriesService):
+
+            def _racing_expire(entries, stamp, match, *, undo_log=None):
+                # Someone else expires the row FIRST, then the real call's
+                # own attempt matches nothing. _expire_matching is a
+                # SYNC function on the mock side — never awaited.
+                _mock_expire_matching(entries, stamp, match, undo_log=undo_log)
+                return []
+
+            monkeypatch.setattr(
+                "audittrace.services.console_acl._mock_write._expire_matching",
+                _racing_expire,
+            )
+        else:
+            real_expire_active = _postgres_write._expire_active
+
+            async def _racing_expire_active(db, **kwargs):
+                await real_expire_active(db, **kwargs)
+                return []
+
+            monkeypatch.setattr(
+                _postgres_write, "_expire_active", _racing_expire_active
+            )
+
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-race",
+            resource_type="agent",
+            resource_id="agent-race",
+            add_bits=2,
+        )
+        assert row is None, "the race branch inserts nothing and returns None"
+        stored = _match_one_op(
+            _interactions(client), "modifyPermissionBits", "agent-race"
+        )
+        assert stored["status"] == "success"
+        answer = json.loads(stored["answer"])
+        assert answer["perm_bits"] == 3, "new_bits, never 0 (S-1, D-A2-6)"
+        assert answer["acl_entry_ids"] == []
+        assert answer["expired_ids"] == []
+        assert answer["visible_matched_count"] == 1
+
+
+# ── delete_acl_entries — single/multi predicate, S-3 rendering, D-A2-4,
+# ordering, retention (#13) ─────────────────────────────────────────────
+
+
+class TestDeleteAclEntries:
+    async def test_single_predicate_expires_and_returns_ids(
+        self, service, client, user_context
+    ) -> None:
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-del-1",
+            resource_type="agent",
+            resource_id="agent-del-1",
+            perm_bits=1,
+        )
+        result = await service.delete_acl_entries(
+            user_context, [{"principal_id": "v-del-1", "resource_id": "agent-del-1"}]
+        )
+        assert result == {"expired_ids": [row["id"]], "visible_matched_count": 1}
+        stored = _match_one_op(_interactions(client), "deleteAclEntries", "agent-del-1")
+        assert stored["status"] == "success"
+        assert stored["question"].startswith("op=deleteAclEntries ")
+
+    async def test_absent_keys_render_dash_everywhere(
+        self, service, client, user_context
+    ) -> None:
+        """S-3 — a predicate naming only ``principal_type='public'``
+        renders every OTHER field as ``-`` in the denial/success
+        rendering, the frozen writer's own ``None`` rendering."""
+        await service.grant_permission(
+            user_context,
+            principal_type="public",
+            principal_id=None,
+            resource_type="agent",
+            resource_id="agent-del-public",
+            perm_bits=1,
+        )
+        await service.delete_acl_entries(user_context, [{"principal_type": "public"}])
+        rows = [
+            r
+            for r in _interactions(client)
+            if r["question"].startswith("op=deleteAclEntries ")
+            and "principal=public:-" in r["question"]
+        ]
+        assert len(rows) >= 1
+        assert "resource=-:- bits=0 tenant=-" in rows[0]["question"], rows[0][
+            "question"
+        ]
+
+    async def test_multi_predicate_one_audit_row_each(
+        self, service, client, user_context
+    ) -> None:
+        """D-A2-4 — three predicates, three success rows, each carrying
+        its OWN ``visible_matched_count``/``expired_ids``."""
+        r1 = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-del-mp-1",
+            resource_type="agent",
+            resource_id="agent-del-mp",
+            perm_bits=1,
+        )
+        r2 = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-del-mp-2",
+            resource_type="agent",
+            resource_id="agent-del-mp",
+            perm_bits=1,
+            tenant_id="t9",
+        )
+        before = len(_interactions(client))
+        result = await service.delete_acl_entries(
+            user_context,
+            [
+                {"principal_id": "v-del-mp-1"},
+                {"principal_id": "v-del-mp-2", "tenant_id": "t9"},
+                {"principal_id": "v-del-mp-nonexistent"},
+            ],
+        )
+        assert set(result["expired_ids"]) == {r1["id"], r2["id"]}
+        assert result["visible_matched_count"] == 2
+        after = _interactions(client)
+        assert len(after) == before + 3, "one audit row per predicate, incl. zero-match"
+
+    async def test_ordering_ties_broken_by_created_at_ms_then_id(
+        self, service, user_context, monkeypatch
+    ) -> None:
+        """S-a — delete's OWN order: ``(created_at_ms, id)``, never
+        RETURNING/insertion order."""
+        t0 = 1_790_200_000_000
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
+        a = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-order-a",
+            resource_type="agent",
+            resource_id="agent-order",
+            perm_bits=1,
+        )
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0 + 1)
+        b = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-order-b",
+            resource_type="agent",
+            resource_id="agent-order",
+            perm_bits=1,
+        )
+        result = await service.delete_acl_entries(
+            user_context, [{"resource_id": "agent-order"}]
+        )
+        assert result["expired_ids"] == [a["id"], b["id"]]
+
+    async def test_retains_rows_never_hard_deletes(self, service, user_context) -> None:
+        """Retention (#13) on delete."""
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-del-retain",
+            resource_type="agent",
+            resource_id="agent-del-retain",
+            perm_bits=2,
+        )
+        await service.delete_acl_entries(
+            user_context, [{"principal_id": "v-del-retain"}]
+        )
+        if isinstance(service, MockConsoleAclEntriesService):
+            retained = next(e for e in service._entries if e.id == row["id"])
+        else:
+            pg = dependencies.get_postgres_factory()
+            async with pg.get_session_factory()() as db:
+                result = await db.execute(
+                    sa.select(ConsoleAclEntry).where(ConsoleAclEntry.id == row["id"])
+                )
+                retained = result.scalar_one()
+        assert retained.perm_bits == 2
+        assert retained.expired_at_ms is not None
+
+
+# ── KSEL / KSEL-t / SEL — key/predicate selectivity (A2v2-BL-1,
+# A2v3-BL-1, A2-BL-1) ────────────────────────────────────────────────────
+
+
+class TestKeySelectivity:
+    """M(odify)/R(evoke)/D(elete) at a key, plus FIVE siblings each
+    differing from the key in exactly ONE of the five columns — a
+    selectivity bug (dropping a key column from the WHERE, or using OR
+    instead of AND) leaks a sibling's bits into ``old_bits`` / expires a
+    sibling it must not touch. ``firstrow`` (a SECOND simultaneously-
+    active row at the identical key) is constructed via a raw insert —
+    ``grant_permission`` itself cannot produce it (O-6 always supersedes
+    the prior active row at the same key first)."""
+
+    async def test_modify_key_selectivity_and_firstrow(
+        self, service, user_context, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: 1_790_000_000_000)
+        owner = user_context.user_id
+        key = dict(
+            principal_type="user",
+            principal_id="viewer-sub-0003",
+            resource_type="agent",
+            resource_id="agent-1",
+            tenant_id=None,
+        )
+        m_id = await _raw_insert(
+            service,
+            user_sub=owner,
+            principal_type=key["principal_type"],
+            principal_id=key["principal_id"],
+            principal_model="User",
+            resource_type=key["resource_type"],
+            resource_id=key["resource_id"],
+            perm_bits=7,
+            tenant_id=None,
+            expired_at_ms=1_790_003_600_000,
+            created_at_ms=1,
+        )
+        # "firstrow" — a second simultaneously-active row at the SAME key.
+        m2_id = await _raw_insert(
+            service,
+            user_sub=owner,
+            principal_type=key["principal_type"],
+            principal_id=key["principal_id"],
+            principal_model="User",
+            resource_type=key["resource_type"],
+            resource_id=key["resource_id"],
+            perm_bits=8,
+            tenant_id=None,
+            expired_at_ms=1_790_007_200_000,
+            created_at_ms=2,
+        )
+        siblings = {
+            "role": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="role",
+                principal_id="viewer-sub-0003",
+                principal_model="Role",
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+            ),
+            "principal": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="other-sub-0009",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+            ),
+            "resource_type": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0003",
+                principal_model="User",
+                resource_type="promptGroup",
+                resource_id="agent-1",
+                perm_bits=15,
+            ),
+            "resource_id": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0003",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-2",
+                perm_bits=15,
+            ),
+            "tenant": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0003",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-1",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+        }
+        sibling_pairs_before = {
+            name: await _row_pair(service, sid) for name, sid in siblings.items()
+        }
+
+        row = await service.modify_permission_bits(user_context, add_bits=1, **key)
+
+        assert row is not None
+        assert row["perm_bits"] == 15, "old_bits = OR(7, 8) = 15, never active[0]"
+        assert row["expired_at_ms"] == 1_790_007_200_000, "the GREATEST captured expiry"
+        for name, sid in siblings.items():
+            assert await _row_pair(service, sid) == sibling_pairs_before[name], (
+                f"sibling differing only in {name!r} must be untouched"
+            )
+        assert (await _row_pair(service, m_id))[0] is not None
+        assert (await _row_pair(service, m2_id))[0] is not None
+
+    async def test_revoke_key_selectivity(self, service, user_context) -> None:
+        owner = user_context.user_id
+        key = dict(
+            principal_type="user",
+            principal_id="viewer-sub-0004",
+            resource_type="agent",
+            resource_id="agent-9",
+            tenant_id=None,
+        )
+        m_id = await _raw_insert(
+            service, user_sub=owner, principal_model="User", perm_bits=7, **key
+        )
+        siblings = {
+            "role": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="role",
+                principal_id="viewer-sub-0004",
+                principal_model="Role",
+                resource_type="agent",
+                resource_id="agent-9",
+                perm_bits=15,
+            ),
+            "principal": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="other-sub-0010",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-9",
+                perm_bits=15,
+            ),
+            "resource_type": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0004",
+                principal_model="User",
+                resource_type="promptGroup",
+                resource_id="agent-9",
+                perm_bits=15,
+            ),
+            "resource_id": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0004",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-10",
+                perm_bits=15,
+            ),
+            "tenant": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0004",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-9",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+        }
+        sibling_pairs_before = {
+            name: await _row_pair(service, sid) for name, sid in siblings.items()
+        }
+
+        result = await service.revoke_permission(user_context, **key)
+
+        assert result == {"expired_ids": [m_id], "visible_matched_count": 1}
+        for name, sid in siblings.items():
+            assert await _row_pair(service, sid) == sibling_pairs_before[name]
+
+    async def test_delete_predicate_selectivity(self, service, user_context) -> None:
+        """SEL — same shape, through ``_predicate_clause``. The
+        predicate names ALL FIVE key columns explicitly (a NULL tenant
+        cannot be named in a predicate at all, D-A2-8 — so M sits at
+        tenant ``t1`` here, mirroring KSEL-t's shape, precisely so the
+        predicate CAN name every column and each sibling differs in
+        exactly one of them)."""
+        owner = user_context.user_id
+        m_id = await _raw_insert(
+            service,
+            user_sub=owner,
+            principal_type="user",
+            principal_id="viewer-sub-0005",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-11",
+            perm_bits=7,
+            tenant_id="t1",
+        )
+        siblings = {
+            "role": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="role",
+                principal_id="viewer-sub-0005",
+                principal_model="Role",
+                resource_type="agent",
+                resource_id="agent-11",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+            "principal": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="other-sub-0011",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-11",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+            "resource_type": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0005",
+                principal_model="User",
+                resource_type="promptGroup",
+                resource_id="agent-11",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+            "resource_id": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0005",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-12",
+                perm_bits=15,
+                tenant_id="t1",
+            ),
+            "tenant": await _raw_insert(
+                service,
+                user_sub=owner,
+                principal_type="user",
+                principal_id="viewer-sub-0005",
+                principal_model="User",
+                resource_type="agent",
+                resource_id="agent-11",
+                perm_bits=15,
+                tenant_id=None,
+            ),
+        }
+        sibling_pairs_before = {
+            name: await _row_pair(service, sid) for name, sid in siblings.items()
+        }
+
+        result = await service.delete_acl_entries(
+            user_context,
+            [
+                {
+                    "principal_type": "user",
+                    "principal_id": "viewer-sub-0005",
+                    "resource_type": "agent",
+                    "resource_id": "agent-11",
+                    "tenant_id": "t1",
+                }
+            ],
+        )
+
+        assert result == {"expired_ids": [m_id], "visible_matched_count": 1}
+        for name, sid in siblings.items():
+            assert await _row_pair(service, sid) == sibling_pairs_before[name]
+
+    async def test_modify_tenant_carriage_ksel_t(
+        self, service, user_context, monkeypatch
+    ) -> None:
+        """KSEL-t (A2v3-BL-1) — the write-side tenant-carriage fix: the
+        NEW row's ``tenant_id`` (and every other key column) come from
+        THIS call's key, never from a captured/sibling row. A closing
+        ``revoke(tenant_id='t1')`` on the NEW row must then actually
+        expire it — if the insert had landed at ``tenant_id=None``
+        instead, that revoke would silently miss it while the original
+        grant stayed live."""
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: 1_790_000_000_000)
+        owner = user_context.user_id
+        key = dict(
+            principal_type="user",
+            principal_id="viewer-sub-0003",
+            resource_type="agent",
+            resource_id="agent-1",
+            tenant_id="t1",
+        )
+        m_id = await _raw_insert(
+            service,
+            user_sub=owner,
+            principal_model="User",
+            perm_bits=7,
+            role_id="r1",
+            expired_at_ms=1_790_003_600_001,
+            **key,
+        )
+        null_sibling_id = await _raw_insert(
+            service,
+            user_sub=owner,
+            principal_type="user",
+            principal_id="viewer-sub-0003",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-1",
+            perm_bits=15,
+            tenant_id=None,
+        )
+        null_sibling_before = await _row_pair(service, null_sibling_id)
+
+        row = await service.modify_permission_bits(user_context, add_bits=0, **key)
+
+        assert row is not None
+        assert row["tenant_id"] == "t1"
+        assert row["perm_bits"] == 7
+        assert row["role_id"] == "r1"
+        assert row["expired_at_ms"] == 1_790_003_600_001
+        assert row["principal_type"] == "user"
+        assert row["principal_id"] == "viewer-sub-0003"
+        assert row["resource_type"] == "agent"
+        assert row["resource_id"] == "agent-1"
+        assert row["user_sub"] == owner
+        assert row["granted_by"] == owner
+        assert row["principal_model"] == "User"
+        assert await _row_pair(service, null_sibling_id) == null_sibling_before
+
+        # The closing proof — a revoke AT tenant t1 must expire the NEW
+        # row (never silently miss it, A2v3-BL-1's defect signature).
+        closing = await service.revoke_permission(user_context, **key)
+        assert closing == {"expired_ids": [row["id"]], "visible_matched_count": 1}
+        assert (await _row_pair(service, m_id))[0] is not None
+
+
+# ── #4 — N4 audit-write-failure: fail-closed caller half, per method ────
+
+
+class TestA2AuditWriteFailure:
+    """Same technique as ``TestFailClosedCallerHalf`` above (A1's grant
+    version): a broken FIRST ``_content_hash`` call must propagate the
+    ORIGINAL exception, leave the ACL row(s) untouched by the FAILED
+    write, and still land ONE ``acl_audit_write_failed`` row (the
+    denial writer's OWN, independent, content_hash call is left
+    unbroken by the counting side effect)."""
+
+    def _flaky_content_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original = _audit._content_hash
+        calls = {"n": 0}
+
+        def _flaky(*args: object, **kwargs: object) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("content_hash broken for this test")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(_audit, "_content_hash", _flaky)
+
+    async def test_revoke_propagates_and_leaves_the_row_active(
+        self, service, client, user_context, monkeypatch
+    ) -> None:
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-n4-revoke",
+            resource_type="agent",
+            resource_id="agent-n4-revoke",
+            perm_bits=1,
+        )
+        self._flaky_content_hash(monkeypatch)
+        with pytest.raises(RuntimeError, match="content_hash broken"):
+            await service.revoke_permission(
+                user_context,
+                principal_type="user",
+                principal_id="v-n4-revoke",
+                resource_type="agent",
+                resource_id="agent-n4-revoke",
+            )
+        pair = await _row_pair(service, row["id"])
+        assert pair[0] is None, "the row must still be ACTIVE — the expiry rolled back"
+        rows = [
+            r
+            for r in _interactions(client)
+            if r["failure_class"] == _audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED
+            and "agent-n4-revoke" in r["question"]
+        ]
+        assert len(rows) == 1
+
+    async def test_modify_propagates_and_restores_the_old_row(
+        self, service, client, user_context, monkeypatch
+    ) -> None:
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-n4-modify",
+            resource_type="agent",
+            resource_id="agent-n4-modify",
+            perm_bits=1,
+        )
+        self._flaky_content_hash(monkeypatch)
+        with pytest.raises(RuntimeError, match="content_hash broken"):
+            await service.modify_permission_bits(
+                user_context,
+                principal_type="user",
+                principal_id="v-n4-modify",
+                resource_type="agent",
+                resource_id="agent-n4-modify",
+                add_bits=2,
+            )
+        pair = await _row_pair(service, row["id"])
+        assert pair[0] is None, "the OLD row must still be ACTIVE — no partial mutation"
+        rows = [
+            r
+            for r in _interactions(client)
+            if r["failure_class"] == _audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED
+            and "agent-n4-modify" in r["question"]
+        ]
+        assert len(rows) == 1
+
+    async def test_delete_propagates_and_leaves_the_row_active(
+        self, service, client, user_context, monkeypatch
+    ) -> None:
+        row = await service.grant_permission(
+            user_context,
+            principal_type="user",
+            principal_id="v-n4-delete",
+            resource_type="agent",
+            resource_id="agent-n4-delete",
+            perm_bits=1,
+        )
+        self._flaky_content_hash(monkeypatch)
+        with pytest.raises(RuntimeError, match="content_hash broken"):
+            await service.delete_acl_entries(
+                user_context,
+                [{"principal_id": "v-n4-delete", "resource_id": "agent-n4-delete"}],
+            )
+        pair = await _row_pair(service, row["id"])
+        assert pair[0] is None, "the row must still be ACTIVE — the expiry rolled back"
+        rows = [
+            r
+            for r in _interactions(client)
+            if r["failure_class"] == _audit.FAILURE_CLASS_ACL_AUDIT_WRITE_FAILED
+            and "agent-n4-delete" in r["question"]
+        ]
+        assert len(rows) == 1
+
+
+# ── §4.0 documentation greps, extended for A2 (spec §10 — 2 / 1 / 0 / 0) ──
+
+
+class TestA2DocumentationGreps:
+    def _grep(self, pattern: str) -> str:
+        import subprocess
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                "grep",
+                "-cE",
+                pattern,
+                str(
+                    repo_root
+                    / "src"
+                    / "audittrace"
+                    / "services"
+                    / "console_acl"
+                    / "_postgres_write.py"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    def test_two_select_statements(self) -> None:
+        """``_visible_ids``/``_active_rows`` each hold ONE short
+        ``sa.select(...)`` call that ``ruff format`` canonically renders
+        on a SINGLE line (unlike ``_expire_where``'s longer chained
+        ``sa.update(...)``, which doesn't fit and stays multi-line) — so
+        this count is NOT line-anchored, unlike the update check below.
+        Verified (this file's own module docstring) that no OTHER
+        mention of the literal ``sa.select(`` text exists in
+        ``_postgres_write.py`` to inflate this count."""
+        assert self._grep(r"sa\.select\(") == "2"
+
+    def test_one_update_statement(self) -> None:
+        """Line-anchored — the module docstring mentions
+        ``sa.update(ConsoleAclEntry)`` in prose (never at the START of
+        its own line, since other words precede it there), so anchoring
+        on ``^\\s+sa\\.update\\(`` counts only the real, multi-line
+        statement in ``_expire_where``."""
+        assert self._grep(r"^\s+sa\.update\(") == "1"
+
+    def test_no_delete_statement(self) -> None:
+        """Retention (#13) — A2's write path never issues a Core
+        ``sa.delete(...)`` (migration 033's trigger would refuse a real
+        DELETE on Postgres regardless; this is the "we never even try"
+        half)."""
+        assert self._grep(r"^\s+sa\.delete\(") == "0"
