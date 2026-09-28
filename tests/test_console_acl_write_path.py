@@ -2555,3 +2555,73 @@ class TestBL4NoActiveAndOwnerMirrorMock:
         )
         other_row = next(e for e in mock_service._entries if e.user_sub == other_owner)
         assert other_row.expired_at_ms is None
+
+
+class TestBL3MultiPredicateMock:
+    """BL-3 (mock half) — same construction as
+    ``tests/test_acl_write_path_rls.py::TestBL3MultiPredicateRealPostgres``:
+    two predicates deliberately OVERLAP on one row (catches ``sum``),
+    the matched rows within one predicate are seeded with
+    ``created_at_ms``/id in CONFLICTING order (catches ``uuidsort``),
+    and the two predicates' own visible/expired sets are kept DISTINCT
+    and NON-EMPTY (catches per-row ``visible=visible_all``, per-row
+    cumulative ``expired_ids``, and reversed predicate/aggregation
+    order) — on the MOCK."""
+
+    async def test_mp_two_predicates_mock(self, mock_service, user_context) -> None:
+        owner_sub = user_context.user_id
+        await _raw_insert(
+            mock_service,
+            user_sub=owner_sub,
+            principal_type="user",
+            principal_id="user-1",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-mp-mock",
+            perm_bits=1,
+            tenant_id="t1",
+            entry_id="zzz-r1",
+            created_at_ms=100,
+            updated_at_ms=100,
+        )
+        await _raw_insert(
+            mock_service,
+            user_sub=owner_sub,
+            principal_type="user",
+            principal_id="user-2",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-mp-mock",
+            perm_bits=1,
+            tenant_id="t1",
+            entry_id="aaa-r2",
+            created_at_ms=101,
+            updated_at_ms=101,
+        )
+        await _raw_insert(
+            mock_service,
+            user_sub=owner_sub,
+            principal_type="user",
+            principal_id="user-1",
+            principal_model="User",
+            resource_type="agent",
+            resource_id="agent-mp-mock",
+            perm_bits=1,
+            tenant_id="t2",
+            entry_id="r3",
+            created_at_ms=150,
+            updated_at_ms=150,
+        )
+        predicates = [
+            {"resource_id": "agent-mp-mock", "tenant_id": "t1"},
+            {"resource_id": "agent-mp-mock", "principal_id": "user-1"},
+        ]
+        result = await mock_service.delete_acl_entries(user_context, predicates)
+
+        assert result["visible_matched_count"] == 3, (
+            "DISTINCT over the OR — never sum(2, 2) == 4"
+        )
+        assert result["expired_ids"] == ["zzz-r1", "aaa-r2", "r3"], (
+            "predicate 1's own (created_at_ms, id) order, THEN predicate "
+            "2's own (r3 only) — never id-only sorted, never reversed"
+        )
