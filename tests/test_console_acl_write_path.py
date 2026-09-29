@@ -1619,10 +1619,24 @@ class TestModifyPermissionBits:
             _interactions(client), "modifyPermissionBits", "agent-x6-nomatch"
         )
         assert stored["status"] == "success"
-        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        assert stored["question"] == (
+            "op=modifyPermissionBits principal=user:v-x6-nomatch "
+            "resource=agent:agent-x6-nomatch bits=1 tenant=t1"
+        )
+        # BL-2/BL-3 convergence sweep (A2 fix-4) — the FULL W-Q parse,
+        # never just tenant+bits: this is a §7 row (W3-NM) every bit as
+        # much as W2/W3-insert/W4/W5/W6, so it must carry the same
+        # per-field guard.
         fields = _parse_question(stored["question"])
-        assert fields["tenant"] == "t1"
-        assert fields["bits"] == "1"  # (0 | 1) & ~0
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": "v-x6-nomatch",
+            "resource_type": "agent",
+            "resource_id": "agent-x6-nomatch",
+            "bits": "1",  # (0 | 1) & ~0
+            "tenant": "t1",
+        }
         answer = json.loads(stored["answer"])
         assert answer["perm_bits"] == 1
         assert answer["acl_entry_ids"] == []
@@ -1674,10 +1688,22 @@ class TestModifyPermissionBits:
             _interactions(client), "modifyPermissionBits", "agent-w3race-t1"
         )
         assert stored["status"] == "success"
-        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        assert stored["question"] == (
+            "op=modifyPermissionBits principal=user:v-w3race-t1 "
+            "resource=agent:agent-w3race-t1 bits=3 tenant=t1"
+        )
+        # BL-2/BL-3 convergence sweep (A2 fix-4) — the FULL W-Q parse
+        # (W3-RACE is a §7 row too).
         fields = _parse_question(stored["question"])
-        assert fields["tenant"] == "t1"
-        assert fields["bits"] == "3"  # new_bits, never 0 (S-1, D-A2-6)
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": "v-w3race-t1",
+            "resource_type": "agent",
+            "resource_id": "agent-w3race-t1",
+            "bits": "3",  # new_bits, never 0 (S-1, D-A2-6)
+            "tenant": "t1",
+        }
         answer = json.loads(stored["answer"])
         assert answer["perm_bits"] == 3
         assert answer["acl_entry_ids"] == []
@@ -2484,6 +2510,24 @@ class TestA2AuditWriteFailure:
             and "agent-n4-revoke" in r["question"]
         ]
         assert len(rows) == 1
+        # BL-3 (A2 fix-4, ADDENDUM-A A-1/A-2 W-Q on W6) — the
+        # audit-failure `question` itself, per field: N15 (drops
+        # principal_id) stayed GREEN under the substring-only check
+        # this test had before.
+        assert rows[0]["question"] == (
+            "op=revokePermission principal=user:v-n4-revoke "
+            "resource=agent:agent-n4-revoke bits=0 tenant=-"
+        )
+        fields = _parse_question(rows[0]["question"])
+        assert fields == {
+            "op": "revokePermission",
+            "principal_type": "user",
+            "principal_id": "v-n4-revoke",
+            "resource_type": "agent",
+            "resource_id": "agent-n4-revoke",
+            "bits": "0",
+            "tenant": "-",
+        }
 
     async def test_modify_propagates_and_restores_the_old_row(
         self, service, client, user_context, monkeypatch
@@ -2515,6 +2559,24 @@ class TestA2AuditWriteFailure:
             and "agent-n4-modify" in r["question"]
         ]
         assert len(rows) == 1
+        # BL-3 convergence (A2 fix-4) — this is a DISTINCT audit-
+        # failure row from TestSFCAuditFailureOnKselTKey's (a different
+        # key entirely); the sweep requires the parse on EVERY row any
+        # §7 test reads, not just one canonical instance per category.
+        assert rows[0]["question"] == (
+            "op=modifyPermissionBits principal=user:v-n4-modify "
+            "resource=agent:agent-n4-modify bits=3 tenant=-"
+        )
+        fields = _parse_question(rows[0]["question"])
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": "v-n4-modify",
+            "resource_type": "agent",
+            "resource_id": "agent-n4-modify",
+            "bits": "3",
+            "tenant": "-",
+        }
 
     async def test_delete_propagates_and_leaves_the_row_active(
         self, service, client, user_context, monkeypatch
@@ -2542,6 +2604,23 @@ class TestA2AuditWriteFailure:
             and "agent-n4-delete" in r["question"]
         ]
         assert len(rows) == 1
+        # BL-3 (A2 fix-4, ADDENDUM-A A-1/A-2 W-Q on W6) — N16 (drops
+        # principal_id) stayed GREEN under the substring-only check
+        # this test had before.
+        assert rows[0]["question"] == (
+            "op=deleteAclEntries principal=-:v-n4-delete "
+            "resource=-:agent-n4-delete bits=0 tenant=-"
+        )
+        fields = _parse_question(rows[0]["question"])
+        assert fields == {
+            "op": "deleteAclEntries",
+            "principal_type": "-",
+            "principal_id": "v-n4-delete",
+            "resource_type": "-",
+            "resource_id": "agent-n4-delete",
+            "bits": "0",
+            "tenant": "-",
+        }
 
 
 # ── §4.0 documentation greps, extended for A2 (spec §10 — 2 / 1 / 0 / 0) ──
@@ -2634,7 +2713,23 @@ class TestBL2TenantOnSuccessAuditRowsBothImpls:
             _interactions(client), "revokePermission", "agent-bl2-revoke"
         )
         assert stored["status"] == "success"
-        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        assert stored["question"] == (
+            "op=revokePermission principal=user:v-bl2-revoke "
+            "resource=agent:agent-bl2-revoke bits=0 tenant=t1"
+        )
+        # BL-2/BL-3 convergence sweep (A2 fix-4) — full W-Q parse; this
+        # is a DISTINCT W2 row from KSEL-t's own (a different key), and
+        # the sweep requires the parse on every row, not one per class.
+        fields = _parse_question(stored["question"])
+        assert fields == {
+            "op": "revokePermission",
+            "principal_type": "user",
+            "principal_id": "v-bl2-revoke",
+            "resource_type": "agent",
+            "resource_id": "agent-bl2-revoke",
+            "bits": "0",
+            "tenant": "t1",
+        }
 
     async def test_modify_success_audit_row_ends_tenant_t1(
         self, service, client, user_context
@@ -2653,7 +2748,22 @@ class TestBL2TenantOnSuccessAuditRowsBothImpls:
             _interactions(client), "modifyPermissionBits", "agent-bl2-modify"
         )
         assert stored["status"] == "success"
-        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        assert stored["question"] == (
+            "op=modifyPermissionBits principal=user:v-bl2-modify "
+            "resource=agent:agent-bl2-modify bits=3 tenant=t1"
+        )
+        # BL-2/BL-3 convergence sweep (A2 fix-4) — full W-Q parse; a
+        # DISTINCT W3-insert row from KSEL-t's own.
+        fields = _parse_question(stored["question"])
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": "v-bl2-modify",
+            "resource_type": "agent",
+            "resource_id": "agent-bl2-modify",
+            "bits": "3",
+            "tenant": "t1",
+        }
 
 
 class TestBL4NoActiveAndOwnerMirrorMock:
@@ -2838,6 +2948,107 @@ _MP_P2 = {"resource_type": "agent", "resource_id": "agent-1"}
 _MP_P3 = {"principal_type": "public"}
 
 
+async def _seed_mp_a_to_g_mock(
+    mock_service: Any, user_context: Any, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
+    """v4 §7.3's rows (mock), seeded through the CLOCK SEAM via the
+    real ``grant_permission`` write path (A2 fix-3 BL-4) — never a raw
+    INSERT, never a fixed/literal id. v4's own RE-ROLL mechanism
+    (A2 fix-4 BL-1): ``grant_permission``'s O-6 expire-and-insert
+    mints a FRESH ``uuid4`` on every call, so re-granting BOTH members
+    of a pair together (never one held fixed — fix-3's own shape was
+    flaky: review-4 measured 3/50 real executions failing, and proved
+    it deterministically with a strictly-increasing ``uuid4``) until
+    the newly-minted ids satisfy the spec's ordering precondition
+    reproduces v4's own re-roll. Mirrors
+    ``tests/test_acl_write_path_rls.py::_seed_mp_a_to_g``."""
+    t0 = 1_790_100_000_000
+
+    async def _grant_at(clock_ms: int, **key: Any) -> str:
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: clock_ms)
+        row = await mock_service.grant_permission(user_context, perm_bits=1, **key)
+        return str(row["id"])
+
+    async def _grant_pair_until(
+        clock_first: int,
+        key_first: dict[str, Any],
+        clock_second: int,
+        key_second: dict[str, Any],
+        condition: Any,
+    ) -> tuple[str, str]:
+        for _ in range(64):
+            id_first = await _grant_at(clock_first, **key_first)
+            id_second = await _grant_at(clock_second, **key_second)
+            if condition(id_first, id_second):
+                return id_first, id_second
+        raise AssertionError(
+            "v4 §7.3's uuid ordering precondition not reached after 64 re-rolls"
+        )
+
+    ids: dict[str, str] = {}
+    ids["E"] = await _grant_at(
+        t0 + 1,
+        principal_type="user",
+        principal_id="untouched-principal",
+        resource_type="agent",
+        resource_id="other-resource-2",
+    )
+    ids["F"] = await _grant_at(
+        t0 + 2,
+        principal_type="user",
+        principal_id="untouched-principal-f",
+        resource_type="promptGroup",
+        resource_id="agent-1",
+    )
+    ids["D"] = await _grant_at(
+        t0 + 3,
+        principal_type="public",
+        principal_id=None,
+        resource_type="agent",
+        resource_id="agent-1",
+    )
+    g_key = dict(
+        principal_type="user",
+        principal_id="aaa-sub-0010",
+        resource_type="agent",
+        resource_id="agent-1",
+    )
+    c_key = dict(
+        principal_type="user",
+        principal_id="other-sub-0009",
+        resource_type="agent",
+        resource_id="agent-1",
+    )
+    ids["G"], ids["C"] = await _grant_pair_until(
+        t0 + 4, g_key, t0 + 4, c_key, lambda gid, cid: cid < gid
+    )
+    a_key = dict(
+        principal_type="user",
+        principal_id=_MP_V,
+        resource_type="agent",
+        resource_id="agent-1",
+    )
+    b_key = dict(
+        principal_type="user",
+        principal_id=_MP_V,
+        resource_type="agent",
+        resource_id="other-resource",
+    )
+    ids["A"], ids["B"] = await _grant_pair_until(
+        t0 + 6, a_key, t0 + 5, b_key, lambda aid, bid: aid < bid
+    )
+
+    assert ids["A"] < ids["B"], "v4 §7.3's own uuid precondition"
+    assert ids["C"] < ids["G"], "v4 §7.3's own uuid precondition"
+    # A superseded re-roll attempt is expired AT ITS OWN grant clock;
+    # the caller's own now_ms must be strictly AFTER every offset used
+    # above, or a discarded attempt could still read as active (fix-4's
+    # own discovery — see the RLS file's _seed_mp_a_to_g for the full
+    # note).
+    monkeypatch.setattr(_clock_module, "now_ms", lambda: t0 + 1000)
+    return ids
+
+
 class TestMPAToGVerbatimMock:
     """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3) — closes
     BL-A on the mock. Same rows/predicates/overlaps/tie/order-inversion
@@ -2846,84 +3057,7 @@ class TestMPAToGVerbatimMock:
     async def test_mp_a_to_g_mock(
         self, mock_service, client, user_context, monkeypatch
     ) -> None:
-        """v4 §7.3's rows, seeded through the CLOCK SEAM via the real
-        ``grant_permission`` write path (A2 fix-3 BL-4) — never a raw
-        INSERT, never a fixed/literal id. v4's own RE-ROLL mechanism:
-        ``grant_permission``'s O-6 expire-and-insert mints a FRESH
-        ``uuid4`` on every call at the same key, so re-granting at G's
-        (respectively B's) key until the newly-minted id satisfies the
-        spec's ordering precondition reproduces v4's own re-roll."""
-        t0 = 1_790_100_000_000
-
-        async def _grant_at(clock_ms: int, **key: Any) -> str:
-            monkeypatch.setattr(_clock_module, "now_ms", lambda: clock_ms)
-            row = await mock_service.grant_permission(user_context, perm_bits=1, **key)
-            return str(row["id"])
-
-        async def _grant_until(
-            clock_ms: int, key: dict[str, Any], condition: Any
-        ) -> str:
-            for _ in range(64):
-                new_id = await _grant_at(clock_ms, **key)
-                if condition(new_id):
-                    return new_id
-            raise AssertionError(
-                "v4 §7.3's uuid ordering precondition not reached after 64 re-rolls"
-            )
-
-        ids: dict[str, str] = {}
-        ids["E"] = await _grant_at(
-            t0 + 1,
-            principal_type="user",
-            principal_id="untouched-principal",
-            resource_type="agent",
-            resource_id="other-resource-2",
-        )
-        ids["F"] = await _grant_at(
-            t0 + 2,
-            principal_type="user",
-            principal_id="untouched-principal-f",
-            resource_type="promptGroup",
-            resource_id="agent-1",
-        )
-        ids["D"] = await _grant_at(
-            t0 + 3,
-            principal_type="public",
-            principal_id=None,
-            resource_type="agent",
-            resource_id="agent-1",
-        )
-        g_key = dict(
-            principal_type="user",
-            principal_id="aaa-sub-0010",
-            resource_type="agent",
-            resource_id="agent-1",
-        )
-        c_key = dict(
-            principal_type="user",
-            principal_id="other-sub-0009",
-            resource_type="agent",
-            resource_id="agent-1",
-        )
-        ids["G"] = await _grant_at(t0 + 4, **g_key)
-        ids["C"] = await _grant_until(t0 + 4, c_key, lambda cid: cid < ids["G"])
-        a_key = dict(
-            principal_type="user",
-            principal_id=_MP_V,
-            resource_type="agent",
-            resource_id="agent-1",
-        )
-        b_key = dict(
-            principal_type="user",
-            principal_id=_MP_V,
-            resource_type="agent",
-            resource_id="other-resource",
-        )
-        ids["A"] = await _grant_at(t0 + 6, **a_key)
-        ids["B"] = await _grant_until(t0 + 5, b_key, lambda bid: ids["A"] < bid)
-
-        assert ids["A"] < ids["B"], "v4 §7.3's own uuid precondition"
-        assert ids["C"] < ids["G"], "v4 §7.3's own uuid precondition"
+        ids = await _seed_mp_a_to_g_mock(mock_service, user_context, monkeypatch)
 
         result = await mock_service.delete_acl_entries(
             user_context, [_MP_P1, _MP_P2, _MP_P3]
@@ -3004,3 +3138,30 @@ class TestMPAToGVerbatimMock:
             "bits": "0",
             "tenant": "-",
         }
+
+
+class TestMPAToGReRollNeverFlakesMock:
+    """A2 fix-4 BL-1 — the mock half of the permanent deterministic
+    proof (see
+    ``tests/test_acl_write_path_rls.py::TestMPAToGReRollNeverFlakes``
+    for the full rationale). Under a strictly-increasing ``uuid4`` the
+    ordering precondition is mathematically unreachable; the seeding
+    must fail LOUDLY with the same clear, named error, never hang,
+    never flake, never silently return a wrong pair."""
+
+    async def test_monotone_uuid4_fails_loudly_not_hangs_or_flakes(
+        self, mock_service, user_context, monkeypatch
+    ) -> None:
+        import itertools
+
+        counter = itertools.count(1)
+
+        def _monotone_uuid4() -> uuid.UUID:
+            n = next(counter)
+            return uuid.UUID(int=(n << 64) | 0x4000_8000_0000_0000_0000)
+
+        monkeypatch.setattr(uuid, "uuid4", _monotone_uuid4)
+        with pytest.raises(
+            AssertionError, match="uuid ordering precondition not reached"
+        ):
+            await _seed_mp_a_to_g_mock(mock_service, user_context, monkeypatch)

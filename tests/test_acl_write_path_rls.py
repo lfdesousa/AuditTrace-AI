@@ -2678,6 +2678,25 @@ class TestDA24RollbackAtPredicateI:
                 "predicate": {"principal_id": "p-d4r-2", "resource_id": "agent-3"},
                 "predicate_count": 3,
             }
+            # BL-2 (A2 fix-4, ADDENDUM-A A-1/A-2 W-Q on W5) — the
+            # denial `question` itself, per-field, never a substring
+            # check alone: N10 (drops principal_id) and N11 (bits=1
+            # instead of delete's own perm_bits=0) both stayed GREEN
+            # under the substring-only check this class had before.
+            assert denial_rows[0]["question"] == (
+                "op=deleteAclEntries principal=-:p-d4r-2 resource=-:agent-3 "
+                "bits=0 tenant=-"
+            )
+            fields = _parse_question(denial_rows[0]["question"])
+            assert fields == {
+                "op": "deleteAclEntries",
+                "principal_type": "-",
+                "principal_id": "p-d4r-2",
+                "resource_type": "-",
+                "resource_id": "agent-3",
+                "bits": "0",
+                "tenant": "-",
+            }
         finally:
             admin.dispose()
 
@@ -3342,14 +3361,15 @@ async def _seed_mp_a_to_g(
     A but INSERTED after it). Seeded through the CLOCK SEAM via the
     real ``grant_permission`` write path (never a raw INSERT) — every
     row's uuid is the one the service itself mints. v4's own RE-ROLL
-    mechanism: ``grant_permission``'s O-6 expire-and-insert mints a
-    FRESH ``uuid4`` on every call at the same key, so re-granting at
-    G's (respectively B's) key until the newly-minted id satisfies the
-    spec's ordering precondition reproduces v4's own re-roll (PG
-    measured 0-7 re-rolls, mock 0-8, per run) — never a fixed/literal
-    id substituted for it. Returns ``{letter: real_id}``; the caller
-    asserts v4's own precondition, ``uuid(A) < uuid(B)`` and
-    ``uuid(C) < uuid(G)``, from these SAME rows."""
+    mechanism (A2 fix-4 BL-1): ``grant_permission``'s O-6 expire-and-
+    insert mints a FRESH ``uuid4`` on every call, so re-granting BOTH
+    members of a pair together (never one held fixed — fix-3's own
+    shape was flaky, see ``_grant_pair_until``) until the newly-minted
+    ids satisfy the spec's ordering precondition reproduces v4's own
+    re-roll — never a fixed/literal id substituted for it. Returns
+    ``{letter: real_id}``; the caller asserts v4's own precondition,
+    ``uuid(A) < uuid(B)`` and ``uuid(C) < uuid(G)``, from these SAME
+    rows."""
     _seed_agent(write_harness, "other-resource")
     _seed_agent(write_harness, "other-resource-2")
     _seed_prompt_group(write_harness, "agent-1")
@@ -3367,11 +3387,34 @@ async def _seed_mp_a_to_g(
             set_current_user_id(None)
         return str(row["id"])
 
-    async def _grant_until(clock_ms: int, key: dict[str, Any], condition: Any) -> str:
+    async def _grant_pair_until(
+        clock_first: int,
+        key_first: dict[str, Any],
+        clock_second: int,
+        key_second: dict[str, Any],
+        condition: Any,
+    ) -> tuple[str, str]:
+        """A2 fix-4 BL-1 — re-grant BOTH members of the pair on EVERY
+        attempt (never hold one fixed). Holding one fixed and re-
+        rolling only the other made each attempt's success probability
+        asymmetric (~1/65 EXHAUST chance per loop, not per attempt —
+        review-4 measured 3/50 real executions failing, one on real
+        PG, and proved it deterministically with a strictly-increasing
+        ``uuid4``: a fixed member can never be beaten by a monotone
+        re-roll). Re-granting BOTH gives each attempt an INDEPENDENT,
+        UNIFORM 50/50 chance under a real random ``uuid4`` draw — v4
+        §7.3's own re-roll re-rolls the WHOLE attempt, never one leg
+        of it. Under an adversarial strictly-increasing ``uuid4`` (see
+        ``TestMPAToGReRollNeverFlakes`` below) the precondition is
+        mathematically unreachable either way; this loop still fails
+        LOUDLY with a clear, named error after a bounded number of
+        attempts — it never hangs and never silently returns a wrong
+        pair."""
         for _ in range(64):
-            new_id = await _grant_at(clock_ms, **key)
-            if condition(new_id):
-                return new_id
+            id_first = await _grant_at(clock_first, **key_first)
+            id_second = await _grant_at(clock_second, **key_second)
+            if condition(id_first, id_second):
+                return id_first, id_second
         raise AssertionError(
             "v4 §7.3's uuid ordering precondition not reached after 64 re-rolls"
         )
@@ -3417,8 +3460,9 @@ async def _seed_mp_a_to_g(
         resource_type="agent",
         resource_id="agent-1",
     )
-    ids["G"] = await _grant_at(t0 + 4, **g_key)
-    ids["C"] = await _grant_until(t0 + 4, c_key, lambda cid: cid < ids["G"])
+    ids["G"], ids["C"] = await _grant_pair_until(
+        t0 + 4, g_key, t0 + 4, c_key, lambda gid, cid: cid < gid
+    )
     # A, B — A in P1 ∩ P2; B in P1 only. A created AFTER B (T0+6 vs
     # T0+5) but INSERTED before it here — insertion order != creation
     # order, so `unsorted`/`globalsort` cannot hide behind coincidence.
@@ -3435,11 +3479,21 @@ async def _seed_mp_a_to_g(
         resource_type="agent",
         resource_id="other-resource",
     )
-    ids["A"] = await _grant_at(t0 + 6, **a_key)
-    ids["B"] = await _grant_until(t0 + 5, b_key, lambda bid: ids["A"] < bid)
+    ids["A"], ids["B"] = await _grant_pair_until(
+        t0 + 6, a_key, t0 + 5, b_key, lambda aid, bid: aid < bid
+    )
 
     assert ids["A"] < ids["B"], "v4 §7.3's own uuid precondition"
     assert ids["C"] < ids["G"], "v4 §7.3's own uuid precondition"
+    # A superseded re-roll attempt is expired AT ITS OWN grant clock
+    # (e.g. a discarded A-attempt reads expired_at_ms == t0+6); the
+    # NEXT caller's own now_ms must be strictly AFTER every offset used
+    # above (t0+1..t0+6), or `_active_clause`'s `expired_at_ms >
+    # now_ms` could read a genuinely-superseded row as still-active —
+    # discovered by fix-4's own re-roll-both-members fix (re-rolling A,
+    # previously fixed, can leave a discarded attempt stamped LATER
+    # than whatever clock value a caller inherits otherwise).
+    monkeypatch.setattr(_clock_module, "now_ms", lambda: t0 + 1000)
     return ids
 
 
@@ -3547,6 +3601,45 @@ class TestMPAToGVerbatimRealPostgres:
         assert f3["resource_id"] == "-"
         assert f3["bits"] == "0"
         assert f3["tenant"] == "-"
+
+
+class TestMPAToGReRollNeverFlakes:
+    """A2 fix-4 BL-1 — the independent reviewer's own deterministic
+    proof (evidence/2026-09-30-A2-review-4/tools/reviewer_uuid_monotone.py),
+    kept PERMANENT. Under a ``uuid4`` that is STRICTLY INCREASING — an
+    adversarial-but-legal draw sequence a real random ``uuid4`` could
+    never reliably reproduce, but the re-roll loop must still behave
+    SAFELY against — the A-G seeding's ordering precondition
+    (``uuid(C) < uuid(G)``: C is always granted AFTER G within an
+    attempt, so a monotone generator can NEVER satisfy it) is
+    mathematically unreachable. The loop must still fail LOUDLY, with
+    the SAME clear, named ``AssertionError``, after exactly the bounded
+    number of attempts it is documented to try (64) — never hang,
+    never flake, never silently return a wrong pair. This is the
+    control proof for BL-1's fix: fix-3's shape (one member of each
+    pair held fixed) made THIS SAME adversarial input succeed the A/B
+    leg by ACCIDENT (a fixed A, re-rolled B, both drawn after G/C, so
+    A < B held trivially) while still exhausting on C/G — fix-4's
+    both-members re-roll is judged not by whether it beats an
+    impossible adversarial precondition, but by never flaking on a
+    REAL one (see the 200-run repeat check, same evidence)."""
+
+    async def test_monotone_uuid4_fails_loudly_not_hangs_or_flakes(
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import itertools
+
+        counter = itertools.count(1)
+
+        def _monotone_uuid4() -> uuid.UUID:
+            n = next(counter)
+            return uuid.UUID(int=(n << 64) | 0x4000_8000_0000_0000_0000)
+
+        monkeypatch.setattr(uuid, "uuid4", _monotone_uuid4)
+        with pytest.raises(
+            AssertionError, match="uuid ordering precondition not reached"
+        ):
+            await _seed_mp_a_to_g(write_harness, monkeypatch)
 
 
 class TestBL4RemainingGuards:
