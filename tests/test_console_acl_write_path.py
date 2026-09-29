@@ -1227,6 +1227,8 @@ class TestAutoflushIsMeasuredOnThisVenv:
 # SF-A/B/C) live in ``tests/test_acl_write_path_rls.py``, NOT here.
 # ═══════════════════════════════════════════════════════════════════════
 
+import re  # noqa: E402
+
 from audittrace.identity import UserContext  # noqa: E402
 from audittrace.services.console_acl._mock_write import (  # noqa: E402
     _expire_matching as _mock_expire_matching,
@@ -1567,6 +1569,92 @@ class TestModifyPermissionBits:
         assert answer["visible_matched_count"] == 0
         assert answer["expired_at_ms"] is None
 
+    async def test_no_match_at_tenant_t1_renders_tenant_t1_not_dash(
+        self, service, client, user_context
+    ) -> None:
+        """X6/W3-NM (ADDENDUM A) — the no-match branch's audit row
+        carries the CALLER'S tenant (from ``key``), never ``-``: v4
+        §4.2 says ``tenant_id=<key>`` on EVERY modify branch, and the
+        no-match branch is no exception."""
+        row = await service.modify_permission_bits(
+            user_context,
+            principal_type="user",
+            principal_id="v-x6-nomatch",
+            resource_type="agent",
+            resource_id="agent-x6-nomatch",
+            add_bits=1,
+            tenant_id="t1",
+        )
+        assert row is None
+        stored = _match_one_op(
+            _interactions(client), "modifyPermissionBits", "agent-x6-nomatch"
+        )
+        assert stored["status"] == "success"
+        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        fields = _parse_question(stored["question"])
+        assert fields["tenant"] == "t1"
+        assert fields["bits"] == "1"  # (0 | 1) & ~0
+        answer = json.loads(stored["answer"])
+        assert answer["perm_bits"] == 1
+        assert answer["acl_entry_ids"] == []
+        assert answer["expired_ids"] == []
+        assert answer["visible_matched_count"] == 0
+        assert answer["expired_at_ms"] is None
+
+    async def test_race_branch_at_tenant_t1_renders_tenant_t1_not_dash(
+        self, service, client, user_context, monkeypatch
+    ) -> None:
+        """W3-RACE (ADDENDUM A) — the race branch's audit row ALSO
+        carries the CALLER'S tenant, at a ``t1`` key (S-1's shape
+        re-run at KSEL-t's tenant)."""
+        key = dict(
+            principal_type="user",
+            principal_id="v-w3race-t1",
+            resource_type="agent",
+            resource_id="agent-w3race-t1",
+            tenant_id="t1",
+        )
+        await service.grant_permission(user_context, perm_bits=1, **key)
+
+        if isinstance(service, MockConsoleAclEntriesService):
+
+            def _racing_expire(entries, stamp, match, *, undo_log=None):
+                # _expire_matching is a SYNC function on the mock side —
+                # never awaited.
+                _mock_expire_matching(entries, stamp, match, undo_log=undo_log)
+                return []
+
+            monkeypatch.setattr(
+                "audittrace.services.console_acl._mock_write._expire_matching",
+                _racing_expire,
+            )
+        else:
+            real_expire_active = _postgres_write._expire_active
+
+            async def _racing_expire_active(db, **kwargs):
+                await real_expire_active(db, **kwargs)
+                return []
+
+            monkeypatch.setattr(
+                _postgres_write, "_expire_active", _racing_expire_active
+            )
+
+        row = await service.modify_permission_bits(user_context, add_bits=2, **key)
+        assert row is None, "the race branch inserts nothing and returns None"
+        stored = _match_one_op(
+            _interactions(client), "modifyPermissionBits", "agent-w3race-t1"
+        )
+        assert stored["status"] == "success"
+        assert stored["question"].endswith("tenant=t1"), stored["question"]
+        fields = _parse_question(stored["question"])
+        assert fields["tenant"] == "t1"
+        assert fields["bits"] == "3"  # new_bits, never 0 (S-1, D-A2-6)
+        answer = json.loads(stored["answer"])
+        assert answer["perm_bits"] == 3
+        assert answer["acl_entry_ids"] == []
+        assert answer["expired_ids"] == []
+        assert answer["visible_matched_count"] == 1
+
     async def test_same_bits_still_expires_and_inserts(
         self, service, user_context
     ) -> None:
@@ -1790,6 +1878,16 @@ class TestDeleteAclEntries:
         assert "resource=-:- bits=0 tenant=-" in rows[0]["question"], rows[0][
             "question"
         ]
+        fields = _parse_question(rows[0]["question"])
+        assert fields == {
+            "op": "deleteAclEntries",
+            "principal_type": "public",
+            "principal_id": "-",
+            "resource_type": "-",
+            "resource_id": "-",
+            "bits": "0",
+            "tenant": "-",
+        }
 
     async def test_multi_predicate_one_audit_row_each(
         self, service, client, user_context
@@ -2194,7 +2292,7 @@ class TestKeySelectivity:
             assert await _row_pair(service, sid) == sibling_pairs_before[name]
 
     async def test_modify_tenant_carriage_ksel_t(
-        self, service, user_context, monkeypatch
+        self, service, client, user_context, monkeypatch
     ) -> None:
         """KSEL-t (A2v3-BL-1) — the write-side tenant-carriage fix: the
         NEW row's ``tenant_id`` (and every other key column) come from
@@ -2248,7 +2346,39 @@ class TestKeySelectivity:
         assert row["user_sub"] == owner
         assert row["granted_by"] == owner
         assert row["principal_model"] == "User"
+        # X2/X2b/BL-C/W1-STAMPS — every stamp on the NEW row is
+        # stamp.now_ms, NEVER inherited from the superseded row (the
+        # clock is frozen above); inherited_from is never written.
+        assert row["created_at_ms"] == 1_790_000_000_000
+        assert row["granted_at_ms"] == 1_790_000_000_000
+        assert row["updated_at_ms"] == 1_790_000_000_000
+        assert row["inherited_from"] is None
         assert await _row_pair(service, null_sibling_id) == null_sibling_before
+
+        # W3 insert branch (ADDENDUM A) — the SAME per-field parse on
+        # the SUCCESS audit row (v4's own full-string check, kept
+        # below, is SF-2-additive with this one).
+        stored = _match_one_op(_interactions(client), "modifyPermissionBits", "agent-1")
+        assert stored["status"] == "success"
+        assert stored["question"] == (
+            "op=modifyPermissionBits principal=user:viewer-sub-0003 "
+            "resource=agent:agent-1 bits=7 tenant=t1"
+        )
+        fields = _parse_question(stored["question"])
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": "viewer-sub-0003",
+            "resource_type": "agent",
+            "resource_id": "agent-1",
+            "bits": "7",
+            "tenant": "t1",
+        }
+        answer = json.loads(stored["answer"])
+        assert answer["acl_entry_ids"] == [row["id"]]
+        assert answer["expired_ids"] == [m_id]
+        assert answer["visible_matched_count"] == 1
+        assert answer["expired_at_ms"] == 1_790_003_600_001
 
         # The closing proof — a revoke AT tenant t1 must expire the NEW
         # row (never silently miss it, A2v3-BL-1's defect signature).
@@ -2488,22 +2618,29 @@ class TestBL4NoActiveAndOwnerMirrorMock:
     twins are in ``test_acl_write_path_rls.py``)."""
 
     async def test_noactive_a_lapsed_sibling_never_contributes_bits(
-        self, service, user_context
+        self, service, user_context, monkeypatch
     ) -> None:
+        """noactive — the lapsed sibling is seeded through the CLOCK
+        SEAM, 30 MINUTES before "now" (never epoch-1970), so a widened
+        active-clause (e.g. a grace window shorter than ~56 years)
+        would actually leak its SHARE bits."""
         key = dict(
             principal_type="user",
             principal_id="v-bl4-noactive",
             resource_type="agent",
             resource_id="agent-bl4-noactive",
         )
+        t0 = 1_790_000_000_000
+        thirty_min = 30 * 60 * 1000
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
         await _raw_insert(
             service,
             user_sub=user_context.user_id,
             principal_model="User",
             perm_bits=15,
-            expired_at_ms=10,
-            created_at_ms=1,
-            updated_at_ms=10,
+            expired_at_ms=t0 - thirty_min,
+            created_at_ms=t0 - thirty_min - 1,
+            updated_at_ms=t0 - thirty_min,
             **key,
         )
         await _raw_insert(
@@ -2512,8 +2649,8 @@ class TestBL4NoActiveAndOwnerMirrorMock:
             principal_model="User",
             perm_bits=1,
             expired_at_ms=None,
-            created_at_ms=2,
-            updated_at_ms=2,
+            created_at_ms=t0 - 1,
+            updated_at_ms=t0 - 1,
             **key,
         )
         row = await service.modify_permission_bits(user_context, add_bits=2, **key)
@@ -2625,3 +2762,140 @@ class TestBL3MultiPredicateMock:
             "predicate 1's own (created_at_ms, id) order, THEN predicate "
             "2's own (r3 only) — never id-only sorted, never reversed"
         )
+
+
+def _parse_question(question: str) -> dict[str, str]:
+    """SF-1 (ADDENDUM A) — parse a ``_audit._question`` string into its
+    SEVEN fields via the exact regex the addendum names. Mirrors
+    ``tests/test_acl_write_path_rls.py``'s own copy (duplicated, not
+    imported, per this suite's existing no-cross-file-coupling
+    convention)."""
+    m = re.match(
+        r"^op=(\S+) principal=([^:\s]+):(\S+) resource=([^:\s]+):(\S+) "
+        r"bits=(-?\d+) tenant=(\S+)$",
+        question,
+    )
+    assert m is not None, f"question does not match the closed shape: {question!r}"
+    return {
+        "op": m.group(1),
+        "principal_type": m.group(2),
+        "principal_id": m.group(3),
+        "resource_type": m.group(4),
+        "resource_id": m.group(5),
+        "bits": m.group(6),
+        "tenant": m.group(7),
+    }
+
+
+_MP_V = "viewer-sub-0003"
+_MP_P1 = {"principal_id": _MP_V}
+_MP_P2 = {"resource_type": "agent", "resource_id": "agent-1"}
+_MP_P3 = {"principal_type": "public"}
+
+
+class TestMPAToGVerbatimMock:
+    """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3) — closes
+    BL-A on the mock. Same rows/predicates/overlaps/tie/order-inversion
+    as ``tests/test_acl_write_path_rls.py::TestMPAToGVerbatimRealPostgres``."""
+
+    async def test_mp_a_to_g_mock(self, mock_service, client, user_context) -> None:
+        owner_sub = user_context.user_id
+        t0 = 1_790_100_000_000
+        rows = {
+            # id: (principal_type, principal_id, resource_type, resource_id, created_at_ms)
+            "E": ("user", "untouched-principal", "agent", "other-resource-2", t0 + 1),
+            "F": ("user", "untouched-principal-f", "promptGroup", "agent-1", t0 + 2),
+            "D": ("public", None, "agent", "agent-1", t0 + 3),
+            "G": ("user", "aaa-sub-0010", "agent", "agent-1", t0 + 4),
+            "C": ("user", "other-sub-0009", "agent", "agent-1", t0 + 4),
+            "A": ("user", _MP_V, "agent", "agent-1", t0 + 6),
+            "B": ("user", _MP_V, "agent", "other-resource", t0 + 5),
+        }
+        for entry_id, (ptype, pid, rtype, rid, created) in rows.items():
+            await _raw_insert(
+                mock_service,
+                user_sub=owner_sub,
+                principal_type=ptype,
+                principal_id=pid,
+                principal_model="User" if ptype == "user" else None,
+                resource_type=rtype,
+                resource_id=rid,
+                perm_bits=1,
+                created_at_ms=created,
+                updated_at_ms=created,
+                entry_id=entry_id,
+            )
+
+        result = await mock_service.delete_acl_entries(
+            user_context, [_MP_P1, _MP_P2, _MP_P3]
+        )
+
+        assert result["visible_matched_count"] == 5, "distinct over the OR: {A,B,D,C,G}"
+        assert result["expired_ids"] == ["B", "A", "D", "C", "G"]
+
+        e_row = next(e for e in mock_service._entries if e.id == "E")
+        f_row = next(e for e in mock_service._entries if e.id == "F")
+        assert e_row.expired_at_ms is None, "E untouched"
+        assert f_row.expired_at_ms is None, "F untouched (survives P2)"
+
+        # /interactions orders newest-first (routes/audit.py:178,
+        # InteractionRow.id.desc()) — reverse to get predicate order.
+        delete_rows = list(
+            reversed(
+                [
+                    r
+                    for r in _interactions(client)
+                    if r["question"].startswith("op=deleteAclEntries")
+                ]
+            )
+        )
+        assert len(delete_rows) == 3, "one audit row per predicate"
+        answers = [json.loads(r["answer"]) for r in delete_rows]
+        questions = [r["question"] for r in delete_rows]
+
+        assert answers[0]["visible_matched_count"] == 2
+        assert answers[0]["expired_ids"] == ["B", "A"]
+        assert answers[1]["visible_matched_count"] == 4
+        assert answers[1]["expired_ids"] == ["D", "C", "G"]
+        assert answers[2]["visible_matched_count"] == 1
+        assert answers[2]["expired_ids"] == []
+
+        assert questions[0] == (
+            f"op=deleteAclEntries principal=-:{_MP_V} resource=-:- bits=0 tenant=-"
+        )
+        assert questions[1] == (
+            "op=deleteAclEntries principal=-:- resource=agent:agent-1 bits=0 tenant=-"
+        )
+        assert questions[2] == (
+            "op=deleteAclEntries principal=public:- resource=-:- bits=0 tenant=-"
+        )
+        f1 = _parse_question(questions[0])
+        assert f1 == {
+            "op": "deleteAclEntries",
+            "principal_type": "-",
+            "principal_id": _MP_V,
+            "resource_type": "-",
+            "resource_id": "-",
+            "bits": "0",
+            "tenant": "-",
+        }
+        f2 = _parse_question(questions[1])
+        assert f2 == {
+            "op": "deleteAclEntries",
+            "principal_type": "-",
+            "principal_id": "-",
+            "resource_type": "agent",
+            "resource_id": "agent-1",
+            "bits": "0",
+            "tenant": "-",
+        }
+        f3 = _parse_question(questions[2])
+        assert f3 == {
+            "op": "deleteAclEntries",
+            "principal_type": "public",
+            "principal_id": "-",
+            "resource_type": "-",
+            "resource_id": "-",
+            "bits": "0",
+            "tenant": "-",
+        }

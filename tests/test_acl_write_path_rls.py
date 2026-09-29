@@ -2553,6 +2553,27 @@ class TestP3RevokeOnSoftDeletedResourceSFA:
             assert denial_rows[0]["question"].endswith("tenant=t1"), denial_rows[0][
                 "question"
             ]
+            # W5-t (ADDENDUM A) — the full field parse (SF-1/W-Q,
+            # additive beside the full-string check above), plus
+            # error_detail.predicate_or_attempted_row == attempted.
+            fields = _parse_question(denial_rows[0]["question"])
+            assert fields == {
+                "op": "revokePermission",
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "bits": "0",
+                "tenant": "t1",
+            }
+            error_detail = json.loads(denial_rows[0]["error_detail"])
+            assert error_detail["predicate_or_attempted_row"] == {
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "tenant_id": "t1",
+            }
         finally:
             admin.dispose()
 
@@ -2722,6 +2743,30 @@ class TestSFCAuditFailureOnKselTKey:
             assert denial_rows[0]["question"].endswith("tenant=t1"), denial_rows[0][
                 "question"
             ]
+            # W6-f (ADDENDUM A) — the full field parse, db_error_class
+            # == type(the patched exception).__name__ (SF-5), and
+            # predicate_or_attempted_row == the call's own attempted.
+            fields = _parse_question(denial_rows[0]["question"])
+            assert fields == {
+                "op": "modifyPermissionBits",
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "bits": "7",  # new_bits = old_bits(7) | add_bits(1) == 7
+                "tenant": "t1",
+            }
+            error_detail = json.loads(denial_rows[0]["error_detail"])
+            assert error_detail["db_error_class"] == "RuntimeError"
+            assert error_detail["predicate_or_attempted_row"] == {
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "tenant_id": "t1",
+                "add_bits": 1,
+                "remove_bits": None,
+            }
         finally:
             admin.dispose()
 
@@ -2793,12 +2838,16 @@ class TestSFBExplainCapture:
 # in tests/test_console_acl_write_path.py.
 # ═══════════════════════════════════════════════════════════════════════
 
+import re  # noqa: E402
+
 from opentelemetry import trace  # noqa: E402
 from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E402
     InMemorySpanExporter,
 )
+
+from audittrace.services.console_store import _context as _clock_module  # noqa: E402
 
 
 def _seed_agent(write_harness: Any, agent_id: str) -> None:
@@ -2821,6 +2870,53 @@ def _seed_agent(write_harness: Any, agent_id: str) -> None:
             )
     finally:
         admin.dispose()
+
+
+def _seed_prompt_group(write_harness: Any, group_id: str) -> None:
+    """Owner-owned prompt group, raw admin insert — v4's MP scenario
+    needs a ``promptGroup``-typed resource sharing the STRING
+    ``resource_id`` an ``agent`` row also uses (row F: ``promptGroup``/
+    ``agent-1``), a different namespace entirely from the agent."""
+    admin = _admin_engine()
+    try:
+        groups = Base.metadata.tables["console_prompt_groups"]
+        with admin.begin() as conn:
+            conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+            conn.execute(
+                insert(groups).values(
+                    id=f"group-row-{group_id}",
+                    group_id=group_id,
+                    user_sub=_OWNER,
+                    name=group_id,
+                    created_at_ms=0,
+                    updated_at_ms=0,
+                )
+            )
+    finally:
+        admin.dispose()
+
+
+def _parse_question(question: str) -> dict[str, str]:
+    """SF-1 (ADDENDUM A) — parse a ``_audit._question`` string into its
+    SEVEN fields via the exact regex the addendum names, so a caller
+    can assert each one separately rather than one six-value full-
+    string equality. A ``None``/absent value renders as the literal
+    ``-`` (``_audit.py``'s own rendering, never re-typed here)."""
+    m = re.match(
+        r"^op=(\S+) principal=([^:\s]+):(\S+) resource=([^:\s]+):(\S+) "
+        r"bits=(-?\d+) tenant=(\S+)$",
+        question,
+    )
+    assert m is not None, f"question does not match the closed shape: {question!r}"
+    return {
+        "op": m.group(1),
+        "principal_type": m.group(2),
+        "principal_id": m.group(3),
+        "resource_type": m.group(4),
+        "resource_id": m.group(5),
+        "bits": m.group(6),
+        "tenant": m.group(7),
+    }
 
 
 class TestBL1ModifyInsertRefusalIsPolicyDenial:
@@ -2939,6 +3035,21 @@ class TestBL2TenantRenderedOnSuccessAuditRows:
         assert revoke_rows[0]["question"].endswith("tenant=t1"), revoke_rows[0][
             "question"
         ]
+        # W2 (ADDENDUM A, W-Q) — per-field parse, additive (SF-2).
+        fields = _parse_question(revoke_rows[0]["question"])
+        assert fields == {
+            "op": "revokePermission",
+            "principal_type": "user",
+            "principal_id": _VIEWER,
+            "resource_type": "agent",
+            "resource_id": "agent-1",
+            "bits": "0",
+            "tenant": "t1",
+        }
+        answer = json.loads(revoke_rows[0]["answer"])
+        assert answer["acl_entry_ids"] == []
+        assert answer["visible_matched_count"] == 1
+        assert answer["expired_at_ms"] is None
 
     async def test_modify_success_audit_row_ends_tenant_t1(
         self, write_harness: Any, sp_pin: Any
@@ -2978,6 +3089,20 @@ class TestBL2TenantRenderedOnSuccessAuditRows:
         assert modify_rows[0]["question"].endswith("tenant=t1"), modify_rows[0][
             "question"
         ]
+        fields = _parse_question(modify_rows[0]["question"])
+        assert fields == {
+            "op": "modifyPermissionBits",
+            "principal_type": "user",
+            "principal_id": _VIEWER,
+            "resource_type": "agent",
+            "resource_id": "agent-1",
+            "bits": "3",  # (1 | 2) & ~0
+            "tenant": "t1",
+        }
+        answer = json.loads(modify_rows[0]["answer"])
+        assert answer["acl_entry_ids"] == [row["id"]]
+        assert answer["visible_matched_count"] == 1
+        assert answer["expired_at_ms"] is None
 
     async def test_delete_success_audit_row_ends_tenant_t1(
         self, write_harness: Any, sp_pin: Any
@@ -3193,6 +3318,237 @@ class TestBL3PlanIndependentTieRealPostgres:
         assert result["expired_ids"] == ["aaa-tie", "zzz-tie"]
 
 
+_MP_V = "viewer-sub-0003"
+_MP_P1 = {"principal_id": _MP_V}
+_MP_P2 = {"resource_type": "agent", "resource_id": "agent-1"}
+_MP_P3 = {"principal_type": "public"}
+
+
+async def _seed_mp_a_to_g(write_harness: Any) -> None:
+    """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3) — same
+    rows (A-G), same predicates (P1/P2/P3), same overlaps (A in
+    P1∩P2, D in P2∩P3), same tie (C/G at the identical created_at_ms,
+    C's id sorting before G's), same insertion-order-vs-created_at_ms-
+    order inversion (B created BEFORE A but INSERTED after it — B@T0+5
+    inserted before A@T0+6 in v4's own text; row ids used here in place
+    of v4's re-rolled uuids, since explicit ids make the tie/sort
+    deterministic without a re-roll loop — the BEHAVIOURAL properties
+    (tie, overlap, order-inversion) are v4's, not the id-generation
+    mechanism)."""
+    _seed_agent(write_harness, "other-resource")
+    _seed_agent(write_harness, "other-resource-2")
+    _seed_prompt_group(write_harness, "agent-1")
+    t0 = 1_790_000_000_000
+    # E — matches NONE.
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="E",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id="untouched-principal",
+        principal_model="User",
+        resource_type="agent",
+        resource_id="other-resource-2",
+        perm_bits=1,
+        created_at_ms=t0 + 1,
+        updated_at_ms=t0 + 1,
+    )
+    # F — promptGroup/agent-1: must survive P2 (resource_type mismatch).
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="F",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id="untouched-principal-f",
+        principal_model="User",
+        resource_type="promptGroup",
+        resource_id="agent-1",
+        perm_bits=1,
+        created_at_ms=t0 + 2,
+        updated_at_ms=t0 + 2,
+    )
+    # D — public, agent/agent-1: D in P2 ∩ P3.
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="D",
+        user_sub=_OWNER,
+        principal_type="public",
+        principal_id=None,
+        principal_model=None,
+        resource_type="agent",
+        resource_id="agent-1",
+        perm_bits=1,
+        created_at_ms=t0 + 3,
+        updated_at_ms=t0 + 3,
+    )
+    # C, G — the created_at_ms TIE at P2's key; id "C" < "G" lexically,
+    # so the CORRECT (created_at_ms, id) sort yields C before G, never
+    # the raw RETURNING/insertion order (G inserted first, mirroring
+    # v4's own construction).
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="G",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id="aaa-sub-0010",
+        principal_model="User",
+        resource_type="agent",
+        resource_id="agent-1",
+        perm_bits=1,
+        created_at_ms=t0 + 4,
+        updated_at_ms=t0 + 4,
+    )
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="C",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id="other-sub-0009",
+        principal_model="User",
+        resource_type="agent",
+        resource_id="agent-1",
+        perm_bits=1,
+        created_at_ms=t0 + 4,
+        updated_at_ms=t0 + 4,
+    )
+    # A, B — A in P1 ∩ P2; B in P1 only. A created AFTER B (T0+6 vs
+    # T0+5) but INSERTED before it here — insertion order != creation
+    # order, so `unsorted`/`globalsort` cannot hide behind coincidence.
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="A",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id=_MP_V,
+        principal_model="User",
+        resource_type="agent",
+        resource_id="agent-1",
+        perm_bits=1,
+        created_at_ms=t0 + 6,
+        updated_at_ms=t0 + 6,
+    )
+    await _insert_grant_full(
+        write_harness.factory,
+        as_user=_OWNER,
+        row_id="B",
+        user_sub=_OWNER,
+        principal_type="user",
+        principal_id=_MP_V,
+        principal_model="User",
+        resource_type="agent",
+        resource_id="other-resource",
+        perm_bits=1,
+        created_at_ms=t0 + 5,
+        updated_at_ms=t0 + 5,
+    )
+
+
+class TestMPAToGVerbatimRealPostgres:
+    """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3) — closes
+    BL-A. A REDUCED scenario (2 predicates, predicate order == creation
+    order) let ``globalsort`` coincide with the correct answer; this
+    3-predicate, 7-row, tied, order-inverted construction cannot."""
+
+    async def test_mp_a_to_g_real_postgres(
+        self, write_harness: Any, sp_pin: Any
+    ) -> None:
+        owner = _new_user_context(_OWNER)
+        await _seed_mp_a_to_g(write_harness)
+
+        set_current_user_id(owner.user_id)
+        try:
+            result = await write_harness.service.delete_acl_entries(
+                owner, [_MP_P1, _MP_P2, _MP_P3]
+            )
+        finally:
+            set_current_user_id(None)
+
+        assert result["visible_matched_count"] == 5, "distinct over the OR: {A,B,D,C,G}"
+        assert result["expired_ids"] == ["B", "A", "D", "C", "G"]
+
+        admin = _admin_engine()
+        try:
+            # NOT _interactions_rows (its LIKE %:<resource_id>% filter
+            # would miss P1's and P3's rows — neither predicate names a
+            # resource_id at all, so their question renders "-:-").
+            with admin.begin() as conn:
+                conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
+                rows = [
+                    dict(r)
+                    for r in conn.execute(
+                        text(
+                            "SELECT status, failure_class, answer, question "
+                            "FROM interactions WHERE question LIKE 'op=deleteAclEntries%' "
+                            "ORDER BY id"
+                        )
+                    )
+                    .mappings()
+                    .all()
+                ]
+            e_pair = await _acl_row_pair(admin, write_harness.schema, "E")
+            f_pair = await _acl_row_pair(admin, write_harness.schema, "F")
+        finally:
+            admin.dispose()
+        assert e_pair[0] is None, "E untouched"
+        assert f_pair[0] is None, "F untouched (survives P2 — resource_type mismatch)"
+
+        delete_rows = [
+            r for r in rows if r["question"].startswith("op=deleteAclEntries")
+        ]
+        assert len(delete_rows) == 3, "one audit row per predicate"
+        answers = [json.loads(r["answer"]) for r in delete_rows]
+        questions = [r["question"] for r in delete_rows]
+
+        assert answers[0]["visible_matched_count"] == 2
+        assert answers[0]["expired_ids"] == ["B", "A"]
+        assert answers[1]["visible_matched_count"] == 4
+        assert answers[1]["expired_ids"] == ["D", "C", "G"]
+        assert answers[2]["visible_matched_count"] == 1
+        assert answers[2]["expired_ids"] == []
+
+        # v4's own full-string equalities (SF-2 — kept, not replaced) ...
+        assert questions[0] == (
+            f"op=deleteAclEntries principal=-:{_MP_V} resource=-:- bits=0 tenant=-"
+        )
+        assert questions[1] == (
+            "op=deleteAclEntries principal=-:- resource=agent:agent-1 bits=0 tenant=-"
+        )
+        assert questions[2] == (
+            "op=deleteAclEntries principal=public:- resource=-:- bits=0 tenant=-"
+        )
+        # ... PLUS the per-field parse (W-Q, ADDENDUM A, additive).
+        f1 = _parse_question(questions[0])
+        assert f1["op"] == "deleteAclEntries"
+        assert f1["principal_type"] == "-"
+        assert f1["principal_id"] == _MP_V
+        assert f1["resource_type"] == "-"
+        assert f1["resource_id"] == "-"
+        assert f1["bits"] == "0"
+        assert f1["tenant"] == "-"
+        f2 = _parse_question(questions[1])
+        assert f2["op"] == "deleteAclEntries"
+        assert f2["principal_type"] == "-"
+        assert f2["principal_id"] == "-"
+        assert f2["resource_type"] == "agent"
+        assert f2["resource_id"] == "agent-1"
+        assert f2["bits"] == "0"
+        assert f2["tenant"] == "-"
+        f3 = _parse_question(questions[2])
+        assert f3["op"] == "deleteAclEntries"
+        assert f3["principal_type"] == "public"
+        assert f3["principal_id"] == "-"
+        assert f3["resource_type"] == "-"
+        assert f3["resource_id"] == "-"
+        assert f3["bits"] == "0"
+        assert f3["tenant"] == "-"
+
+
 class TestBL4RemainingGuards:
     """BL-4 — noactive (modify's ``_active_rows`` without
     ``_active_clause``), E-A on revoke (count from RETURNING instead
@@ -3201,8 +3557,14 @@ class TestBL4RemainingGuards:
     denial row."""
 
     async def test_noactive_a_lapsed_sibling_never_contributes_bits(
-        self, write_harness: Any, sp_pin: Any
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """noactive — the lapsed sibling is seeded through the CLOCK
+        SEAM, 30 MINUTES before "now" (never epoch-1970), so a widened
+        ``_active_clause`` (e.g. a grace window shorter than ~56 years)
+        would actually leak its SHARE bits — a 1970 timestamp cannot
+        distinguish a correct ``_active_rows`` from one with a grace
+        period, since no realistic grace window is that wide."""
         owner = _new_user_context(_OWNER)
         key = dict(
             principal_type="user",
@@ -3210,7 +3572,9 @@ class TestBL4RemainingGuards:
             resource_type="agent",
             resource_id="agent-1",
         )
-        # A LAPSED row at the SAME key (expired_at_ms in the past) —
+        t0 = 1_790_000_000_000
+        thirty_min = 30 * 60 * 1000
+        # A LAPSED row at the SAME key, expired 30 minutes before "now" —
         # _active_rows must NOT read its bits into old_bits.
         await _insert_grant_full(
             write_harness.factory,
@@ -3219,9 +3583,9 @@ class TestBL4RemainingGuards:
             user_sub=_OWNER,
             principal_model="User",
             perm_bits=15,
-            expired_at_ms=10,
-            created_at_ms=1,
-            updated_at_ms=10,
+            expired_at_ms=t0 - thirty_min,
+            created_at_ms=t0 - thirty_min - 1,
+            updated_at_ms=t0 - thirty_min,
             **key,
         )
         await _insert_grant_full(
@@ -3232,10 +3596,11 @@ class TestBL4RemainingGuards:
             principal_model="User",
             perm_bits=1,
             expired_at_ms=None,
-            created_at_ms=2,
-            updated_at_ms=2,
+            created_at_ms=t0 - 1,
+            updated_at_ms=t0 - 1,
             **key,
         )
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
         set_current_user_id(owner.user_id)
         try:
             row = await write_harness.service.modify_permission_bits(
@@ -3300,11 +3665,16 @@ class TestBL4RemainingGuards:
         assert b_pair[0] is None
 
     async def test_w1_trace_id_and_stamps_on_modify_insert(
-        self, write_harness: Any, sp_pin: Any
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Guard T + 7.0 — modify's NEW row carries the REAL trace_id
-        of the active span, and REAL ``created_at_ms``/``granted_at_ms``
-        (``stamp.now_ms``), never ``None``/``0``."""
+        """Guard T + 7.0/X2/X2b/BL-C — modify's NEW row carries the REAL
+        trace_id of the active span, and its ``created_at_ms``/
+        ``granted_at_ms``/``updated_at_ms`` are the CURRENT stamp —
+        never ``None``/``0`` and, more precisely, never INHERITED from
+        the superseded row: the clock is frozen at a DIFFERENT,
+        well-separated value for the grant vs. the modify, so a bug
+        that copied the old row's ``created_at_ms`` cannot hide behind
+        two nearly-identical real-wall-clock reads."""
         owner = _new_user_context(_OWNER)
         key = dict(
             principal_type="user",
@@ -3312,13 +3682,17 @@ class TestBL4RemainingGuards:
             resource_type="agent",
             resource_id="agent-1",
         )
+        t0 = 1_790_000_000_000
+        t1 = 1_790_000_500_000
         provider = TracerProvider()
         exporter = InMemorySpanExporter()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
         tracer = provider.get_tracer("test")
         set_current_user_id(owner.user_id)
         try:
+            monkeypatch.setattr(_clock_module, "now_ms", lambda: t0)
             await write_harness.service.grant_permission(owner, perm_bits=1, **key)
+            monkeypatch.setattr(_clock_module, "now_ms", lambda: t1)
             with tracer.start_as_current_span("modify"):
                 span = trace.get_current_span()
                 trace_id_hex = format(span.get_span_context().trace_id, "032x")
@@ -3330,15 +3704,16 @@ class TestBL4RemainingGuards:
         assert row is not None
         assert len(trace_id_hex) == 32
         assert row["trace_id"] == trace_id_hex
-        assert row["created_at_ms"] > 0
-        assert row["granted_at_ms"] > 0
+        assert row["created_at_ms"] == t1, "X2/BL-C — never inherited from the old row"
+        assert row["granted_at_ms"] == t1, "X2b"
+        assert row["updated_at_ms"] == t1
         admin = _admin_engine()
         try:
             with admin.begin() as conn:
                 conn.execute(text(f'SET search_path TO "{write_harness.schema}"'))
                 db_row = conn.execute(
                     text(
-                        "SELECT trace_id, created_at_ms, granted_at_ms "
+                        "SELECT trace_id, created_at_ms, granted_at_ms, updated_at_ms "
                         "FROM console_acl_entries WHERE id = :id"
                     ),
                     {"id": row["id"]},
@@ -3346,15 +3721,18 @@ class TestBL4RemainingGuards:
         finally:
             admin.dispose()
         assert db_row[0] == trace_id_hex
-        assert db_row[1] > 0
-        assert db_row[2] > 0
+        assert db_row[1] == t1
+        assert db_row[2] == t1
+        assert db_row[3] == t1
 
     async def test_w5_modify_denial_row_carries_tenant(
         self, write_harness: Any, sp_pin: Any
     ) -> None:
-        """W5 — modify's OWN domain-level refusal (a soft-deleted
-        resource, mirroring P-3) must carry the caller's tenant on the
-        denial row, not ``-``."""
+        """W5-t (ADDENDUM A) — modify's OWN domain-level refusal (a
+        soft-deleted resource, mirroring P-3) must carry the caller's
+        tenant on the denial row, not ``-``, AND ``bits=new_bits``
+        (SF-4: seeding 7, ``remove_bits=4`` gives ``new_bits=3``) —
+        never the seeded bits or 0."""
         owner = _new_user_context(_OWNER)
         key = dict(
             principal_type="user",
@@ -3365,7 +3743,7 @@ class TestBL4RemainingGuards:
         )
         set_current_user_id(owner.user_id)
         try:
-            await write_harness.service.grant_permission(owner, perm_bits=1, **key)
+            await write_harness.service.grant_permission(owner, perm_bits=7, **key)
         finally:
             set_current_user_id(None)
 
@@ -3384,7 +3762,7 @@ class TestBL4RemainingGuards:
             try:
                 with pytest.raises(AclWriteRefused):
                     await write_harness.service.modify_permission_bits(
-                        owner, add_bits=2, **key
+                        owner, remove_bits=4, **key
                     )
             finally:
                 set_current_user_id(None)
@@ -3402,5 +3780,25 @@ class TestBL4RemainingGuards:
             assert denial_rows[0]["question"].endswith("tenant=t1"), denial_rows[0][
                 "question"
             ]
+            fields = _parse_question(denial_rows[0]["question"])
+            assert fields == {
+                "op": "modifyPermissionBits",
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "bits": "3",
+                "tenant": "t1",
+            }
+            error_detail = json.loads(denial_rows[0]["error_detail"])
+            assert error_detail["predicate_or_attempted_row"] == {
+                "principal_type": "user",
+                "principal_id": _VIEWER,
+                "resource_type": "agent",
+                "resource_id": "agent-1",
+                "tenant_id": "t1",
+                "add_bits": None,
+                "remove_bits": 4,
+            }
         finally:
             admin.dispose()

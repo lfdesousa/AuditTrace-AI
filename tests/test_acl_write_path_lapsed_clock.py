@@ -539,23 +539,26 @@ _A2_SITES = ["revoke", "modify", "delete"]
 
 async def _site_a2(
     service: Any, ctx: UserContext, site: str, key: dict[str, Any]
-) -> list[str] | None:
-    """Perform A2's W3 at ``key``. Returns the expired ids the method
-    reports directly for revoke/delete; ``None`` for modify (whose
-    return is the NEW row or ``None``, never the expired ids) — the
-    grid reads R2's post-W3 state from the EMITTED rows regardless
-    (S-c discipline, same as A1's ``ids_w2``/``ids_w3``)."""
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Perform A2's W3 at ``key``. Returns ``(expired_ids, modify_row)``
+    — ``expired_ids`` is the method's own reported list for revoke/
+    delete, ``None`` for modify; ``modify_row`` is modify's OWN
+    returned row (BL-B/X2/X2b — never discarded: v4 §7.0's lapsed-cell
+    check reads it directly, not only the emitted table rows) and
+    ``None`` for revoke/delete. The grid ALSO reads R2's post-W3 state
+    from the EMITTED rows regardless (S-c discipline, same as A1's
+    ``ids_w2``/``ids_w3``)."""
     if site == "revoke":
         result = await service.revoke_permission(ctx, **key)
-        return list(result["expired_ids"])
+        return list(result["expired_ids"]), None
     if site == "modify":
-        await service.modify_permission_bits(ctx, remove_bits=4, **key)
-        return None
+        row = await service.modify_permission_bits(ctx, remove_bits=4, **key)
+        return None, row
     assert site == "delete"
     predicate = dict(key)
     predicate.setdefault("principal_type", PRINCIPAL_TYPE_USER)
     result = await service.delete_acl_entries(ctx, [predicate])
-    return list(result["expired_ids"])
+    return list(result["expired_ids"]), None
 
 
 async def _run_a2_cell(
@@ -592,7 +595,7 @@ async def _run_a2_cell(
         after_w2 = rows[r1_id][1:3]
 
         clock["t"] = s2 + 1
-        ids_w3 = await _site_a2(service, ctx, site, _KEY)
+        ids_w3, modify_row = await _site_a2(service, ctx, site, _KEY)
         rows = await read()
         s3 = rows[r2_id][1]
         after_w3 = rows[r1_id][1:3]
@@ -609,6 +612,22 @@ async def _run_a2_cell(
         f"(want {gap}) lifetime_written={lifetime_written} (want {lifetime}) "
         f"s3-s2={s3 - s2} (want 1)"
     )
+
+    if site == "modify":
+        # BL-B/X2/X2b — never discard modify's own returned row: at
+        # W3's clock, R2 (bits=7, NULL expiry) is the SOLE active row
+        # (R1 has already lapsed or been superseded by W2), so
+        # new_bits = (7 | 0) & ~4 == 3 — a widened active-clause (a
+        # grace period) would OR R1's stale bits=15 back in, giving 15.
+        assert modify_row is not None
+        assert modify_row["created_at_ms"] == s3, (
+            "RED — modify's new row must be stamped at W3's clock, "
+            "never inherited from the superseded row"
+        )
+        assert modify_row["perm_bits"] == 3, (
+            "RED — old_bits leaked a lapsed/stale row's SHARE bit(s)"
+        )
+        assert modify_row["expired_at_ms"] is None
 
     if gap >= 0:
         # Lapsed: R1 has already lapsed before W2 runs, and must stay
