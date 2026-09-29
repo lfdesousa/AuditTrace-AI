@@ -25,6 +25,7 @@ import dataclasses
 import json
 import time
 import uuid
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -1261,6 +1262,7 @@ async def _raw_insert(
     perm_bits: int,
     tenant_id: str | None = None,
     role_id: str | None = None,
+    inherited_from: str | None = None,
     granted_by: str | None = None,
     granted_at_ms: int = 0,
     expired_at_ms: int | None = None,
@@ -1275,7 +1277,12 @@ async def _raw_insert(
     construct). Mirrors ``tests/test_acl_write_path_rls.py``'s own "raw
     INSERT bypassing the service" precedent. ``entry_id``, when given,
     pins the row's id (S-a's ordering test needs to control id ASCII
-    order independently of insertion order)."""
+    order independently of insertion order). ``inherited_from``, when
+    given, makes the seeded row itself look like a PRIOR inheritance —
+    A2 fix-3 BL-1: without this, a captured row seeded through this
+    helper always reads ``inherited_from=None``, so a bug that COPIES
+    it onto modify's new row is indistinguishable from correct code
+    that always writes ``None`` (a vacuous neuter)."""
     if isinstance(service, MockConsoleAclEntriesService):
         row = service.seed_entry(
             user_sub=user_sub,
@@ -1287,6 +1294,7 @@ async def _raw_insert(
             perm_bits=perm_bits,
             tenant_id=tenant_id,
             role_id=role_id,
+            inherited_from=inherited_from,
             granted_by=granted_by,
             granted_at_ms=granted_at_ms,
             expired_at_ms=expired_at_ms,
@@ -1313,6 +1321,7 @@ async def _raw_insert(
                 perm_bits=perm_bits,
                 tenant_id=tenant_id,
                 role_id=role_id,
+                inherited_from=inherited_from,
                 granted_by=granted_by,
                 granted_at_ms=granted_at_ms,
                 expired_at_ms=expired_at_ms,
@@ -1341,6 +1350,26 @@ async def _row_pair(
         )
         row = result.one()
         return (row[0], row[1])
+
+
+async def _fresh_inherited_from(
+    service: ConsoleAclEntriesService, row_id: str
+) -> str | None:
+    """``inherited_from`` for a SPECIFIC row, read from a FRESH lookup
+    (a brand-new PG session on postgres; a fresh scan of
+    ``service._entries`` on mock) — never the dict a prior call
+    already returned. A2 fix-3 BL-1's own fresh-session read."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = next(e for e in service._entries if e.id == row_id)
+        return row.inherited_from
+    pg = dependencies.get_postgres_factory()
+    async with pg.get_session_factory()() as db:
+        result = await db.execute(
+            sa.select(ConsoleAclEntry.inherited_from).where(
+                ConsoleAclEntry.id == row_id
+            )
+        )
+        return result.scalar_one()
 
 
 # ── VAL — §3's pre-I/O ValueError shapes, no I/O, no audit row ──────────
@@ -2317,6 +2346,13 @@ class TestKeySelectivity:
             perm_bits=7,
             role_id="r1",
             expired_at_ms=1_790_003_600_001,
+            # A2 fix-3 BL-1 — M itself looks like a PRIOR inheritance.
+            # Without this, M.inherited_from is always None (the
+            # helper's own default), so a bug that COPIES it onto
+            # modify's new row is indistinguishable from correct code:
+            # both read None. N3a/N3am (the reviewer's own neuter) only
+            # turns RED once M carries a real, non-None value.
+            inherited_from="parent-x",
             **key,
         )
         null_sibling_id = await _raw_insert(
@@ -2353,6 +2389,15 @@ class TestKeySelectivity:
         assert row["granted_at_ms"] == 1_790_000_000_000
         assert row["updated_at_ms"] == 1_790_000_000_000
         assert row["inherited_from"] is None
+        # BL-1 (A2 fix-3) — the SAME field, re-read from a FRESH lookup
+        # (a brand-new PG session; a fresh mock scan), never the dict
+        # `modify_permission_bits` already returned. M itself carries
+        # `inherited_from="parent-x"` (seeded above): a bug that copies
+        # it onto the new row would leave the RETURNED dict wrong too,
+        # but this closes the (admittedly redundant, intentionally so)
+        # gap where a future refactor returns a stale/cached dict while
+        # the actually-written row is correct, or vice versa.
+        assert await _fresh_inherited_from(service, row["id"]) is None
         assert await _row_pair(service, null_sibling_id) == null_sibling_before
 
         # W3 insert branch (ADDENDUM A) — the SAME per-field parse on
@@ -2798,43 +2843,103 @@ class TestMPAToGVerbatimMock:
     BL-A on the mock. Same rows/predicates/overlaps/tie/order-inversion
     as ``tests/test_acl_write_path_rls.py::TestMPAToGVerbatimRealPostgres``."""
 
-    async def test_mp_a_to_g_mock(self, mock_service, client, user_context) -> None:
-        owner_sub = user_context.user_id
+    async def test_mp_a_to_g_mock(
+        self, mock_service, client, user_context, monkeypatch
+    ) -> None:
+        """v4 §7.3's rows, seeded through the CLOCK SEAM via the real
+        ``grant_permission`` write path (A2 fix-3 BL-4) — never a raw
+        INSERT, never a fixed/literal id. v4's own RE-ROLL mechanism:
+        ``grant_permission``'s O-6 expire-and-insert mints a FRESH
+        ``uuid4`` on every call at the same key, so re-granting at G's
+        (respectively B's) key until the newly-minted id satisfies the
+        spec's ordering precondition reproduces v4's own re-roll."""
         t0 = 1_790_100_000_000
-        rows = {
-            # id: (principal_type, principal_id, resource_type, resource_id, created_at_ms)
-            "E": ("user", "untouched-principal", "agent", "other-resource-2", t0 + 1),
-            "F": ("user", "untouched-principal-f", "promptGroup", "agent-1", t0 + 2),
-            "D": ("public", None, "agent", "agent-1", t0 + 3),
-            "G": ("user", "aaa-sub-0010", "agent", "agent-1", t0 + 4),
-            "C": ("user", "other-sub-0009", "agent", "agent-1", t0 + 4),
-            "A": ("user", _MP_V, "agent", "agent-1", t0 + 6),
-            "B": ("user", _MP_V, "agent", "other-resource", t0 + 5),
-        }
-        for entry_id, (ptype, pid, rtype, rid, created) in rows.items():
-            await _raw_insert(
-                mock_service,
-                user_sub=owner_sub,
-                principal_type=ptype,
-                principal_id=pid,
-                principal_model="User" if ptype == "user" else None,
-                resource_type=rtype,
-                resource_id=rid,
-                perm_bits=1,
-                created_at_ms=created,
-                updated_at_ms=created,
-                entry_id=entry_id,
+
+        async def _grant_at(clock_ms: int, **key: Any) -> str:
+            monkeypatch.setattr(_clock_module, "now_ms", lambda: clock_ms)
+            row = await mock_service.grant_permission(user_context, perm_bits=1, **key)
+            return str(row["id"])
+
+        async def _grant_until(
+            clock_ms: int, key: dict[str, Any], condition: Any
+        ) -> str:
+            for _ in range(64):
+                new_id = await _grant_at(clock_ms, **key)
+                if condition(new_id):
+                    return new_id
+            raise AssertionError(
+                "v4 §7.3's uuid ordering precondition not reached after 64 re-rolls"
             )
+
+        ids: dict[str, str] = {}
+        ids["E"] = await _grant_at(
+            t0 + 1,
+            principal_type="user",
+            principal_id="untouched-principal",
+            resource_type="agent",
+            resource_id="other-resource-2",
+        )
+        ids["F"] = await _grant_at(
+            t0 + 2,
+            principal_type="user",
+            principal_id="untouched-principal-f",
+            resource_type="promptGroup",
+            resource_id="agent-1",
+        )
+        ids["D"] = await _grant_at(
+            t0 + 3,
+            principal_type="public",
+            principal_id=None,
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        g_key = dict(
+            principal_type="user",
+            principal_id="aaa-sub-0010",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        c_key = dict(
+            principal_type="user",
+            principal_id="other-sub-0009",
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        ids["G"] = await _grant_at(t0 + 4, **g_key)
+        ids["C"] = await _grant_until(t0 + 4, c_key, lambda cid: cid < ids["G"])
+        a_key = dict(
+            principal_type="user",
+            principal_id=_MP_V,
+            resource_type="agent",
+            resource_id="agent-1",
+        )
+        b_key = dict(
+            principal_type="user",
+            principal_id=_MP_V,
+            resource_type="agent",
+            resource_id="other-resource",
+        )
+        ids["A"] = await _grant_at(t0 + 6, **a_key)
+        ids["B"] = await _grant_until(t0 + 5, b_key, lambda bid: ids["A"] < bid)
+
+        assert ids["A"] < ids["B"], "v4 §7.3's own uuid precondition"
+        assert ids["C"] < ids["G"], "v4 §7.3's own uuid precondition"
 
         result = await mock_service.delete_acl_entries(
             user_context, [_MP_P1, _MP_P2, _MP_P3]
         )
 
         assert result["visible_matched_count"] == 5, "distinct over the OR: {A,B,D,C,G}"
-        assert result["expired_ids"] == ["B", "A", "D", "C", "G"]
+        assert result["expired_ids"] == [
+            ids["B"],
+            ids["A"],
+            ids["D"],
+            ids["C"],
+            ids["G"],
+        ]
 
-        e_row = next(e for e in mock_service._entries if e.id == "E")
-        f_row = next(e for e in mock_service._entries if e.id == "F")
+        e_row = next(e for e in mock_service._entries if e.id == ids["E"])
+        f_row = next(e for e in mock_service._entries if e.id == ids["F"])
         assert e_row.expired_at_ms is None, "E untouched"
         assert f_row.expired_at_ms is None, "F untouched (survives P2)"
 
@@ -2854,9 +2959,9 @@ class TestMPAToGVerbatimMock:
         questions = [r["question"] for r in delete_rows]
 
         assert answers[0]["visible_matched_count"] == 2
-        assert answers[0]["expired_ids"] == ["B", "A"]
+        assert answers[0]["expired_ids"] == [ids["B"], ids["A"]]
         assert answers[1]["visible_matched_count"] == 4
-        assert answers[1]["expired_ids"] == ["D", "C", "G"]
+        assert answers[1]["expired_ids"] == [ids["D"], ids["C"], ids["G"]]
         assert answers[2]["visible_matched_count"] == 1
         assert answers[2]["expired_ids"] == []
 

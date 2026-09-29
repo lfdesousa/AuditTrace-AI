@@ -2669,7 +2669,15 @@ class TestDA24RollbackAtPredicateI:
             assert len(denial_rows) == 1
             error_detail = json.loads(denial_rows[0]["error_detail"])
             attempted = error_detail["predicate_or_attempted_row"]
-            assert attempted["predicate_index"] == 1
+            # BL-2 (A2 fix-3, ADDENDUM-A A-2 W5) — full dict equality:
+            # `predicate_index` alone let `predicate` (the refused
+            # predicate itself) and `predicate_count` (the batch size)
+            # silently drop from the audit record and still read GREEN.
+            assert attempted == {
+                "predicate_index": 1,
+                "predicate": {"principal_id": "p-d4r-2", "resource_id": "agent-3"},
+                "predicate_count": 3,
+            }
         finally:
             admin.dispose()
 
@@ -3324,129 +3332,115 @@ _MP_P2 = {"resource_type": "agent", "resource_id": "agent-1"}
 _MP_P3 = {"principal_type": "public"}
 
 
-async def _seed_mp_a_to_g(write_harness: Any) -> None:
-    """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3) — same
-    rows (A-G), same predicates (P1/P2/P3), same overlaps (A in
-    P1∩P2, D in P2∩P3), same tie (C/G at the identical created_at_ms,
-    C's id sorting before G's), same insertion-order-vs-created_at_ms-
-    order inversion (B created BEFORE A but INSERTED after it — B@T0+5
-    inserted before A@T0+6 in v4's own text; row ids used here in place
-    of v4's re-rolled uuids, since explicit ids make the tie/sort
-    deterministic without a re-roll loop — the BEHAVIOURAL properties
-    (tie, overlap, order-inversion) are v4's, not the id-generation
-    mechanism)."""
+async def _seed_mp_a_to_g(
+    write_harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
+    """v4 §7.3's MP scenario, built VERBATIM (ADDENDUM A §A-3, A2 fix-3
+    BL-4) — same rows (A-G), same predicates (P1/P2/P3), same overlaps
+    (A in P1∩P2, D in P2∩P3), same created_at_ms TIE (C/G), same
+    insertion-order-vs-created_at_ms-order inversion (B created BEFORE
+    A but INSERTED after it). Seeded through the CLOCK SEAM via the
+    real ``grant_permission`` write path (never a raw INSERT) — every
+    row's uuid is the one the service itself mints. v4's own RE-ROLL
+    mechanism: ``grant_permission``'s O-6 expire-and-insert mints a
+    FRESH ``uuid4`` on every call at the same key, so re-granting at
+    G's (respectively B's) key until the newly-minted id satisfies the
+    spec's ordering precondition reproduces v4's own re-roll (PG
+    measured 0-7 re-rolls, mock 0-8, per run) — never a fixed/literal
+    id substituted for it. Returns ``{letter: real_id}``; the caller
+    asserts v4's own precondition, ``uuid(A) < uuid(B)`` and
+    ``uuid(C) < uuid(G)``, from these SAME rows."""
     _seed_agent(write_harness, "other-resource")
     _seed_agent(write_harness, "other-resource-2")
     _seed_prompt_group(write_harness, "agent-1")
+    owner = _new_user_context(_OWNER)
     t0 = 1_790_000_000_000
+
+    async def _grant_at(clock_ms: int, **key: Any) -> str:
+        monkeypatch.setattr(_clock_module, "now_ms", lambda: clock_ms)
+        set_current_user_id(owner.user_id)
+        try:
+            row = await write_harness.service.grant_permission(
+                owner, perm_bits=1, **key
+            )
+        finally:
+            set_current_user_id(None)
+        return str(row["id"])
+
+    async def _grant_until(clock_ms: int, key: dict[str, Any], condition: Any) -> str:
+        for _ in range(64):
+            new_id = await _grant_at(clock_ms, **key)
+            if condition(new_id):
+                return new_id
+        raise AssertionError(
+            "v4 §7.3's uuid ordering precondition not reached after 64 re-rolls"
+        )
+
+    ids: dict[str, str] = {}
     # E — matches NONE.
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="E",
-        user_sub=_OWNER,
+    ids["E"] = await _grant_at(
+        t0 + 1,
         principal_type="user",
         principal_id="untouched-principal",
-        principal_model="User",
         resource_type="agent",
         resource_id="other-resource-2",
-        perm_bits=1,
-        created_at_ms=t0 + 1,
-        updated_at_ms=t0 + 1,
     )
     # F — promptGroup/agent-1: must survive P2 (resource_type mismatch).
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="F",
-        user_sub=_OWNER,
+    ids["F"] = await _grant_at(
+        t0 + 2,
         principal_type="user",
         principal_id="untouched-principal-f",
-        principal_model="User",
         resource_type="promptGroup",
         resource_id="agent-1",
-        perm_bits=1,
-        created_at_ms=t0 + 2,
-        updated_at_ms=t0 + 2,
     )
     # D — public, agent/agent-1: D in P2 ∩ P3.
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="D",
-        user_sub=_OWNER,
+    ids["D"] = await _grant_at(
+        t0 + 3,
         principal_type="public",
         principal_id=None,
-        principal_model=None,
         resource_type="agent",
         resource_id="agent-1",
-        perm_bits=1,
-        created_at_ms=t0 + 3,
-        updated_at_ms=t0 + 3,
     )
-    # C, G — the created_at_ms TIE at P2's key; id "C" < "G" lexically,
-    # so the CORRECT (created_at_ms, id) sort yields C before G, never
-    # the raw RETURNING/insertion order (G inserted first, mirroring
-    # v4's own construction).
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="G",
-        user_sub=_OWNER,
+    # G, then C — the created_at_ms TIE at P2's key; G inserted FIRST
+    # (mirroring v4's own construction — the raw RETURNING/insertion
+    # order must never be mistaken for the correct (created_at_ms, id)
+    # sort); C re-rolled until uuid(C) < uuid(G), v4's own precondition.
+    g_key = dict(
         principal_type="user",
         principal_id="aaa-sub-0010",
-        principal_model="User",
         resource_type="agent",
         resource_id="agent-1",
-        perm_bits=1,
-        created_at_ms=t0 + 4,
-        updated_at_ms=t0 + 4,
     )
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="C",
-        user_sub=_OWNER,
+    c_key = dict(
         principal_type="user",
         principal_id="other-sub-0009",
-        principal_model="User",
         resource_type="agent",
         resource_id="agent-1",
-        perm_bits=1,
-        created_at_ms=t0 + 4,
-        updated_at_ms=t0 + 4,
     )
+    ids["G"] = await _grant_at(t0 + 4, **g_key)
+    ids["C"] = await _grant_until(t0 + 4, c_key, lambda cid: cid < ids["G"])
     # A, B — A in P1 ∩ P2; B in P1 only. A created AFTER B (T0+6 vs
     # T0+5) but INSERTED before it here — insertion order != creation
     # order, so `unsorted`/`globalsort` cannot hide behind coincidence.
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="A",
-        user_sub=_OWNER,
+    # B re-rolled until uuid(A) < uuid(B), v4's own precondition.
+    a_key = dict(
         principal_type="user",
         principal_id=_MP_V,
-        principal_model="User",
         resource_type="agent",
         resource_id="agent-1",
-        perm_bits=1,
-        created_at_ms=t0 + 6,
-        updated_at_ms=t0 + 6,
     )
-    await _insert_grant_full(
-        write_harness.factory,
-        as_user=_OWNER,
-        row_id="B",
-        user_sub=_OWNER,
+    b_key = dict(
         principal_type="user",
         principal_id=_MP_V,
-        principal_model="User",
         resource_type="agent",
         resource_id="other-resource",
-        perm_bits=1,
-        created_at_ms=t0 + 5,
-        updated_at_ms=t0 + 5,
     )
+    ids["A"] = await _grant_at(t0 + 6, **a_key)
+    ids["B"] = await _grant_until(t0 + 5, b_key, lambda bid: ids["A"] < bid)
+
+    assert ids["A"] < ids["B"], "v4 §7.3's own uuid precondition"
+    assert ids["C"] < ids["G"], "v4 §7.3's own uuid precondition"
+    return ids
 
 
 class TestMPAToGVerbatimRealPostgres:
@@ -3456,10 +3450,10 @@ class TestMPAToGVerbatimRealPostgres:
     3-predicate, 7-row, tied, order-inverted construction cannot."""
 
     async def test_mp_a_to_g_real_postgres(
-        self, write_harness: Any, sp_pin: Any
+        self, write_harness: Any, sp_pin: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         owner = _new_user_context(_OWNER)
-        await _seed_mp_a_to_g(write_harness)
+        ids = await _seed_mp_a_to_g(write_harness, monkeypatch)
 
         set_current_user_id(owner.user_id)
         try:
@@ -3470,7 +3464,13 @@ class TestMPAToGVerbatimRealPostgres:
             set_current_user_id(None)
 
         assert result["visible_matched_count"] == 5, "distinct over the OR: {A,B,D,C,G}"
-        assert result["expired_ids"] == ["B", "A", "D", "C", "G"]
+        assert result["expired_ids"] == [
+            ids["B"],
+            ids["A"],
+            ids["D"],
+            ids["C"],
+            ids["G"],
+        ]
 
         admin = _admin_engine()
         try:
@@ -3491,8 +3491,8 @@ class TestMPAToGVerbatimRealPostgres:
                     .mappings()
                     .all()
                 ]
-            e_pair = await _acl_row_pair(admin, write_harness.schema, "E")
-            f_pair = await _acl_row_pair(admin, write_harness.schema, "F")
+            e_pair = await _acl_row_pair(admin, write_harness.schema, ids["E"])
+            f_pair = await _acl_row_pair(admin, write_harness.schema, ids["F"])
         finally:
             admin.dispose()
         assert e_pair[0] is None, "E untouched"
@@ -3506,9 +3506,9 @@ class TestMPAToGVerbatimRealPostgres:
         questions = [r["question"] for r in delete_rows]
 
         assert answers[0]["visible_matched_count"] == 2
-        assert answers[0]["expired_ids"] == ["B", "A"]
+        assert answers[0]["expired_ids"] == [ids["B"], ids["A"]]
         assert answers[1]["visible_matched_count"] == 4
-        assert answers[1]["expired_ids"] == ["D", "C", "G"]
+        assert answers[1]["expired_ids"] == [ids["D"], ids["C"], ids["G"]]
         assert answers[2]["visible_matched_count"] == 1
         assert answers[2]["expired_ids"] == []
 
