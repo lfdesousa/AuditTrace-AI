@@ -271,6 +271,8 @@ def test_cmd_arbitrate_writes_arbitration_row(tmp_path, repo):
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
         ]
     )
     assert rc == 0
@@ -301,6 +303,8 @@ def test_cmd_arbitrate_raises_on_preexisting_dirty_repo(tmp_path, repo):
                 str(repo),
                 "--python",
                 PYTHON,
+                "--lock-path",
+                str(tmp_path / "arb.lock"),
             ]
         )
 
@@ -323,6 +327,8 @@ def test_cmd_arbitrate_nocompile_is_authoritative(tmp_path, repo):
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
         ]
     )
     assert rc == 0
@@ -442,6 +448,8 @@ def test_cmd_arbitrate_tests_expected_matches_full_scope_not_mapped_count(tmp_pa
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
         ]
     )
     assert rc == 0
@@ -535,6 +543,8 @@ def test_cmd_run_guard_tests_closure_ok_and_persisted(tmp_path, repo):
             "mod",
             "--src-root-relative",
             "",
+            "--lock-path",
+            str(tmp_path / "pool.lock"),
         ]
     )
     assert rc == 0
@@ -625,6 +635,8 @@ def test_cmd_arbitrate_reads_merged_results_when_no_per_worker_files(tmp_path, r
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
         ]
     )
     assert rc == 0
@@ -692,6 +704,8 @@ def test_cmd_arbitrate_x6_never_reports_authoritative_green(tmp_path):
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
         ]
     )
     assert rc == 0
