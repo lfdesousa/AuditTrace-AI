@@ -1233,6 +1233,14 @@ def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
     assert rows["w1"].get("drift_not_reproduced") is True
     assert rows["w2"].get("drift_not_reproduced") is True
     assert "unmapped_red" not in rows["w1"]
+    # Review round 3 blocker 3: not_reproduced is never a silent flag on an
+    # otherwise-RED row -- the row's own verdict is overwritten to ERROR,
+    # so it surfaces through the EXISTING error_n > 0 / --ack-errors gate
+    # `report --verify` already enforces, rather than riding along on a
+    # RED verdict that reads as "clean".
+    assert rows["w1"]["verdict"] == "ERROR"
+    assert rows["w2"]["verdict"] == "ERROR"
+    assert rows["w1"]["error_reason"] == "not_reproduced"
 
 
 def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
