@@ -29,6 +29,15 @@ import pytest
 from scripts.neuter import lock as lockmod
 from scripts.neuter.pytest_run import run_pytest
 
+_DOCKER_AVAILABLE = shutil.which("docker") is not None
+if _DOCKER_AVAILABLE:
+    try:
+        subprocess.run(["docker", "info"], check=True, capture_output=True, timeout=10)
+    except Exception:
+        _DOCKER_AVAILABLE = False
+
+requires_docker = pytest.mark.skipif(not _DOCKER_AVAILABLE, reason="docker unavailable")
+
 
 @contextlib.contextmanager
 def _fake_watch(seen: bool):
@@ -175,3 +184,71 @@ def test_assert_lock_held_enforced_for_a_standalone_caller(tmp_path):
         import os
 
         os.close(fd)
+
+
+@requires_docker
+def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
+    """The ONE test in this module that exercises the REAL, unmocked
+    :func:`scripts.neuter.pytest_run._continuous_foreign_container_watch`
+    against an ACTUAL docker daemon -- the reviewer's exact round-3
+    regression signature: a durable, product-shaped Postgres container is
+    started at TEST-BODY time in the mapped test's own pytest subprocess
+    and torn down via ``atexit`` before that subprocess exits, so it is
+    GONE by the time ``run_pytest`` returns. Every other test in this file
+    stubs the watch directly (fast, no docker dependency) -- none of them
+    can prove the watch's OWN internals still work, or catch a neuter that
+    breaks JUST those internals (e.g. hard-coding its reported verdict) --
+    this is the guard test SPEC v3 §11's self-neuter NE-6 (round 3) maps
+    to, precisely so that neuter goes RED."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    fixture = repo / "test_atexit_container.py"
+    fixture.write_text(
+        "import atexit, os, subprocess, time\n"
+        '_NAME = f"audittrace-acl-wu2a-pg-rev{os.getpid()}"\n'
+        "def test_starts_a_durable_container_removed_at_atexit():\n"
+        "    subprocess.run(\n"
+        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:16"],\n'
+        "        check=True, capture_output=True, timeout=120,\n"
+        "    )\n"
+        "    atexit.register(\n"
+        '        lambda: subprocess.run(["docker", "rm", "-f", _NAME], capture_output=True)\n'
+        "    )\n"
+        "    time.sleep(0.5)\n"
+        "    assert True\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@test.invalid"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    result = run_pytest(
+        workdir=repo,
+        pytest_args=[
+            "test_atexit_container.py::test_starts_a_durable_container_removed_at_atexit"
+        ],
+        python=PYTHON,
+        lock_path=tmp_path / "atexit.lock",
+        timeout_s=120,
+    )
+    assert result.exit_code == 0
+    assert result.foreign_pg_container is True
+    # ...and the container really is gone -- proving the snapshot-style
+    # before/after check this replaced would have missed it entirely.
+    ps = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            "name=audittrace-acl-wu2a-pg-rev",
+            "--format",
+            "{{.Names}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert ps.stdout.strip() == ""

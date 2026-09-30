@@ -10,7 +10,9 @@ print them and exit 3 without a stack trace.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -118,12 +120,21 @@ def _collect_ids(
     round. The production CLI commands (``run``/``arbitrate``/``report``)
     pass the real ``--no-db`` value explicitly, so collect gets a real (or
     fake) DSN too.
+
+    The fake-mode state dir lives under a throwaway ``tempfile.mkdtemp()``,
+    never under ``repo_dir`` itself: ``repo_dir`` here is the CALLER's own
+    checkout (which can be a live, non-throwaway worktree -- e.g. a direct
+    CLI invocation against the harness's own source tree), and this
+    function must never leave a stray ``.neuter_collect_fake_pg/`` behind
+    in it (found live: it did, polluting a real checkout's git status).
     """
     resolved_lock = lockmod.resolve_lock_path(str(lock_path) if lock_path else None)
     pg_handle = None
+    fake_dir_tmp: str | None = None
     if fake_db is not None:
+        fake_dir_tmp = tempfile.mkdtemp(prefix="neuter-collect-fake-pg-")
         pg_handle = start_container(
-            "collect", 0, fake=fake_db, fake_dir=repo_dir / ".neuter_collect_fake_pg"
+            "collect", 0, fake=fake_db, fake_dir=Path(fake_dir_tmp)
         )
     try:
         result = run_pytest(
@@ -142,6 +153,8 @@ def _collect_ids(
                 stop_container(pg_handle)
             except Exception:  # noqa: BLE001 - cleanup must not itself crash
                 pass
+        if fake_dir_tmp is not None:
+            shutil.rmtree(fake_dir_tmp, ignore_errors=True)
     stdout = result.collect_stdout or ""
     ids = {line.strip() for line in stdout.splitlines() if "::" in line}
     return ids
