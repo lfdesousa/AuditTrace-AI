@@ -296,6 +296,28 @@ def run_pytest(
                     "addopts=",
                     *pytest_args,
                 ]
+                # Review round 3 regression (found dogfooding this round's
+                # own self-neuters, nested 3 levels deep): NEUTER_CHOKEPOINT_
+                # REQUIRED/PYTEST_PLUGINS being sticky in os.environ means
+                # `neuter_pathcheck` now auto-loads for THIS collect-only
+                # subprocess too, even though this call never asked for
+                # path-checking. If a caller ALREADY holding a pathcheck-
+                # configured environment (e.g. a pool worker running its own
+                # mapped self-proof test, which itself calls this function
+                # for a COMPLETELY UNRELATED toy fixture) is what spawned
+                # this collect, `env = dict(os.environ)` above just inherited
+                # that STALE NEUTER_PATHCHECK_EXPECT/_MODULE/_LOG -- and the
+                # plugin then tries to import the OUTER caller's module
+                # against ITS OWN expected path from INSIDE this unrelated
+                # collect, crashing at pytest_configure with a bare
+                # ModuleNotFoundError before printing a single collected id
+                # (observed live: `_collect_ids` returned an empty set,
+                # misclassified as `uncollected` -- SpecLoadError -- instead
+                # of the real cause). Collect-only never wants pathcheck at
+                # all, so these three are explicitly cleared here.
+                env.pop("NEUTER_PATHCHECK_EXPECT", None)
+                env.pop("NEUTER_PATHCHECK_MODULE", None)
+                env.pop("NEUTER_PATHCHECK_LOG", None)
                 # Review round 3 blocker 1: --collect-only still IMPORTS
                 # every test module -- an import-time side effect can
                 # start a durable product container exactly like a full

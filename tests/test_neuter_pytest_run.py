@@ -161,6 +161,44 @@ def test_foreign_container_collect_only_uses_the_same_delta(
     assert result.foreign_pg_container is True
 
 
+def test_collect_only_clears_a_stale_pathcheck_env_from_an_outer_caller(
+    tmp_path, monkeypatch, _isolated_lock
+):
+    """Review round 3 regression, found dogfooding this round's own
+    self-neuters (nested 3 levels deep): a POOL WORKER runs with
+    ``NEUTER_PATHCHECK_EXPECT``/``_MODULE``/``_LOG`` set in its OWN
+    environment (for its OWN mapped-test run) -- if one of that worker's
+    mapped tests is ITSELF a self-proof that calls ``_collect_ids`` for a
+    COMPLETELY UNRELATED toy fixture, ``env = dict(os.environ)`` inherits
+    those THREE stale vars, and (since ``PYTEST_PLUGINS=neuter_pathcheck``
+    is sticky and auto-loads regardless of ``collect_only``) the nested
+    collect-only subprocess's ``pytest_configure`` tries to import the
+    OUTER caller's module against the OUTER caller's expected path from
+    inside the UNRELATED collect -- crashing before printing a single
+    collected id. Observed live: this made ``_collect_ids`` return an
+    empty set, misclassified three levels up as a plain ``uncollected``
+    ``SpecLoadError`` instead of the real cause."""
+    repo = _init_repo(tmp_path)
+    monkeypatch.setenv("NEUTER_PATHCHECK_EXPECT", "/some/outer/caller/path")
+    monkeypatch.setenv("NEUTER_PATHCHECK_MODULE", "some_outer_module")
+    monkeypatch.setenv("NEUTER_PATHCHECK_LOG", str(tmp_path / "outer.log"))
+
+    result = run_pytest(
+        workdir=repo,
+        pytest_args=["test_guarded.py"],
+        python=PYTHON,
+        lock_path=_isolated_lock,
+        collect_only=True,
+    )
+    ids = {
+        line.strip()
+        for line in (result.collect_stdout or "").splitlines()
+        if "::" in line
+    }
+    assert result.exit_code == 0
+    assert "test_guarded.py::test_a" in ids
+
+
 def test_assert_lock_held_enforced_for_a_standalone_caller(tmp_path):
     """``already_locked=False`` (the default) self-acquires ``lock_path``:
     proven here by holding it externally first and confirming the call
