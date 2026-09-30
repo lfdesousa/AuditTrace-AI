@@ -79,9 +79,25 @@ def _collect_ids(
     repo_dir: Path, sha: str, scope_files: list[str], python: str
 ) -> set[str]:
     """Run ``--collect-only`` once over ``scope_files`` at ``sha`` (checked
-    out in ``repo_dir``) and return the collected node ids."""
+    out in ``repo_dir``) and return the collected node ids.
+
+    ``-o addopts=""`` overrides whatever the TARGET repo's own
+    ``pyproject.toml``/``pytest.ini`` sets (a ``-v`` there switches
+    ``--collect-only``'s rendering from the flat ``file.py::test`` list this
+    parses to a verbose ``<Dir>/<Module>/<Function>`` tree instead) --
+    portable regardless of which repo is being neutered.
+    """
     result = subprocess.run(
-        [python, "-m", "pytest", "--collect-only", "-q", *scope_files],
+        [
+            python,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-o",
+            "addopts=",
+            *scope_files,
+        ],
         cwd=repo_dir,
         capture_output=True,
         text=True,

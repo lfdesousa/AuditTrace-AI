@@ -253,3 +253,20 @@ def test_collected_ids_can_be_supplied_directly(tmp_path, repo):
         spec_path, repo_dir=repo, python=PYTHON, collected_ids={"test_mod.py::test_f"}
     )
     assert spec.neuters[0].id == "n1"
+
+
+def test_load_survives_a_target_repo_whose_own_addopts_forces_verbose_collection(
+    tmp_path, repo
+):
+    """A target repo's own ``pyproject.toml`` ``addopts = "-v ..."`` switches
+    pytest's ``--collect-only -q`` rendering from the flat ``file.py::test``
+    list to a verbose ``<Dir>/<Module>/<Function>`` tree -- ``_collect_ids``
+    must override it (``-o addopts=""``), or every load against a
+    ``-v``-configured repo (this repo included) falsely reports every
+    mapped test id as uncollected."""
+    (repo / "pyproject.toml").write_text('[tool.pytest.ini_options]\naddopts = "-v"\n')
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "force verbose addopts")
+    spec_path = _write(tmp_path, _valid_spec(repo))
+    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    assert spec.neuters[0].id == "n1"
