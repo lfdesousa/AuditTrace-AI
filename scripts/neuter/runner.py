@@ -164,10 +164,22 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 )
         finally:
             restore(repo_dir, entry)
+        # Arbitration runs over the FULL scope_files, not just entry.tests --
+        # junit's own `tests=` attribute (the full-scope collected count) is
+        # what "collected" must compare against here, or a full-scope run
+        # would ALWAYS "mismatch" against the neuter's small mapped-test
+        # count and mask every other condition (§4's `collected` fires
+        # first). `missing` still checks the SPECIFIC mapped ids
+        # independently, at whatever scale.
+        tests_expected = (
+            junit_result.tests_collected
+            if junit_result is not None and junit_result.tests_collected is not None
+            else len(entry.tests)
+        )
         verdict = classify(
             entry.tests,
             junit_result,
-            tests_expected=len(entry.tests),
+            tests_expected=tests_expected,
             nocompile=nocompile,
             pathcheck_ok=True,
             db_leak=False,
@@ -181,6 +193,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 "id": neuter_id,
                 "harness_verdict": harness_verdict,
                 "authoritative_verdict": verdict.verdict,
+                "authoritative_error_reason": verdict.error_reason,
                 "defect_ref": None,
             },
         )

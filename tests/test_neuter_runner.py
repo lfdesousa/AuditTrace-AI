@@ -387,3 +387,66 @@ def test_cmd_report_with_reviewer_guard_tests(tmp_path, repo):
     assert rc == 0
     text = (evidence / "per_guard_table.md").read_text()
     assert "test_extra" in text
+
+
+def test_cmd_arbitrate_tests_expected_matches_full_scope_not_mapped_count(tmp_path):
+    """``arbitrate`` runs over the FULL ``scope_files``, not just the
+    neuter's mapped ``tests`` -- junit's own collected count (many more
+    than the one mapped test) must not be compared against
+    ``len(entry.tests)`` (1), or every arbitration would spuriously go
+    ERROR ``collected`` regardless of the actual outcome. Found running
+    the T1 oracle for real (SPEC v3 §12)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("def f(x):\n    return x + 1\n")
+    (repo / "test_mod.py").write_text(
+        "from mod import f\n\n\n"
+        "def test_f():\n    assert f(1) == 2\n\n\n"
+        "def test_g():\n    assert f(2) == 3\n"
+    )
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "a@b.c")
+    _run_git(repo, "config", "user.name", "a")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "init")
+
+    spec = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_mod.py"],
+        "guard_tests": [{"id": "test_mod.py::test_f", "row": "R1"}],
+        "neuters": [
+            {
+                "id": "n1",
+                "file": "mod.py",
+                "edits": [{"old": "    return x + 1", "new": "    return x + 2"}],
+                "tests": ["test_mod.py::test_f"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec))
+    rc = main(
+        [
+            "arbitrate",
+            "--ids",
+            "n1",
+            "--evidence",
+            str(tmp_path / "ev"),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+        ]
+    )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "ev" / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["authoritative_verdict"] == "RED"
+    assert rows[0]["authoritative_error_reason"] is None
