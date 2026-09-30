@@ -13,6 +13,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,6 +128,17 @@ def _collect_ids(
     CLI invocation against the harness's own source tree), and this
     function must never leave a stray ``.neuter_collect_fake_pg/`` behind
     in it (found live: it did, polluting a real checkout's git status).
+
+    The container's own run-id suffix is a fresh UUID, never the literal
+    ``"collect"``: found dogfooding this round's own self-neuters at N=5 --
+    several CONCURRENT self-proof tests (each a standalone, legitimate
+    caller with a REAL, non-fake ``pg_handle``) all named their container
+    ``audittrace-neuter-collect-w0`` identically, so ``docker run`` failed
+    outright (exit 125, name already in use) on every collision. A single
+    top-level CLI invocation's own ``_collect_ids`` call is still fine
+    either way (the heavy-cap lock already serialises it against any OTHER
+    top-level invocation) -- this only matters once several INDEPENDENT
+    callers can legitimately call this function around the same time.
     """
     resolved_lock = lockmod.resolve_lock_path(str(lock_path) if lock_path else None)
     pg_handle = None
@@ -134,7 +146,10 @@ def _collect_ids(
     if fake_db is not None:
         fake_dir_tmp = tempfile.mkdtemp(prefix="neuter-collect-fake-pg-")
         pg_handle = start_container(
-            "collect", 0, fake=fake_db, fake_dir=Path(fake_dir_tmp)
+            f"collect-{uuid.uuid4().hex[:8]}",
+            0,
+            fake=fake_db,
+            fake_dir=Path(fake_dir_tmp),
         )
     try:
         result = run_pytest(
