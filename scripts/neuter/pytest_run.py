@@ -22,21 +22,36 @@ CHEAP, secondary, compile-time check -- see requirement 2 below):
 
 1. **A per-invocation chokepoint token.** ``run_pytest`` writes a fresh
    UUID to a throwaway file (``NEUTER_CHOKEPOINT_TOKEN_FILE``) and passes
-   the SAME value via ``NEUTER_CHOKEPOINT_TOKEN``. Importing this module
-   makes ``NEUTER_CHOKEPOINT_REQUIRED=1`` STICKY in ``os.environ`` for the
-   rest of the CURRENT process (safe: ``make test``'s own outer
-   ``pytest_configure`` always runs BEFORE any test file -- hence this
-   module -- is ever imported; the only pytest SESSIONS that start AFTER
-   this import are the ones this review targets: a nested ``pytest.main()``
-   call, or a child process spawned via ``subprocess``/``os.system``, which
-   inherit ``os.environ`` by default). The mandatory ``neuter_pathcheck``
-   plugin (loaded via ``PYTEST_PLUGINS``, itself made sticky the same way,
-   so it auto-loads for ANY pytest session in this process without needing
-   an explicit ``-p`` flag) fails the session at ``pytest_configure`` if
+   the SAME value via ``NEUTER_CHOKEPOINT_TOKEN``. The FIRST time
+   ``run_pytest`` actually RUNS (not merely when this module is imported --
+   a critical correction, see below), it makes
+   ``NEUTER_CHOKEPOINT_REQUIRED=1`` STICKY in ``os.environ`` for the rest
+   of the CURRENT process, precisely so a bypass that constructs its OWN
+   subprocess/``pytest.main()`` call (never routing through ``run_pytest``
+   again) still inherits the "this session MUST carry a valid token"
+   requirement. The mandatory ``neuter_pathcheck`` plugin (loaded via
+   ``PYTEST_PLUGINS``, made sticky the same way) fails any SUBSEQUENT
+   pytest session in this process at ``pytest_configure`` if
    ``NEUTER_CHOKEPOINT_REQUIRED`` is set but the token is missing or
    doesn't match the recorded file -- so a bypass that skips this module
    entirely never even gets a token to omit; it simply fails by
    construction the moment pytest starts.
+
+   **Critical correction (found running the definitive full-suite
+   ``make test``):** an EARLIER revision made this sticky at MODULE IMPORT
+   time instead. That poisoned ANY process that merely IMPORTED this
+   module for an unrelated reason -- including ``make test``'s own
+   ``hold-shared`` wrapper (``scripts/neuter/runner.py`` imports this
+   module at its own top) and, transitively, every test in the 6500-test
+   suite that shells out to ANOTHER command which happens to invoke pytest
+   itself (e.g. ``make release``'s own "drift gate" step, run from inside
+   ``tests/test_release_bump_files_ssot.py``) -- none of which ever calls
+   ``run_pytest`` at all. Scoping the stickiness to "the first REAL call"
+   instead of "the mere import" keeps every genuine neuter invocation
+   (``run``/``arbitrate``/``report`` always call ``load_neuter_spec`` --
+   hence ``run_pytest`` -- before any worker starts) exactly as protected,
+   while a process that only ever IMPORTS this module without ever
+   actually running a neuter phase stays completely inert.
 2. **A continuous, event-driven container watch.** Round 2's before/after
    ``docker ps`` snapshot missed a container started and torn down (via
    ``atexit``) ENTIRELY WITHIN the pytest call. This module now streams
@@ -82,39 +97,87 @@ _PRODUCT_PG_CONTAINER_PREFIXES = (
     "audittrace-console-store-pg-",
 )
 
-# --------------------------------------------------------------------- #
-# Review round 3, requirement 2 (B2): make the chokepoint REQUIRED for
-# every pytest session that starts in THIS process from this point on --
-# sticky in os.environ, not a per-call argument, precisely so a bypass
-# that constructs its OWN subprocess/``pytest.main()`` call (never routing
-# through `run_pytest` at all) still inherits the "this session MUST carry
-# a valid token" requirement. Safe for `make test`'s own outer session:
-# `pytest_configure` for that TOP-LEVEL session always runs BEFORE any
-# test file -- hence this module -- is ever imported, so the flag isn't
-# set yet when the outer session's own configure hook runs. It only
-# becomes sticky for sessions that start AFTER a neuter test file (or any
-# neuter code path) has been imported -- exactly the bypass shapes this
-# round targets. Repo-wide grep confirms no OTHER test spawns a nested
-# pytest session, so this cannot collide with unrelated product tests.
-# --------------------------------------------------------------------- #
-os.environ.setdefault("NEUTER_CHOKEPOINT_REQUIRED", "1")
-os.environ.setdefault("PYTEST_PLUGINS", "neuter_pathcheck")
-_existing_pythonpath = os.environ.get("PYTHONPATH", "")
-if str(_PLUGIN_DIR) not in _existing_pythonpath.split(os.pathsep):
-    os.environ["PYTHONPATH"] = (
-        f"{_PLUGIN_DIR}{os.pathsep}{_existing_pythonpath}"
-        if _existing_pythonpath
-        else str(_PLUGIN_DIR)
-    )
-# `PYTHONPATH` only affects a CHILD interpreter's import resolution at its
-# own startup -- an IN-PROCESS bypass (`pytest.main()` called directly,
-# never a subprocess) needs `neuter_pathcheck` importable via THIS
-# interpreter's own `sys.path` right now, or pytest's plugin manager fails
-# with a bare `ImportError` before `pytest_configure` ever runs (still a
-# fail-by-construction outcome, just a less diagnostic one than the
-# plugin's own `pytest.exit` message).
-if str(_PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_DIR))
+
+@contextlib.contextmanager
+def chokepoint_scope():
+    """Review round 3, requirement B2 (twice-corrected): make the
+    chokepoint REQUIRED for every pytest session that starts in THIS
+    process for the DURATION of this ``with`` block -- sticky in
+    ``os.environ``, not a per-call argument, precisely so a bypass that
+    constructs its OWN subprocess/``pytest.main()`` call (never routing
+    through :func:`run_pytest` again) still inherits the "this session
+    MUST carry a valid token" requirement -- then RESTORES whatever
+    ``os.environ`` held before, so this process's chokepoint state never
+    outlives the caller that asked for it.
+
+    Entered by ``_cmd_run``/``_cmd_arbitrate``/``_cmd_report`` (the CLI
+    commands that own an ENTIRE neuter invocation start to finish) around
+    their whole body -- never called from inside :func:`run_pytest`
+    itself.
+
+    Two corrections on top of the original design, both found running the
+    definitive full-suite ``make test``:
+
+    1. Setting this at MODULE IMPORT time poisoned ANY process that merely
+       imported this module for an unrelated reason -- including
+       ``scripts/neuter/runner.py``'s own ``hold-shared`` wrapper, which
+       ``make test`` uses to run the product's own, entirely un-gated
+       pytest suite.
+    2. Even set explicitly-but-never-undone from inside a caller, a TEST
+       that exercises a REAL CLI command (``main(["run", ...])``,
+       necessary to test the command itself) left the sticky vars in
+       ``os.environ`` for the REST of that pytest SESSION -- poisoning
+       every LATER test in the same ``make test`` run that shells out to
+       something which itself invokes pytest (e.g.
+       ``test_release_bump_files_ssot.py``'s own ``make release``
+       subprocess, whose "drift gate" step runs pytest internally). A
+       real, standalone CLI process exits when its command finishes
+       anyway, so restoring on exit changes nothing for actual production
+       use, while making every unit test that exercises
+       ``_cmd_run``/``_cmd_arbitrate``/``_cmd_report`` directly leave
+       ``os.environ`` exactly as it found it.
+    """
+    saved_required = os.environ.get("NEUTER_CHOKEPOINT_REQUIRED")
+    saved_plugins = os.environ.get("PYTEST_PLUGINS")
+    saved_pythonpath = os.environ.get("PYTHONPATH")
+    inserted_syspath = str(_PLUGIN_DIR) not in sys.path
+    try:
+        os.environ.setdefault("NEUTER_CHOKEPOINT_REQUIRED", "1")
+        os.environ.setdefault("PYTEST_PLUGINS", "neuter_pathcheck")
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        if str(_PLUGIN_DIR) not in existing_pythonpath.split(os.pathsep):
+            os.environ["PYTHONPATH"] = (
+                f"{_PLUGIN_DIR}{os.pathsep}{existing_pythonpath}"
+                if existing_pythonpath
+                else str(_PLUGIN_DIR)
+            )
+        # `PYTHONPATH` only affects a CHILD interpreter's import
+        # resolution at its own startup -- an IN-PROCESS bypass
+        # (`pytest.main()` called directly, never a subprocess) needs
+        # `neuter_pathcheck` importable via THIS interpreter's own
+        # `sys.path` right now, or pytest's plugin manager fails with a
+        # bare `ImportError` before `pytest_configure` ever runs (still a
+        # fail-by-construction outcome, just a less diagnostic one than
+        # the plugin's own `pytest.exit` message).
+        if str(_PLUGIN_DIR) not in sys.path:
+            sys.path.insert(0, str(_PLUGIN_DIR))
+        yield
+    finally:
+        if saved_required is None:
+            os.environ.pop("NEUTER_CHOKEPOINT_REQUIRED", None)
+        else:
+            os.environ["NEUTER_CHOKEPOINT_REQUIRED"] = saved_required
+        if saved_plugins is None:
+            os.environ.pop("PYTEST_PLUGINS", None)
+        else:
+            os.environ["PYTEST_PLUGINS"] = saved_plugins
+        if saved_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = saved_pythonpath
+        if inserted_syspath:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(str(_PLUGIN_DIR))
 
 
 def _log_line_count(path: Path) -> int:
