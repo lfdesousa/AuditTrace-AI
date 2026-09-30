@@ -25,6 +25,7 @@ from pathlib import Path
 from scripts.neuter import lock as lockmod
 from scripts.neuter.classify import classify
 from scripts.neuter.junit import (
+    mapped_failed_in_full,
     parse_junit,
     parse_junit_full,
     unmapped_assertion_shaped_failures,
@@ -38,6 +39,7 @@ from scripts.neuter.pool import (
     restore,
     run_pool,
 )
+from scripts.neuter.pytest_run import run_pytest
 from scripts.neuter.report import verify_report, write_report
 from scripts.neuter.spec import (
     EXIT_SPEC_ERROR,
@@ -102,13 +104,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
     repo_dir = Path(args.repo_dir).resolve()
     evidence_dir = Path(args.evidence).resolve()
     python = args.python or f"{repo_dir}/.venv/bin/python"
+    lock_path = Path(args.lock_path) if args.lock_path else None
 
     if evidence_dir_is_refused(evidence_dir):
         print(f"run: evidence dir refused (/tmp): {evidence_dir}", file=sys.stderr)
         return EXIT_SPEC_ERROR
 
     try:
-        spec = load_neuter_spec(Path(args.neuters), repo_dir=repo_dir, python=python)
+        # collect (this spec load's own --collect-only) is one of the five
+        # chokepoint-gated phases (review round 2): `already_locked=False`
+        # (the default) makes it acquire+release the SAME heavy-cap lock
+        # itself for the duration of the collect-only call, since `run_pool`
+        # below has not yet taken its own (longer-held) lock at this point.
+        spec = load_neuter_spec(
+            Path(args.neuters), repo_dir=repo_dir, python=python, lock_path=lock_path
+        )
     except SpecLoadError as exc:
         print(f"spec load error [{exc.reason}]: {exc.detail}", file=sys.stderr)
         return EXIT_SPEC_ERROR
@@ -161,9 +171,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pathcheck_module=args.pathcheck_module,
         src_root_relative=args.src_root_relative,
         fake_db=args.no_db,
-        lock_path=Path(args.lock_path) if args.lock_path else None,
+        lock_path=lock_path,
         sample=args.sample,
         i_measured_it=args.i_measured_it,
+        ack_drift=args.ack_drift,
     )
 
 
@@ -171,13 +182,13 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
     repo_dir = Path(args.repo_dir).resolve()
     evidence_dir = Path(args.evidence).resolve()
     python = args.python or f"{repo_dir}/.venv/bin/python"
-    spec = load_neuter_spec(Path(args.neuters), repo_dir=repo_dir, python=python)
-    neuters_by_id = {n.id: n for n in spec.neuters}
-    ids = args.ids.split(",")
 
-    # arbitrate takes the SAME heavy-cap lock as the pool: it applies edits
-    # and runs pytest against repo_dir directly, exactly the class of
-    # operation `make test`'s hold-shared must never race with.
+    # arbitrate takes the SAME heavy-cap lock as the pool -- BEFORE the
+    # spec load's own collect phase, so collect is ALSO covered by this
+    # one, long-held acquisition (review round 2: collect is one of the
+    # five chokepoint-gated phases). It applies edits and runs pytest
+    # against repo_dir directly, exactly the class of operation `make
+    # test`'s hold-shared must never race with.
     resolved_lock = lockmod.resolve_lock_path(
         str(args.lock_path) if args.lock_path else None
     )
@@ -190,6 +201,16 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
         return EXIT_LOCK_HELD
 
     try:
+        spec = load_neuter_spec(
+            Path(args.neuters),
+            repo_dir=repo_dir,
+            python=python,
+            lock_path=resolved_lock,
+            already_locked=True,
+        )
+        neuters_by_id = {n.id: n for n in spec.neuters}
+        ids = args.ids.split(",")
+
         results_by_id = {}
         for path in evidence_dir.glob("neuter_results_w*.jsonl"):
             with path.open() as fh:
@@ -215,37 +236,31 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 / "junit"
                 / f"arbitration_{neuter_id.replace('/', '_')}.xml"
             )
-            junit_path.parent.mkdir(parents=True, exist_ok=True)
             exit_code = None
             junit_result = None
+            full = None
             unmapped_red: list[str] = []
+            foreign_pg_container = False
             try:
                 if not nocompile:
-                    # sequential, alone, over the FULL scope_files (§12) --
-                    # the authoritative tie-break, never the mapped-test
-                    # shortcut. Classifies the FULL scope (blocker 3): a
-                    # planted wrong-mapping neuter (X6) that leaves OTHER,
-                    # unmapped tests failing must never read as an
-                    # "authoritative GREEN".
-                    cmd = [
-                        python,
-                        "-m",
-                        "pytest",
-                        *spec.scope_files,
-                        "-q",
-                        "--no-cov",
-                        "-o",
-                        "addopts=",
-                        f"--junitxml={junit_path}",
-                    ]
-                    result = subprocess.run(
-                        cmd,
-                        cwd=repo_dir,
-                        capture_output=True,
-                        text=True,
-                        timeout=args.timeout,
+                    # THE chokepoint (review round 2): sequential, alone,
+                    # over the FULL scope_files (§12) -- the authoritative
+                    # tie-break, never the mapped-test shortcut. Pins the
+                    # SAME PYTHONPATH/DSN/container-watch every other phase
+                    # gets -- blockers 1/2/5's root cause was arbitrate
+                    # blindly importing the venv's editable install instead
+                    # of repo_dir's edited tree.
+                    pytest_result = run_pytest(
+                        workdir=repo_dir,
+                        pytest_args=list(spec.scope_files),
+                        python=python,
+                        lock_path=resolved_lock,
+                        timeout_s=args.timeout,
+                        junit_path=junit_path,
+                        already_locked=True,
                     )
-                    exit_code = result.returncode
+                    exit_code = pytest_result.exit_code
+                    foreign_pg_container = pytest_result.foreign_pg_container
                     full = parse_junit_full(junit_path if junit_path.exists() else None)
                     junit_result = parse_junit(
                         junit_path if junit_path.exists() else None, entry.tests
@@ -280,21 +295,36 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 db_leak=False,
                 timed_out=False,
                 exit_code=exit_code,
+                foreign_pg_container=foreign_pg_container,
             )
             authoritative_verdict = verdict.verdict
-            if authoritative_verdict == "GREEN" and unmapped_red:
+            authoritative_error_reason = verdict.error_reason
+            harness_verdict = results_by_id.get(neuter_id, {}).get("verdict")
+            if (
+                harness_verdict == "RED"
+                and full is not None
+                and not mapped_failed_in_full(full, entry.tests)
+            ):
+                # SPEC v3 §5 `not_reproduced` (review round 2, blocker 1/2):
+                # the harness's own targeted run was RED, but NONE of its
+                # mapped tests show as failed in the FULL-scope run --
+                # the full-scope run never even reproduced the edit (a
+                # blind PYTHONPATH, a dirty restore, ...). This is an ERROR,
+                # never a "clean" or "confirmed" GREEN.
+                authoritative_verdict = "ERROR"
+                authoritative_error_reason = "not_reproduced"
+            elif authoritative_verdict == "GREEN" and unmapped_red:
                 # Blocker 3: a mapped-only GREEN whose full-scope run shows
                 # OTHER assertion-shaped failures is drift, not a confirmed
                 # GREEN -- never reported as an "authoritative GREEN".
                 authoritative_verdict = "DRIFT"
-            harness_verdict = results_by_id.get(neuter_id, {}).get("verdict")
             append_jsonl(
                 out_path,
                 {
                     "id": neuter_id,
                     "harness_verdict": harness_verdict,
                     "authoritative_verdict": authoritative_verdict,
-                    "authoritative_error_reason": verdict.error_reason,
+                    "authoritative_error_reason": authoritative_error_reason,
                     "unmapped_red": unmapped_red,
                     "defect_ref": None,
                 },
@@ -308,7 +338,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
     repo_dir = Path(args.repo_dir).resolve()
     evidence_dir = Path(args.evidence).resolve()
     python = args.python or f"{repo_dir}/.venv/bin/python"
-    spec = load_neuter_spec(Path(args.neuters), repo_dir=repo_dir, python=python)
+    lock_path = Path(args.lock_path) if args.lock_path else None
+    # collect is chokepoint-gated here too (review round 2): report has not
+    # taken any lock of its own, so the default `already_locked=False`
+    # makes the spec's own collect-only call acquire+release it.
+    spec = load_neuter_spec(
+        Path(args.neuters), repo_dir=repo_dir, python=python, lock_path=lock_path
+    )
     guard_tests_path = args.guard_tests
     if not guard_tests_path:
         default_path = evidence_dir / "guard_tests_reviewer.json"
@@ -323,6 +359,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
             spec,
             reviewer_guard_tests=reviewer_guard_tests,
             ack_errors=args.ack_errors,
+            ack_drift=args.ack_drift,
         )
     write_report(evidence_dir, spec, reviewer_guard_tests=reviewer_guard_tests)
     return 0
@@ -359,6 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="required to use --workers > 10 (the reason is logged to events.jsonl)",
     )
+    run_p.add_argument(
+        "--ack-drift",
+        action="store_true",
+        help=(
+            "acknowledge a non-empty unmapped_red on any row so the pool "
+            "may still exit clean (never implicit; review round 2 blocker 4)"
+        ),
+    )
     run_p.add_argument("--repo-dir", default=common["repo_dir"])
     run_p.add_argument("--python", default=common["python"])
     run_p.set_defaults(func=_cmd_run)
@@ -383,6 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="acknowledge error_n > 0 so --verify may still pass (never implicit)",
     )
+    rep_p.add_argument(
+        "--ack-drift",
+        action="store_true",
+        help="acknowledge drift_n > 0 so --verify may still pass (never implicit)",
+    )
+    rep_p.add_argument("--lock-path", default=None)
     rep_p.add_argument("--repo-dir", default=common["repo_dir"])
     rep_p.add_argument("--python", default=common["python"])
     rep_p.set_defaults(func=_cmd_report)

@@ -144,6 +144,22 @@ def parse_junit(path: Path | None, mapped_ids: list[str]) -> JunitResult:
     )
 
 
+def mapped_failed_in_full(full: FullJunitResult, mapped_ids: list[str]) -> list[str]:
+    """Which of ``mapped_ids`` actually show as ``failed`` in a FULL-scope
+    junit (SPEC v3 §5 ``not_reproduced``, review round 2 blockers 1/2): the
+    tie-break for "did the full-scope run even see the edit". A targeted
+    run that was RED, whose full-scope re-run shows NONE of the same mapped
+    ids failing, was not reproduced -- most likely the full-scope run
+    imported a different, unedited copy of the module (a blind
+    ``PYTHONPATH``), not a real recovery."""
+    return sorted(
+        node_id
+        for node_id in mapped_ids
+        if (tc := full.by_key.get(mangle_node_id(node_id))) is not None
+        and tc.outcome == "failed"
+    )
+
+
 def unmapped_assertion_shaped_failures(
     full: FullJunitResult, mapped_ids: list[str]
 ) -> list[str]:

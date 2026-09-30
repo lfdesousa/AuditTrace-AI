@@ -7,6 +7,8 @@ guard branches.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import queue
@@ -22,15 +24,20 @@ from scripts.neuter import lock as lockmod
 from scripts.neuter.pg import PgHandle
 from scripts.neuter.pool import (
     EXIT_BASELINE_FAILED,
+    EXIT_DRIFT_UNACKNOWLEDGED,
+    EXIT_EVIDENCE_NOT_EMPTY,
     EXIT_MISSING_ROWS,
     DirtyTreeError,
     WorkerContext,
+    _sample_pool_metrics,
     _worker_main,
     apply_edits,
     foreign_audittrace_container_exists,
     pool_exit_code,
+    run_baseline,
     run_one_neuter,
     run_pool,
+    sample_full_scope_drift,
     should_skip,
 )
 from scripts.neuter.spec import (
@@ -75,6 +82,22 @@ def _entry(**kwargs) -> NeuterEntry:
     return NeuterEntry(**base)
 
 
+@contextlib.contextmanager
+def _held_lock(path: Path):
+    """A direct ``_worker_main(...)`` call (bypassing ``run_pool``) still
+    constructs its ``WorkerContext`` with ``already_locked=True`` -- matching
+    what a REAL worker always sees (``run_pool`` holds the lock for the
+    whole run). These tests must therefore hold ``path`` themselves for the
+    call's duration, or the chokepoint's own lock assertion (correctly)
+    raises."""
+    fd = lockmod.open_lock_file(path)
+    lockmod.try_flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
 def _ctx(repo: Path, evidence_dir: Path, **overrides) -> WorkerContext:
     base = dict(
         workdir=repo,
@@ -88,6 +111,7 @@ def _ctx(repo: Path, evidence_dir: Path, **overrides) -> WorkerContext:
         pathcheck_module="guarded",
         timeout_s=30,
         src_root=str(repo),
+        lock_path=evidence_dir.parent / "test.lock",
     )
     base.update(overrides)
     return WorkerContext(**base)
@@ -216,24 +240,26 @@ def test_worker_main_direct_drains_queue_and_writes_rows(tmp_path):
     q.put(None)
     stop_flag = threading.Event()
     evidence = _ev(tmp_path)
-    _worker_main(
-        1,
-        q,
-        spec,
-        neuters_by_id,
-        repo_dir=repo,
-        parent_worktree_dir=tmp_path,
-        evidence_dir=evidence,
-        run_id="direct",
-        python=PYTHON,
-        timeout_s=30,
-        tmpfs=False,
-        fake_db=True,
-        pathcheck_module="guarded",
-        src_root_relative="",
-        resume_rows={},
-        stop_flag=stop_flag,
-    )
+    with _held_lock(tmp_path / "worker.lock"):
+        _worker_main(
+            1,
+            q,
+            spec,
+            neuters_by_id,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=evidence,
+            run_id="direct",
+            python=PYTHON,
+            timeout_s=30,
+            tmpfs=False,
+            fake_db=True,
+            pathcheck_module="guarded",
+            src_root_relative="",
+            resume_rows={},
+            stop_flag=stop_flag,
+            lock_path=tmp_path / "worker.lock",
+        )
     rows = [
         json.loads(line)
         for line in (evidence / "neuter_results_w1.jsonl").read_text().splitlines()
@@ -265,24 +291,26 @@ def test_worker_main_direct_skips_via_resume_rows(tmp_path):
     q.put(None)
     stop_flag = threading.Event()
     evidence = _ev(tmp_path)
-    _worker_main(
-        1,
-        q,
-        spec,
-        neuters_by_id,
-        repo_dir=repo,
-        parent_worktree_dir=tmp_path,
-        evidence_dir=evidence,
-        run_id="direct",
-        python=PYTHON,
-        timeout_s=30,
-        tmpfs=False,
-        fake_db=True,
-        pathcheck_module="guarded",
-        src_root_relative="",
-        resume_rows=resume_rows,
-        stop_flag=stop_flag,
-    )
+    with _held_lock(tmp_path / "worker.lock"):
+        _worker_main(
+            1,
+            q,
+            spec,
+            neuters_by_id,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=evidence,
+            run_id="direct",
+            python=PYTHON,
+            timeout_s=30,
+            tmpfs=False,
+            fake_db=True,
+            pathcheck_module="guarded",
+            src_root_relative="",
+            resume_rows=resume_rows,
+            stop_flag=stop_flag,
+            lock_path=tmp_path / "worker.lock",
+        )
     rows = [
         json.loads(line)
         for line in (evidence / "neuter_results_w1.jsonl").read_text().splitlines()
@@ -321,6 +349,7 @@ def test_worker_main_direct_dirty_tree_error_stops_and_logs(tmp_path, monkeypatc
         src_root_relative="",
         resume_rows={},
         stop_flag=stop_flag,
+        lock_path=tmp_path / "worker.lock",
     )
     assert stop_flag.is_set()
     rows = [
@@ -366,24 +395,26 @@ def test_worker_main_direct_restored_dirty_stops_pool(tmp_path):
     q.put(None)
     stop_flag = threading.Event()
     evidence = _ev(tmp_path)
-    _worker_main(
-        1,
-        q,
-        spec,
-        neuters_by_id,
-        repo_dir=repo,
-        parent_worktree_dir=tmp_path,
-        evidence_dir=evidence,
-        run_id="direct",
-        python=PYTHON,
-        timeout_s=30,
-        tmpfs=False,
-        fake_db=True,
-        pathcheck_module="guarded",
-        src_root_relative="",
-        resume_rows={},
-        stop_flag=stop_flag,
-    )
+    with _held_lock(tmp_path / "worker.lock"):
+        _worker_main(
+            1,
+            q,
+            spec,
+            neuters_by_id,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=evidence,
+            run_id="direct",
+            python=PYTHON,
+            timeout_s=30,
+            tmpfs=False,
+            fake_db=True,
+            pathcheck_module="guarded",
+            src_root_relative="",
+            resume_rows={},
+            stop_flag=stop_flag,
+            lock_path=tmp_path / "worker.lock",
+        )
     assert stop_flag.is_set()
     rows = [
         json.loads(line)
@@ -428,7 +459,9 @@ def test_run_pool_dirty_restore_returns_exit_4(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     exit_code = run_pool(
         spec,
         repo_dir=repo,
@@ -496,7 +529,9 @@ def test_run_pool_error_verdict_returns_exit_9(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     exit_code = run_pool(
         spec,
         repo_dir=repo,
@@ -537,7 +572,9 @@ def test_run_pool_refuses_when_docker_build_running(tmp_path, monkeypatch):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     monkeypatch.setattr(lockmod, "foreign_docker_build_running", lambda: True)
     exit_code = run_pool(
         spec,
@@ -577,7 +614,9 @@ def test_run_pool_refuses_when_foreign_container_exists(tmp_path, monkeypatch):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     monkeypatch.setattr(
         "scripts.neuter.pool.foreign_audittrace_container_exists", lambda run_id: True
     )
@@ -632,7 +671,9 @@ def test_run_pool_fails_closed_when_every_worker_crashes(tmp_path, monkeypatch):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
 
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
     evidence = _ev(tmp_path)
@@ -712,7 +753,9 @@ def test_run_pool_baseline_failure_exits_5_never_red(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     evidence = _ev(tmp_path)
     exit_code = run_pool(
         spec,
@@ -766,7 +809,9 @@ def test_run_pool_drift_sample_measures_real_unmapped_red(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     evidence = _ev(tmp_path)
     exit_code = run_pool(
         spec,
@@ -781,7 +826,11 @@ def test_run_pool_drift_sample_measures_real_unmapped_red(tmp_path):
         src_root_relative="",
         sample=1.0,  # sample every neuter -- deterministic for this 1-neuter spec
     )
-    assert exit_code == 2  # GREEN present
+    # Review round 2 blocker 4: a non-empty unmapped_red is unacknowledged
+    # drift, not clean -- even though this row's OWN targeted verdict is
+    # GREEN, the exit code must surface the drift, not the plain
+    # vacuous-GREEN code.
+    assert exit_code == EXIT_DRIFT_UNACKNOWLEDGED
     rows = {
         json.loads(line)["id"]: json.loads(line)
         for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
@@ -881,9 +930,9 @@ def test_mock_engine_worker_gets_dsn_when_a_real_pg_handle_exists(
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr("scripts.neuter.pool.subprocess.run", fake_run)
+    monkeypatch.setattr("scripts.neuter.pytest_run.subprocess.run", fake_run)
     monkeypatch.setattr(
-        "scripts.neuter.pool.foreign_product_pg_container_running", lambda: False
+        "scripts.neuter.pytest_run.foreign_product_pg_container_running", lambda: False
     )
     real_shaped_handle = PgHandle(
         name="w1", dsn="postgresql+psycopg2://x/y", fake=False
@@ -893,3 +942,324 @@ def test_mock_engine_worker_gets_dsn_when_a_real_pg_handle_exists(
     assert (
         captured_env.get("AUDITTRACE_TEST_POSTGRES_URL") == "postgresql+psycopg2://x/y"
     )
+
+
+# ─────────── review round 2 coverage-closing: new blocker/should-fix code ──
+
+
+def test_run_pool_refuses_nonempty_evidence_dir_without_resume(tmp_path):
+    """Blocker 3 should-fix: a non-empty evidence dir from an earlier run
+    must never be silently reused without --resume."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    evidence = _ev(tmp_path)
+    evidence.mkdir(parents=True, exist_ok=True)
+    (evidence / "neuter_results_w1.jsonl").write_text('{"id": "stale"}\n')
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        src_root_relative="",
+        resume=False,
+    )
+    assert exit_code == EXIT_EVIDENCE_NOT_EMPTY
+
+
+def test_sample_pool_metrics_writes_one_sample(tmp_path):
+    """Direct call (the background thread's own body never runs inside a
+    normal test's lifetime -- ``interval_s`` defaults to 5s): proves the
+    real ``/proc/meminfo`` + ``docker ps`` + jsonl-append path works, not
+    just that the thread can be started."""
+    evidence = _ev(tmp_path)
+    stop = threading.Event()
+    stop.set()  # `stop.wait(interval_s)` returns True immediately -> one pass, then exit
+    # Force one iteration before the stop check: call the loop body directly
+    # by using an Event that is NOT set yet, with interval_s=0, then set it
+    # from a timer so the loop runs exactly once.
+    stop2 = threading.Event()
+
+    def _set_soon():
+        stop2.set()
+
+    timer = threading.Timer(0.05, _set_soon)
+    timer.start()
+    _sample_pool_metrics(evidence, stop2, interval_s=0.01)
+    timer.join()
+    metrics_path = evidence / "pool_metrics.jsonl"
+    assert metrics_path.exists()
+    rows = [json.loads(line) for line in metrics_path.read_text().splitlines() if line]
+    assert len(rows) >= 1
+    assert "avail_mb" in rows[0]
+    assert "containers" in rows[0]
+
+
+def test_worker_main_direct_crash_is_caught_and_logged(tmp_path, monkeypatch):
+    """A non-``DirtyTreeError`` exception ANYWHERE in the worker's setup
+    (here: ``start_container``) must be caught, logged as ``worker_crashed``,
+    and never propagate -- an uncaught exception here would silently kill
+    the ``multiprocessing.Process`` with the parent none the wiser
+    (blocker 1's fail-open)."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    neuters_by_id = {n.id: n for n in spec.neuters}
+
+    def raise_on_start(*args, **kwargs):
+        raise RuntimeError("simulated container start failure")
+
+    monkeypatch.setattr("scripts.neuter.pool.start_container", raise_on_start)
+    q: queue.Queue[str | None] = queue.Queue()
+    q.put("w1")
+    q.put(None)
+    stop_flag = threading.Event()
+    evidence = _ev(tmp_path)
+    with _held_lock(tmp_path / "worker.lock"):
+        _worker_main(
+            1,
+            q,
+            spec,
+            neuters_by_id,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=evidence,
+            run_id="direct",
+            python=PYTHON,
+            timeout_s=30,
+            tmpfs=False,
+            fake_db=True,
+            pathcheck_module="guarded",
+            src_root_relative="",
+            resume_rows={},
+            stop_flag=stop_flag,
+            lock_path=tmp_path / "worker.lock",
+        )
+    events = [
+        json.loads(line)
+        for line in (evidence / "events.jsonl").read_text().splitlines()
+    ]
+    crashes = [e for e in events if e.get("event") == "worker_crashed"]
+    assert len(crashes) == 1
+    assert "simulated container start failure" in crashes[0]["error"]
+
+
+def test_worker_main_direct_stop_container_failure_is_logged(tmp_path, monkeypatch):
+    """``stop_container`` raising in the worker's cleanup must be logged,
+    never allowed to mask the row/crash the process."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    neuters_by_id = {n.id: n for n in spec.neuters}
+    real_start = __import__(
+        "scripts.neuter.pool", fromlist=["start_container"]
+    ).start_container
+
+    def fake_stop(handle):
+        raise RuntimeError("simulated docker rm failure")
+
+    monkeypatch.setattr("scripts.neuter.pool.stop_container", fake_stop)
+    q: queue.Queue[str | None] = queue.Queue()
+    q.put("w1")
+    q.put("w2")
+    q.put(None)
+    stop_flag = threading.Event()
+    evidence = _ev(tmp_path)
+    with _held_lock(tmp_path / "worker.lock"):
+        _worker_main(
+            1,
+            q,
+            spec,
+            neuters_by_id,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=evidence,
+            run_id="direct",
+            python=PYTHON,
+            timeout_s=30,
+            tmpfs=False,
+            fake_db=True,
+            pathcheck_module="guarded",
+            src_root_relative="",
+            resume_rows={},
+            stop_flag=stop_flag,
+            lock_path=tmp_path / "worker.lock",
+        )
+    assert real_start is not None  # sanity: the real function still exists
+    rows = [
+        json.loads(line)
+        for line in (evidence / "neuter_results_w1.jsonl").read_text().splitlines()
+    ]
+    assert {r["id"] for r in rows} == {"w1", "w2"}
+
+
+def _baseline_spec(
+    repo: Path, *, test_id: str = "test_guarded.py::test_a"
+) -> NeuterSpecFile:
+    entry = _entry(
+        id="b1",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=[test_id],
+    )
+    return NeuterSpecFile(
+        schema=3,
+        sha=_sha(repo),
+        scope_files=["test_guarded.py"],
+        guard_tests=[GuardTestEntry(id=test_id, row="G")],
+        neuters=[entry],
+        path=Path("unused.json"),
+    )
+
+
+def test_run_baseline_success_path(tmp_path):
+    repo = _init_repo(tmp_path)
+    spec = _baseline_spec(repo)
+    with _held_lock(tmp_path / "baseline.lock"):
+        ok, detail = run_baseline(
+            spec,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=_ev(tmp_path),
+            run_id="baseline-direct",
+            python=PYTHON,
+            timeout_s=30,
+            lock_path=tmp_path / "baseline.lock",
+        )
+    assert ok is True
+    assert detail == ""
+
+
+def test_run_baseline_reports_failure_detail(tmp_path, monkeypatch):
+    """The mapped test is already broken at the pinned sha: baseline must
+    report the failing id(s) in its detail string, never just a bare
+    exit code."""
+    repo = _init_repo(tmp_path)
+    (repo / "test_guarded.py").write_text(
+        (repo / "test_guarded.py").read_text()
+        + "\n\ndef test_always_fails():\n    assert False\n"
+    )
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "add a failing test")
+    spec = _baseline_spec(repo, test_id="test_guarded.py::test_always_fails")
+    with _held_lock(tmp_path / "baseline.lock"):
+        ok, detail = run_baseline(
+            spec,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=_ev(tmp_path),
+            run_id="baseline-fail",
+            python=PYTHON,
+            timeout_s=30,
+            lock_path=tmp_path / "baseline.lock",
+        )
+    assert ok is False
+    assert "test_always_fails" in detail
+
+
+def test_run_baseline_refuses_on_foreign_pg_container(tmp_path, monkeypatch):
+    """Review round 2 blocker 5: baseline goes through the SAME
+    foreign-durable-container watch every phase does now."""
+    repo = _init_repo(tmp_path)
+    spec = _baseline_spec(repo)
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = True
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    ok, detail = run_baseline(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="baseline-foreign",
+        python=PYTHON,
+        timeout_s=30,
+        lock_path=tmp_path / "baseline.lock",
+    )
+    assert ok is False
+    assert "foreign" in detail
+
+
+def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
+    """Review round 2 blocker 1: a row that was RED on its targeted run,
+    but whose full-scope drift re-run shows the SAME mapped test as
+    PASSED (i.e. never reproduced the edit), must be flagged
+    ``drift_not_reproduced`` -- never a silent, falsely-clean
+    ``unmapped_red=[]``."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    rows = {
+        "w1": {"verdict": "RED"},
+        "w2": {"verdict": "RED"},
+    }
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+
+    def fake_run_pytest(*, junit_path, **kwargs):
+        # write a junit file where NEITHER mapped test failed.
+        junit_path.parent.mkdir(parents=True, exist_ok=True)
+        junit_path.write_text(
+            '<?xml version="1.0"?><testsuite tests="2">'
+            '<testcase classname="test_guarded" name="test_a"/>'
+            '<testcase classname="test_guarded" name="test_b"/>'
+            "</testsuite>"
+        )
+        return _FakeResult()
+
+    monkeypatch.setattr("scripts.neuter.pool.run_pytest", fake_run_pytest)
+    sample_full_scope_drift(
+        spec,
+        rows,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="drift-nr",
+        python=PYTHON,
+        timeout_s=30,
+        sample=1.0,
+        lock_path=tmp_path / "drift.lock",
+    )
+    assert rows["w1"].get("drift_not_reproduced") is True
+    assert rows["w2"].get("drift_not_reproduced") is True
+    assert "unmapped_red" not in rows["w1"]
+
+
+def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
+    """Review round 2 blocker 5: drift also refuses to trust a measurement
+    taken while a foreign, durable product Postgres container was seen."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    rows = {"w1": {"verdict": "RED"}, "w2": {"verdict": "RED"}}
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = True
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    sample_full_scope_drift(
+        spec,
+        rows,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="drift-fpc",
+        python=PYTHON,
+        timeout_s=30,
+        sample=1.0,
+        lock_path=tmp_path / "drift.lock",
+    )
+    assert rows["w1"].get("drift_foreign_pg_container") is True
+    assert "unmapped_red" not in rows["w1"]

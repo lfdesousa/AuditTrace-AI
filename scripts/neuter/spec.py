@@ -10,10 +10,12 @@ print them and exit 3 without a stack trace.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from scripts.neuter import lock as lockmod
+from scripts.neuter.pytest_run import run_pytest
 
 EXIT_SPEC_ERROR = 3
 
@@ -77,10 +79,19 @@ def _git_show(repo_dir: Path, sha: str, file: str) -> str:
 
 
 def _collect_ids(
-    repo_dir: Path, sha: str, scope_files: list[str], python: str
+    repo_dir: Path,
+    sha: str,  # noqa: ARG001 - kept in the signature; callers pass the pinned sha for clarity/logging
+    scope_files: list[str],
+    python: str,
+    *,
+    lock_path: Path | None,
+    already_locked: bool,
 ) -> set[str]:
     """Run ``--collect-only`` once over ``scope_files`` at ``sha`` (checked
-    out in ``repo_dir``) and return the collected node ids.
+    out in ``repo_dir``) and return the collected node ids -- through the
+    SAME chokepoint (:func:`scripts.neuter.pytest_run.run_pytest`) every
+    other phase (neuter/baseline/drift/arbitrate) uses (review round 2:
+    collect is one of the five phases the chokepoint requirement names).
 
     ``-o addopts=""`` overrides whatever the TARGET repo's own
     ``pyproject.toml``/``pytest.ini`` sets (a ``-v`` there switches
@@ -88,35 +99,26 @@ def _collect_ids(
     parses to a verbose ``<Dir>/<Module>/<Function>`` tree instead) --
     portable regardless of which repo is being neutered.
 
-    ``PYTHONPATH`` is pinned to ``<repo_dir>/src`` explicitly: without it,
-    an editable install of the SAME package in ``python``'s own environment
-    (e.g. the harness's own dev venv, if it happens to be reused to collect
-    against a DIFFERENT checkout) can resolve import collisions from ITS
-    OWN site-packages ``.pth`` entry instead of ``repo_dir``'s tree,
-    collecting nothing there was to collect and failing every id as
-    ``uncollected`` (exit 3) until this is pinned.
+    ``PYTHONPATH`` is pinned to ``<repo_dir>/src`` (the chokepoint's own
+    rule): without it, an editable install of the SAME package in
+    ``python``'s own environment (e.g. the harness's own dev venv, if it
+    happens to be reused to collect against a DIFFERENT checkout) can
+    resolve import collisions from ITS OWN site-packages ``.pth`` entry
+    instead of ``repo_dir``'s tree, collecting nothing there was to collect
+    and failing every id as ``uncollected`` (exit 3) until this is pinned.
     """
-    env = dict(os.environ)
-    src_dir = str(repo_dir / "src")
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = f"{src_dir}:{existing}" if existing else src_dir
-    result = subprocess.run(
-        [
-            python,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-o",
-            "addopts=",
-            *scope_files,
-        ],
-        cwd=repo_dir,
-        env=env,
-        capture_output=True,
-        text=True,
+    resolved_lock = lockmod.resolve_lock_path(str(lock_path) if lock_path else None)
+    result = run_pytest(
+        workdir=repo_dir,
+        pytest_args=list(scope_files),
+        python=python,
+        lock_path=resolved_lock,
+        src_root=str(repo_dir / "src"),
+        collect_only=True,
+        already_locked=already_locked,
     )
-    ids = {line.strip() for line in result.stdout.splitlines() if "::" in line}
+    stdout = result.collect_stdout or ""
+    ids = {line.strip() for line in stdout.splitlines() if "::" in line}
     return ids
 
 
@@ -126,12 +128,24 @@ def load_neuter_spec(
     repo_dir: Path,
     python: str,
     collected_ids: set[str] | None = None,
+    lock_path: Path | None = None,
+    already_locked: bool = False,
 ) -> NeuterSpecFile:
     """Load and fail-closed validate a neuter spec file (§3).
 
     ``collected_ids``, when given, is used instead of running
     ``--collect-only`` again (the pool runs it once, in worker 1's
     worktree, per §3).
+
+    ``lock_path``/``already_locked``: threaded straight through to the
+    collect phase's chokepoint call (review round 2). A caller that has
+    already taken the heavy-cap lock itself (the ``run``/``arbitrate``/
+    ``report`` CLI commands) passes ``already_locked=True`` so collect only
+    ASSERTS the lock, never re-acquires it (which would self-conflict on a
+    second file descriptor to the same lock file). A standalone caller
+    (most existing unit tests, or a direct script) leaves the default
+    ``already_locked=False``: collect acquires+releases ``lock_path`` (or
+    the process-wide default) itself around the ``--collect-only`` call.
     """
     try:
         raw = json.loads(path.read_text())
@@ -242,7 +256,14 @@ def load_neuter_spec(
         )
 
     if collected_ids is None:
-        collected_ids = _collect_ids(repo_dir, sha, scope_files, python)
+        collected_ids = _collect_ids(
+            repo_dir,
+            sha,
+            scope_files,
+            python,
+            lock_path=lock_path,
+            already_locked=already_locked,
+        )
     for test_id in sorted(all_tests):
         if test_id not in collected_ids:
             raise SpecLoadError("uncollected", test_id)

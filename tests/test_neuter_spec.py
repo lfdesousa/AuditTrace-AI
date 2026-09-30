@@ -69,7 +69,9 @@ def _write(path: Path, spec: dict) -> Path:
 
 def test_load_valid_spec(tmp_path, repo):
     spec_path = _write(tmp_path, _valid_spec(repo))
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     assert spec.sha == _sha(repo)
     assert len(spec.neuters) == 1
     assert spec.neuters[0].id == "n1"
@@ -77,7 +79,12 @@ def test_load_valid_spec(tmp_path, repo):
 
 def test_missing_file_exit_3(tmp_path, repo):
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(tmp_path / "missing.json", repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            tmp_path / "missing.json",
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "unreadable"
 
 
@@ -85,7 +92,9 @@ def test_bad_json_exit_3(tmp_path, repo):
     p = tmp_path / "neuters.json"
     p.write_text("not json {{{")
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(p, repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            p, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
     assert excinfo.value.reason == "unreadable"
 
 
@@ -93,7 +102,12 @@ def test_wrong_schema(tmp_path, repo):
     d = _valid_spec(repo)
     d["schema"] = 2
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "schema"
 
 
@@ -101,7 +115,12 @@ def test_missing_sha(tmp_path, repo):
     d = _valid_spec(repo)
     del d["sha"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "sha"
 
 
@@ -109,7 +128,12 @@ def test_empty_scope_files(tmp_path, repo):
     d = _valid_spec(repo)
     d["scope_files"] = []
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "scope_files"
 
 
@@ -117,7 +141,12 @@ def test_empty_guard_tests(tmp_path, repo):
     d = _valid_spec(repo)
     d["guard_tests"] = []
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "guard_tests"
 
 
@@ -125,7 +154,12 @@ def test_empty_neuters(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"] = []
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "neuters"
 
 
@@ -133,7 +167,12 @@ def test_missing_neuter_id(tmp_path, repo):
     d = _valid_spec(repo)
     del d["neuters"][0]["id"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "neuter_id"
 
 
@@ -141,7 +180,12 @@ def test_duplicate_neuter_id(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"].append(dict(d["neuters"][0]))
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "duplicate_id"
 
 
@@ -149,7 +193,12 @@ def test_expect_not_red(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["expect"] = "GREEN"
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "expect"
 
 
@@ -157,7 +206,12 @@ def test_missing_neuter_file(tmp_path, repo):
     d = _valid_spec(repo)
     del d["neuters"][0]["file"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "neuter_file"
 
 
@@ -165,7 +219,12 @@ def test_empty_edits(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["edits"] = []
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "edits"
 
 
@@ -173,7 +232,12 @@ def test_old_equals_new(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["edits"][0]["new"] = d["neuters"][0]["edits"][0]["old"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "old_eq_new"
 
 
@@ -181,7 +245,12 @@ def test_empty_tests(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["tests"] = []
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "tests"
 
 
@@ -189,7 +258,12 @@ def test_unknown_engine(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["engines"] = ["oracle"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "engines"
 
 
@@ -197,7 +271,12 @@ def test_untracked_file(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["file"] = "does_not_exist.py"
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "untracked_file"
 
 
@@ -205,7 +284,12 @@ def test_zero_match(tmp_path, repo):
     d = _valid_spec(repo)
     d["neuters"][0]["edits"][0]["old"] = "nonexistent"
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "match_count"
 
 
@@ -218,7 +302,12 @@ def test_two_match(tmp_path, repo):
     subprocess.run(["git", "commit", "-am", "dup"], cwd=repo, capture_output=True)
     d["sha"] = _sha(repo)
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "match_count"
 
 
@@ -226,7 +315,12 @@ def test_guard_tests_entry_without_row(tmp_path, repo):
     d = _valid_spec(repo)
     del d["guard_tests"][0]["row"]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "guard_tests_row"
 
 
@@ -234,7 +328,12 @@ def test_closure_mismatch(tmp_path, repo):
     d = _valid_spec(repo)
     d["guard_tests"].append({"id": "test_mod.py::test_unrelated", "row": "R2"})
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "closure"
 
 
@@ -243,7 +342,12 @@ def test_uncollected_test_id(tmp_path, repo):
     d["neuters"][0]["tests"] = ["test_mod.py::test_nonexistent"]
     d["guard_tests"] = [{"id": "test_mod.py::test_nonexistent", "row": "R1"}]
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(_write(tmp_path, d), repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            _write(tmp_path, d),
+            repo_dir=repo,
+            python=PYTHON,
+            lock_path=tmp_path / "collect.lock",
+        )
     assert excinfo.value.reason == "uncollected"
 
 
@@ -268,5 +372,7 @@ def test_load_survives_a_target_repo_whose_own_addopts_forces_verbose_collection
     _run_git(repo, "add", "-A")
     _run_git(repo, "commit", "-q", "-m", "force verbose addopts")
     spec_path = _write(tmp_path, _valid_spec(repo))
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     assert spec.neuters[0].id == "n1"

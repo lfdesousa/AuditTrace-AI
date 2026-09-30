@@ -22,6 +22,7 @@ import pytest
 from scripts.neuter import lock as lockmod
 from scripts.neuter.pg import PgHandle, start_container
 from scripts.neuter.pool import (
+    EXIT_DRIFT_UNACKNOWLEDGED,
     WorkerContext,
     compute_neuter_hash,
     run_one_neuter,
@@ -86,6 +87,11 @@ def _ctx(
         pathcheck_module="guarded",
         timeout_s=timeout_s,
         src_root=src_root or str(repo),
+        # a per-test, never-contended lock file: `already_locked` stays
+        # False (the default), so the chokepoint self-acquires+releases
+        # this exact path around each `run_one_neuter` call -- a real,
+        # if trivially-uncontended, exercise of the lock-enforcement rule.
+        lock_path=evidence_dir.parent / "test.lock",
     )
 
 
@@ -138,7 +144,9 @@ def test_proof_a_pool_exit_code_is_2(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     exit_code = run_pool(
         spec,
         repo_dir=repo,
@@ -150,7 +158,16 @@ def test_proof_a_pool_exit_code_is_2(tmp_path):
         lock_path=tmp_path / "pool.lock",
         **FIXTURE_POOL_KWARGS,
     )
-    assert exit_code == 2
+    # Review round 2, blocker 4: the drift sample (default sample=0.10,
+    # always covers the pool's one neuter here) now correctly measures
+    # this wrong-mapping neuter's REAL effect on the full scope -- it
+    # breaks test_b, which is outside its own `tests` mapping. A non-empty
+    # `unmapped_red` on ANY row (this one reads GREEN on its own targeted
+    # test, but that GREEN is not "clean") makes the pool exit
+    # EXIT_DRIFT_UNACKNOWLEDGED, not the bare vacuous-GREEN code -- the
+    # SAME wrong-mapping defect proof a demonstrates is now caught one
+    # layer earlier, by the pool itself, not just by `arbitrate`.
+    assert exit_code == EXIT_DRIFT_UNACKNOWLEDGED
 
 
 # ───────────────────────── b. text mismatch ──────────────────────────────
@@ -179,7 +196,9 @@ def test_proof_b_zero_match_exits_3(tmp_path):
         )
     )
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
     assert excinfo.value.reason == "match_count"
     assert not _ev(tmp_path, create=False).exists()
     assert (
@@ -212,7 +231,9 @@ def test_proof_b_two_match_exits_3(tmp_path):
         )
     )
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
     assert excinfo.value.reason == "match_count"
 
 
@@ -366,7 +387,9 @@ def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
     }
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(spec_dict))
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
 
     run_pool(
         spec,
@@ -390,7 +413,9 @@ def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
     spec_dict["neuters"][0]["edits"][0]["new"] = "    return x + 20"
     # `old` still matches once in guarded.py's committed tree.
     spec_path.write_text(json.dumps(spec_dict))
-    spec2 = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec2 = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     run_pool(
         spec2,
         repo_dir=repo,
@@ -482,7 +507,9 @@ def test_proof_g_unmapped_guard_test_id_exits_3(tmp_path):
         )
     )
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
     assert excinfo.value.reason == "closure"
 
 
@@ -511,7 +538,9 @@ def test_proof_g_entry_without_row_exits_3(tmp_path):
         )
     )
     with pytest.raises(SpecLoadError) as excinfo:
-        load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
     assert excinfo.value.reason == "guard_tests_row"
 
 
@@ -540,7 +569,9 @@ def test_proof_g_reviewer_guard_tests_diff_is_report_only(tmp_path):
             }
         )
     )
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     reviewer_guard_tests = [
         GuardTestEntry(id="test_guarded.py::test_a", row="G1"),
         GuardTestEntry(id="test_guarded.py::test_b", row="G2"),
@@ -707,7 +738,9 @@ def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
                 }
             )
         )
-        spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        spec = load_neuter_spec(
+            spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+        )
         exit_code = run_pool(
             spec,
             repo_dir=repo,
@@ -727,7 +760,9 @@ def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
         child.wait(timeout=10)
 
     # after the child exits, the pool starts.
-    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
     exit_code = run_pool(
         spec,
         repo_dir=repo,
@@ -775,7 +810,14 @@ def test_proof_m_sf2_isolated_lock_path_survives_an_outer_shared_default_lock(
                 }
             )
         )
-        spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+        spec = load_neuter_spec(
+            spec_path,
+            repo_dir=repo,
+            python=PYTHON,
+            # collect is ALSO chokepoint-gated (review round 2) -- its own
+            # isolated lock, never the outer/default one, same SF-2 rule.
+            lock_path=tmp_path / "isolated-collect.lock",
+        )
         exit_code = run_pool(
             spec,
             repo_dir=repo,

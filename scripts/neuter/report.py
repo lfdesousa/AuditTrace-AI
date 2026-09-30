@@ -215,13 +215,41 @@ def write_report(evidence_dir: Path, spec: Any, **kwargs: Any) -> Path:
     return out
 
 
+def _parse_trailer_fields(trailer_line: str) -> dict[str, str]:
+    """Parse the trailer's own ``key=value`` tokens (review round 2
+    should-fix): the trailer EMBEDS the evidence directory's path
+    (``generated-from: <evidence_dir>/neuter_results.jsonl ...``), so a
+    plain substring check (``"drift_n=0" not in trailer_line``) is fooled
+    by an evidence directory whose OWN path happens to contain that exact
+    text (e.g. a test fixture literally named ``.../drift_n=0/...``).
+    Splitting on whitespace and requiring an EXACT key match before the
+    first ``=`` means a malformed "key" lifted out of the path (which will
+    contain ``/`` and never equals a real field name) can never collide
+    with the genuine trailer field emitted later on the same line."""
+    fields: dict[str, str] = {}
+    for token in trailer_line.split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            fields[key] = value
+    return fields
+
+
 def verify_report(
-    evidence_dir: Path, spec: Any, *, ack_errors: bool = False, **kwargs: Any
+    evidence_dir: Path,
+    spec: Any,
+    *,
+    ack_errors: bool = False,
+    ack_drift: bool = False,
+    **kwargs: Any,
 ) -> int:
     """``--verify``: exit 7 on any byte difference, an open arbitration
     defect (SF-D), a spec neuter with no row (blocker 1), a GREEN with no
-    confirming full-scope arbitration (blocker 3), or an unacknowledged
-    ERROR (``error_n > 0`` without ``ack_errors=True``, blocker 1)."""
+    confirming full-scope arbitration (blocker 3), an unacknowledged ERROR
+    (``error_n > 0`` without ``ack_errors=True``, blocker 1), or an
+    unacknowledged non-empty ``unmapped_red`` on ANY row (``drift_n > 0``
+    without ``ack_drift=True`` -- review round 2 blocker 4: a RED row with
+    drift is not "clean" just because its own targeted verdict was already
+    RED)."""
     out = evidence_dir / "per_guard_table.md"
     if not out.exists():
         return EXIT_VERIFY_FAILED
@@ -229,12 +257,15 @@ def verify_report(
     if fresh != out.read_text():
         return EXIT_VERIFY_FAILED
     trailer_line = fresh.splitlines()[-1]
-    if "defect_n=0" not in trailer_line:
+    fields = _parse_trailer_fields(trailer_line)
+    if fields.get("defect_n") != "0":
         return EXIT_VERIFY_FAILED
-    if "missing_n=0" not in trailer_line:
+    if fields.get("missing_n") != "0":
         return EXIT_VERIFY_FAILED
-    if "unconfirmed_green_n=0" not in trailer_line:
+    if fields.get("unconfirmed_green_n") != "0":
         return EXIT_VERIFY_FAILED
-    if "error_n=0" not in trailer_line and not ack_errors:
+    if fields.get("error_n") != "0" and not ack_errors:
+        return EXIT_VERIFY_FAILED
+    if fields.get("drift_n") != "0" and not ack_drift:
         return EXIT_VERIFY_FAILED
     return 0

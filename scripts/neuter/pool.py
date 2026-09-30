@@ -60,6 +60,7 @@ from typing import Any
 from scripts.neuter import lock as lockmod
 from scripts.neuter.classify import classify
 from scripts.neuter.junit import (
+    mapped_failed_in_full,
     parse_junit,
     parse_junit_full,
     unmapped_assertion_shaped_failures,
@@ -70,12 +71,11 @@ from scripts.neuter.pg import (
     PgHandle,
     assert_nondurable,
     db_snapshot,
-    foreign_product_pg_container_running,
-    poll_db_leak,
     read_settings,
     start_container,
     stop_container,
 )
+from scripts.neuter.pytest_run import run_pytest
 from scripts.neuter.spec import NeuterEntry, NeuterSpecFile
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,8 @@ EXIT_BASELINE_FAILED = 5
 EXIT_LOCK_HELD = 8
 EXIT_MISSING_ROWS = 10
 EXIT_WORKERS_UNMEASURED = 12
+EXIT_EVIDENCE_NOT_EMPTY = 13
+EXIT_DRIFT_UNACKNOWLEDGED = 14
 
 
 class DirtyTreeError(Exception):
@@ -173,40 +175,6 @@ def py_compile_ok(workdir: Path, entry: NeuterEntry, python: str) -> bool:
     return result.returncode == 0
 
 
-def _log_line_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    with path.open() as fh:
-        return sum(1 for _ in fh)
-
-
-def _run_pytest_full_scope(
-    workdir: Path, python: str, scope_files: list[str], junit_path: Path, timeout_s: int
-) -> tuple[int | None, bool]:
-    """Run ``scope_files`` (the WHOLE scope, never just mapped tests) and
-    return ``(exit_code, timed_out)``. Shared by the drift sampler and
-    ``arbitrate``."""
-    junit_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        python,
-        "-m",
-        "pytest",
-        *scope_files,
-        "-q",
-        "--no-cov",
-        "-o",
-        "addopts=",
-        f"--junitxml={junit_path}",
-    ]
-    try:
-        result = subprocess.run(
-            cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s
-        )
-        return result.returncode, False
-    except subprocess.TimeoutExpired:
-        return None, True
-
-
 @dataclass
 class WorkerContext:
     workdir: Path
@@ -217,12 +185,22 @@ class WorkerContext:
     evidence_dir: Path
     pg_handle: PgHandle | None
     pathcheck_expect: str
+    lock_path: Path
     pathcheck_module: str = "audittrace"
     timeout_s: int = 900
     #: PYTHONPATH root prepended before the tested package resolves (real
     #: worker worktrees use ``<workdir>/src``; the self-proof fixture's
     #: toy ``guarded`` module sits at its repo root instead).
     src_root: str | None = None
+    #: ``True`` when the CALLER (``_worker_main``, itself inside
+    #: ``run_pool``'s own long-held lock) already holds ``lock_path`` --
+    #: the chokepoint then only ASSERTS it, never re-acquires (which would
+    #: self-conflict on a second file descriptor). ``False`` (default) is
+    #: for a standalone caller (the self-proof fixture calls
+    #: ``run_one_neuter`` directly, with no outer pool lock held) -- the
+    #: chokepoint acquires+releases ``lock_path`` itself around this one
+    #: invocation.
+    already_locked: bool = False
 
 
 def _base_row(
@@ -273,7 +251,6 @@ def run_one_neuter(
     pathcheck_log = ctx.evidence_dir / f"pathcheck_w{ctx.worker_idx}.log"
 
     if not nocompile:
-        real_pg = ctx.pg_handle is not None and not ctx.pg_handle.fake
         want_pg_check = "postgres" in entry.engines and ctx.pg_handle is not None
         if want_pg_check:
             pg_settings = read_settings(ctx.pg_handle)
@@ -315,67 +292,32 @@ def run_one_neuter(
                 return row
             db_before = db_snapshot(ctx.pg_handle)
 
-        junit_path.parent.mkdir(parents=True, exist_ok=True)
-        before_lines = _log_line_count(pathcheck_log)
-        env = dict(os.environ)
+        # THE chokepoint (review round 2): every pytest invocation, every
+        # phase, funnels through here -- pins PYTHONPATH, passes the DSN,
+        # watches for a foreign durable container, enforces the lock.
         src_root = ctx.src_root or f"{ctx.workdir}/src"
-        env["PYTHONPATH"] = f"{src_root}:{Path(__file__).resolve().parent}"
-        env["NEUTER_PATHCHECK_MODULE"] = ctx.pathcheck_module
-        env["NEUTER_PATHCHECK_EXPECT"] = ctx.pathcheck_expect
-        env["NEUTER_PATHCHECK_LOG"] = str(pathcheck_log)
-        # §9: EVERY worker with a real (non-fake) Postgres gets the DSN,
-        # regardless of whether THIS neuter's own `engines` names
-        # "postgres" -- a mock-engine neuter's mapped test file can still
-        # import a module that starts a DURABLE product container at
-        # import time (tests/_pg_ephemeral.py's callers) unless it finds
-        # AUDITTRACE_TEST_POSTGRES_URL already set and reuses the worker's
-        # own throwaway container instead.
-        if real_pg:
-            env["AUDITTRACE_TEST_POSTGRES_URL"] = ctx.pg_handle.dsn  # type: ignore[union-attr]
-        if (
-            ctx.pg_handle is not None
-            and ctx.pg_handle.fake
-            and ctx.pg_handle.fake_state_path is not None
-        ):
-            env["NEUTER_FAKE_PG_STATE"] = str(ctx.pg_handle.fake_state_path)
-
-        cmd = [
-            ctx.python,
-            "-m",
-            "pytest",
-            *entry.tests,
-            "-q",
-            "--no-cov",
-            "-o",
-            "addopts=",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "neuter_pathcheck",
-            "-rfE",
-            f"--junitxml={junit_path}",
-        ]
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=ctx.workdir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=ctx.timeout_s,
-            )
-            exit_code = result.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-
-        pathcheck_ok = _log_line_count(pathcheck_log) > before_lines
-
-        if want_pg_check and ctx.pg_handle is not None:
-            db_leak = poll_db_leak(ctx.pg_handle, db_before)
-            db_after = db_snapshot(ctx.pg_handle)
-
-        if real_pg:
-            foreign_pg_container = foreign_product_pg_container_running()
+        pytest_result = run_pytest(
+            workdir=ctx.workdir,
+            pytest_args=list(entry.tests),
+            python=ctx.python,
+            lock_path=ctx.lock_path,
+            timeout_s=ctx.timeout_s,
+            junit_path=junit_path,
+            pg_handle=ctx.pg_handle,
+            check_db_leak=want_pg_check,
+            pathcheck_module=ctx.pathcheck_module,
+            pathcheck_expect=ctx.pathcheck_expect,
+            pathcheck_log=pathcheck_log,
+            src_root=src_root,
+            already_locked=ctx.already_locked,
+        )
+        exit_code = pytest_result.exit_code
+        timed_out = pytest_result.timed_out
+        pathcheck_ok = bool(pytest_result.pathcheck_ok)
+        db_before = pytest_result.db_before or db_before
+        db_after = pytest_result.db_after
+        db_leak = pytest_result.db_leak
+        foreign_pg_container = pytest_result.foreign_pg_container
 
         junit_result = parse_junit(
             junit_path if junit_path.exists() else None, entry.tests
@@ -490,9 +432,16 @@ def run_baseline(
     run_id: str,
     python: str,
     timeout_s: int,
+    lock_path: Path,
 ) -> tuple[bool, str]:
     """SPEC v3 §5: before any neuter runs, every mapped test must PASS at
-    the pinned sha with NO edit applied. Returns ``(ok, detail)``."""
+    the pinned sha with NO edit applied. Returns ``(ok, detail)``.
+
+    Runs through the SAME chokepoint every other phase uses (review round
+    2): the venv's editable install would otherwise be imported instead of
+    THIS worktree, and no foreign-durable-container watch would ever run
+    for baseline at all.
+    """
     worktree = parent_worktree_dir / f"at-nt-{run_id}-baseline"
     subprocess.run(
         ["git", "worktree", "add", "--detach", str(worktree), spec.sha],
@@ -503,40 +452,48 @@ def run_baseline(
     try:
         all_tests = sorted({t for n in spec.neuters for t in n.tests})
         junit_path = evidence_dir / "junit" / "baseline.xml"
-        junit_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            python,
-            "-m",
-            "pytest",
-            *all_tests,
-            "-q",
-            "--no-cov",
-            "-o",
-            "addopts=",
-            "-rfE",
-            f"--junitxml={junit_path}",
-        ]
-        try:
-            result = subprocess.run(
-                cmd, cwd=worktree, capture_output=True, text=True, timeout=timeout_s
-            )
-        except subprocess.TimeoutExpired:
+        pytest_result = run_pytest(
+            workdir=worktree,
+            pytest_args=all_tests,
+            python=python,
+            lock_path=lock_path,
+            timeout_s=timeout_s,
+            junit_path=junit_path,
+            already_locked=True,
+        )
+        if pytest_result.foreign_pg_container:
+            return False, "a foreign, durable product Postgres container was observed"
+        if pytest_result.timed_out:
             return False, f"baseline timed out after {timeout_s}s"
-        if result.returncode not in (0,):
+        if pytest_result.exit_code not in (0,):
             full = parse_junit_full(junit_path if junit_path.exists() else None)
             failed = sorted(
                 "::".join(k) for k, o in full.by_key.items() if o.outcome != "passed"
             )
-            tail = result.stdout[-2000:]
-            return False, f"exit={result.returncode} failed={failed} tail={tail}"
+            return False, f"exit={pytest_result.exit_code} failed={failed}"
         return True, ""
     finally:
-        if worktree.exists() and git_diff_quiet(worktree):
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(worktree)],
-                cwd=repo_dir,
-                capture_output=True,
-            )
+        if worktree.exists():
+            if git_diff_quiet(worktree):
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    cwd=repo_dir,
+                    capture_output=True,
+                )
+            else:
+                # Should-fix (review round 2, deviation 2): a dirty
+                # baseline worktree is kept and LOGGED, the same fail-safe
+                # rule §6/proof c gives every worker -- previously this
+                # left the dirt silently, with no event at all.
+                logger.error("baseline: worktree %s left dirty, kept", worktree)
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worktree_kept_dirty",
+                        "phase": "baseline",
+                        "path": str(worktree),
+                    },
+                )
 
 
 def sample_full_scope_drift(
@@ -550,12 +507,22 @@ def sample_full_scope_drift(
     python: str,
     timeout_s: int,
     sample: float,
+    lock_path: Path,
 ) -> None:
     """SPEC v3 §5 sampled full-scope drift check: for a ``random.Random(run_id)``
     seeded sample of neuters, re-apply the edit and run the FULL
-    ``scope_files`` (not just the mapped tests). Any assertion-shaped
-    failure OUTSIDE the mapped set is MEASURED and written back onto that
-    row's ``unmapped_red`` -- never a constant. Mutates ``rows`` in place.
+    ``scope_files`` (not just the mapped tests) THROUGH THE CHOKEPOINT.
+    Any assertion-shaped failure OUTSIDE the mapped set is MEASURED and
+    written back onto that row's ``unmapped_red`` -- never a constant.
+    Mutates ``rows`` in place.
+
+    ``not_reproduced`` (review round 2, blocker 1): if the row's own
+    ORIGINAL verdict was RED but NONE of its mapped tests show as failed in
+    THIS full-scope run, the drift measurement itself did not reproduce the
+    edit (most likely a blind ``PYTHONPATH`` in an earlier defect, or a
+    dirty restore) -- ``unmapped_red`` is left untouched and
+    ``drift_not_reproduced`` is recorded instead of a falsely-clean
+    ``unmapped_red=[]``.
     """
     if sample <= 0 or not spec.neuters:
         return
@@ -589,8 +556,14 @@ def sample_full_scope_drift(
             junit_path = (
                 evidence_dir / "junit" / f"drift_{entry.id.replace('/', '_')}.xml"
             )
-            _run_pytest_full_scope(
-                worktree, python, spec.scope_files, junit_path, timeout_s
+            drift_result = run_pytest(
+                workdir=worktree,
+                pytest_args=list(spec.scope_files),
+                python=python,
+                lock_path=lock_path,
+                timeout_s=timeout_s,
+                junit_path=junit_path,
+                already_locked=True,
             )
             subprocess.run(
                 ["git", "checkout", "--", entry.file], cwd=worktree, check=True
@@ -600,7 +573,17 @@ def sample_full_scope_drift(
                     "drift sample: %s left %s dirty after restore", entry.id, worktree
                 )
                 continue
+            if drift_result.foreign_pg_container:
+                row["drift_foreign_pg_container"] = True
+                continue
             full = parse_junit_full(junit_path if junit_path.exists() else None)
+            if row.get("verdict") == "RED" and not mapped_failed_in_full(
+                full, entry.tests
+            ):
+                # The full-scope run never reproduced the original RED at
+                # all -- an unreliable measurement, not a clean one.
+                row["drift_not_reproduced"] = True
+                continue
             unmapped_red = unmapped_assertion_shaped_failures(full, entry.tests)
             row["unmapped_red"] = unmapped_red
             row["drift_sampled"] = True
@@ -671,6 +654,7 @@ def _worker_main(
     src_root_relative: str,
     resume_rows: dict[str, Any],
     stop_flag: mp.Event,  # type: ignore[type-arg]
+    lock_path: Path,
 ) -> None:
     worktree = parent_worktree_dir / f"at-nt-{run_id}-w{worker_idx}"
     out_path = evidence_dir / f"neuter_results_w{worker_idx}.jsonl"
@@ -707,6 +691,8 @@ def _worker_main(
             pathcheck_module=pathcheck_module,
             timeout_s=timeout_s,
             src_root=src_root,
+            lock_path=lock_path,
+            already_locked=True,
         )
         while not stop_flag.is_set():
             neuter_id = queue.get()
@@ -828,6 +814,7 @@ def run_pool(
     sample: float = 0.10,
     i_measured_it: bool = False,
     skip_baseline: bool = False,
+    ack_drift: bool = False,
 ) -> int:
     """Orchestrate the whole pool run (§6). Returns the process exit code."""
     python = python or f"{repo_dir}/.venv/bin/python"
@@ -838,6 +825,23 @@ def run_pool(
             f"neuter pool: evidence dir refused (/tmp): {evidence_dir}", file=sys.stderr
         )
         return EXIT_SPEC_ERROR
+
+    # Review round 2, blocker 3 (should-fix half): a non-empty evidence dir
+    # from an EARLIER run must never be silently reused -- a second,
+    # fully-crashed run into the same directory must not inherit the
+    # first run's rows. `--resume` is the only sanctioned way to point a
+    # run at an evidence dir that already has content.
+    if (
+        not resume
+        and evidence_dir.exists()
+        and any(evidence_dir.glob("neuter_results*.jsonl"))
+    ):
+        print(
+            f"neuter pool: {evidence_dir} already has neuter_results*.jsonl "
+            "(pass --resume to reuse it)",
+            file=sys.stderr,
+        )
+        return EXIT_EVIDENCE_NOT_EMPTY
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
     if workers > 10 and not i_measured_it:
@@ -886,6 +890,7 @@ def run_pool(
                 run_id=run_id,
                 python=python,
                 timeout_s=timeout_s,
+                lock_path=resolved_lock,
             )
             append_event(
                 evidence_dir,
@@ -926,6 +931,7 @@ def run_pool(
                     src_root_relative=src_root_relative,
                     resume_rows=resume_rows,
                     stop_flag=stop_flag,
+                    lock_path=resolved_lock,
                 ),
             )
             for i in range(workers)
@@ -935,7 +941,29 @@ def run_pool(
         for p in procs:
             p.join()
 
-        rows = load_existing_rows(evidence_dir)
+        # Review round 2, blocker 3: filter to THIS run's own rows
+        # (matching run_id) before anything downstream treats a row as
+        # satisfying the count. A row left over from an earlier, unrelated
+        # invocation into the SAME evidence dir must never count -- the
+        # reviewer's stale-row attack (a first run completes, a second,
+        # fully-crashed run reuses the dir) exited 0 on the FIRST run's
+        # rows before this filter existed. `--resume`'s legitimately
+        # skip-eligible prior rows are explicitly carried forward (their
+        # sha/hash/harness_version were already re-validated by
+        # `should_skip` before the worker decided to skip them).
+        all_rows = load_existing_rows(evidence_dir)
+        rows = {
+            rid: row for rid, row in all_rows.items() if row.get("run_id") == run_id
+        }
+        if resume:
+            for rid, row in resume_rows.items():
+                if rid in rows:
+                    continue
+                entry = neuters_by_id.get(rid)
+                if entry is not None and should_skip(
+                    entry, row, sha=spec.sha, harness_version=HARNESS_VERSION
+                ):
+                    rows[rid] = row
 
         if sample > 0:
             sample_full_scope_drift(
@@ -948,6 +976,7 @@ def run_pool(
                 python=python,
                 timeout_s=timeout_s,
                 sample=sample,
+                lock_path=resolved_lock,
             )
 
         merged = evidence_dir / "neuter_results.jsonl"
@@ -986,18 +1015,26 @@ def run_pool(
             )
             return EXIT_MISSING_ROWS
 
-        return pool_exit_code(rows)
+        return pool_exit_code(rows, ack_drift=ack_drift)
     finally:
         metrics_stop.set()
         os.close(lock_fd)
 
 
-def pool_exit_code(rows: dict[str, dict[str, Any]]) -> int:
+def pool_exit_code(rows: dict[str, dict[str, Any]], *, ack_drift: bool = False) -> int:
     """The whole run's exit code from its merged rows (§4 M7, §8): a
-    ``pg_settings`` row takes priority (exit 6); else any ``ERROR`` row
-    exits 9; else any ``GREEN`` (vacuous) row exits 2; else 0."""
+    ``pg_settings`` row takes priority (exit 6); else any row with a
+    non-empty ``unmapped_red`` is UNACKNOWLEDGED DRIFT (exit 14) unless
+    ``ack_drift`` -- review round 2 blocker 4: a RED row with drift is not
+    "clean" just because its own targeted verdict happened to be RED; the
+    neuter's ``tests`` mapping is incomplete either way, and that must be
+    surfaced, not silently folded into a plain RED/GREEN summary; else any
+    ``ERROR`` row exits 9; else any ``GREEN`` (vacuous) row exits 2; else 0.
+    """
     if any(r.get("error_reason") == "pg_settings" for r in rows.values()):
         return EXIT_NONDURABLE_SETTINGS
+    if not ack_drift and any(r.get("unmapped_red") for r in rows.values()):
+        return EXIT_DRIFT_UNACKNOWLEDGED
     verdicts = {r.get("verdict") for r in rows.values()}
     if "ERROR" in verdicts:
         return 9

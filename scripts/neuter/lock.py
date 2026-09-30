@@ -87,6 +87,33 @@ def try_flock(fd: int, flags: int) -> None:
         raise LockHeldError from exc
 
 
+def assert_lock_held(path: Path) -> None:
+    """Review round 2 chokepoint requirement: prove the heavy-cap lock at
+    ``path`` is CURRENTLY held (by anyone) before proceeding, without ever
+    acquiring or releasing it here.
+
+    Opens a FRESH file descriptor to ``path`` and attempts a non-blocking
+    ``LOCK_EX``. ``flock`` locks are per OPEN FILE DESCRIPTION, so even the
+    SAME process's own earlier fd holding the lock makes this probe fail
+    with :class:`LockHeldError` -- exactly the signal this function wants.
+    If the probe SUCCEEDS, nobody holds the lock: that is a caller bug (a
+    chokepoint invocation happening outside the lock's protection), so the
+    probe's own accidental lock is released immediately and this raises.
+    """
+    fd = open_lock_file(path)
+    try:
+        try:
+            try_flock(fd, fcntl.LOCK_EX)
+        except LockHeldError:
+            return  # held by someone else (or by our own earlier fd) -- good.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        raise RuntimeError(
+            f"chokepoint: {path} is not held -- pytest invoked outside the heavy-cap lock"
+        )
+    finally:
+        os.close(fd)
+
+
 def foreign_docker_build_running() -> bool:
     """``/proc/*/cmdline`` scan for a ``docker build``/``buildx`` process (§10 H4).
 
