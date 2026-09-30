@@ -516,3 +516,174 @@ async def test_ac_t_hist_time_limited_variant_mock(
     await _run_time_limited_cell(
         monkeypatch, service, _ctx(_OWNER), site, _read, pg=False
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AC-T-HIST-A2 (2026-09-28-SPEC-acl-2b-core-A2-revoke-modify-delete-
+# CONSOLIDATED-v4.md §7.0) — the SAME grid, over A2's three methods.
+# W1/W2 are UNCHANGED (W2 is always ``grant(7)``, creating R2); W3 is
+# one of ``revoke_permission``/``modify_permission_bits``/
+# ``delete_acl_entries`` at ``_KEY``. Unlike A1's ``site`` (grant/bulk,
+# which always creates a NEW row R3), revoke and delete create NOTHING
+# — so ``s3`` here is **R2's own ``expired_at_ms`` after W3**, not a
+# third row's ``created_at_ms``. For modify (which DOES insert a new
+# row) the two quantities coincide numerically (the INSERT's
+# ``created_at_ms`` and the UPDATE's ``expired_at_ms`` are both
+# ``stamp.now_ms``), so one formulation covers all three sites.
+# ═══════════════════════════════════════════════════════════════════════
+
+from audittrace.services.console_acl import PRINCIPAL_TYPE_USER  # noqa: E402
+
+_A2_SITES = ["revoke", "modify", "delete"]
+
+
+async def _site_a2(
+    service: Any, ctx: UserContext, site: str, key: dict[str, Any]
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Perform A2's W3 at ``key``. Returns ``(expired_ids, modify_row)``
+    — ``expired_ids`` is the method's own reported list for revoke/
+    delete, ``None`` for modify; ``modify_row`` is modify's OWN
+    returned row (BL-B/X2/X2b — never discarded: v4 §7.0's lapsed-cell
+    check reads it directly, not only the emitted table rows) and
+    ``None`` for revoke/delete. The grid ALSO reads R2's post-W3 state
+    from the EMITTED rows regardless (S-c discipline, same as A1's
+    ``ids_w2``/``ids_w3``)."""
+    if site == "revoke":
+        result = await service.revoke_permission(ctx, **key)
+        return list(result["expired_ids"]), None
+    if site == "modify":
+        row = await service.modify_permission_bits(ctx, remove_bits=4, **key)
+        return None, row
+    assert site == "delete"
+    predicate = dict(key)
+    predicate.setdefault("principal_type", PRINCIPAL_TYPE_USER)
+    result = await service.delete_acl_entries(ctx, [predicate])
+    return list(result["expired_ids"]), None
+
+
+async def _run_a2_cell(
+    monkeypatch: pytest.MonkeyPatch,
+    service: Any,
+    ctx: UserContext,
+    site: str,
+    case: str,
+    read: _ReadFn,
+    *,
+    pg: bool,
+) -> None:
+    lifetime_name, gap_name = case.split("-")
+    lifetime, gap = _LIFETIMES[lifetime_name], _GAPS[gap_name]
+    clock = {"t": _T0}
+    monkeypatch.setattr(_clock_module, "now_ms", lambda: clock["t"])
+
+    if pg:
+        set_current_user_id(ctx.user_id)
+    try:
+        r1_id = (
+            await service.grant_permission(
+                ctx, perm_bits=15, expired_at_ms=_T0 + lifetime, **_KEY
+            )
+        )["id"]
+        rows = await read()
+        created = rows[r1_id][1:3]
+        lifetime_written = rows[r1_id][1] - rows[r1_id][3]
+
+        clock["t"] = _T0 + lifetime + gap
+        r2_id = (await service.grant_permission(ctx, perm_bits=7, **_KEY))["id"]
+        rows = await read()
+        s2 = rows[r2_id][3]
+        after_w2 = rows[r1_id][1:3]
+
+        clock["t"] = s2 + 1
+        ids_w3, modify_row = await _site_a2(service, ctx, site, _KEY)
+        rows = await read()
+        s3 = rows[r2_id][1]
+        after_w3 = rows[r1_id][1:3]
+        r2_after_w3 = rows[r2_id][1:3]
+    finally:
+        if pg:
+            set_current_user_id(None)
+
+    gap_written = s2 - created[0]
+    precondition = gap_written == gap and lifetime_written == lifetime and s3 == s2 + 1
+    assert precondition, (
+        f"the cell's identity is what was WRITTEN, not requested "
+        f"(case={case!r} site={site!r} pg={pg}): gap_written={gap_written} "
+        f"(want {gap}) lifetime_written={lifetime_written} (want {lifetime}) "
+        f"s3-s2={s3 - s2} (want 1)"
+    )
+
+    if site == "modify":
+        # BL-B/X2/X2b — never discard modify's own returned row: at
+        # W3's clock, R2 (bits=7, NULL expiry) is the SOLE active row
+        # (R1 has already lapsed or been superseded by W2), so
+        # new_bits = (7 | 0) & ~4 == 3 — a widened active-clause (a
+        # grace period) would OR R1's stale bits=15 back in, giving 15.
+        assert modify_row is not None
+        assert modify_row["created_at_ms"] == s3, (
+            "RED — modify's new row must be stamped at W3's clock, "
+            "never inherited from the superseded row"
+        )
+        assert modify_row["perm_bits"] == 3, (
+            "RED — old_bits leaked a lapsed/stale row's SHARE bit(s)"
+        )
+        assert modify_row["expired_at_ms"] is None
+
+    if gap >= 0:
+        # Lapsed: R1 has already lapsed before W2 runs, and must stay
+        # UNTOUCHED by W2 AND W3.
+        assert after_w2 == created, "RED — R1 rewritten by W2 (lapsed cell)"
+        assert after_w3 == created, "RED — R1 rewritten by W3 (lapsed cell)"
+        if ids_w3 is not None:
+            assert ids_w3 == [r2_id], "RED — W3 must expire only R2"
+    else:
+        # Near-future: R1 is still active by exactly 1 ms when W2 runs
+        # and must be SUPERSEDED at W2's clock; W3 must not touch it
+        # again.
+        assert after_w2 == (s2, s2), "RED — R1 must be superseded by W2 (near-future)"
+        assert after_w3 == (s2, s2), "RED — R1 must not be touched again by W3"
+        if ids_w3 is not None:
+            assert ids_w3 == [r2_id]
+    assert r2_after_w3 == (s3, s3), "RED — R2 must be expired AT s3, updated_at_ms too"
+
+
+@pytest.mark.skipif(_ADMIN_URL is None, reason=_SKIP_REASON)
+@pytest.mark.parametrize("case", _CASES)
+@pytest.mark.parametrize("site", _A2_SITES)
+async def test_ac_t_hist_a2_grid_postgres(
+    write_harness: Any,  # noqa: F811 - reused fixture, imported above
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    case: str,
+) -> None:
+    owner = _ctx(_OWNER)
+    await _run_a2_cell(
+        monkeypatch,
+        write_harness.service,
+        owner,
+        site,
+        case,
+        lambda: _pg_rows(write_harness.factory, owner.user_id),
+        pg=True,
+    )
+
+
+@pytest.mark.parametrize("case", _CASES)
+@pytest.mark.parametrize("site", _A2_SITES)
+async def test_ac_t_hist_a2_grid_mock(
+    client: Any, monkeypatch: pytest.MonkeyPatch, site: str, case: str
+) -> None:
+    service = MockConsoleAclEntriesService()
+
+    async def _read() -> dict[str, _Row]:
+        return {
+            entry.id: (
+                entry.perm_bits,
+                entry.expired_at_ms,
+                entry.updated_at_ms,
+                entry.created_at_ms,
+            )
+            for entry in service._entries
+        }
+
+    await _run_a2_cell(monkeypatch, service, _ctx(_OWNER), site, case, _read, pg=False)
