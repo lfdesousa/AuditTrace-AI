@@ -1372,6 +1372,43 @@ async def _fresh_inherited_from(
         return result.scalar_one()
 
 
+async def _fresh_w1_stamps(
+    service: ConsoleAclEntriesService, row_id: str
+) -> dict[str, Any]:
+    """``created_at_ms``/``granted_at_ms``/``updated_at_ms``/
+    ``inherited_from`` for a SPECIFIC row, read from a FRESH lookup —
+    W1-STAMPS (ADDENDUM A, advisory since fix-3): the RETURNED dict a
+    prior call already produced could, in principle, be stale/cached
+    while the actually-written row differs; this closes that gap by
+    re-reading all four fields from a source the call under test never
+    touched again afterward."""
+    if isinstance(service, MockConsoleAclEntriesService):
+        row = next(e for e in service._entries if e.id == row_id)
+        return {
+            "created_at_ms": row.created_at_ms,
+            "granted_at_ms": row.granted_at_ms,
+            "updated_at_ms": row.updated_at_ms,
+            "inherited_from": row.inherited_from,
+        }
+    pg = dependencies.get_postgres_factory()
+    async with pg.get_session_factory()() as db:
+        result = await db.execute(
+            sa.select(
+                ConsoleAclEntry.created_at_ms,
+                ConsoleAclEntry.granted_at_ms,
+                ConsoleAclEntry.updated_at_ms,
+                ConsoleAclEntry.inherited_from,
+            ).where(ConsoleAclEntry.id == row_id)
+        )
+        row = result.one()
+        return {
+            "created_at_ms": row[0],
+            "granted_at_ms": row[1],
+            "updated_at_ms": row[2],
+            "inherited_from": row[3],
+        }
+
+
 # ── VAL — §3's pre-I/O ValueError shapes, no I/O, no audit row ──────────
 
 
@@ -1477,6 +1514,25 @@ class TestRevokePermission:
             _interactions(client), "revokePermission", "agent-revoke-none"
         )
         assert stored["status"] == "success"
+        # S03 (A2 fix-5, ADDENDUM-A A-1 W-Q) — the ZERO-MATCH revoke
+        # row is still a §7 W2 row; its question must render the
+        # CALLER'S own key, never a value that depends on whether
+        # anything was actually expired (S03's escape: principal_id
+        # renders "-" only on this exact zero-match branch).
+        assert stored["question"] == (
+            "op=revokePermission principal=user:v-revoke-none "
+            "resource=agent:agent-revoke-none bits=0 tenant=-"
+        )
+        fields = _parse_question(stored["question"])
+        assert fields == {
+            "op": "revokePermission",
+            "principal_type": "user",
+            "principal_id": "v-revoke-none",
+            "resource_type": "agent",
+            "resource_id": "agent-revoke-none",
+            "bits": "0",
+            "tenant": "-",
+        }
 
     async def test_retains_the_row_never_hard_deletes(
         self, service, user_context
@@ -1709,6 +1765,11 @@ class TestModifyPermissionBits:
         assert answer["acl_entry_ids"] == []
         assert answer["expired_ids"] == []
         assert answer["visible_matched_count"] == 1
+        # C1 (A2 fix-5, ADDENDUM-A A-2 W3 RACE) — the race branch's
+        # answer.expired_at_ms is None (inherited_expiry only applies
+        # when a new row is actually inserted; the race branch inserts
+        # nothing).
+        assert answer["expired_at_ms"] is None
 
     async def test_same_bits_still_expires_and_inserts(
         self, service, user_context
@@ -2424,6 +2485,18 @@ class TestKeySelectivity:
         # gap where a future refactor returns a stale/cached dict while
         # the actually-written row is correct, or vice versa.
         assert await _fresh_inherited_from(service, row["id"]) is None
+        # W1-STAMPS (ADDENDUM A, advisory since fix-3, closed fix-5) —
+        # ALL FOUR fields re-read from a fresh lookup, AT KSEL-t's own
+        # tenant-t1 key, never a NULL-tenant key: the returned dict a
+        # prior call already produced could, in principle, diverge from
+        # the actually-written row.
+        fresh = await _fresh_w1_stamps(service, row["id"])
+        assert fresh == {
+            "created_at_ms": 1_790_000_000_000,
+            "granted_at_ms": 1_790_000_000_000,
+            "updated_at_ms": 1_790_000_000_000,
+            "inherited_from": None,
+        }
         assert await _row_pair(service, null_sibling_id) == null_sibling_before
 
         # W3 insert branch (ADDENDUM A) — the SAME per-field parse on
@@ -2484,6 +2557,11 @@ class TestA2AuditWriteFailure:
     async def test_revoke_propagates_and_leaves_the_row_active(
         self, service, client, user_context, monkeypatch
     ) -> None:
+        # C4 (A2 fix-5, ADDENDUM-A A-2 W6-f) — run #4 at KSEL-t's OWN
+        # tenant-t1 key, never a NULL-tenant key: A-2's own words are
+        # "run #4 at KSEL-t's key: tenant=t1" — a NULL-tenant key can
+        # never distinguish a real tenant carrying through from one
+        # silently omitted.
         row = await service.grant_permission(
             user_context,
             principal_type="user",
@@ -2491,6 +2569,7 @@ class TestA2AuditWriteFailure:
             resource_type="agent",
             resource_id="agent-n4-revoke",
             perm_bits=1,
+            tenant_id="t1",
         )
         self._flaky_content_hash(monkeypatch)
         with pytest.raises(RuntimeError, match="content_hash broken"):
@@ -2500,6 +2579,7 @@ class TestA2AuditWriteFailure:
                 principal_id="v-n4-revoke",
                 resource_type="agent",
                 resource_id="agent-n4-revoke",
+                tenant_id="t1",
             )
         pair = await _row_pair(service, row["id"])
         assert pair[0] is None, "the row must still be ACTIVE — the expiry rolled back"
@@ -2516,7 +2596,7 @@ class TestA2AuditWriteFailure:
         # this test had before.
         assert rows[0]["question"] == (
             "op=revokePermission principal=user:v-n4-revoke "
-            "resource=agent:agent-n4-revoke bits=0 tenant=-"
+            "resource=agent:agent-n4-revoke bits=0 tenant=t1"
         )
         fields = _parse_question(rows[0]["question"])
         assert fields == {
@@ -2526,7 +2606,20 @@ class TestA2AuditWriteFailure:
             "resource_type": "agent",
             "resource_id": "agent-n4-revoke",
             "bits": "0",
-            "tenant": "-",
+            "tenant": "t1",
+        }
+        # C4 (A2 fix-5) — the answer/error_detail half: db_error_class
+        # is the REAL patched exception's class name (S13), and
+        # predicate_or_attempted_row is the call's own attempted dict,
+        # never omitted (S14).
+        detail = json.loads(rows[0]["error_detail"])
+        assert detail["db_error_class"] == "RuntimeError"
+        assert detail["predicate_or_attempted_row"] == {
+            "principal_type": "user",
+            "principal_id": "v-n4-revoke",
+            "resource_type": "agent",
+            "resource_id": "agent-n4-revoke",
+            "tenant_id": "t1",
         }
 
     async def test_modify_propagates_and_restores_the_old_row(
@@ -2588,13 +2681,16 @@ class TestA2AuditWriteFailure:
             resource_type="agent",
             resource_id="agent-n4-delete",
             perm_bits=1,
+            tenant_id="t1",
         )
         self._flaky_content_hash(monkeypatch)
+        predicate = {
+            "principal_id": "v-n4-delete",
+            "resource_id": "agent-n4-delete",
+            "tenant_id": "t1",
+        }
         with pytest.raises(RuntimeError, match="content_hash broken"):
-            await service.delete_acl_entries(
-                user_context,
-                [{"principal_id": "v-n4-delete", "resource_id": "agent-n4-delete"}],
-            )
+            await service.delete_acl_entries(user_context, [predicate])
         pair = await _row_pair(service, row["id"])
         assert pair[0] is None, "the row must still be ACTIVE — the expiry rolled back"
         rows = [
@@ -2606,10 +2702,11 @@ class TestA2AuditWriteFailure:
         assert len(rows) == 1
         # BL-3 (A2 fix-4, ADDENDUM-A A-1/A-2 W-Q on W6) — N16 (drops
         # principal_id) stayed GREEN under the substring-only check
-        # this test had before.
+        # this test had before. C4 (A2 fix-5) — run at KSEL-t's OWN
+        # tenant-t1 key, never NULL-tenant.
         assert rows[0]["question"] == (
             "op=deleteAclEntries principal=-:v-n4-delete "
-            "resource=-:agent-n4-delete bits=0 tenant=-"
+            "resource=-:agent-n4-delete bits=0 tenant=t1"
         )
         fields = _parse_question(rows[0]["question"])
         assert fields == {
@@ -2619,7 +2716,15 @@ class TestA2AuditWriteFailure:
             "resource_type": "-",
             "resource_id": "agent-n4-delete",
             "bits": "0",
-            "tenant": "-",
+            "tenant": "t1",
+        }
+        # C4 (A2 fix-5) — the answer/error_detail half.
+        detail = json.loads(rows[0]["error_detail"])
+        assert detail["db_error_class"] == "RuntimeError"
+        assert detail["predicate_or_attempted_row"] == {
+            "predicate": predicate,
+            "predicate_count": 1,
+            "predicate_index": 0,
         }
 
 
@@ -3098,6 +3203,11 @@ class TestMPAToGVerbatimMock:
         assert answers[1]["expired_ids"] == [ids["D"], ids["C"], ids["G"]]
         assert answers[2]["visible_matched_count"] == 1
         assert answers[2]["expired_ids"] == []
+        # C2 (A2 fix-5, ADDENDUM-A A-2 W4) — the answer/error_detail
+        # half of W-Q, per row, on the mock too.
+        for answer in answers:
+            assert answer["acl_entry_ids"] == []
+            assert answer["expired_at_ms"] is None
 
         assert questions[0] == (
             f"op=deleteAclEntries principal=-:{_MP_V} resource=-:- bits=0 tenant=-"

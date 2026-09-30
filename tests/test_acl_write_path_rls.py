@@ -2574,6 +2574,10 @@ class TestP3RevokeOnSoftDeletedResourceSFA:
                 "resource_id": "agent-1",
                 "tenant_id": "t1",
             }
+            # C3 (A2 fix-5, ADDENDUM-A A-2 W5) — the answer/error_detail
+            # half of W-Q: db_error_class is the real SQLSTATE (RLS's
+            # own owner-only policy refusal), never a made-up literal.
+            assert error_detail["db_error_class"] == "42501"
         finally:
             admin.dispose()
 
@@ -2678,6 +2682,9 @@ class TestDA24RollbackAtPredicateI:
                 "predicate": {"principal_id": "p-d4r-2", "resource_id": "agent-3"},
                 "predicate_count": 3,
             }
+            # C3 (A2 fix-5, ADDENDUM-A A-2 W5) — db_error_class is the
+            # real SQLSTATE, never a made-up literal.
+            assert error_detail["db_error_class"] == "42501"
             # BL-2 (A2 fix-4, ADDENDUM-A A-1/A-2 W-Q on W5) — the
             # denial `question` itself, per-field, never a substring
             # check alone: N10 (drops principal_id) and N11 (bits=1
@@ -3565,6 +3572,14 @@ class TestMPAToGVerbatimRealPostgres:
         assert answers[1]["expired_ids"] == [ids["D"], ids["C"], ids["G"]]
         assert answers[2]["visible_matched_count"] == 1
         assert answers[2]["expired_ids"] == []
+        # C2 (A2 fix-5, ADDENDUM-A A-2 W4) — the answer/error_detail
+        # half of W-Q, per row: delete NEVER inserts a row
+        # (acl_entry_ids is always empty) and never sets its own
+        # expired_at_ms (each row's own perm_bits=0 refusal-free
+        # success has no NEW row to time-limit).
+        for answer in answers:
+            assert answer["acl_entry_ids"] == []
+            assert answer["expired_at_ms"] is None
 
         # v4's own full-string equalities (SF-2 — kept, not replaced) ...
         assert questions[0] == (
@@ -3605,8 +3620,9 @@ class TestMPAToGVerbatimRealPostgres:
 
 class TestMPAToGReRollNeverFlakes:
     """A2 fix-4 BL-1 — the independent reviewer's own deterministic
-    proof (evidence/2026-09-30-A2-review-4/tools/reviewer_uuid_monotone.py),
-    kept PERMANENT. Under a ``uuid4`` that is STRICTLY INCREASING — an
+    proof (a pytest plugin that makes ``uuid.uuid4`` STRICTLY
+    INCREASING on every call), kept PERMANENT here. Under a ``uuid4``
+    that is STRICTLY INCREASING — an
     adversarial-but-legal draw sequence a real random ``uuid4`` could
     never reliably reproduce, but the re-roll loop must still behave
     SAFELY against — the A-G seeding's ordering precondition
