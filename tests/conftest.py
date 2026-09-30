@@ -98,21 +98,18 @@ subprocess.run = _patched_subprocess_run
 # heavy-cap lock-path override -- every harness test points it at a
 # `tmp_path` file so the suite never contends with (or is blocked by) the
 # real, shared lock a concurrent `make test`/pool run would hold.
-# AUDITTRACE_NEUTER_PATHCHECK_{MODULE,EXPECT,LOG} and
-# AUDITTRACE_NEUTER_FAKE_PG_STATE are the neuter pool's per-neuter wiring
-# (§6 P4, §11 proof f) -- when this repo ITSELF is the neuter target (the
-# harness proving itself against its own commits, or any future WU's
-# self-neuters), the mapped test's own `tests/conftest.py` import runs
-# INSIDE the same subprocess as `neuter_pathcheck`'s `pytest_configure` and
-# would otherwise wipe these before the plugin ever reads them --
-# discovered by dogfooding the harness against this repo (A11.1).
+# (The pool's OTHER per-neuter env vars -- NEUTER_PATHCHECK_{MODULE,EXPECT,
+# LOG}, NEUTER_FAKE_PG_STATE -- deliberately do NOT start with "AUDITTRACE_"
+# at all, precisely so they survive this wipe in ANY target repo's own
+# conftest.py, this one included, without needing an allowlist entry here.
+# A prior revision prefixed them "AUDITTRACE_NEUTER_*" and allow-listed
+# them here; that broke the moment the harness targeted a DIFFERENT repo
+# with the identical AUDITTRACE_*-wipe convention but no matching
+# allowlist entry (the T1 oracle's frozen target) -- discovered by
+# dogfooding the harness against this repo first (A11.1).)
 _TEST_ONLY_ALLOWLIST = {
     "AUDITTRACE_TEST_POSTGRES_URL",
     "AUDITTRACE_NEUTER_LOCK",
-    "AUDITTRACE_NEUTER_PATHCHECK_MODULE",
-    "AUDITTRACE_NEUTER_PATHCHECK_EXPECT",
-    "AUDITTRACE_NEUTER_PATHCHECK_LOG",
-    "AUDITTRACE_NEUTER_FAKE_PG_STATE",
 }
 for _key in [
     k

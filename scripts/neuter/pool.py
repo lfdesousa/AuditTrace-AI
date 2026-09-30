@@ -230,9 +230,9 @@ def run_one_neuter(
         env = dict(os.environ)
         src_root = ctx.src_root or f"{ctx.workdir}/src"
         env["PYTHONPATH"] = f"{src_root}:{Path(__file__).resolve().parent}"
-        env["AUDITTRACE_NEUTER_PATHCHECK_MODULE"] = ctx.pathcheck_module
-        env["AUDITTRACE_NEUTER_PATHCHECK_EXPECT"] = ctx.pathcheck_expect
-        env["AUDITTRACE_NEUTER_PATHCHECK_LOG"] = str(pathcheck_log)
+        env["NEUTER_PATHCHECK_MODULE"] = ctx.pathcheck_module
+        env["NEUTER_PATHCHECK_EXPECT"] = ctx.pathcheck_expect
+        env["NEUTER_PATHCHECK_LOG"] = str(pathcheck_log)
         if want_pg and ctx.pg_handle is not None and not ctx.pg_handle.fake:
             env["AUDITTRACE_TEST_POSTGRES_URL"] = ctx.pg_handle.dsn
         if (
@@ -240,7 +240,7 @@ def run_one_neuter(
             and ctx.pg_handle.fake
             and ctx.pg_handle.fake_state_path is not None
         ):
-            env["AUDITTRACE_NEUTER_FAKE_PG_STATE"] = str(ctx.pg_handle.fake_state_path)
+            env["NEUTER_FAKE_PG_STATE"] = str(ctx.pg_handle.fake_state_path)
 
         cmd = [
             ctx.python,

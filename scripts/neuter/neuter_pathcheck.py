@@ -3,12 +3,12 @@ from ITS OWN worktree, not a stale sibling copy.
 
 Configured entirely by environment variable so the same plugin serves both
 the product harness (module ``audittrace``) and the self-proof fixture
-(module ``guarded``): ``AUDITTRACE_NEUTER_PATHCHECK_MODULE`` (default
-``audittrace``), ``AUDITTRACE_NEUTER_PATHCHECK_EXPECT`` (the worktree's
-``src`` root the module must resolve under), ``AUDITTRACE_NEUTER_PATHCHECK_LOG``
+(module ``guarded``): ``NEUTER_PATHCHECK_MODULE`` (default
+``audittrace``), ``NEUTER_PATHCHECK_EXPECT`` (the worktree's
+``src`` root the module must resolve under), ``NEUTER_PATHCHECK_LOG``
 (where to append the proof line).
 
-If ``AUDITTRACE_NEUTER_PATHCHECK_EXPECT`` is unset the plugin does nothing
+If ``NEUTER_PATHCHECK_EXPECT`` is unset the plugin does nothing
 (so it is safe to leave on `sys.path` for unrelated pytest invocations).
 The assertion firing (wrong ``PYTHONPATH``) means the log line below is
 never reached -- the pool observes "no log line" and classifies the run
@@ -22,11 +22,11 @@ import os
 
 
 def pytest_configure(config) -> None:  # noqa: ANN001 - pytest hook signature
-    expect = os.environ.get("AUDITTRACE_NEUTER_PATHCHECK_EXPECT")
+    expect = os.environ.get("NEUTER_PATHCHECK_EXPECT")
     if not expect:
         return
-    module_name = os.environ.get("AUDITTRACE_NEUTER_PATHCHECK_MODULE", "audittrace")
-    log_path = os.environ["AUDITTRACE_NEUTER_PATHCHECK_LOG"]
+    module_name = os.environ.get("NEUTER_PATHCHECK_MODULE", "audittrace")
+    log_path = os.environ["NEUTER_PATHCHECK_LOG"]
     module = importlib.import_module(module_name)
     got = os.path.realpath(module.__file__)
     want = os.path.realpath(expect)

@@ -410,7 +410,7 @@ def test_proof_f_db_leak(tmp_path):
                 new=(
                     "def test_a():\n"
                     "    import json, os\n"
-                    "    p = os.environ['AUDITTRACE_NEUTER_FAKE_PG_STATE']\n"
+                    "    p = os.environ['NEUTER_FAKE_PG_STATE']\n"
                     "    state = json.loads(open(p).read())\n"
                     "    state['schemata'].append('leaked_schema')\n"
                     "    open(p, 'w').write(json.dumps(state))\n"
