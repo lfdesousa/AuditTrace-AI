@@ -128,6 +128,8 @@ def test_cmd_run_spec_load_error_exits_3(tmp_path, repo, capsys):
             "--workers",
             "1",
             "--no-db",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 3
@@ -209,6 +211,8 @@ def test_cmd_report_writes_and_verifies(tmp_path, repo):
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 0
@@ -225,6 +229,8 @@ def test_cmd_report_writes_and_verifies(tmp_path, repo):
             "--python",
             PYTHON,
             "--verify",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc_verify == 0
@@ -389,6 +395,8 @@ def test_cmd_report_with_reviewer_guard_tests(tmp_path, repo):
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 0
@@ -483,6 +491,8 @@ def test_cmd_run_sha_mismatch_refused(tmp_path, repo):
             "--workers",
             "1",
             "--no-db",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 3
@@ -507,6 +517,8 @@ def test_cmd_run_evidence_under_tmp_refused(tmp_path, repo, capsys):
             "--workers",
             "1",
             "--no-db",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 3
@@ -576,6 +588,8 @@ def test_cmd_run_guard_tests_closure_mismatch_refused(tmp_path, repo, capsys):
             "--workers",
             "1",
             "--no-db",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 3
@@ -742,6 +756,8 @@ def test_cmd_report_picks_up_guard_tests_reviewer_json_automatically(tmp_path, r
             "mod",
             "--src-root-relative",
             "",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     evidence.mkdir(exist_ok=True)
@@ -764,6 +780,8 @@ def test_cmd_report_picks_up_guard_tests_reviewer_json_automatically(tmp_path, r
             str(repo),
             "--python",
             PYTHON,
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
         ]
     )
     assert rc == 0
