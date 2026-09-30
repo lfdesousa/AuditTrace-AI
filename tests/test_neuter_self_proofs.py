@@ -354,6 +354,24 @@ def test_proof_e_should_skip_rules(tmp_path):
     )
     assert should_skip(changed, good_row, sha="shaX", harness_version="1") is False
 
+    # Review round 3 should-fix: a row produced under a DIFFERENT DB mode
+    # (fake vs real Postgres) must never satisfy a resume in the other
+    # mode -- the two modes exercise different code paths entirely.
+    fake_row = {**good_row, "fake_db": True}
+    assert (
+        should_skip(entry, fake_row, sha="shaX", harness_version="1", fake_db=True)
+        is True
+    )
+    assert (
+        should_skip(entry, fake_row, sha="shaX", harness_version="1", fake_db=False)
+        is False
+    )
+    real_row = {**good_row, "fake_db": False}
+    assert (
+        should_skip(entry, real_row, sha="shaX", harness_version="1", fake_db=True)
+        is False
+    )
+
 
 def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
     repo = _init_repo(tmp_path)

@@ -32,6 +32,7 @@ from scripts.neuter.junit import (
 )
 from scripts.neuter.pg import start_container, stop_container
 from scripts.neuter.pool import (
+    append_event,
     append_jsonl,
     apply_edits,
     evidence_dir_is_refused,
@@ -41,7 +42,7 @@ from scripts.neuter.pool import (
     run_pool,
 )
 from scripts.neuter.pytest_run import run_pytest
-from scripts.neuter.report import verify_report, write_report
+from scripts.neuter.report import read_jsonl, verify_report, write_report
 from scripts.neuter.spec import (
     EXIT_SPEC_ERROR,
     GuardTestEntry,
@@ -375,6 +376,32 @@ def _cmd_report(args: argparse.Namespace) -> int:
     reviewer_guard_tests = None
     if guard_tests_path:
         reviewer_guard_tests = _load_guard_tests_file(Path(guard_tests_path))
+    # Review round 3 should-fix: an ack is never a bare flag -- record the
+    # ACTUAL acknowledged ids in events.jsonl too (the report's own
+    # ACKNOWLEDGED section + trailer carry the same list; this is the
+    # durable, append-only side of the same fact).
+    if args.ack_errors or args.ack_drift:
+        rows = read_jsonl(evidence_dir / "neuter_results.jsonl")
+        acked_error_ids = (
+            sorted(r["id"] for r in rows if r.get("verdict") == "ERROR")
+            if args.ack_errors
+            else []
+        )
+        acked_drift_ids = (
+            sorted(r["id"] for r in rows if r.get("unmapped_red"))
+            if args.ack_drift
+            else []
+        )
+        append_event(
+            evidence_dir,
+            {
+                "event": "ack",
+                "ack_errors": args.ack_errors,
+                "ack_drift": args.ack_drift,
+                "acked_error_ids": acked_error_ids,
+                "acked_drift_ids": acked_drift_ids,
+            },
+        )
     if args.verify:
         return verify_report(
             evidence_dir,
@@ -383,7 +410,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
             ack_errors=args.ack_errors,
             ack_drift=args.ack_drift,
         )
-    write_report(evidence_dir, spec, reviewer_guard_tests=reviewer_guard_tests)
+    write_report(
+        evidence_dir,
+        spec,
+        reviewer_guard_tests=reviewer_guard_tests,
+        ack_errors=args.ack_errors,
+        ack_drift=args.ack_drift,
+    )
     return 0
 
 

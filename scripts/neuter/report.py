@@ -42,7 +42,7 @@ _COLUMNS = [
 ]
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows = []
@@ -112,10 +112,18 @@ def generate_report(
     reviewer_guard_tests: list[Any] | None = None,
     harness_version: str = "1",
     run_id: str = "",
+    ack_errors: bool = False,
+    ack_drift: bool = False,
 ) -> str:
-    """Build ``per_guard_table.md`` text (not yet written to disk)."""
-    rows = _read_jsonl(evidence_dir / "neuter_results.jsonl")
-    arbitration = _read_jsonl(evidence_dir / "arbitration.jsonl")
+    """Build ``per_guard_table.md`` text (not yet written to disk).
+
+    ``ack_errors``/``ack_drift`` (review round 3 should-fix): an
+    acknowledgement is never a bare boolean in the report -- the
+    acknowledged ids themselves are listed, both here and (by
+    ``_cmd_report``) in ``events.jsonl``, so a reviewer can see EXACTLY
+    which rows were waved through, not just that "something" was."""
+    rows = read_jsonl(evidence_dir / "neuter_results.jsonl")
+    arbitration = read_jsonl(evidence_dir / "arbitration.jsonl")
     neuters_by_id = {n.id: n for n in spec.neuters}
 
     if not run_id:
@@ -196,6 +204,19 @@ def generate_report(
     lines += [f"- {gid}" for gid in unconfirmed_green]
     lines.append("")
 
+    # Review round 3 should-fix: an ack is never a bare flag -- the actual
+    # acknowledged ids are listed here (empty unless the caller passed the
+    # matching ack flag), so a reviewer sees precisely what was waved
+    # through, not merely that error_n/drift_n were non-zero.
+    acked_error_ids = sorted(r["id"] for r in error_rows) if ack_errors else []
+    acked_drift_ids = sorted(r["id"] for r in drift_rows) if ack_drift else []
+    lines.append(
+        f"## ACKNOWLEDGED (errors={len(acked_error_ids)} drift={len(acked_drift_ids)})"
+    )
+    lines += [f"- error: {rid}" for rid in acked_error_ids]
+    lines += [f"- drift: {rid}" for rid in acked_drift_ids]
+    lines.append("")
+
     error_n = len(error_rows)
     body = "\n".join(lines)
     sha = hashlib.sha256(body.encode()).hexdigest()
@@ -203,7 +224,9 @@ def generate_report(
         f"generated-from: {evidence_dir}/neuter_results.jsonl sha256={sha} "
         f"harness={harness_version} run_id={run_id} drift_n={drift_n} error_n={error_n} "
         f"arbitrated_n={len(arbitration)} defect_n={defect_n} missing_n={len(missing_ids)} "
-        f"unconfirmed_green_n={len(unconfirmed_green)}"
+        f"unconfirmed_green_n={len(unconfirmed_green)} "
+        f"acked_error_ids={','.join(acked_error_ids) if acked_error_ids else '-'} "
+        f"acked_drift_ids={','.join(acked_drift_ids) if acked_drift_ids else '-'}"
     )
     return body + "\n" + trailer + "\n"
 
@@ -253,7 +276,9 @@ def verify_report(
     out = evidence_dir / "per_guard_table.md"
     if not out.exists():
         return EXIT_VERIFY_FAILED
-    fresh = generate_report(evidence_dir, spec, **kwargs)
+    fresh = generate_report(
+        evidence_dir, spec, ack_errors=ack_errors, ack_drift=ack_drift, **kwargs
+    )
     if fresh != out.read_text():
         return EXIT_VERIFY_FAILED
     trailer_line = fresh.splitlines()[-1]

@@ -15,6 +15,21 @@ invocation with ``hold-shared`` while leaving a SECOND, real ``python -m
 pytest`` line unwrapped must also be caught -- the detection regex covers
 BOTH the ``.venv/bin/pytest`` binary form and the ``python -m pytest``
 module form, not just the former.
+
+Review round 3 should-fix: the regex now also catches the legacy ``py.test``
+launcher name (pytest's own pre-rename entry point, still installed by
+some distributions) -- previously invisible to a plain ``pytest`` substring
+search because of the literal dot.
+
+This Makefile-level guard stays STATIC (a ``make -n`` dry-run + regex),
+not B2's runtime chokepoint token: ``make test``'s own top-level pytest
+invocation is the legitimate, un-gated OUTER session every developer/CI
+run depends on (``scripts.neuter.pytest_run`` is not even imported yet
+when it starts), so making it carry a token would break every normal test
+run, not just a bypass. B2's token protects invocations the NEUTER HARNESS
+itself spawns (baseline/drift/arbitrate/collect/neuter); this guard
+protects `make test`'s OWN recipe text from acquiring a second, unwrapped
+pytest line.
 """
 
 from __future__ import annotations
@@ -31,11 +46,14 @@ _HOLD_SHARED_PREFIX = (
 )
 _ASSERT_IDLE = "python -m scripts.neuter.runner assert-idle"
 
-#: Matches EITHER the direct binary (``.venv/bin/pytest``, ``pytest``) or
-#: the module form (``python -m pytest`` / ``python3 -m pytest``) -- a
-#: Makefile recipe that switches to the module form to dodge a
-#: substring-only check on the binary path must still be caught.
-_PYTEST_INVOCATION_RE = re.compile(r"(?:/|^|\s)pytest\b|\bpython3?\s+-m\s+pytest\b")
+#: Matches the direct binary (``.venv/bin/pytest``, ``pytest``), the module
+#: form (``python -m pytest`` / ``python3 -m pytest``), OR the legacy
+#: ``py.test`` launcher name -- a Makefile recipe that switches to any of
+#: these to dodge a substring-only check on one specific spelling must
+#: still be caught.
+_PYTEST_INVOCATION_RE = re.compile(
+    r"(?:/|^|\s)pytest\b|\bpython3?\s+-m\s+pytest\b|(?:/|^|\s)py\.test\b"
+)
 
 
 def _dry_run(target: str) -> list[str]:
@@ -89,6 +107,18 @@ def test_regex_catches_the_module_form_escape():
 def test_regex_does_not_match_unrelated_lines():
     assert not _PYTEST_INVOCATION_RE.search("echo running the suite")
     assert not _PYTEST_INVOCATION_RE.search("docker build -t audittrace-ai .")
+
+
+def test_regex_catches_the_legacy_py_dot_test_launcher():
+    """Review round 3 should-fix: ``py.test`` (pytest's pre-rename entry
+    point) is a DIFFERENT literal string than ``pytest`` -- a plain
+    substring search for ``pytest`` never matches it (the dot breaks the
+    run), so an unwrapped ``py.test tests/`` line would have sailed through
+    this guard undetected before this round."""
+    unwrapped_py_dot_test = "py.test tests/ --cov=src --cov-fail-under=90"
+    assert _PYTEST_INVOCATION_RE.search(unwrapped_py_dot_test)
+    assert not unwrapped_py_dot_test.strip().startswith(_HOLD_SHARED_PREFIX)
+    assert "pytest" not in unwrapped_py_dot_test  # confirms the OLD regex missed it
 
 
 def _target_body(name: str) -> str:

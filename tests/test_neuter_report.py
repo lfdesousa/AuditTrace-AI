@@ -204,6 +204,13 @@ def test_generate_report_missing_neuter_is_listed_and_fails_verify(tmp_path):
 
 
 def test_verify_report_unacknowledged_error_fails_acknowledged_passes(tmp_path):
+    """Review round 3 should-fix: an ack is embedded in the report's own
+    ACKNOWLEDGED section + trailer (the acknowledged ids, not a bare flag)
+    -- so acknowledging is a two-step, not a free pass on the ORIGINAL
+    (unacknowledged) report text: the report must be RE-WRITTEN with the
+    ack flag before `--verify` can pass with that same flag, exactly the
+    same way a real operator's CLI invocation would (`report --ack-errors`
+    then `report --verify --ack-errors`)."""
     evidence = tmp_path / "ev"
     evidence.mkdir()
     (evidence / "neuter_results.jsonl").write_text(
@@ -212,7 +219,15 @@ def test_verify_report_unacknowledged_error_fails_acknowledged_passes(tmp_path):
     spec = _spec(tmp_path)
     write_report(evidence, spec)
     assert verify_report(evidence, spec) == 7
+    # Verifying with the flag against the UNACKNOWLEDGED report text still
+    # fails -- the acked-ids list would differ from what's on disk.
+    assert verify_report(evidence, spec, ack_errors=True) == 7
+    write_report(evidence, spec, ack_errors=True)
+    assert "- error: n1" in (evidence / "per_guard_table.md").read_text()
     assert verify_report(evidence, spec, ack_errors=True) == 0
+    # ...and now the UNACKNOWLEDGED check correctly flips back to failing,
+    # since the report on disk now carries the acked id.
+    assert verify_report(evidence, spec) == 7
 
 
 def test_generate_report_run_id_auto_populated_from_rows(tmp_path):

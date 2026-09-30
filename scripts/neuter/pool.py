@@ -217,6 +217,11 @@ def _base_row(
         "file": entry.file,
         "matches": matches,
         "tests_expected": len(entry.tests),
+        # Review round 3 should-fix: recorded so `should_skip` can refuse a
+        # resume that would otherwise let a `--no-db` (fake) row satisfy a
+        # real-Postgres run, or vice versa -- the two modes exercise
+        # different code paths and must never be treated as equivalent.
+        "fake_db": ctx.pg_handle.fake if ctx.pg_handle is not None else None,
     }
 
 
@@ -374,10 +379,20 @@ def should_skip(
     *,
     sha: str,
     harness_version: str,
+    fake_db: bool | None = None,
 ) -> bool:
     """Resume rule (§7): skip iff an existing row is RED/GREEN, restored
-    clean, same sha, same neuter_hash, same harness_version. ERROR rows
-    always re-run."""
+    clean, same sha, same neuter_hash, same harness_version, same DB mode.
+    ERROR rows always re-run.
+
+    ``fake_db`` (review round 3 should-fix): a row produced under
+    ``--no-db`` (fake Postgres) exercises a DIFFERENT code path than one
+    produced against a real container -- a resume must never let a row
+    from one mode silently satisfy the other. ``None`` (the default)
+    preserves the exact prior behaviour for callers that never pass it
+    (existing rows with no ``fake_db`` field, from before this round, also
+    read back as ``None`` and keep resuming as before -- comparing
+    ``None == None`` -- rather than being invalidated retroactively)."""
     if existing is None:
         return False
     if existing.get("verdict") not in ("RED", "GREEN"):
@@ -387,6 +402,14 @@ def should_skip(
     if existing.get("sha") != sha:
         return False
     if existing.get("harness_version") != harness_version:
+        return False
+    stored_fake_db = existing.get("fake_db")
+    # A row from BEFORE this round (or a caller that legitimately doesn't
+    # know/care about DB mode) records/passes `None` -- that's "no
+    # information to compare", not "the modes differ", so it never refuses
+    # a resume on its own. Only an EXPLICIT mismatch (both sides recorded,
+    # and they disagree) refuses.
+    if stored_fake_db is not None and fake_db is not None and stored_fake_db != fake_db:
         return False
     if existing.get("neuter_hash") != compute_neuter_hash(entry):
         return False
@@ -783,6 +806,7 @@ def _worker_main(
                 resume_rows.get(neuter_id),
                 sha=spec.sha,
                 harness_version=HARNESS_VERSION,
+                fake_db=fake_db,
             ):
                 continue
             try:
@@ -1042,7 +1066,11 @@ def run_pool(
                     continue
                 entry = neuters_by_id.get(rid)
                 if entry is not None and should_skip(
-                    entry, row, sha=spec.sha, harness_version=HARNESS_VERSION
+                    entry,
+                    row,
+                    sha=spec.sha,
+                    harness_version=HARNESS_VERSION,
+                    fake_db=fake_db,
                 ):
                     rows[rid] = row
 

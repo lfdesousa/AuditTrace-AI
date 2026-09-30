@@ -236,6 +236,117 @@ def test_cmd_report_writes_and_verifies(tmp_path, repo):
     assert rc_verify == 0
 
 
+def test_cmd_report_ack_errors_records_ids_in_events_and_trailer(tmp_path, repo):
+    """Review round 3 should-fix: ``--ack-errors``/``--ack-drift`` record
+    the ACTUAL acknowledged ids, both in ``events.jsonl`` (durable,
+    append-only) and in the report's own ACKNOWLEDGED section + trailer --
+    never a bare flag."""
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    evidence = _ev(tmp_path)
+    main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "mod",
+            "--src-root-relative",
+            "",
+            "--lock-path",
+            str(tmp_path / "pool.lock"),
+        ]
+    )
+    # Force the one row ERROR, as if a real crash/timeout had produced it --
+    # this test cares about the ack plumbing, not how a row becomes ERROR.
+    results_path = evidence / "neuter_results.jsonl"
+    rows = [json.loads(line) for line in results_path.read_text().splitlines()]
+    rows[0]["verdict"] = "ERROR"
+    rows[0]["error_reason"] = "forced_for_test"
+    results_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    rc = main(
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--ack-errors",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
+        ]
+    )
+    assert rc == 0
+    trailer = (evidence / "per_guard_table.md").read_text()
+    assert f"- error: {rows[0]['id']}" in trailer
+    assert f"acked_error_ids={rows[0]['id']}" in trailer.splitlines()[-1]
+
+    events = [
+        json.loads(line)
+        for line in (evidence / "events.jsonl").read_text().splitlines()
+    ]
+    ack_events = [e for e in events if e.get("event") == "ack"]
+    assert len(ack_events) == 1
+    assert ack_events[0]["acked_error_ids"] == [rows[0]["id"]]
+    assert ack_events[0]["acked_drift_ids"] == []
+
+    rc_verify = main(
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--verify",
+            "--ack-errors",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
+        ]
+    )
+    assert rc_verify == 0
+
+    # Verifying WITHOUT the flag against the now-acknowledged report text
+    # fails closed -- the report on disk carries the acked id, so a fresh,
+    # unacknowledged regeneration no longer matches it byte-for-byte.
+    rc_verify_unacked = main(
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--verify",
+            "--lock-path",
+            str(tmp_path / "collect.lock"),
+        ]
+    )
+    assert rc_verify_unacked == 7
+
+
 def test_cmd_arbitrate_writes_arbitration_row(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))
