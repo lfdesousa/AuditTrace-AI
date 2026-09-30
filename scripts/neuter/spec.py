@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from scripts.neuter import lock as lockmod
+from scripts.neuter.pg import start_container, stop_container
 from scripts.neuter.pytest_run import run_pytest
 
 EXIT_SPEC_ERROR = 3
@@ -86,6 +87,7 @@ def _collect_ids(
     *,
     lock_path: Path | None,
     already_locked: bool,
+    fake_db: bool | None = None,
 ) -> set[str]:
     """Run ``--collect-only`` once over ``scope_files`` at ``sha`` (checked
     out in ``repo_dir``) and return the collected node ids -- through the
@@ -106,17 +108,40 @@ def _collect_ids(
     resolve import collisions from ITS OWN site-packages ``.pth`` entry
     instead of ``repo_dir``'s tree, collecting nothing there was to collect
     and failing every id as ``uncollected`` (exit 3) until this is pinned.
+
+    ``fake_db`` (review round 3 blocker 1, opt-in): ``--collect-only``
+    still IMPORTS every test module to introspect it, and an import-time
+    side effect in a mapped test's module can start a durable product
+    container exactly like a full run can. ``None`` (the default -- every
+    existing unit test on the toy fixture, which never touches Postgres at
+    all) skips container start-up entirely, unchanged from before this
+    round. The production CLI commands (``run``/``arbitrate``/``report``)
+    pass the real ``--no-db`` value explicitly, so collect gets a real (or
+    fake) DSN too.
     """
     resolved_lock = lockmod.resolve_lock_path(str(lock_path) if lock_path else None)
-    result = run_pytest(
-        workdir=repo_dir,
-        pytest_args=list(scope_files),
-        python=python,
-        lock_path=resolved_lock,
-        src_root=str(repo_dir / "src"),
-        collect_only=True,
-        already_locked=already_locked,
-    )
+    pg_handle = None
+    if fake_db is not None:
+        pg_handle = start_container(
+            "collect", 0, fake=fake_db, fake_dir=repo_dir / ".neuter_collect_fake_pg"
+        )
+    try:
+        result = run_pytest(
+            workdir=repo_dir,
+            pytest_args=list(scope_files),
+            python=python,
+            lock_path=resolved_lock,
+            src_root=str(repo_dir / "src"),
+            collect_only=True,
+            already_locked=already_locked,
+            pg_handle=pg_handle,
+        )
+    finally:
+        if pg_handle is not None:
+            try:
+                stop_container(pg_handle)
+            except Exception:  # noqa: BLE001 - cleanup must not itself crash
+                pass
     stdout = result.collect_stdout or ""
     ids = {line.strip() for line in stdout.splitlines() if "::" in line}
     return ids
@@ -130,6 +155,7 @@ def load_neuter_spec(
     collected_ids: set[str] | None = None,
     lock_path: Path | None = None,
     already_locked: bool = False,
+    fake_db: bool | None = None,
 ) -> NeuterSpecFile:
     """Load and fail-closed validate a neuter spec file (§3).
 
@@ -263,6 +289,7 @@ def load_neuter_spec(
             python,
             lock_path=lock_path,
             already_locked=already_locked,
+            fake_db=fake_db,
         )
     for test_id in sorted(all_tests):
         if test_id not in collected_ids:

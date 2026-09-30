@@ -30,6 +30,7 @@ from scripts.neuter.junit import (
     parse_junit_full,
     unmapped_assertion_shaped_failures,
 )
+from scripts.neuter.pg import start_container, stop_container
 from scripts.neuter.pool import (
     append_jsonl,
     apply_edits,
@@ -117,7 +118,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # itself for the duration of the collect-only call, since `run_pool`
         # below has not yet taken its own (longer-held) lock at this point.
         spec = load_neuter_spec(
-            Path(args.neuters), repo_dir=repo_dir, python=python, lock_path=lock_path
+            Path(args.neuters),
+            repo_dir=repo_dir,
+            python=python,
+            lock_path=lock_path,
+            fake_db=args.no_db,
         )
     except SpecLoadError as exc:
         print(f"spec load error [{exc.reason}]: {exc.detail}", file=sys.stderr)
@@ -200,6 +205,13 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
         os.close(lock_fd)
         return EXIT_LOCK_HELD
 
+    pg_handle = start_container(
+        "arbitrate",
+        0,
+        tmpfs=getattr(args, "tmpfs", False),
+        fake=getattr(args, "no_db", False),
+        fake_dir=evidence_dir / "fake_pg" if getattr(args, "no_db", False) else None,
+    )
     try:
         spec = load_neuter_spec(
             Path(args.neuters),
@@ -207,6 +219,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
             python=python,
             lock_path=resolved_lock,
             already_locked=True,
+            fake_db=getattr(args, "no_db", False),
         )
         neuters_by_id = {n.id: n for n in spec.neuters}
         ids = args.ids.split(",")
@@ -257,6 +270,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                         lock_path=resolved_lock,
                         timeout_s=args.timeout,
                         junit_path=junit_path,
+                        pg_handle=pg_handle,
                         already_locked=True,
                     )
                     exit_code = pytest_result.exit_code
@@ -331,6 +345,10 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
             )
         return 0
     finally:
+        try:
+            stop_container(pg_handle)
+        except Exception:  # noqa: BLE001 - cleanup must not itself crash
+            pass
         os.close(lock_fd)
 
 
@@ -343,7 +361,11 @@ def _cmd_report(args: argparse.Namespace) -> int:
     # taken any lock of its own, so the default `already_locked=False`
     # makes the spec's own collect-only call acquire+release it.
     spec = load_neuter_spec(
-        Path(args.neuters), repo_dir=repo_dir, python=python, lock_path=lock_path
+        Path(args.neuters),
+        repo_dir=repo_dir,
+        python=python,
+        lock_path=lock_path,
+        fake_db=args.no_db,
     )
     guard_tests_path = args.guard_tests
     if not guard_tests_path:
@@ -414,6 +436,10 @@ def build_parser() -> argparse.ArgumentParser:
     arb_p.add_argument("--neuters", required=True)
     arb_p.add_argument("--timeout", type=int, default=900)
     arb_p.add_argument("--lock-path", default=None)
+    arb_p.add_argument(
+        "--no-db", action="store_true", help="fake Postgres (self-proofs only)"
+    )
+    arb_p.add_argument("--tmpfs", action="store_true")
     arb_p.add_argument("--repo-dir", default=common["repo_dir"])
     arb_p.add_argument("--python", default=common["python"])
     arb_p.set_defaults(func=_cmd_arbitrate)
@@ -434,6 +460,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="acknowledge drift_n > 0 so --verify may still pass (never implicit)",
     )
     rep_p.add_argument("--lock-path", default=None)
+    rep_p.add_argument(
+        "--no-db", action="store_true", help="fake Postgres (self-proofs only)"
+    )
     rep_p.add_argument("--repo-dir", default=common["repo_dir"])
     rep_p.add_argument("--python", default=common["python"])
     rep_p.set_defaults(func=_cmd_report)

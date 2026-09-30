@@ -433,6 +433,8 @@ def run_baseline(
     python: str,
     timeout_s: int,
     lock_path: Path,
+    fake_db: bool = False,
+    tmpfs: bool = False,
 ) -> tuple[bool, str]:
     """SPEC v3 §5: before any neuter runs, every mapped test must PASS at
     the pinned sha with NO edit applied. Returns ``(ok, detail)``.
@@ -441,6 +443,13 @@ def run_baseline(
     2): the venv's editable install would otherwise be imported instead of
     THIS worktree, and no foreign-durable-container watch would ever run
     for baseline at all.
+
+    Review round 3 blocker 1: baseline now gets its OWN real (or fake, in
+    ``--no-db`` mode) Postgres container and passes its DSN through the
+    chokepoint -- REMOVING THE CAUSE, not just watching for it. A mapped
+    test's import/test-body fixture (``tests/_pg_ephemeral.py``'s callers)
+    finds ``AUDITTRACE_TEST_POSTGRES_URL`` already set and never starts its
+    own durable ``audittrace-acl-wu2a-pg-*`` container in the first place.
     """
     worktree = parent_worktree_dir / f"at-nt-{run_id}-baseline"
     subprocess.run(
@@ -448,6 +457,13 @@ def run_baseline(
         cwd=repo_dir,
         check=True,
         capture_output=True,
+    )
+    pg_handle = start_container(
+        f"{run_id}-baseline",
+        0,
+        tmpfs=tmpfs,
+        fake=fake_db,
+        fake_dir=evidence_dir / "fake_pg" if fake_db else None,
     )
     try:
         all_tests = sorted({t for n in spec.neuters for t in n.tests})
@@ -459,6 +475,7 @@ def run_baseline(
             lock_path=lock_path,
             timeout_s=timeout_s,
             junit_path=junit_path,
+            pg_handle=pg_handle,
             already_locked=True,
         )
         if pytest_result.foreign_pg_container:
@@ -473,6 +490,10 @@ def run_baseline(
             return False, f"exit={pytest_result.exit_code} failed={failed}"
         return True, ""
     finally:
+        try:
+            stop_container(pg_handle)
+        except Exception:  # noqa: BLE001 - cleanup must not itself crash
+            logger.error("baseline: failed to stop pg container", exc_info=True)
         if worktree.exists():
             if git_diff_quiet(worktree):
                 subprocess.run(
@@ -496,6 +517,21 @@ def run_baseline(
                 )
 
 
+def _mark_drift_unresolved(row: dict[str, Any], reason: str) -> None:
+    """Review round 3 blocker 3: a drift measurement that could not be
+    TRUSTED (dirty worktree, a foreign container observed, or the
+    full-scope run never reproducing an originally-RED verdict) must NEVER
+    pass silently as a flag riding along a RED/GREEN verdict -- it
+    overwrites the row's own verdict to ERROR outright, so
+    ``pool_exit_code``/``report --verify``'s existing ``error_n > 0``
+    handling (never silent, requires ``--ack-errors``) covers it for free,
+    instead of needing a SEPARATE, easy-to-forget check."""
+    row["verdict"] = "ERROR"
+    row["error_reason"] = reason
+    row["error_reasons"] = [*row.get("error_reasons", []), reason]
+    row[f"drift_{reason}"] = True
+
+
 def sample_full_scope_drift(
     spec: NeuterSpecFile,
     rows: dict[str, dict[str, Any]],
@@ -508,6 +544,8 @@ def sample_full_scope_drift(
     timeout_s: int,
     sample: float,
     lock_path: Path,
+    fake_db: bool = False,
+    tmpfs: bool = False,
 ) -> None:
     """SPEC v3 §5 sampled full-scope drift check: for a ``random.Random(run_id)``
     seeded sample of neuters, re-apply the edit and run the FULL
@@ -516,13 +554,17 @@ def sample_full_scope_drift(
     written back onto that row's ``unmapped_red`` -- never a constant.
     Mutates ``rows`` in place.
 
-    ``not_reproduced`` (review round 2, blocker 1): if the row's own
-    ORIGINAL verdict was RED but NONE of its mapped tests show as failed in
-    THIS full-scope run, the drift measurement itself did not reproduce the
-    edit (most likely a blind ``PYTHONPATH`` in an earlier defect, or a
-    dirty restore) -- ``unmapped_red`` is left untouched and
-    ``drift_not_reproduced`` is recorded instead of a falsely-clean
-    ``unmapped_red=[]``.
+    Review round 3 blocker 1: drift gets its OWN real (or fake) Postgres
+    container, DSN passed through the chokepoint -- removing the cause of
+    an import/test-body fixture starting a durable product container,
+    rather than only watching for one.
+
+    Review round 3 blocker 3 (``not_reproduced`` was a silent flag): every
+    condition that makes a drift measurement UNTRUSTWORTHY -- a dirty
+    worktree before or after, a foreign container observed during the
+    full-scope run, or the full-scope run never reproducing an originally
+    RED verdict -- now overwrites the row's verdict to ERROR via
+    :func:`_mark_drift_unresolved`, never a silent flag on a RED/GREEN row.
     """
     if sample <= 0 or not spec.neuters:
         return
@@ -537,6 +579,13 @@ def sample_full_scope_drift(
         check=True,
         capture_output=True,
     )
+    pg_handle = start_container(
+        f"{run_id}-drift",
+        0,
+        tmpfs=tmpfs,
+        fake=fake_db,
+        fake_dir=evidence_dir / "fake_pg" if fake_db else None,
+    )
     try:
         for entry in sampled:
             row = rows.get(entry.id)
@@ -546,6 +595,7 @@ def sample_full_scope_drift(
                 logger.error(
                     "drift sample: %s left %s dirty before start", entry.id, worktree
                 )
+                _mark_drift_unresolved(row, "dirty_before")
                 continue
             apply_edits(worktree, entry)
             if not py_compile_ok(worktree, entry, python):
@@ -563,6 +613,7 @@ def sample_full_scope_drift(
                 lock_path=lock_path,
                 timeout_s=timeout_s,
                 junit_path=junit_path,
+                pg_handle=pg_handle,
                 already_locked=True,
             )
             subprocess.run(
@@ -572,9 +623,19 @@ def sample_full_scope_drift(
                 logger.error(
                     "drift sample: %s left %s dirty after restore", entry.id, worktree
                 )
-                continue
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worktree_kept_dirty",
+                        "phase": "drift",
+                        "id": entry.id,
+                        "path": str(worktree),
+                    },
+                )
+                _mark_drift_unresolved(row, "dirty_after")
+                break  # this worktree is no longer trustworthy for the rest of the sample
             if drift_result.foreign_pg_container:
-                row["drift_foreign_pg_container"] = True
+                _mark_drift_unresolved(row, "foreign_pg_container")
                 continue
             full = parse_junit_full(junit_path if junit_path.exists() else None)
             if row.get("verdict") == "RED" and not mapped_failed_in_full(
@@ -582,18 +643,36 @@ def sample_full_scope_drift(
             ):
                 # The full-scope run never reproduced the original RED at
                 # all -- an unreliable measurement, not a clean one.
-                row["drift_not_reproduced"] = True
+                _mark_drift_unresolved(row, "not_reproduced")
                 continue
             unmapped_red = unmapped_assertion_shaped_failures(full, entry.tests)
             row["unmapped_red"] = unmapped_red
             row["drift_sampled"] = True
     finally:
-        if worktree.exists() and git_diff_quiet(worktree):
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(worktree)],
-                cwd=repo_dir,
-                capture_output=True,
-            )
+        try:
+            stop_container(pg_handle)
+        except Exception:  # noqa: BLE001 - cleanup must not itself crash
+            logger.error("drift: failed to stop pg container", exc_info=True)
+        if worktree.exists():
+            if git_diff_quiet(worktree):
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    cwd=repo_dir,
+                    capture_output=True,
+                )
+            else:
+                # Should-fix: a dirty drift worktree is kept and logged,
+                # the same fail-safe rule baseline/every worker already
+                # gets -- previously this was force-removed silently.
+                logger.error("drift: worktree %s left dirty, kept", worktree)
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worktree_kept_dirty",
+                        "phase": "drift",
+                        "path": str(worktree),
+                    },
+                )
 
 
 def _sample_pool_metrics(
@@ -891,6 +970,8 @@ def run_pool(
                 python=python,
                 timeout_s=timeout_s,
                 lock_path=resolved_lock,
+                fake_db=fake_db,
+                tmpfs=tmpfs,
             )
             append_event(
                 evidence_dir,
@@ -977,6 +1058,8 @@ def run_pool(
                 timeout_s=timeout_s,
                 sample=sample,
                 lock_path=resolved_lock,
+                fake_db=fake_db,
+                tmpfs=tmpfs,
             )
 
         merged = evidence_dir / "neuter_results.jsonl"

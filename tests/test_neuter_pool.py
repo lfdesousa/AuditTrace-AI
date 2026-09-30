@@ -932,7 +932,8 @@ def test_mock_engine_worker_gets_dsn_when_a_real_pg_handle_exists(
 
     monkeypatch.setattr("scripts.neuter.pytest_run.subprocess.run", fake_run)
     monkeypatch.setattr(
-        "scripts.neuter.pytest_run.foreign_product_pg_container_running", lambda: False
+        "scripts.neuter.pytest_run._continuous_foreign_container_watch",
+        lambda: contextlib.nullcontext(lambda: False),
     )
     real_shaped_handle = PgHandle(
         name="w1", dsn="postgresql+psycopg2://x/y", fake=False

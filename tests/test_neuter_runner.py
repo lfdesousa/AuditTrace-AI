@@ -279,6 +279,7 @@ def test_cmd_arbitrate_writes_arbitration_row(tmp_path, repo):
             PYTHON,
             "--lock-path",
             str(tmp_path / "arb.lock"),
+            "--no-db",
         ]
     )
     assert rc == 0
@@ -311,6 +312,7 @@ def test_cmd_arbitrate_raises_on_preexisting_dirty_repo(tmp_path, repo):
                 PYTHON,
                 "--lock-path",
                 str(tmp_path / "arb.lock"),
+                "--no-db",
             ]
         )
 
@@ -335,6 +337,7 @@ def test_cmd_arbitrate_nocompile_is_authoritative(tmp_path, repo):
             PYTHON,
             "--lock-path",
             str(tmp_path / "arb.lock"),
+            "--no-db",
         ]
     )
     assert rc == 0
@@ -458,6 +461,7 @@ def test_cmd_arbitrate_tests_expected_matches_full_scope_not_mapped_count(tmp_pa
             PYTHON,
             "--lock-path",
             str(tmp_path / "arb.lock"),
+            "--no-db",
         ]
     )
     assert rc == 0
@@ -621,6 +625,7 @@ def test_cmd_arbitrate_refuses_while_lock_held(tmp_path, repo):
                 PYTHON,
                 "--lock-path",
                 str(lock_path),
+                "--no-db",
             ]
         )
         assert rc == 8
@@ -651,6 +656,7 @@ def test_cmd_arbitrate_reads_merged_results_when_no_per_worker_files(tmp_path, r
             PYTHON,
             "--lock-path",
             str(tmp_path / "arb.lock"),
+            "--no-db",
         ]
     )
     assert rc == 0
@@ -720,6 +726,7 @@ def test_cmd_arbitrate_x6_never_reports_authoritative_green(tmp_path):
             PYTHON,
             "--lock-path",
             str(tmp_path / "arb.lock"),
+            "--no-db",
         ]
     )
     assert rc == 0
