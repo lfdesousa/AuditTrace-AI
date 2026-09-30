@@ -158,7 +158,16 @@ def run_pytest(
                 db_before=None,
                 db_after=None,
                 db_leak=False,
-                foreign_pg_container=foreign_before or foreign_after,
+                # A DELTA, never bare presence: a foreign product container
+                # that was ALREADY running before this call (a genuinely
+                # unrelated, concurrent test elsewhere in the SAME `make
+                # test` session -- e.g. another suite's own RLS/ACL fixture
+                # -- and is STILL running after) is not something THIS
+                # invocation caused, and flagging it would false-positive
+                # on every self-proof run alongside real product tests.
+                # Only a container that appears where NONE existed before
+                # is the actual SPEC v3 §9 defect signature.
+                foreign_pg_container=(not foreign_before) and foreign_after,
                 collect_stdout=result.stdout,
             )
 
@@ -249,7 +258,12 @@ def run_pytest(
             db_before=db_before,
             db_after=db_after,
             db_leak=db_leak,
-            foreign_pg_container=foreign_before or foreign_after,
+            # A DELTA, never bare presence -- see the collect-only branch's
+            # comment above for why: a foreign product container already
+            # running before this call, from an unrelated concurrent test
+            # elsewhere in the SAME make-test session, must never be
+            # attributed to THIS invocation.
+            foreign_pg_container=(not foreign_before) and foreign_after,
         )
     finally:
         if probe_fd is not None:
