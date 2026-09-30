@@ -19,6 +19,7 @@ dependency.
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from scripts.neuter import lock as lockmod
-from scripts.neuter.pytest_run import run_pytest
+from scripts.neuter.pytest_run import chokepoint_scope, run_pytest
 
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
 if _DOCKER_AVAILABLE:
@@ -290,3 +291,62 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
         text=True,
     )
     assert ps.stdout.strip() == ""
+
+
+def test_chokepoint_scope_restores_prior_values_that_were_already_set(monkeypatch):
+    """Branch coverage for chokepoint_scope()'s restore path: when
+    NEUTER_CHOKEPOINT_REQUIRED/PYTEST_PLUGINS/PYTHONPATH were ALREADY set
+    (and the plugin dir already on sys.path) before entering the scope,
+    exiting it must restore those EXACT prior values, not merely pop them
+    -- the "else" branch of every restore, as distinct from the "was
+    absent" branch every other test in this module exercises implicitly."""
+    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "prior-required")
+    monkeypatch.setenv("PYTEST_PLUGINS", "prior-plugin")
+    plugin_dir = str(
+        Path(sys.modules["scripts.neuter.pytest_run"].__file__).resolve().parent
+    )
+    monkeypatch.setenv("PYTHONPATH", f"{plugin_dir}:/somewhere/else")
+    already_inserted = plugin_dir not in sys.path
+    if already_inserted:
+        sys.path.insert(0, plugin_dir)
+    try:
+        with chokepoint_scope():
+            assert os.environ["NEUTER_CHOKEPOINT_REQUIRED"] == "prior-required"
+            assert os.environ["PYTEST_PLUGINS"] == "prior-plugin"
+        assert os.environ["NEUTER_CHOKEPOINT_REQUIRED"] == "prior-required"
+        assert os.environ["PYTEST_PLUGINS"] == "prior-plugin"
+        assert os.environ["PYTHONPATH"] == f"{plugin_dir}:/somewhere/else"
+        assert plugin_dir in sys.path
+    finally:
+        if already_inserted:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(plugin_dir)
+
+
+def test_chokepoint_scope_pops_vars_that_were_absent_before(monkeypatch):
+    """The other half: when the three vars were ABSENT before entering the
+    scope, exiting it must leave them absent again (not "1"/leftover)."""
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_REQUIRED", raising=False)
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    with chokepoint_scope():
+        assert os.environ["NEUTER_CHOKEPOINT_REQUIRED"] == "1"
+    assert "NEUTER_CHOKEPOINT_REQUIRED" not in os.environ
+    assert "PYTEST_PLUGINS" not in os.environ
+    assert "PYTHONPATH" not in os.environ
+
+
+def test_pathcheck_expect_without_pathcheck_log_raises(tmp_path, _isolated_lock):
+    """Branch coverage: pathcheck_expect given without pathcheck_log is a
+    programmer error, fails closed with ValueError before spawning anything."""
+    repo = _init_repo(tmp_path)
+    with pytest.raises(
+        ValueError, match="pathcheck_expect given without pathcheck_log"
+    ):
+        run_pytest(
+            workdir=repo,
+            pytest_args=["test_guarded.py::test_a"],
+            python=PYTHON,
+            lock_path=_isolated_lock,
+            pathcheck_expect="/some/path",
+        )
