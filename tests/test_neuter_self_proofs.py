@@ -605,11 +605,19 @@ def test_proof_k_syntax_error_short_circuits(tmp_path):
         ],
         tests=["test_guarded.py::test_a"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    evidence = tmp_path / "ev"
+    row = run_one_neuter(_ctx(repo, evidence), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "nocompile"
     assert row["error_reasons"] == ["nocompile"]
     assert row["tests_collected"] is None
+    # SF-4: the run never starts at all -- pytest is never invoked, so no
+    # junit file exists (classify()'s own nocompile short-circuit would
+    # mask a gate bypass in pool.py's "if not nocompile:" guard on its
+    # OWN, since it forces this same verdict from the `nocompile` flag
+    # regardless of whether pytest actually ran -- this is the guard that
+    # catches THAT bypass specifically).
+    assert not (evidence / "junit").exists()
 
 
 # ──────────────────────────── l. precedence (SF-B) ───────────────────────
