@@ -22,6 +22,15 @@ from fastapi.testclient import TestClient
 # ever applies to collection rooted at THIS repo.
 collect_ignore = ["neuter_fixture"]
 
+# Clear stale evidence from a PRIOR session's neuter-harness tests
+# (tests/_neuter_test_evidence.py) at the start of every session -- it's
+# gitignored scratch space, not evidence anyone reads back later.
+from tests._neuter_test_evidence import (  # noqa: E402
+    cleanup_root as _cleanup_neuter_test_evidence,
+)
+
+_cleanup_neuter_test_evidence()
+
 # ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
 # ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
 # and `observability.external.{langfuse,tempo,loki}Host` are `required`

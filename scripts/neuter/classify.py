@@ -3,9 +3,9 @@
 Every mapped run is classified, in this exact order, first match wins for
 ``error_reason``; ``error_reasons[]`` records every condition met:
 
-    collected -> nocompile -> pathcheck -> db_leak -> timeout ->
-    setup_or_teardown -> skipped -> missing -> call_exception -> junit ->
-    exit_code
+    collected -> nocompile -> pathcheck -> db_leak -> foreign_pg_container ->
+    timeout -> setup_or_teardown -> skipped -> missing -> call_exception ->
+    junit -> exit_code
 
 RED iff no ERROR condition holds and at least one mapped test is ``failed``
 (necessarily assertion-shaped by then). GREEN iff every mapped test
@@ -52,6 +52,7 @@ def classify(
     db_leak: bool,
     timed_out: bool,
     exit_code: int | None,
+    foreign_pg_container: bool = False,
 ) -> VerdictResult:
     """Apply the verdict rule. ``junit_result`` may be ``None`` when the run
     never reached pytest (``nocompile``, or the caller has nothing to parse)."""
@@ -73,6 +74,8 @@ def classify(
         reasons.append("pathcheck")
     if db_leak:
         reasons.append("db_leak")
+    if foreign_pg_container:
+        reasons.append("foreign_pg_container")
     if timed_out:
         reasons.append("timeout")
 

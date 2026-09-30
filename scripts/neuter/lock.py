@@ -91,6 +91,19 @@ def foreign_docker_build_running() -> bool:
     """``/proc/*/cmdline`` scan for a ``docker build``/``buildx`` process (§10 H4).
 
     Own PID is excluded; no ``pgrep`` (the self-matching pgrep lesson).
+
+    Checks ARGV POSITIONS, never a substring search over the whole joined
+    cmdline: a worker's own pytest invocation carries a mapped test's file
+    path or node id, and this repo's own test suite has file/test names
+    containing "docker" AND "build" as substrings (e.g.
+    ``test_chart_rendering.py``'s docker-build-shaped tests) -- a naive
+    ``"docker" in cmdline and "build" in cmdline`` false-positives on
+    exactly those, at N=5 (proof: 4/143 harness tests failed under the
+    substring scan, 0 sequential -- the false positive only shows up when
+    a sibling worker's pytest process happens to be running concurrently).
+    The real signal is narrower: argv[0]'s basename is literally
+    ``docker``/``docker-buildx``, and one of ITS OWN subsequent args is
+    exactly ``build`` or ``buildx``.
     """
     own_pid = os.getpid()
     for entry in Path("/proc").glob("[0-9]*"):
@@ -102,11 +115,16 @@ def foreign_docker_build_running() -> bool:
             continue
         cmdline_path = entry / "cmdline"
         try:
-            cmdline = (
-                cmdline_path.read_bytes().replace(b"\0", b" ").decode(errors="replace")
-            )
+            raw = cmdline_path.read_bytes()
         except OSError:
             continue
-        if "docker" in cmdline and ("build" in cmdline or "buildx" in cmdline):
+        argv = [a for a in raw.split(b"\0") if a]
+        if not argv:
+            continue
+        exe = os.path.basename(argv[0].decode(errors="replace"))
+        if exe not in ("docker", "docker-buildx"):
+            continue
+        rest = {a.decode(errors="replace") for a in argv[1:]}
+        if "build" in rest or "buildx" in rest:
             return True
     return False

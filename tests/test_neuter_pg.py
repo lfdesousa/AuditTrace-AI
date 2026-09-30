@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -14,6 +16,7 @@ from scripts.neuter.pg import (
     _wait_ready,
     assert_nondurable,
     db_snapshot,
+    foreign_product_pg_container_running,
     free_port,
     poll_db_leak,
     read_settings,
@@ -117,5 +120,70 @@ def test_real_container_lifecycle_settings_and_catalog():
             poll_db_leak(handle, (schemata, sessions), deadline_s=0.3, interval_s=0.05)
             is False
         )
+    finally:
+        stop_container(handle)
+
+
+def test_poll_db_leak_actually_repolls_and_catches_a_recovery(tmp_path):
+    """ESC-3 (review round 1): the reviewer's escape drops the
+    ``while ...:`` re-check entirely (``while False and ...``), so
+    ``poll_db_leak`` would only ever look ONCE, at t=0. Real polling must
+    catch a catalog that's dirty at t=0 but RECOVERS (a schema dropped by a
+    slightly-delayed cleanup) before the deadline -- proven here with a
+    background thread that clears the leaked schema mid-poll, independent
+    of anything ``run_one_neuter`` orchestrates."""
+    handle = start_container("esc3", 1, fake=True, fake_dir=tmp_path)
+    before = db_snapshot(handle)
+    state = json.loads(handle.fake_state_path.read_text())
+    state["schemata"].append("leaked_schema")
+    handle.fake_state_path.write_text(json.dumps(state))
+
+    def _recover() -> None:
+        time.sleep(0.12)
+        recovered = json.loads(handle.fake_state_path.read_text())
+        recovered["schemata"] = []
+        handle.fake_state_path.write_text(json.dumps(recovered))
+
+    threading.Thread(target=_recover, daemon=True).start()
+    # dirty at t=0, recovers ~0.12s in -- a real poll (interval < recovery
+    # time, deadline > recovery time) must observe the recovery and report
+    # NO leak; a disabled loop would report the t=0 reading forever.
+    leaked = poll_db_leak(handle, before, deadline_s=0.6, interval_s=0.05)
+    assert leaked is False
+
+
+def test_foreign_product_pg_container_running_false_when_none(monkeypatch):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert foreign_product_pg_container_running() is False
+
+
+def test_foreign_product_pg_container_running_true_for_a_match(monkeypatch):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 0, stdout="audittrace-acl-wu2a-pg-12345\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert foreign_product_pg_container_running() is True
+
+
+def test_foreign_product_pg_container_running_false_on_nonzero_exit(monkeypatch):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="no docker")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert foreign_product_pg_container_running() is False
+
+
+@requires_docker
+def test_start_container_real_with_tmpfs():
+    """The ``tmpfs=True`` branch of the real (non-fake) container path."""
+    handle = start_container("t-pg-tmpfs", 98, tmpfs=True)
+    try:
+        settings = read_settings(handle)
+        assert_nondurable(settings)  # does not raise
     finally:
         stop_container(handle)

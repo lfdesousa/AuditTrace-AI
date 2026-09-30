@@ -179,3 +179,62 @@ def test_verify_report_closed_arbitration_defect_passes(tmp_path):
     spec = _spec(tmp_path)
     write_report(evidence, spec)
     assert verify_report(evidence, spec) == 0
+
+
+def test_read_jsonl_skips_blank_lines(tmp_path):
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    (evidence / "neuter_results.jsonl").write_text("\n" + json.dumps(_row()) + "\n\n")
+    spec = _spec(tmp_path)
+    text = generate_report(evidence, spec)
+    assert "n1" in text
+
+
+def test_generate_report_missing_neuter_is_listed_and_fails_verify(tmp_path):
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    # the spec's one neuter (n1) never produced a row at all.
+    (evidence / "neuter_results.jsonl").write_text("")
+    spec = _spec(tmp_path)
+    text = generate_report(evidence, spec)
+    assert "missing_n=1" in text.splitlines()[-1]
+    assert "- n1" in text
+    write_report(evidence, spec)
+    assert verify_report(evidence, spec) == 7
+
+
+def test_verify_report_unacknowledged_error_fails_acknowledged_passes(tmp_path):
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    (evidence / "neuter_results.jsonl").write_text(
+        json.dumps(_row(verdict="ERROR", error_reason="call_exception")) + "\n"
+    )
+    spec = _spec(tmp_path)
+    write_report(evidence, spec)
+    assert verify_report(evidence, spec) == 7
+    assert verify_report(evidence, spec, ack_errors=True) == 0
+
+
+def test_generate_report_run_id_auto_populated_from_rows(tmp_path):
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    (evidence / "neuter_results.jsonl").write_text(
+        json.dumps(_row(run_id="run-42")) + "\n"
+    )
+    spec = _spec(tmp_path)
+    text = generate_report(evidence, spec)
+    assert "run_id=run-42" in text.splitlines()[-1]
+
+
+def test_generate_report_run_id_multiple_values_joined(tmp_path):
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    row = _row(run_id="run-a")
+    (evidence / "neuter_results_w1.jsonl").write_text(json.dumps(row) + "\n")
+    other = _row(id="n1", run_id="run-b")
+    text_rows = "\n".join(json.dumps(r) for r in (row, other))
+    (evidence / "neuter_results.jsonl").write_text(text_rows + "\n")
+    spec = _spec(tmp_path)
+    text = generate_report(evidence, spec)
+    trailer = text.splitlines()[-1]
+    assert "run_id=run-a,run-b" in trailer

@@ -53,6 +53,18 @@ class JunitResult:
     outcomes: dict[str, JunitTestcase] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class FullJunitResult:
+    """Every testcase in the suite, not just the mapped ids -- the sampled
+    full-scope drift pass (§5) and ``arbitrate`` (§12) both need to see
+    failures OUTSIDE the neuter's own mapped tests, which :func:`parse_junit`
+    deliberately can't show (it only looks up the ids it's given)."""
+
+    tests_collected: int | None
+    parse_failed: bool
+    by_key: dict[tuple[str, str], JunitTestcase] = field(default_factory=dict)
+
+
 def _failure_type(failure_msg: str) -> str:
     """``failure_type := AssertionError if failure_msg starts with 'assert '``
     ``else the text before the first ':'`` (§4)."""
@@ -62,24 +74,37 @@ def _failure_type(failure_msg: str) -> str:
     return first_line.split(":", 1)[0].strip()
 
 
-def parse_junit(path: Path | None, mapped_ids: list[str]) -> JunitResult:
-    """Parse ``path`` (a pytest ``--junitxml`` file) for the given mapped ids.
+def _testcase_outcome(testcase: ET.Element) -> JunitTestcase:
+    failure = testcase.find("failure")
+    error = testcase.find("error")
+    skipped = testcase.find("skipped")
+    if failure is not None:
+        msg = failure.get("message") or (failure.text or "")
+        ftype = _failure_type(msg)
+        return JunitTestcase("failed", msg.splitlines()[0] if msg else "", ftype)
+    if error is not None:
+        msg = error.get("message") or (error.text or "")
+        return JunitTestcase("error", msg.splitlines()[0] if msg else "", None)
+    if skipped is not None:
+        return JunitTestcase("skipped")
+    return JunitTestcase("passed")
 
-    ``tests_collected`` stays ``None`` unless the file parses successfully
-    (an absent or unparsable file is a *different* condition -- ``junit`` --
-    at a lower precedence than ``collected``; see ``classify.py``).
-    """
+
+def parse_junit_full(path: Path | None) -> FullJunitResult:
+    """Parse every testcase in ``path``, keyed by ``(classname, name)`` --
+    the basis both :func:`parse_junit` (mapped-id lookup) and the drift/
+    arbitration full-scope checks build on."""
     if path is None or not path.exists():
-        return JunitResult(tests_collected=None, parse_failed=True)
+        return FullJunitResult(tests_collected=None, parse_failed=True)
     try:
         tree = ET.parse(path)
     except ET.ParseError:
-        return JunitResult(tests_collected=None, parse_failed=True)
+        return FullJunitResult(tests_collected=None, parse_failed=True)
 
     root = tree.getroot()
     suite = root if root.tag == "testsuite" else root.find("testsuite")
     if suite is None:
-        return JunitResult(tests_collected=None, parse_failed=True)
+        return FullJunitResult(tests_collected=None, parse_failed=True)
 
     tests_collected: int | None
     try:
@@ -87,37 +112,51 @@ def parse_junit(path: Path | None, mapped_ids: list[str]) -> JunitResult:
     except ValueError:
         tests_collected = None
 
-    by_key: dict[tuple[str, str], ET.Element] = {}
+    by_key: dict[tuple[str, str], JunitTestcase] = {}
     for testcase in suite.findall("testcase"):
         classname = testcase.get("classname", "")
         name = testcase.get("name", "")
-        by_key[(classname, name)] = testcase
+        by_key[(classname, name)] = _testcase_outcome(testcase)
 
+    return FullJunitResult(
+        tests_collected=tests_collected, parse_failed=False, by_key=by_key
+    )
+
+
+def parse_junit(path: Path | None, mapped_ids: list[str]) -> JunitResult:
+    """Parse ``path`` (a pytest ``--junitxml`` file) for the given mapped ids.
+
+    ``tests_collected`` stays ``None`` unless the file parses successfully
+    (an absent or unparsable file is a *different* condition -- ``junit`` --
+    at a lower precedence than ``collected``; see ``classify.py``).
+    """
+    full = parse_junit_full(path)
     outcomes: dict[str, JunitTestcase] = {}
     for node_id in mapped_ids:
         key = mangle_node_id(node_id)
-        testcase = by_key.get(key)
-        if testcase is None:
-            continue
-        failure = testcase.find("failure")
-        error = testcase.find("error")
-        skipped = testcase.find("skipped")
-        if failure is not None:
-            msg = failure.get("message") or (failure.text or "")
-            ftype = _failure_type(msg)
-            outcomes[node_id] = JunitTestcase(
-                "failed", msg.splitlines()[0] if msg else "", ftype
-            )
-        elif error is not None:
-            msg = error.get("message") or (error.text or "")
-            outcomes[node_id] = JunitTestcase(
-                "error", msg.splitlines()[0] if msg else "", None
-            )
-        elif skipped is not None:
-            outcomes[node_id] = JunitTestcase("skipped")
-        else:
-            outcomes[node_id] = JunitTestcase("passed")
-
+        testcase = full.by_key.get(key)
+        if testcase is not None:
+            outcomes[node_id] = testcase
     return JunitResult(
-        tests_collected=tests_collected, parse_failed=False, outcomes=outcomes
+        tests_collected=full.tests_collected,
+        parse_failed=full.parse_failed,
+        outcomes=outcomes,
     )
+
+
+def unmapped_assertion_shaped_failures(
+    full: FullJunitResult, mapped_ids: list[str]
+) -> list[str]:
+    """Every OTHER assertion-shaped failure in the full-scope junit, outside
+    ``mapped_ids`` (SPEC v3 §5 drift: "full-scope failing ids outside tests
+    -> unmapped_red[]"). Returns ``classname::name`` strings (a diagnostic
+    label, not necessarily an exact pytest node id -- the mangling isn't
+    perfectly invertible, and this is for the DRIFT report, not re-lookup)."""
+    mapped_keys = {mangle_node_id(t) for t in mapped_ids}
+    unmapped: list[str] = []
+    for key, testcase in full.by_key.items():
+        if key in mapped_keys:
+            continue
+        if testcase.outcome == "failed" and testcase.assertion_shaped:
+            unmapped.append("::".join(key))
+    return sorted(unmapped)

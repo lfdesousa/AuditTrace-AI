@@ -10,6 +10,7 @@ print them and exit 3 without a stack trace.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,7 +87,19 @@ def _collect_ids(
     ``--collect-only``'s rendering from the flat ``file.py::test`` list this
     parses to a verbose ``<Dir>/<Module>/<Function>`` tree instead) --
     portable regardless of which repo is being neutered.
+
+    ``PYTHONPATH`` is pinned to ``<repo_dir>/src`` explicitly: without it,
+    an editable install of the SAME package in ``python``'s own environment
+    (e.g. the harness's own dev venv, if it happens to be reused to collect
+    against a DIFFERENT checkout) can resolve import collisions from ITS
+    OWN site-packages ``.pth`` entry instead of ``repo_dir``'s tree,
+    collecting nothing there was to collect and failing every id as
+    ``uncollected`` (exit 3) until this is pinned.
     """
+    env = dict(os.environ)
+    src_dir = str(repo_dir / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src_dir}:{existing}" if existing else src_dir
     result = subprocess.run(
         [
             python,
@@ -99,6 +112,7 @@ def _collect_ids(
             *scope_files,
         ],
         cwd=repo_dir,
+        env=env,
         capture_output=True,
         text=True,
     )
@@ -141,11 +155,18 @@ def load_neuter_spec(
         raise SpecLoadError("guard_tests", "empty guard_tests")
     guard_tests: list[GuardTestEntry] = []
     for entry in raw_guard_tests:
-        if "row" not in entry or not entry["row"]:
-            raise SpecLoadError(
-                "guard_tests_row", f"entry without row: {entry.get('id')!r}"
-            )
-        guard_tests.append(GuardTestEntry(id=entry["id"], row=entry["row"]))
+        # `.get()` throughout, never direct indexing: a malformed entry
+        # (missing "id" or "row") must always fail closed as a
+        # SpecLoadError (exit 3), never escape as a raw KeyError -- found
+        # when a neuter that skips the "row" check went on to raise
+        # KeyError on `entry["row"]` instead of the expected exit 3.
+        gid = entry.get("id")
+        if not gid:
+            raise SpecLoadError("guard_tests_id", f"entry without id: {entry!r}")
+        row = entry.get("row")
+        if not row:
+            raise SpecLoadError("guard_tests_row", f"entry without row: {gid!r}")
+        guard_tests.append(GuardTestEntry(id=gid, row=row))
 
     raw_neuters = raw.get("neuters") or []
     if not raw_neuters:

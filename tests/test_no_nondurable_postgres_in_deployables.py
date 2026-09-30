@@ -6,7 +6,9 @@ A test-only, throwaway ``postgres:16`` container running with ``fsync=off``,
 pool -- crash durability doesn't matter for a container that lives seconds
 and is force-removed. The SAME flags on a real deployment would risk silent
 data loss on a crash. This guard is broad and case-insensitive on purpose
-(``off``/``false``/``no``/``0``): a narrower regex is a narrower guard.
+(the Postgres boolean spellings ``off``/``false``/``no``/``0``/``f``/``n``,
+including the single-letter abbreviations Postgres itself accepts): a
+narrower regex is a narrower guard.
 """
 
 from __future__ import annotations
@@ -17,9 +19,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: Broad, case-insensitive on purpose (SPEC v3 §8).
+#: Broad, case-insensitive on purpose (SPEC v3 §8) -- the Postgres boolean
+#: spellings, including the single-letter abbreviations (``fsync = f`` is a
+#: real, valid postgresql.conf value Postgres itself accepts).
 _NONDURABLE_RE = re.compile(
-    r"(fsync|synchronous_commit|full_page_writes)\s*[:=]\s*['\"]?(off|false|no|0)\b",
+    r"(fsync|synchronous_commit|full_page_writes)\s*[:=]\s*['\"]?(off|false|no|0|f|n)\b",
     re.IGNORECASE,
 )
 
@@ -119,3 +123,38 @@ def test_positive_control_regex_matches_the_test_fixture_itself():
     text = (REPO_ROOT / "tests" / "_pg_ephemeral.py").read_text()
     matches = [line for line in text.splitlines() if _NONDURABLE_RE.search(line)]
     assert len(matches) == 3, matches
+
+
+def test_regex_matches_every_nondurable_spelling():
+    """Review round 1 should-fix: a narrowed regex (dropping everything but
+    ``off``) left every test in this file green -- none of them exercised
+    the regex's OWN breadth. This asserts on EVERY spelling the guard
+    claims to catch (including the single-letter Postgres abbreviations),
+    so narrowing it reddens here directly, not by accident elsewhere."""
+    for key in ("fsync", "synchronous_commit", "full_page_writes"):
+        for spelling in (
+            "off",
+            "OFF",
+            "false",
+            "False",
+            "no",
+            "No",
+            "0",
+            "f",
+            "F",
+            "n",
+            "N",
+        ):
+            for sep in (":", "="):
+                for quote in ("", '"', "'"):
+                    line = f"{key} {sep} {quote}{spelling}{quote}"
+                    assert _NONDURABLE_RE.search(line), f"no match: {line!r}"
+
+
+def test_regex_does_not_match_durable_values():
+    """The mirror image of the breadth check: durable values (``on``,
+    ``true``, ``1``) must NEVER trip the guard, or every real deployable
+    setting them explicitly durable would be a permanent false positive."""
+    for spelling in ("on", "true", "1", "t", "yes", "y"):
+        line = f"fsync = {spelling}"
+        assert not _NONDURABLE_RE.search(line), f"unexpected match: {line!r}"

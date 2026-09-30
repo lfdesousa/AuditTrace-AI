@@ -13,6 +13,27 @@ Results are durable: one JSONL per worker, ``flush()`` + ``fsync()`` per
 row, never ``/tmp``. Resume skips a neuter whose existing row already has
 verdict in {RED, GREEN}, ``restored_clean``, the same ``sha``,
 ``neuter_hash``, and ``harness_version``; ERROR rows always re-run.
+
+**Fails CLOSED (review round 1, blocker 1):** every neuter in the spec
+must produce exactly one row. A crashed worker (a fake ``docker`` that
+exits 1, a poisoned import, anything) is caught, logged to
+``events.jsonl`` with its traceback, and its worktree/container cleaned up
+-- but the crash can never make the pool silently exit 0 with rows
+missing. After every worker joins, ``run_pool`` diffs the merged rows
+against ``{n.id for n in spec.neuters}``; any gap is
+:data:`EXIT_MISSING_ROWS`, the missing ids printed.
+
+**Baseline-first (blocker 2):** before any worker even starts, the union
+of every neuter's mapped tests is run ONCE, untouched, at the pinned sha.
+Any non-passed outcome there is :data:`EXIT_BASELINE_FAILED` and no
+neuter runs -- a neuter mapped to an already-failing test can never read
+as a false RED.
+
+**Sampled full-scope drift (blocker 3):** after the targeted pass, a
+``random.Random(run_id)``-seeded sample of neuters is re-applied and run
+over the FULL ``scope_files`` (not just their mapped tests); any
+assertion-shaped failure OUTSIDE the mapped set is recorded as measured
+``unmapped_red`` on that row -- never a hardcoded ``[]``.
 """
 
 from __future__ import annotations
@@ -21,11 +42,16 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
+import random
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,13 +59,18 @@ from typing import Any
 
 from scripts.neuter import lock as lockmod
 from scripts.neuter.classify import classify
-from scripts.neuter.junit import parse_junit
+from scripts.neuter.junit import (
+    parse_junit,
+    parse_junit_full,
+    unmapped_assertion_shaped_failures,
+)
 from scripts.neuter.pg import (
     EXIT_NONDURABLE_SETTINGS,
     NonDurableSettingsError,
     PgHandle,
     assert_nondurable,
     db_snapshot,
+    foreign_product_pg_container_running,
     poll_db_leak,
     read_settings,
     start_container,
@@ -52,8 +83,12 @@ logger = logging.getLogger(__name__)
 HARNESS_VERSION = "1"
 
 EXIT_OK = 0
+EXIT_SPEC_ERROR = 3
 EXIT_DIRTY_TREE = 4
+EXIT_BASELINE_FAILED = 5
 EXIT_LOCK_HELD = 8
+EXIT_MISSING_ROWS = 10
+EXIT_WORKERS_UNMEASURED = 12
 
 
 class DirtyTreeError(Exception):
@@ -62,6 +97,18 @@ class DirtyTreeError(Exception):
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def evidence_dir_is_refused(evidence_dir: Path) -> bool:
+    """SPEC v3 §7: ``/tmp`` (and ``tempfile.gettempdir()``) are refused as
+    evidence dirs -- results must be durable, never in the one place every
+    OS routinely reaps."""
+    resolved = str(evidence_dir.resolve())
+    refused_roots = {"/tmp", os.path.realpath(tempfile.gettempdir())}
+    return any(
+        resolved == root or resolved.startswith(root.rstrip("/") + "/")
+        for root in refused_roots
+    )
 
 
 def compute_neuter_hash(entry: NeuterEntry) -> str:
@@ -86,14 +133,16 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         os.fsync(fh.fileno())
 
 
+def append_event(evidence_dir: Path, event: dict[str, Any]) -> None:
+    """Append one structured event to ``events.jsonl`` (should-fix)."""
+    row = {"ts": _now_iso(), **event}
+    append_jsonl(evidence_dir / "events.jsonl", row)
+
+
 def git_diff_quiet(workdir: Path, *paths: str) -> bool:
     return (
         subprocess.run(["git", "diff", "--quiet", *paths], cwd=workdir).returncode == 0
     )
-
-
-def _read_file(workdir: Path, relpath: str) -> str:
-    return (workdir / relpath).read_text()
 
 
 def apply_edits(workdir: Path, entry: NeuterEntry) -> list[int]:
@@ -131,6 +180,33 @@ def _log_line_count(path: Path) -> int:
         return sum(1 for _ in fh)
 
 
+def _run_pytest_full_scope(
+    workdir: Path, python: str, scope_files: list[str], junit_path: Path, timeout_s: int
+) -> tuple[int | None, bool]:
+    """Run ``scope_files`` (the WHOLE scope, never just mapped tests) and
+    return ``(exit_code, timed_out)``. Shared by the drift sampler and
+    ``arbitrate``."""
+    junit_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        python,
+        "-m",
+        "pytest",
+        *scope_files,
+        "-q",
+        "--no-cov",
+        "-o",
+        "addopts=",
+        f"--junitxml={junit_path}",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s
+        )
+        return result.returncode, False
+    except subprocess.TimeoutExpired:
+        return None, True
+
+
 @dataclass
 class WorkerContext:
     workdir: Path
@@ -147,6 +223,23 @@ class WorkerContext:
     #: worker worktrees use ``<workdir>/src``; the self-proof fixture's
     #: toy ``guarded`` module sits at its repo root instead).
     src_root: str | None = None
+
+
+def _base_row(
+    ctx: WorkerContext, entry: NeuterEntry, matches: list[int], harness_version: str
+) -> dict[str, Any]:
+    return {
+        "schema": 3,
+        "run_id": ctx.run_id,
+        "sha": ctx.sha,
+        "harness_version": harness_version,
+        "id": entry.id,
+        "neuter_hash": compute_neuter_hash(entry),
+        "worker": ctx.worker_idx,
+        "file": entry.file,
+        "matches": matches,
+        "tests_expected": len(entry.tests),
+    }
 
 
 def run_one_neuter(
@@ -169,6 +262,7 @@ def run_one_neuter(
     pathcheck_ok = True
     db_before = db_after = None
     db_leak = False
+    foreign_pg_container = False
     pg_settings = None
     junit_result = None
     junit_path = (
@@ -179,8 +273,9 @@ def run_one_neuter(
     pathcheck_log = ctx.evidence_dir / f"pathcheck_w{ctx.worker_idx}.log"
 
     if not nocompile:
-        want_pg = "postgres" in entry.engines and ctx.pg_handle is not None
-        if want_pg:
+        real_pg = ctx.pg_handle is not None and not ctx.pg_handle.fake
+        want_pg_check = "postgres" in entry.engines and ctx.pg_handle is not None
+        if want_pg_check:
             pg_settings = read_settings(ctx.pg_handle)
             try:
                 assert_nondurable(pg_settings)
@@ -190,39 +285,34 @@ def run_one_neuter(
                 # ignored the non-durable flags -- a mapping/environment
                 # defect, not a test outcome, so the run never starts.
                 restored_clean = restore(ctx.workdir, entry)
-                return {
-                    "schema": 3,
-                    "run_id": ctx.run_id,
-                    "sha": ctx.sha,
-                    "harness_version": harness_version,
-                    "id": entry.id,
-                    "neuter_hash": compute_neuter_hash(entry),
-                    "worker": ctx.worker_idx,
-                    "file": entry.file,
-                    "matches": matches,
-                    "tests_expected": len(entry.tests),
-                    "tests_collected": None,
-                    "outcomes": {},
-                    "failed": [],
-                    "failure_msgs": {},
-                    "failure_types": [],
-                    "errors": [],
-                    "verdict": "ERROR",
-                    "error_reason": "pg_settings",
-                    "error_reasons": ["pg_settings"],
-                    "vacuous": False,
-                    "unmapped_red": [],
-                    "secs": round(time.time() - t0, 3),
-                    "started_at": started,
-                    "finished_at": _now_iso(),
-                    "exit_code": None,
-                    "timeout": False,
-                    "restored_clean": restored_clean,
-                    "db_before": None,
-                    "db_after": None,
-                    "db_leak": False,
-                    "pg_settings": pg_settings,
-                }
+                row = _base_row(ctx, entry, matches, harness_version)
+                row.update(
+                    {
+                        "tests_collected": None,
+                        "outcomes": {},
+                        "failed": [],
+                        "failure_msgs": {},
+                        "failure_types": [],
+                        "errors": [],
+                        "verdict": "ERROR",
+                        "error_reason": "pg_settings",
+                        "error_reasons": ["pg_settings"],
+                        "vacuous": False,
+                        "unmapped_red": [],
+                        "drift_sampled": False,
+                        "secs": round(time.time() - t0, 3),
+                        "started_at": started,
+                        "finished_at": _now_iso(),
+                        "exit_code": None,
+                        "timeout": False,
+                        "restored_clean": restored_clean,
+                        "db_before": None,
+                        "db_after": None,
+                        "db_leak": False,
+                        "pg_settings": pg_settings,
+                    }
+                )
+                return row
             db_before = db_snapshot(ctx.pg_handle)
 
         junit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,8 +323,15 @@ def run_one_neuter(
         env["NEUTER_PATHCHECK_MODULE"] = ctx.pathcheck_module
         env["NEUTER_PATHCHECK_EXPECT"] = ctx.pathcheck_expect
         env["NEUTER_PATHCHECK_LOG"] = str(pathcheck_log)
-        if want_pg and ctx.pg_handle is not None and not ctx.pg_handle.fake:
-            env["AUDITTRACE_TEST_POSTGRES_URL"] = ctx.pg_handle.dsn
+        # §9: EVERY worker with a real (non-fake) Postgres gets the DSN,
+        # regardless of whether THIS neuter's own `engines` names
+        # "postgres" -- a mock-engine neuter's mapped test file can still
+        # import a module that starts a DURABLE product container at
+        # import time (tests/_pg_ephemeral.py's callers) unless it finds
+        # AUDITTRACE_TEST_POSTGRES_URL already set and reuses the worker's
+        # own throwaway container instead.
+        if real_pg:
+            env["AUDITTRACE_TEST_POSTGRES_URL"] = ctx.pg_handle.dsn  # type: ignore[union-attr]
         if (
             ctx.pg_handle is not None
             and ctx.pg_handle.fake
@@ -249,6 +346,8 @@ def run_one_neuter(
             *entry.tests,
             "-q",
             "--no-cov",
+            "-o",
+            "addopts=",
             "-p",
             "no:cacheprovider",
             "-p",
@@ -271,9 +370,12 @@ def run_one_neuter(
 
         pathcheck_ok = _log_line_count(pathcheck_log) > before_lines
 
-        if want_pg and ctx.pg_handle is not None:
+        if want_pg_check and ctx.pg_handle is not None:
             db_leak = poll_db_leak(ctx.pg_handle, db_before)
             db_after = db_snapshot(ctx.pg_handle)
+
+        if real_pg:
+            foreign_pg_container = foreign_product_pg_container_running()
 
         junit_result = parse_junit(
             junit_path if junit_path.exists() else None, entry.tests
@@ -290,42 +392,38 @@ def run_one_neuter(
         db_leak=db_leak,
         timed_out=timed_out,
         exit_code=exit_code,
+        foreign_pg_container=foreign_pg_container,
     )
     secs = round(time.time() - t0, 3)
 
-    return {
-        "schema": 3,
-        "run_id": ctx.run_id,
-        "sha": ctx.sha,
-        "harness_version": harness_version,
-        "id": entry.id,
-        "neuter_hash": compute_neuter_hash(entry),
-        "worker": ctx.worker_idx,
-        "file": entry.file,
-        "matches": matches,
-        "tests_expected": len(entry.tests),
-        "tests_collected": verdict.tests_collected,
-        "outcomes": verdict.outcomes,
-        "failed": verdict.failed,
-        "failure_msgs": verdict.failure_msgs,
-        "failure_types": verdict.failure_types,
-        "errors": verdict.errors,
-        "verdict": verdict.verdict,
-        "error_reason": verdict.error_reason,
-        "error_reasons": verdict.error_reasons,
-        "vacuous": verdict.vacuous,
-        "unmapped_red": [],
-        "secs": secs,
-        "started_at": started,
-        "finished_at": _now_iso(),
-        "exit_code": exit_code,
-        "timeout": timed_out,
-        "restored_clean": restored_clean,
-        "db_before": sorted(db_before[0]) if db_before else None,
-        "db_after": sorted(db_after[0]) if db_after else None,
-        "db_leak": db_leak,
-        "pg_settings": pg_settings,
-    }
+    row = _base_row(ctx, entry, matches, harness_version)
+    row.update(
+        {
+            "tests_collected": verdict.tests_collected,
+            "outcomes": verdict.outcomes,
+            "failed": verdict.failed,
+            "failure_msgs": verdict.failure_msgs,
+            "failure_types": verdict.failure_types,
+            "errors": verdict.errors,
+            "verdict": verdict.verdict,
+            "error_reason": verdict.error_reason,
+            "error_reasons": verdict.error_reasons,
+            "vacuous": verdict.vacuous,
+            "unmapped_red": [],
+            "drift_sampled": False,
+            "secs": secs,
+            "started_at": started,
+            "finished_at": _now_iso(),
+            "exit_code": exit_code,
+            "timeout": timed_out,
+            "restored_clean": restored_clean,
+            "db_before": sorted(db_before[0]) if db_before else None,
+            "db_after": sorted(db_after[0]) if db_after else None,
+            "db_leak": db_leak,
+            "pg_settings": pg_settings,
+        }
+    )
+    return row
 
 
 def should_skip(
@@ -383,6 +481,178 @@ def foreign_audittrace_container_exists(run_id: str) -> bool:
     )
 
 
+def run_baseline(
+    spec: NeuterSpecFile,
+    *,
+    repo_dir: Path,
+    parent_worktree_dir: Path,
+    evidence_dir: Path,
+    run_id: str,
+    python: str,
+    timeout_s: int,
+) -> tuple[bool, str]:
+    """SPEC v3 §5: before any neuter runs, every mapped test must PASS at
+    the pinned sha with NO edit applied. Returns ``(ok, detail)``."""
+    worktree = parent_worktree_dir / f"at-nt-{run_id}-baseline"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(worktree), spec.sha],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    try:
+        all_tests = sorted({t for n in spec.neuters for t in n.tests})
+        junit_path = evidence_dir / "junit" / "baseline.xml"
+        junit_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            python,
+            "-m",
+            "pytest",
+            *all_tests,
+            "-q",
+            "--no-cov",
+            "-o",
+            "addopts=",
+            "-rfE",
+            f"--junitxml={junit_path}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, cwd=worktree, capture_output=True, text=True, timeout=timeout_s
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"baseline timed out after {timeout_s}s"
+        if result.returncode not in (0,):
+            full = parse_junit_full(junit_path if junit_path.exists() else None)
+            failed = sorted(
+                "::".join(k) for k, o in full.by_key.items() if o.outcome != "passed"
+            )
+            tail = result.stdout[-2000:]
+            return False, f"exit={result.returncode} failed={failed} tail={tail}"
+        return True, ""
+    finally:
+        if worktree.exists() and git_diff_quiet(worktree):
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=repo_dir,
+                capture_output=True,
+            )
+
+
+def sample_full_scope_drift(
+    spec: NeuterSpecFile,
+    rows: dict[str, dict[str, Any]],
+    *,
+    repo_dir: Path,
+    parent_worktree_dir: Path,
+    evidence_dir: Path,
+    run_id: str,
+    python: str,
+    timeout_s: int,
+    sample: float,
+) -> None:
+    """SPEC v3 §5 sampled full-scope drift check: for a ``random.Random(run_id)``
+    seeded sample of neuters, re-apply the edit and run the FULL
+    ``scope_files`` (not just the mapped tests). Any assertion-shaped
+    failure OUTSIDE the mapped set is MEASURED and written back onto that
+    row's ``unmapped_red`` -- never a constant. Mutates ``rows`` in place.
+    """
+    if sample <= 0 or not spec.neuters:
+        return
+    n_sample = max(1, math.ceil(sample * len(spec.neuters)))
+    rng = random.Random(run_id)
+    sampled = rng.sample(spec.neuters, k=min(n_sample, len(spec.neuters)))
+
+    worktree = parent_worktree_dir / f"at-nt-{run_id}-drift"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(worktree), spec.sha],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    try:
+        for entry in sampled:
+            row = rows.get(entry.id)
+            if row is None or row.get("verdict") not in ("RED", "GREEN"):
+                continue  # ERROR/DIRTY rows are not drift-sampled
+            if not git_diff_quiet(worktree):
+                logger.error(
+                    "drift sample: %s left %s dirty before start", entry.id, worktree
+                )
+                continue
+            apply_edits(worktree, entry)
+            if not py_compile_ok(worktree, entry, python):
+                subprocess.run(
+                    ["git", "checkout", "--", entry.file], cwd=worktree, check=True
+                )
+                continue
+            junit_path = (
+                evidence_dir / "junit" / f"drift_{entry.id.replace('/', '_')}.xml"
+            )
+            _run_pytest_full_scope(
+                worktree, python, spec.scope_files, junit_path, timeout_s
+            )
+            subprocess.run(
+                ["git", "checkout", "--", entry.file], cwd=worktree, check=True
+            )
+            if not git_diff_quiet(worktree):
+                logger.error(
+                    "drift sample: %s left %s dirty after restore", entry.id, worktree
+                )
+                continue
+            full = parse_junit_full(junit_path if junit_path.exists() else None)
+            unmapped_red = unmapped_assertion_shaped_failures(full, entry.tests)
+            row["unmapped_red"] = unmapped_red
+            row["drift_sampled"] = True
+    finally:
+        if worktree.exists() and git_diff_quiet(worktree):
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=repo_dir,
+                capture_output=True,
+            )
+
+
+def _sample_pool_metrics(
+    evidence_dir: Path, stop: threading.Event, interval_s: float = 5.0
+) -> None:
+    """Background thread: append memory/load/container samples to
+    ``pool_metrics.jsonl`` every ``interval_s`` while the pool runs
+    (should-fix)."""
+    while not stop.wait(interval_s):
+        try:
+            meminfo_lines = Path("/proc/meminfo").read_text().splitlines()
+            total = int(
+                next(ln for ln in meminfo_lines if ln.startswith("MemTotal:")).split()[
+                    1
+                ]
+            )
+            avail = int(
+                next(
+                    ln for ln in meminfo_lines if ln.startswith("MemAvailable:")
+                ).split()[1]
+            )
+            load1 = os.getloadavg()[0]
+            containers = subprocess.run(
+                ["docker", "ps", "-q"], capture_output=True, text=True, timeout=5
+            )
+            n_containers = (
+                len(containers.stdout.split()) if containers.returncode == 0 else 0
+            )
+            append_jsonl(
+                evidence_dir / "pool_metrics.jsonl",
+                {
+                    "ts": _now_iso(),
+                    "avail_mb": avail // 1024,
+                    "used_mb": (total - avail) // 1024,
+                    "load1": load1,
+                    "containers": n_containers,
+                },
+            )
+        except Exception:  # noqa: BLE001 - best-effort metrics, never fatal
+            logger.debug("pool_metrics sample failed", exc_info=True)
+
+
 def _worker_main(
     worker_idx: int,
     queue: mp.Queue[str | None],
@@ -403,35 +673,41 @@ def _worker_main(
     stop_flag: mp.Event,  # type: ignore[type-arg]
 ) -> None:
     worktree = parent_worktree_dir / f"at-nt-{run_id}-w{worker_idx}"
-    subprocess.run(
-        ["git", "worktree", "add", "--detach", str(worktree), spec.sha],
-        cwd=repo_dir,
-        check=True,
-        capture_output=True,
-    )
-    pg_handle = start_container(
-        run_id,
-        worker_idx,
-        tmpfs=tmpfs,
-        fake=fake_db,
-        fake_dir=evidence_dir / "fake_pg" if fake_db else None,
-    )
     out_path = evidence_dir / f"neuter_results_w{worker_idx}.jsonl"
-    src_root = str(worktree / src_root_relative) if src_root_relative else str(worktree)
-    ctx = WorkerContext(
-        workdir=worktree,
-        worker_idx=worker_idx,
-        python=python,
-        run_id=run_id,
-        sha=spec.sha,
-        evidence_dir=evidence_dir,
-        pg_handle=pg_handle,
-        pathcheck_expect=src_root,
-        pathcheck_module=pathcheck_module,
-        timeout_s=timeout_s,
-        src_root=src_root,
-    )
+    worktree_created = False
+    pg_handle: PgHandle | None = None
     try:
+        append_event(evidence_dir, {"event": "worker_start", "worker": worker_idx})
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), spec.sha],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+        worktree_created = True
+        pg_handle = start_container(
+            run_id,
+            worker_idx,
+            tmpfs=tmpfs,
+            fake=fake_db,
+            fake_dir=evidence_dir / "fake_pg" if fake_db else None,
+        )
+        src_root = (
+            str(worktree / src_root_relative) if src_root_relative else str(worktree)
+        )
+        ctx = WorkerContext(
+            workdir=worktree,
+            worker_idx=worker_idx,
+            python=python,
+            run_id=run_id,
+            sha=spec.sha,
+            evidence_dir=evidence_dir,
+            pg_handle=pg_handle,
+            pathcheck_expect=src_root,
+            pathcheck_module=pathcheck_module,
+            timeout_s=timeout_s,
+            src_root=src_root,
+        )
         while not stop_flag.is_set():
             neuter_id = queue.get()
             if neuter_id is None:
@@ -460,6 +736,14 @@ def _worker_main(
                         "worker": worker_idx,
                     },
                 )
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worker_dirty_stop",
+                        "worker": worker_idx,
+                        "id": neuter_id,
+                    },
+                )
                 return
             append_jsonl(out_path, row)
             if not row["restored_clean"]:
@@ -469,14 +753,60 @@ def _worker_main(
                     neuter_id,
                 )
                 stop_flag.set()
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worker_dirty_stop",
+                        "worker": worker_idx,
+                        "id": neuter_id,
+                    },
+                )
                 return
-    finally:
-        stop_container(pg_handle)
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(worktree)],
-            cwd=repo_dir,
-            capture_output=True,
+    except Exception as exc:  # noqa: BLE001 - MUST be caught: an uncaught
+        # exception here kills this mp.Process silently and the parent
+        # would never know a single row is missing (blocker 1: fail-open).
+        append_event(
+            evidence_dir,
+            {
+                "event": "worker_crashed",
+                "worker": worker_idx,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            },
         )
+        logger.error("worker %d crashed: %s", worker_idx, exc, exc_info=True)
+    finally:
+        if pg_handle is not None:
+            try:
+                stop_container(pg_handle)
+            except Exception:  # noqa: BLE001 - cleanup must not itself crash
+                logger.error(
+                    "worker %d: failed to stop pg container", worker_idx, exc_info=True
+                )
+        if worktree_created and worktree.exists():
+            clean = git_diff_quiet(worktree)
+            if clean:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    cwd=repo_dir,
+                    capture_output=True,
+                )
+            else:
+                # §6 proof c / should-fix: a dirty worktree is KEPT and
+                # logged, never force-removed -- force-removing here would
+                # erase the evidence the dirty-restore path exists to keep.
+                logger.error(
+                    "worker %d: worktree %s left dirty, kept", worker_idx, worktree
+                )
+                append_event(
+                    evidence_dir,
+                    {
+                        "event": "worktree_kept_dirty",
+                        "worker": worker_idx,
+                        "path": str(worktree),
+                    },
+                )
+        append_event(evidence_dir, {"event": "worker_end", "worker": worker_idx})
 
 
 def run_pool(
@@ -495,11 +825,27 @@ def run_pool(
     pathcheck_module: str = "audittrace",
     src_root_relative: str = "src",
     fake_db: bool = False,
+    sample: float = 0.10,
+    i_measured_it: bool = False,
+    skip_baseline: bool = False,
 ) -> int:
     """Orchestrate the whole pool run (§6). Returns the process exit code."""
     python = python or f"{repo_dir}/.venv/bin/python"
     run_id = run_id or datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+
+    if evidence_dir_is_refused(evidence_dir):
+        print(
+            f"neuter pool: evidence dir refused (/tmp): {evidence_dir}", file=sys.stderr
+        )
+        return EXIT_SPEC_ERROR
     evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    if workers > 10 and not i_measured_it:
+        print(
+            "neuter pool: --workers > 10 requires --i-measured-it (reason logged)",
+            file=sys.stderr,
+        )
+        return EXIT_WORKERS_UNMEASURED
 
     resolved_lock = lockmod.resolve_lock_path(str(lock_path) if lock_path else None)
     lock_fd = lockmod.open_lock_file(resolved_lock)
@@ -510,7 +856,16 @@ def run_pool(
         os.close(lock_fd)
         return EXIT_LOCK_HELD
 
+    metrics_stop = threading.Event()
+    metrics_thread = threading.Thread(
+        target=_sample_pool_metrics, args=(evidence_dir, metrics_stop), daemon=True
+    )
+    metrics_thread.start()
+
     try:
+        append_event(
+            evidence_dir, {"event": "pool_start", "run_id": run_id, "workers": workers}
+        )
         if lockmod.foreign_docker_build_running():
             print(
                 "neuter pool: a docker build/buildx process is running", file=sys.stderr
@@ -521,6 +876,27 @@ def run_pool(
                 "neuter pool: a foreign audittrace-* container exists", file=sys.stderr
             )
             return EXIT_LOCK_HELD
+
+        if not skip_baseline:
+            baseline_ok, detail = run_baseline(
+                spec,
+                repo_dir=repo_dir,
+                parent_worktree_dir=parent_worktree_dir,
+                evidence_dir=evidence_dir,
+                run_id=run_id,
+                python=python,
+                timeout_s=timeout_s,
+            )
+            append_event(
+                evidence_dir,
+                {"event": "baseline", "ok": baseline_ok, "detail": detail[:2000]},
+            )
+            if not baseline_ok:
+                print(
+                    f"neuter pool: baseline failed at {spec.sha}: {detail}",
+                    file=sys.stderr,
+                )
+                return EXIT_BASELINE_FAILED
 
         resume_rows = load_existing_rows(evidence_dir) if resume else {}
         neuters_by_id = {n.id: n for n in spec.neuters}
@@ -559,19 +935,60 @@ def run_pool(
         for p in procs:
             p.join()
 
-        if stop_flag.is_set():
-            return EXIT_DIRTY_TREE
+        rows = load_existing_rows(evidence_dir)
+
+        if sample > 0:
+            sample_full_scope_drift(
+                spec,
+                rows,
+                repo_dir=repo_dir,
+                parent_worktree_dir=parent_worktree_dir,
+                evidence_dir=evidence_dir,
+                run_id=run_id,
+                python=python,
+                timeout_s=timeout_s,
+                sample=sample,
+            )
 
         merged = evidence_dir / "neuter_results.jsonl"
-        rows = load_existing_rows(evidence_dir)
         with open(merged, "w") as fh:
             for row in rows.values():
                 fh.write(json.dumps(row) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
 
+        append_event(
+            evidence_dir, {"event": "pool_end", "run_id": run_id, "rows": len(rows)}
+        )
+
+        if stop_flag.is_set():
+            return EXIT_DIRTY_TREE
+
+        # Blocker 1: fail CLOSED. Every neuter in the spec must have
+        # produced exactly one row -- a crashed worker (or any other
+        # cause) leaving gaps is never silently exit 0.
+        expected_ids = {n.id for n in spec.neuters}
+        missing = sorted(expected_ids - set(rows.keys()))
+        if missing:
+            crashes = [
+                json.loads(line)
+                for line in (evidence_dir / "events.jsonl").read_text().splitlines()
+                if '"worker_crashed"' in line
+            ]
+            for c in crashes:
+                print(
+                    f"neuter pool: worker {c.get('worker')} crashed: {c.get('error')}",
+                    file=sys.stderr,
+                )
+            print(
+                f"neuter pool: {len(missing)} neuter(s) never produced a row: {missing}",
+                file=sys.stderr,
+            )
+            return EXIT_MISSING_ROWS
+
         return pool_exit_code(rows)
     finally:
+        metrics_stop.set()
         os.close(lock_fd)
 
 

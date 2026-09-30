@@ -13,6 +13,7 @@ import pytest
 
 from scripts.neuter import lock as lockmod
 from scripts.neuter.runner import main
+from tests._neuter_test_evidence import evidence_dir_for as _ev
 
 PYTHON = sys.executable
 
@@ -119,7 +120,7 @@ def test_cmd_run_spec_load_error_exits_3(tmp_path, repo, capsys):
             "--neuters",
             str(spec_path),
             "--evidence",
-            str(tmp_path / "ev"),
+            str(_ev(tmp_path)),
             "--repo-dir",
             str(repo),
             "--python",
@@ -136,7 +137,7 @@ def test_cmd_run_spec_load_error_exits_3(tmp_path, repo, capsys):
 def test_cmd_run_full_pool_via_cli(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     rc = main(
         [
             "run",
@@ -172,7 +173,7 @@ def test_cmd_run_full_pool_via_cli(tmp_path, repo):
 def test_cmd_report_writes_and_verifies(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     main(
         [
             "run",
@@ -232,7 +233,7 @@ def test_cmd_report_writes_and_verifies(tmp_path, repo):
 def test_cmd_arbitrate_writes_arbitration_row(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     main(
         [
             "run",
@@ -293,7 +294,7 @@ def test_cmd_arbitrate_raises_on_preexisting_dirty_repo(tmp_path, repo):
                 "--ids",
                 "n1",
                 "--evidence",
-                str(tmp_path / "ev"),
+                str(_ev(tmp_path)),
                 "--neuters",
                 str(spec_path),
                 "--repo-dir",
@@ -315,7 +316,7 @@ def test_cmd_arbitrate_nocompile_is_authoritative(tmp_path, repo):
             "--ids",
             "n1",
             "--evidence",
-            str(tmp_path / "ev"),
+            str(_ev(tmp_path)),
             "--neuters",
             str(spec_path),
             "--repo-dir",
@@ -327,7 +328,7 @@ def test_cmd_arbitrate_nocompile_is_authoritative(tmp_path, repo):
     assert rc == 0
     rows = [
         json.loads(line)
-        for line in (tmp_path / "ev" / "arbitration.jsonl").read_text().splitlines()
+        for line in (_ev(tmp_path) / "arbitration.jsonl").read_text().splitlines()
     ]
     assert rows[0]["authoritative_verdict"] == "ERROR"
 
@@ -335,7 +336,7 @@ def test_cmd_arbitrate_nocompile_is_authoritative(tmp_path, repo):
 def test_cmd_report_with_reviewer_guard_tests(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     main(
         [
             "run",
@@ -434,7 +435,7 @@ def test_cmd_arbitrate_tests_expected_matches_full_scope_not_mapped_count(tmp_pa
             "--ids",
             "n1",
             "--evidence",
-            str(tmp_path / "ev"),
+            str(_ev(tmp_path)),
             "--neuters",
             str(spec_path),
             "--repo-dir",
@@ -446,7 +447,311 @@ def test_cmd_arbitrate_tests_expected_matches_full_scope_not_mapped_count(tmp_pa
     assert rc == 0
     rows = [
         json.loads(line)
-        for line in (tmp_path / "ev" / "arbitration.jsonl").read_text().splitlines()
+        for line in (_ev(tmp_path) / "arbitration.jsonl").read_text().splitlines()
     ]
     assert rows[0]["authoritative_verdict"] == "RED"
     assert rows[0]["authoritative_error_reason"] is None
+
+
+# ─────────────────── should-fix: --sha honoured, /tmp refused ────────────
+
+
+def test_cmd_run_sha_mismatch_refused(tmp_path, repo):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    rc = main(
+        [
+            "run",
+            "--sha",
+            "0" * 40,
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(_ev(tmp_path)),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+        ]
+    )
+    assert rc == 3
+
+
+def test_cmd_run_evidence_under_tmp_refused(tmp_path, repo, capsys):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    rc = main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            "/tmp/some-neuter-run",
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+        ]
+    )
+    assert rc == 3
+    assert "refused" in capsys.readouterr().err
+
+
+def test_cmd_run_guard_tests_closure_ok_and_persisted(tmp_path, repo):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    guard_tests_path = tmp_path / "guard_tests.json"
+    guard_tests_path.write_text(
+        json.dumps([{"id": "test_mod.py::test_f", "row": "R1"}])
+    )
+    evidence = _ev(tmp_path)
+    rc = main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--guard-tests",
+            str(guard_tests_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "mod",
+            "--src-root-relative",
+            "",
+        ]
+    )
+    assert rc == 0
+    assert (evidence / "guard_tests_reviewer.json").exists()
+
+
+def test_cmd_run_guard_tests_closure_mismatch_refused(tmp_path, repo, capsys):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    guard_tests_path = tmp_path / "guard_tests.json"
+    guard_tests_path.write_text(
+        json.dumps([{"id": "test_mod.py::test_OTHER", "row": "R1"}])
+    )
+    rc = main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--guard-tests",
+            str(guard_tests_path),
+            "--evidence",
+            str(_ev(tmp_path)),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+        ]
+    )
+    assert rc == 3
+    assert "does not close over union(tests)" in capsys.readouterr().err
+
+
+# ──────────────── should-fix: arbitrate takes the lock ───────────────────
+
+
+def test_cmd_arbitrate_refuses_while_lock_held(tmp_path, repo):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    lock_path = tmp_path / "pool.lock"
+    fd = lockmod.open_lock_file(lock_path)
+    lockmod.try_flock(fd, fcntl.LOCK_EX)
+    try:
+        rc = main(
+            [
+                "arbitrate",
+                "--ids",
+                "n1",
+                "--evidence",
+                str(_ev(tmp_path)),
+                "--neuters",
+                str(spec_path),
+                "--repo-dir",
+                str(repo),
+                "--python",
+                PYTHON,
+                "--lock-path",
+                str(lock_path),
+            ]
+        )
+        assert rc == 8
+    finally:
+        os.close(fd)
+
+
+def test_cmd_arbitrate_reads_merged_results_when_no_per_worker_files(tmp_path, repo):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    evidence = _ev(tmp_path)
+    evidence.mkdir(exist_ok=True)
+    (evidence / "neuter_results.jsonl").write_text(
+        json.dumps({"id": "n1", "verdict": "RED"}) + "\n"
+    )
+    rc = main(
+        [
+            "arbitrate",
+            "--ids",
+            "n1",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+        ]
+    )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (evidence / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["harness_verdict"] == "RED"
+
+
+def test_cmd_arbitrate_x6_never_reports_authoritative_green(tmp_path):
+    """Blocker 3, through the real CLI: a wrong-mapping neuter (X6) that
+    leaves an UNMAPPED test failing in the full scope must never come back
+    ``authoritative_verdict: GREEN`` from ``arbitrate``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text(
+        "def f(x):\n    return x + 1\n\n\ndef g(x):\n    return x * 2\n"
+    )
+    (repo / "test_mod.py").write_text(
+        "from mod import f, g\n\n\n"
+        "def test_f():\n    assert f(1) == 2\n\n\n"
+        "def test_g():\n    assert g(2) == 4\n"
+    )
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "a@b.c")
+    _run_git(repo, "config", "user.name", "a")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "init")
+
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_mod.py"],
+        "guard_tests": [{"id": "test_mod.py::test_f", "row": "R1"}],
+        "neuters": [
+            {
+                "id": "x6",
+                "file": "mod.py",
+                # breaks g(), but mapped only to test_f (which exercises f()).
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_mod.py::test_f"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    evidence = _ev(tmp_path)
+    evidence.mkdir(exist_ok=True)
+    (evidence / "neuter_results.jsonl").write_text(
+        json.dumps({"id": "x6", "verdict": "GREEN"}) + "\n"
+    )
+    rc = main(
+        [
+            "arbitrate",
+            "--ids",
+            "x6",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+        ]
+    )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (evidence / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["authoritative_verdict"] != "GREEN"
+    assert rows[0]["authoritative_verdict"] == "DRIFT"
+    assert any("test_g" in u for u in rows[0]["unmapped_red"])
+
+
+def test_cmd_report_picks_up_guard_tests_reviewer_json_automatically(tmp_path, repo):
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    evidence = _ev(tmp_path)
+    main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "mod",
+            "--src-root-relative",
+            "",
+        ]
+    )
+    evidence.mkdir(exist_ok=True)
+    (evidence / "guard_tests_reviewer.json").write_text(
+        json.dumps(
+            [
+                {"id": "test_mod.py::test_f", "row": "R1"},
+                {"id": "test_mod.py::test_extra", "row": "R2"},
+            ]
+        )
+    )
+    rc = main(
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+        ]
+    )
+    assert rc == 0
+    text = (evidence / "per_guard_table.md").read_text()
+    assert "test_extra" in text

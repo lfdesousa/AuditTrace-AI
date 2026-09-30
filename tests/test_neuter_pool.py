@@ -8,6 +8,7 @@ guard branches.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -18,7 +19,10 @@ from pathlib import Path
 import pytest
 
 from scripts.neuter import lock as lockmod
+from scripts.neuter.pg import PgHandle
 from scripts.neuter.pool import (
+    EXIT_BASELINE_FAILED,
+    EXIT_MISSING_ROWS,
     DirtyTreeError,
     WorkerContext,
     _worker_main,
@@ -36,6 +40,7 @@ from scripts.neuter.spec import (
     NeuterSpecFile,
     load_neuter_spec,
 )
+from tests._neuter_test_evidence import evidence_dir_for as _ev
 
 FIXTURE_DIR = Path(__file__).parent / "neuter_fixture"
 PYTHON = sys.executable
@@ -126,7 +131,7 @@ def test_run_one_neuter_raises_dirty_tree_error_on_preexisting_dirt(tmp_path):
         tests=["test_guarded.py::test_a"],
     )
     with pytest.raises(DirtyTreeError):
-        run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+        run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
 
 
 # ───────────────────── foreign_audittrace_container_exists ──────────────
@@ -210,7 +215,7 @@ def test_worker_main_direct_drains_queue_and_writes_rows(tmp_path):
         q.put(n.id)
     q.put(None)
     stop_flag = threading.Event()
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     _worker_main(
         1,
         q,
@@ -259,7 +264,7 @@ def test_worker_main_direct_skips_via_resume_rows(tmp_path):
     q.put("w2")
     q.put(None)
     stop_flag = threading.Event()
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     _worker_main(
         1,
         q,
@@ -298,7 +303,7 @@ def test_worker_main_direct_dirty_tree_error_stops_and_logs(tmp_path, monkeypatc
     q.put("w1")
     q.put(None)
     stop_flag = threading.Event()
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     _worker_main(
         1,
         q,
@@ -360,7 +365,7 @@ def test_worker_main_direct_restored_dirty_stops_pool(tmp_path):
     q.put("c1")
     q.put(None)
     stop_flag = threading.Event()
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     _worker_main(
         1,
         q,
@@ -428,7 +433,7 @@ def test_run_pool_dirty_restore_returns_exit_4(tmp_path):
         spec,
         repo_dir=repo,
         parent_worktree_dir=tmp_path,
-        evidence_dir=tmp_path / "ev",
+        evidence_dir=_ev(tmp_path),
         workers=1,
         python=PYTHON,
         fake_db=True,
@@ -496,7 +501,7 @@ def test_run_pool_error_verdict_returns_exit_9(tmp_path):
         spec,
         repo_dir=repo,
         parent_worktree_dir=tmp_path,
-        evidence_dir=tmp_path / "ev",
+        evidence_dir=_ev(tmp_path),
         workers=1,
         python=PYTHON,
         fake_db=True,
@@ -538,7 +543,7 @@ def test_run_pool_refuses_when_docker_build_running(tmp_path, monkeypatch):
         spec,
         repo_dir=repo,
         parent_worktree_dir=tmp_path,
-        evidence_dir=tmp_path / "ev",
+        evidence_dir=_ev(tmp_path),
         workers=1,
         python=PYTHON,
         fake_db=True,
@@ -580,10 +585,311 @@ def test_run_pool_refuses_when_foreign_container_exists(tmp_path, monkeypatch):
         spec,
         repo_dir=repo,
         parent_worktree_dir=tmp_path,
-        evidence_dir=tmp_path / "ev",
+        evidence_dir=_ev(tmp_path),
         workers=1,
         python=PYTHON,
         fake_db=False,
         lock_path=tmp_path / "pool.lock",
     )
     assert exit_code == 8
+
+
+# ────────────── review round-1 blocker 1: fail-open (fake docker) ────────
+
+
+def test_run_pool_fails_closed_when_every_worker_crashes(tmp_path, monkeypatch):
+    """A fake ``docker`` that exits 1 crashes EVERY worker in
+    ``start_container``. The pool must fail CLOSED: a non-zero exit and the
+    missing ids listed -- never a silent exit 0 with 0 rows (the reviewer's
+    x3 fixture attack)."""
+    repo = _init_repo(tmp_path)
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 1\n")
+    fake_docker.chmod(0o755)
+
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "crash1",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x + 1", "new": "    return x + 2"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                        "guard": "G",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    evidence = _ev(tmp_path)
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=2,
+        python=PYTHON,
+        fake_db=False,
+        lock_path=tmp_path / "pool.lock",
+        skip_baseline=True,
+        sample=0,
+    )
+    assert exit_code == EXIT_MISSING_ROWS
+    # the crash is collected and surfaced, not silently dropped.
+    events = [
+        json.loads(line)
+        for line in (evidence / "events.jsonl").read_text().splitlines()
+    ]
+    crashes = [e for e in events if e.get("event") == "worker_crashed"]
+    assert len(crashes) == 2
+    assert "CalledProcessError" in crashes[0]["error"]
+    # no rows at all -- the neuter never produced any evidence.
+    assert (
+        not (evidence / "neuter_results.jsonl").exists()
+        or (evidence / "neuter_results.jsonl").read_text().strip() == ""
+    )
+    # no worktrees leaked: only the main repo checkout remains.
+    assert _run_git(repo, "worktree", "list").stdout.count("\n") == 1
+
+
+# ─────────────── review round-1 blocker 2: baseline-first (§5) ───────────
+
+
+def test_run_pool_baseline_failure_exits_5_never_red(tmp_path):
+    """A no-op neuter mapped to a test that's ALREADY failing at the pinned
+    sha must give exit 5 (baseline-first), never a false RED (the
+    reviewer's PREFAIL fixture attack)."""
+    repo = _init_repo(tmp_path)
+    broken = (
+        (repo / "test_guarded.py")
+        .read_text()
+        .replace(
+            "def test_b():\n    assert guard_b(2) == 4",
+            "def test_b():\n    assert guard_b(2) == 999  # already broken at the pinned sha",
+        )
+    )
+    assert broken != (repo / "test_guarded.py").read_text()
+    (repo / "test_guarded.py").write_text(broken)
+    _run_git(repo, "commit", "-am", "break test_b before any neuter runs")
+
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_b", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "noop-on-failing-baseline",
+                        "file": "guarded.py",
+                        "edits": [
+                            {
+                                "old": "    return x * 2",
+                                "new": "    return x * 2  # no-op",
+                            }
+                        ],
+                        "tests": ["test_guarded.py::test_b"],
+                        "engines": ["mock"],
+                        "guard": "G",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    evidence = _ev(tmp_path)
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        src_root_relative="",
+    )
+    assert exit_code == EXIT_BASELINE_FAILED
+    # no neuter ever ran -- there is no RED row to point to.
+    assert (
+        not (evidence / "neuter_results.jsonl").exists()
+        or (evidence / "neuter_results.jsonl").read_text().strip() == ""
+    )
+
+
+# ────────── review round-1 blocker 3: X6 undetectable (sampled drift) ────
+
+
+def test_run_pool_drift_sample_measures_real_unmapped_red(tmp_path):
+    """A neuter that breaks ``guard_b`` but is mapped only to ``test_a``
+    (wrong mapping, X6-shaped) reads GREEN on the targeted pass -- the
+    sampled full-scope drift check must MEASURE that ``test_b`` also fails
+    and record it as ``unmapped_red``, never a hardcoded ``[]``."""
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "x6-wrong-mapping",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x * 2", "new": "    return x * 3"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                        "guard": "G",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
+    evidence = _ev(tmp_path)
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        src_root_relative="",
+        sample=1.0,  # sample every neuter -- deterministic for this 1-neuter spec
+    )
+    assert exit_code == 2  # GREEN present
+    rows = {
+        json.loads(line)["id"]: json.loads(line)
+        for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
+    }
+    row = rows["x6-wrong-mapping"]
+    assert row["verdict"] == "GREEN"
+    assert row["drift_sampled"] is True
+    assert row["unmapped_red"] != []
+    assert any("test_b" in u for u in row["unmapped_red"])
+
+
+def test_generate_report_refuses_unconfirmed_green(tmp_path):
+    """Blocker 3, enforced in code: ``--verify`` fails while a GREEN row has
+    no full-scope arbitration confirming it GREEN -- convention (a human
+    remembering to arbitrate) is not enough."""
+    from scripts.neuter.report import generate_report, verify_report, write_report
+
+    repo = _init_repo(tmp_path)
+    entry = NeuterEntry(
+        id="g1",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 1  # noop")],
+        tests=["test_guarded.py::test_a"],
+        engines=["mock"],
+        guard="G",
+        clause="",
+        expect="RED",
+    )
+    spec = NeuterSpecFile(
+        schema=3,
+        sha=_sha(repo),
+        scope_files=["test_guarded.py"],
+        guard_tests=[GuardTestEntry(id="test_guarded.py::test_a", row="G")],
+        neuters=[entry],
+        path=tmp_path / "unused.json",
+    )
+    evidence = _ev(tmp_path)
+    evidence.mkdir(exist_ok=True)
+    row = {
+        "id": "g1",
+        "verdict": "GREEN",
+        "file": "guarded.py",
+        "tests_expected": 1,
+        "tests_collected": 1,
+        "failed": [],
+        "failure_types": [],
+        "error_reason": None,
+        "secs": 1.0,
+        "worker": 1,
+        "restored_clean": True,
+        "pg_settings": None,
+        "unmapped_red": [],
+        "run_id": "r1",
+    }
+    (evidence / "neuter_results.jsonl").write_text(json.dumps(row) + "\n")
+    text = generate_report(evidence, spec)
+    assert "unconfirmed_green_n=1" in text.splitlines()[-1]
+    write_report(evidence, spec)
+    assert verify_report(evidence, spec) != 0
+
+    # now arbitrate it as GREEN -- the report must confirm it clean.
+    arb = {
+        "id": "g1",
+        "harness_verdict": "GREEN",
+        "authoritative_verdict": "GREEN",
+        "defect_ref": None,
+    }
+    (evidence / "arbitration.jsonl").write_text(json.dumps(arb) + "\n")
+    write_report(evidence, spec)
+    assert verify_report(evidence, spec) == 0
+
+
+# ───────── review round-1 blocker 5: §9 -- mock engines get the DSN ──────
+
+
+def test_mock_engine_worker_gets_dsn_when_a_real_pg_handle_exists(
+    tmp_path, monkeypatch
+):
+    """§9: a MOCK-engine neuter's worker still gets ``AUDITTRACE_TEST_POSTGRES_URL``
+    when the worker holds a real (non-fake) Postgres -- so a test file that
+    starts a DURABLE product container at import time finds the var
+    already set and reuses the worker's own throwaway container instead."""
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="mock1",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 1  # noop")],
+        tests=["test_guarded.py::test_a"],
+        engines=["mock"],
+    )
+    captured_env: dict[str, str] = {}
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == [PYTHON, "-m"] and "pytest" in cmd:
+            captured_env.update(kwargs.get("env") or {})
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.neuter.pool.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "scripts.neuter.pool.foreign_product_pg_container_running", lambda: False
+    )
+    real_shaped_handle = PgHandle(
+        name="w1", dsn="postgresql+psycopg2://x/y", fake=False
+    )
+    ctx = _ctx(repo, _ev(tmp_path), pg_handle=real_shaped_handle)
+    run_one_neuter(ctx, entry)
+    assert (
+        captured_env.get("AUDITTRACE_TEST_POSTGRES_URL") == "postgresql+psycopg2://x/y"
+    )

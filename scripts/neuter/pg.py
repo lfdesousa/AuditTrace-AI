@@ -215,3 +215,32 @@ def poll_db_leak(
         time.sleep(interval_s)
         after = db_snapshot(handle)
     return after != before
+
+
+#: Product-owned, DURABLE ephemeral-Postgres container name prefixes (the
+#: three RLS-proof test files' own bring-up, `tests/_pg_ephemeral.py`) --
+#: none of these may exist during a neuter run. A mock-engine (or any)
+#: worker that accidentally imports one of those test modules without the
+#: worker's own DSN pre-set would otherwise start one of these as an
+#: uncontrolled side effect of import (§9).
+PRODUCT_PG_CONTAINER_PREFIXES = (
+    "audittrace-acl-wu2a-pg-",
+    "audittrace-rls-pg-",
+    "audittrace-console-store-pg-",
+)
+
+
+def foreign_product_pg_container_running() -> bool:
+    """``docker ps`` scan for any of :data:`PRODUCT_PG_CONTAINER_PREFIXES`
+    (§9: "no such container appears during a neuter")."""
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return False
+    names = result.stdout.splitlines()
+    return any(
+        name.startswith(prefix)
+        for name in names
+        for prefix in PRODUCT_PG_CONTAINER_PREFIXES
+    )

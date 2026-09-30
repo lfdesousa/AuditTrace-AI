@@ -1,10 +1,17 @@
 """Per-guard report generation + ``--verify`` (SPEC v3 §13; SF-C, SF-D).
 
 Generated from ``neuter_results.jsonl`` (+ ``arbitration.jsonl``) only.
-``--verify`` byte-compares a freshly generated report against the one on
-disk and exits 7 on any difference, or if any arbitration row lacks a
-``defect_ref`` (SF-D) -- a table without a matching trailer, or with an
-open arbitration defect, is not evidence.
+``--verify`` fails (exit 7) on any of:
+
+- a byte difference against the report on disk;
+- an arbitration row that disagrees with the harness without a
+  ``defect_ref`` (SF-D);
+- a neuter in the spec with NO row at all (review round 1 blocker 1 --
+  a report can't certify a run that silently dropped ids);
+- a GREEN row with no full-scope arbitration confirming it GREEN (review
+  round 1 blocker 3 -- "every GREEN is arbitrated", never convention-only);
+- any ERROR row, unless the caller passes ``ack_errors=True`` (review
+  round 1 blocker 1 -- ``error_n > 0`` can never pass silently).
 """
 
 from __future__ import annotations
@@ -111,6 +118,16 @@ def generate_report(
     arbitration = _read_jsonl(evidence_dir / "arbitration.jsonl")
     neuters_by_id = {n.id: n for n in spec.neuters}
 
+    if not run_id:
+        # Auto-populate from the rows themselves (should-fix: the trailer's
+        # run_id used to stay empty unless a caller remembered to pass it).
+        run_ids = {r.get("run_id") for r in rows if r.get("run_id")}
+        run_id = sorted(run_ids)[0] if len(run_ids) == 1 else ",".join(sorted(run_ids))
+
+    expected_ids = {n.id for n in spec.neuters}
+    got_ids = {r["id"] for r in rows}
+    missing_ids = sorted(expected_ids - got_ids)
+
     green_rows = [r for r in rows if r["verdict"] == "GREEN"]
     error_rows = [r for r in rows if r["verdict"] == "ERROR"]
     drift_rows = [r for r in rows if r.get("unmapped_red")]
@@ -120,6 +137,10 @@ def generate_report(
     lines.append("|" + "---|" * len(_COLUMNS))
     for row in sorted(rows, key=lambda r: r["id"]):
         lines.append(_row_line(row, neuters_by_id))
+    lines.append("")
+
+    lines.append(f"## MISSING (missing_n={len(missing_ids)})")
+    lines += [f"- {mid}" for mid in missing_ids]
     lines.append("")
 
     lines.append(f"## GREEN ({len(green_rows)})")
@@ -149,7 +170,9 @@ def generate_report(
 
     lines.append("## ARBITRATION")
     defect_n = 0
+    arb_by_id: dict[str, dict[str, Any]] = {}
     for row in arbitration:
+        arb_by_id[row["id"]] = row
         lines.append(
             f"- {row['id']}: harness={row.get('harness_verdict')} authoritative={row.get('authoritative_verdict')} "
             f"defect_ref={row.get('defect_ref')}"
@@ -160,13 +183,27 @@ def generate_report(
             defect_n += 1
     lines.append("")
 
+    # Blocker 3: "every GREEN is arbitrated" is enforced in CODE, not
+    # convention -- a GREEN row with no arbitration entry confirming it
+    # GREEN is listed here (and fails --verify below), never silently
+    # certified as clean.
+    unconfirmed_green = sorted(
+        r["id"]
+        for r in green_rows
+        if arb_by_id.get(r["id"], {}).get("authoritative_verdict") != "GREEN"
+    )
+    lines.append(f"## UNCONFIRMED-GREEN (unconfirmed_green_n={len(unconfirmed_green)})")
+    lines += [f"- {gid}" for gid in unconfirmed_green]
+    lines.append("")
+
     error_n = len(error_rows)
     body = "\n".join(lines)
     sha = hashlib.sha256(body.encode()).hexdigest()
     trailer = (
         f"generated-from: {evidence_dir}/neuter_results.jsonl sha256={sha} "
         f"harness={harness_version} run_id={run_id} drift_n={drift_n} error_n={error_n} "
-        f"arbitrated_n={len(arbitration)} defect_n={defect_n}"
+        f"arbitrated_n={len(arbitration)} defect_n={defect_n} missing_n={len(missing_ids)} "
+        f"unconfirmed_green_n={len(unconfirmed_green)}"
     )
     return body + "\n" + trailer + "\n"
 
@@ -178,9 +215,13 @@ def write_report(evidence_dir: Path, spec: Any, **kwargs: Any) -> Path:
     return out
 
 
-def verify_report(evidence_dir: Path, spec: Any, **kwargs: Any) -> int:
-    """``--verify``: exit 7 on any byte difference, or an open arbitration
-    defect (SF-D)."""
+def verify_report(
+    evidence_dir: Path, spec: Any, *, ack_errors: bool = False, **kwargs: Any
+) -> int:
+    """``--verify``: exit 7 on any byte difference, an open arbitration
+    defect (SF-D), a spec neuter with no row (blocker 1), a GREEN with no
+    confirming full-scope arbitration (blocker 3), or an unacknowledged
+    ERROR (``error_n > 0`` without ``ack_errors=True``, blocker 1)."""
     out = evidence_dir / "per_guard_table.md"
     if not out.exists():
         return EXIT_VERIFY_FAILED
@@ -189,5 +230,11 @@ def verify_report(evidence_dir: Path, spec: Any, **kwargs: Any) -> int:
         return EXIT_VERIFY_FAILED
     trailer_line = fresh.splitlines()[-1]
     if "defect_n=0" not in trailer_line:
+        return EXIT_VERIFY_FAILED
+    if "missing_n=0" not in trailer_line:
+        return EXIT_VERIFY_FAILED
+    if "unconfirmed_green_n=0" not in trailer_line:
+        return EXIT_VERIFY_FAILED
+    if "error_n=0" not in trailer_line and not ack_errors:
         return EXIT_VERIFY_FAILED
     return 0

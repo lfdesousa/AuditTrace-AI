@@ -36,6 +36,7 @@ from scripts.neuter.spec import (
     SpecLoadError,
     load_neuter_spec,
 )
+from tests._neuter_test_evidence import evidence_dir_for as _ev
 
 FIXTURE_DIR = Path(__file__).parent / "neuter_fixture"
 PYTHON = sys.executable
@@ -105,14 +106,14 @@ def test_proof_a_wrong_mapping(tmp_path):
         edits=[Edit(old="    return x * 2", new="    return x * 3")],  # breaks guard_b
         tests=["test_guarded.py::test_a"],  # WRONG: test_a only exercises guard_a
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "GREEN"
     assert row["vacuous"] is True
 
 
 def test_proof_a_pool_exit_code_is_2(tmp_path):
     repo = _init_repo(tmp_path)
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(
         json.dumps(
@@ -180,7 +181,7 @@ def test_proof_b_zero_match_exits_3(tmp_path):
     with pytest.raises(SpecLoadError) as excinfo:
         load_neuter_spec(spec_path, repo_dir=repo, python=PYTHON)
     assert excinfo.value.reason == "match_count"
-    assert not (tmp_path / "ev").exists()
+    assert not _ev(tmp_path, create=False).exists()
     assert (
         _run_git(repo, "worktree", "list").stdout.count("\n") == 1
     )  # only the main worktree
@@ -236,7 +237,7 @@ def test_proof_c_dirty_tree_stops_restore(tmp_path):
         ],
         tests=["test_guarded.py::test_a"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["restored_clean"] is False
     status = _run_git(repo, "status", "--porcelain").stdout
     assert "data.txt" in status
@@ -248,23 +249,44 @@ def test_proof_c_dirty_tree_stops_restore(tmp_path):
 
 
 def test_proof_d_wrong_import_path(tmp_path):
+    """Both directions in ONE proof, so the self-neuter that drops
+    ``-p neuter_pathcheck`` from ``pool.py`` reddens THIS test directly
+    (not only a sibling): (1) with the CORRECT expected root, the plugin
+    must actually run and leave a log line -- drop the plugin flag and this
+    half fails, since no invocation ever writes one; (2) with a WRONG
+    expected root (a decoy), the plugin's own assertion must fire -- ERROR
+    ``pathcheck``, no log line."""
     repo = _init_repo(tmp_path)
-    decoy = tmp_path / "decoy"
-    decoy.mkdir()
-    shutil.copy(FIXTURE_DIR / "guarded.py", decoy / "guarded.py")
 
-    entry = _entry(
-        id="d-noop",
+    # (1) correct expect: the plugin runs, succeeds, and leaves its proof.
+    entry_ok = _entry(
+        id="d-ok",
         file="guarded.py",
         edits=[Edit(old="    return x + 1", new="    return x + 1  # noop")],
         tests=["test_guarded.py::test_a"],
     )
-    ctx = _ctx(repo, tmp_path / "ev", src_root=str(decoy))  # wrong PYTHONPATH root
-    row = run_one_neuter(ctx, entry)
-    assert row["verdict"] == "ERROR"
-    assert row["error_reason"] == "pathcheck"
-    log = tmp_path / "ev" / "pathcheck_w1.log"
-    assert not log.exists() or log.read_text() == ""
+    evidence = _ev(tmp_path)
+    row_ok = run_one_neuter(_ctx(repo, evidence), entry_ok)
+    assert row_ok["error_reason"] != "pathcheck"
+    log = evidence / "pathcheck_w1.log"
+    assert log.exists() and log.read_text().strip() != ""
+
+    # (2) wrong expect (a decoy dir): the plugin's own assertion fires.
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    shutil.copy(FIXTURE_DIR / "guarded.py", decoy / "guarded.py")
+    entry_bad = _entry(
+        id="d-bad",
+        file="guarded.py",
+        edits=[Edit(old="    return x * 2", new="    return x * 2  # noop")],
+        tests=["test_guarded.py::test_b"],
+    )
+    before_lines = log.read_text().count("\n")
+    ctx_bad = _ctx(repo, evidence, src_root=str(decoy))  # wrong expected root
+    row_bad = run_one_neuter(ctx_bad, entry_bad)
+    assert row_bad["verdict"] == "ERROR"
+    assert row_bad["error_reason"] == "pathcheck"
+    assert log.read_text().count("\n") == before_lines  # no NEW log line
 
 
 # ──────────────────────────────── e. resume ──────────────────────────────
@@ -314,7 +336,7 @@ def test_proof_e_should_skip_rules(tmp_path):
 
 def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
     repo = _init_repo(tmp_path)
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     spec_dict = {
         "schema": 3,
         "sha": _sha(repo),
@@ -396,8 +418,7 @@ def test_proof_e_resume_reruns_exactly_the_edited_one(tmp_path):
 
 def test_proof_f_db_leak(tmp_path):
     repo = _init_repo(tmp_path)
-    evidence = tmp_path / "ev"
-    evidence.mkdir()
+    evidence = _ev(tmp_path)
     pg_handle = start_container(
         "selfproof", 1, fake=True, fake_dir=evidence / "fake_pg"
     )
@@ -524,10 +545,16 @@ def test_proof_g_reviewer_guard_tests_diff_is_report_only(tmp_path):
         GuardTestEntry(id="test_guarded.py::test_a", row="G1"),
         GuardTestEntry(id="test_guarded.py::test_b", row="G2"),
     ]
-    evidence = tmp_path / "ev"
-    evidence.mkdir()
+    evidence = _ev(tmp_path)
     (evidence / "neuter_results.jsonl").write_text("")
     text = generate_report(evidence, spec, reviewer_guard_tests=reviewer_guard_tests)
+    # Both independent lists must print, not just their diff -- "print only
+    # one list" is exactly the self-neuter this guards: the diff line alone
+    # still mentions test_b (it's the symmetric difference), so asserting on
+    # "test_b" anywhere in the report is vacuous against that neuter. The
+    # REVIEWER'S OWN list line, with its own count, must be there too.
+    assert "builder (1):" in text
+    assert "reviewer (2):" in text
     assert "test_guarded.py::test_b" in text  # the diff is visible, not fatal
 
 
@@ -536,8 +563,7 @@ def test_proof_g_reviewer_guard_tests_diff_is_report_only(tmp_path):
 
 def test_proof_h_nondurable_settings_violation(tmp_path):
     repo = _init_repo(tmp_path)
-    evidence = tmp_path / "ev"
-    evidence.mkdir()
+    evidence = _ev(tmp_path)
     pg_handle = start_container(
         "selfproof", 1, fake=True, fake_dir=evidence / "fake_pg"
     )
@@ -570,7 +596,7 @@ def test_proof_i_fixture_crash_is_error_never_red(tmp_path):
         edits=[Edit(old="    return 41", new="    raise RuntimeError('boom')")],
         tests=["test_guarded.py::test_uses_seed"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "setup_or_teardown"
 
@@ -586,7 +612,7 @@ def test_proof_j_timeout(tmp_path):
         edits=[Edit(old="    slow(0.01)", new="    slow(5)")],
         tests=["test_guarded.py::test_uses_slow"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev", timeout_s=2), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path), timeout_s=2), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "timeout"
     assert row["timeout"] is True
@@ -605,7 +631,7 @@ def test_proof_k_syntax_error_short_circuits(tmp_path):
         ],
         tests=["test_guarded.py::test_a"],
     )
-    evidence = tmp_path / "ev"
+    evidence = _ev(tmp_path)
     row = run_one_neuter(_ctx(repo, evidence), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "nocompile"
@@ -636,7 +662,7 @@ def test_proof_l_collection_error_precedence(tmp_path):
         ],
         tests=["test_guarded.py::test_a", "test_guarded.py::test_b"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "collected"
     reasons = row["error_reasons"]
@@ -686,7 +712,7 @@ def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
             spec,
             repo_dir=repo,
             parent_worktree_dir=tmp_path,
-            evidence_dir=tmp_path / "ev",
+            evidence_dir=_ev(tmp_path),
             workers=1,
             python=PYTHON,
             fake_db=True,
@@ -706,7 +732,7 @@ def test_proof_m_pool_refuses_while_hold_shared_running(tmp_path):
         spec,
         repo_dir=repo,
         parent_worktree_dir=tmp_path,
-        evidence_dir=tmp_path / "ev2",
+        evidence_dir=_ev(tmp_path, "ev2"),
         workers=1,
         python=PYTHON,
         fake_db=True,
@@ -754,7 +780,7 @@ def test_proof_m_sf2_isolated_lock_path_survives_an_outer_shared_default_lock(
             spec,
             repo_dir=repo,
             parent_worktree_dir=tmp_path,
-            evidence_dir=tmp_path / "ev",
+            evidence_dir=_ev(tmp_path),
             workers=1,
             python=PYTHON,
             fake_db=True,
@@ -782,7 +808,7 @@ def test_proof_n_call_exception_never_red(tmp_path):
         ],
         tests=["test_guarded.py::test_uses_raiser"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "ERROR"
     assert row["error_reason"] == "call_exception"
     assert row["failure_types"] == ["RuntimeError"]
@@ -796,7 +822,7 @@ def test_proof_n_sibling_assert_flip_is_red(tmp_path):
         edits=[Edit(old="    return x + 1", new="    return x + 2")],
         tests=["test_guarded.py::test_a"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "RED"
     assert row["failure_types"] == ["AssertionError"]
 
@@ -809,6 +835,6 @@ def test_proof_n_sibling_raises_removed_is_red_failed(tmp_path):
         edits=[Edit(old='    raise ValueError("boom")', new="    return None")],
         tests=["test_guarded.py::test_maybe_raise_shape"],
     )
-    row = run_one_neuter(_ctx(repo, tmp_path / "ev"), entry)
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "RED"
     assert row["failure_types"] == ["Failed"]
