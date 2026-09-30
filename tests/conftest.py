@@ -12,15 +12,17 @@ import subprocess  # noqa: S404 — used only for chart-rendering test injection
 import pytest
 from fastapi.testclient import TestClient
 
-# `tests/neuter_fixture/` is a STATIC TEMPLATE for the fast neuter harness's
-# self-proofs (SPEC v3 §11): its `test_guarded.py` does `from guarded import
-# ...`, a module that only exists once the fixture is copied into a
-# throwaway git repo (never this one). Collecting it here would break every
-# `make test` run with an ImportError. The self-proof tests copy these
-# files into `tmp_path` and spawn a FRESH pytest subprocess there, whose
-# rootdir has no `conftest.py` of its own -- this `collect_ignore` only
-# ever applies to collection rooted at THIS repo.
-collect_ignore = ["neuter_fixture"]
+# `tests/neuter_fixture/` (and its src/-layout sibling,
+# `tests/neuter_fixture_src/` -- review round 2's structural-fix item 4)
+# are STATIC TEMPLATES for the fast neuter harness's self-proofs (SPEC v3
+# §11): each `test_guarded.py` does `from guarded import ...`, a module
+# that only exists once the fixture is copied into a throwaway git repo
+# (never this one). Collecting either here would break every `make test`
+# run with an ImportError. The self-proof tests copy these files into
+# `tmp_path` and spawn a FRESH pytest subprocess there, whose rootdir has
+# no `conftest.py` of its own -- this `collect_ignore` only ever applies
+# to collection rooted at THIS repo.
+collect_ignore = ["neuter_fixture", "neuter_fixture_src"]
 
 # Clear stale evidence from a PRIOR session's neuter-harness tests
 # (tests/_neuter_test_evidence.py) at the start of every session -- it's
