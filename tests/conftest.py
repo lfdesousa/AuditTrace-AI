@@ -12,6 +12,16 @@ import subprocess  # noqa: S404 — used only for chart-rendering test injection
 import pytest
 from fastapi.testclient import TestClient
 
+# `tests/neuter_fixture/` is a STATIC TEMPLATE for the fast neuter harness's
+# self-proofs (SPEC v3 §11): its `test_guarded.py` does `from guarded import
+# ...`, a module that only exists once the fixture is copied into a
+# throwaway git repo (never this one). Collecting it here would break every
+# `make test` run with an ImportError. The self-proof tests copy these
+# files into `tmp_path` and spawn a FRESH pytest subprocess there, whose
+# rootdir has no `conftest.py` of its own -- this `collect_ignore` only
+# ever applies to collection rooted at THIS repo.
+collect_ignore = ["neuter_fixture"]
+
 # ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
 # ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
 # and `observability.external.{langfuse,tempo,loki}Host` are `required`
@@ -84,7 +94,11 @@ subprocess.run = _patched_subprocess_run
 # the SQLite default). It's not app config, so it must survive the wipe —
 # otherwise CI and local-dev RLS integration tests silently fall back
 # to a stale compose URL and skip / fail.
-_TEST_ONLY_ALLOWLIST = {"AUDITTRACE_TEST_POSTGRES_URL"}
+# AUDITTRACE_NEUTER_LOCK (SPEC v3 §10 SF-2) is the fast neuter harness's
+# heavy-cap lock-path override -- every harness test points it at a
+# `tmp_path` file so the suite never contends with (or is blocked by) the
+# real, shared lock a concurrent `make test`/pool run would hold.
+_TEST_ONLY_ALLOWLIST = {"AUDITTRACE_TEST_POSTGRES_URL", "AUDITTRACE_NEUTER_LOCK"}
 for _key in [
     k
     for k in os.environ
