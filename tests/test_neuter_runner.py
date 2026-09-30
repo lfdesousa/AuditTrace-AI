@@ -54,6 +54,34 @@ def test_hold_shared_runs_child_and_returns_its_exit_code(tmp_path, monkeypatch)
     assert main(["hold-shared", "--", "false"]) == 1
 
 
+def test_hold_shared_child_never_inherits_the_chokepoint_env(tmp_path, monkeypatch):
+    """Critical regression, found running the definitive `make test`: THIS
+    module (`runner.py`) imports `scripts.neuter.pytest_run` at its own
+    top, which makes NEUTER_CHOKEPOINT_REQUIRED=1 and
+    PYTEST_PLUGINS=neuter_pathcheck sticky in the CURRENT process's own
+    `os.environ` -- true for every process that ever imports `runner.py`,
+    including the `hold-shared` wrapper `make test` itself uses to run the
+    product's own, entirely un-gated pytest suite. Without this fix, that
+    child inherits both vars, its own `neuter_pathcheck` plugin auto-loads,
+    and the WHOLE `make test` run fails at `pytest_configure` before a
+    single test runs (REQUIRED is set, but no token was ever recorded for
+    that session)."""
+    monkeypatch.setenv("AUDITTRACE_NEUTER_LOCK", str(tmp_path / "pool.lock"))
+    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "1")
+    monkeypatch.setenv("PYTEST_PLUGINS", "neuter_pathcheck")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os, sys\n"
+        "sys.exit(\n"
+        "    1\n"
+        "    if os.environ.get('NEUTER_CHOKEPOINT_REQUIRED')\n"
+        "    or os.environ.get('PYTEST_PLUGINS')\n"
+        "    else 0\n"
+        ")\n"
+    )
+    assert main(["hold-shared", "--", PYTHON, str(probe)]) == 0
+
+
 def test_hold_shared_refuses_while_pool_holds_exclusive(tmp_path, monkeypatch):
     lock_path = tmp_path / "pool.lock"
     monkeypatch.setenv("AUDITTRACE_NEUTER_LOCK", str(lock_path))

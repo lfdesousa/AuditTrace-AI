@@ -71,8 +71,27 @@ def _cmd_hold_shared(argv: list[str]) -> int:
         )
         return EXIT_LOCK_HELD
     try:
+        # Critical regression, found running the definitive `make test`:
+        # this module (`runner.py`) imports `scripts.neuter.pytest_run` at
+        # its own top, which makes NEUTER_CHOKEPOINT_REQUIRED=1 and
+        # PYTEST_PLUGINS=neuter_pathcheck sticky in THIS wrapper process's
+        # own `os.environ` the instant `python -m scripts.neuter.runner
+        # hold-shared -- ...` starts -- regardless of whether hold-shared
+        # is wrapping a real neuter invocation or (as `make test` uses it)
+        # the product's own, entirely un-gated top-level pytest run.
+        # `subprocess.run(argv)` with no `env=` override would inherit
+        # those two vars into the CHILD, whose own `neuter_pathcheck`
+        # plugin then auto-loads (PYTEST_PLUGINS) and immediately fails
+        # the whole session at `pytest_configure` (REQUIRED is set, but no
+        # token was ever recorded for this session) -- before a single
+        # test runs. hold-shared's own child must never inherit these.
+        child_env = dict(os.environ)
+        child_env.pop("NEUTER_CHOKEPOINT_REQUIRED", None)
+        child_env.pop("NEUTER_CHOKEPOINT_TOKEN", None)
+        child_env.pop("NEUTER_CHOKEPOINT_TOKEN_FILE", None)
+        child_env.pop("PYTEST_PLUGINS", None)
         result = subprocess.run(
-            argv
+            argv, env=child_env
         )  # fork+exec as a CHILD -- never os.exec*, or the fd (and lock) would drop.
         return result.returncode
     finally:
