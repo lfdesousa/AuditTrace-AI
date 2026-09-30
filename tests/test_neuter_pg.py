@@ -4,6 +4,7 @@ fake-mode seam, settings read-back, and catalog isolation (SPEC v3 §8, §9)."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -103,8 +104,12 @@ def test_wait_ready_times_out_on_an_unreachable_dsn():
 def test_real_container_lifecycle_settings_and_catalog():
     """Real ``postgres:16`` end-to-end: start (non-fake), SHOW read-back,
     catalog snapshot, stop -- the code path the self-proofs' ``fake=True``
-    seam stands in for."""
-    handle = start_container("t-pg-real", 99)
+    seam stands in for.
+
+    Review round 2 should-fix: the container NAME is derived per-process
+    (``os.getpid()``), not hardcoded -- a hardcoded name collided across
+    parallel test copies at N=5 (``CalledProcessError``, ERRORing 4 rows)."""
+    handle = start_container(f"t-pg-real-{os.getpid()}", 99)
     try:
         settings = read_settings(handle)
         assert settings == {
@@ -180,8 +185,9 @@ def test_foreign_product_pg_container_running_false_on_nonzero_exit(monkeypatch)
 
 @requires_docker
 def test_start_container_real_with_tmpfs():
-    """The ``tmpfs=True`` branch of the real (non-fake) container path."""
-    handle = start_container("t-pg-tmpfs", 98, tmpfs=True)
+    """The ``tmpfs=True`` branch of the real (non-fake) container path.
+    Review round 2 should-fix: per-process container name (see above)."""
+    handle = start_container(f"t-pg-tmpfs-{os.getpid()}", 98, tmpfs=True)
     try:
         settings = read_settings(handle)
         assert_nondurable(settings)  # does not raise

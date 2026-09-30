@@ -1263,3 +1263,78 @@ def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
     )
     assert rows["w1"].get("drift_foreign_pg_container") is True
     assert "unmapped_red" not in rows["w1"]
+
+
+def test_sample_full_scope_drift_is_seeded_from_run_id(tmp_path, monkeypatch):
+    """NE-3 should-fix: the drift sample must be REPRODUCIBLE for the same
+    run_id (proving it's actually seeded from run_id, the way
+    ``random.Random(run_id)`` promises) and (with high probability, for a
+    10-of-3 sample) DIFFERENT for a different run_id -- a neuter that drops
+    the seed (``random.Random()``) would make the SAME run_id's selection
+    vary run to run, which this test would catch."""
+    repo = _init_repo(tmp_path)
+    neuters = [
+        _entry(
+            id=f"n{i}",
+            file="guarded.py",
+            edits=[Edit(old="    return x + 1", new=f"    return x + 1  # {i}")],
+            tests=["test_guarded.py::test_a"],
+        )
+        for i in range(10)
+    ]
+    spec = NeuterSpecFile(
+        schema=3,
+        sha=_sha(repo),
+        scope_files=["test_guarded.py"],
+        guard_tests=[GuardTestEntry(id="test_guarded.py::test_a", row="G")],
+        neuters=neuters,
+        path=Path("unused.json"),
+    )
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+
+    def fake_run_pytest(*, junit_path, **kwargs):
+        junit_path.parent.mkdir(parents=True, exist_ok=True)
+        # test_a shows as FAILED so `mapped_failed_in_full` is satisfied for
+        # every row's own verdict=RED -- else the not_reproduced branch
+        # fires instead of setting drift_sampled, leaving this test's
+        # selection sets always empty regardless of the seed.
+        junit_path.write_text(
+            '<?xml version="1.0"?><testsuite tests="1">'
+            '<testcase classname="test_guarded" name="test_a">'
+            '<failure message="assert 1 == 2"></failure>'
+            "</testcase></testsuite>"
+        )
+        return _FakeResult()
+
+    monkeypatch.setattr("scripts.neuter.pool.run_pytest", fake_run_pytest)
+    monkeypatch.setattr("scripts.neuter.pool.apply_edits", lambda workdir, entry: [1])
+    monkeypatch.setattr(
+        "scripts.neuter.pool.py_compile_ok", lambda workdir, entry, python: True
+    )
+    monkeypatch.setattr("scripts.neuter.pool.git_diff_quiet", lambda *a, **k: True)
+
+    def sampled_ids(run_id: str) -> set[str]:
+        rows = {n.id: {"verdict": "RED"} for n in neuters}
+        sample_full_scope_drift(
+            spec,
+            rows,
+            repo_dir=repo,
+            parent_worktree_dir=tmp_path,
+            evidence_dir=_ev(tmp_path, str(run_id)),
+            run_id=run_id,
+            python=PYTHON,
+            timeout_s=30,
+            sample=0.3,
+            lock_path=tmp_path / "drift.lock",
+        )
+        return {nid for nid, r in rows.items() if r.get("drift_sampled")}
+
+    first = sampled_ids("run-alpha")
+    second = sampled_ids("run-alpha")
+    third = sampled_ids("run-beta")
+    assert first == second, "same run_id must select the SAME sample"
+    assert first != third, "a different run_id should (with high probability) differ"

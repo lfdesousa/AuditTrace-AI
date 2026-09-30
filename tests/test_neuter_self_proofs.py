@@ -880,3 +880,186 @@ def test_proof_n_sibling_raises_removed_is_red_failed(tmp_path):
     row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
     assert row["verdict"] == "RED"
     assert row["failure_types"] == ["Failed"]
+
+
+# ─────── review round 2, structural fix item 4: self-proofs on the ───────
+# ─────── PRODUCT LAYOUT (src/), not just the root-layout fixture ────────
+
+FIXTURE_SRC_DIR = Path(__file__).parent / "neuter_fixture_src"
+
+
+def _init_src_repo(tmp_path: Path) -> Path:
+    """The SAME toy module/tests as ``neuter_fixture/``, but laid out like
+    the product (``src/guarded.py``, tests at the repo root importing it
+    via ``PYTHONPATH=<repo>/src``) -- the shape review round 2 found blind:
+    the root-layout fixture always had SOMETHING importable at the repo
+    root, so a missing/blind PYTHONPATH silently still found a module
+    (just possibly a stale one); under src/, a blind PYTHONPATH finds
+    NOTHING at the repo root and falls back to the interpreter's own
+    editable install instead -- the exact defect class blockers 1/2/5
+    were about."""
+    repo = tmp_path / "repo_src"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    shutil.copy(FIXTURE_SRC_DIR / "src" / "guarded.py", repo / "src" / "guarded.py")
+    shutil.copy(FIXTURE_SRC_DIR / "test_guarded.py", repo / "test_guarded.py")
+    shutil.copy(FIXTURE_SRC_DIR / "data.txt", repo / "data.txt")
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "neuter@test.invalid")
+    _run_git(repo, "config", "user.name", "neuter")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def test_proof_src_layout_targeted_run_reddens(tmp_path):
+    """Baseline sanity on the product layout: a straightforward, correctly-
+    mapped neuter under ``src/`` still reads RED through the chokepoint."""
+    repo = _init_src_repo(tmp_path)
+    entry = _entry(
+        id="src-a",
+        file="src/guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=["test_guarded.py::test_a"],
+    )
+    ctx = _ctx(repo, _ev(tmp_path), src_root=str(repo / "src"))
+    row = run_one_neuter(ctx, entry)
+    assert row["verdict"] == "RED"
+    assert row["failure_types"] == ["AssertionError"]
+
+
+def test_proof_src_layout_drift_sees_the_edit(tmp_path):
+    """The exact review round 2 regression, reproduced on the product
+    layout: a wrong-mapping neuter (breaks ``guard_b``, mapped only to
+    ``test_a``) under ``src/`` must have its drift sample MEASURE
+    ``test_b``'s real failure -- a blind ``PYTHONPATH`` would import the
+    UNEDITED module from the venv's editable install instead and report a
+    false, empty ``unmapped_red``."""
+    repo = _init_src_repo(tmp_path)
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_guarded.py"],
+        "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+        "neuters": [
+            {
+                "id": "src-x6",
+                "file": "src/guarded.py",
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_guarded.py::test_a"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    evidence = _ev(tmp_path)
+    spec = load_neuter_spec(
+        spec_path,
+        repo_dir=repo,
+        python=PYTHON,
+        lock_path=tmp_path / "collect.lock",
+    )
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        # DEFAULT src_root_relative="src" -- the product's OWN layout, NOT
+        # the root-layout fixture's override to "".
+        sample=1.0,
+    )
+    assert exit_code == EXIT_DRIFT_UNACKNOWLEDGED
+    rows = {
+        json.loads(line)["id"]: json.loads(line)
+        for line in (evidence / "neuter_results.jsonl").read_text().splitlines()
+    }
+    row = rows["src-x6"]
+    assert row["verdict"] == "GREEN"
+    assert row["drift_sampled"] is True
+    assert any("test_b" in u for u in row["unmapped_red"])
+
+
+def test_proof_src_layout_arbitrate_gives_drift_not_a_blind_green(tmp_path):
+    """The SAME src-layout X6 neuter, checked through ``arbitrate`` (the
+    authoritative tie-break) instead of the sampled drift pass -- must
+    ALSO see the edit and report DRIFT, never an authoritative GREEN."""
+    from scripts.neuter.runner import main as runner_main
+
+    repo = _init_src_repo(tmp_path)
+    spec_dict = {
+        "schema": 3,
+        "sha": _sha(repo),
+        "scope_files": ["test_guarded.py"],
+        "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+        "neuters": [
+            {
+                "id": "src-x6-arb",
+                "file": "src/guarded.py",
+                "edits": [{"old": "    return x * 2", "new": "    return x * 3"}],
+                "tests": ["test_guarded.py::test_a"],
+                "engines": ["mock"],
+                "guard": "G",
+            }
+        ],
+    }
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(spec_dict))
+    evidence = _ev(tmp_path)
+    rc = runner_main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "guarded",
+            "--sample",
+            "0",
+            "--lock-path",
+            str(tmp_path / "pool.lock"),
+            "--ack-drift",
+        ]
+    )
+    assert rc == 2  # GREEN on the targeted (wrong) mapping
+    rc = runner_main(
+        [
+            "arbitrate",
+            "--ids",
+            "src-x6-arb",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
+        ]
+    )
+    assert rc == 0
+    arb_rows = [
+        json.loads(line)
+        for line in (evidence / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert arb_rows[0]["harness_verdict"] == "GREEN"
+    assert arb_rows[0]["authoritative_verdict"] == "DRIFT"
+    assert any("test_b" in u for u in arb_rows[0]["unmapped_red"])
