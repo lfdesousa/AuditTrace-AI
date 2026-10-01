@@ -189,12 +189,16 @@ class ToolCall(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     granted_scope: Mapped[str] = mapped_column(String(255), nullable=False)
     # Migration 021 (ADR-063 Phase 2 Track B): broker provenance. NULL on
-    # every Phase 1 own-tool row (unchanged, untouched by this migration);
-    # ``"brokered"`` is the ONLY value the broker path ever writes — the
-    # spec's "provenance clearly distinguishable from Phase-1 own-tool
-    # rows" requirement, enforced as a real column rather than a naming
-    # convention on ``tool_name`` (which is namespaced ``broker:<server>:
-    # <tool>`` for readability, not as the provenance signal).
+    # every Phase 1 own-tool row (unchanged, untouched by this migration).
+    # The column is a plain nullable String(16) with no CHECK constraint.
+    # Two values are written: ``"brokered"`` by the broker path (the spec's
+    # "provenance clearly distinguishable from Phase-1 own-tool rows"
+    # requirement, enforced as a real column rather than a naming convention
+    # on ``tool_name``, which is namespaced ``broker:<server>:<tool>`` for
+    # readability), and ``"decision"`` by the #459 decision-model client
+    # (``services.decision``; ``tool_name="system_one_route"``,
+    # ``granted_scope="system:decision"``). The public audit API does not
+    # expose this column.
     provenance: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Which half of the broker's "record(request) → forward → record
     # (result)" sequence this row is. ``"request"`` rows are written
