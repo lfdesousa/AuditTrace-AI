@@ -187,6 +187,21 @@ def _log_line_count(path: Path) -> int:
         return sum(1 for _ in fh)
 
 
+def _marker_was_written(marker_file: str, token: str) -> bool:
+    """Review round 4, requirement E2: did ``neuter_pathcheck.pytest_
+    configure`` actually run and validate during this invocation? The
+    marker file starts EMPTY (created by ``run_pytest()`` itself, never
+    the child); the plugin only writes the token to it after its OWN
+    checks pass. If a stray ``-p no:neuter_pathcheck`` (or any other way
+    the plugin fails to load/run) reached this call, the file stays empty
+    -- a fact the plugin itself can never detect from the inside, but
+    ``run_pytest()`` can, from the outside, after the child exits."""
+    try:
+        return Path(marker_file).read_text() == token
+    except OSError:
+        return False
+
+
 def build_pythonpath(src_root: str) -> str:
     """The ONE ``PYTHONPATH`` construction rule, shared by every phase: the
     worktree's own source root first, then this package's directory (so the
@@ -282,6 +297,13 @@ class PytestRunResult:
     chokepoint_token: str = ""
     #: Populated only for ``collect_only=True`` calls.
     collect_stdout: str | None = None
+    #: False iff ``neuter_pathcheck.pytest_configure`` never wrote the
+    #: marker file this call handed its child (review round 4, requirement
+    #: E2) -- meaning the plugin never ran AT ALL this invocation (e.g. a
+    #: stray ``-p no:neuter_pathcheck`` reached ``pytest_args``), which the
+    #: plugin itself can never detect from the inside. ``run_pytest()``
+    #: checks this AFTER the child exits, regardless of its exit code.
+    chokepoint_marker_ok: bool = True
 
 
 def run_pytest(
@@ -331,6 +353,8 @@ def run_pytest(
 
     token = uuid.uuid4().hex
     token_fd, token_file = tempfile.mkstemp(prefix="neuter-chokepoint-")
+    marker_fd, marker_file = tempfile.mkstemp(prefix="neuter-chokepoint-marker-")
+    os.close(marker_fd)  # start EMPTY -- the plugin writes to it, not us
     try:
         with os.fdopen(token_fd, "w") as fh:
             fh.write(token)
@@ -356,17 +380,23 @@ def run_pytest(
                 "NEUTER_PATHCHECK_LOG",
                 "AUDITTRACE_TEST_POSTGRES_URL",
                 "NEUTER_FAKE_PG_STATE",
+                "NEUTER_CHOKEPOINT_SKIP",
             ):
                 env.pop(_stale_key, None)
             resolved_src_root = src_root or f"{workdir}/src"
             env["PYTHONPATH"] = build_pythonpath(resolved_src_root)
-            # Review round 3, requirement B2: every session this call
-            # spawns must carry a fresh token AND the file it was recorded
-            # to -- `neuter_pathcheck`'s `pytest_configure` fails the
-            # session outright if either is missing or they don't match.
-            env["NEUTER_CHOKEPOINT_REQUIRED"] = "1"
+            # Review round 3, requirement B2 (UNCONDITIONAL since round 4
+            # requirement E1): every session this call spawns must carry a
+            # fresh token AND the file it was recorded to --
+            # `neuter_pathcheck`'s `pytest_configure` fails the session
+            # outright if either is missing or they don't match, with no
+            # opt-out flag to strip. It ALSO records a marker (review round
+            # 4 requirement E2) this function checks AFTER the child exits,
+            # catching the plugin never running at all (e.g. a stray
+            # `-p no:neuter_pathcheck`).
             env["NEUTER_CHOKEPOINT_TOKEN"] = token
             env["NEUTER_CHOKEPOINT_TOKEN_FILE"] = token_file
+            env["NEUTER_CHOKEPOINT_MARKER_FILE"] = marker_file
             env["PYTEST_PLUGINS"] = "neuter_pathcheck"
 
             if collect_only:
@@ -406,6 +436,7 @@ def run_pytest(
                     foreign_pg_container=foreign_seen(),
                     chokepoint_token=token,
                     collect_stdout=result.stdout,
+                    chokepoint_marker_ok=_marker_was_written(marker_file, token),
                 )
 
             cmd = [
@@ -492,6 +523,7 @@ def run_pytest(
                 db_leak=db_leak,
                 foreign_pg_container=foreign_seen(),
                 chokepoint_token=token,
+                chokepoint_marker_ok=_marker_was_written(marker_file, token),
             )
         finally:
             if probe_fd is not None:
@@ -499,3 +531,5 @@ def run_pytest(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(token_file)
+        with contextlib.suppress(OSError):
+            os.unlink(marker_file)

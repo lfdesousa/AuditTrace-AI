@@ -13,6 +13,7 @@ import time
 import pytest
 
 from scripts.neuter.pg import (
+    DockerUnavailableError,
     NonDurableSettingsError,
     _wait_ready,
     assert_nondurable,
@@ -193,3 +194,35 @@ def test_start_container_real_with_tmpfs():
         assert_nondurable(settings)  # does not raise
     finally:
         stop_container(handle)
+
+
+def test_start_container_docker_binary_missing_raises_typed_error(
+    monkeypatch, tmp_path
+):
+    """Review round 4 should-fix: docker unavailable must never surface as
+    a raw, uncaught traceback (FileNotFoundError/CalledProcessError/
+    TimeoutExpired) -- a typed DockerUnavailableError with a clear message
+    every time."""
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+    with pytest.raises(DockerUnavailableError, match="docker binary not found"):
+        start_container("test-missing-docker", 0)
+
+
+def test_start_container_fake_docker_nonzero_exit_raises_typed_error(
+    monkeypatch, tmp_path
+):
+    """Same guard, the `docker run` ITSELF failing (daemon unreachable,
+    name collision, etc.) -- a fake `docker` on PATH that exits non-zero,
+    never a bare CalledProcessError."""
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/bash\necho 'fake docker: daemon not reachable' >&2\nexit 125\n"
+    )
+    fake_docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    with pytest.raises(DockerUnavailableError, match="docker run.*failed"):
+        start_container("test-fake-docker-fail", 0)

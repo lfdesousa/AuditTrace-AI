@@ -18,20 +18,20 @@ from scripts.neuter import neuter_pathcheck
 
 def _clear_chokepoint_env(monkeypatch):
     """These tests exercise the PATH-CHECK half of ``pytest_configure``, not
-    the chokepoint-totality guard added in review round 3 -- which is
-    STICKY process-wide the moment ``scripts.neuter.pytest_run`` is
-    imported (by other files in this same collection), so by the time this
-    module's tests EXECUTE, ``NEUTER_CHOKEPOINT_REQUIRED`` is already set in
-    ``os.environ`` even though this direct, in-process call was never
-    routed through ``run_pytest()``. Without clearing it here, every test
-    below raises ``pytest.exit()`` (``_pytest.outcomes.Exit``), which
-    pytest treats as "abort the whole session", not "fail this test" --
-    found live: it silently truncated this file's own suite (and would have
-    truncated ``make test``) after exactly 42 unrelated tests, with no
-    per-test failure ever recorded."""
-    monkeypatch.delenv("NEUTER_CHOKEPOINT_REQUIRED", raising=False)
+    the chokepoint-totality guard (review round 3; made UNCONDITIONAL in
+    round 4, requirement E1 -- the check now runs whenever this plugin
+    loads, regardless of any single env var, since a hermetic bypass env
+    can strip any one flag). Without an explicit opt-out, every test below
+    would raise ``pytest.exit()`` (``_pytest.outcomes.Exit``), which pytest
+    treats as "abort the whole session", not "fail this test" -- found
+    live in round 3: it silently truncated this file's own suite (and
+    would have truncated ``make test``) with no per-test failure ever
+    recorded. ``NEUTER_CHOKEPOINT_SKIP=1`` is the one, explicit,
+    affirmative opt-out these path-check-only tests use."""
+    monkeypatch.setenv("NEUTER_CHOKEPOINT_SKIP", "1")
     monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN", raising=False)
     monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_MARKER_FILE", raising=False)
 
 
 def test_noop_when_expect_unset(monkeypatch):
@@ -71,19 +71,35 @@ def test_assertion_fires_and_no_log_line_on_wrong_path(tmp_path, monkeypatch):
     assert not log_path.exists()
 
 
-def test_chokepoint_required_but_token_missing_exits(monkeypatch):
-    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "1")
+def test_chokepoint_unconditional_token_missing_exits(monkeypatch):
+    """Review round 4, requirement E1: the check is now UNCONDITIONAL --
+    no NEUTER_CHOKEPOINT_REQUIRED flag needed to trigger it, closing the
+    hermetic-env bypass (an env with only PATH/HOME strips any single
+    flag, but there is no longer a flag whose absence means "permissive")."""
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_SKIP", raising=False)
     monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN", raising=False)
     monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN_FILE", raising=False)
     monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
 
     with pytest.raises(pytest.exit.Exception) as exc_info:
         neuter_pathcheck.pytest_configure(config=None)
-    assert "NEUTER_CHOKEPOINT_TOKEN/_FILE is missing" in str(exc_info.value)
+    assert "no valid NEUTER_CHOKEPOINT_TOKEN/_FILE" in str(exc_info.value)
 
 
-def test_chokepoint_required_but_token_file_unreadable_exits(tmp_path, monkeypatch):
-    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "1")
+def test_chokepoint_explicit_skip_opt_out_bypasses_the_check(monkeypatch):
+    """The ONLY sanctioned way to skip: an explicit, affirmative
+    NEUTER_CHOKEPOINT_SKIP=1 -- never set by run_pytest(), hold-shared, or
+    any test except these path-check-only ones."""
+    monkeypatch.setenv("NEUTER_CHOKEPOINT_SKIP", "1")
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN", raising=False)
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
+
+    neuter_pathcheck.pytest_configure(config=None)  # must not raise
+
+
+def test_chokepoint_token_file_unreadable_exits(tmp_path, monkeypatch):
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_SKIP", raising=False)
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN", "sometoken")
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN_FILE", str(tmp_path / "does-not-exist"))
     monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
@@ -93,10 +109,10 @@ def test_chokepoint_required_but_token_file_unreadable_exits(tmp_path, monkeypat
     assert "unreadable" in str(exc_info.value)
 
 
-def test_chokepoint_required_but_token_mismatch_exits(tmp_path, monkeypatch):
+def test_chokepoint_token_mismatch_exits(tmp_path, monkeypatch):
     token_file = tmp_path / "token"
     token_file.write_text("expected-token\n")
-    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "1")
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_SKIP", raising=False)
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN", "wrong-token")
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN_FILE", str(token_file))
     monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
@@ -106,15 +122,21 @@ def test_chokepoint_required_but_token_mismatch_exits(tmp_path, monkeypatch):
     assert "does not match" in str(exc_info.value)
 
 
-def test_chokepoint_required_and_token_matches_falls_through(tmp_path, monkeypatch):
+def test_chokepoint_token_matches_falls_through_and_writes_marker(
+    tmp_path, monkeypatch
+):
     token_file = tmp_path / "token"
     token_file.write_text("good-token\n")
-    monkeypatch.setenv("NEUTER_CHOKEPOINT_REQUIRED", "1")
+    marker_file = tmp_path / "marker"
+    monkeypatch.delenv("NEUTER_CHOKEPOINT_SKIP", raising=False)
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN", "good-token")
     monkeypatch.setenv("NEUTER_CHOKEPOINT_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("NEUTER_CHOKEPOINT_MARKER_FILE", str(marker_file))
     monkeypatch.delenv("NEUTER_PATHCHECK_EXPECT", raising=False)
 
     neuter_pathcheck.pytest_configure(config=None)  # must not raise
+
+    assert marker_file.read_text() == "good-token"
 
 
 def test_env_var_names_never_start_with_the_products_own_prefix():

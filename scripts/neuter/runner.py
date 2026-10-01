@@ -20,9 +20,11 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from scripts.neuter import lock as lockmod
+from scripts.neuter import pg
 from scripts.neuter.classify import classify
 from scripts.neuter.junit import (
     mapped_failed_in_full,
@@ -227,8 +229,13 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
             os.close(lock_fd)
             return EXIT_LOCK_HELD
 
+        # Review round 4 should-fix (same class as round 3's "collect"
+        # fix): a literal "arbitrate" run-id container name collides with
+        # any leftover container from an earlier interrupted/crashed
+        # arbitrate call (docker run exit 125, name already in use) --
+        # found live, re-running this exact command. Unique per call.
         pg_handle = start_container(
-            "arbitrate",
+            f"arbitrate-{uuid.uuid4().hex[:8]}",
             0,
             tmpfs=getattr(args, "tmpfs", False),
             fake=getattr(args, "no_db", False),
@@ -280,6 +287,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 full = None
                 unmapped_red: list[str] = []
                 foreign_pg_container = False
+                chokepoint_marker_ok = True
                 try:
                     if not nocompile:
                         # THE chokepoint (review round 2): sequential, alone,
@@ -301,6 +309,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                         )
                         exit_code = pytest_result.exit_code
                         foreign_pg_container = pytest_result.foreign_pg_container
+                        chokepoint_marker_ok = pytest_result.chokepoint_marker_ok
                         full = parse_junit_full(
                             junit_path if junit_path.exists() else None
                         )
@@ -341,6 +350,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                     timed_out=False,
                     exit_code=exit_code,
                     foreign_pg_container=foreign_pg_container,
+                    chokepoint_marker_ok=chokepoint_marker_ok,
                 )
                 authoritative_verdict = verdict.verdict
                 authoritative_error_reason = verdict.error_reason
@@ -548,7 +558,16 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    # Review round 4 should-fix: a real (non-fake) Postgres start can fail
+    # at ANY of the chokepoint-gated phases (collect, baseline, worker,
+    # drift, arbitrate) -- this used to surface as a raw, uncaught
+    # traceback. One catch at the single CLI dispatch point, a clear
+    # message, and the typed exit code -- never a bare stack trace.
+    try:
+        return args.func(args)
+    except pg.DockerUnavailableError as exc:
+        print(f"neuter: docker unavailable: {exc}", file=sys.stderr)
+        return pg.EXIT_DOCKER_UNAVAILABLE
 
 
 if __name__ == "__main__":

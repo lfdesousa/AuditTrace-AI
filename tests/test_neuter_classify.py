@@ -281,3 +281,48 @@ def test_outcomes_and_errors_lists_populated():
     )
     assert result.outcomes == {"a": "passed", "b": "error"}
     assert result.errors == ["b"]
+
+
+def test_chokepoint_marker_missing_forces_error():
+    """Review round 4, requirement E2: `run_pytest()` detects, from the
+    OUTSIDE, that `neuter_pathcheck` never ran during this invocation
+    (e.g. a stray `-p no:neuter_pathcheck`) -- classify() must turn that
+    into a hard ERROR, never a silent pass, regardless of exit code or
+    otherwise-passing tests."""
+    jr = JunitResult(
+        tests_collected=1,
+        parse_failed=False,
+        outcomes={"t": JunitTestcase("passed")},
+    )
+    result = classify(
+        ["t"],
+        jr,
+        tests_expected=1,
+        nocompile=False,
+        pathcheck_ok=True,
+        db_leak=False,
+        timed_out=False,
+        exit_code=0,
+        chokepoint_marker_ok=False,
+    )
+    assert result.verdict == "ERROR"
+    assert result.error_reason == "chokepoint_marker_missing"
+
+
+def test_chokepoint_marker_ok_true_is_the_default_and_never_errors():
+    jr = JunitResult(
+        tests_collected=1,
+        parse_failed=False,
+        outcomes={"t": JunitTestcase("passed")},
+    )
+    result = classify(
+        ["t"],
+        jr,
+        tests_expected=1,
+        nocompile=False,
+        pathcheck_ok=True,
+        db_leak=False,
+        timed_out=False,
+        exit_code=0,
+    )
+    assert result.verdict == "GREEN"

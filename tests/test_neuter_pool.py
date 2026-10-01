@@ -697,7 +697,9 @@ def test_run_pool_fails_closed_when_every_worker_crashes(tmp_path, monkeypatch):
     ]
     crashes = [e for e in events if e.get("event") == "worker_crashed"]
     assert len(crashes) == 2
-    assert "CalledProcessError" in crashes[0]["error"]
+    # Review round 4 should-fix: docker failures are a typed
+    # DockerUnavailableError now, not a raw CalledProcessError.
+    assert "DockerUnavailableError" in crashes[0]["error"]
     # no rows at all -- the neuter never produced any evidence.
     assert (
         not (evidence / "neuter_results.jsonl").exists()
@@ -840,6 +842,67 @@ def test_run_pool_drift_sample_measures_real_unmapped_red(tmp_path):
     assert row["drift_sampled"] is True
     assert row["unmapped_red"] != []
     assert any("test_b" in u for u in row["unmapped_red"])
+
+
+def test_run_pool_ack_drift_records_an_ack_event(tmp_path):
+    """Review round 4 should-fix: the POOL's own --ack-drift (distinct from
+    `report`'s) must ALSO be recorded in events.jsonl -- never reflected
+    only in the exit code."""
+    repo = _init_repo(tmp_path)
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "sha": _sha(repo),
+                "scope_files": ["test_guarded.py"],
+                "guard_tests": [{"id": "test_guarded.py::test_a", "row": "G"}],
+                "neuters": [
+                    {
+                        "id": "x6-wrong-mapping",
+                        "file": "guarded.py",
+                        "edits": [
+                            {"old": "    return x * 2", "new": "    return x * 3"}
+                        ],
+                        "tests": ["test_guarded.py::test_a"],
+                        "engines": ["mock"],
+                        "guard": "G",
+                    }
+                ],
+            }
+        )
+    )
+    spec = load_neuter_spec(
+        spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
+    )
+    evidence = _ev(tmp_path)
+    exit_code = run_pool(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=evidence,
+        workers=1,
+        python=PYTHON,
+        fake_db=True,
+        lock_path=tmp_path / "pool.lock",
+        pathcheck_module="guarded",
+        src_root_relative="",
+        sample=1.0,
+        ack_drift=True,
+    )
+    # the row's own verdict is GREEN (vacuous) -- ack_drift only suppresses
+    # the DRIFT exit code (14), not the separate vacuous-GREEN one (2).
+    assert exit_code == 2
+    events = [
+        json.loads(line)
+        for line in (evidence / "events.jsonl").read_text().splitlines()
+    ]
+    ack_events = [
+        e for e in events if e.get("event") == "ack" and e.get("phase") == "pool"
+    ]
+    assert len(ack_events) == 1
+    assert ack_events[0]["ack_drift"] is True
+    assert ack_events[0]["acked_drift_ids"] == ["x6-wrong-mapping"]
 
 
 def test_generate_report_refuses_unconfirmed_green(tmp_path):

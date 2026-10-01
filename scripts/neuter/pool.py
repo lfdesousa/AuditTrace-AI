@@ -246,6 +246,7 @@ def run_one_neuter(
     db_before = db_after = None
     db_leak = False
     foreign_pg_container = False
+    chokepoint_marker_ok = True
     pg_settings = None
     junit_result = None
     junit_path = (
@@ -323,6 +324,7 @@ def run_one_neuter(
         db_after = pytest_result.db_after
         db_leak = pytest_result.db_leak
         foreign_pg_container = pytest_result.foreign_pg_container
+        chokepoint_marker_ok = pytest_result.chokepoint_marker_ok
 
         junit_result = parse_junit(
             junit_path if junit_path.exists() else None, entry.tests
@@ -340,6 +342,7 @@ def run_one_neuter(
         timed_out=timed_out,
         exit_code=exit_code,
         foreign_pg_container=foreign_pg_container,
+        chokepoint_marker_ok=chokepoint_marker_ok,
     )
     secs = round(time.time() - t0, 3)
 
@@ -1126,6 +1129,23 @@ def run_pool(
             )
             return EXIT_MISSING_ROWS
 
+        # Review round 4 should-fix: the POOL's own --ack-drift was only
+        # ever reflected in its exit code -- `report`'s own --ack-errors/
+        # --ack-drift already get an `ack` event; the pool's own
+        # acknowledgement is recorded the same durable, append-only way.
+        if ack_drift:
+            acked_drift_ids = sorted(
+                rid for rid, row in rows.items() if row.get("unmapped_red")
+            )
+            append_event(
+                evidence_dir,
+                {
+                    "event": "ack",
+                    "phase": "pool",
+                    "ack_drift": True,
+                    "acked_drift_ids": acked_drift_ids,
+                },
+            )
         return pool_exit_code(rows, ack_drift=ack_drift)
     finally:
         metrics_stop.set()

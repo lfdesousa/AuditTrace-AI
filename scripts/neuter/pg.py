@@ -26,6 +26,20 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 EXIT_NONDURABLE_SETTINGS = 6
+#: Review round 4 should-fix: docker unavailable (binary missing, daemon
+#: unreachable, or `docker run` itself failing) used to surface as a raw,
+#: uncaught traceback from `subprocess.run(..., check=True)` -- fails
+#: closed either way (the pool never silently proceeds), but with no
+#: typed, documented exit code a caller/CI step can branch on.
+EXIT_DOCKER_UNAVAILABLE = 14
+
+
+class DockerUnavailableError(Exception):
+    """Raised by :func:`start_container` (real, non-fake mode only) when
+    the ``docker`` binary is missing, the daemon is unreachable, or
+    ``docker run`` itself fails -- never a raw ``FileNotFoundError``/
+    ``CalledProcessError``/``TimeoutExpired`` escaping to the caller."""
+
 
 NONDURABLE_FLAGS = [
     "-c",
@@ -119,7 +133,23 @@ def start_container(
     if tmpfs:
         cmd += ["--tmpfs", "/var/lib/postgresql/data"]
     cmd += [tag, *NONDURABLE_FLAGS]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError(
+            "docker binary not found on PATH -- install docker or pass "
+            "--no-db to use the fake-Postgres seam instead"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode(errors="replace").strip()
+        raise DockerUnavailableError(
+            f"`docker run` failed (exit {exc.returncode}): {stderr or '(no stderr)'}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerUnavailableError(
+            "`docker run` timed out after 120s -- is the docker daemon "
+            "running and responsive?"
+        ) from exc
     dsn = f"postgresql+psycopg2://postgres:{password}@127.0.0.1:{port}/{db}"
     _wait_ready(dsn)
     return PgHandle(name=name, dsn=dsn)

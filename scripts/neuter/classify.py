@@ -53,6 +53,7 @@ def classify(
     timed_out: bool,
     exit_code: int | None,
     foreign_pg_container: bool = False,
+    chokepoint_marker_ok: bool = True,
 ) -> VerdictResult:
     """Apply the verdict rule. ``junit_result`` may be ``None`` when the run
     never reached pytest (``nocompile``, or the caller has nothing to parse)."""
@@ -76,6 +77,13 @@ def classify(
         reasons.append("db_leak")
     if foreign_pg_container:
         reasons.append("foreign_pg_container")
+    if not chokepoint_marker_ok:
+        # Review round 4, requirement E2: the plugin never ran at all this
+        # invocation (e.g. a stray `-p no:neuter_pathcheck` reached
+        # pytest_args) -- `run_pytest()` detected this from the OUTSIDE,
+        # after the child exited, since the plugin can never detect its
+        # own absence. Never a silent pass, regardless of exit code.
+        reasons.append("chokepoint_marker_missing")
     if timed_out:
         reasons.append("timeout")
 
