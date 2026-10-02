@@ -48,9 +48,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # tests/test_decision_routes_untouched.py diffs against the merge base
-          # with origin/main and FAILS CLOSED when it cannot resolve it, so the
-          # full history is required (a depth-1 checkout has no origin/main).
+          # Full history is kept: it is harmless, and other jobs and tools
+          # (merge-base / diff against origin/main) may rely on it. A depth-1
+          # checkout has no origin/main to compare against.
           fetch-depth: 0
 
       - name: Set up Python 3.12
