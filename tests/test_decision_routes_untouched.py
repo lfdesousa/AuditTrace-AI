@@ -2,24 +2,20 @@
 
 The git-diff instrument FAILS CLOSED: if the merge base with ``origin/main``
 cannot be resolved the test FAILS (CI checks out with full history for this
-reason). A static-only run is possible ONLY when the environment variable
-``AUDITTRACE_T12_STATIC_ONLY=1`` is set explicitly; CI never sets it. The
-static "no route imports the package" check always runs as a second assertion.
+reason). There is no override. The static "no route imports the package"
+check always runs as a second assertion.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
-from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 ROUTES = REPO / "src/audittrace/routes"
-STATIC_ONLY_ENV = "AUDITTRACE_T12_STATIC_ONLY"
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -28,25 +24,18 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def routes_diff_is_empty(repo: Path, env: Mapping[str, str]) -> str:
-    """Return how the invariant was established; raise AssertionError if broken.
-
-    ``"diff"``: the routes diff against the merge base is empty.
-    ``"static-only"``: explicitly requested by the environment.
-    """
-    if env.get(STATIC_ONLY_ENV) == "1":
-        return "static-only"
+def routes_diff_is_empty(repo: Path) -> None:
+    """Assert the routes diff against the merge base is empty (fail closed)."""
     base = _git(repo, "merge-base", "HEAD", "origin/main")
     assert base.returncode == 0, (
         "cannot resolve the merge base with origin/main (shallow checkout?): "
-        f"fetch full history, or set {STATIC_ONLY_ENV}=1 to run static-only"
+        "fetch full history"
     )
     diff = _git(
         repo, "diff", base.stdout.strip(), "HEAD", "--", "src/audittrace/routes"
     )
     assert diff.returncode == 0
     assert diff.stdout == ""
-    return "diff"
 
 
 def find_route_importers(routes: Path, root: Path) -> list[str]:
@@ -82,7 +71,7 @@ def test_the_static_import_check_sees_a_planted_importer(
 
 
 def test_t12_routes_diff_against_main_merge_base_is_empty() -> None:
-    assert routes_diff_is_empty(REPO, os.environ) in {"diff", "static-only"}
+    routes_diff_is_empty(REPO)
 
 
 # ---- the instrument itself, on throw-away repositories ----------------------
@@ -112,15 +101,7 @@ def test_instrument_fails_closed_when_origin_main_is_unresolvable(
 ) -> None:
     repo = _init_repo(tmp_path)  # no origin/main: the shallow-CI shape
     with pytest.raises(AssertionError, match="cannot resolve the merge base"):
-        routes_diff_is_empty(repo, {})
-
-
-def test_instrument_static_only_requires_the_explicit_env_var(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    assert routes_diff_is_empty(repo, {STATIC_ONLY_ENV: "1"}) == "static-only"
-    for other in ("0", "true", "", "yes"):
-        with pytest.raises(AssertionError):
-            routes_diff_is_empty(repo, {STATIC_ONLY_ENV: other})
+        routes_diff_is_empty(repo)
 
 
 def test_instrument_passes_on_an_untouched_routes_tree(tmp_path: Path) -> None:
@@ -129,7 +110,7 @@ def test_instrument_passes_on_an_untouched_routes_tree(tmp_path: Path) -> None:
     (repo / "other.txt").write_text("y\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "elsewhere")
-    assert routes_diff_is_empty(repo, {}) == "diff"
+    routes_diff_is_empty(repo)  # no exception: diff empty
 
 
 def test_instrument_goes_red_when_a_route_changes(tmp_path: Path) -> None:
@@ -139,4 +120,4 @@ def test_instrument_goes_red_when_a_route_changes(tmp_path: Path) -> None:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "touch a route")
     with pytest.raises(AssertionError):
-        routes_diff_is_empty(repo, {})
+        routes_diff_is_empty(repo)
