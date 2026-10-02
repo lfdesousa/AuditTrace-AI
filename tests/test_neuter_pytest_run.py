@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from scripts.neuter import lock as lockmod
-from scripts.neuter.pytest_run import chokepoint_scope, run_pytest
+from scripts.neuter.pytest_run import PytestRunResult, chokepoint_scope, run_pytest
 
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
 if _DOCKER_AVAILABLE:
@@ -162,6 +162,55 @@ def test_foreign_container_collect_only_uses_the_same_delta(
         collect_only=True,
     )
     assert result.foreign_pg_container is True
+
+
+def test_collect_only_populates_watch_attached_from_the_same_watch(
+    tmp_path, monkeypatch, _isolated_lock
+):
+    """Review round 7, O-1a (orchestrator-confirmed blocker): the
+    collect-only construction site (``run_pytest()``'s ``collect_only``
+    branch) must populate ``PytestRunResult.watch_attached`` from the SAME
+    watch the full-run site uses -- dropping the explicit
+    ``watch_attached=watch_attached`` pass there previously left all 120
+    targeted tests GREEN, because the dataclass field defaulted silently
+    to ``True``. The field is now REQUIRED (no default), so that drop is
+    an immediate ``TypeError`` raised from inside ``run_pytest()`` itself
+    -- this test exercises exactly the collect-only code path end-to-end,
+    with the fake watch set to the NON-default ``False`` so a reintroduced
+    default could never make it pass by coincidence either."""
+    repo = _init_repo(tmp_path)
+    monkeypatch.setattr(
+        "scripts.neuter.pytest_run._continuous_foreign_container_watch",
+        lambda: _fake_watch(True, watch_attached=False),
+    )
+    result = run_pytest(
+        workdir=repo,
+        pytest_args=["test_guarded.py"],
+        python=PYTHON,
+        lock_path=_isolated_lock,
+        collect_only=True,
+    )
+    assert result.watch_attached is False
+
+
+def test_pytest_run_result_requires_watch_attached_explicitly():
+    """Review round 7 (O-1a, orchestrator-confirmed blocker): ``watch_
+    attached`` has NO default -- dropping the explicit pass at EITHER
+    construction site in ``run_pytest()`` (collect-only or the full run)
+    must be an immediate ``TypeError``, never a silent, fail-open
+    ``True``. A structural, dataclass-level proof complementing the two
+    end-to-end tests above/below that exercise the real construction
+    sites."""
+    with pytest.raises(TypeError, match="watch_attached"):
+        PytestRunResult(  # type: ignore[call-arg]
+            exit_code=0,
+            timed_out=False,
+            pathcheck_ok=None,
+            db_before=None,
+            db_after=None,
+            db_leak=False,
+            foreign_pg_container=False,
+        )
 
 
 def test_collect_only_clears_a_stale_pathcheck_env_from_an_outer_caller(

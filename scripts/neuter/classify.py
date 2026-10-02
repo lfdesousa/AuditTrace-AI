@@ -55,7 +55,13 @@ def classify(
     exit_code: int | None,
     foreign_pg_container: bool = False,
     chokepoint_marker_ok: bool = True,
-    watch_attached: bool = True,
+    # Review round 7 (O-1a): no default -- a missing explicit pass at a
+    # call site must be a hard TypeError, never a silent, fail-open
+    # `True`. `nocompile`'s early return above never reaches this kwarg at
+    # all, so the `nocompile=True` callers are unaffected. Already
+    # keyword-only (the bare `*` above), so this is a pure Python-level
+    # required-kwarg change -- no reordering needed.
+    watch_attached: bool,
 ) -> VerdictResult:
     """Apply the verdict rule. ``junit_result`` may be ``None`` when the run
     never reached pytest (``nocompile``, or the caller has nothing to parse)."""

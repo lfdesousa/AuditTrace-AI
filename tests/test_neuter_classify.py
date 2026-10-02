@@ -4,6 +4,8 @@ subprocess plumbing."""
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.neuter.classify import classify
 from scripts.neuter.junit import JunitResult, JunitTestcase
 
@@ -22,6 +24,7 @@ def test_nocompile_short_circuits_everything():
         db_leak=True,
         timed_out=True,
         exit_code=99,
+        watch_attached=True,
     )
     assert result.verdict == "ERROR"
     assert result.error_reason == "nocompile"
@@ -44,6 +47,7 @@ def test_green_when_all_passed():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.verdict == "GREEN"
     assert result.vacuous is True
@@ -64,6 +68,7 @@ def test_red_when_one_failed_assertion_shaped():
         db_leak=False,
         timed_out=False,
         exit_code=1,
+        watch_attached=True,
     )
     assert result.verdict == "RED"
     assert result.error_reason is None
@@ -85,6 +90,7 @@ def test_call_exception_is_error_not_red():
         db_leak=False,
         timed_out=False,
         exit_code=1,
+        watch_attached=True,
     )
     assert result.verdict == "ERROR"
     assert result.error_reason == "call_exception"
@@ -104,6 +110,7 @@ def test_pathcheck_error():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.error_reason == "pathcheck"
 
@@ -121,6 +128,7 @@ def test_db_leak_error():
         db_leak=True,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.error_reason == "db_leak"
 
@@ -135,6 +143,7 @@ def test_timeout_error_junit_absent():
         db_leak=False,
         timed_out=True,
         exit_code=None,
+        watch_attached=True,
     )
     assert result.error_reason == "timeout"
     assert "junit" in result.error_reasons  # junit was never produced either
@@ -153,6 +162,7 @@ def test_setup_or_teardown_error():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.error_reason == "setup_or_teardown"
 
@@ -170,6 +180,7 @@ def test_skipped_error():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.error_reason == "skipped"
 
@@ -185,6 +196,7 @@ def test_missing_error():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert "missing" in result.error_reasons
 
@@ -202,6 +214,7 @@ def test_collected_mismatch_error():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.error_reason == "collected"
 
@@ -216,6 +229,7 @@ def test_junit_none_result_treated_as_parse_failed():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert "junit" in result.error_reasons
 
@@ -233,6 +247,7 @@ def test_bad_exit_code_error():
         db_leak=False,
         timed_out=False,
         exit_code=5,
+        watch_attached=True,
     )
     assert "exit_code" in result.error_reasons
 
@@ -248,6 +263,7 @@ def test_error_reasons_order_and_first_wins():
         db_leak=True,
         timed_out=True,
         exit_code=5,
+        watch_attached=True,
     )
     assert result.error_reasons == [
         "collected",
@@ -278,6 +294,7 @@ def test_outcomes_and_errors_lists_populated():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.outcomes == {"a": "passed", "b": "error"}
     assert result.errors == ["b"]
@@ -304,6 +321,7 @@ def test_chokepoint_marker_missing_forces_error():
         timed_out=False,
         exit_code=0,
         chokepoint_marker_ok=False,
+        watch_attached=True,
     )
     assert result.verdict == "ERROR"
     assert result.error_reason == "chokepoint_marker_missing"
@@ -324,6 +342,7 @@ def test_chokepoint_marker_ok_true_is_the_default_and_never_errors():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.verdict == "GREEN"
 
@@ -356,7 +375,10 @@ def test_watch_unproven_forces_error():
     assert result.error_reason == "watch_unproven"
 
 
-def test_watch_attached_true_is_the_default_and_never_errors():
+def test_watch_attached_true_passed_explicitly_never_errors():
+    """Review round 7 (O-1a): ``watch_attached`` is now a REQUIRED kwarg
+    (no default) -- this test passes it explicitly, unlike its
+    pre-round-7 namesake which relied on the (now-removed) default."""
     jr = JunitResult(
         tests_collected=1,
         parse_failed=False,
@@ -371,5 +393,29 @@ def test_watch_attached_true_is_the_default_and_never_errors():
         db_leak=False,
         timed_out=False,
         exit_code=0,
+        watch_attached=True,
     )
     assert result.verdict == "GREEN"
+
+
+def test_classify_requires_watch_attached_explicitly():
+    """Review round 7 (O-1a, orchestrator-confirmed blocker): dropping the
+    explicit ``watch_attached=...`` pass at a ``classify()`` call site must
+    be an immediate ``TypeError``, never a silent, fail-open default of
+    ``True``."""
+    jr = JunitResult(
+        tests_collected=1,
+        parse_failed=False,
+        outcomes={"t": JunitTestcase("passed")},
+    )
+    with pytest.raises(TypeError, match="watch_attached"):
+        classify(  # type: ignore[call-arg]
+            ["t"],
+            jr,
+            tests_expected=1,
+            nocompile=False,
+            pathcheck_ok=True,
+            db_leak=False,
+            timed_out=False,
+            exit_code=0,
+        )

@@ -347,6 +347,23 @@ class PytestRunResult:
     #: requirement B1) -- checked for every phase, regardless of whether
     #: this call was even given a ``pg_handle``.
     foreign_pg_container: bool
+    #: False iff ``_continuous_foreign_container_watch()``'s own readiness
+    #: probe could never PROVE the ``docker events`` stream was live before
+    #: this call's caller-visible work began (review round 6, fixing the
+    #: round-5 fail-open regression: the probe's result used to be computed
+    #: and then discarded). A watch that was never proven live can never
+    #: certify "no foreign container appeared" -- every phase MUST treat
+    #: ``False`` as ERROR ``watch_unproven``, fail closed, never silently
+    #: trust ``foreign_pg_container`` from an unproven watch.
+    #:
+    #: Review round 7 (O-1a, orchestrator-confirmed blocker): this field
+    #: used to default to ``True`` -- dropping the explicit pass at EITHER
+    #: construction site below (``:507`` main, ``:598`` collect-only) still
+    #: left all 120 targeted tests GREEN at the collect site, because a
+    #: dataclass default silently fills the gap. Deliberately REQUIRED (no
+    #: default) so a missing explicit value is a ``TypeError`` at
+    #: construction time, not a silent, fail-open ``True``.
+    watch_attached: bool
     #: The fresh per-invocation chokepoint token this call issued (review
     #: round 3, requirement B2) -- carried on the row for audit purposes.
     chokepoint_token: str = ""
@@ -359,15 +376,6 @@ class PytestRunResult:
     #: plugin itself can never detect from the inside. ``run_pytest()``
     #: checks this AFTER the child exits, regardless of its exit code.
     chokepoint_marker_ok: bool = True
-    #: False iff ``_continuous_foreign_container_watch()``'s own readiness
-    #: probe could never PROVE the ``docker events`` stream was live before
-    #: this call's caller-visible work began (review round 6, fixing the
-    #: round-5 fail-open regression: the probe's result used to be computed
-    #: and then discarded). A watch that was never proven live can never
-    #: certify "no foreign container appeared" -- every phase MUST treat
-    #: ``False`` as ERROR ``watch_unproven``, fail closed, never silently
-    #: trust ``foreign_pg_container`` from an unproven watch.
-    watch_attached: bool = True
 
 
 def run_pytest(

@@ -247,6 +247,13 @@ def run_one_neuter(
     db_leak = False
     foreign_pg_container = False
     chokepoint_marker_ok = True
+    # Review round 7 (reviewer-accepted, documented for reachability): this
+    # pre-init value only ever reaches `classify()` below on the
+    # `nocompile=True` path -- `classify()`'s own SF-4 rule returns on
+    # `nocompile` BEFORE evaluating `watch_attached` (or any other
+    # condition) at all, so this `True` is provably never read there. The
+    # pg_settings/NonDurableSettingsError branch above returns its own row
+    # directly and never reaches `classify()` either.
     watch_attached = True
     pg_settings = None
     junit_result = None

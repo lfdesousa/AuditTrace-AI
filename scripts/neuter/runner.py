@@ -10,6 +10,19 @@
     .venv/bin/python -m scripts.neuter.runner report [--verify] [--ack-errors] --evidence <dir> --neuters <priv>/neuters.json
     .venv/bin/python -m scripts.neuter.runner hold-shared -- <pytest argv>
     .venv/bin/python -m scripts.neuter.runner assert-idle
+
+Docker is REQUIRED on the host regardless of ``--no-db`` (review round 7).
+``--no-db`` only fakes the Postgres CONTAINER/DSN for self-proofs -- every
+phase still runs its pytest invocation through the continuous
+foreign-container watch (``scripts.neuter.pytest_run.
+_continuous_foreign_container_watch``), which streams ``docker events``
+and PROVES itself live via a throwaway ``busybox`` probe container before
+trusting its own "no foreign container" verdict. On a docker-less host
+that probe can never run, ``PytestRunResult.watch_attached`` is ``False``,
+and EVERY phase classifies that as ERROR ``watch_unproven`` -- at collect
+this is a hard exit 3 (``SpecLoadError``). This is fail-closed BY DESIGN,
+not a bug: a watch that was never proven live can never certify "no
+foreign container appeared", so neither can this harness.
 """
 
 from __future__ import annotations
@@ -288,6 +301,13 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 unmapped_red: list[str] = []
                 foreign_pg_container = False
                 chokepoint_marker_ok = True
+                # Review round 7 (reviewer-accepted, documented for
+                # reachability): this pre-init value only ever reaches
+                # `classify()` below on the `nocompile=True` path --
+                # `classify()`'s own SF-4 rule returns on `nocompile`
+                # BEFORE evaluating `watch_attached` (or any other
+                # condition) at all, so this `True` is provably never
+                # read there.
                 watch_attached = True
                 try:
                     if not nocompile:
@@ -481,7 +501,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--tmpfs", action="store_true")
     run_p.add_argument("--resume", action="store_true")
     run_p.add_argument(
-        "--no-db", action="store_true", help="fake Postgres (self-proofs only)"
+        "--no-db",
+        action="store_true",
+        help=(
+            "fake Postgres (self-proofs only) -- docker is still REQUIRED "
+            "regardless: the foreign-container watch runs every phase and "
+            "fails closed (watch_unproven) if it can never prove itself live"
+        ),
     )
     run_p.add_argument("--pathcheck-module", default="audittrace")
     run_p.add_argument("--src-root-relative", default="src")
@@ -514,7 +540,13 @@ def build_parser() -> argparse.ArgumentParser:
     arb_p.add_argument("--timeout", type=int, default=900)
     arb_p.add_argument("--lock-path", default=None)
     arb_p.add_argument(
-        "--no-db", action="store_true", help="fake Postgres (self-proofs only)"
+        "--no-db",
+        action="store_true",
+        help=(
+            "fake Postgres (self-proofs only) -- docker is still REQUIRED "
+            "regardless: the foreign-container watch runs every phase and "
+            "fails closed (watch_unproven) if it can never prove itself live"
+        ),
     )
     arb_p.add_argument("--tmpfs", action="store_true")
     arb_p.add_argument("--repo-dir", default=common["repo_dir"])
@@ -538,7 +570,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rep_p.add_argument("--lock-path", default=None)
     rep_p.add_argument(
-        "--no-db", action="store_true", help="fake Postgres (self-proofs only)"
+        "--no-db",
+        action="store_true",
+        help=(
+            "fake Postgres (self-proofs only) -- docker is still REQUIRED "
+            "regardless: the foreign-container watch runs every phase and "
+            "fails closed (watch_unproven) if it can never prove itself live"
+        ),
     )
     rep_p.add_argument("--repo-dir", default=common["repo_dir"])
     rep_p.add_argument("--python", default=common["python"])
