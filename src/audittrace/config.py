@@ -1,8 +1,10 @@
 import logging
+import math
 import os
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,12 @@ def _as_sync_url(url: str) -> str:
     if url.startswith("sqlite+aiosqlite://"):
         return url.replace("sqlite+aiosqlite://", "sqlite://", 1)
     return url
+
+
+# #459 WU-459-1: the routing modes this slice accepts. ``acting`` is
+# deliberately absent: no scheduling answer exists yet (acting mode is out of
+# scope until a later slice), so it must fail at startup, not silently act.
+_MEMORY_ROUTING_MODES = frozenset({"off", "shadow"})
 
 
 # Skip .env loading entirely when AUDITTRACE_ENV=test so a developer's local
@@ -568,6 +576,81 @@ class Settings(BaseSettings):
     otel_service_name: str = "audittrace-server"
     metrics_enabled: bool = True
     tracing_enabled: bool = True
+
+    # #459 WU-459-1: decision-model client (llama.cpp ``/completion``).
+    # Everything is default-off: ``decision_url == ""`` means no network call
+    # is ever made and ``memory_routing_mode`` stays ``off``. Invalid values
+    # stop startup on purpose (the operator sets these deliberately, so a
+    # fail-closed config is the correct posture).
+    decision_url: str = ""
+    # Secret. Plain ``str`` is the existing pattern for secrets in this file
+    # (``langfuse_secret_key`` / ``minio_secret_key`` / ``aws_secret_access_key``);
+    # as with those, ``repr(Settings)`` contains it, so Settings must never be
+    # logged. The decision client never logs Settings, headers or this value.
+    decision_api_key: str = ""
+    decision_model: str = ""
+    # The launch label the server must report on ``GET /props``. Required when
+    # ``decision_url`` is set so the identity comparison always runs.
+    decision_model_alias: str = ""
+    # sha256 (lowercase hex) of the GGUF file this deployment is pinned to.
+    decision_model_digest: str = ""
+    # TOTAL budget (ms) for one ``decide()`` across every HTTP call it makes.
+    decision_timeout_ms: int = 2000
+    # Client-side softmax temperature over the raw logprobs (never sent to
+    # the runtime, which is always called at temperature 0).
+    decision_temperature: float = 1.0
+    # Free text recorded on every decision row (e.g. ``vulkan`` / ``f16``).
+    decision_backend: str = ""
+    decision_quantisation: str = ""
+    # ``off`` | ``shadow``. ``acting`` is rejected in this slice.
+    memory_routing_mode: str = "off"
+
+    @field_validator("decision_timeout_ms")
+    @classmethod
+    def _decision_timeout_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("decision_timeout_ms must be > 0")
+        return v
+
+    @field_validator("decision_temperature")
+    @classmethod
+    def _decision_temperature_positive_finite(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("decision_temperature must be > 0 and finite")
+        return v
+
+    @field_validator("memory_routing_mode")
+    @classmethod
+    def _memory_routing_mode_known(cls, v: str) -> str:
+        if v not in _MEMORY_ROUTING_MODES:
+            raise ValueError(
+                "memory_routing_mode must be 'off' or 'shadow' "
+                f"('acting' is not available in this release), got {v!r}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _decision_cross_field(self) -> Self:
+        if self.decision_url:
+            # Imported here: the decision package imports this module.
+            from audittrace.services.decision.token_tables import table_for
+
+            if table_for(self.decision_model_digest) is None:
+                raise ValueError(
+                    "decision_model_digest has no vendored added-token table "
+                    "(must be the lowercase sha256 of a pinned model): an "
+                    "unknown model has no control-token denylist and may not "
+                    "take decisions"
+                )
+            if not self.decision_model_alias:
+                raise ValueError(
+                    "decision_model_alias is required when decision_url is set"
+                )
+        if self.memory_routing_mode == "shadow" and not self.decision_url:
+            raise ValueError(
+                "memory_routing_mode='shadow' requires decision_url to be set"
+            )
+        return self
 
     @property
     def database_url(self) -> str | None:
