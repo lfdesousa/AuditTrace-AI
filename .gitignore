@@ -65,6 +65,7 @@ docker-compose.override.yml
 htmlcov/
 .pytest_cache/
 .tox/
+.neuter_test_evidence/
 
 # MyPy
 .mypy_cache/

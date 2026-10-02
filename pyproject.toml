@@ -227,6 +227,10 @@ source = [
     "scripts/network",
     "scripts/replay_dead_lettered_index.py",
     "scripts/backfill_pdf_signature_status.py",
+    # `scripts/neuter` (the fast neuter harness, SPEC v3) joins the same way:
+    # public SDLC tooling under the same ≥90% per-file gate as everything
+    # else, measured alongside `--cov=scripts/neuter` in `make test`/`test-cov`.
+    "scripts/neuter",
     "bff",
 ]
 branch = true

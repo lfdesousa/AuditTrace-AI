@@ -89,14 +89,9 @@ the open, out-of-scope production finding this qualifies.
 
 from __future__ import annotations
 
-import atexit
 import importlib.util
 import os
-import shutil
-import socket
-import subprocess
 import sys
-import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -145,80 +140,25 @@ from audittrace.identity import UserContext  # noqa: E402
 from audittrace.services.console_acl import _audit  # noqa: E402
 from audittrace.services.console_store import ConsoleStoreScopeError  # noqa: E402
 
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _start_ephemeral_postgres() -> str | None:
-    if shutil.which("docker") is None:
-        return None
-    try:
-        subprocess.run(["docker", "info"], check=True, capture_output=True, timeout=10)
-    except Exception:
-        return None
-    port = _free_port()
-    name = f"audittrace-acl-wu2a-pg-{os.getpid()}"
-    password = "acl_wu2a_ephemeral_pw"  # noqa: S105 - throwaway container credential
-    db = "audittrace_acl_wu2a"
-    try:
-        subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                name,
-                "-e",
-                f"POSTGRES_PASSWORD={password}",
-                "-e",
-                f"POSTGRES_DB={db}",
-                "-p",
-                f"{port}:5432",
-                "postgres:16",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-    except Exception:
-        return None
-    # NOTE (WU-2a housekeeping — filed, not fixed): the spec's
-    # ADDENDUM-L flagged that this exact atexit-based cleanup did not
-    # fire on a --collect-only run in the sibling files, leaking a
-    # container. Registering it here too (same known limitation,
-    # shared by all three ephemeral-postgres test files) rather than
-    # inventing a different, unproven cleanup mechanism for this file
-    # alone. `docker run --rm` still removes the container on a clean
-    # `docker stop`/process exit; the gap is specifically the
-    # --collect-only path. Follow-up: a shared pytest_sessionfinish
-    # hook in conftest.py would close it for all three files at once —
-    # out of this WU's scope (§3 "OUT of scope" does not list it, and
-    # touching shared conftest behavior for 3 independent RLS-proof
-    # files is a bigger blast radius than this WU should take on).
-    atexit.register(
-        lambda: subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    )
-    dsn = f"postgresql+psycopg2://postgres:{password}@127.0.0.1:{port}/{db}"
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        try:
-            engine = create_engine(dsn, future=True)
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            engine.dispose()
-            return dsn
-        except Exception:
-            time.sleep(0.5)
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    return None
+# SPEC v3 §8 (fast neuter harness): the bring-up itself now lives in the
+# shared `tests/_pg_ephemeral.py` helper (all three RLS-proof files apply
+# the same non-durable flags there); container name and DSN shape are
+# unchanged. The known --collect-only atexit-cleanup gap this file used to
+# note inline is the shared helper's gap too (filed, not fixed, same as
+# before).
 
 
 def _resolve_admin_url() -> str | None:
-    return os.environ.get("AUDITTRACE_TEST_POSTGRES_URL") or _start_ephemeral_postgres()
+    env_url = os.environ.get("AUDITTRACE_TEST_POSTGRES_URL")
+    if env_url:
+        return env_url
+    from tests._pg_ephemeral import start_ephemeral_postgres
+
+    return start_ephemeral_postgres(
+        "audittrace-acl-wu2a-pg-",
+        "acl_wu2a_ephemeral_pw",  # noqa: S106 - throwaway container credential
+        "audittrace_acl_wu2a",
+    )
 
 
 _ADMIN_URL = _resolve_admin_url()

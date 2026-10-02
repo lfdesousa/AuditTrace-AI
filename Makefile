@@ -83,7 +83,7 @@ typecheck: ## Run type checking
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts.replay_dead_lettered_index --cov=scripts.backfill_pdf_signature_status --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts/neuter --cov=scripts.replay_dead_lettered_index --cov=scripts.backfill_pdf_signature_status --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
@@ -105,7 +105,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 	  -e POSTGRES_PASSWORD=test \
 	  -e POSTGRES_DB=audittrace \
 	  -p 15432:5432 \
-	  postgres:16 >/dev/null
+	  postgres:16 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
 	@echo "⏳ Waiting for Postgres to accept connections ..."
 	@for i in 1 2 3 4 5 6 7 8; do \
 	  docker exec audittrace-test-pg pg_isready -U postgres >/dev/null 2>&1 && break ; \
@@ -121,7 +121,7 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 
 test-cov: ## Run tests with HTML coverage report + per-file gate
 	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/network --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/network --cov=scripts/neuter --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "✅ Tests passed"
@@ -149,6 +149,7 @@ test-integration: docker-build ## Run RLS integration suite as a Helm test Pod i
 	# WARNING: Postgres logs accumulate ERROR-by-design entries from the
 	# RLS-violation test case. For pollution-free runs use `make test-rls-local`.
 	@echo "🐳 Building tests image (FROM audittrace-ai:latest)..."
+	@.venv/bin/python -m scripts.neuter.runner assert-idle
 	@docker build -f Dockerfile.tests \
 	  --build-arg TESTS_BASE_IMAGE=audittrace-ai:latest \
 	  -t localhost:5000/audittrace/tests:latest . > /dev/null
@@ -181,6 +182,7 @@ clean: ## Clean up build artifacts
 
 docker-build: ## Build Docker image
 	@echo "🐳 Building Docker image..."
+	@.venv/bin/python -m scripts.neuter.runner assert-idle
 	@docker build -t audittrace-ai:latest .
 	@echo "✅ Docker image built"
 
