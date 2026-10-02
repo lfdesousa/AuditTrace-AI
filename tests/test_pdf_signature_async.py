@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -178,6 +179,99 @@ class TestAc1RealRoute:
         assert response.json()["documents"][0]["signature_status"] == (
             "signed_untrusted"
         )
+
+
+class TestPipelinePlumbingOfLogJoinFields:
+    """Reviewer B1 (R28): the key + sha plumbing from the REAL pipeline into
+    the classifier's production log line, asserted through the route and the
+    worker, not the classifier directly. Neuter: delete
+    ``key=obj["key"], document_sha256=document_hash`` at the pipeline call
+    -> ``file`` / ``document_sha256`` are empty -> both tests RED."""
+
+    @staticmethod
+    def _internal_error_records(caplog: pytest.LogCaptureFixture) -> list[Any]:
+        return [
+            r
+            for r in caplog.records
+            if getattr(r, "reason", "") == "signature_check_internal_error"
+        ]
+
+    async def test_route_log_line_carries_file_and_document_sha256(
+        self,
+        client: TestClient,
+        trust_env: str,
+        pki: fx.TestPki,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        raw = await fx.sign_pdf_bytes(fx.blank_pdf(), pki)
+        with (
+            patch(ASYNC_VALIDATE, autospec=True, side_effect=RuntimeError("boom")),
+            caplog.at_level(logging.DEBUG),
+        ):
+            response, _col, _manifest = await asyncio.to_thread(
+                _index_signed_via_route, client, raw
+            )
+        assert response.status_code == 200, response.text
+        records = self._internal_error_records(caplog)
+        assert len(records) == 1
+        assert records[0].file == "episodic/papers/signed.pdf"
+        assert records[0].document_sha256 == hashlib.sha256(raw).hexdigest()
+        assert response.json()["documents"][0]["signature_status"] == "check_error"
+
+    async def test_worker_log_line_carries_file_sha256_and_trace_id(
+        self,
+        trust_env: str,
+        pki: fx.TestPki,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from audittrace.services.index_worker import (
+            IndexRequestEnvelope,
+            default_indexer,
+        )
+
+        raw = await fx.sign_pdf_bytes(fx.blank_pdf(), pki)
+        minio = MagicMock()
+        response_obj = MagicMock()
+        response_obj.read.return_value = raw
+        response_obj.__enter__.return_value = response_obj
+        minio.get_object.return_value = response_obj
+        chroma_client = MagicMock()
+        chroma_client.get_or_create_collection = AsyncMock(return_value=AsyncMock())
+        manifest = AsyncMock()
+        manifest.get = AsyncMock(return_value=None)
+        env = IndexRequestEnvelope(
+            scan_id="scan-2",
+            key="episodic/papers/scan-2/signed.pdf",
+            collection="ai_research_papers",
+            user_id="alice",
+            trace_id="t",
+        )
+        settings = SimpleNamespace(
+            aws_bucket="", object_storage_backend="minio", minio_shared_bucket="b"
+        )
+        tracer = TracerProvider().get_tracer("test")
+        with (
+            patch("audittrace.dependencies.get_chromadb", return_value=chroma_client),
+            patch(
+                "audittrace.dependencies.get_memory_manifest_service",
+                return_value=manifest,
+            ),
+            patch("audittrace.routes.memory._get_minio_client", return_value=minio),
+            patch(
+                "audittrace.routes.memory.embed_via_nomic",
+                AsyncMock(side_effect=lambda t, **_: [[0.1, 0.2, 0.3] for _ in t]),
+            ),
+            patch(ASYNC_VALIDATE, autospec=True, side_effect=RuntimeError("boom")),
+            tracer.start_as_current_span("worker") as span,
+            caplog.at_level(logging.DEBUG),
+        ):
+            await default_indexer(env, settings)  # type: ignore[arg-type]
+            trace_hex = format(span.get_span_context().trace_id, "032x")
+        records = self._internal_error_records(caplog)
+        assert len(records) == 1
+        assert records[0].file == env.key
+        assert records[0].document_sha256 == hashlib.sha256(raw).hexdigest()
+        assert records[0].trace_id == trace_hex
 
 
 # ───────────────────────── AC2: the worker path ─────────────────────────
@@ -349,7 +443,7 @@ class TestAc5Grid:
                 return await real(*a, **k)
             raise RuntimeError("retry boom")
 
-        with patch(ASYNC_VALIDATE, side_effect=first_real_then_boom):
+        with patch(ASYNC_VALIDATE, autospec=True, side_effect=first_real_then_boom):
             status = await _status(signed, _wrong_ca_trust_file(tmp_path))
         assert len(calls) == 2  # the retry really ran
         assert status == ("check_error", 0)
@@ -361,8 +455,13 @@ class TestAc5Grid:
             assert await _status(signed, trust_file) == ("check_error", 0)
 
     async def test_retry_document_failure_stays_signed_untrusted(
-        self, signed: bytes, tmp_path: Any
+        self,
+        signed: bytes,
+        tmp_path: Any,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """Also (reviewer S2): the retry WARNING carries the join fields.
+        Neuter: drop the ``extra`` from the retry warning -> RED."""
         from pyhanko.sign.validation import async_validate_pdf_signature as real
         from pyhanko_certvalidator.errors import PathError
 
@@ -374,9 +473,25 @@ class TestAc5Grid:
                 return await real(*a, **k)
             raise PathError("no path at signing time")
 
-        with patch(ASYNC_VALIDATE, side_effect=first_real_then_path_error):
-            status = await _status(signed, _wrong_ca_trust_file(tmp_path))
+        with patch(
+            ASYNC_VALIDATE, autospec=True, side_effect=first_real_then_path_error
+        ):
+            with caplog.at_level(logging.DEBUG):
+                status = await _status(
+                    signed,
+                    _wrong_ca_trust_file(tmp_path),
+                    key="episodic/papers/r.pdf",
+                    document_sha256="cd" * 32,
+                )
         assert status == ("signed_untrusted", 1)
+        rec = next(
+            r
+            for r in caplog.records
+            if getattr(r, "reason", "") == "signature_retry_rejected"
+        )
+        assert rec.file == "episodic/papers/r.pdf"  # type: ignore[attr-defined]
+        assert rec.document_sha256 == "cd" * 32  # type: ignore[attr-defined]
+        assert hasattr(rec, "trace_id")
 
     @pytest.mark.parametrize("missing", ["intact", "valid", "trusted"])
     async def test_status_missing_an_attribute_is_check_error(
@@ -389,6 +504,23 @@ class TestAc5Grid:
         fake = SimpleNamespace(**attrs)
         with patch(ASYNC_VALIDATE, autospec=True, return_value=fake):
             assert await _status(signed, trust_file) == ("check_error", 0)
+
+    @pytest.mark.parametrize(
+        "exc", [RuntimeError("ctor"), ValueError("ctor")], ids=["runtime", "value"]
+    )
+    async def test_retry_context_construction_failure_is_check_error_for_any_type(
+        self, signed: bytes, tmp_path: Any, exc: Exception
+    ) -> None:
+        """Reviewer S1 (R27). The retry ``ValidationContext`` construction is
+        OUR configuration: ``check_error`` even for a ``ValueError``, which
+        is a document-failure type. Neuter: classify it by type
+        (``_fail``) -> the ``ValueError`` case reads ``check_failed`` -> RED."""
+        trust = _wrong_ca_trust_file(tmp_path)
+        sig._get_validation_context(trust)  # primary context built + cached
+        with patch("pyhanko_certvalidator.ValidationContext", autospec=True) as vc:
+            vc.side_effect = exc
+            status = await _status(signed, trust)
+        assert status == ("check_error", 0)
 
     async def test_retry_status_missing_trusted_is_check_error(
         self, signed: bytes, tmp_path: Any
@@ -406,7 +538,9 @@ class TestAc5Grid:
                 return await real(*a, **k)
             return SimpleNamespace(intact=True, valid=True)
 
-        with patch(ASYNC_VALIDATE, side_effect=first_real_then_shapeless):
+        with patch(
+            ASYNC_VALIDATE, autospec=True, side_effect=first_real_then_shapeless
+        ):
             status = await _status(signed, _wrong_ca_trust_file(tmp_path))
         assert len(calls) == 2
         assert status == ("check_error", 0)

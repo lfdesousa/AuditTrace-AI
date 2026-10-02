@@ -13,10 +13,15 @@ OWN affected rows and re-indexes them through the public API.
   (key, owner, created/modified ms) and NEVER touched: an ownership-preserving
   re-classify path for them is a separate follow-up, opened only if that count
   is above zero.
-* ``chunk_owner_before`` / ``chunk_owner_after`` are read around every real
-  re-index and must be equal; on a mismatch the script STOPS (exit 3). A row
-  whose chunk owner cannot be read is SKIPPED, not guessed, because the
-  invariant cannot be checked for it.
+* The CHUNK owner is checked BEFORE any write, fail closed. A row is SKIPPED
+  (reported, never re-indexed) when (a) a matching chunk has no owner
+  (missing / None / empty, e.g. legacy chunks), (b) any matching chunk owner
+  is not exactly the caller's ``sub``, (c) the file name matches chunks of
+  more than one owner or more than one document, or no chunk is visible at
+  all. After a real re-index the owner is read again; ``chunk_owner_before``
+  and ``chunk_owner_after`` must be equal or the script STOPS (exit 3). That
+  post-write equality check is the second line; the pre-write check is the
+  first.
 
 **Dry run first.** Without ``--apply`` the script only issues
 ``POST /memory/index?file=<key>&dry_run=true&details=true`` (no write) and
@@ -33,8 +38,9 @@ written. The caller's ``sub`` is read from the token's own payload.
 ``AUDITTRACE_FRONT_DOOR`` (``scripts.deploy.frontdoor``); nothing target-shaped
 is hardcoded here.
 
-Off-gate by design (operator tooling, not a served API): it lives in
-``scripts/`` and imports nothing from ``src/audittrace``.
+Operator tooling, not a served API: it lives in ``scripts/``, imports nothing
+from ``src/audittrace``, and IS under the per-file coverage gate (it is listed
+in the coverage ``source`` and in ``make test``).
 """
 
 from __future__ import annotations
@@ -200,15 +206,39 @@ def index_file_param(row: dict[str, Any], caller_sub: str, layer: str) -> str:
     return f"{layer}/{key}"
 
 
-def read_chunk_owner(client: Client, key: str) -> str | None:
-    """Who owns the document's chunks, via the public semantic list at chunk
+@dataclass(frozen=True)
+class ChunkScan:
+    """What the public semantic list shows for one document's chunks."""
+
+    owners: tuple[str | None, ...]  # distinct owners, sorted ("" < None-last)
+    document_ids: frozenset[str]  # distinct document hashes, when exposed
+
+    @property
+    def owner_text(self) -> str:
+        return ",".join("<none>" if o is None else o for o in self.owners)
+
+    def skip_reason(self, caller_sub: str) -> str | None:
+        """Why the row must NOT be re-indexed, or ``None`` if it may be."""
+        if any(o is None or o == "" for o in self.owners):
+            return "chunk_owner_missing"
+        if len(self.owners) > 1:
+            return "title_matches_multiple_owners"
+        if len(self.document_ids) > 1:
+            return "title_matches_multiple_documents"
+        if self.owners != (caller_sub,):
+            return "chunk_owner_not_caller"
+        return None
+
+
+def scan_chunks(client: Client, key: str) -> ChunkScan | None:
+    """Scan the document's chunks via the public semantic list at chunk
     granularity (``created_by_user_id`` is the chunk's ``user_id`` metadata).
 
-    Returns the sorted, comma-joined distinct owners of the chunk rows whose
-    title is the document's file name, or ``None`` when no chunk row is
-    visible (the invariant cannot be checked for that row)."""
+    Matches chunk rows whose title is the file name. Returns ``None`` when no
+    chunk row is visible or the read fails (the invariant cannot be checked)."""
     filename = key.rsplit("/", 1)[-1]
-    owners: set[str] = set()
+    owners: set[str | None] = set()
+    docs: set[str] = set()
     found = False
     offset = 0
     while True:
@@ -228,12 +258,26 @@ def read_chunk_owner(client: Client, key: str) -> str | None:
         for item in page:
             if item.get("title") == filename:
                 found = True
-                owners.add(str(item.get("created_by_user_id")))
+                owner = item.get("created_by_user_id")
+                owners.add(owner if isinstance(owner, str) and owner else None)
+                sha = item.get("document_sha256")
+                if isinstance(sha, str) and sha:
+                    docs.add(sha)
         offset += len(page)
         total = body.get("total")
         if not page or not isinstance(total, int) or offset >= total:
             break
-    return ",".join(sorted(owners)) if found else None
+    if not found:
+        return None
+    ordered = tuple(sorted(owners, key=lambda o: (o is None, o or "")))
+    return ChunkScan(owners=ordered, document_ids=frozenset(docs))
+
+
+def read_chunk_owner(client: Client, key: str) -> str | None:
+    """Joined distinct chunk owners (``<none>`` for a missing owner), or
+    ``None`` when no chunk is visible."""
+    scan = scan_chunks(client, key)
+    return None if scan is None else scan.owner_text
 
 
 # ───────────────────────────────── the run ─────────────────────────────────
@@ -266,10 +310,10 @@ def run_backfill(
     apply: bool = False,
     sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
-    owner_reader: Callable[[Client, str], str | None] | None = None,
+    scanner: Callable[[Client, str], ChunkScan | None] | None = None,
 ) -> BackfillReport:
     """Select, dry-run and (with ``apply``) re-classify the caller's own rows."""
-    read_owner = owner_reader or read_chunk_owner
+    scan = scanner or scan_chunks
     report = BackfillReport(caller_sub=caller_sub, applied=apply)
     candidates: list[tuple[TableRow, str]] = []
     for layer in layers:
@@ -299,15 +343,20 @@ def run_backfill(
     # Phase 1: dry run for every caller-owned row.
     runnable: list[tuple[TableRow, str]] = []
     for table_row, file_param in candidates:
-        before = read_owner(client, table_row.key)
-        table_row.chunk_owner_before = before
+        before = scan(client, table_row.key)
+        table_row.chunk_owner_before = None if before is None else before.owner_text
         status, new_status, trace_id = _post_index(client, file_param, dry_run=True)
         table_row.new_status, table_row.trace_id = new_status, trace_id
         report.rows.append(table_row)
+        skip = (
+            "chunk_owner_unreadable"
+            if before is None
+            else before.skip_reason(caller_sub)
+        )
         if status != 200:
             table_row.outcome = f"failed:dry_run_http_{status}"
-        elif before is None:
-            table_row.outcome = "skipped:chunk_owner_unreadable"
+        elif skip is not None:
+            table_row.outcome = f"skipped:{skip}"
         else:
             table_row.outcome = "dry_run_ok"
             runnable.append((table_row, file_param))
@@ -324,7 +373,8 @@ def run_backfill(
             table_row.outcome = f"failed:index_http_{status}"
             continue
         table_row.new_status = new_status
-        table_row.chunk_owner_after = read_owner(client, table_row.key)
+        after = scan(client, table_row.key)
+        table_row.chunk_owner_after = None if after is None else after.owner_text
         if table_row.chunk_owner_after != table_row.chunk_owner_before:
             table_row.outcome = "failed:chunk_owner_changed"
             raise OwnerMismatchError(

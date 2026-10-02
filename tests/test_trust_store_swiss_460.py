@@ -292,39 +292,82 @@ class TestAc6CallShape:
 
     def test_every_pyhanko_patch_in_tests_uses_autospec(self) -> None:
         """A mock without autospec accepts any call shape, which is how
-        #366's drift reached main. Every string-target ``patch`` of a
-        pyhanko symbol in ``tests/`` must pass ``autospec=True`` unless it
+        #366's drift reached main. Every ``patch`` of a pyhanko symbol in
+        ``tests/`` (this file included) must pass ``autospec=True`` unless it
         replaces the target with an explicit object (positional ``new``).
-        Neuter: remove ``autospec=True`` from any such patch -> RED."""
+        Targets are string literals OR module-level constants holding one.
+        Neuter: remove ``autospec=True`` from any such patch, including a
+        constant-target one -> RED."""
         offenders: list[str] = []
         for path in sorted(Path(__file__).parent.rglob("*.py")):
-            if path.name == Path(__file__).name:
-                continue
-            tree = ast.parse(path.read_text())
-            for node in ast.walk(tree):
-                if not (isinstance(node, ast.Call) and node.args):
-                    continue
-                func = node.func
-                name = (
-                    func.attr
-                    if isinstance(func, ast.Attribute)
-                    else getattr(func, "id", "")
-                )
-                target = node.args[0]
-                if name != "patch" or not (
-                    isinstance(target, ast.Constant)
-                    and isinstance(target.value, str)
-                    and target.value.startswith(("pyhanko.", "pyhanko_certvalidator."))
-                ):
-                    continue
-                if len(node.args) >= 2:  # explicit replacement object
-                    continue
-                autospec = next(
-                    (k.value for k in node.keywords if k.arg == "autospec"), None
-                )
-                if not (isinstance(autospec, ast.Constant) and autospec.value is True):
-                    offenders.append(f"{path.name}:{node.lineno} {target.value}")
+            offenders += find_unspecced_pyhanko_patches(path.read_text(), path.name)
         assert offenders == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'import x\ndef t():\n    x.patch("pyhanko.a.b")\n',
+            'T = "pyhanko.a.b"\ndef t():\n    patch(T, side_effect=E)\n',
+            'T = "pyhanko_certvalidator.a"\ndef t():\n    patch(T, autospec=False)\n',
+        ],
+        ids=["literal", "constant-name", "autospec-false"],
+    )
+    def test_the_autospec_scanner_flags_unspecced_literal_and_constant_targets(
+        self, source: str
+    ) -> None:
+        assert find_unspecced_pyhanko_patches(source, "t.py")
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'T = "pyhanko.a"\ndef t():\n    patch(T, autospec=True)\n',
+            'T = "pyhanko.a"\ndef t():\n    patch(T, replacement)\n',
+            'T = "other.mod"\ndef t():\n    patch(T)\n',
+            "def t(n):\n    patch(n)\n",
+        ],
+        ids=["autospec", "explicit-object", "non-pyhanko", "unresolvable-name"],
+    )
+    def test_the_autospec_scanner_accepts_specced_or_unrelated_patches(
+        self, source: str
+    ) -> None:
+        assert find_unspecced_pyhanko_patches(source, "t.py") == []
+
+
+def find_unspecced_pyhanko_patches(source: str, filename: str) -> list[str]:
+    tree = ast.parse(source)
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        first = node.args[0]
+        target = (
+            first.value
+            if isinstance(first, ast.Constant)
+            else constants.get(first.id)
+            if isinstance(first, ast.Name)
+            else None
+        )
+        if name != "patch" or not isinstance(target, str):
+            continue
+        if not target.startswith(("pyhanko.", "pyhanko_certvalidator.")):
+            continue
+        if len(node.args) >= 2:  # explicit replacement object
+            continue
+        autospec = next((k.value for k in node.keywords if k.arg == "autospec"), None)
+        if not (isinstance(autospec, ast.Constant) and autospec.value is True):
+            out.append(f"{filename}:{node.lineno} {target}")
+    return out
 
 
 # ───────────────────────── AC7: the failure split ─────────────────────────

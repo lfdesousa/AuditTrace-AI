@@ -472,6 +472,9 @@ async def _classify_pdf_signatures(
                     "as-of-signing-time retry rejected: %s; "
                     "classifying as signed_untrusted",
                     retry_exc,
+                    extra=_log_context(
+                        key, document_sha256, "signature_retry_rejected", retry_exc
+                    ),
                 )
                 any_untrusted = True
                 continue

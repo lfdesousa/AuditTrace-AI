@@ -410,3 +410,104 @@ class TestMain:
         text = bf.format_report(bf.BackfillReport(caller_sub=ME, applied=False))
         assert "caller-owned check_failed rows: 0" in text
         assert "other-owner rows:" not in text
+
+
+class TestPreWriteOwnerGuards:
+    """Reviewer B3: the chunk owner is checked BEFORE any write.
+
+    Individual neuters (each makes only its own test RED):
+    * (a) drop the missing/None/empty-owner check   -> test_a_*
+    * (b) drop the owner == caller check            -> test_b_*
+    * (c) drop the multiple-owner check             -> test_c_multiple_owners
+    * (c) drop the multiple-document check          -> test_c_multiple_documents
+    """
+
+    @staticmethod
+    def _one_row(front: FakeFront, chunks: list[dict[str, Any]]) -> None:
+        front.layers["episodic"] = [_row("episodic/legacy.pdf", ME)]
+        front.chunks = chunks
+
+    def _assert_no_write(
+        self, front: FakeFront, client: bf.Client, outcome: str
+    ) -> None:
+        report = _run(client, apply=True, layers=("episodic",))
+        assert report.rows[0].outcome == f"skipped:{outcome}"
+        assert not [p for p in front.posts if "dry_run" not in p]
+
+    @pytest.mark.parametrize("owner", [None, ""])
+    def test_a_missing_chunk_owner_skips_without_a_write(
+        self, front: FakeFront, client: bf.Client, owner: Any
+    ) -> None:
+        self._one_row(front, [{"title": "legacy.pdf", "created_by_user_id": owner}])
+        self._assert_no_write(front, client, "chunk_owner_missing")
+
+    def test_a_absent_owner_key_skips_without_a_write(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(front, [{"title": "legacy.pdf"}])
+        self._assert_no_write(front, client, "chunk_owner_missing")
+
+    def test_b_chunks_owned_by_someone_else_skip_without_a_write(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(front, [{"title": "legacy.pdf", "created_by_user_id": OTHER}])
+        self._assert_no_write(front, client, "chunk_owner_not_caller")
+
+    def test_c_multiple_owners_skip_without_a_write(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(
+            front,
+            [
+                {"title": "legacy.pdf", "created_by_user_id": ME},
+                {"title": "legacy.pdf", "created_by_user_id": OTHER},
+            ],
+        )
+        self._assert_no_write(front, client, "title_matches_multiple_owners")
+
+    def test_c_multiple_documents_skip_without_a_write(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(
+            front,
+            [
+                {
+                    "title": "legacy.pdf",
+                    "created_by_user_id": ME,
+                    "document_sha256": "a",
+                },
+                {
+                    "title": "legacy.pdf",
+                    "created_by_user_id": ME,
+                    "document_sha256": "b",
+                },
+            ],
+        )
+        self._assert_no_write(front, client, "title_matches_multiple_documents")
+
+    def test_caller_owned_chunks_of_one_document_pass(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(
+            front,
+            [
+                {
+                    "title": "legacy.pdf",
+                    "created_by_user_id": ME,
+                    "document_sha256": "a",
+                },
+                {
+                    "title": "legacy.pdf",
+                    "created_by_user_id": ME,
+                    "document_sha256": "a",
+                },
+            ],
+        )
+        report = _run(client, apply=True, layers=("episodic",))
+        assert report.rows[0].outcome == "applied"
+
+    def test_missing_owner_is_not_conflated_with_the_string_none(
+        self, front: FakeFront, client: bf.Client
+    ) -> None:
+        self._one_row(front, [{"title": "legacy.pdf", "created_by_user_id": None}])
+        assert bf.read_chunk_owner(client, "episodic/legacy.pdf") == "<none>"
