@@ -670,6 +670,7 @@ class TestSwissTslTrustStoreBuilder:
             patch("aiohttp.ClientSession", return_value=_FakeSession()),
             patch(
                 "pyhanko.sign.validation.qualified.eutl_parse._validate_and_extract_tl_data_multiple_certs",
+                autospec=True,
                 side_effect=ValueError("XAdES verification failed"),
             ),
         ):
@@ -761,9 +762,13 @@ class TestSwissTslTrustStoreBuilder:
             patch("aiohttp.ClientSession", return_value=_FakeSession()),
             # Skip the XAdES verification — we're testing the
             # Swiss-namespace-aware walker, not the signature path.
+            # pyhanko returns the VERIFIED XML, which is what the builder
+            # extracts from (spec #460 B1); autospec so the call shape is
+            # checked against the real signature.
             patch(
                 "pyhanko.sign.validation.qualified.eutl_parse._validate_and_extract_tl_data_multiple_certs",
-                return_value=None,
+                autospec=True,
+                return_value=synth_xml,
             ),
         ):
             bundle = asyncio.run(builder.build())

@@ -74,6 +74,12 @@ class TrustStoreMetadata:
     built_at: datetime
     cert_count: int
     source_url: str
+    # Spec #460 (A4): the builders that ACTUALLY contributed, in order, and
+    # the ones that failed (``{"builder_id", "reason"}``). ``None`` means
+    # "unknown" (a sidecar written before these fields existed); it is never
+    # inferred from ``builder_id``, which lists the CONFIGURED builders.
+    contributing_builders: list[str] | None = None
+    failed_builders: list[dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise for JSON responses + persistence side-channels."""
@@ -83,7 +89,22 @@ class TrustStoreMetadata:
             "built_at": self.built_at.isoformat(),
             "cert_count": self.cert_count,
             "source_url": self.source_url,
+            "contributing_builders": self.contributing_builders,
+            "failed_builders": self.failed_builders,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TrustStoreMetadata:
+        """Rebuild from a persisted sidecar; tolerates the pre-#460 shape."""
+        return cls(
+            sha256=data["sha256"],
+            builder_id=data["builder_id"],
+            built_at=datetime.fromisoformat(data["built_at"]),
+            cert_count=data["cert_count"],
+            source_url=data["source_url"],
+            contributing_builders=data.get("contributing_builders"),
+            failed_builders=data.get("failed_builders"),
+        )
 
 
 @dataclass(frozen=True)
@@ -105,6 +126,19 @@ class TrustStoreBuilderUnavailableError(RuntimeError):
     (e.g. ``EuLotlTrustStoreBuilder`` invoked in an image that omitted
     the ``pyhanko[etsi]`` extra). Surfaced as a 503 from the admin
     endpoint, not a startup crash."""
+
+
+class TrustStoreBuilderInternalError(RuntimeError):
+    """A Builder's own code failed (a call-shape drift against a library, a
+    non-conforming verified payload), as opposed to the upstream list being
+    unreachable or its signature being bad.
+
+    Deliberately NOT a :class:`TrustStoreBuilderUnavailableError`: the
+    composite catches only ``Unavailable`` as a best-effort inner failure, so
+    this propagates, the refresh fails closed and the previously stored
+    bundle is kept (operator decision, spec #460 A3). The message never
+    blames certificates or tampering.
+    """
 
 
 # ───────────────────────────── ABCs ─────────────────────────────────────
@@ -177,6 +211,8 @@ def _bundle_from_pem(
     builder_id: str,
     source_url: str,
     cert_count: int,
+    contributing_builders: list[str] | None = None,
+    failed_builders: list[dict[str, str]] | None = None,
 ) -> TrustStoreBundle:
     """Construct a :class:`TrustStoreBundle` from raw PEM bytes,
     computing the sha256 + capture timestamp.
@@ -192,6 +228,10 @@ def _bundle_from_pem(
         built_at=datetime.now(UTC),
         cert_count=cert_count,
         source_url=source_url,
+        contributing_builders=(
+            [builder_id] if contributing_builders is None else contributing_builders
+        ),
+        failed_builders=[] if failed_builders is None else failed_builders,
     )
     return TrustStoreBundle(pem_bytes=pem_bytes, metadata=metadata)
 
@@ -268,13 +308,7 @@ class S3TrustStoreProvider(TrustStoreProvider):
         import json
 
         meta_dict = json.loads(metadata_json)
-        metadata = TrustStoreMetadata(
-            sha256=meta_dict["sha256"],
-            builder_id=meta_dict["builder_id"],
-            built_at=datetime.fromisoformat(meta_dict["built_at"]),
-            cert_count=meta_dict["cert_count"],
-            source_url=meta_dict["source_url"],
-        )
+        metadata = TrustStoreMetadata.from_dict(meta_dict)
         return TrustStoreBundle(pem_bytes=pem_bytes, metadata=metadata)
 
     @log_call(logger=logger)
@@ -313,13 +347,7 @@ class S3TrustStoreProvider(TrustStoreProvider):
         import json
 
         meta_dict = json.loads(metadata_json)
-        return TrustStoreMetadata(
-            sha256=meta_dict["sha256"],
-            builder_id=meta_dict["builder_id"],
-            built_at=datetime.fromisoformat(meta_dict["built_at"]),
-            cert_count=meta_dict["cert_count"],
-            source_url=meta_dict["source_url"],
-        )
+        return TrustStoreMetadata.from_dict(meta_dict)
 
 
 class MockTrustStoreProvider(TrustStoreProvider):
@@ -592,22 +620,37 @@ class SwissTslTrustStoreBuilder(TrustStoreBuilder):
         # Two-phase processing (caught live 2026-05-09):
         # (1) verify the XAdES signature on the TSL using pyhanko's
         #     internal helper — this raises if the TSL was tampered
-        #     with or signed by an unknown TSLO.
-        # (2) walk the verified XML directly with lxml to extract
-        #     the X.509 certs from QC services. We can't use
-        #     ``trust_list_to_registry`` here because Switzerland
+        #     with or signed by an unknown TSLO. It RETURNS the signed
+        #     element (the C14N of what signxml actually verified).
+        # (2) walk ONLY that verified XML with lxml to extract the
+        #     X.509 certs from QC services. ``tl_xml`` (the network
+        #     bytes) is never parsed for certs: an XML-signature-wrapping
+        #     attacker can inject unsigned ``TSPService`` nodes outside
+        #     the signed element and keep the signature valid (measured,
+        #     pyhanko 0.37.0 / signxml 5.1.0, ``URI="#Id"`` references).
+        #     We can't use ``trust_list_to_registry`` because Switzerland
         #     uses its own URI namespace for service-type identifiers
         #     (``https://uri.tsl-switzerland.ch/TrstSvc/Svctype/CA/QC``)
         #     while pyhanko's parser only recognises ETSI's URI
-        #     (``http://uri.etsi.org/TrstSvc/Svctype/CA/QC``). Both
-        #     URIs identify the same ETSI TS 119 612 concept — a
-        #     qualified-signature CA — but pyhanko's hard-coded URI
-        #     check drops every Swiss CA on the floor. Verified live
+        #     (``http://uri.etsi.org/TrstSvc/Svctype/CA/QC``). Verified live
         #     2026-05-09: 36 services in the Swiss TSL, 0 CAs parsed
-        #     by pyhanko under the unmodified path; this two-phase
-        #     approach extracts them correctly.
+        #     by pyhanko under the unmodified path.
+        #
+        # ``validation_time=None`` means "verify at the current time":
+        # pyhanko passes it as ``verification_time`` to
+        # ``XAdESSignatureConfiguration`` (eutl_parse.py ``_verify_xml``)
+        # and ``trust_list_to_registry`` itself passes ``None``.
         try:
-            _validate_and_extract_tl_data_multiple_certs(tl_xml, [tslo_cert])
+            verified_xml = _validate_and_extract_tl_data_multiple_certs(
+                tl_xml, [tslo_cert], None
+            )
+        except (TypeError, AttributeError) as exc:
+            # A call-shape drift against pyhanko (what #366 was): our
+            # code, not the list. Fails the refresh closed.
+            raise TrustStoreBuilderInternalError(
+                f"SwissTslTrustStoreBuilder: internal error calling pyhanko "
+                f"TSL verification (call-shape drift): {exc!r}"
+            ) from exc
         except Exception as exc:
             raise TrustStoreBuilderUnavailableError(
                 f"SwissTslTrustStoreBuilder: TSL signature validation "
@@ -615,8 +658,16 @@ class SwissTslTrustStoreBuilder(TrustStoreBuilder):
                 f"tampered in transit): {exc!r}"
             ) from exc
 
+        if not isinstance(verified_xml, (str, bytes)) or not verified_xml:
+            raise TrustStoreBuilderInternalError(
+                f"SwissTslTrustStoreBuilder: pyhanko returned a "
+                f"non-conforming verified payload "
+                f"({type(verified_xml).__name__}); refusing to extract "
+                f"trust anchors."
+            )
+
         try:
-            der_certs = _extract_qc_certs_from_swiss_tsl(tl_xml)
+            der_certs = _extract_qc_certs_from_swiss_tsl(verified_xml)
         except Exception as exc:
             raise TrustStoreBuilderUnavailableError(
                 f"SwissTslTrustStoreBuilder: Swiss TSL XML walk failed: {exc!r}"
@@ -650,6 +701,12 @@ class CompositeTrustStoreBuilder(TrustStoreBuilder):
     "best-effort, audit-clear" posture (the operator can read the
     cert_count + builder_id chain and notice a missing layer).
     Composite raises only if EVERY inner builder fails.
+
+    A :class:`TrustStoreBuilderInternalError` (a builder's own code is
+    broken) is NOT caught here: it propagates so the refresh fails closed
+    and the stored bundle is kept (spec #460 A3). The bundle's metadata
+    records ``contributing_builders`` / ``failed_builders`` from what
+    actually happened, not from the configured list.
     """
 
     builder_id_const = "composite"
@@ -684,7 +741,7 @@ class CompositeTrustStoreBuilder(TrustStoreBuilder):
                 )
                 failures.append((inner_builder.builder_id, exc))
                 continue
-            successes.append(f"{inner_builder.builder_id}={bundle.metadata.cert_count}")
+            successes.append(inner_builder.builder_id)
             chunks.append(bundle.pem_bytes)
         if not chunks:
             # All inner builders failed — propagate the first error
@@ -714,6 +771,11 @@ class CompositeTrustStoreBuilder(TrustStoreBuilder):
             builder_id=self.builder_id,
             source_url=", ".join(b.builder_id for b in self._inner),
             cert_count=_count_pem_certs(pem_bytes),
+            # ACTUAL contributors, never the configured list (F8).
+            contributing_builders=successes,
+            failed_builders=[
+                {"builder_id": b, "reason": str(e)[:500]} for b, e in failures
+            ],
         )
 
 
@@ -726,7 +788,7 @@ class CompositeTrustStoreBuilder(TrustStoreBuilder):
 _SVCTYPE_QC_SUFFIX = "/TrstSvc/Svctype/CA/QC"
 
 
-def _extract_qc_certs_from_swiss_tsl(tl_xml: str) -> list[bytes]:
+def _extract_qc_certs_from_swiss_tsl(tl_xml: str | bytes) -> list[bytes]:
     """Walk a ETSI TS 119 612 trusted list XML and return the DER
     bytes of every X.509 cert attached to a qualified-signature CA
     service. URI-suffix-matched on ``/TrstSvc/Svctype/CA/QC`` so the
@@ -734,7 +796,9 @@ def _extract_qc_certs_from_swiss_tsl(tl_xml: str) -> list[bytes]:
     ETSI namespace (``http://uri.etsi.org/...``) both resolve to QC.
 
     Caller is responsible for verifying the TSL's XAdES signature
-    BEFORE invoking this — this function trusts the input bytes.
+    BEFORE invoking this, and MUST pass the XML pyhanko RETURNED from that
+    verification (the signed element), never the raw network payload: this
+    function trusts its input (spec #460 B1, XML-signature-wrapping).
     """
     import base64
 
@@ -743,7 +807,8 @@ def _extract_qc_certs_from_swiss_tsl(tl_xml: str) -> list[bytes]:
     # Parse without resolving entities (defence in depth — tl_xml
     # came from the network).
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
-    root = etree.fromstring(tl_xml.encode("utf-8"), parser=parser)
+    payload = tl_xml.encode("utf-8") if isinstance(tl_xml, str) else tl_xml
+    root = etree.fromstring(payload, parser=parser)
 
     # ETSI TS 119 612 namespace.
     ns = {"tsl": "http://uri.etsi.org/02231/v2#"}
