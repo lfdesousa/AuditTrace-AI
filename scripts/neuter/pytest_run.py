@@ -357,11 +357,11 @@ class PytestRunResult:
     #: trust ``foreign_pg_container`` from an unproven watch.
     #:
     #: Review round 7 (O-1a, orchestrator-confirmed blocker): this field
-    #: used to default to ``True`` -- the orchestrator found that dropping
-    #: the explicit pass at the ``collect_only=True`` construction site
-    #: (below, in this function) left all 120 targeted tests GREEN,
-    #: because a dataclass default silently filled the gap (the SAME drop
-    #: at the full-run construction site, further below, was already
+    #: used to default to ``True`` -- review 6 measured that dropping the
+    #: explicit pass at the ``collect_only=True`` construction site (in
+    #: ``run_pytest()`` below) left all 120 targeted tests GREEN, because a
+    #: dataclass default silently filled the gap (the SAME drop at the
+    #: full-run construction site, also in ``run_pytest()``, was already
     #: caught). Deliberately REQUIRED (no default, on EITHER site) so a
     #: missing explicit value is a ``TypeError`` at construction time, not
     #: a silent, fail-open ``True``. Line numbers deliberately omitted
