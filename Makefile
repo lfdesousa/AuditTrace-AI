@@ -76,10 +76,15 @@ format: ## Run code formatting
 	@.venv/bin/ruff format src/ tests/
 	@echo "✅ Code formatted"
 
-typecheck: ## Run type checking
-	@echo "🔎 Running type checker..."
-	@.venv/bin/mypy src/
-	@echo "✅ Type checking passed"
+typecheck: ## Run type checking (resolves mypy as .venv/bin/mypy, else mypy on PATH, as CI has no .venv; fails closed if neither exists)
+	@MYPY="$$( [ -x .venv/bin/mypy ] && echo .venv/bin/mypy || command -v mypy || true )"; \
+	if [ -z "$$MYPY" ]; then \
+	  echo "❌ mypy not found (looked for .venv/bin/mypy and mypy on PATH)."; \
+	  echo "   Install the dev deps: pip install -e '.[dev]'"; \
+	  exit 1; \
+	fi; \
+	echo "🔎 Running type checker via $$MYPY ..."; \
+	"$$MYPY" src/ && echo "✅ Type checking passed"
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
