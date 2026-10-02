@@ -351,6 +351,33 @@ def test_uncollected_test_id(tmp_path, repo):
     assert excinfo.value.reason == "uncollected"
 
 
+def test_collect_refuses_on_chokepoint_marker_missing(tmp_path, repo, monkeypatch):
+    """Review round 5 should-fix: the marker check (round 4, requirement
+    E2) was only ever consumed at the neuter and arbitrate phases --
+    collect's own --collect-only invocation could silently run with
+    neuter_pathcheck disabled and this phase would never notice. Fails
+    closed the same way every other SpecLoadError does (exit 3)."""
+    from scripts.neuter.spec import _collect_ids
+
+    class _FakeResult:
+        collect_stdout = "test_mod.py::test_f\n"
+        chokepoint_marker_ok = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.spec.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        _collect_ids(
+            repo,
+            "sha",
+            ["test_mod.py"],
+            PYTHON,
+            lock_path=tmp_path / "collect.lock",
+            already_locked=False,
+        )
+    assert excinfo.value.reason == "chokepoint_marker_missing"
+
+
 def test_collected_ids_can_be_supplied_directly(tmp_path, repo):
     spec_path = _write(tmp_path, _valid_spec(repo))
     spec = load_neuter_spec(

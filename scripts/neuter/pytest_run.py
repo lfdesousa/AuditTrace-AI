@@ -74,7 +74,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -248,6 +247,20 @@ def _continuous_foreign_container_watch():
         proc = None
 
     stop = threading.Event()
+    # Review round 5 should-fix: a FIXED `time.sleep()` attach-window was
+    # load-sensitive -- under box contention, `docker events` can take
+    # LONGER than any fixed sleep to actually subscribe, so a container
+    # started immediately after entering the `with` block could still race
+    # the watcher and be missed (measured: 1/9 runs under concurrent load).
+    # `docker events` itself has no "subscribed" handshake visible on
+    # stdout, so this now proves attachment with a REAL readiness signal:
+    # a trivial, near-instant throwaway container whose OWN start event
+    # the watcher thread must observe before this function returns control
+    # -- `attached` below is set ONLY by that specific probe match, never
+    # by `seen` (a genuine product-prefixed container), so the two can
+    # never be confused.
+    attached = threading.Event()
+    probe_name = f"neuter-watch-probe-{uuid.uuid4().hex[:8]}"
 
     def _watch() -> None:
         if proc is None or proc.stdout is None:
@@ -256,16 +269,39 @@ def _continuous_foreign_container_watch():
             if stop.is_set():
                 break
             name = line.strip()
-            if any(name.startswith(p) for p in _PRODUCT_PG_CONTAINER_PREFIXES):
+            if name == probe_name:
+                attached.set()
+            elif any(name.startswith(p) for p in _PRODUCT_PG_CONTAINER_PREFIXES):
                 seen.set()
 
     thread = threading.Thread(target=_watch, daemon=True)
     thread.start()
-    # docker events needs a brief moment to actually attach to the event
-    # stream before it will see anything -- without this, a container
-    # started immediately after entering the `with` block can race the
-    # watcher's own startup and be missed.
-    time.sleep(0.15)
+    if proc is not None:
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    probe_name,
+                    "busybox",
+                    "true",
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+            # Bounded wait for PROOF the stream is live, never a blind
+            # guess -- falls through (fail-open) if docker is slow/absent,
+            # same posture as the rest of this function.
+            attached.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            subprocess.run(
+                ["docker", "rm", "-f", probe_name], capture_output=True, timeout=10
+            )
     try:
         yield lambda: seen.is_set()
     finally:

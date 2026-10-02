@@ -1233,6 +1233,7 @@ def test_run_baseline_refuses_on_foreign_pg_container(tmp_path, monkeypatch):
         exit_code = 0
         timed_out = False
         foreign_pg_container = True
+        chokepoint_marker_ok = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1249,6 +1250,37 @@ def test_run_baseline_refuses_on_foreign_pg_container(tmp_path, monkeypatch):
     )
     assert ok is False
     assert "foreign" in detail
+
+
+def test_run_baseline_refuses_on_chokepoint_marker_missing(tmp_path, monkeypatch):
+    """Review round 5 should-fix: the marker check (round 4, requirement
+    E2) was only ever consumed at the neuter and arbitrate phases --
+    baseline's own pytest invocation could silently run with
+    neuter_pathcheck disabled and this phase would never notice."""
+    repo = _init_repo(tmp_path)
+    spec = _baseline_spec(repo)
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    ok, detail = run_baseline(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="baseline-no-marker",
+        python=PYTHON,
+        timeout_s=30,
+        lock_path=tmp_path / "baseline.lock",
+    )
+    assert ok is False
+    assert "chokepoint marker" in detail
 
 
 def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
@@ -1268,6 +1300,7 @@ def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
         exit_code = 0
         timed_out = False
         foreign_pg_container = False
+        chokepoint_marker_ok = True
 
     def fake_run_pytest(*, junit_path, **kwargs):
         # write a junit file where NEITHER mapped test failed.
@@ -1317,6 +1350,7 @@ def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
         exit_code = 0
         timed_out = False
         foreign_pg_container = True
+        chokepoint_marker_ok = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1334,6 +1368,41 @@ def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
         lock_path=tmp_path / "drift.lock",
     )
     assert rows["w1"].get("drift_foreign_pg_container") is True
+    assert "unmapped_red" not in rows["w1"]
+
+
+def test_sample_full_scope_drift_chokepoint_marker_missing(tmp_path, monkeypatch):
+    """Review round 5 should-fix: drift's own full-scope pytest invocation
+    could silently run with neuter_pathcheck disabled and this phase would
+    never notice -- same class of gap as neuter/arbitrate already closed
+    in round 4."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    rows = {"w1": {"verdict": "RED"}, "w2": {"verdict": "RED"}}
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    sample_full_scope_drift(
+        spec,
+        rows,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="drift-marker",
+        python=PYTHON,
+        timeout_s=30,
+        sample=1.0,
+        lock_path=tmp_path / "drift.lock",
+    )
+    assert rows["w1"].get("drift_chokepoint_marker_missing") is True
+    assert rows["w1"]["verdict"] == "ERROR"
     assert "unmapped_red" not in rows["w1"]
 
 
@@ -1367,6 +1436,7 @@ def test_sample_full_scope_drift_is_seeded_from_run_id(tmp_path, monkeypatch):
         exit_code = 0
         timed_out = False
         foreign_pg_container = False
+        chokepoint_marker_ok = True
 
     def fake_run_pytest(*, junit_path, **kwargs):
         junit_path.parent.mkdir(parents=True, exist_ok=True)

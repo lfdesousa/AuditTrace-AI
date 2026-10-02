@@ -504,6 +504,13 @@ def run_baseline(
             pg_handle=pg_handle,
             already_locked=True,
         )
+        if not pytest_result.chokepoint_marker_ok:
+            # Review round 5 should-fix: the marker check (round 4,
+            # requirement E2) was only ever consumed at the neuter and
+            # arbitrate phases -- baseline's own pytest invocation could
+            # silently run with the plugin disabled (e.g. a stray
+            # `-p no:neuter_pathcheck`) and this phase would never notice.
+            return False, "chokepoint marker missing -- neuter_pathcheck did not run"
         if pytest_result.foreign_pg_container:
             return False, "a foreign, durable product Postgres container was observed"
         if pytest_result.timed_out:
@@ -662,6 +669,13 @@ def sample_full_scope_drift(
                 break  # this worktree is no longer trustworthy for the rest of the sample
             if drift_result.foreign_pg_container:
                 _mark_drift_unresolved(row, "foreign_pg_container")
+                continue
+            if not drift_result.chokepoint_marker_ok:
+                # Review round 5 should-fix: drift's own full-scope pytest
+                # invocation could silently run with neuter_pathcheck
+                # disabled and this phase would never notice -- same class
+                # of gap as neuter/arbitrate already closed in round 4.
+                _mark_drift_unresolved(row, "chokepoint_marker_missing")
                 continue
             full = parse_junit_full(junit_path if junit_path.exists() else None)
             if row.get("verdict") == "RED" and not mapped_failed_in_full(

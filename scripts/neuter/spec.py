@@ -170,6 +170,16 @@ def _collect_ids(
                 pass
         if fake_dir_tmp is not None:
             shutil.rmtree(fake_dir_tmp, ignore_errors=True)
+    if not result.chokepoint_marker_ok:
+        # Review round 5 should-fix: the marker check (round 4, requirement
+        # E2) was only ever consumed at the neuter and arbitrate phases --
+        # collect's own --collect-only invocation could silently run with
+        # neuter_pathcheck disabled and this phase would never notice.
+        # Fails closed the same way every other SpecLoadError does (exit 3).
+        raise SpecLoadError(
+            "chokepoint_marker_missing",
+            "neuter_pathcheck did not run during --collect-only",
+        )
     stdout = result.collect_stdout or ""
     ids = {line.strip() for line in stdout.splitlines() if "::" in line}
     return ids

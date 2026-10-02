@@ -31,7 +31,12 @@ EXIT_NONDURABLE_SETTINGS = 6
 #: uncaught traceback from `subprocess.run(..., check=True)` -- fails
 #: closed either way (the pool never silently proceeds), but with no
 #: typed, documented exit code a caller/CI step can branch on.
-EXIT_DOCKER_UNAVAILABLE = 14
+#: Review round 5 should-fix: this collided with
+#: `pool.EXIT_DRIFT_UNACKNOWLEDGED` (also 14) -- every exit code this
+#: package defines must be pairwise distinct (see
+#: tests/test_neuter_exit_codes_distinct.py), so a caller can always tell
+#: the two apart. Moved to 15, the next free value.
+EXIT_DOCKER_UNAVAILABLE = 15
 
 
 class DockerUnavailableError(Exception):
