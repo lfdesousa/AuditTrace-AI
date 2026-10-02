@@ -996,7 +996,7 @@ def test_mock_engine_worker_gets_dsn_when_a_real_pg_handle_exists(
     monkeypatch.setattr("scripts.neuter.pytest_run.subprocess.run", fake_run)
     monkeypatch.setattr(
         "scripts.neuter.pytest_run._continuous_foreign_container_watch",
-        lambda: contextlib.nullcontext(lambda: False),
+        lambda: contextlib.nullcontext((lambda: False, True)),
     )
     real_shaped_handle = PgHandle(
         name="w1", dsn="postgresql+psycopg2://x/y", fake=False
@@ -1234,6 +1234,7 @@ def test_run_baseline_refuses_on_foreign_pg_container(tmp_path, monkeypatch):
         timed_out = False
         foreign_pg_container = True
         chokepoint_marker_ok = True
+        watch_attached = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1252,6 +1253,41 @@ def test_run_baseline_refuses_on_foreign_pg_container(tmp_path, monkeypatch):
     assert "foreign" in detail
 
 
+def test_run_one_neuter_watch_unproven_forces_error(tmp_path, monkeypatch):
+    """Review round 6 blocker fix: ``run_one_neuter``'s own ``classify()``
+    call must receive ``pytest_result.watch_attached`` -- if the
+    foreign-container watch's readiness probe never proved live, THIS
+    phase (neuter, the per-worker unit every mapped test runs through)
+    must classify ERROR ``watch_unproven`` too, exactly like
+    ``foreign_pg_container``/``chokepoint_marker_missing`` already do."""
+    repo = _init_repo(tmp_path)
+    entry = _entry(
+        id="x",
+        file="guarded.py",
+        edits=[Edit(old="    return x + 1", new="    return x + 2")],
+        tests=["test_guarded.py::test_a"],
+    )
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        pathcheck_ok = True
+        db_before = None
+        db_after = None
+        db_leak = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = True
+        watch_attached = False
+        collect_stdout = None
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    row = run_one_neuter(_ctx(repo, _ev(tmp_path)), entry)
+    assert row["verdict"] == "ERROR"
+    assert row["error_reason"] == "watch_unproven"
+
+
 def test_run_baseline_refuses_on_chokepoint_marker_missing(tmp_path, monkeypatch):
     """Review round 5 should-fix: the marker check (round 4, requirement
     E2) was only ever consumed at the neuter and arbitrate phases --
@@ -1265,6 +1301,7 @@ def test_run_baseline_refuses_on_chokepoint_marker_missing(tmp_path, monkeypatch
         timed_out = False
         foreign_pg_container = False
         chokepoint_marker_ok = False
+        watch_attached = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1281,6 +1318,39 @@ def test_run_baseline_refuses_on_chokepoint_marker_missing(tmp_path, monkeypatch
     )
     assert ok is False
     assert "chokepoint marker" in detail
+
+
+def test_run_baseline_refuses_on_watch_unproven(tmp_path, monkeypatch):
+    """Review round 6 blocker fix: baseline's own full-scope pytest
+    invocation could silently run with the foreign-container watch's
+    readiness probe never attaching (slow/contended docker daemon), and
+    this phase would never notice -- same class of gap as the chokepoint
+    marker check above, now closed for the watch too."""
+    repo = _init_repo(tmp_path)
+    spec = _baseline_spec(repo)
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = True
+        watch_attached = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    ok, detail = run_baseline(
+        spec,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="baseline-watch-unproven",
+        python=PYTHON,
+        timeout_s=30,
+        lock_path=tmp_path / "baseline.lock",
+    )
+    assert ok is False
+    assert "watch unproven" in detail
 
 
 def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
@@ -1301,6 +1371,7 @@ def test_sample_full_scope_drift_not_reproduced(tmp_path, monkeypatch):
         timed_out = False
         foreign_pg_container = False
         chokepoint_marker_ok = True
+        watch_attached = True
 
     def fake_run_pytest(*, junit_path, **kwargs):
         # write a junit file where NEITHER mapped test failed.
@@ -1351,6 +1422,7 @@ def test_sample_full_scope_drift_foreign_pg_container(tmp_path, monkeypatch):
         timed_out = False
         foreign_pg_container = True
         chokepoint_marker_ok = True
+        watch_attached = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1385,6 +1457,7 @@ def test_sample_full_scope_drift_chokepoint_marker_missing(tmp_path, monkeypatch
         timed_out = False
         foreign_pg_container = False
         chokepoint_marker_ok = False
+        watch_attached = True
 
     monkeypatch.setattr(
         "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
@@ -1402,6 +1475,43 @@ def test_sample_full_scope_drift_chokepoint_marker_missing(tmp_path, monkeypatch
         lock_path=tmp_path / "drift.lock",
     )
     assert rows["w1"].get("drift_chokepoint_marker_missing") is True
+    assert rows["w1"]["verdict"] == "ERROR"
+    assert "unmapped_red" not in rows["w1"]
+
+
+def test_sample_full_scope_drift_watch_unproven(tmp_path, monkeypatch):
+    """Review round 6 blocker fix: drift's own full-scope pytest invocation
+    could silently run with the foreign-container watch's readiness probe
+    never attaching, and this phase would never notice -- same class of
+    gap as the chokepoint marker check above, now closed for the watch
+    too."""
+    repo = _init_repo(tmp_path)
+    spec = _spec_two_neuters(repo)
+    rows = {"w1": {"verdict": "RED"}, "w2": {"verdict": "RED"}}
+
+    class _FakeResult:
+        exit_code = 0
+        timed_out = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = True
+        watch_attached = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.pool.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    sample_full_scope_drift(
+        spec,
+        rows,
+        repo_dir=repo,
+        parent_worktree_dir=tmp_path,
+        evidence_dir=_ev(tmp_path),
+        run_id="drift-watch-unproven",
+        python=PYTHON,
+        timeout_s=30,
+        sample=1.0,
+        lock_path=tmp_path / "drift.lock",
+    )
+    assert rows["w1"].get("drift_watch_unproven") is True
     assert rows["w1"]["verdict"] == "ERROR"
     assert "unmapped_red" not in rows["w1"]
 
@@ -1437,6 +1547,7 @@ def test_sample_full_scope_drift_is_seeded_from_run_id(tmp_path, monkeypatch):
         timed_out = False
         foreign_pg_container = False
         chokepoint_marker_ok = True
+        watch_attached = True
 
     def fake_run_pytest(*, junit_path, **kwargs):
         junit_path.parent.mkdir(parents=True, exist_ok=True)

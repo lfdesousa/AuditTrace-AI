@@ -288,6 +288,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                 unmapped_red: list[str] = []
                 foreign_pg_container = False
                 chokepoint_marker_ok = True
+                watch_attached = True
                 try:
                     if not nocompile:
                         # THE chokepoint (review round 2): sequential, alone,
@@ -310,6 +311,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                         exit_code = pytest_result.exit_code
                         foreign_pg_container = pytest_result.foreign_pg_container
                         chokepoint_marker_ok = pytest_result.chokepoint_marker_ok
+                        watch_attached = pytest_result.watch_attached
                         full = parse_junit_full(
                             junit_path if junit_path.exists() else None
                         )
@@ -351,6 +353,7 @@ def _cmd_arbitrate(args: argparse.Namespace) -> int:
                     exit_code=exit_code,
                     foreign_pg_container=foreign_pg_container,
                     chokepoint_marker_ok=chokepoint_marker_ok,
+                    watch_attached=watch_attached,
                 )
                 authoritative_verdict = verdict.verdict
                 authoritative_error_reason = verdict.error_reason

@@ -180,6 +180,16 @@ def _collect_ids(
             "chokepoint_marker_missing",
             "neuter_pathcheck did not run during --collect-only",
         )
+    if not result.watch_attached:
+        # Review round 6: collect's own --collect-only invocation can
+        # import test modules with side effects too (round 3, blocker 1) --
+        # if the foreign-container watch's readiness probe never proved
+        # the watch was live, this phase can never certify "no foreign
+        # container appeared" either. Fail closed, same exit path.
+        raise SpecLoadError(
+            "watch_unproven",
+            "foreign-container watch never attached during --collect-only",
+        )
     stdout = result.collect_stdout or ""
     ids = {line.strip() for line in stdout.splitlines() if "::" in line}
     return ids

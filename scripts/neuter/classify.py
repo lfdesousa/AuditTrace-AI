@@ -4,8 +4,9 @@ Every mapped run is classified, in this exact order, first match wins for
 ``error_reason``; ``error_reasons[]`` records every condition met:
 
     collected -> nocompile -> pathcheck -> db_leak -> foreign_pg_container ->
-    timeout -> setup_or_teardown -> skipped -> missing -> call_exception ->
-    junit -> exit_code
+    chokepoint_marker_missing -> watch_unproven -> timeout ->
+    setup_or_teardown -> skipped -> missing -> call_exception -> junit ->
+    exit_code
 
 RED iff no ERROR condition holds and at least one mapped test is ``failed``
 (necessarily assertion-shaped by then). GREEN iff every mapped test
@@ -54,6 +55,7 @@ def classify(
     exit_code: int | None,
     foreign_pg_container: bool = False,
     chokepoint_marker_ok: bool = True,
+    watch_attached: bool = True,
 ) -> VerdictResult:
     """Apply the verdict rule. ``junit_result`` may be ``None`` when the run
     never reached pytest (``nocompile``, or the caller has nothing to parse)."""
@@ -84,6 +86,14 @@ def classify(
         # after the child exited, since the plugin can never detect its
         # own absence. Never a silent pass, regardless of exit code.
         reasons.append("chokepoint_marker_missing")
+    if not watch_attached:
+        # Review round 6, fixing the round-5 fail-open regression: the
+        # continuous foreign-container watch's own readiness probe could
+        # never PROVE the `docker events` stream was live before this
+        # call's work began -- `foreign_pg_container` above can never be
+        # trusted from an unproven watch, so this is its own ERROR
+        # condition, never a silent pass.
+        reasons.append("watch_unproven")
     if timed_out:
         reasons.append("timeout")
 

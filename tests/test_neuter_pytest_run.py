@@ -41,13 +41,15 @@ requires_docker = pytest.mark.skipif(not _DOCKER_AVAILABLE, reason="docker unava
 
 
 @contextlib.contextmanager
-def _fake_watch(seen: bool):
+def _fake_watch(seen: bool, watch_attached: bool = True):
     """Stand-in for ``_continuous_foreign_container_watch`` that reports a
     fixed, pre-determined verdict regardless of what happens inside the
     ``with`` block -- exactly the shape ``run_pytest`` consumes it as
-    (``with _continuous_foreign_container_watch() as foreign_seen: ...
-    foreign_seen()``)."""
-    yield lambda: seen
+    (``with _continuous_foreign_container_watch() as (foreign_seen,
+    watch_attached): ... foreign_seen()``). ``watch_attached`` defaults to
+    ``True`` -- round 6's readiness-proof boolean -- so callers that only
+    care about ``seen`` need not think about it."""
+    yield lambda: seen, watch_attached
 
 
 FIXTURE_DIR = Path(__file__).parent / "neuter_fixture"
@@ -275,6 +277,12 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
     )
     assert result.exit_code == 0
     assert result.foreign_pg_container is True
+    # Review round 6 N-P1 self-neuter target: `attached.set()` -> `pass`
+    # (the reviewer's exact neuter) makes the readiness probe NEVER prove
+    # the watch attached, which this assertion catches directly -- before
+    # round 6, nothing in this file observed `watch_attached` at all, so
+    # that neuter went completely unnoticed (10/10 still GREEN).
+    assert result.watch_attached is True
     # ...and the container really is gone -- proving the snapshot-style
     # before/after check this replaced would have missed it entirely.
     ps = subprocess.run(
@@ -291,6 +299,84 @@ def test_continuous_watch_catches_a_container_removed_via_atexit_live(tmp_path):
         text=True,
     )
     assert ps.stdout.strip() == ""
+
+
+@requires_docker
+def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
+    tmp_path, monkeypatch
+):
+    """Review round 6 blocker reproduction, mirroring the reviewer's own
+    ``slow_events_run.py``/``docker`` shim: a ``docker`` wrapper on PATH
+    that delays ONLY ``docker events``'s attach (simulating a
+    slow/contended daemon) past the readiness probe's 5s bound -- a
+    durable, foreign ``audittrace-acl-wu2a-pg-*`` container started the
+    whole time must now surface as ``watch_attached=False`` (ERROR
+    ``watch_unproven`` once classified), NEVER the pre-round-6 silent
+    ``foreign_pg_container=False, exit_code=0`` the reviewer measured live
+    (``readiness_failopen_measured.txt``)."""
+    real_docker = shutil.which("docker")
+    assert real_docker is not None  # requires_docker already gates this
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "docker"
+    shim.write_text(
+        "#!/bin/bash\n"
+        "# builder repro of the reviewer's docker-events-is-slow shim:\n"
+        "# `docker events` attaches only well after the readiness probe's\n"
+        "# own 5s bound AND the mapped test's container has already fully\n"
+        "# started (margin: 5s probe + ~2-3s container create/sleep,\n"
+        "# measured) -- everything else passes through unchanged.\n"
+        'if [ "$1" = "events" ]; then sleep 12; fi\n'
+        f'exec {real_docker} "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    name = f"audittrace-acl-wu2a-pg-rev6slow{os.getpid()}"
+    fixture = repo / "test_slow_durable.py"
+    fixture.write_text(
+        "import atexit, os, subprocess, time\n"
+        f'_NAME = "{name}"\n'
+        "def test_starts_a_durable_container_immediately():\n"
+        "    subprocess.run(\n"
+        '        ["docker", "run", "-d", "--rm", "--name", _NAME, "postgres:16"],\n'
+        "        check=True, capture_output=True, timeout=120,\n"
+        "    )\n"
+        "    atexit.register(\n"
+        '        lambda: subprocess.run(["docker", "rm", "-f", _NAME], capture_output=True)\n'
+        "    )\n"
+        "    time.sleep(0.5)\n"
+        "    assert True\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@test.invalid"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    try:
+        result = run_pytest(
+            workdir=repo,
+            pytest_args=[
+                "test_slow_durable.py::test_starts_a_durable_container_immediately"
+            ],
+            python=PYTHON,
+            lock_path=tmp_path / "slow.lock",
+            timeout_s=120,
+        )
+        assert result.exit_code == 0
+        # THE regression, now caught: pre-round-6, `foreign_pg_container`
+        # alone would read `False` here (fail-open). Round 6 exposes the
+        # unproven watch via `watch_attached=False` so the caller can fail
+        # closed instead of trusting this silent "clean".
+        assert result.watch_attached is False
+        assert result.foreign_pg_container is False
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=10)
 
 
 def test_chokepoint_scope_restores_prior_values_that_were_already_set(monkeypatch):

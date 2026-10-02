@@ -212,18 +212,29 @@ def build_pythonpath(src_root: str) -> str:
 @contextlib.contextmanager
 def _continuous_foreign_container_watch():
     """Streams ``docker events --filter event=start`` for the DURATION of
-    the ``with`` block, in a background thread, and yields a callable that
-    reports whether a foreign product container was seen starting at any
-    point during the block -- even if it was gone before the block ended
-    (review round 3, requirement B1: a before/after snapshot misses a
-    container started and torn down via ``atexit`` entirely within a
-    single pytest call).
+    the ``with`` block, in a background thread, and yields ``(seen, was_
+    attached)`` -- ``seen`` a callable reporting whether a foreign product
+    container was seen starting at any point during the block (review
+    round 3, requirement B1: a before/after snapshot misses a container
+    started and torn down via ``atexit`` entirely within a single pytest
+    call); ``was_attached`` a plain ``bool``, TRUE only if the readiness
+    probe (below) PROVED the watch was actually live before the block's
+    caller-visible work began.
 
-    Falls back to reporting ``False`` (never raises) if the ``docker``
-    binary is unavailable or the events stream can't be started -- the
-    same fail-open-on-tooling-absence posture the rest of this module's
-    docker interactions already have (``--no-db``/fake mode never touches
-    docker at all).
+    Review round 5 BLOCKER (fail-open verifier class, rejected in rounds
+    1-3): an earlier revision added the readiness probe but DISCARDED its
+    own result -- ``attached.wait(timeout=5)``'s return value went
+    nowhere, so a watcher that NEVER actually attached (slow/contended
+    docker daemon, or docker unavailable) still reported "clean"
+    (``seen() -> False``) with no error, FAIL OPEN. Measured live: a
+    `docker events` shim that attaches only after 8s made a genuinely
+    durable, foreign `audittrace-acl-wu2a-pg-*` container go completely
+    undetected (`foreign_pg_container=False`, exit 0). This function now
+    returns the attachment proof itself; the CALLER (``run_pytest()``,
+    then every phase in ``pool.py``/``spec.py``/``runner.py``) must fail
+    CLOSED (``ERROR watch_unproven``) whenever it is ``False`` -- a watch
+    that was never proven live can never certify "no foreign container
+    appeared", so neither can this function on its own.
     """
     seen = threading.Event()
     proc: subprocess.Popen[str] | None = None
@@ -276,6 +287,12 @@ def _continuous_foreign_container_watch():
 
     thread = threading.Thread(target=_watch, daemon=True)
     thread.start()
+    # Review round 6 BLOCKER fix: `was_attached` is the ACTUAL, CHECKED
+    # result -- `False` by default (proc missing/absent means readiness
+    # was never even attempted, so it is UNPROVEN, not "assumed fine"),
+    # and only set to the real `attached.wait()` return value when the
+    # probe itself was attempted. Never silently discarded again.
+    was_attached = False
     if proc is not None:
         try:
             subprocess.run(
@@ -292,18 +309,20 @@ def _continuous_foreign_container_watch():
                 capture_output=True,
                 timeout=10,
             )
-            # Bounded wait for PROOF the stream is live, never a blind
-            # guess -- falls through (fail-open) if docker is slow/absent,
-            # same posture as the rest of this function.
-            attached.wait(timeout=5)
+            # Bounded wait for PROOF the stream is live -- the RETURN
+            # VALUE is now the whole point: `False` means readiness was
+            # never proven, and the caller (run_pytest(), then every
+            # chokepoint-gated phase) must treat that as ERROR
+            # `watch_unproven`, fail CLOSED, never a silent "clean".
+            was_attached = attached.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            was_attached = False
         finally:
             subprocess.run(
                 ["docker", "rm", "-f", probe_name], capture_output=True, timeout=10
             )
     try:
-        yield lambda: seen.is_set()
+        yield lambda: seen.is_set(), was_attached
     finally:
         stop.set()
         if proc is not None:
@@ -340,6 +359,15 @@ class PytestRunResult:
     #: plugin itself can never detect from the inside. ``run_pytest()``
     #: checks this AFTER the child exits, regardless of its exit code.
     chokepoint_marker_ok: bool = True
+    #: False iff ``_continuous_foreign_container_watch()``'s own readiness
+    #: probe could never PROVE the ``docker events`` stream was live before
+    #: this call's caller-visible work began (review round 6, fixing the
+    #: round-5 fail-open regression: the probe's result used to be computed
+    #: and then discarded). A watch that was never proven live can never
+    #: certify "no foreign container appeared" -- every phase MUST treat
+    #: ``False`` as ERROR ``watch_unproven``, fail closed, never silently
+    #: trust ``foreign_pg_container`` from an unproven watch.
+    watch_attached: bool = True
 
 
 def run_pytest(
@@ -458,7 +486,10 @@ def run_pytest(
                     and pg_handle.fake_state_path is not None
                 ):
                     env["NEUTER_FAKE_PG_STATE"] = str(pg_handle.fake_state_path)
-                with _continuous_foreign_container_watch() as foreign_seen:
+                with _continuous_foreign_container_watch() as (
+                    foreign_seen,
+                    watch_attached,
+                ):
                     result = subprocess.run(
                         cmd, cwd=workdir, env=env, capture_output=True, text=True
                     )
@@ -473,6 +504,7 @@ def run_pytest(
                     chokepoint_token=token,
                     collect_stdout=result.stdout,
                     chokepoint_marker_ok=_marker_was_written(marker_file, token),
+                    watch_attached=watch_attached,
                 )
 
             cmd = [
@@ -526,7 +558,10 @@ def run_pytest(
 
             exit_code: int | None = None
             timed_out = False
-            with _continuous_foreign_container_watch() as foreign_seen:
+            with _continuous_foreign_container_watch() as (
+                foreign_seen,
+                watch_attached,
+            ):
                 try:
                     result = subprocess.run(
                         cmd,
@@ -560,6 +595,7 @@ def run_pytest(
                 foreign_pg_container=foreign_seen(),
                 chokepoint_token=token,
                 chokepoint_marker_ok=_marker_was_written(marker_file, token),
+                watch_attached=watch_attached,
             )
         finally:
             if probe_fd is not None:

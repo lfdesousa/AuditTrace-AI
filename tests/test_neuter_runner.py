@@ -431,6 +431,93 @@ def test_cmd_arbitrate_writes_arbitration_row(tmp_path, repo):
     assert rows[0]["harness_verdict"] == "RED"
 
 
+def test_cmd_arbitrate_watch_unproven_forces_error(tmp_path, repo, monkeypatch):
+    """Review round 6 blocker fix: arbitrate's own ``classify()`` call must
+    receive ``pytest_result.watch_attached`` -- if the foreign-container
+    watch's readiness probe never proved live during arbitrate's
+    full-scope run, THIS phase (the authoritative tie-break) must
+    classify ERROR ``watch_unproven`` too, never a silent authoritative
+    RED/GREEN riding on an unproven watch."""
+    spec_path = tmp_path / "neuters.json"
+    spec_path.write_text(json.dumps(_spec_dict(repo)))
+    evidence = _ev(tmp_path)
+    main(
+        [
+            "run",
+            "--sha",
+            _sha(repo),
+            "--neuters",
+            str(spec_path),
+            "--evidence",
+            str(evidence),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--workers",
+            "1",
+            "--no-db",
+            "--pathcheck-module",
+            "mod",
+            "--src-root-relative",
+            "",
+            "--lock-path",
+            str(tmp_path / "pool.lock"),
+        ]
+    )
+
+    class _FakeResult:
+        exit_code = 1
+        timed_out = False
+        foreign_pg_container = False
+        chokepoint_marker_ok = True
+        watch_attached = False
+
+    def fake_run_pytest(*, junit_path, **kwargs):
+        # Mark the mapped test FAILED in the full-scope junit so the
+        # pre-existing `not_reproduced` override (SPEC v3 S5, triggered
+        # when the full-scope run never reproduces an originally-RED
+        # harness verdict) does not mask `watch_unproven` -- this test is
+        # isolating THIS phase's own watch-readiness check, not that one.
+        junit_path.parent.mkdir(parents=True, exist_ok=True)
+        junit_path.write_text(
+            '<?xml version="1.0"?><testsuite tests="1">'
+            '<testcase classname="test_mod" name="test_f">'
+            '<failure message="assert 2 == 3"/>'
+            "</testcase>"
+            "</testsuite>"
+        )
+        return _FakeResult()
+
+    monkeypatch.setattr("scripts.neuter.runner.run_pytest", fake_run_pytest)
+    rc = main(
+        [
+            "arbitrate",
+            "--ids",
+            "n1",
+            "--evidence",
+            str(evidence),
+            "--neuters",
+            str(spec_path),
+            "--repo-dir",
+            str(repo),
+            "--python",
+            PYTHON,
+            "--lock-path",
+            str(tmp_path / "arb.lock"),
+            "--no-db",
+        ]
+    )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (evidence / "arbitration.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["id"] == "n1"
+    assert rows[0]["authoritative_verdict"] == "ERROR"
+    assert rows[0]["authoritative_error_reason"] == "watch_unproven"
+
+
 def test_cmd_arbitrate_raises_on_preexisting_dirty_repo(tmp_path, repo):
     spec_path = tmp_path / "neuters.json"
     spec_path.write_text(json.dumps(_spec_dict(repo)))

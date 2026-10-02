@@ -362,6 +362,7 @@ def test_collect_refuses_on_chokepoint_marker_missing(tmp_path, repo, monkeypatc
     class _FakeResult:
         collect_stdout = "test_mod.py::test_f\n"
         chokepoint_marker_ok = False
+        watch_attached = True
 
     monkeypatch.setattr(
         "scripts.neuter.spec.run_pytest", lambda **kwargs: _FakeResult()
@@ -376,6 +377,34 @@ def test_collect_refuses_on_chokepoint_marker_missing(tmp_path, repo, monkeypatc
             already_locked=False,
         )
     assert excinfo.value.reason == "chokepoint_marker_missing"
+
+
+def test_collect_refuses_on_watch_unproven(tmp_path, repo, monkeypatch):
+    """Review round 6 blocker fix: collect's own --collect-only invocation
+    can import test modules with side effects too (round 3, blocker 1) --
+    if the foreign-container watch's readiness probe never proved the
+    watch was live, this phase can never certify "no foreign container
+    appeared" either. Fails closed, same exit path as the marker check."""
+    from scripts.neuter.spec import _collect_ids
+
+    class _FakeResult:
+        collect_stdout = "test_mod.py::test_f\n"
+        chokepoint_marker_ok = True
+        watch_attached = False
+
+    monkeypatch.setattr(
+        "scripts.neuter.spec.run_pytest", lambda **kwargs: _FakeResult()
+    )
+    with pytest.raises(SpecLoadError) as excinfo:
+        _collect_ids(
+            repo,
+            "sha",
+            ["test_mod.py"],
+            PYTHON,
+            lock_path=tmp_path / "collect.lock",
+            already_locked=False,
+        )
+    assert excinfo.value.reason == "watch_unproven"
 
 
 def test_collected_ids_can_be_supplied_directly(tmp_path, repo):

@@ -326,3 +326,50 @@ def test_chokepoint_marker_ok_true_is_the_default_and_never_errors():
         exit_code=0,
     )
     assert result.verdict == "GREEN"
+
+
+def test_watch_unproven_forces_error():
+    """Review round 6 blocker fix: the continuous foreign-container watch's
+    own readiness probe could never prove the `docker events` stream was
+    live for this invocation (e.g. a slow/contended docker daemon) --
+    `foreign_pg_container=False` from an unproven watch can never be
+    trusted as "clean", so classify() must turn that into a hard ERROR,
+    never a silent pass, regardless of exit code or otherwise-passing
+    tests."""
+    jr = JunitResult(
+        tests_collected=1,
+        parse_failed=False,
+        outcomes={"t": JunitTestcase("passed")},
+    )
+    result = classify(
+        ["t"],
+        jr,
+        tests_expected=1,
+        nocompile=False,
+        pathcheck_ok=True,
+        db_leak=False,
+        timed_out=False,
+        exit_code=0,
+        watch_attached=False,
+    )
+    assert result.verdict == "ERROR"
+    assert result.error_reason == "watch_unproven"
+
+
+def test_watch_attached_true_is_the_default_and_never_errors():
+    jr = JunitResult(
+        tests_collected=1,
+        parse_failed=False,
+        outcomes={"t": JunitTestcase("passed")},
+    )
+    result = classify(
+        ["t"],
+        jr,
+        tests_expected=1,
+        nocompile=False,
+        pathcheck_ok=True,
+        db_leak=False,
+        timed_out=False,
+        exit_code=0,
+    )
+    assert result.verdict == "GREEN"

@@ -247,6 +247,7 @@ def run_one_neuter(
     db_leak = False
     foreign_pg_container = False
     chokepoint_marker_ok = True
+    watch_attached = True
     pg_settings = None
     junit_result = None
     junit_path = (
@@ -325,6 +326,7 @@ def run_one_neuter(
         db_leak = pytest_result.db_leak
         foreign_pg_container = pytest_result.foreign_pg_container
         chokepoint_marker_ok = pytest_result.chokepoint_marker_ok
+        watch_attached = pytest_result.watch_attached
 
         junit_result = parse_junit(
             junit_path if junit_path.exists() else None, entry.tests
@@ -343,6 +345,7 @@ def run_one_neuter(
         exit_code=exit_code,
         foreign_pg_container=foreign_pg_container,
         chokepoint_marker_ok=chokepoint_marker_ok,
+        watch_attached=watch_attached,
     )
     secs = round(time.time() - t0, 3)
 
@@ -511,6 +514,15 @@ def run_baseline(
             # silently run with the plugin disabled (e.g. a stray
             # `-p no:neuter_pathcheck`) and this phase would never notice.
             return False, "chokepoint marker missing -- neuter_pathcheck did not run"
+        if not pytest_result.watch_attached:
+            # Review round 6: the continuous foreign-container watch's own
+            # readiness probe could never prove the `docker events` stream
+            # was live for baseline's invocation -- fail closed, baseline
+            # can never certify "no foreign container appeared" either.
+            return (
+                False,
+                "watch unproven -- foreign-container watch never attached",
+            )
         if pytest_result.foreign_pg_container:
             return False, "a foreign, durable product Postgres container was observed"
         if pytest_result.timed_out:
@@ -676,6 +688,13 @@ def sample_full_scope_drift(
                 # disabled and this phase would never notice -- same class
                 # of gap as neuter/arbitrate already closed in round 4.
                 _mark_drift_unresolved(row, "chokepoint_marker_missing")
+                continue
+            if not drift_result.watch_attached:
+                # Review round 6: drift's own full-scope watch could never
+                # prove the `docker events` stream was live -- the
+                # `foreign_pg_container` check above can never be trusted
+                # from an unproven watch, fail closed.
+                _mark_drift_unresolved(row, "watch_unproven")
                 continue
             full = parse_junit_full(junit_path if junit_path.exists() else None)
             if row.get("verdict") == "RED" and not mapped_failed_in_full(
