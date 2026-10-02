@@ -357,12 +357,17 @@ class PytestRunResult:
     #: trust ``foreign_pg_container`` from an unproven watch.
     #:
     #: Review round 7 (O-1a, orchestrator-confirmed blocker): this field
-    #: used to default to ``True`` -- dropping the explicit pass at EITHER
-    #: construction site below (``:507`` main, ``:598`` collect-only) still
-    #: left all 120 targeted tests GREEN at the collect site, because a
-    #: dataclass default silently fills the gap. Deliberately REQUIRED (no
-    #: default) so a missing explicit value is a ``TypeError`` at
-    #: construction time, not a silent, fail-open ``True``.
+    #: used to default to ``True`` -- the orchestrator found that dropping
+    #: the explicit pass at the ``collect_only=True`` construction site
+    #: (below, in this function) left all 120 targeted tests GREEN,
+    #: because a dataclass default silently filled the gap (the SAME drop
+    #: at the full-run construction site, further below, was already
+    #: caught). Deliberately REQUIRED (no default, on EITHER site) so a
+    #: missing explicit value is a ``TypeError`` at construction time, not
+    #: a silent, fail-open ``True``. Line numbers deliberately omitted
+    #: here -- they go stale; the two sites are identified structurally
+    #: instead (the ``collect_only`` branch vs. the full-run return, both
+    #: inside ``run_pytest()``).
     watch_attached: bool
     #: The fresh per-invocation chokepoint token this call issued (review
     #: round 3, requirement B2) -- carried on the row for audit purposes.
