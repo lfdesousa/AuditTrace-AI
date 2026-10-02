@@ -17,11 +17,18 @@ OWN affected rows and re-indexes them through the public API.
   (reported, never re-indexed) when (a) a matching chunk has no owner
   (missing / None / empty, e.g. legacy chunks), (b) any matching chunk owner
   is not exactly the caller's ``sub``, (c) the file name matches chunks of
-  more than one owner or more than one document, or no chunk is visible at
-  all. After a real re-index the owner is read again; ``chunk_owner_before``
-  and ``chunk_owner_after`` must be equal or the script STOPS (exit 3). That
-  post-write equality check is the second line; the pre-write check is the
-  first.
+  more than one owner, or no chunk is visible at all. After a real re-index
+  the owner is read again; ``chunk_owner_before`` and ``chunk_owner_after``
+  must be equal or the script STOPS (exit 3). That post-write equality check
+  is the second line; the pre-write check is the first.
+* LIMIT, stated exactly: the "more than one DOCUMENT" skip
+  (``title_matches_multiple_documents``) is INERT today. It only fires once
+  the chunk list API exposes a per-chunk document sha256 (``document_sha256``
+  on the row); current chunk rows do not carry it (discovered rows omit it
+  and PDF chunks store it under a different metadata key). Until then, same
+  named documents of ONE owner cannot be told apart, and safety rests on the
+  exact-owner rule above, the index route's own prefix/scope checks, and the
+  post-write equality check.
 
 **Dry run first.** Without ``--apply`` the script only issues
 ``POST /memory/index?file=<key>&dry_run=true&details=true`` (no write) and
