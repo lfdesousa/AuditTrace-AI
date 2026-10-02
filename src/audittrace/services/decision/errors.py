@@ -17,6 +17,7 @@ ERROR_CODES: frozenset[str] = frozenset(
         "no_allowed_token_in_top",
         "model_identity_mismatch",
         "invalid_input",
+        "internal_error",
     }
 )
 

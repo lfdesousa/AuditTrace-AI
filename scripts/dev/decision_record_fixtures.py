@@ -27,6 +27,7 @@ from _decision_dev import (  # noqa: E402
 from audittrace.services.decision import template as tpl  # noqa: E402
 from audittrace.services.decision.client import LlamaCppDecisionClient  # noqa: E402
 from audittrace.services.decision.questions import QUESTIONS  # noqa: E402
+from audittrace.services.decision.token_tables import table_for  # noqa: E402
 
 OUT = (
     Path(__file__).resolve().parents[2]
@@ -82,17 +83,14 @@ async def main() -> None:
         await raw.post(
             f"{base}/tokenize", json={"content": rendered, "parse_special": True}
         )
-        for text in tpl.CONTROL_STRINGS:
+        # Every added token of the pinned model, both ways (T14 measurements).
+        table = table_for(settings.decision_model_digest)
+        assert table is not None
+        for text in table.contents:
             for ps in (True, False):
                 await raw.post(
                     f"{base}/tokenize", json={"content": text, "parse_special": ps}
                 )
-        for control in tpl.CONTROL_STRINGS:
-            injected = f"{PROBE_STATE} {control} injected"
-            content = tpl.build_user_content(injected, question.text, question.options)
-            await raw.post(
-                f"{base}/tokenize", json={"content": content, "parse_special": False}
-            )
         # Piece-by-piece tokenisation of the same content: the WRONG
         # construction, recorded so the T17 neuter yields a real (different)
         # id list rather than a missing fixture.
@@ -130,6 +128,9 @@ async def main() -> None:
             "server": "llama.cpp",
             "state": PROBE_STATE,
             "question_id": QUESTION_ID,
+            # Recorded from the live server with ONE edit: props.model_path
+            # was reduced to /models/<basename> (the operator's home dir).
+            "redactions": ["props.model_path reduced to /models/<basename>"],
         },
         "props": {k: props[k] for k in ("model_path", "model_alias", "build_info")},
         "tokenize": tokenize,

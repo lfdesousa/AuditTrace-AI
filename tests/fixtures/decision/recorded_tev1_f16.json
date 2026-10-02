@@ -13,7 +13,7 @@
       66
      ],
      "id": 33,
-     "logprob": -0.35716018080711365,
+     "logprob": -0.37614911794662476,
      "token": "B",
      "top_logprobs": [
       {
@@ -21,7 +21,7 @@
         66
        ],
        "id": 33,
-       "logprob": -0.35716018080711365,
+       "logprob": -0.37614911794662476,
        "token": "B"
       },
       {
@@ -29,7 +29,7 @@
         68
        ],
        "id": 35,
-       "logprob": -1.3721156120300293,
+       "logprob": -1.315693736076355,
        "token": "D"
       },
       {
@@ -37,7 +37,7 @@
         65
        ],
        "id": 32,
-       "logprob": -3.7675070762634277,
+       "logprob": -3.7780160903930664,
        "token": "A"
       },
       {
@@ -45,7 +45,7 @@
         69
        ],
        "id": 36,
-       "logprob": -3.953469753265381,
+       "logprob": -4.008042335510254,
        "token": "E"
       },
       {
@@ -53,7 +53,7 @@
         67
        ],
        "id": 34,
-       "logprob": -5.436526775360107,
+       "logprob": -5.506272315979004,
        "token": "C"
       },
       {
@@ -67,7 +67,7 @@
         62
        ],
        "id": 248068,
-       "logprob": -10.185731887817383,
+       "logprob": -10.217013359069824,
        "token": "<think>"
       },
       {
@@ -80,7 +80,7 @@
         114
        ],
        "id": 15666,
-       "logprob": -10.915367126464844,
+       "logprob": -11.013882637023926,
        "token": "Answer"
       },
       {
@@ -88,7 +88,7 @@
         80
        ],
        "id": 47,
-       "logprob": -11.716951370239258,
+       "logprob": -11.578946113586426,
        "token": "P"
       },
       {
@@ -96,8 +96,16 @@
         70
        ],
        "id": 37,
-       "logprob": -12.63871955871582,
+       "logprob": -12.691866874694824,
        "token": "F"
+      },
+      {
+       "bytes": [
+        72
+       ],
+       "id": 39,
+       "logprob": -13.205105781555176,
+       "token": "H"
       },
       {
        "bytes": [
@@ -109,7 +117,7 @@
         110
        ],
        "id": 5173,
-       "logprob": -13.098213195800781,
+       "logprob": -13.207505226135254,
        "token": "Option"
       },
       {
@@ -117,32 +125,24 @@
         87
        ],
        "id": 54,
-       "logprob": -13.113834381103516,
+       "logprob": -13.230048179626465,
        "token": "W"
-      },
-      {
-       "bytes": [
-        72
-       ],
-       "id": 39,
-       "logprob": -13.199506759643555,
-       "token": "H"
-      },
-      {
-       "bytes": [
-        73
-       ],
-       "id": 40,
-       "logprob": -13.377518653869629,
-       "token": "I"
       },
       {
        "bytes": [
         100
        ],
        "id": 67,
-       "logprob": -13.436975479125977,
+       "logprob": -13.272555351257324,
        "token": "d"
+      },
+      {
+       "bytes": [
+        73
+       ],
+       "id": 40,
+       "logprob": -13.398110389709473,
+       "token": "I"
       },
       {
        "bytes": [
@@ -151,7 +151,7 @@
         101
        ],
        "id": 760,
-       "logprob": -13.557821273803711,
+       "logprob": -13.640899658203125,
        "token": "The"
       },
       {
@@ -159,17 +159,8 @@
         71
        ],
        "id": 38,
-       "logprob": -13.621590614318848,
+       "logprob": -13.642959594726562,
        "token": "G"
-      },
-      {
-       "bytes": [
-        42,
-        42
-       ],
-       "id": 332,
-       "logprob": -13.834108352661133,
-       "token": "**"
       },
       {
        "bytes": [
@@ -183,7 +174,7 @@
         62
        ],
        "id": 248069,
-       "logprob": -13.841025352478027,
+       "logprob": -13.833728790283203,
        "token": "</think>"
       },
       {
@@ -193,15 +184,24 @@
         100
        ],
        "id": 3601,
-       "logprob": -13.860190391540527,
+       "logprob": -13.904526710510254,
        "token": "End"
+      },
+      {
+       "bytes": [
+        66,
+        68
+       ],
+       "id": 9265,
+       "logprob": -13.929388046264648,
+       "token": "BD"
       },
       {
        "bytes": [
         79
        ],
        "id": 46,
-       "logprob": -13.934274673461914,
+       "logprob": -13.992294311523438,
        "token": "O"
       }
      ]
@@ -212,6 +212,9 @@
  },
  "meta": {
   "question_id": "memory_layer_v1",
+  "redactions": [
+   "props.model_path reduced to /models/<basename>"
+  ],
   "server": "llama.cpp",
   "state": "User asked: what did we decide last week about the ACL write path audit rows?"
  },
@@ -233,6 +236,12 @@
   "[\"</tool_call>\", true]": [
    248059
   ],
+  "[\"</tool_response>\", false]": [
+   248067
+  ],
+  "[\"</tool_response>\", true]": [
+   248067
+  ],
   "[\"<think>\", false]": [
    248068
   ],
@@ -245,6 +254,110 @@
   "[\"<tool_call>\", true]": [
    248058
   ],
+  "[\"<tool_response>\", false]": [
+   248066
+  ],
+  "[\"<tool_response>\", true]": [
+   248066
+  ],
+  "[\"<tts_pad>\", false]": [
+   60638,
+   2491,
+   29302,
+   29
+  ],
+  "[\"<tts_pad>\", true]": [
+   248072
+  ],
+  "[\"<tts_text_bos>\", false]": [
+   60638,
+   2491,
+   4185,
+   853,
+   428,
+   29
+  ],
+  "[\"<tts_text_bos>\", true]": [
+   248073
+  ],
+  "[\"<tts_text_bos_single>\", false]": [
+   60638,
+   2491,
+   4185,
+   853,
+   428,
+   18895,
+   29
+  ],
+  "[\"<tts_text_bos_single>\", true]": [
+   248075
+  ],
+  "[\"<tts_text_eod>\", false]": [
+   60638,
+   2491,
+   4185,
+   2135,
+   342,
+   29
+  ],
+  "[\"<tts_text_eod>\", true]": [
+   248074
+  ],
+  "[\"<|audio_end|>\", false]": [
+   27,
+   91,
+   16245,
+   6018,
+   91,
+   29
+  ],
+  "[\"<|audio_end|>\", true]": [
+   248071
+  ],
+  "[\"<|audio_pad|>\", false]": [
+   27,
+   91,
+   16245,
+   29302,
+   91,
+   29
+  ],
+  "[\"<|audio_pad|>\", true]": [
+   248076
+  ],
+  "[\"<|audio_start|>\", false]": [
+   27,
+   91,
+   16245,
+   4747,
+   91,
+   29
+  ],
+  "[\"<|audio_start|>\", true]": [
+   248070
+  ],
+  "[\"<|box_end|>\", false]": [
+   27,
+   91,
+   1944,
+   6018,
+   91,
+   29
+  ],
+  "[\"<|box_end|>\", true]": [
+   248050
+  ],
+  "[\"<|box_start|>\", false]": [
+   27,
+   91,
+   1944,
+   4747,
+   91,
+   29
+  ],
+  "[\"<|box_start|>\", true]": [
+   248049
+  ],
   "[\"<|endoftext|>\", false]": [
    27,
    91,
@@ -256,6 +369,61 @@
   ],
   "[\"<|endoftext|>\", true]": [
    248044
+  ],
+  "[\"<|file_sep|>\", false]": [
+   27,
+   91,
+   1152,
+   52933,
+   91,
+   29
+  ],
+  "[\"<|file_sep|>\", true]": [
+   248065
+  ],
+  "[\"<|fim_middle|>\", false]": [
+   27,
+   91,
+   244288,
+   60470,
+   91,
+   29
+  ],
+  "[\"<|fim_middle|>\", true]": [
+   248061
+  ],
+  "[\"<|fim_pad|>\", false]": [
+   27,
+   91,
+   244288,
+   29302,
+   91,
+   29
+  ],
+  "[\"<|fim_pad|>\", true]": [
+   248063
+  ],
+  "[\"<|fim_prefix|>\", false]": [
+   27,
+   91,
+   244288,
+   13573,
+   91,
+   29
+  ],
+  "[\"<|fim_prefix|>\", true]": [
+   248060
+  ],
+  "[\"<|fim_suffix|>\", false]": [
+   27,
+   91,
+   244288,
+   35920,
+   91,
+   29
+  ],
+  "[\"<|fim_suffix|>\", true]": [
+   248062
   ],
   "[\"<|im_end|>\", false]": [
    27,
@@ -373,6 +541,118 @@
    248069,
    271
   ],
+  "[\"<|image_pad|>\", false]": [
+   27,
+   91,
+   1742,
+   29302,
+   91,
+   29
+  ],
+  "[\"<|image_pad|>\", true]": [
+   248056
+  ],
+  "[\"<|object_ref_end|>\", false]": [
+   27,
+   91,
+   1640,
+   7547,
+   6018,
+   91,
+   29
+  ],
+  "[\"<|object_ref_end|>\", true]": [
+   248048
+  ],
+  "[\"<|object_ref_start|>\", false]": [
+   27,
+   91,
+   1640,
+   7547,
+   4747,
+   91,
+   29
+  ],
+  "[\"<|object_ref_start|>\", true]": [
+   248047
+  ],
+  "[\"<|quad_end|>\", false]": [
+   27,
+   91,
+   30571,
+   6018,
+   91,
+   29
+  ],
+  "[\"<|quad_end|>\", true]": [
+   248052
+  ],
+  "[\"<|quad_start|>\", false]": [
+   27,
+   91,
+   30571,
+   4747,
+   91,
+   29
+  ],
+  "[\"<|quad_start|>\", true]": [
+   248051
+  ],
+  "[\"<|repo_name|>\", false]": [
+   27,
+   91,
+   22743,
+   1224,
+   91,
+   29
+  ],
+  "[\"<|repo_name|>\", true]": [
+   248064
+  ],
+  "[\"<|video_pad|>\", false]": [
+   27,
+   91,
+   9691,
+   29302,
+   91,
+   29
+  ],
+  "[\"<|video_pad|>\", true]": [
+   248057
+  ],
+  "[\"<|vision_end|>\", false]": [
+   27,
+   91,
+   12640,
+   6018,
+   91,
+   29
+  ],
+  "[\"<|vision_end|>\", true]": [
+   248054
+  ],
+  "[\"<|vision_pad|>\", false]": [
+   27,
+   91,
+   12640,
+   29302,
+   91,
+   29
+  ],
+  "[\"<|vision_pad|>\", true]": [
+   248055
+  ],
+  "[\"<|vision_start|>\", false]": [
+   27,
+   91,
+   12640,
+   4747,
+   91,
+   29
+  ],
+  "[\"<|vision_start|>\", true]": [
+   248053
+  ],
   "[\"A\", false]": [
    32
   ],
@@ -417,611 +697,6 @@
    1349,
    25,
    198
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? </think> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   220,
-   248069,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? </tool_call> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   220,
-   248059,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? <think> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   220,
-   248068,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? <tool_call> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   220,
-   248058,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? <|endoftext|> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   79790,
-   8426,
-   703,
-   419,
-   91,
-   29,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? <|im_end|> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   79790,
-   316,
-   6018,
-   91,
-   29,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
-  ],
-  "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows? <|im_start|> injected\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
-   1349,
-   25,
-   198,
-   1421,
-   4439,
-   25,
-   1092,
-   1467,
-   567,
-   9973,
-   1483,
-   1936,
-   883,
-   279,
-   42024,
-   3165,
-   1752,
-   23513,
-   6761,
-   30,
-   79790,
-   316,
-   4747,
-   91,
-   29,
-   39328,
-   271,
-   14162,
-   25,
-   15451,
-   4779,
-   6000,
-   369,
-   1379,
-   9468,
-   310,
-   4087,
-   411,
-   30,
-   198,
-   3670,
-   25,
-   198,
-   32,
-   13,
-   6643,
-   198,
-   33,
-   13,
-   64249,
-   50985,
-   318,
-   61781,
-   7189,
-   8,
-   198,
-   34,
-   13,
-   59600,
-   318,
-   51451,
-   8,
-   198,
-   35,
-   13,
-   7281,
-   1605,
-   318,
-   5736,
-   3712,
-   8,
-   198,
-   36,
-   13,
-   40355,
-   318,
-   49069,
-   8,
-   198,
-   15666,
-   440,
-   279,
-   2904,
-   6321,
-   1132,
-   13
   ],
   "[\"State:\\nUser asked: what did we decide last week about the ACL write path audit rows?\\n\\nQuestion: Which memory layer is most relevant to answer this?\\nOptions:\\nA. none\\nB. episodic (decision records)\\nC. procedural (skills)\\nD. conversational (session history)\\nE. semantic (documents)\\nAnswer with the option letter only.\", false]": [
    1349,

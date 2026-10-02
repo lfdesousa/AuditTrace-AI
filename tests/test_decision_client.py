@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import math
+from datetime import datetime
 
 import httpx
 import pytest
@@ -410,7 +412,7 @@ CASES = [
         "/completion",
         _boom(RuntimeError("secret internal text")),
         "error",
-        "malformed_response",
+        "internal_error",
     ),
 ]
 
@@ -654,7 +656,7 @@ async def test_span_is_child_of_current_context_with_only_allowed_attributes() -
         "choice_index": 1,
         "confidence": r.confidence,
         "latency_ms": r.latency_ms,
-        "decision_model_digest_configured": "ab" * 32,
+        "decision_model_digest_configured": "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf",
     }
 
 
@@ -726,7 +728,9 @@ def test_error_vocabulary_is_closed() -> None:
         "no_allowed_token_in_top",
         "model_identity_mismatch",
         "invalid_input",
+        "internal_error",
     }
+    assert result_for("internal_error") == "error"
     with pytest.raises(ValueError, match="unknown error_code"):
         DecisionError("made_up")
     assert DecisionError("timeout").error_code == "timeout"
@@ -735,3 +739,65 @@ def test_error_vocabulary_is_closed() -> None:
     assert llama.map_transport_error(httpx.ConnectError("x")) == "connect_error"
     assert {result_for(c) for c in ERROR_CODES} == {"unavailable", "timeout", "error"}
     assert result_for("disabled") == "unavailable"
+
+
+async def test_a_bug_in_our_own_code_is_internal_error_not_an_upstream_fault(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def explode(*_a: object, **_k: object) -> None:
+        raise ZeroDivisionError("CANARY-INTERNAL-TEXT")
+
+    monkeypatch.setattr("audittrace.services.decision.client.renormalise", explode)
+    r = await _decide(FakeLlama())
+    assert (r.result, r.error_code) == ("error", "internal_error")
+    assert "ZeroDivisionError" in caplog.text
+    assert "CANARY-INTERNAL-TEXT" not in caplog.text
+
+
+def test_constructor_refuses_a_digest_with_no_vendored_token_table() -> None:
+    s = make_settings().model_copy(update={"decision_model_digest": "ab" * 32})
+    with pytest.raises(ValueError, match="no vendored added-token table"):
+        LlamaCppDecisionClient(s)
+
+
+async def test_disabled_client_needs_no_token_table() -> None:
+    s = make_settings(decision_url="", memory_routing_mode="off").model_copy(
+        update={"decision_model_digest": ""}
+    )
+    async with LlamaCppDecisionClient(s) as c:
+        r = await c.decide(STATE, Q)
+    assert r.error_code == "disabled"
+
+
+# ------------------------------------------------- SF-b: reconstruction inputs
+
+
+async def test_sfb_raw_logprobs_and_sampler_params_are_read_only() -> None:
+    r = await _decide(FakeLlama())
+    assert r.raw_top_logprobs is not None and r.sampler_params is not None
+    with pytest.raises(TypeError):
+        r.raw_top_logprobs[65] = 0.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        r.sampler_params["temperature"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del r.raw_top_logprobs[65]  # type: ignore[attr-defined]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        r.raw_top_logprobs = {}  # type: ignore[misc]
+
+
+def test_sfb_result_copies_the_callers_dicts() -> None:
+    raw = {1: -1.0, 2: -2.0}
+    params = {"temperature": 0}
+    r = DecisionResult(
+        result="ok",
+        error_code=None,
+        started_at=datetime.now(),
+        latency_ms=1,
+        raw_top_logprobs=raw,
+        sampler_params=params,
+    )
+    raw[1] = 99.0
+    params["temperature"] = 5
+    assert r.raw_top_logprobs == {1: -1.0, 2: -2.0}
+    assert r.sampler_params == {"temperature": 0}
+    assert dataclasses.replace(r).raw_top_logprobs == {1: -1.0, 2: -2.0}

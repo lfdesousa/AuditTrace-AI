@@ -20,13 +20,22 @@
 * **Template injection closed by construction:** the prompt is sent as TOKEN
   IDS. User content is tokenised in ONE ``parse_special:false`` call (piece by
   piece changes the ids) and the template's special ids are placed around it.
-  Because ``parse_special:false`` still returns some control strings
-  (``<think>`` etc.) as single ids on the pinned tokenizer, the user-content
-  ids are also checked against a DENYLIST of control ids (resolved by
-  tokenising each fixed control string with ``parse_special:true``). Control
-  tokens that only the GGUF tokenizer metadata marks as control, and that are
-  not in that fixed list, cannot be enumerated over HTTP; the live probe
-  cross-checks the fixed list on the real server.
+  ``parse_special:false`` is NOT enough on its own: on the pinned tokenizer it
+  still returns six added tokens (``<tool_call>``, ``</tool_call>``,
+  ``<tool_response>``, ``</tool_response>``, ``<think>``, ``</think>``) as
+  single control ids, and the tokenizer config's ``special`` flag does not
+  predict which ones. The guard is therefore keyed on the WHOLE added-token
+  table of the pinned model (all 33 entries, vendored in
+  ``token_tables.py`` and keyed by ``decision_model_digest``): user content is
+  rejected (``invalid_input``, no ``/completion`` call) if it contains any of
+  those strings literally OR tokenises to any of those ids. A digest with no
+  vendored table is refused at config time and at construction, because an
+  unknown model has no denylist and so may not take decisions.
+* **Identity cache (SF-e, the risk is open):** the ``/props`` identity is
+  fetched once per client and cached for its lifetime, as specified. A model
+  swapped behind the same URL is therefore not re-attested by a long-lived
+  client. WU-459-2, which makes the client process-resident, must choose
+  between a per-call re-check and a TTL.
 * **Secrets:** ``decision_api_key`` is sent as ``Authorization: Bearer`` and is
   never logged, recorded or placed in a repr.
 * **One process-resident client per settings;** use ``async with`` (the app
@@ -56,6 +65,7 @@ from audittrace.services.decision.distribution import (
 from audittrace.services.decision.errors import DecisionError, result_for
 from audittrace.services.decision.questions import Question, get_question
 from audittrace.services.decision.result import DecisionResult
+from audittrace.services.decision.token_tables import AddedTokenTable, table_for
 
 logger = logging.getLogger(__name__)
 
@@ -70,30 +80,10 @@ class _TokenTables:
         self,
         special_ids: dict[str, int],
         piece_ids: dict[str, list[int]],
-        denylist: frozenset[int],
     ) -> None:
         self.special_ids = special_ids
         self.piece_ids = piece_ids
-        self.denylist = denylist
         self.letter_ids: dict[str, int] = {}
-
-
-def _carries_control_token(
-    content: str, content_ids: list[int], denylist: frozenset[int]
-) -> bool:
-    """True when user content can reach a control token (fail closed).
-
-    Two independent signals, because each alone is incomplete on the pinned
-    tokenizer: ``parse_special:false`` splits ``<|im_start|>``, ``<|im_end|>``
-    and ``<|endoftext|>`` into plain-text pieces (no control id appears, so
-    only the literal-string check sees them) but still returns ``<think>``,
-    ``</think>``, ``<tool_call>`` and ``</tool_call>`` as single control ids
-    (caught by BOTH signals), and a text variant the tokenizer normalises to a
-    control id is caught only by the id check.
-    """
-    if any(control in content for control in tpl.CONTROL_STRINGS):
-        return True
-    return not denylist.isdisjoint(content_ids)
 
 
 class _Progress:
@@ -131,6 +121,13 @@ class LlamaCppDecisionClient:
             transport=transport, headers=headers, timeout=self._timeout_s
         )
         self._tracer = tracer or trace.get_tracer(__name__)
+        table = table_for(settings.decision_model_digest)
+        if self._base and table is None:
+            raise ValueError(
+                "no vendored added-token table for decision_model_digest: "
+                "an unknown model has no denylist and may not take decisions"
+            )
+        self._table: AddedTokenTable | None = table
         self._identity: llama.ServerIdentity | None = None
         self._tables: _TokenTables | None = None
         self._lock = asyncio.Lock()
@@ -184,10 +181,11 @@ class LlamaCppDecisionClient:
         except httpx.HTTPError as exc:
             return llama.map_transport_error(exc) or "malformed_response"
         except Exception as exc:
-            # Closed vocabulary has no "internal" code; log the CLASS only
-            # (never the message: it could carry user text).
+            # A bug in our own code: recorded as internal_error, never blamed
+            # on the upstream. Log the CLASS only (the message could carry
+            # user text).
             logger.warning("decision call failed unexpectedly: %s", type(exc).__name__)
-            return "malformed_response"
+            return "internal_error"
         return None
 
     # ----------------------------------------------------------- pipeline
@@ -207,29 +205,19 @@ class LlamaCppDecisionClient:
             if self._tables is not None:
                 return self._tables
             special: dict[str, int] = {}
-            denylist: set[int] = set()
-            # Template specials are resolved independently of the denylist
-            # (they are a subset of CONTROL_STRINGS today, but the two jobs
-            # must not be coupled: the denylist is exactly CONTROL_STRINGS).
-            for text in dict.fromkeys(
-                tpl.CONTROL_STRINGS + tpl.TEMPLATE_SPECIAL_TOKENS
-            ):
+            for text in tpl.TEMPLATE_SPECIAL_TOKENS:
                 ids = await llama.tokenize(
                     self._http, self._base, text, parse_special=True
                 )
-                if len(ids) == 1:
-                    special[text] = ids[0]
-                    if text in tpl.CONTROL_STRINGS:
-                        denylist.add(ids[0])
-            for text in tpl.TEMPLATE_SPECIAL_TOKENS:
-                if text not in special:
+                if len(ids) != 1:
                     raise DecisionError("template_token_unresolved")
+                special[text] = ids[0]
             pieces: dict[str, list[int]] = {}
             for text in dict.fromkeys(tpl.TEMPLATE_TEXT_PIECES):
                 pieces[text] = await llama.tokenize(
                     self._http, self._base, text, parse_special=False
                 )
-            self._tables = _TokenTables(special, pieces, frozenset(denylist))
+            self._tables = _TokenTables(special, pieces)
             return self._tables
 
     async def _allowed_ids(
@@ -247,6 +235,24 @@ class LlamaCppDecisionClient:
             out.append(tables.letter_ids[letter])
         return tuple(out)
 
+    def _has_denied_literal(self, content: str) -> bool:
+        """Literal added-token string in the user content (any of the table).
+
+        Needed because ``parse_special:false`` splits some of them into plain
+        text pieces, so no id would ever reveal them.
+        """
+        return self._table is not None and any(
+            token in content for token in self._table.contents
+        )
+
+    def _has_denied_id(self, content_ids: list[int]) -> bool:
+        """Any added-token id in the tokenised user content (any of the table).
+
+        Catches text the tokenizer normalises to an added-token id even though
+        the literal string is absent.
+        """
+        return self._table is not None and not self._table.ids.isdisjoint(content_ids)
+
     async def build_prompt_ids(self, state: str, question: Question) -> list[int]:
         """The exact token-id prompt for ``(state, question)``.
 
@@ -257,10 +263,12 @@ class LlamaCppDecisionClient:
         """
         tables = await self._resolve_tables()
         content = tpl.build_user_content(state, question.text, question.options)
+        if self._has_denied_literal(content):
+            raise DecisionError("invalid_input")
         content_ids = await llama.tokenize(
             self._http, self._base, content, parse_special=False
         )
-        if _carries_control_token(content, content_ids, tables.denylist):
+        if self._has_denied_id(content_ids):
             raise DecisionError("invalid_input")
         return tpl.splice_prompt_ids(tables.special_ids, tables.piece_ids, content_ids)
 

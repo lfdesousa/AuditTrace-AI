@@ -1,7 +1,6 @@
 import logging
 import math
 import os
-import re
 from functools import lru_cache
 from typing import Literal, Self
 
@@ -35,8 +34,6 @@ def _as_sync_url(url: str) -> str:
     return url
 
 
-# #459 WU-459-1: a configured decision-model digest is a lowercase sha256 hex.
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # #459 WU-459-1: the routing modes this slice accepts. ``acting`` is
 # deliberately absent: no scheduling answer exists yet (acting mode is out of
 # scope until a later slice), so it must fail at startup, not silently act.
@@ -635,10 +632,15 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _decision_cross_field(self) -> Self:
         if self.decision_url:
-            if not _SHA256_HEX.fullmatch(self.decision_model_digest):
+            # Imported here: the decision package imports this module.
+            from audittrace.services.decision.token_tables import table_for
+
+            if table_for(self.decision_model_digest) is None:
                 raise ValueError(
-                    "decision_model_digest must be 64 lowercase hex chars "
-                    "when decision_url is set"
+                    "decision_model_digest has no vendored added-token table "
+                    "(must be the lowercase sha256 of a pinned model): an "
+                    "unknown model has no control-token denylist and may not "
+                    "take decisions"
                 )
             if not self.decision_model_alias:
                 raise ValueError(

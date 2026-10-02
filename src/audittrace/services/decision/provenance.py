@@ -86,7 +86,9 @@ def build_args(result: DecisionResult, *, mode: str, acted: bool) -> dict[str, A
         "backend": result.backend,
         "quantisation": result.quantisation,
         "temperature": result.temperature,
-        "sampler_params": result.sampler_params,
+        "sampler_params": (
+            None if result.sampler_params is None else dict(result.sampler_params)
+        ),
         "n_probs": result.n_probs,
         # JSON object keys are strings: token ids are stringified here.
         "raw_top_logprobs": None

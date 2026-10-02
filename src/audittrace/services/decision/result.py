@@ -13,8 +13,10 @@ reconstruction divides the raw logprobs by the CLIENT one.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 
 
@@ -32,7 +34,7 @@ class DecisionResult:
     entropy: float | None = None
     distribution: tuple[float, ...] | None = None
     # id -> logprob, exactly as returned by the runtime.
-    raw_top_logprobs: dict[int, float] | None = None
+    raw_top_logprobs: Mapping[int, float] | None = None
     allowed_ids: tuple[int, ...] | None = None
     # --- reconstruction inputs / provenance ---
     template_id: str | None = None
@@ -51,5 +53,19 @@ class DecisionResult:
     backend: str = ""
     quantisation: str = ""
     temperature: float | None = None
-    sampler_params: dict[str, Any] | None = field(default=None)
+    sampler_params: Mapping[str, Any] | None = field(default=None)
     n_probs: int | None = None
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` only protects the FIELDS. The two mappings are the
+        # reconstruction inputs, so they are copied and wrapped read-only:
+        # neither the caller's original dict nor the result can later change
+        # what the audit row records.
+        if self.raw_top_logprobs is not None:
+            object.__setattr__(
+                self, "raw_top_logprobs", MappingProxyType(dict(self.raw_top_logprobs))
+            )
+        if self.sampler_params is not None:
+            object.__setattr__(
+                self, "sampler_params", MappingProxyType(dict(self.sampler_params))
+            )

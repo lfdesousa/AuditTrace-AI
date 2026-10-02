@@ -175,7 +175,10 @@ async def test_t7_ok_row_keys_equal_literal_set_and_every_value_by_value() -> No
     )
     assert args["allowed_ids"] == ids
     assert args["decision_model"] == "tev1-test-model"
-    assert args["decision_model_digest_configured"] == "ab" * 32
+    assert (
+        args["decision_model_digest_configured"]
+        == "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf"
+    )
     assert args["server_model_file"] == "tev1-test.gguf"
     assert args["server_model_alias"] == "tev1-test"
     assert args["runtime"] == "llama.cpp"
@@ -268,7 +271,8 @@ async def test_t7_failure_rows_have_every_key_with_null_for_unknowns(
     ):
         assert args[unknown] is None, unknown
     assert (
-        args["decision_model_digest_configured"] == "ab" * 32
+        args["decision_model_digest_configured"]
+        == "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf"
     )  # config is always known
     assert args["temperature"] == 1.0
     assert p.error == r.error_code

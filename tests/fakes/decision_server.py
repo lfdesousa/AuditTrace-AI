@@ -21,23 +21,14 @@ from typing import Any
 import httpx
 
 from audittrace.config import Settings
+from tests.fakes.decision_added_tokens import ID_OF, LEAKY
 
-DIGEST = "ab" * 32
+DIGEST = "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf"
 URL = "http://decision.test"
 ALIAS = "tev1-test"
 
-# Control ids of the fake tokenizer (same ids the real tokenizer returns).
-CONTROL_IDS = {
-    "<|im_start|>": 248045,
-    "<|im_end|>": 248046,
-    "<|endoftext|>": 248044,
-    "<think>": 248068,
-    "</think>": 248069,
-    "<tool_call>": 248058,
-    "</tool_call>": 248059,
-}
-# Measured: parse_special:false still matches these four as control ids.
-LEAKY = ("<think>", "</think>", "<tool_call>", "</tool_call>")
+# Added-token ids of the fake tokenizer (same ids the real tokenizer returns).
+CONTROL_IDS = dict(ID_OF)
 
 RECORDED = (
     Path(__file__).resolve().parents[1] / "fixtures/decision/recorded_tev1_f16.json"
@@ -62,7 +53,11 @@ def make_settings(**overrides: Any) -> Settings:
 
 
 def fake_tokenize(text: str, parse_special: bool) -> list[int]:
-    """Char-level ids (``ord``) with the measured control-token behaviour."""
+    """Char-level ids (``ord``) with the measured added-token behaviour.
+
+    ``parse_special:true``: every added token is ONE id. ``parse_special:false``:
+    only the measured ``LEAKY`` six stay single ids; the rest split to text.
+    """
     ids: list[int] = []
     i = 0
     while i < len(text):

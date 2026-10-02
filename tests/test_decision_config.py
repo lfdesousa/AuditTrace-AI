@@ -7,7 +7,8 @@ from pydantic import ValidationError
 
 from audittrace.config import Settings
 
-DIGEST = "ab" * 32
+DIGEST = "4f8a3d7fc2c8eda2601751ace44690ba1080e508842df88644cedcc08af82cdf"
+UNTABLED_DIGEST = "ab" * 32  # valid hex, but no vendored added-token table
 
 
 def _s(**kw: object) -> Settings:
@@ -90,3 +91,17 @@ def test_timeout_must_be_positive(value: int) -> None:
 def test_temperature_must_be_positive_and_finite(value: float) -> None:
     with pytest.raises(ValidationError, match="decision_temperature"):
         _s(decision_temperature=value)
+
+
+def test_digest_without_a_vendored_token_table_is_rejected_when_url_set() -> None:
+    """An unknown model has no control-token denylist, so it may not decide."""
+    with pytest.raises(ValidationError, match="vendored added-token table"):
+        _s(
+            decision_url="http://x:1",
+            decision_model_alias="a",
+            decision_model_digest=UNTABLED_DIGEST,
+        )
+
+
+def test_untabled_digest_is_harmless_while_disabled() -> None:
+    assert _s(decision_model_digest=UNTABLED_DIGEST).decision_url == ""

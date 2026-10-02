@@ -65,20 +65,6 @@ TEMPLATE_SPECIAL_TOKENS = (IM_START, IM_END, THINK_OPEN, THINK_CLOSE)
 # Every ordinary-text piece the template places itself.
 TEMPLATE_TEXT_PIECES = (USER_ROLE, NEWLINE, ASSISTANT_ROLE, THINK_BODY)
 
-# The fixed list whose ids are DENIED in user content (SF-1). On the pinned
-# tokenizer ``parse_special:false`` splits the role tokens but still returns
-# <think>, </think>, <tool_call>, </tool_call> as single control ids, so the
-# denylist is checked on the tokenised user content, not assumed.
-CONTROL_STRINGS = (
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|endoftext|>",
-    "<think>",
-    "</think>",
-    "<tool_call>",
-    "</tool_call>",
-)
-
 # The sha256 of OUR template definition (format pieces + special-token names),
 # NOT of the upstream jinja. Changing any piece changes this id; the version
 # id ``TEMPLATE_ID`` must then be bumped (a test pins the pair).
