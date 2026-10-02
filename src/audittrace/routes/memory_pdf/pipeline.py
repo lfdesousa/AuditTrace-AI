@@ -268,10 +268,14 @@ async def _index_pdf_objects(
         # for the entire downstream lifecycle.
         document_hash = hashlib.sha256(raw).hexdigest()
         # Item #12 — signature validation. Computed once per file.
-        signature_status, _signers_count = _pdf_signature_status(
+        # Awaited: pyhanko's sync wrapper does ``asyncio.run`` and fails
+        # inside this running loop (#366). key + sha only enrich log lines.
+        signature_status, _signers_count = await _pdf_signature_status(
             raw,
             enabled=settings.pdf_signature_check_enabled,
             trust_store_path=settings.pdf_signature_trust_store,
+            key=obj["key"],
+            document_sha256=document_hash,
         )
         # Tier-C #13 (ADR-056) — LTV summary. Computed once per file
         # alongside signature_status. Returns ``None`` for

@@ -3137,16 +3137,16 @@ class TestPdfSignatureValidation:
     a future revision.
     """
 
-    def test_signature_check_disabled_returns_check_skipped(self) -> None:
+    async def test_signature_check_disabled_returns_check_skipped(self) -> None:
         from audittrace.routes.memory import _pdf_signature_status
 
-        status, count = _pdf_signature_status(
+        status, count = await _pdf_signature_status(
             b"%PDF-1.4 ignored", enabled=False, trust_store_path=""
         )
         assert status == "check_skipped"
         assert count == 0
 
-    def test_pdf_with_no_signatures_returns_none_real_pdf(self) -> None:
+    async def test_pdf_with_no_signatures_returns_none_real_pdf(self) -> None:
         """Real pyhanko + real (unsigned) PDF generated via pymupdf.
         Smoke test for contract drift between our helper and pyhanko's
         ``embedded_signatures`` field — runs every CI pass."""
@@ -3160,11 +3160,13 @@ class TestPdfSignatureValidation:
         raw = doc.tobytes()
         doc.close()
 
-        status, count = _pdf_signature_status(raw, enabled=True, trust_store_path="")
+        status, count = await _pdf_signature_status(
+            raw, enabled=True, trust_store_path=""
+        )
         assert status == "none"
         assert count == 0
 
-    def test_signed_valid_returns_signed_valid(self) -> None:
+    async def test_signed_valid_returns_signed_valid(self) -> None:
         """Mock pyhanko: one signature, all checks pass."""
         from audittrace.routes.memory import _pdf_signature_status
 
@@ -3175,20 +3177,22 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=fake_status,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_valid"
         assert count == 1
 
-    def test_signed_invalid_returns_signed_invalid(self) -> None:
+    async def test_signed_invalid_returns_signed_invalid(self) -> None:
         """``valid=False`` is the signature-math-broken signal:
         wrong key, corrupted bytes, or weak-algorithm policy reject.
         Real audit signal — the auth claim is unverifiable.
@@ -3209,20 +3213,22 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=fake_status,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_invalid"
         assert count == 1
 
-    def test_signed_with_untrusted_chain_returns_signed_untrusted(self) -> None:
+    async def test_signed_with_untrusted_chain_returns_signed_untrusted(self) -> None:
         """Signature math valid + content intact but cert chain not
         trusted by the configured trust store, even when re-validated
         as-of self-reported signing time. Per ADR-052 §1 + ADR-054 §2
@@ -3243,20 +3249,22 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=fake_status,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_untrusted"
         assert count == 1
 
-    def test_signed_expired_returns_signed_expired(self) -> None:
+    async def test_signed_expired_returns_signed_expired(self) -> None:
         """ADR-054 §1 — chain doesn't validate at present (e.g. cert
         expired) but DOES validate as-of the self-reported signing
         time. Distinct from ``signed_untrusted`` (no confidence at
@@ -3286,21 +3294,23 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 side_effect=[first_status, retry_status],
             ),
-            patch("pyhanko_certvalidator.ValidationContext"),
+            patch("pyhanko_certvalidator.ValidationContext", autospec=True),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_expired"
         assert count == 1
 
-    def test_signed_untrusted_when_retry_also_fails(self) -> None:
+    async def test_signed_untrusted_when_retry_also_fails(self) -> None:
         """ADR-054 §2 — retry path: when the as-of-signing-time
         re-validation ALSO returns trusted=False (the chain doesn't
         validate at any time, not just now), classify as
@@ -3324,26 +3334,72 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 side_effect=[first_status, retry_status],
             ),
-            patch("pyhanko_certvalidator.ValidationContext"),
+            patch("pyhanko_certvalidator.ValidationContext", autospec=True),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_untrusted"
         assert count == 1
 
-    def test_signed_untrusted_when_retry_path_crashes(self) -> None:
-        """ADR-054 §2 — defensive guard: if the as-of-signing-time
-        retry path itself crashes (e.g. ValidationContext ctor blows
-        up on edge-case input), fall back to ``signed_untrusted``
-        rather than masking with a worse class. The original outcome
-        (trusted=False, no retry signal) is the safe interpretation."""
+    async def test_signed_untrusted_when_retry_rejects_the_document(self) -> None:
+        """ADR-054 §2 + spec #460 S5 — if the as-of-signing-time retry
+        validation raises a DOCUMENT failure type (the cert does not
+        validate at signing time either, here a certvalidator
+        ``PathError``), keep ``signed_untrusted``: the original
+        outcome (trusted=False, no retry signal) is the safe reading.
+
+        Neuter: map ANY retry exception to ``signed_untrusted`` again ->
+        ``test_retry_runtime_error_is_check_error`` (and grid cell G9 in
+        ``tests/test_pdf_signature_async.py``) goes RED."""
+        from datetime import UTC, datetime
+
+        from pyhanko_certvalidator.errors import PathError
+
+        from audittrace.routes.memory import _pdf_signature_status
+        from audittrace.routes.memory_pdf import signature as _sig
+
+        _sig._VC_TRUST_ROOTS = [MagicMock(name="trust-root-cert")]
+
+        fake_emb = MagicMock()
+        fake_emb.self_reported_timestamp = datetime(2025, 1, 15, tzinfo=UTC)
+        fake_reader = MagicMock()
+        fake_reader.embedded_signatures = [fake_emb]
+        first_status = MagicMock(intact=True, valid=True, trusted=False)
+
+        with (
+            patch(
+                "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
+                return_value=fake_reader,
+            ),
+            patch(
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
+                side_effect=[first_status, PathError("no path")],
+            ),
+            patch("pyhanko_certvalidator.ValidationContext", autospec=True),
+        ):
+            status, count = await _pdf_signature_status(
+                b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
+            )
+        assert status == "signed_untrusted"
+        assert count == 1
+
+    async def test_retry_context_construction_crash_is_check_error(self) -> None:
+        """Spec #460 S5 / B-1 — our own retry ``ValidationContext``
+        construction crashing is NOT a document failure: ``check_error``
+        (it used to be swallowed into ``signed_untrusted``). Neuter: catch
+        broad ``Exception`` around the construction and mark untrusted ->
+        RED."""
         from datetime import UTC, datetime
 
         from audittrace.routes.memory import _pdf_signature_status
@@ -3360,24 +3416,27 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=first_status,
             ),
             patch(
                 "pyhanko_certvalidator.ValidationContext",
+                autospec=True,
                 side_effect=RuntimeError("crash inside retry"),
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
-        assert status == "signed_untrusted"
-        assert count == 1
+        assert status == "check_error"
+        assert count == 0
 
-    def test_signed_untrusted_takes_precedence_over_signed_expired(self) -> None:
+    async def test_signed_untrusted_takes_precedence_over_signed_expired(self) -> None:
         """ADR-054 §4 — multi-sig document with one expired sig and
         one untrusted sig flags as ``signed_untrusted``. ``untrusted``
         (no confidence at any time) outranks ``expired`` (confidence
@@ -3413,21 +3472,23 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 side_effect=statuses,
             ),
-            patch("pyhanko_certvalidator.ValidationContext"),
+            patch("pyhanko_certvalidator.ValidationContext", autospec=True),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_untrusted"
         assert count == 2
 
-    def test_signed_invalid_takes_precedence_over_signed_untrusted(self) -> None:
+    async def test_signed_invalid_takes_precedence_over_signed_untrusted(self) -> None:
         """Multi-sig document with one ``valid=False`` sig and one
         ``trusted=False`` sig flags as ``signed_invalid`` — the
         worst-signal-wins precedence per ADR-052 §1
@@ -3453,14 +3514,16 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 side_effect=statuses,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         # signed_invalid wins because invalid > untrusted in the
@@ -3469,7 +3532,7 @@ class TestPdfSignatureValidation:
         assert status == "signed_invalid"
         assert count == 2
 
-    def test_signed_tampered_returns_signed_tampered(self) -> None:
+    async def test_signed_tampered_returns_signed_tampered(self) -> None:
         """``intact=False`` is the strongest negative signal:
         cryptographic proof that the document was modified after
         signing. Reported separately from generic ``signed_invalid``
@@ -3483,20 +3546,22 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=fake_status,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_tampered"
         assert count == 1
 
-    def test_signature_validation_exception_returns_check_failed(self) -> None:
+    async def test_signature_validation_exception_returns_check_failed(self) -> None:
         """Any unexpected exception during validation (malformed PDF,
         OCSP timeout, pyhanko bug) is recorded as ``check_failed`` —
         distinct from ``signed_invalid`` so auditors can separate
@@ -3507,15 +3572,16 @@ class TestPdfSignatureValidation:
 
         with patch(
             "pyhanko.pdf_utils.reader.PdfFileReader",
+            autospec=True,
             side_effect=ValueError("corrupted xref"),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"\x00bad bytes", enabled=True, trust_store_path=""
             )
         assert status == "check_failed"
         assert count == 0
 
-    def test_multiple_signatures_aggregate_to_worst_status(self) -> None:
+    async def test_multiple_signatures_aggregate_to_worst_status(self) -> None:
         """When a document has N signatures, the file's status is the
         worst across them — one tampered signature poisons the file
         even if other signatures are valid. (Tampering > invalid >
@@ -3535,14 +3601,16 @@ class TestPdfSignatureValidation:
         with (
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 side_effect=statuses,
             ),
         ):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "signed_tampered"
@@ -3605,10 +3673,12 @@ class TestPdfSignatureValidation:
             patch.dict("sys.modules", {"pymupdf": fake_pymupdf}),
             patch(
                 "pyhanko.pdf_utils.reader.PdfFileReader",
+                autospec=True,
                 return_value=fake_reader,
             ),
             patch(
-                "pyhanko.sign.validation.validate_pdf_signature",
+                "pyhanko.sign.validation.async_validate_pdf_signature",
+                autospec=True,
                 return_value=fake_sig_status,
             ),
         ):
@@ -3769,6 +3839,7 @@ class TestPdfHelperCoverage:
             ),
             patch(
                 "pyhanko_certvalidator.ValidationContext",
+                autospec=True,
                 return_value=fake_vc,
             ) as mock_vc_cls,
         ):
@@ -3815,7 +3886,7 @@ class TestPdfHelperCoverage:
         assert _sig._VALIDATION_CONTEXT is None
         assert _sig._VC_TRUST_STORE_PATH == ""
 
-    def test_signature_check_unavailable_when_pyhanko_missing(self) -> None:
+    async def test_signature_check_unavailable_when_pyhanko_missing(self) -> None:
         """If pyhanko.pdf_utils.reader can't import, the helper
         returns ``check_unavailable`` instead of crashing — graceful
         degradation per PYTHON-ENGINEERING §4."""
@@ -3827,7 +3898,7 @@ class TestPdfHelperCoverage:
         # into sys.modules — Python raises ImportError when an entry
         # is None on import attempt.
         with patch.dict(sys.modules, {"pyhanko.pdf_utils.reader": None}):
-            status, count = _pdf_signature_status(
+            status, count = await _pdf_signature_status(
                 b"%PDF-1.4 ignored", enabled=True, trust_store_path=""
             )
         assert status == "check_unavailable"
@@ -6935,7 +7006,8 @@ class TestSignatureStatusCodes:
     def test_signature_status_codes_match_adr_052_closed_set(self) -> None:
         from audittrace.routes.memory import _SIGNATURE_STATUS_CODES
 
-        # The exact 9 values documented in ADR-052 §1 + ADR-054 §1.
+        # The exact 10 values documented in ADR-052 §1 + ADR-054 §1 +
+        # the #460 addendum (``check_error``).
         # Adding a value: bump the ADR + add it here. Removing one:
         # same. CI fails the diff if these drift. The split across
         # operator/runtime conditions, structural, and verdict
@@ -6945,6 +7017,7 @@ class TestSignatureStatusCodes:
             "check_skipped",
             "check_unavailable",
             "check_failed",
+            "check_error",  # #460: our call into the validator failed
             # structural (the document carries no signatures)
             "none",
             # verdicts (pyhanko produced a verdict for at least
@@ -8054,7 +8127,11 @@ class TestLtvSummary:
         fake_reader = MagicMock()
         fake_reader.embedded_signatures = []
 
-        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+        with patch(
+            "pyhanko.pdf_utils.reader.PdfFileReader",
+            autospec=True,
+            return_value=fake_reader,
+        ):
             assert _summarize_ltv(b"%PDF-1.4 minimal") is None
 
     def test_signed_no_dss_returns_has_dss_false(self) -> None:
@@ -8071,7 +8148,11 @@ class TestLtvSummary:
         fake_reader.trailer_view = fake_trailer
         fake_reader.trailer = fake_trailer
 
-        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+        with patch(
+            "pyhanko.pdf_utils.reader.PdfFileReader",
+            autospec=True,
+            return_value=fake_reader,
+        ):
             result = _summarize_ltv(b"%PDF-1.4 signed-no-ltv")
         assert result is not None
         assert result == {
@@ -8099,7 +8180,11 @@ class TestLtvSummary:
         fake_reader.trailer_view = fake_trailer
         fake_reader.trailer = fake_trailer
 
-        with patch("pyhanko.pdf_utils.reader.PdfFileReader", return_value=fake_reader):
+        with patch(
+            "pyhanko.pdf_utils.reader.PdfFileReader",
+            autospec=True,
+            return_value=fake_reader,
+        ):
             result = _summarize_ltv(b"%PDF-1.4 doctimestamped")
         assert result is not None
         assert result["timestamps"] == 1

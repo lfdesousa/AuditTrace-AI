@@ -6070,7 +6070,8 @@ paths:
         * 401 — missing or invalid JWT.\n* 403 — JWT lacks ``audittrace:admin``.\n* 502 — Builder unavailable (pyhanko[etsi]\
         \ missing, EU LOTL\n  unreachable, XAdES verification failed). The previously-stored\n  bundle remains in place; subsequent\
         \ signature checks continue\n  to use it. Operator can retry once upstream conditions clear.\n* 500 — Provider write\
-        \ failed (MinIO down, permission issue).\n  Investigate and retry."
+        \ failed (MinIO down, permission issue), OR a\n  Builder's own code failed (``trust_store_build_internal_error``;\n\
+        \  the stored bundle is kept). Investigate and retry."
       operationId: refresh_trust_store_system_trust_store_refresh_post
       responses:
         '200':

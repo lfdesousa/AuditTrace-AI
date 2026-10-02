@@ -155,6 +155,97 @@
         "enableLogDetails": true,
         "sortOrder": "Descending"
       }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "PDF Signature Classifications — rate by status",
+      "description": "Per-status rate of PDF signature classifications (audittrace_pdf_signature_checks_total{status}; closed 10-code taxonomy, no PII). A signed corpus reading mostly check_failed or check_error is the #366 failure shape. A missing series means no PDF was classified in the window, not zero.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(audittrace_pdf_signature_checks_total[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "PDF Signature check_error — 24h",
+      "description": "Count of check_error classifications in 24h: our call into the validator failed for a reason other than the document (logged at ERROR). Any non-zero value is a regression signal. 'no data' means no check_error series exists, which is NOT a measured zero.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(audittrace_pdf_signature_checks_total{status=\"check_error\"}[24h]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background"
+      }
     }
   ],
   "refresh": "30s",

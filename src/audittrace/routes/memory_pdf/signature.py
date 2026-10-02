@@ -1,4 +1,4 @@
-"""PAdES signature validation + closed-set 9-class taxonomy.
+"""PAdES signature validation + closed-set 10-class taxonomy.
 
 The heaviest pure-PDF concern in this sub-package. Encapsulates:
 
@@ -26,7 +26,12 @@ import io
 import logging
 import re
 import threading
+from datetime import timedelta
 from typing import Any
+
+from opentelemetry import trace
+
+from audittrace.services.pdf_signature_telemetry import emit_signature_check
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,7 @@ _SIGNATURE_STATUS_CODES: frozenset[str] = frozenset(
         "check_skipped",
         "check_unavailable",
         "check_failed",
+        "check_error",
         "none",
         "signed_valid",
         "signed_invalid",
@@ -217,27 +223,110 @@ def _invalidate_validation_context() -> None:
         _VC_TRUST_ROOTS = []
 
 
-def _pdf_signature_status(
+def _current_trace_id() -> str | None:
+    """Active OpenTelemetry trace id as 32-char hex, or ``None``."""
+    ctx = trace.get_current_span().get_span_context()
+    return format(ctx.trace_id, "032x") if ctx.is_valid else None
+
+
+def _log_context(
+    key: str, document_sha256: str, reason: str, exc: BaseException
+) -> dict[str, Any]:
+    """``extra`` fields that join a log line to its manifest row (AC13)."""
+    return {
+        "reason": reason,
+        "error": repr(exc),
+        "file": key,
+        "document_sha256": document_sha256,
+        "trace_id": _current_trace_id(),
+    }
+
+
+def _classify_exception(
+    exc: Exception,
+    *,
+    document_failure_types: tuple[type[BaseException], ...],
+    key: str,
+    document_sha256: str,
+) -> str:
+    """Map a pyhanko-call exception to ``check_failed`` or ``check_error``.
+
+    Purely type-based (Addendum B-1): an instance of
+    ``DOCUMENT_FAILURE_TYPES`` means the document could not be validated
+    (WARNING); anything else means our call crashed (ERROR).
+    """
+    if isinstance(exc, document_failure_types):
+        logger.warning(
+            "Signature validation raised on document: %s",
+            exc,
+            extra=_log_context(key, document_sha256, "signature_check_exception", exc),
+        )
+        return "check_failed"
+    logger.error(
+        "Signature validation call failed (not a document failure): %r",
+        exc,
+        extra=_log_context(key, document_sha256, "signature_check_internal_error", exc),
+    )
+    return "check_error"
+
+
+async def _pdf_signature_status(
     raw: bytes,
     *,
     enabled: bool,
     trust_store_path: str,
+    key: str = "",
+    document_sha256: str = "",
 ) -> tuple[str, int]:
-    """Return ``(status, signers_count)`` for *raw* PDF bytes.
+    """Return ``(status, signers_count)`` for *raw* PDF bytes, and count it.
 
-    Status taxonomy — 9 closed-set values pinned by
-    ``_SIGNATURE_STATUS_CODES`` (per ADR-052 §1 + ADR-054 §1).
+    Runs as a coroutine on the caller's event loop and awaits pyhanko's
+    native ``async_validate_pdf_signature``. The synchronous
+    ``validate_pdf_signature`` wraps the same coroutine in ``asyncio.run``,
+    which raises inside a running loop (#366: every signed PDF read
+    ``check_failed`` from 2026-05-31, when ``_index_pdf_objects`` became
+    ``async def``). ``key`` / ``document_sha256`` only enrich log lines.
+    """
+    status, signers = await _classify_pdf_signatures(
+        raw,
+        enabled=enabled,
+        trust_store_path=trust_store_path,
+        key=key,
+        document_sha256=document_sha256,
+    )
+    emit_signature_check(status=status)
+    return status, signers
+
+
+async def _classify_pdf_signatures(
+    raw: bytes,
+    *,
+    enabled: bool,
+    trust_store_path: str,
+    key: str,
+    document_sha256: str,
+) -> tuple[str, int]:
+    """Classify *raw* into the closed taxonomy. See the codes below.
+
+    Status taxonomy — 10 closed-set values pinned by
+    ``_SIGNATURE_STATUS_CODES`` (ADR-052 §1, ADR-054 §1, spec #460).
     Every chunk's metadata carries one via ``signature_status``:
 
     * ``"check_skipped"`` — operator disabled the check via
       ``AUDITTRACE_PDF_SIGNATURE_CHECK_ENABLED=false``.
     * ``"check_unavailable"`` — pyhanko not importable (graceful
       degradation per PYTHON-ENGINEERING §4).
-    * ``"check_failed"`` — pyhanko raised on this file (malformed
-      PDF, network failure during OCSP, unexpected exception).
-      Distinct from ``"signed_invalid"`` so auditors can separate
-      "we tried and the document broke" from "the document said it
-      was signed and the signature was bad."
+    * ``"check_failed"`` — the DOCUMENT could not be validated: pyhanko (or
+      a library under it) raised one of ``DOCUMENT_FAILURE_TYPES`` (corrupt
+      signature bytes, truncated file, ...). Distinct from
+      ``"signed_invalid"`` so auditors can separate "we tried and the
+      document broke" from "the document said it was signed and the
+      signature was bad." Narrowed by spec #460 from ADR-054 §1's
+      "(pyhanko raised)": "our code crashed" is now ``check_error``.
+    * ``"check_error"`` — our call into the validator failed for a reason
+      other than the document (``RuntimeError``, ``TypeError``,
+      ``AttributeError``, a status object that lost an attribute the
+      classifier reads, ...). Logged at ERROR; a spike means a regression.
     * ``"none"`` — file parsed successfully and contains zero
       embedded signatures.
     * ``"signed_valid"`` — every signature is intact, valid, AND
@@ -274,6 +363,15 @@ def _pdf_signature_status(
     the signing identity at any time, while expired = confidence in
     the identity, just past the validity window.
 
+    Exception handling (Addendum B-1): every exception from the reader /
+    embedded-signature construction and from the validate call, primary
+    and ADR-054 retry alike, is split by TYPE. ``DOCUMENT_FAILURE_TYPES``
+    -> ``check_failed`` (in the retry: ``signed_untrusted``, the cert did
+    not validate at signing time either); anything else -> ``check_error``.
+    The classifier reads ONLY ``intact``, ``valid`` and ``trusted`` from a
+    status, by direct attribute access: a missing attribute is an
+    ``AttributeError`` and so ``check_error``, never a silent default.
+
     Detect-and-record only in v1 — never reject. The chunk metadata
     field lets auditors query for any non-clean state without changing
     the ingestion contract.
@@ -282,29 +380,57 @@ def _pdf_signature_status(
         return ("check_skipped", 0)
     try:
         from pyhanko.pdf_utils.reader import PdfFileReader
-        from pyhanko.sign.validation import validate_pdf_signature
+        from pyhanko.sign.validation import async_validate_pdf_signature
         from pyhanko_certvalidator import ValidationContext
+
+        from audittrace.routes.memory_pdf.signature_errors import (
+            DOCUMENT_FAILURE_TYPES,
+        )
     except ImportError:
         return ("check_unavailable", 0)
+
+    def _fail(exc: Exception) -> tuple[str, int]:
+        return (
+            _classify_exception(
+                exc,
+                document_failure_types=DOCUMENT_FAILURE_TYPES,
+                key=key,
+                document_sha256=document_sha256,
+            ),
+            0,
+        )
+
+    # Parse step: reader + embedded-signature construction.
     try:
         reader = PdfFileReader(io.BytesIO(raw))
         signatures = list(reader.embedded_signatures)
-        if not signatures:
-            return ("none", 0)
+    except Exception as exc:
+        return _fail(exc)
+    if not signatures:
+        return ("none", 0)
+    # Our own configuration, not the document: any failure here is
+    # ``check_error`` regardless of the exception type.
+    try:
         vc = _get_validation_context(trust_store_path)
-        any_tampered = False
-        any_invalid = False
-        any_untrusted = False
-        any_expired = False
+    except Exception as exc:
+        return _fail_internal(exc, key=key, document_sha256=document_sha256)
+
+    any_tampered = False
+    any_invalid = False
+    any_untrusted = False
+    any_expired = False
+    try:
         for emb in signatures:
-            status = validate_pdf_signature(emb, vc)
-            if not getattr(status, "intact", True):
+            status = await async_validate_pdf_signature(
+                emb, signer_validation_context=vc
+            )
+            if not status.intact:
                 any_tampered = True
                 continue
-            if not getattr(status, "valid", True):
+            if not status.valid:
                 any_invalid = True
                 continue
-            if getattr(status, "trusted", True):
+            if status.trusted:
                 continue  # signed_valid for this sig
             # trusted=False — try as-of-signing-time validation
             # (ADR-054 §2). If pyhanko's chain walk failed because
@@ -314,63 +440,72 @@ def _pdf_signature_status(
             # legitimate when signed (issuing CA in our trust roots);
             # the chain has just aged out — distinct audit signal
             # from "we don't know this CA at all".
-            signing_time = getattr(emb, "self_reported_timestamp", None)
+            signing_time = emb.self_reported_timestamp
             if signing_time is None or not _VC_TRUST_ROOTS:
                 any_untrusted = True
                 continue
+            # ``time_tolerance`` absorbs clock skew between the signing
+            # machine and the CA that issued the leaf cert (a real
+            # signature's signing time was 28s BEFORE the leaf's
+            # NotBefore, rejected under pyhanko's 1s default). 5 minutes
+            # is roughly Kerberos's default skew tolerance.
             try:
-                # ADR-054 §2 + 2026-05-09 hotfix:
-                # ``time_tolerance`` absorbs clock skew between the
-                # signing machine and the CA that issued the leaf
-                # cert. main_signed.pdf had a self-reported signing
-                # time 28 seconds BEFORE the leaf cert's NotBefore —
-                # signing happened mid-issuance, but pyhanko's
-                # default 1-second tolerance rejected it as
-                # NotYetValidError. 5 minutes is a realistic
-                # cap on signer-vs-CA clock skew (roughly Kerberos's
-                # default skew tolerance), generous enough to
-                # absorb workflow timing without being so wide it
-                # masks genuinely-out-of-window signatures.
-                from datetime import timedelta
-
                 retry_vc = ValidationContext(
                     trust_roots=list(_VC_TRUST_ROOTS),
                     moment=signing_time,
                     best_signature_time=signing_time,
                     time_tolerance=timedelta(minutes=5),
                 )
-                retry_status = validate_pdf_signature(emb, retry_vc)
-            except Exception as retry_exc:
-                # Retry path crashed — fall back to untrusted rather
-                # than masking the original outcome with a worse one.
+            except Exception as exc:
+                # Our own context construction, not the document.
+                return _fail_internal(exc, key=key, document_sha256=document_sha256)
+            try:
+                retry_status = await async_validate_pdf_signature(
+                    emb, signer_validation_context=retry_vc
+                )
+            except DOCUMENT_FAILURE_TYPES as retry_exc:
+                # The cert did not validate at signing time either:
+                # keep today's ``signed_untrusted`` semantics. Anything
+                # that is NOT a document failure propagates to the outer
+                # handler -> ``check_error`` (Addendum A S5 / B-1).
                 logger.warning(
-                    "as-of-signing-time retry crashed: %s; "
+                    "as-of-signing-time retry rejected: %s; "
                     "classifying as signed_untrusted",
                     retry_exc,
+                    extra=_log_context(
+                        key, document_sha256, "signature_retry_rejected", retry_exc
+                    ),
                 )
                 any_untrusted = True
                 continue
-            if getattr(retry_status, "trusted", False):
+            if retry_status.trusted:
                 any_expired = True
             else:
                 any_untrusted = True
-        # Precedence (ADR-054 §4): tampered > invalid > untrusted
-        # > expired > valid. signed_untrusted (no confidence at any
-        # time) outranks signed_expired (confidence at signing time,
-        # past validity now).
-        if any_tampered:
-            return ("signed_tampered", len(signatures))
-        if any_invalid:
-            return ("signed_invalid", len(signatures))
-        if any_untrusted:
-            return ("signed_untrusted", len(signatures))
-        if any_expired:
-            return ("signed_expired", len(signatures))
-        return ("signed_valid", len(signatures))
     except Exception as exc:
-        logger.warning(
-            "Signature validation raised on document: %s",
-            exc,
-            extra={"reason": "signature_check_exception", "error": repr(exc)},
-        )
-        return ("check_failed", 0)
+        return _fail(exc)
+    # Precedence (ADR-054 §4): tampered > invalid > untrusted
+    # > expired > valid. signed_untrusted (no confidence at any
+    # time) outranks signed_expired (confidence at signing time,
+    # past validity now).
+    if any_tampered:
+        return ("signed_tampered", len(signatures))
+    if any_invalid:
+        return ("signed_invalid", len(signatures))
+    if any_untrusted:
+        return ("signed_untrusted", len(signatures))
+    if any_expired:
+        return ("signed_expired", len(signatures))
+    return ("signed_valid", len(signatures))
+
+
+def _fail_internal(
+    exc: Exception, *, key: str, document_sha256: str
+) -> tuple[str, int]:
+    """``check_error`` for a failure in OUR configuration code, any type."""
+    logger.error(
+        "Signature validation setup failed (not a document failure): %r",
+        exc,
+        extra=_log_context(key, document_sha256, "signature_check_internal_error", exc),
+    )
+    return ("check_error", 0)

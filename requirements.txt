@@ -34,8 +34,8 @@ aio-pika>=9.4.0
 audittrace-object-storage @ git+https://github.com/lfdesousa/audittrace-object-storage.git@v0.1.1
 minio>=7.2.0
 pymupdf>=1.24.0
-pyhanko[etsi,async-http]>=0.35.1
-pyhanko-certvalidator>=0.26.0
+pyhanko[etsi,async-http]>=0.37,<0.38
+pyhanko-certvalidator>=0.32,<0.33
 pytesseract>=0.3.10
 mcp>=1.9.0,<2.0.0
 opentelemetry-api>=1.27.0

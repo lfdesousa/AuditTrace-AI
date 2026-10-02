@@ -80,8 +80,12 @@ dependencies = [
     # etsi LOTL walker — pyhanko's [etsi] extra does NOT pull aiohttp
     # on its own, verified 2026-05-09 against pyhanko 0.35.1). Both
     # extras must be co-installed for EuLotlTrustStoreBuilder.
-    "pyhanko[etsi,async-http]>=0.35.1",
-    "pyhanko-certvalidator>=0.26.0",
+    # Bounded to the tested minor (#366): pyhanko's private ETSI helpers and
+    # its sync/async wrapper surface change between minors (0.36 added the
+    # `validation_time` argument that silently broke the Swiss TSL builder).
+    # Bump deliberately, with the AC6/AC9 guard tests, never by drift.
+    "pyhanko[etsi,async-http]>=0.37,<0.38",
+    "pyhanko-certvalidator>=0.32,<0.33",
     # pytesseract: tier-B item #1 — OCR for scanned pages. Python
     # binding only; the actual `tesseract` binary + language packs
     # (eng+deu+fra+ita) are installed via apt in the Dockerfile.
@@ -203,7 +207,10 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # it is real decision logic (scope selection, dry-run/apply, the reset
 # predicate) and gets the same ≥90% floor — a single-file entry, not a
 # directory, since this tool lives at the `scripts/` top level rather than a
-# dedicated subpackage. No other `scripts/*` module is dragged into the gate.
+# dedicated subpackage. `scripts/backfill_pdf_signature_status.py` (#460, the
+# caller-owned `check_failed` re-classify backfill) joins the same way for the
+# same reason: real decision logic (ownership partition, dry-run/apply, the
+# chunk-owner invariant). No other `scripts/*` module is dragged into the gate.
 # `bff` (M3-WU-2, the LibreChat BFF sidecar — ADR-042 §5 Option A) joins the
 # same way for the same reason: a genuinely separate top-level deployable
 # (own image, own tests under `tests/bff/`), not under `src/audittrace/`, so
@@ -219,6 +226,7 @@ source = [
     "scripts/curator",
     "scripts/network",
     "scripts/replay_dead_lettered_index.py",
+    "scripts/backfill_pdf_signature_status.py",
     # `scripts/neuter` (the fast neuter harness, SPEC v3) joins the same way:
     # public SDLC tooling under the same ≥90% per-file gate as everything
     # else, measured alongside `--cov=scripts/neuter` in `make test`/`test-cov`.

@@ -62,11 +62,11 @@ deliberately *minimal* — it is not LibreChat in disguise.
   sees the scope gate before clicking.
 - **Signature audit chips** (Memory tab → episodic / procedural /
   semantic) — each row carries a coloured `signature_status` chip
-  per the 9-class taxonomy (ADR-052 §1 + ADR-054 §1). At a glance:
+  per the 10-class taxonomy (ADR-052 §1 + ADR-054 §1 + #460). At a glance:
   green `signed_valid`, red `signed_invalid` / `signed_tampered`,
   amber `signed_expired`, neutral `signed_untrusted`, italic for
   the operator/runtime classes (`check_skipped`, `check_unavailable`,
-  `check_failed`). Empty cells mean `signature_status` was null
+  `check_failed`, `check_error`). Empty cells mean `signature_status` was null
   (pre-tier-A row, or non-PDF). Added 2026-05-09 for M5 demo
   readiness — the audit signal needs to be visible in the UI, not
   just in `psql` queries.

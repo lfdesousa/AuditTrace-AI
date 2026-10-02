@@ -100,6 +100,12 @@ jobs:
       - name: Format check
         run: ruff format --check src/ tests/
 
+      - name: Type check (make typecheck — same target as local; #366)
+        # Until #366 only the pre-commit mirrors-mypy hook ran mypy, so a
+        # call-shape drift against a typed library (trust_store.py, pyhanko
+        # 0.36) reached main. Same make target as the local gate.
+        run: make typecheck
+
       - name: Security-lint (offline semgrep gate — same make target as local + pre-commit; #382)
         # WS1 of the local deterministic CI-Agent (ADR-059). Runs the SAME
         # make target, vendored rules, and flags as the local
@@ -132,6 +138,7 @@ jobs:
             --cov=scripts/migrate \
             --cov=scripts/curator \
             --cov=scripts.replay_dead_lettered_index \
+            --cov=scripts.backfill_pdf_signature_status \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html:htmlcov \

@@ -76,14 +76,19 @@ format: ## Run code formatting
 	@.venv/bin/ruff format src/ tests/
 	@echo "✅ Code formatted"
 
-typecheck: ## Run type checking
-	@echo "🔎 Running type checker..."
-	@.venv/bin/mypy src/
-	@echo "✅ Type checking passed"
+typecheck: ## Run type checking (resolves mypy as .venv/bin/mypy, else mypy on PATH, as CI has no .venv; fails closed if neither exists)
+	@MYPY="$$( [ -x .venv/bin/mypy ] && echo .venv/bin/mypy || command -v mypy || true )"; \
+	if [ -z "$$MYPY" ]; then \
+	  echo "❌ mypy not found (looked for .venv/bin/mypy and mypy on PATH)."; \
+	  echo "   Install the dev deps: pip install -e '.[dev]'"; \
+	  exit 1; \
+	fi; \
+	echo "🔎 Running type checker via $$MYPY ..."; \
+	"$$MYPY" src/ && echo "✅ Type checking passed"
 
 test: ## Run all tests with per-file coverage gate
 	@echo "🧪 Running tests..."
-	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts/neuter --cov=scripts.replay_dead_lettered_index --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
+	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts/neuter --cov=scripts.replay_dead_lettered_index --cov=scripts.backfill_pdf_signature_status --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
 	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
 	@.venv/bin/python scripts/check-per-file-coverage.py
 	@echo "🚫 Enforcing zero-skip policy..."
