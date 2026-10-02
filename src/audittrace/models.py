@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _reject_project_pii(value: str | None) -> str | None:
@@ -967,7 +967,8 @@ class ConsoleToolFavoriteListResponse(BaseModel):
 # no request model here carries a principal_id/principal_type field a
 # caller could use to ask about a DIFFERENT principal
 # (feedback_never_trust_caller_metadata_for_security_fields, epic
-# invariant 5). No write model exists yet (WU-2).
+# invariant 5). The WRITE models (WU-2c, further down) are the only
+# request bodies in this module that forbid unknown keys — see below.
 
 
 class ConsoleAclEffectivePermissionsResponse(BaseModel):
@@ -991,6 +992,8 @@ class ConsoleAclBatchPermissionsRequest(BaseModel):
     permissions/batch`` — bounded at 200 ids, same cap as every other
     console-* batch route."""
 
+    model_config = ConfigDict(extra="forbid")
+
     resource_ids: list[str] = Field(..., min_length=1, max_length=200)
 
 
@@ -1008,3 +1011,121 @@ class ConsoleAclResourceIdsResponse(BaseModel):
     resource-id routes."""
 
     resource_ids: list[str] = Field(default_factory=list)
+
+
+# ── Console-ACL WRITE routes (WU-2c-A) ───────────────────────────────────
+#
+# Every request model here is ``extra="forbid"`` (a hostile
+# ``user_sub``/``granted_by``/``trace_id`` key answers 422, never silently
+# ignored) and bounds every string to the 031 column width
+# (``resource_id`` 36, ``role_id`` 36, ``tenant_id`` 64; ``principal_id``
+# is a ``Text`` column bounded to 64 at the edge). The bounds are SHAPE,
+# not authority: the database (migrations 031/032) stays the control.
+
+ACL_PRINCIPAL_TYPES = Literal["user", "public", "role"]
+ACL_RESOURCE_TYPES = Literal[
+    "agent", "mcpServer", "promptGroup", "remoteAgent", "sharedLink", "skill"
+]
+_ACL_MAX_BITS = 15  # == services.console_acl.MAX_PERM_BITS (pinned by a test)
+_ACL_MAX_BATCH = 200
+
+
+class ConsoleAclGrantRequest(BaseModel):
+    """Body of ``POST /console/acl/{type}/{id}/grants`` and of each
+    bulk op. Carries no identity/audit field — those are token-derived."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    perm_bits: int = Field(..., ge=0, le=_ACL_MAX_BITS)
+    role_id: str | None = Field(None, min_length=1, max_length=36)
+    expired_at_ms: int | None = Field(None, ge=0)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+
+class ConsoleAclModifyRequest(BaseModel):
+    """Body of ``PATCH /console/acl/{type}/{id}/grants``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    add_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
+    remove_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+
+class ConsoleAclBulkRequest(BaseModel):
+    """Body of ``POST /console/acl/{type}/{id}/grants/bulk``. The route
+    stamps the PATH's resource into every op — an op cannot name another
+    resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ops: list[ConsoleAclGrantRequest] = Field(
+        ..., min_length=1, max_length=_ACL_MAX_BATCH
+    )
+
+
+class ConsoleAclPredicate(BaseModel):
+    """One ``POST /console/acl/expire`` predicate — the five optional
+    keys the service accepts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: ACL_PRINCIPAL_TYPES | None = None
+    principal_id: str | None = Field(None, min_length=1, max_length=64)
+    resource_type: ACL_RESOURCE_TYPES | None = None
+    resource_id: str | None = Field(None, min_length=1, max_length=36)
+    tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+
+class ConsoleAclExpireRequest(BaseModel):
+    """Body of ``POST /console/acl/expire``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    predicates: list[ConsoleAclPredicate] = Field(
+        ..., min_length=1, max_length=_ACL_MAX_BATCH
+    )
+
+
+class ConsoleAclEntryItem(BaseModel):
+    """One ACL row as answered by a write route. ``user_sub`` is
+    deliberately NOT echoed (it equals the caller)."""
+
+    id: str
+    principal_type: str
+    principal_id: str | None = None
+    principal_model: str | None = None
+    resource_type: str
+    resource_id: str
+    perm_bits: int
+    bits: dict[str, bool]
+    role_id: str | None = None
+    granted_by: str | None = None
+    granted_at_ms: int
+    expired_at_ms: int | None = None
+    inherited_from: str | None = None
+    tenant_id: str | None = None
+    trace_id: str | None = None
+    created_at_ms: int
+    updated_at_ms: int
+
+
+class ConsoleAclExpireResponse(BaseModel):
+    """Response of W2/W5. An empty ``expired_ids`` is the idempotent
+    answer, never a 404."""
+
+    expired_ids: list[str] = Field(default_factory=list)
+    visible_matched_count: int = 0
+    trace_id: str | None = None
+
+
+class ConsoleAclBulkResponse(BaseModel):
+    """Response of W4."""
+
+    acl_entry_ids: list[str] = Field(default_factory=list)
+    expired_ids: list[str] = Field(default_factory=list)
+    trace_id: str | None = None

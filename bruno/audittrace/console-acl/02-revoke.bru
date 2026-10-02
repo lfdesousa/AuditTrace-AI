@@ -1,0 +1,28 @@
+meta {
+  name: W2 DELETE grants
+  type: http
+  seq: 2
+}
+
+delete {
+  url: {{baseUrl}}/console/acl/{{aclResourceType}}/{{aclResourceId}}/grants?principal_type=user&principal_id={{aclPrincipalId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+tests {
+  test("200 + idempotent", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().expired_ids).to.be.an("array");
+    expect(res.getBody().trace_id).to.match(/^[0-9a-f]{32}$/);
+  });
+}
+
+docs {
+  200 with empty expired_ids is the idempotent answer (an unowned row is
+  omitted by RLS, never a 404).
+}

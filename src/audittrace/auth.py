@@ -271,8 +271,17 @@ ALL_SCOPES: dict[str, str] = {
         "RLS-isolated store backing LibreChat's AclEntry records. "
         "Every answer is scoped to the CALLER's own resolved principal "
         "set (self + public); group principals are disabled at the "
-        "schema level. No write path exists yet (WU-2), and this scope "
-        "grants no access to any other memory layer."
+        "schema level. This scope grants no write path (see "
+        "memory:acl:write) and no access to any other memory layer."
+    ),
+    "memory:acl:write": (
+        "Write ACL grants through the console-ACL routes (Sovereign "
+        "Authorization Layer EPIC, WU-2c): grant, revoke, modify, bulk "
+        "and expire-by-predicate on the CALLER's own resources. The "
+        "database (RLS, migration 032) decides who may write — a "
+        "non-owner is refused and the refusal is audited. Does not "
+        "open the read routes (memory:acl:read-own) and grants no "
+        "access to any other memory layer."
     ),
     "memory:upload:write": (
         "Upload bytes (PDFs, etc.) into the ingestion content-control "

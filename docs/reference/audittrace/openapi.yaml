@@ -151,6 +151,7 @@ components:
       title: Body_upload_memory_file_memory_upload_post
       type: object
     ConsoleAclBatchPermissionsRequest:
+      additionalProperties: false
       description: 'Request body for ``POST /console/acl/{resource_type}/
 
         permissions/batch`` — bounded at 200 ids, same cap as every other
@@ -184,6 +185,45 @@ components:
           type: object
       title: ConsoleAclBatchPermissionsResponse
       type: object
+    ConsoleAclBulkRequest:
+      additionalProperties: false
+      description: 'Body of ``POST /console/acl/{type}/{id}/grants/bulk``. The route
+
+        stamps the PATH''s resource into every op — an op cannot name another
+
+        resource.'
+      properties:
+        ops:
+          items:
+            $ref: '#/components/schemas/ConsoleAclGrantRequest'
+          maxItems: 200
+          minItems: 1
+          title: Ops
+          type: array
+      required:
+      - ops
+      title: ConsoleAclBulkRequest
+      type: object
+    ConsoleAclBulkResponse:
+      description: Response of W4.
+      properties:
+        acl_entry_ids:
+          items:
+            type: string
+          title: Acl Entry Ids
+          type: array
+        expired_ids:
+          items:
+            type: string
+          title: Expired Ids
+          type: array
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+      title: ConsoleAclBulkResponse
+      type: object
     ConsoleAclEffectivePermissionsResponse:
       description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
 
@@ -201,6 +241,178 @@ components:
       - perm_bits
       title: ConsoleAclEffectivePermissionsResponse
       type: object
+    ConsoleAclEntryItem:
+      description: 'One ACL row as answered by a write route. ``user_sub`` is
+
+        deliberately NOT echoed (it equals the caller).'
+      properties:
+        bits:
+          additionalProperties:
+            type: boolean
+          title: Bits
+          type: object
+        created_at_ms:
+          title: Created At Ms
+          type: integer
+        expired_at_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Expired At Ms
+        granted_at_ms:
+          title: Granted At Ms
+          type: integer
+        granted_by:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Granted By
+        id:
+          title: Id
+          type: string
+        inherited_from:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Inherited From
+        perm_bits:
+          title: Perm Bits
+          type: integer
+        principal_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Principal Id
+        principal_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Principal Model
+        principal_type:
+          title: Principal Type
+          type: string
+        resource_id:
+          title: Resource Id
+          type: string
+        resource_type:
+          title: Resource Type
+          type: string
+        role_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Role Id
+        tenant_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tenant Id
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+        updated_at_ms:
+          title: Updated At Ms
+          type: integer
+      required:
+      - id
+      - principal_type
+      - resource_type
+      - resource_id
+      - perm_bits
+      - bits
+      - granted_at_ms
+      - created_at_ms
+      - updated_at_ms
+      title: ConsoleAclEntryItem
+      type: object
+    ConsoleAclExpireRequest:
+      additionalProperties: false
+      description: Body of ``POST /console/acl/expire``.
+      properties:
+        predicates:
+          items:
+            $ref: '#/components/schemas/ConsoleAclPredicate'
+          maxItems: 200
+          minItems: 1
+          title: Predicates
+          type: array
+      required:
+      - predicates
+      title: ConsoleAclExpireRequest
+      type: object
+    ConsoleAclExpireResponse:
+      description: 'Response of W2/W5. An empty ``expired_ids`` is the idempotent
+
+        answer, never a 404.'
+      properties:
+        expired_ids:
+          items:
+            type: string
+          title: Expired Ids
+          type: array
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+        visible_matched_count:
+          default: 0
+          title: Visible Matched Count
+          type: integer
+      title: ConsoleAclExpireResponse
+      type: object
+    ConsoleAclGrantRequest:
+      additionalProperties: false
+      description: 'Body of ``POST /console/acl/{type}/{id}/grants`` and of each
+
+        bulk op. Carries no identity/audit field — those are token-derived.'
+      properties:
+        expired_at_ms:
+          anyOf:
+          - minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Expired At Ms
+        perm_bits:
+          maximum: 15.0
+          minimum: 0.0
+          title: Perm Bits
+          type: integer
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+        role_id:
+          anyOf:
+          - maxLength: 36
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Role Id
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - principal_type
+      - perm_bits
+      title: ConsoleAclGrantRequest
+      type: object
     ConsoleAclHasPermissionResponse:
       description: 'Response from ``GET /console/acl/{resource_type}/{resource_id}/
 
@@ -212,6 +424,99 @@ components:
       required:
       - has_permission
       title: ConsoleAclHasPermissionResponse
+      type: object
+    ConsoleAclModifyRequest:
+      additionalProperties: false
+      description: Body of ``PATCH /console/acl/{type}/{id}/grants``.
+      properties:
+        add_bits:
+          anyOf:
+          - maximum: 15.0
+            minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Add Bits
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+        remove_bits:
+          anyOf:
+          - maximum: 15.0
+            minimum: 0.0
+            type: integer
+          - type: 'null'
+          title: Remove Bits
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      required:
+      - principal_type
+      title: ConsoleAclModifyRequest
+      type: object
+    ConsoleAclPredicate:
+      additionalProperties: false
+      description: 'One ``POST /console/acl/expire`` predicate — the five optional
+
+        keys the service accepts.'
+      properties:
+        principal_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+        principal_type:
+          anyOf:
+          - enum:
+            - user
+            - public
+            - role
+            type: string
+          - type: 'null'
+          title: Principal Type
+        resource_id:
+          anyOf:
+          - maxLength: 36
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Resource Id
+        resource_type:
+          anyOf:
+          - enum:
+            - agent
+            - mcpServer
+            - promptGroup
+            - remoteAgent
+            - sharedLink
+            - skill
+            type: string
+          - type: 'null'
+          title: Resource Type
+        tenant_id:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      title: ConsoleAclPredicate
       type: object
     ConsoleAclResourceIdsResponse:
       description: 'Response shape shared by the accessible/public/sole-owned
@@ -2282,8 +2587,12 @@ components:
             memory:acl:read-own: Read effective permissions, accessible/public/sole-owned resource ids from the console-ACL
               store (Sovereign Authorization Layer EPIC, WU-1 — READ PATH ONLY) — the RLS-isolated store backing LibreChat's
               AclEntry records. Every answer is scoped to the CALLER's own resolved principal set (self + public); group principals
-              are disabled at the schema level. No write path exists yet (WU-2), and this scope grants no access to any other
-              memory layer.
+              are disabled at the schema level. This scope grants no write path (see memory:acl:write) and no access to any
+              other memory layer.
+            memory:acl:write: 'Write ACL grants through the console-ACL routes (Sovereign Authorization Layer EPIC, WU-2c):
+              grant, revoke, modify, bulk and expire-by-predicate on the CALLER''s own resources. The database (RLS, migration
+              032) decides who may write — a non-owner is refused and the refusal is audited. Does not open the read routes
+              (memory:acl:read-own) and grants no access to any other memory layer.'
             memory:agents:read-own: 'Read your own agents (and batch-get-by-ids) from the console-agents store (Agents domain,
               MongoDB-elimination EPIC) — the RLS-isolated store backing LibreChat''s Agent records. Own-agents-only: sharing/marketplace
               is out of scope. Grants no access to another user''s agents or to any other memory layer.'
@@ -2432,6 +2741,37 @@ paths:
       summary: Create Assessment
       tags:
       - audit
+  /console/acl/expire:
+    post:
+      description: 'Expire-by-predicate, caller-scoped (the fork''s
+
+        ``removeAllPermissions`` / revoke-list shapes).'
+      operationId: expire_by_predicate_console_acl_expire_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclExpireRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclExpireResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Expire By Predicate
+      tags:
+      - console-acl
   /console/acl/{resource_type}/accessible:
     get:
       description: 'Resource ids the CALLER can access with at least ``bit``
@@ -2586,6 +2926,208 @@ paths:
       - audittrace-oauth2:
         - memory:acl:read-own
       summary: Get Sole Owned Resource Ids
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/grants:
+    delete:
+      description: 'Expire the caller''s active grant at the key. 200 with empty ids is
+
+        the idempotent answer (an unowned row is omitted by 032, not refused).'
+      operationId: revoke_console_acl__resource_type___resource_id__grants_delete
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      - in: query
+        name: principal_type
+        required: true
+        schema:
+          enum:
+          - user
+          - public
+          - role
+          title: Principal Type
+          type: string
+      - in: query
+        name: principal_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Principal Id
+      - in: query
+        name: tenant_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 64
+            minLength: 1
+            type: string
+          - type: 'null'
+          title: Tenant Id
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclExpireResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Revoke
+      tags:
+      - console-acl
+    patch:
+      description: 'Recompute the bits of the active grant (expire-and-insert). 404
+
+        (with the success row''s trace_id) when no active grant matched.'
+      operationId: modify_grant_console_acl__resource_type___resource_id__grants_patch
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclModifyRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEntryItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Modify Grant
+      tags:
+      - console-acl
+    post:
+      description: Grant (expire-and-insert) on the resource as the CALLER.
+      operationId: grant_console_acl__resource_type___resource_id__grants_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclGrantRequest'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclEntryItem'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Grant
+      tags:
+      - console-acl
+  /console/acl/{resource_type}/{resource_id}/grants/bulk:
+    post:
+      description: All-or-nothing batch of grants on ONE resource (the path's).
+      operationId: bulk_grants_console_acl__resource_type___resource_id__grants_bulk_post
+      parameters:
+      - in: path
+        name: resource_type
+        required: true
+        schema:
+          title: Resource Type
+          type: string
+      - in: path
+        name: resource_id
+        required: true
+        schema:
+          maxLength: 36
+          minLength: 1
+          title: Resource Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsoleAclBulkRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleAclBulkResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - audittrace-oauth2:
+        - memory:acl:write
+      summary: Bulk Grants
       tags:
       - console-acl
   /console/acl/{resource_type}/{resource_id}/has-permission:
@@ -4228,8 +4770,7 @@ paths:
       - description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' | ''acl_authz''
           (ADR-048 / ADR-058 / ADR-062 §5 / the Sovereign Authorization Layer EPIC). Pull a whole recorded self-assessment
           with event_class=assessment & session_id=<assessment_id>; pull every /memory/* access with event_class=memory_access;
-          pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz. NOTE: there is no trace_id
-          filter — match trace_id in the returned body instead.'
+          pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz.'
         in: query
         name: event_class
         required: false
@@ -4240,9 +4781,23 @@ paths:
           description: 'Filter by event_class: ''interaction'' | ''security'' | ''assessment'' | ''memory_access'' | ''acl_authz''
             (ADR-048 / ADR-058 / ADR-062 §5 / the Sovereign Authorization Layer EPIC). Pull a whole recorded self-assessment
             with event_class=assessment & session_id=<assessment_id>; pull every /memory/* access with event_class=memory_access;
-            pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz. NOTE: there is no trace_id
-            filter — match trace_id in the returned body instead.'
+            pull every sovereign ACL write attempt (granted or denied) with event_class=acl_authz.'
           title: Event Class
+      - description: Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows *within* the caller's own RLS-scoped rows;
+          composes with every other filter.
+        in: query
+        name: trace_id
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 32
+            minLength: 32
+            pattern: ^[0-9a-f]{32}$
+            type: string
+          - type: 'null'
+          description: Filter by OpenTelemetry trace_id (32 lowercase hex). Narrows *within* the caller's own RLS-scoped rows;
+            composes with every other filter.
+          title: Trace Id
       - description: Max rows (1-1000).
         in: query
         name: limit

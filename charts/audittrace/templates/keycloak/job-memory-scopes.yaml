@@ -60,6 +60,11 @@ spec:
               value: "http://{{ .Release.Name }}-keycloak:8080"
             - name: REALM
               value: "audittrace"
+            # ACL WU-2c: the dedicated E2E client's sunset flag — the script
+            # reads it (default true); enabled -> ensure+verify, disabled ->
+            # verify-then-delete.
+            - name: AUDITTRACE_ACL_E2E_CLIENT_ENABLED
+              value: {{ .Values.keycloak.aclE2eClient.enabled | quote }}
             {{- if not .Values.vault.enabled }}
             # vault.enabled=false branch — K8s Secret. When
             # vault.enabled=true KEYCLOAK_ADMIN_PASSWORD lands at
