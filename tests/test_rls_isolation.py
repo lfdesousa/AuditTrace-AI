@@ -45,12 +45,7 @@ the session, so RLS actually applies to the test queries.
 
 from __future__ import annotations
 
-import atexit
 import os
-import shutil
-import socket
-import subprocess
-import time
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -59,85 +54,16 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from audittrace.db.rls import install_rls_listener, set_current_user_id
+from tests._pg_ephemeral import start_ephemeral_postgres
 
 # ───────────────────── Ephemeral Postgres scaffolding ───────────────────────
 # Classic setup/teardown: RLS needs a REAL Postgres (SQLite has no
-# row-level-security / set_config GUCs). The ``ephemeral_postgres``
-# session-scoped fixture below brings a throwaway ``postgres:16`` container
-# UP before the RLS suite and tears it DOWN after — the same bring-up →
-# validate → destroy discipline as the cloud rigs, zero leftover state.
-
-
-def _free_port() -> int:
-    """Grab an OS-assigned free TCP port, then release it for docker."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _start_ephemeral_postgres() -> str | None:
-    """Spin a throwaway ``postgres:16`` container and return its DSN.
-
-    Returns ``None`` (→ suite skips) when Docker is unavailable. The
-    container is ``--rm`` AND force-removed via ``atexit`` so nothing
-    survives the session.
-    """
-    if shutil.which("docker") is None:
-        return None
-    try:
-        subprocess.run(["docker", "info"], check=True, capture_output=True, timeout=10)
-    except Exception:
-        return None
-
-    port = _free_port()
-    name = f"audittrace-rls-pg-{os.getpid()}"
-    # Throwaway, container-local credential — never leaves this process and
-    # the container is destroyed at session end. Not a real secret.
-    password = "rls_ephemeral_pw"  # noqa: S105
-    db = "audittrace_rls"
-    try:
-        subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                name,
-                "-e",
-                f"POSTGRES_PASSWORD={password}",
-                "-e",
-                f"POSTGRES_DB={db}",
-                "-p",
-                f"{port}:5432",
-                "postgres:16",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-    except Exception:
-        return None
-
-    atexit.register(
-        lambda: subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    )
-
-    dsn = f"postgresql+psycopg2://postgres:{password}@127.0.0.1:{port}/{db}"
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        try:
-            eng = create_engine(dsn, future=True)
-            with eng.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            eng.dispose()
-            return dsn
-        except Exception:
-            time.sleep(0.5)
-
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    return None
-
+# row-level-security / set_config GUCs). SPEC v3 §8 (fast neuter harness):
+# the throwaway-container bring-up itself now lives in the shared
+# `tests/_pg_ephemeral.py` helper (all three RLS-proof files apply the same
+# non-durable flags there); container name and DSN shape are unchanged --
+# the same bring-up -> validate -> destroy discipline as the cloud rigs,
+# zero leftover state.
 
 # Standard local test-PG container (audittrace-test-pg) credentials:
 # postgres/test-pg-pass on :15432, DB audittrace. Used as the fallback
@@ -174,7 +100,11 @@ def _resolve_test_postgres_url() -> str | None:
     # torn down at session end (teardown). Returns None when Docker is
     # unavailable so the suite degrades to skip, never to a false failure
     # against whatever happens to be squatting on :15432.
-    return _start_ephemeral_postgres()
+    return start_ephemeral_postgres(
+        "audittrace-rls-pg-",
+        "rls_ephemeral_pw",  # noqa: S106 - throwaway container credential
+        "audittrace_rls",
+    )
 
 
 # Default test-PG container (audittrace-test-pg) credentials. The legacy

@@ -12,6 +12,27 @@ import subprocess  # noqa: S404 — used only for chart-rendering test injection
 import pytest
 from fastapi.testclient import TestClient
 
+# `tests/neuter_fixture/` (and its src/-layout sibling,
+# `tests/neuter_fixture_src/` -- review round 2's structural-fix item 4)
+# are STATIC TEMPLATES for the fast neuter harness's self-proofs (SPEC v3
+# §11): each `test_guarded.py` does `from guarded import ...`, a module
+# that only exists once the fixture is copied into a throwaway git repo
+# (never this one). Collecting either here would break every `make test`
+# run with an ImportError. The self-proof tests copy these files into
+# `tmp_path` and spawn a FRESH pytest subprocess there, whose rootdir has
+# no `conftest.py` of its own -- this `collect_ignore` only ever applies
+# to collection rooted at THIS repo.
+collect_ignore = ["neuter_fixture", "neuter_fixture_src"]
+
+# Clear stale evidence from a PRIOR session's neuter-harness tests
+# (tests/_neuter_test_evidence.py) at the start of every session -- it's
+# gitignored scratch space, not evidence anyone reads back later.
+from tests._neuter_test_evidence import (  # noqa: E402
+    cleanup_root as _cleanup_neuter_test_evidence,
+)
+
+_cleanup_neuter_test_evidence()
+
 # ─────────── Chart-rendering subprocess injection (FQDN-only chart) ───────────
 # ADR-045 (amended 2026-05-19) made the chart FQDN-only — `externalLLM.host`
 # and `observability.external.{langfuse,tempo,loki}Host` are `required`
@@ -84,7 +105,23 @@ subprocess.run = _patched_subprocess_run
 # the SQLite default). It's not app config, so it must survive the wipe —
 # otherwise CI and local-dev RLS integration tests silently fall back
 # to a stale compose URL and skip / fail.
-_TEST_ONLY_ALLOWLIST = {"AUDITTRACE_TEST_POSTGRES_URL"}
+# AUDITTRACE_NEUTER_LOCK (SPEC v3 §10 SF-2) is the fast neuter harness's
+# heavy-cap lock-path override -- every harness test points it at a
+# `tmp_path` file so the suite never contends with (or is blocked by) the
+# real, shared lock a concurrent `make test`/pool run would hold.
+# (The pool's OTHER per-neuter env vars -- NEUTER_PATHCHECK_{MODULE,EXPECT,
+# LOG}, NEUTER_FAKE_PG_STATE -- deliberately do NOT start with "AUDITTRACE_"
+# at all, precisely so they survive this wipe in ANY target repo's own
+# conftest.py, this one included, without needing an allowlist entry here.
+# A prior revision prefixed them "AUDITTRACE_NEUTER_*" and allow-listed
+# them here; that broke the moment the harness targeted a DIFFERENT repo
+# with the identical AUDITTRACE_*-wipe convention but no matching
+# allowlist entry (the T1 oracle's frozen target) -- discovered by
+# dogfooding the harness against this repo first (A11.1).)
+_TEST_ONLY_ALLOWLIST = {
+    "AUDITTRACE_TEST_POSTGRES_URL",
+    "AUDITTRACE_NEUTER_LOCK",
+}
 for _key in [
     k
     for k in os.environ
