@@ -73,7 +73,7 @@ _REAL_LIBRECHAT_DIGEST = (
     "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
 )
 _REAL_BFF_DIGEST = (
-    "sha256:b9cc31e78b50b5535cafc204a2ba30179677a707ea1ee77d63c8f80042741d55"
+    "sha256:ddba3c72b1f3b31d0d62fede8bf88aee83986c66cfedfac08cc389ef8145d8cc"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
