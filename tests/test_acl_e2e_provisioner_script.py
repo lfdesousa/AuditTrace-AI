@@ -94,6 +94,8 @@ FAKE_KCADM = textwrap.dedent(
             if "--fields" in args:
                 for m in c["mappers"]:
                     print(m["name"])
+            elif c.get("raw_mappers_text"):
+                print(c["raw_mappers_text"])
             else:
                 print(pretty(c["mappers"]))
         sys.exit(0)
@@ -284,6 +286,43 @@ class TestEnabledCreate:
         assert proc.returncode != 0
         assert "unexpected-mapper:injected" in proc.stderr
         assert "STEP-COMPLETED" not in proc.stdout
+
+
+SPLIT_BLOCKS_RAW = """[
+  {
+    "id" : "m1",
+    "name" : "aud-audittrace-server",
+    "protocol" : "openid-connect",
+    "protocolMapper" : "oidc-audience-mapper",
+    "config" : {
+      "included.custom.audience" : "audittrace-server",
+      "id.token.claim" : "false"
+    },
+    "config" : {
+      "access.token.claim" : "true"
+    }
+  }
+]"""
+
+
+class TestSplitConfigBlocks:
+    """B1 (round-3 review): TWO ``config`` blocks that together hold exactly
+    the three pinned pairs (3 pairs in total, every pair allowed, count 3)
+    are not "exactly one config block" and must fail closed. Only the
+    block-count guard can see it - weakening ``-ne 1`` to ``-lt 1`` (the
+    reviewer's neuter) leaves every other provisioner test green."""
+
+    def test_two_config_blocks_fail_closed_with_zero_mutation(self, run: Run) -> None:
+        state = _pinned_client_state(raw_mappers_text=SPLIT_BLOCKS_RAW)
+        proc = run.go(clients=[state])
+        assert proc.returncode != 0
+        assert "mapper-config-absent" in proc.stderr
+        assert "unexpected-mapper-config" not in proc.stderr, (
+            "the pairs themselves are all allowed: only the block count can catch this"
+        )
+        assert "mapper-config-count" not in proc.stderr, "count is 3 across blocks"
+        assert "STEP-COMPLETED" not in proc.stdout
+        assert run.mutating_calls() == []
 
 
 class TestEnabledCreateServerAddedConfig:
