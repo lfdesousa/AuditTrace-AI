@@ -97,6 +97,14 @@ spec:
       {{- if .Values.istio.enabled }}
       serviceAccountName: {{ .Release.Name }}-bucket-init
       {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      # v1.28.1 — the ghcr.io/lfdesousa mirror is PRIVATE; this pod needs the
+      # same pull Secret as the subcharts. No-op when
+      # global.imagePullSecrets is empty. Guarded by
+      # tests/test_chart_private_image_pull_secrets.py.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: mc
           image: "{{ .Values.minio.mcImage.repository }}:{{ .Values.minio.mcImage.tag }}"
