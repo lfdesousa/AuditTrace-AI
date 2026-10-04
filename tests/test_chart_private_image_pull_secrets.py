@@ -16,10 +16,13 @@ Design (each point is a falsifiability claim, proven by a test below):
   required ``ghcr.io/lfdesousa/``; the chart uses ghcr.io for nothing else, so
   the broader prefix is the fail-closed choice).
 * "Live-shaped" values: the deploy runner (scripts/deploy/runner) upgrades with
-  ``--reset-then-reuse-values`` and carries no repo overlay for this key; the
-  live release's user-supplied values contain
-  ``global.imagePullSecrets: [{name: ghcr-pull-secret}]`` (``helm get values
-  audittrace``). That exact shape is reproduced here with ``--set-json``.
+  ``--reset-then-reuse-values`` and no repo overlay carries the live overrides.
+  ``tests/fixtures/live-structure-values-nonsecret.yaml`` is the NON-SECRET
+  structure of the live release's user values: ``global.imagePullSecrets``,
+  postgresql/redis images overridden to ghcr.io, ``allowInsecureImages`` and
+  ``console.enabled``. With ghcr postgresql the summariser Job also pulls a
+  private image, so six pods are derived, not three (a guard fed only
+  ``global.imagePullSecrets`` was blind to the summariser Job).
 * Each of the three templates is neutered INDIVIDUALLY (block stripped from a
   copy of the chart) and must turn the guard RED naming that pod.
 """
@@ -37,18 +40,33 @@ import yaml
 CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 PRIVATE_PREFIXES = ("ghcr.io/",)
 POD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"}
-REQUIRED = {
+REQUIRED_DEFAULT = {
     ("StatefulSet", "audittrace-chromadb"),
     ("StatefulSet", "audittrace-minio"),
     ("Job", "audittrace-minio-bucket-init"),
+}
+REQUIRED = REQUIRED_DEFAULT | {
+    # Live release overrides postgresql/redis images to ghcr too (see fixture):
+    ("StatefulSet", "audittrace-redis-master"),
+    ("StatefulSet", "audittrace-postgresql"),
+    ("Job", "audittrace-ensure-summariser-role"),
 }
 # Templates carrying the block, keyed by the pod each one renders.
 TEMPLATE_FOR = {
     ("StatefulSet", "audittrace-chromadb"): "templates/chromadb/statefulset.yaml",
     ("StatefulSet", "audittrace-minio"): "templates/minio/statefulset.yaml",
     ("Job", "audittrace-minio-bucket-init"): "templates/minio/job-bucket-init.yaml",
+    (
+        "Job",
+        "audittrace-ensure-summariser-role",
+    ): "templates/postgres/job-summariser-role.yaml",
 }
-LIVE_SHAPED = ["--set-json", 'global.imagePullSecrets=[{"name":"ghcr-pull-secret"}]']
+FIXTURE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "live-structure-values-nonsecret.yaml"
+)
+LIVE_SHAPED = ["-f", str(FIXTURE)]
 # Same required-secret args as `make helm-lint`.
 RENDER_ARGS = [
     "--set", "secrets.minio.secretKey=ci-test",
@@ -72,7 +90,9 @@ BLOCK_RE = re.compile(
 
 def _render(chart: Path, extra: list[str], vault: bool = False) -> list[dict]:
     helm = shutil.which("helm")
-    assert helm is not None, "helm is required (CI helm-lint job installs it)"
+    assert helm is not None, (
+        "helm is required (the CI `test` job uses the runner image's helm)"
+    )
     cmd = [helm, "template", "audittrace", str(chart), "-n", "audittrace"]
     cmd += ["--set", f"vault.enabled={'true' if vault else 'false'}"]
     cmd += RENDER_ARGS + extra
@@ -131,8 +151,8 @@ def test_defaults_render_has_no_pull_secrets_and_is_noop():
     # Block is a no-op when global.imagePullSecrets is empty: no key emitted.
     docs = _render(CHART_DIR, [])
     pods = private_pods(docs)
-    assert REQUIRED <= set(pods)
-    for key in REQUIRED:
+    assert REQUIRED_DEFAULT <= set(pods)
+    for key in REQUIRED_DEFAULT:
         assert "imagePullSecrets" not in pods[key]
 
 
