@@ -51,6 +51,11 @@ REQUIRED = REQUIRED_DEFAULT | {
     ("StatefulSet", "audittrace-postgresql"),
     ("Job", "audittrace-ensure-summariser-role"),
 }
+CONSOLE = {
+    ("Deployment", "audittrace-librechat"),
+    ("Deployment", "audittrace-librechat-bff"),
+    ("StatefulSet", "audittrace-librechat-mongodb"),
+}
 # Templates carrying the block, keyed by the pod each one renders.
 TEMPLATE_FOR = {
     ("StatefulSet", "audittrace-chromadb"): "templates/chromadb/statefulset.yaml",
@@ -139,7 +144,18 @@ def live_docs(request: pytest.FixtureRequest) -> list[dict]:
     return _render(CHART_DIR, LIVE_SHAPED, vault=request.param)
 
 
-def test_derived_set_contains_the_three_and_all_carry_secret(live_docs):
+def test_live_render_includes_console_workloads(live_docs):
+    # The fixture's console.enabled must really render the console (G2): removing
+    # or falsifying it in the fixture turns this RED.
+    names = {
+        (d["kind"], d["metadata"]["name"])
+        for d in live_docs
+        if _pod_spec(d) is not None
+    }
+    assert CONSOLE <= names, f"console workloads missing: {sorted(CONSOLE - names)}"
+
+
+def test_derived_set_contains_the_six_and_all_carry_secret(live_docs):
     pods = private_pods(live_docs)
     assert REQUIRED <= set(pods), f"derived {sorted(pods)} lacks a required pod"
     assert violations(live_docs) == []
