@@ -196,6 +196,23 @@ class TestZeroLocalhost5000InRenderedChart:
             "eliminated by this WU."
         )
 
+    def test_rendered_tests_image_equals_v1_28_0_pin_exactly(self) -> None:
+        """RENDER-level pin (v1.28.0 Phase-E fix round): the `-test-rls`
+        Pod's `tests` container image must EQUAL the exact published
+        ref. Mirrors test_bff_digest_matches_pinned_values_digest. Catches
+        a template that hard-codes a stale tag or digest while keeping the
+        `if .Values.tests.image.digest` conditional, which a values.yaml-only
+        assertion cannot see."""
+        rendered = _render_full(vault_enabled=True, tests_enabled=True)
+        hook_pod = _find(_parse(rendered), "Pod", "-test-rls")
+        tests_container = next(
+            c for c in hook_pod["spec"]["containers"] if c["name"] == "tests"
+        )
+        assert tests_container["image"] == (
+            "docker.io/lfds/audittrace-tests:1.28.0"
+            "@sha256:ad869e59e967ccadafa014a6d1a6fee1c3476ebc136d4f40141852f694bf12fc"
+        )
+
     def test_tests_image_renders_as_repository_tag_digest(self) -> None:
         rendered = _render_full(vault_enabled=True, tests_enabled=True)
         docs = _parse(rendered)
