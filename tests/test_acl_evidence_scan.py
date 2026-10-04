@@ -52,6 +52,16 @@ FORMS = {
     "json-newline-pretty": '{\n  "K" : "V",\n  "x": 1\n}',
     "json-nonstring": '{"K": 123456789}',
     "json-single-quoted": "{'K': 'V'}",
+    # Addendum E clarification N2: ANY RFC 8259 whitespace, JSON escaped
+    # inside a string (a response body embedded in a log line).
+    "json-newline-after-colon": '{"K":\n    "V"}',
+    "json-crlf-after-colon": '{"K":\r\n"V"}',
+    "json-tab-after-colon": '{"K":\t"V"}',
+    "json-newline-before-colon": '{"K"\n  : "V"}',
+    "json-nonstring-newline": '{"K":\n  123456789}',
+    "json-escaped-in-string": '{\\"K\\":\\"V\\"}',
+    "json-escaped-in-log-line": 'INFO body="{\\"K\\": \\"V\\", \\"x\\": 1}"',
+    "json-escaped-newline": '{\\"K\\":\n\\"V\\"}',
     "yaml": "K: V",
     "yaml-indented": "creds:\n  K: V\n",
     "env": "K=V",
@@ -96,6 +106,20 @@ class TestBearerAndJwt:
     def test_bearer_credentials_are_hits(self, tmp_path: Path, line: str) -> None:
         assert _hits(tmp_path, line)
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            f"bearer {OPAQUE}",
+            f"BEARER {OPAQUE}",
+            f"BeArEr {OPAQUE}",
+            f"token was bearer {OPAQUE} in the log",
+            f"authorization: bearer {OPAQUE}",
+            "AUTHORIZATION: BASIC dXNlcjpwYXNz",
+        ],
+    )
+    def test_bearer_scheme_is_case_insensitive(self, tmp_path: Path, line: str) -> None:
+        assert _hits(tmp_path, line)
+
     def test_jwt_shape_is_a_hit(self, tmp_path: Path) -> None:
         assert _hits(tmp_path, f"x {_jwt()} y")
 
@@ -122,6 +146,27 @@ class TestTheReviewersThreePlantedCases:
         (tmp_path / "a.txt").write_text(f"refresh_token={OPAQUE}")
         (tmp_path / "b.txt").write_text(_jwt())
         assert [p.name for p in scan.scan(tmp_path)] == ["a.txt", "b.txt"]
+
+
+class TestClarificationNegativesStayGreen:
+    """The N2 widening (newline after the colon, escaped JSON, lowercase
+    bearer) must not turn prose or empty values into findings."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"device_code":\n  ""}',
+            '{\\"device_code\\":\\"\\"}',
+            '{"refresh_token":\r\n}',
+            "password:\nthe next line is prose, not a value",
+            "refresh_token:\n\nsomething else entirely",
+            "a bearer credential",
+            "bearer short",
+            "the bearer-equivalent device code is never printed",
+        ],
+    )
+    def test_not_a_finding(self, tmp_path: Path, text: str) -> None:
+        assert _hits(tmp_path, text) == [], text
 
 
 class TestNegativesAreGreen:

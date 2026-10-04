@@ -11,11 +11,13 @@ A finding is any of:
 1. **A secret key with a non-empty value** (key names matched
    case-insensitively: ``access_token``, ``refresh_token``, ``id_token``,
    ``device_code``, ``client_secret``, ``accessToken``, ``refreshToken``,
-   ``password``) in JSON (optional whitespace/quotes around the key and
-   the ``:``, string or non-string values), YAML (``k: v``), env/ini
-   (``k=v``, ``export k=v``) or URL/form (``k=v&``) shape.
+   ``password``) in JSON (ANY RFC 8259 whitespace - space, tab, LF, CR -
+   around the ``:``, string or non-string values, and JSON ESCAPED inside
+   a string: ``\\"k\\":\\"v\\"``), YAML (``k: v``), env/ini (``k=v``,
+   ``export k=v``) or URL/form (``k=v&``) shape.
 2. **A bearer credential:** an ``Authorization:`` header carrying
-   ``Bearer``/``Basic`` and a value, or any ``Bearer <16+ chars>`` token.
+   ``Bearer``/``Basic`` and a value, or any ``Bearer <16+ chars>`` token;
+   the scheme match is case-INSENSITIVE (``bearer x...``).
 3. **A JWT-shaped string** (three base64url segments of >= 20 chars; a
    32-hex ``trace_id`` cannot match).
 4. **An unreadable or binary file** (fail closed).
@@ -25,6 +27,13 @@ read-back wording "refresh-token key absent" is how evidence says it);
 neither are an empty value, a ``trace_id`` or a ``user_code``. Only file
 NAMES are reported, never matched text, so the scan cannot leak a secret
 into a log.
+
+**NOT claimed** (outside Addendum E's closed key list and JWT rule; known
+limits, not defects): a custom ``token:`` header or ``X-Auth-Token``, a
+hyphenated ``access-token`` key, a JWT wrapped across several lines, an
+encoded/split secret. A JSON ``null`` value for a listed key (for example
+``"client_secret": null``) IS flagged (fail closed; a false positive that
+may stay).
 
 Lives under ``scripts/deploy/`` so the per-file coverage floor covers it.
 """
@@ -52,20 +61,24 @@ SECRET_KEYS = (
     "refreshToken",
     "password",
 )
-# key, an optional closing quote, optional spaces, ``:`` or ``=``, optional
-# spaces, an optional OPENING quote, then at least one value character that
-# is not a quote/space/delimiter - so an empty value (``""``, ``k=``,
-# ``k:`` at end of line) is not a finding and a bare key name is not either.
-SECRET_KEY_PATTERN = re.compile(
-    r"(?:(?:"
-    + "|".join(SECRET_KEYS)
-    + r""")\b)["']?[ \t]*[:=][ \t]*["']?[^\s"',}&\]]""",
-    re.IGNORECASE,
-)
+_KEYS = r"(?:(?:" + "|".join(SECRET_KEYS) + r")\b)"
+# A value character: not a quote, backslash, whitespace or delimiter - so an
+# empty value (``""``, ``\"\"``, ``k=``, ``k:`` at end of line) is not a
+# finding and a bare key name is not either.
+_VALUE = r"""[^\s"',}&\]\\]"""
+# QUOTED key (JSON, also JSON-escaped inside a string: ``\"k\":\"v\"``):
+# ANY RFC 8259 whitespace (space, tab, LF, CR) around the colon.
+_QUOTED = _KEYS + r"""(?:\\?["'])\s*[:=]\s*(?:\\?["'])?""" + _VALUE
+# BARE key (YAML, env/ini, ``export``, URL/form): same-line whitespace only,
+# so ``password:`` followed by prose on the next line is not a finding.
+_BARE = _KEYS + r"""[ \t]*[:=][ \t]*["']?""" + _VALUE
+SECRET_KEY_PATTERN = re.compile(f"(?:{_QUOTED})|(?:{_BARE})", re.IGNORECASE)
 AUTH_HEADER_PATTERN = re.compile(
     r"authorization[ \t]*:[ \t]*(?:bearer|basic)[ \t]+\S", re.IGNORECASE
 )
-BEARER_TOKEN_PATTERN = re.compile(r"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{16,}")
+BEARER_TOKEN_PATTERN = re.compile(
+    r"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE
+)
 
 
 def _secret_shaped(text: str) -> bool:

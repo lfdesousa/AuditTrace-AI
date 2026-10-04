@@ -422,6 +422,50 @@ class TestEnabledPresent:
                 "mapper-config-count:4",
             ),
             (
+                "N1 whitespace INSIDE a config value (audience)",
+                {
+                    "mappers": [
+                        {
+                            **PINNED_MAPPER,
+                            "config": {
+                                **PINNED_MAPPER["config"],
+                                "included.custom.audience": "audittrace -server",
+                            },
+                        }
+                    ]
+                },
+                'unexpected-mapper-config:"included.custom.audience":"audittrace -server"',
+            ),
+            (
+                "N1 whitespace inside the claim flag value",
+                {
+                    "mappers": [
+                        {
+                            **PINNED_MAPPER,
+                            "config": {
+                                **PINNED_MAPPER["config"],
+                                "access.token.claim": "tr ue",
+                            },
+                        }
+                    ]
+                },
+                "unexpected-mapper-config:",
+            ),
+            (
+                "N1 trailing space in the protocolMapper value",
+                {
+                    "mappers": [
+                        {**PINNED_MAPPER, "protocolMapper": "oidc-audience-mapper "}
+                    ]
+                },
+                "missing-mapper-field:protocolMapper",
+            ),
+            (
+                "N1 trailing space in the mapper name",
+                {"mappers": [{**PINNED_MAPPER, "name": "aud-audittrace-server "}]},
+                "unexpected-mapper:aud-audittrace-server ",
+            ),
+            (
                 "SC-1 config key missing",
                 {
                     "mappers": [
@@ -455,7 +499,7 @@ class TestEnabledPresent:
                         }
                     ]
                 },
-                '"protocolMapper":"oidc-audience-mapper"',
+                "missing-mapper-field:protocolMapper",
             ),
             ("no mappers", {"mappers": []}, "mapper-count:0"),
         ],

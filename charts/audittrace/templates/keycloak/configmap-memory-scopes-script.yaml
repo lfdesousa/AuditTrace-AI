@@ -759,7 +759,7 @@ data:
     # mappers EXACT (name set == {aud-audittrace-server}, protocolMapper and
     # config pinned). Any difference -> exit non-zero with the diff.
     acl_e2e_verify() {
-      local uuid="$1" diffs="" compact item name names n=0 cfg pairs
+      local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
       compact=$(acl_e2e_compact "clients/${uuid}") \
         || acl_e2e_fail "cannot read the client"
       for item in \
@@ -804,32 +804,52 @@ data:
         [[ "${name}" == "aud-audittrace-server" ]] || diffs+=" unexpected-mapper:${name}"
       done <<< "${names}"
       [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
-      compact=$(acl_e2e_compact "clients/${uuid}/protocol-mappers/models") \
+      raw=$("${KCADM}" get "clients/${uuid}/protocol-mappers/models" -r "${REALM}") \
         || acl_e2e_fail "cannot read the mapper config"
       # SC-1, EXACT: the mapper's name and protocolMapper equal the pinned
-      # values, and its `config` map EQUALS the pinned three-key map - no extra
-      # key (an audience widening or a hardcoded-claim `scope` writer would be
-      # one), none missing, none duplicated. No allow-list: if a real Keycloak
-      # adds a config key on create, this fails closed and the spec is amended.
-      for item in \
-          '"name":"aud-audittrace-server"' \
-          '"protocolMapper":"oidc-audience-mapper"'; do
-        [[ "${compact}" == *"${item}"* ]] || diffs+=" missing-mapper-field:${item}"
-      done
-      cfg="${compact#*\"config\":\{}"
-      if [[ "${cfg}" == "${compact}" ]]; then
+      # values and its `config` map holds EXACTLY the pinned three pairs - no
+      # extra key (an audience widening or a hardcoded-claim `scope` writer
+      # would be one), none missing. Lines are compared VERBATIM: only the
+      # indentation, a trailing comma and the `" : "` key separator of kcadm's
+      # pretty-printed JSON are normalised, so whitespace INSIDE a value (for
+      # example `audittrace -server`) is a difference. This relies on kcadm's
+      # one-key-per-line pretty output of a ProtocolMapperRepresentation (id,
+      # name, protocol, protocolMapper, consentRequired, config - `config` is
+      # a flat string map with unique keys); a compact or re-shaped output
+      # finds no `config` block and fails closed (mapper-config-absent). No
+      # allow-list: if a real Keycloak adds a config key on create, this fails
+      # closed and the spec is amended.
+      incfg=0
+      cfgblocks=0
+      pmok=0
+      n=0
+      while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        line="${line%,}"
+        line="${line/ : /:}"
+        if [[ "${incfg}" -eq 1 ]]; then
+          if [[ "${line}" == "}" ]]; then
+            incfg=0
+            continue
+          fi
+          n=$((n + 1))
+          case "${line}" in
+            '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
+            *) diffs+=" unexpected-mapper-config:${line}" ;;
+          esac
+        elif [[ "${line}" == '"config":{' ]]; then
+          incfg=1
+          cfgblocks=$((cfgblocks + 1))
+        elif [[ "${line}" == '"protocolMapper":"oidc-audience-mapper"' ]]; then
+          pmok=1
+        fi
+      done <<< "${raw}"
+      [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
+      if [[ "${cfgblocks}" -ne 1 ]]; then
         diffs+=" mapper-config-absent"
       else
-        cfg="${cfg%%\}*}"
-        pairs=()
-        IFS=',' read -r -a pairs <<< "${cfg}"
-        [[ "${#pairs[@]}" -eq 3 ]] || diffs+=" mapper-config-count:${#pairs[@]}"
-        for item in "${pairs[@]}"; do
-          case "${item}" in
-            '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
-            *) diffs+=" unexpected-mapper-config:${item}" ;;
-          esac
-        done
+        [[ "${n}" -eq 3 ]] || diffs+=" mapper-config-count:${n}"
       fi
       if [[ -n "${diffs}" ]]; then
         acl_e2e_fail "drift from the pinned client (fail closed, no kcadm update):${diffs}"

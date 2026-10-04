@@ -488,6 +488,10 @@ class TestShapeBounds:
         grant = ConsoleAclGrantRequest.model_json_schema()["properties"]
         assert grant["perm_bits"]["maximum"] == MAX_PERM_BITS
         assert grant["perm_bits"]["minimum"] == 0
+        # A1: the model's own schema carries the EXACT integer (the BIGINT
+        # maximum); FastAPI's OpenAPI rendering floats numerics (9.22e18 ==
+        # 2**63, disclosed), so the exact bound is pinned here.
+        assert _bound(grant["expired_at_ms"], "maximum") == 2**63 - 1
         assert _max_len(grant["principal_id"]) == 64
         assert _max_len(grant["tenant_id"]) == 64
         assert _max_len(grant["role_id"]) == 36
