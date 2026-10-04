@@ -927,27 +927,21 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.27.0"
-      # Phase-E re-pin (2026-09-18, spec 2026-09-18-SPEC-e2e-deploy-and-
-      # mongo-audit.md) — the published INDEX digest for
-      # docker.io/lfds/audittrace-librechat-bff:1.27.0, confirmed live on
-      # Docker Hub 2026-09-18 via TWO independent manifest reads
-      # (registry-1.docker.io GET and HEAD, Accept negotiated for the OCI
-      # index; both returned `Docker-Content-Digest` and a
-      # `content-type: application/vnd.oci.image.index.v1+json` body — the
-      # manifest-list/index digest, never a child-manifest digest — never
-      # fabricated or copied from an operator-supplied value on trust).
-      # Bumped from `1.26.0` because `bff/` gained the v1.27.0 console
-      # proxies (presets, prompts, tool-favorites) — 19 files / +2222
-      # lines / -6 lines between `v1.26.0` and `v1.27.0` (confirmed via
-      # `git diff --shortstat v1.26.0 v1.27.0 -- bff/`), which the
-      # v1.26.0-era BFF image cannot serve. Mirrors the
-      # console.librechat.image digest-pin pattern below. When Part B's
-      # release pipeline publishes a new version this reconciles to
-      # whatever digest THAT publish produces — never hand-edited without
-      # re-verifying against the registry. When set, the rendered image
-      # ref becomes `<repository>:<tag>@<digest>` (deployment-bff.yaml).
-      digest: "sha256:b9cc31e78b50b5535cafc204a2ba30179677a707ea1ee77d63c8f80042741d55"
+      tag: "1.28.0"
+      # Phase-E re-pin (2026-10-04, release v1.28.0) — the published INDEX
+      # digest for docker.io/lfds/audittrace-librechat-bff:1.28.0 (publish.yml
+      # run 37054436343 on the v1.28.0 tag push), confirmed live on Docker Hub
+      # 2026-10-04 via TWO independent manifest reads (registry-1.docker.io
+      # HEAD with an OCI-index Accept header, and `docker buildx imagetools
+      # inspect`; both returned this digest with media type
+      # `application/vnd.oci.image.index.v1+json` — the index digest, never a
+      # child-manifest digest — never fabricated or copied on trust).
+      # Bumped from `1.27.0` so the BFF tracks the released version. Mirrors
+      # the console.librechat.image digest-pin pattern below. Tag and digest
+      # move together on every bump, never hand-edited without re-verifying
+      # against the registry. When set, the rendered image ref becomes
+      # `<repository>:<tag>@<digest>` (deployment-bff.yaml).
+      digest: "sha256:ddba3c72b1f3b31d0d62fede8bf88aee83986c66cfedfac08cc389ef8145d8cc"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -1136,15 +1130,14 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.26.0"
-    # RULE-2/3 RESOLVED (WU-6 Part C, 2026-09-10): the placeholder is now a
-    # real published index digest. The `audittrace-tests` publish.yml job
-    # (added in the D2-5F round) first fired on the v1.26.0 tag push and
-    # published docker.io/lfds/audittrace-tests:1.26.0 on 2026-09-07T20:15Z;
-    # this digest was confirmed via a manifest GET on hub.docker.com
-    # (never fabricated), same discipline as console.bff.image.digest /
-    # console.librechat.image.digest. Tag+digest move together on every bump.
-    digest: "sha256:84771ab04ec9aedbc828a2b8c73a3ad2369cbcf58f0c99890244bd8c48d796d0"
+    tag: "1.28.0"
+    # Phase-E re-pin (2026-10-04, release v1.28.0): the published INDEX
+    # digest for docker.io/lfds/audittrace-tests:1.28.0 (publish.yml run
+    # 37054436343), confirmed live on Docker Hub 2026-10-04 via TWO
+    # independent manifest reads (registry HEAD with an OCI-index Accept
+    # header, and `docker buildx imagetools inspect`), never fabricated.
+    # Bumped from `1.26.0`. Tag+digest move together on every bump.
+    digest: "sha256:ad869e59e967ccadafa014a6d1a6fee1c3476ebc136d4f40141852f694bf12fc"
     pullPolicy: IfNotPresent
   resources:
     requests:
