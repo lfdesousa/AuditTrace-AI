@@ -50,6 +50,7 @@ from audittrace.models import (
     ConsoleAclHasPermissionResponse,
     ConsoleAclModifyRequest,
     ConsoleAclResourceIdsResponse,
+    _check_principal_shape,
 )
 from audittrace.services.console_acl import (
     MAX_PERM_BITS,
@@ -327,6 +328,10 @@ async def revoke(
     """Expire the caller's active grant at the key. 200 with empty ids is
     the idempotent answer (an unowned row is omitted by 032, not refused)."""
     resource_type = _validated_resource_type(resource_type)
+    try:
+        _check_principal_shape(principal_type, principal_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     service = get_console_acl_service()
     try:
         result = await service.revoke_permission(

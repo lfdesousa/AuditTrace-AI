@@ -238,6 +238,75 @@ _BAD: list[tuple[str, str, str, dict[str, Any]]] = [
     ("perm_bits=16", "POST", _grants("r"), {"json": _grant_body(perm_bits=16)}),
     ("perm_bits=-1", "POST", _grants("r"), {"json": _grant_body(perm_bits=-1)}),
     (
+        "expired_at_ms=2**63 (S2: BIGINT overflow, was audited as a denial)",
+        "POST",
+        _grants("r"),
+        {"json": _grant_body(expired_at_ms=2**63)},
+    ),
+    (
+        "expired_at_ms=1e30",
+        "POST",
+        _grants("r"),
+        {
+            "content": b'{"principal_type":"user","principal_id":"p","perm_bits":1,"expired_at_ms":1e30}',
+            "headers": {"content-type": "application/json"},
+        },
+    ),
+    (
+        "user without principal_id (S2)",
+        "POST",
+        _grants("r"),
+        {"json": {"principal_type": "user", "perm_bits": 1}},
+    ),
+    (
+        "role without principal_id (S2)",
+        "POST",
+        _grants("r"),
+        {"json": {"principal_type": "role", "perm_bits": 1}},
+    ),
+    (
+        "public WITH principal_id (S2)",
+        "POST",
+        _grants("r"),
+        {"json": {"principal_type": "public", "principal_id": "p", "perm_bits": 1}},
+    ),
+    (
+        "bulk op: user without principal_id (S2)",
+        "POST",
+        _grants("r") + "/bulk",
+        {"json": {"ops": [{"principal_type": "user", "perm_bits": 1}]}},
+    ),
+    (
+        "bulk op: expired_at_ms=2**63 (S2)",
+        "POST",
+        _grants("r") + "/bulk",
+        {"json": {"ops": [_grant_body(expired_at_ms=2**63)]}},
+    ),
+    (
+        "modify: user without principal_id (S2)",
+        "PATCH",
+        _grants("r"),
+        {"json": {"principal_type": "user", "add_bits": 1}},
+    ),
+    (
+        "modify: public with principal_id (S2)",
+        "PATCH",
+        _grants("r"),
+        {"json": {"principal_type": "public", "principal_id": "p", "add_bits": 1}},
+    ),
+    (
+        "revoke: user without principal_id (S2)",
+        "DELETE",
+        _grants("r"),
+        {"params": {"principal_type": "user"}},
+    ),
+    (
+        "revoke: public with principal_id (S2)",
+        "DELETE",
+        _grants("r"),
+        {"params": {"principal_type": "public", "principal_id": "p"}},
+    ),
+    (
         "unknown principal_type",
         "POST",
         _grants("r"),
@@ -381,6 +450,22 @@ class TestShapeBounds:
         r = client.request(method, path, **kwargs)
         assert r.status_code == 422, (label, r.text)
         assert len(_acl_rows(client)) == before, f"{label}: a 422 wrote a row"
+
+    def test_bigint_maximum_expiry_is_still_accepted(self, client: TestClient) -> None:
+        """The bound is the column's own maximum (031 BIGINT): the largest
+        representable expiry is a valid grant, one more is a 422."""
+        ok = client.post(_grants("s2-max"), json=_grant_body(expired_at_ms=2**63 - 1))
+        assert ok.status_code == 201
+        assert ok.json()["expired_at_ms"] == 2**63 - 1
+
+    def test_public_grant_without_an_id_is_still_accepted(
+        self, client: TestClient
+    ) -> None:
+        r = client.post(
+            _grants("s2-public"), json={"principal_type": "public", "perm_bits": 1}
+        )
+        assert r.status_code == 201
+        assert r.json()["principal_id"] is None
 
     def test_unknown_resource_type_is_400_and_writes_no_row(
         self, client: TestClient
@@ -547,11 +632,22 @@ class TestRefusalMapping:
     @pytest.mark.parametrize(
         ("method", "suffix", "kwargs", "svc_method"),
         [
-            ("DELETE", "", {"params": {"principal_type": "user"}}, "revoke_permission"),
+            (
+                "DELETE",
+                "",
+                {"params": {"principal_type": "user", "principal_id": "p1"}},
+                "revoke_permission",
+            ),
             (
                 "PATCH",
                 "",
-                {"json": {"principal_type": "user", "add_bits": 1}},
+                {
+                    "json": {
+                        "principal_type": "user",
+                        "principal_id": "p1",
+                        "add_bits": 1,
+                    }
+                },
                 "modify_permission_bits",
             ),
             (
@@ -806,12 +902,92 @@ class TestTraceEquality:
         )
         bb = b.json()
         assert HEX32.fullmatch(bb["trace_id"]) and len(bb["acl_entry_ids"]) == 2
-        for e in await _entry_rows("tr-w4"):
+        w4_entries = await _entry_rows("tr-w4")
+        assert len(w4_entries) == 2, "S3: an empty list would make the loop vacuous"
+        assert {e.resource_id for e in w4_entries} == {"tr-w4"}
+        assert await _entry_rows("tr-w4x") == [], "no row may land on another resource"
+        for e in w4_entries:
             assert e.trace_id == bb["trace_id"]
         x = client.post(
             "/console/acl/expire", json={"predicates": [{"resource_id": "tr-w4"}]}
         )
         assert HEX32.fullmatch(x.json()["trace_id"])
+
+
+class TestDenialBodyTraceValue:
+    """R1 (review of 201b74a): the 4xx denial body's ``trace_id`` VALUE —
+    spec section 2 / AC-6 / the runbook's Rule-3 step for a denial. Under a
+    RECORDING tracer it must be 32-hex AND equal the denial audit row's
+    ``trace_id`` (and be the key ``GET /interactions?trace_id=`` returns
+    that row by). Neuter: ``detail.trace_id = None`` -> RED."""
+
+    def test_past_expiry_400_body_trace_equals_the_denial_row(
+        self, client: TestClient, recording_tracer: InMemorySpanExporter
+    ) -> None:
+        r = client.post(_grants("r1-past"), json=_grant_body(expired_at_ms=1))
+        assert r.status_code == 400
+        trace = r.json()["detail"]["trace_id"]
+        assert trace is not None and HEX32.fullmatch(trace), (
+            "vacuous without a trace id"
+        )
+        rows = _acl_rows(client, trace_id=trace)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["failure_class"] == "acl_denied_past_expiry"
+        assert rows[0]["trace_id"] == trace
+
+    def test_bulk_rollback_403_body_trace_equals_the_denial_row(
+        self, client: TestClient, recording_tracer: InMemorySpanExporter
+    ) -> None:
+        body = {"ops": [_grant_body(principal_id=OWNER), _grant_body(expired_at_ms=1)]}
+        r = client.post(_grants("r1-bulk") + "/bulk", json=body)
+        assert r.status_code == 403
+        trace = r.json()["detail"]["trace_id"]
+        assert trace is not None and HEX32.fullmatch(trace)
+        rows = _acl_rows(client, trace_id=trace)
+        assert [x["failure_class"] for x in rows] == ["acl_denied_bulk_rollback"]
+
+    def test_refusal_function_reads_the_ambient_trace_not_a_constant(
+        self, recording_tracer: InMemorySpanExporter
+    ) -> None:
+        from opentelemetry import trace as otel_trace
+
+        tracer = telemetry._tracer
+        with tracer.start_as_current_span("denial"):
+            expected = format(
+                otel_trace.get_current_span().get_span_context().trace_id, "032x"
+            )
+            http = refusal_to_http(
+                AclWriteRefused("x", failure_class="acl_denied_policy")
+            )
+        assert http.detail["trace_id"] == expected
+
+
+class TestW5TraceEqualsItsRows:
+    """R2: W5's response ``trace_id`` equals EVERY ``acl_authz`` row the
+    call wrote (n predicates -> n rows). A fresh uuid is 32-hex too, so
+    presence/shape proves nothing. Neuter: ``uuid4().hex`` -> RED."""
+
+    def test_n_predicates_n_rows_with_the_responses_trace(
+        self, client: TestClient, recording_tracer: InMemorySpanExporter
+    ) -> None:
+        preds = [{"resource_id": f"r2-w5-{i}"} for i in range(3)]
+        r = client.post("/console/acl/expire", json={"predicates": preds})
+        assert r.status_code == 200
+        trace = r.json()["trace_id"]
+        assert trace is not None and HEX32.fullmatch(trace)
+        rows = _acl_rows(client, trace_id=trace)
+        assert len(rows) == 3
+        assert {x["trace_id"] for x in rows} == {trace}
+        assert all(x["question"].startswith("op=deleteAclEntries ") for x in rows)
+        assert sorted(
+            x["question"].split("resource=")[1].split(":")[1].split(" ")[0]
+            for x in rows
+        ) == [
+            "r2-w5-0",
+            "r2-w5-1",
+            "r2-w5-2",
+        ]
 
 
 class TestExactRowDeltas:

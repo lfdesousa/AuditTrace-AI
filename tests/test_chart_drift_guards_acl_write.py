@@ -29,7 +29,6 @@ Every guard's neuter (recorded in the build record) turns it RED.
 
 from __future__ import annotations
 
-import copy
 import functools
 import json
 import re
@@ -453,19 +452,3 @@ class TestAclE2eProvisionerParity:
         there but a single quote would break the shell literal."""
         raw, _ = _pinned_json(SCRIPT)
         assert "'" not in raw
-
-
-def test_mutating_the_realm_block_is_detected() -> None:
-    """Self-attack on the instrument: a second mapper in a copy of the
-    realm block changes the exact comparison."""
-    c = copy.deepcopy(_client(_dev_realm(), E2E))
-    assert c is not None
-    c["protocolMappers"].append(
-        {
-            "name": "scope-injector",
-            "protocol": "openid-connect",
-            "protocolMapper": "oidc-hardcoded-claim-mapper",
-            "config": {"claim.name": "scope", "claim.value": "audittrace:admin"},
-        }
-    )
-    assert {m["name"] for m in c["protocolMappers"]} != {"aud-audittrace-server"}

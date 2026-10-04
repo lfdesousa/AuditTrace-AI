@@ -656,7 +656,7 @@ acl_e2e_strip_scopes() {
 # mappers EXACT (name set == {aud-audittrace-server}, protocolMapper and
 # config pinned). Any difference -> exit non-zero with the diff.
 acl_e2e_verify() {
-  local uuid="$1" diffs="" compact item name names n=0
+  local uuid="$1" diffs="" compact item name names n=0 cfg pairs
   compact=$(acl_e2e_compact "clients/${uuid}") \
     || acl_e2e_fail "cannot read the client"
   for item in \
@@ -703,13 +703,31 @@ acl_e2e_verify() {
   [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
   compact=$(acl_e2e_compact "clients/${uuid}/protocol-mappers/models") \
     || acl_e2e_fail "cannot read the mapper config"
+  # SC-1, EXACT: the mapper's name and protocolMapper equal the pinned
+  # values, and its `config` map EQUALS the pinned three-key map - no extra
+  # key (an audience widening or a hardcoded-claim `scope` writer would be
+  # one), none missing, none duplicated. No allow-list: if a real Keycloak
+  # adds a config key on create, this fails closed and the spec is amended.
   for item in \
       '"name":"aud-audittrace-server"' \
-      '"protocolMapper":"oidc-audience-mapper"' \
-      '"included.custom.audience":"audittrace-server"' \
-      '"id.token.claim":"false"' '"access.token.claim":"true"'; do
+      '"protocolMapper":"oidc-audience-mapper"'; do
     [[ "${compact}" == *"${item}"* ]] || diffs+=" missing-mapper-field:${item}"
   done
+  cfg="${compact#*\"config\":\{}"
+  if [[ "${cfg}" == "${compact}" ]]; then
+    diffs+=" mapper-config-absent"
+  else
+    cfg="${cfg%%\}*}"
+    pairs=()
+    IFS=',' read -r -a pairs <<< "${cfg}"
+    [[ "${#pairs[@]}" -eq 3 ]] || diffs+=" mapper-config-count:${#pairs[@]}"
+    for item in "${pairs[@]}"; do
+      case "${item}" in
+        '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
+        *) diffs+=" unexpected-mapper-config:${item}" ;;
+      esac
+    done
+  fi
   if [[ -n "${diffs}" ]]; then
     acl_e2e_fail "drift from the pinned client (fail closed, no kcadm update):${diffs}"
   fi

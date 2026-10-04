@@ -40,3 +40,21 @@ The fork's ACL shim and the BFF ACL proxy (WU-4); the O-7 cascade (2c-B); the
 live cluster (PostgreSQL 18.3 vs this harness's `postgres:16`); Keycloak's
 behaviour for the dedicated client (proven only by the provisioner's read-back
 after deploy).
+
+## Fix round 1 (2026-10-04) — the value guards the review found missing
+
+The independent review showed two claims in the table above were presence-
+checked only (a denial body's `trace_id`, W5's response `trace_id`). They are
+now value-checked under a recording tracer, on aiosqlite AND real Postgres.
+Captured through the real route on real Postgres (`postgres:16`):
+
+| artefact | value |
+|---|---|
+| non-owner W1 -> HTTP 403; response body `trace_id` == `interactions.trace_id` of the denial row | `bad3bb505167890281e5a37b3afda951` |
+| owner W5 with 2 predicates; response `trace_id` == the trace of BOTH `acl_authz` rows it wrote | `52dc612604de79f2456c51a11a9de91b` (2 rows) |
+
+Also fixed: an input-SHAPE defect (an `expired_at_ms` above the BIGINT maximum,
+a `user`/`role` grant without a `principal_id`, a `public` grant with one) is a
+422 with no row instead of an audited authorization denial; the evidence
+scanner now catches secrets in JSON, YAML, env, URL and header forms; the
+provisioner's live read-back compares the mapper `config` map EXACTLY.

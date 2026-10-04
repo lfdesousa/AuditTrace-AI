@@ -371,7 +371,8 @@ components:
       properties:
         expired_at_ms:
           anyOf:
-          - minimum: 0.0
+          - maximum: 9.223372036854776e+18
+            minimum: 0.0
             type: integer
           - type: 'null'
           title: Expired At Ms

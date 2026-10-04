@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _reject_project_pii(value: str | None) -> str | None:
@@ -1028,6 +1028,24 @@ ACL_RESOURCE_TYPES = Literal[
 ]
 _ACL_MAX_BITS = 15  # == services.console_acl.MAX_PERM_BITS (pinned by a test)
 _ACL_MAX_BATCH = 200
+# 031's ``expired_at_ms`` is a BIGINT: anything above its signed 64-bit
+# maximum is a database ``22000`` that would otherwise be AUDITED AS AN
+# AUTHORIZATION DENIAL. Shape is refused at the edge (422, no row).
+_ACL_MAX_MS = 2**63 - 1
+
+
+def _check_principal_shape(principal_type: str, principal_id: str | None) -> None:
+    """031's ``ck_console_acl_entries_public_principal_null`` at the edge:
+    a ``public`` principal has NO id; every other principal type needs
+    one. A shape defect, not an authorization event (422, no row); the
+    CHECK constraint stays the control."""
+    if principal_type == "public":
+        if principal_id is not None:
+            raise ValueError("principal_id must be omitted for principal_type=public")
+    elif principal_id is None:
+        raise ValueError(
+            f"principal_id is required for principal_type={principal_type}"
+        )
 
 
 class ConsoleAclGrantRequest(BaseModel):
@@ -1040,8 +1058,13 @@ class ConsoleAclGrantRequest(BaseModel):
     principal_id: str | None = Field(None, min_length=1, max_length=64)
     perm_bits: int = Field(..., ge=0, le=_ACL_MAX_BITS)
     role_id: str | None = Field(None, min_length=1, max_length=36)
-    expired_at_ms: int | None = Field(None, ge=0)
+    expired_at_ms: int | None = Field(None, ge=0, le=_ACL_MAX_MS)
     tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _principal_shape(self) -> Self:
+        _check_principal_shape(self.principal_type, self.principal_id)
+        return self
 
 
 class ConsoleAclModifyRequest(BaseModel):
@@ -1054,6 +1077,11 @@ class ConsoleAclModifyRequest(BaseModel):
     add_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
     remove_bits: int | None = Field(None, ge=0, le=_ACL_MAX_BITS)
     tenant_id: str | None = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _principal_shape(self) -> Self:
+        _check_principal_shape(self.principal_type, self.principal_id)
+        return self
 
 
 class ConsoleAclBulkRequest(BaseModel):

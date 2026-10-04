@@ -109,7 +109,10 @@ FAKE_KCADM = textwrap.dedent(
             "id": uid, "body": stored,
             "default": [dict(s) for s in state.get("realm_default_scopes", [])],
             "optional": [dict(s) for s in state.get("realm_optional_scopes", [])],
-            "mappers": body.get("protocolMappers", []) + state.get("extra_mappers_on_create", []),
+            "mappers": [
+                dict(m, config=dict(m.get("config", {}), **state.get("extra_mapper_config_on_create", {})))
+                for m in body.get("protocolMappers", [])
+            ] + state.get("extra_mappers_on_create", []),
         })
         save()
         sys.exit(0)
@@ -283,6 +286,23 @@ class TestEnabledCreate:
         assert "STEP-COMPLETED" not in proc.stdout
 
 
+class TestEnabledCreateServerAddedConfig:
+    def test_server_added_mapper_config_key_on_create_fails_closed(
+        self, run: Run
+    ) -> None:
+        """SC-1 EXACT: a config key the SERVER adds on create (modelled by
+        the fake) is not tolerated — no allow-list. If a real Keycloak does
+        this, the live read-back fails and the spec is amended."""
+        proc = run.go(
+            clients=[],
+            extra_mapper_config_on_create={"introspection.token.claim": "true"},
+            **REALM_DEFAULTS,
+        )
+        assert proc.returncode != 0
+        assert "unexpected-mapper-config:" in proc.stderr
+        assert "STEP-COMPLETED" not in proc.stdout
+
+
 class TestEnabledPresent:
     def test_equal_is_a_no_op(self, run: Run) -> None:
         proc = run.go(clients=[_pinned_client_state()])
@@ -369,7 +389,61 @@ class TestEnabledPresent:
                         }
                     ]
                 },
-                '"included.custom.audience":"audittrace-server"',
+                'unexpected-mapper-config:"included.custom.audience":"some-other-api"',
+            ),
+            (
+                "SC-1 extra config key: audience widening",
+                {
+                    "mappers": [
+                        {
+                            **PINNED_MAPPER,
+                            "config": {
+                                **PINNED_MAPPER["config"],
+                                "included.client.audience": "audittrace-librechat",
+                            },
+                        }
+                    ]
+                },
+                "unexpected-mapper-config:",
+            ),
+            (
+                "SC-1 extra config key: userinfo claim",
+                {
+                    "mappers": [
+                        {
+                            **PINNED_MAPPER,
+                            "config": {
+                                **PINNED_MAPPER["config"],
+                                "userinfo.token.claim": "true",
+                            },
+                        }
+                    ]
+                },
+                "mapper-config-count:4",
+            ),
+            (
+                "SC-1 config key missing",
+                {
+                    "mappers": [
+                        {
+                            **PINNED_MAPPER,
+                            "config": {
+                                "included.custom.audience": "audittrace-server",
+                                "id.token.claim": "false",
+                            },
+                        }
+                    ]
+                },
+                "mapper-config-count:2",
+            ),
+            (
+                "SC-1 config absent",
+                {
+                    "mappers": [
+                        {k: v for k, v in PINNED_MAPPER.items() if k != "config"}
+                    ]
+                },
+                "mapper-config-absent",
             ),
             (
                 "SC-1 mapper type changed",

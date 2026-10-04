@@ -337,6 +337,138 @@ class TestN1GrantOnForeignResource:
             assert len(h.entries()) == 1
 
 
+@pytest.fixture
+def recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A REAL recording tracer behind ``@log_call`` (no recording provider
+    -> ``current_trace_id_hex`` is None and ``None == None`` proves
+    nothing)."""
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from audittrace import telemetry
+
+    monkeypatch.setattr(telemetry, "_tracer", TracerProvider().get_tracer("pg-rec"))
+
+
+class TestDenialBodyTraceValueOnPostgres:
+    """R1 on REAL Postgres: the 403 body's ``trace_id`` equals the denial
+    row's ``trace_id`` (read by the ADMIN connection AND by the denied
+    subject through the RLS-scoped ``GET /interactions?trace_id=``);
+    the resource owner sees nothing for that trace. Neuter:
+    ``detail.trace_id = None`` -> RED."""
+
+    async def test_n1_denial_body_trace_equals_the_row_and_the_subjects_read(
+        self, h: Harness, recording: None
+    ) -> None:
+        r = h.call(_ATTACKER, "POST", _grants(), json=_body(_ATTACKER, 15))
+        assert r.status_code == 403
+        trace = r.json()["detail"]["trace_id"]
+        assert trace is not None and len(trace) == 32, "vacuous without a trace id"
+        denial = h.audit(user_id=_ATTACKER)[-1]
+        assert denial["trace_id"] == trace
+        mine = h.call(
+            _ATTACKER, "GET", "/interactions", params={"trace_id": trace}
+        ).json()
+        assert mine["total"] == 1
+        assert mine["interactions"][0]["failure_class"] == "acl_denied_policy"
+        theirs = h.call(_OWNER, "GET", "/interactions", params={"trace_id": trace})
+        assert theirs.json()["total"] == 0
+
+    async def test_n5_bulk_rollback_body_trace_equals_the_row(
+        self, h: Harness, recording: None
+    ) -> None:
+        r = h.call(
+            _ATTACKER, "POST", _grants() + "/bulk", json={"ops": [_body(_ATTACKER, 1)]}
+        )
+        assert r.status_code == 403
+        trace = r.json()["detail"]["trace_id"]
+        assert trace is not None and len(trace) == 32
+        assert h.audit(user_id=_ATTACKER)[-1]["trace_id"] == trace
+
+
+class TestW5TraceEqualsItsRowsOnPostgres:
+    """R2 on REAL Postgres. Neuter: W5 returns ``uuid4().hex`` -> RED."""
+
+    async def test_w5_response_trace_equals_every_row_it_wrote(
+        self, h: Harness, recording: None
+    ) -> None:
+        r = h.call(
+            _OWNER,
+            "POST",
+            "/console/acl/expire",
+            json={"predicates": [{"resource_id": _AGENT}, {"resource_id": _GROUP}]},
+        )
+        assert r.status_code == 200
+        trace = r.json()["trace_id"]
+        assert trace is not None and len(trace) == 32
+        rows = h.audit(trace_id=trace)
+        assert len(rows) == 2
+        via_route = h.call(
+            _OWNER, "GET", "/interactions", params={"trace_id": trace}
+        ).json()
+        assert via_route["total"] == 2
+
+
+class TestS2ShapeIsRefusedAtTheEdgeOnPostgres:
+    """S2: an input-SHAPE defect is a 422 with NO row — it must not be
+    audited as an authorization denial. Before the fix, ``expired_at_ms=2**63``
+    was a 403 ``acl_denied_policy`` (SQLSTATE 22000) and ``user`` without a
+    ``principal_id`` was a 403 (23514) plus a ``failed`` row. The DB stays
+    the control (its CHECK / BIGINT are untouched)."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {
+                "principal_type": "user",
+                "principal_id": _THIRD,
+                "perm_bits": 1,
+                "expired_at_ms": 2**63,
+            },
+            {"principal_type": "user", "perm_bits": 1},
+            {"principal_type": "role", "perm_bits": 1},
+            {"principal_type": "public", "principal_id": _THIRD, "perm_bits": 1},
+        ],
+        ids=["bigint-overflow", "user-no-id", "role-no-id", "public-with-id"],
+    )
+    async def test_w1_is_422_with_zero_rows_and_zero_audit_rows(
+        self, h: Harness, body: dict[str, Any]
+    ) -> None:
+        before = h.audit_count()
+        r = h.call(_OWNER, "POST", _grants(), json=body)
+        assert r.status_code == 422, r.text
+        assert h.entries() == []
+        assert h.audit_count() == before
+
+    async def test_w4_op_with_overflow_is_422_with_zero_rows(self, h: Harness) -> None:
+        before = h.audit_count()
+        r = h.call(
+            _OWNER,
+            "POST",
+            _grants() + "/bulk",
+            json={"ops": [_body(_THIRD, 1), _body(_THIRD, 1, expired_at_ms=2**63)]},
+        )
+        assert r.status_code == 422
+        assert h.entries() == [] and h.audit_count() == before
+
+    async def test_the_bigint_maximum_is_accepted_by_the_real_column(
+        self, h: Harness
+    ) -> None:
+        """The bound equals the column's own range, measured: 2**63-1 lands."""
+        r = h.call(
+            _OWNER, "POST", _grants(), json=_body(_THIRD, 1, expired_at_ms=2**63 - 1)
+        )
+        assert r.status_code == 201, r.text
+        assert h.entries()[0]["perm_bits"] == 1
+
+    async def test_the_database_still_refuses_what_the_edge_would_let_through(
+        self, h: Harness
+    ) -> None:
+        """Control stays the DB: a non-owner's well-shaped grant is still a
+        403 policy denial with a row (N-1) — shape bounds did not replace it."""
+        r = h.call(_ATTACKER, "POST", _grants(), json=_body(_ATTACKER, 1))
+        assert r.status_code == 403
+
+
 # ── N-2 / N-4: B revokes / expires A's grant ───────────────────────────────
 
 

@@ -1,10 +1,10 @@
-"""``scripts/deploy/acl_e2e_device_mint.py`` and ``acl_evidence_scan.py``
+"""``scripts/deploy/acl_e2e_device_mint.py``
 (ACL WU-2c-A) — offline, no network, no real token store.
 
 Covers: the isolation refusal (BA-2), the request fields (explicit
 ``scope=``, the device-code grant), the persisted file shape (no refresh
-keys), AC-19 (no token / device code on ANY output path) and AC-18's seal
-scan. Every guard has an assertion that fails when the guard is removed
+keys), AC-19 (no token / device code on ANY output path). AC-18's seal scan
+has its own module (tests/test_acl_evidence_scan.py). Every guard has an assertion that fails when the guard is removed
 (neuters recorded in the build record).
 """
 
@@ -20,7 +20,6 @@ from urllib.parse import parse_qs
 import pytest
 
 from scripts.deploy import acl_e2e_device_mint as mint
-from scripts.deploy import acl_evidence_scan as scan
 
 JWT_RE = re.compile(r"[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}")
 DEVICE_CODE = "DEVCODE-0123456789-abcdefghijklmnopqrstuvwxyz"
@@ -324,60 +323,3 @@ class TestMainEntry:
         monkeypatch.setattr(mint, "run", fake_run)
         assert mint.main(["--scope", "openid x", "--insecure"]) == 0
         assert seen == {"scope": "openid x", "insecure": True}
-
-
-class TestEvidenceScan:
-    """AC-18 — the seal check. Neuter: plant a three-segment string -> hit."""
-
-    def test_clean_folder_passes(self, tmp_path, capsys) -> None:
-        (tmp_path / "a.md").write_text(
-            "trace_id 0123456789abcdef0123456789abcdef\nrefresh-token key absent: True\n"
-        )
-        assert scan.main([str(tmp_path)]) == 0
-        assert "clean" in capsys.readouterr().out
-
-    def test_planted_jwt_shape_is_a_hit(self, tmp_path, capsys) -> None:
-        (tmp_path / "leak.txt").write_text(f"x {ACCESS} y")
-        assert scan.main([str(tmp_path)]) == 1
-        out = capsys.readouterr().out
-        assert "leak.txt" in out and ACCESS not in out
-
-    @pytest.mark.parametrize(
-        "line",
-        [
-            "refresh_token: absent",
-            "accessToken=abc",
-            "device_code : x",
-            "device_code=x",
-        ],
-    )
-    def test_secret_key_assignments_are_hits(self, tmp_path, line) -> None:
-        (tmp_path / "n.md").write_text(line)
-        assert [p.name for p in scan.scan(tmp_path)] == ["n.md"]
-
-    def test_hyphenated_prose_is_not_a_hit(self, tmp_path) -> None:
-        (tmp_path / "n.md").write_text(
-            "refresh-token key absent: True; device-code never printed"
-        )
-        assert scan.scan(tmp_path) == []
-
-    def test_nested_files_scanned(self, tmp_path) -> None:
-        (tmp_path / "d" / "e").mkdir(parents=True)
-        (tmp_path / "d" / "e" / "x").write_text(ACCESS)
-        assert len(scan.scan(tmp_path)) == 1
-
-    def test_not_a_directory_fails_closed(self, tmp_path) -> None:
-        assert scan.main([str(tmp_path / "missing")]) == 2
-
-    def test_unreadable_file_is_a_hit(self, tmp_path, monkeypatch) -> None:
-        f = tmp_path / "u"
-        f.write_text("x")
-        real = Path.read_text
-
-        def deny(self, *a, **k):
-            if self == f:
-                raise PermissionError
-            return real(self, *a, **k)
-
-        monkeypatch.setattr(Path, "read_text", deny)
-        assert scan.scan(tmp_path) == [f]
