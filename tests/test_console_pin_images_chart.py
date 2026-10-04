@@ -359,9 +359,13 @@ class TestNoLocalRegistryOrStaleTagSurvives:
         )
 
     def test_tests_hook_image_pinned_to_v1_28_0_tag_and_digest_together(self) -> None:
-        """v1.28.0 Phase-E re-pin (2026-10-04): the `helm test` hook image
-        moves tag + digest together; a half-bump (new tag, old digest or
-        vice versa) goes RED here."""
+        """VALUES-level only (v1.28.0 Phase-E re-pin, 2026-10-04): asserts
+        `tests.image.tag` and `.digest` in values.yaml moved together; a
+        half-bump of values.yaml goes RED here. It does NOT measure the
+        rendered Pod — that is pinned by
+        test_console_d2_5f_reproducible_values_and_secrets.py::
+        TestZeroLocalhost5000InRenderedChart::
+        test_rendered_tests_image_equals_v1_28_0_pin_exactly."""
         values = yaml.safe_load(VALUES_DEFAULT.read_text(encoding="utf-8"))
         image = values["tests"]["image"]
         assert image["tag"] == "1.28.0"
