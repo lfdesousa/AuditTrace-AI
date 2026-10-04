@@ -3849,10 +3849,9 @@ class TestKeycloakAclReadOwnScopeGovernance:
     half: ``memory:acl:read-own`` reaches ``audittrace-librechat`` as a
     DEFAULT scope, via a dedicated ``MEMORY_ACL_READ_SCOPES`` array +
     bind loop kept SEPARATE from every other scope array in this
-    script. There is no write half yet (WU-1 is read-only; WU-2 adds
-    ``memory:acl:write`` later), so unlike every prior domain there is
-    no sibling ``...WriteScopeGovernance`` class to borrow a
-    ``_FORBIDDEN`` set from — it is self-contained here.
+    script. The WRITE half (``memory:acl:write``, WU-2c) has its own
+    sibling guard in ``tests/test_chart_drift_guards_acl_write.py``;
+    this class stays self-contained and keeps the read array exact.
 
     Falsifiable, same shape as
     ``TestKeycloakToolFavoritesReadOwnScopeGovernance``:
@@ -3992,7 +3991,9 @@ class TestOpencodeClientScopesUnchangedByAcl:
     ``TestOpencodeClientScopesUnchangedByToolFavorites``.
     """
 
-    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset({"memory:acl:read-own"})
+    _FORBIDDEN_ON_OPENCODE: frozenset[str] = frozenset(
+        {"memory:acl:read-own", "memory:acl:write"}
+    )
 
     @staticmethod
     def _client(realm: dict, client_id: str) -> dict:
@@ -5358,6 +5359,10 @@ class TestLibrechatConsoleClient:
             # BFF's console-tool-favorites proxy exchange requests it
             # explicitly.
             "memory:tool_favorites:write",
+            # ACL WU-2c (2026-10-02) — the console-ACL write scope, ALSO
+            # optional on the console's client (the dedicated E2E client
+            # holds it separately — test_chart_drift_guards_acl_write.py).
+            "memory:acl:write",
         }
     )
 

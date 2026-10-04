@@ -317,15 +317,22 @@ MEMORY_TOOL_FAVORITES_READ_SCOPES=(
 # Sovereign Authorization Layer EPIC, WU-1 (2026-09-17, READ PATH ONLY)
 # — the console-ACL store's read-own scope. Bound as DEFAULT to
 # audittrace-librechat — same rationale as
-# MEMORY_TOOL_FAVORITES_READ_SCOPES above. No write array exists yet:
-# WU-1 is read-only (WU-2 adds memory:acl:write later).
+# MEMORY_TOOL_FAVORITES_READ_SCOPES above.
 MEMORY_ACL_READ_SCOPES=(
   "memory:acl:read-own"
 )
 
+# Sovereign Authorization Layer EPIC, WU-2c — the console-ACL WRITE
+# scope. Bound ONLY as OPTIONAL to audittrace-librechat (like every
+# console write scope) — own array/bind loop; the dedicated E2E client
+# gets it through its own step below, never through this loop.
+MEMORY_ACL_WRITE_SCOPES=(
+  "memory:acl:write"
+)
+
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
-for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}" "${MEMORY_ACL_READ_SCOPES[@]}"; do
+for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}" "${MEMORY_ACL_READ_SCOPES[@]}" "${MEMORY_ACL_WRITE_SCOPES[@]}"; do
   EXISTING=$(kcadm get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
@@ -564,6 +571,236 @@ echo "▶ binding console-acl read-own scope to client audittrace-librechat (def
 for SCOPE in "${MEMORY_ACL_READ_SCOPES[@]}"; do
   bind_scope "audittrace-librechat" "${SCOPE}" "default"
 done
+
+# ----- Bind the console-ACL WRITE scope (WU-2c) -----
+# audittrace-librechat only, as OPTIONAL — like every console write scope.
+echo "▶ binding console-acl write scope to client audittrace-librechat (optional)..."
+for SCOPE in "${MEMORY_ACL_WRITE_SCOPES[@]}"; do
+  bind_scope "audittrace-librechat" "${SCOPE}" "optional"
+done
+
+# ----- ACL WU-2c: the dedicated E2E-only device-flow client (audittrace-acl-e2e) -----
+# Flag-aware (AUDITTRACE_ACL_E2E_CLIENT_ENABLED, set by the hook Job from
+# .Values.keycloak.aclE2eClient.enabled; default true): enabled ->
+# ensure + VERIFY (fail closed on drift, never `kcadm update` a drifted
+# client); disabled -> verify-then-delete (exactly one match, clientId
+# equal) and read back an empty result. This step sits OUTSIDE the
+# MEMORY_ACL_*_SCOPES bind loops. The pinned JSON below is byte-identical
+# in scripts/setup-memory-scopes.sh and the chart ConfigMap (parity-guarded).
+ACL_E2E_CLIENT_ID="audittrace-acl-e2e"
+ACL_E2E_ENABLED="${AUDITTRACE_ACL_E2E_CLIENT_ENABLED:-true}"
+ACL_E2E_CLIENT_JSON='{"clientId":"audittrace-acl-e2e","description":"ACL WU-2c E2E-only device-flow client (sunset: WU-4 merge, keycloak.aclE2eClient.enabled=false). Holds ONLY memory:acl:read-own + memory:acl:write; no offline_access, no refresh, consent required.","enabled":true,"protocol":"openid-connect","publicClient":true,"standardFlowEnabled":false,"directAccessGrantsEnabled":false,"implicitFlowEnabled":false,"serviceAccountsEnabled":false,"consentRequired":true,"redirectUris":["urn:ietf:wg:oauth:2.0:oob"],"webOrigins":[],"attributes":{"oauth2.device.authorization.grant.enabled":"true","oauth2.device.polling.interval":"5","oauth2.device.code.lifespan":"120","use.refresh.tokens":"false","access.token.lifespan":"900"},"defaultClientScopes":["memory:acl:read-own","memory:acl:write"],"optionalClientScopes":[],"protocolMappers":[{"name":"aud-audittrace-server","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.custom.audience":"audittrace-server","id.token.claim":"false","access.token.claim":"true"}}]}'
+ACL_E2E_DEFAULT_SCOPES=("memory:acl:read-own" "memory:acl:write")
+
+acl_e2e_fail() {
+  echo "❌ ${ACL_E2E_CLIENT_ID}: $*" >&2
+  exit 1
+}
+
+# Whitespace-stripped JSON of one kcadm GET (so `"k" : "v"` -> `"k":"v"`).
+acl_e2e_compact() {
+  local raw
+  raw=$(kcadm get "$1" -r "${REALM}") || acl_e2e_fail "cannot read $1"
+  echo "${raw//[[:space:]]/}"
+}
+
+# Names of a client's default|optional scopes, one per line.
+acl_e2e_scope_names() {
+  local out line
+  out=$(kcadm get "clients/$1/$2-client-scopes" -r "${REALM}" \
+          --fields name --format csv --noquotes) \
+    || acl_e2e_fail "cannot read $2 scopes"
+  while IFS= read -r line; do
+    line="${line//\"/}"
+    [[ -n "${line}" ]] && echo "${line}"
+  done <<< "${out}"
+  return 0
+}
+
+acl_e2e_in_default_set() {
+  local want
+  for want in "${ACL_E2E_DEFAULT_SCOPES[@]}"; do
+    [[ "$1" == "${want}" ]] && return 0
+  done
+  return 1
+}
+
+# Remove every default/optional scope NOT in the pinned set (Keycloak may
+# add realm-default scopes on create): default keeps the two ACL scopes,
+# optional keeps none.
+acl_e2e_strip_scopes() {
+  local uuid="$1" kind out sid sname keep
+  for kind in default optional; do
+    out=$(kcadm get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
+            --fields id,name --format csv --noquotes) \
+      || acl_e2e_fail "cannot list ${kind} scopes"
+    while IFS=, read -r sid sname; do
+      sid="${sid//\"/}"; sname="${sname//\"/}"
+      [[ -z "${sid}" ]] && continue
+      keep=0
+      if [[ "${kind}" == "default" ]] && acl_e2e_in_default_set "${sname}"; then
+        keep=1
+      fi
+      if [[ "${keep}" -eq 0 ]]; then
+        kcadm delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
+          -r "${REALM}" >/dev/null \
+          || acl_e2e_fail "could not strip ${kind} scope ${sname}"
+        echo "  ✓ ${ACL_E2E_CLIENT_ID}: stripped unpinned ${kind} scope ${sname}"
+      fi
+    done <<< "${out}"
+  done
+}
+
+# VERIFY (equality on the compared keys). Flags + consentRequired exact;
+# attributes a pinned SUBSET; default/optional scopes EXACT sets; protocol
+# mappers EXACT (name set == {aud-audittrace-server}, protocolMapper and
+# config pinned). Any difference -> exit non-zero with the diff.
+acl_e2e_verify() {
+  local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
+  compact=$(acl_e2e_compact "clients/${uuid}") \
+    || acl_e2e_fail "cannot read the client"
+  for item in \
+      '"clientId":"audittrace-acl-e2e"' '"publicClient":true' \
+      '"standardFlowEnabled":false' '"directAccessGrantsEnabled":false' \
+      '"implicitFlowEnabled":false' '"serviceAccountsEnabled":false' \
+      '"consentRequired":true' \
+      '"oauth2.device.authorization.grant.enabled":"true"' \
+      '"oauth2.device.polling.interval":"5"' \
+      '"oauth2.device.code.lifespan":"120"' \
+      '"use.refresh.tokens":"false"' '"access.token.lifespan":"900"'; do
+    [[ "${compact}" == *"${item}"* ]] || diffs+=" missing:${item}"
+  done
+  # default scopes: exact set (read FIRST, so a failed read is fatal and
+  # can never look like an empty/equal set)
+  names=$(acl_e2e_scope_names "${uuid}" default) \
+    || acl_e2e_fail "cannot read default scopes"
+  n=0
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    n=$((n + 1))
+    acl_e2e_in_default_set "${name}" || diffs+=" unexpected-default-scope:${name}"
+  done <<< "${names}"
+  [[ "${n}" -eq "${#ACL_E2E_DEFAULT_SCOPES[@]}" ]] \
+    || diffs+=" default-scope-count:${n}"
+  # optional scopes: exact empty set
+  names=$(acl_e2e_scope_names "${uuid}" optional) \
+    || acl_e2e_fail "cannot read optional scopes"
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    diffs+=" unexpected-optional-scope:${name}"
+  done <<< "${names}"
+  # protocol mappers: exact name set + pinned protocolMapper/config
+  names=$(kcadm get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
+            --fields name --format csv --noquotes) \
+    || acl_e2e_fail "cannot read protocol mappers"
+  n=0
+  while IFS= read -r name; do
+    name="${name//\"/}"
+    [[ -z "${name}" ]] && continue
+    n=$((n + 1))
+    [[ "${name}" == "aud-audittrace-server" ]] || diffs+=" unexpected-mapper:${name}"
+  done <<< "${names}"
+  [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
+  raw=$(kcadm get "clients/${uuid}/protocol-mappers/models" -r "${REALM}") \
+    || acl_e2e_fail "cannot read the mapper config"
+  # SC-1, EXACT: the mapper's name and protocolMapper equal the pinned
+  # values and its `config` map holds EXACTLY the pinned three pairs - no
+  # extra key (an audience widening or a hardcoded-claim `scope` writer
+  # would be one), none missing. Lines are compared VERBATIM: only the
+  # indentation, a trailing comma and the `" : "` key separator of kcadm's
+  # pretty-printed JSON are normalised, so whitespace INSIDE a value (for
+  # example `audittrace -server`) is a difference. This relies on kcadm's
+  # one-key-per-line pretty output of a ProtocolMapperRepresentation (id,
+  # name, protocol, protocolMapper, consentRequired, config - `config` is
+  # a flat string map with unique keys); a compact or re-shaped output
+  # finds no `config` block and fails closed (mapper-config-absent). No
+  # allow-list: if a real Keycloak adds a config key on create, this fails
+  # closed and the spec is amended.
+  incfg=0
+  cfgblocks=0
+  pmok=0
+  n=0
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    line="${line%,}"
+    line="${line/ : /:}"
+    if [[ "${incfg}" -eq 1 ]]; then
+      if [[ "${line}" == "}" ]]; then
+        incfg=0
+        continue
+      fi
+      n=$((n + 1))
+      case "${line}" in
+        '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
+        *) diffs+=" unexpected-mapper-config:${line}" ;;
+      esac
+    elif [[ "${line}" == '"config":{' ]]; then
+      incfg=1
+      cfgblocks=$((cfgblocks + 1))
+    elif [[ "${line}" == '"protocolMapper":"oidc-audience-mapper"' ]]; then
+      pmok=1
+    fi
+  done <<< "${raw}"
+  [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
+  if [[ "${cfgblocks}" -ne 1 ]]; then
+    diffs+=" mapper-config-absent"
+  else
+    [[ "${n}" -eq 3 ]] || diffs+=" mapper-config-count:${n}"
+  fi
+  if [[ -n "${diffs}" ]]; then
+    acl_e2e_fail "drift from the pinned client (fail closed, no kcadm update):${diffs}"
+  fi
+  echo "  ✓ ${ACL_E2E_CLIENT_ID}: verified equal to the pinned block"
+}
+
+# Matching clients as csv `id,clientId` lines; query failure is fatal.
+acl_e2e_lookup() {
+  local out
+  out=$(kcadm get clients -r "${REALM}" -q "clientId=${ACL_E2E_CLIENT_ID}" \
+          --fields id,clientId --format csv --noquotes) \
+    || acl_e2e_fail "client lookup failed"
+  echo "${out//\"/}"
+}
+
+if [[ "${ACL_E2E_ENABLED}" == "true" ]]; then
+  echo "▶ ensuring the dedicated E2E client ${ACL_E2E_CLIENT_ID} (enabled)..."
+  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+  if [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]]; then
+    printf '%s' "${ACL_E2E_CLIENT_JSON}" | kcadm create clients -r "${REALM}" -f - >/dev/null \
+      || acl_e2e_fail "create failed"
+    echo "  ✓ ${ACL_E2E_CLIENT_ID}: created"
+    ACL_E2E_UUID=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+    ACL_E2E_UUID="${ACL_E2E_UUID%%,*}"
+    [[ -n "${ACL_E2E_UUID}" ]] || acl_e2e_fail "created but id not resolvable"
+    acl_e2e_strip_scopes "${ACL_E2E_UUID}"
+    for SCOPE in "${ACL_E2E_DEFAULT_SCOPES[@]}"; do
+      bind_scope "${ACL_E2E_CLIENT_ID}" "${SCOPE}" "default"
+    done
+  else
+    [[ "$(echo "${ACL_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
+      || acl_e2e_fail "more than one client matches (refusing)"
+    ACL_E2E_UUID="${ACL_E2E_FOUND%%,*}"
+  fi
+  acl_e2e_verify "${ACL_E2E_UUID}"
+else
+  echo "▶ removing the dedicated E2E client ${ACL_E2E_CLIENT_ID} (disabled — sunset)..."
+  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+  if [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]]; then
+    echo "  ⊝ ${ACL_E2E_CLIENT_ID}: absent (empty query result)"
+  else
+    [[ "$(echo "${ACL_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
+      || acl_e2e_fail "refusing to delete: query did not return exactly one client"
+    [[ "${ACL_E2E_FOUND#*,}" == "${ACL_E2E_CLIENT_ID}" ]] \
+      || acl_e2e_fail "refusing to delete: returned clientId is not ${ACL_E2E_CLIENT_ID}"
+    kcadm delete "clients/${ACL_E2E_FOUND%%,*}" -r "${REALM}" >/dev/null \
+      || acl_e2e_fail "delete failed"
+    ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "read-back lookup failed"
+    [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]] \
+      || acl_e2e_fail "read-back after delete is not empty"
+    echo "  ✓ ${ACL_E2E_CLIENT_ID}: deleted (read-back empty)"
+  fi
+fi
 
 # ----- User-identity protocol mappers -----
 # Without these, JWTs from user-facing clients lack `preferred_username`,

@@ -813,6 +813,15 @@ keycloak:
       - "https://librechat.audittrace.local"
     devWebOrigins:
       - "http://localhost:3080"
+  # ACL WU-2c — the dedicated, E2E-only `audittrace-acl-e2e` device-flow
+  # client (the only sanctioned path to the ACL write routes for two
+  # human subjects until the WU-4 console shim exists). SUNSET MECHANISM:
+  # flip `enabled` to false after WU-4 — the realm template then omits
+  # the client and the scopes hook Job deletes it (verify-then-delete).
+  # Also delete the dev-realm copy (keycloak/realm-audittrace.json); the
+  # two-realm parity guards redden until it is.
+  aclE2eClient:
+    enabled: true
   resources:
     requests:
       cpu: 500m

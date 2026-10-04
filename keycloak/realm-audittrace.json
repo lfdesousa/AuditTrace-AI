@@ -285,6 +285,13 @@
       }
     },
     {
+      "name": "memory:acl:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      }
+    },
+    {
       "name": "audittrace:scan:retrigger",
       "protocol": "openid-connect",
       "attributes": {
@@ -858,7 +865,8 @@
         "memory:files:write",
         "memory:agents:write",
         "memory:conversation_tags:write",
-        "memory:tool_favorites:write"
+        "memory:tool_favorites:write",
+        "memory:acl:write"
       ],
       "protocolMappers": [
         {
@@ -914,6 +922,46 @@
       "defaultClientScopes": [],
       "optionalClientScopes": [],
       "protocolMappers": []
+    },
+    {
+      "description": "ACL WU-2c E2E-only device-flow client (sunset: WU-4 merge, keycloak.aclE2eClient.enabled=false). Holds ONLY memory:acl:read-own + memory:acl:write; no offline_access, no refresh, consent required.",
+      "clientId": "audittrace-acl-e2e",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": true,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "urn:ietf:wg:oauth:2.0:oob"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "oauth2.device.polling.interval": "5",
+        "oauth2.device.code.lifespan": "120",
+        "use.refresh.tokens": "false",
+        "access.token.lifespan": "900"
+      },
+      "defaultClientScopes": [
+        "memory:acl:read-own",
+        "memory:acl:write"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-audittrace-server",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "audittrace-server",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "identityProviders": [],
