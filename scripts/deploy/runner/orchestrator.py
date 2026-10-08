@@ -1,10 +1,12 @@
 """The ordered P0-P5 phases, the CLI, and the non-self-certifying report.
 
-:class:`DeployRunner` composes :class:`~scripts.deploy.runner.convergence.ConvergenceMixin`
-and :class:`~scripts.deploy.runner.helm.HelmMixin` with its own P0/P1/P3/P4/P5
-phase methods. Methods defined directly in THIS module call the ``_run`` /
-``_sleep`` seams via the PACKAGE namespace (``_runner_pkg._run(...)``), same
-as the mixins — see ``_exec.py``'s module docstring.
+:class:`DeployRunner` composes :class:`~scripts.deploy.runner.convergence.ConvergenceMixin`,
+:class:`~scripts.deploy.runner.helm.HelmMixin`, and
+:class:`~scripts.deploy.runner.images.FirstPartyImagesMixin` with its own
+P0/P1/P3/P4/P5 phase methods. Methods defined directly in THIS module call
+the ``_run`` / ``_sleep`` seams via the PACKAGE namespace
+(``_runner_pkg._run(...)``), same as the mixins — see ``_exec.py``'s module
+docstring.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from scripts.deploy import runner as _runner_pkg
 from scripts.deploy.runner._exec import _now_iso
 from scripts.deploy.runner.config import (
     _COMPONENT_SELECTOR,
+    FIRST_PARTY_MISMATCH_EXIT,
+    IMAGE_PIN_LAG_EXIT,
     PHASES,
     PREFLIGHT_SCRIPT,
     VERIFICATION_DEFERRED,
@@ -33,11 +37,29 @@ from scripts.deploy.runner.config import (
 )
 from scripts.deploy.runner.convergence import ConvergenceMixin, within_surge_bound
 from scripts.deploy.runner.helm import HelmMixin
+from scripts.deploy.runner.images import (
+    FIRST_PARTY_PREFIXES,
+    FirstPartyImagesMixin,
+    _manifest_workload_docs,
+    _parse_image_ref,
+    _pod_spec_of,
+    mismatched_components,
+)
 
 logger = logging.getLogger("audittrace.deploy.runner")
 
 
-class DeployRunner(ConvergenceMixin, HelmMixin):
+def _pinned_tag(mapping: dict[str, Any] | None, *keys: str) -> str | None:
+    """Walk a nested ``dict`` by ``keys``, returning the leaf only if it is a
+    ``str`` — a pure helper so D6's preflight check is unit-testable without
+    a chart file or a cluster."""
+    value: Any = mapping
+    for key in keys:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, str) else None
+
+
+class DeployRunner(ConvergenceMixin, HelmMixin, FirstPartyImagesMixin):
     """Executes the ordered phases and emits the non-self-certifying report."""
 
     def __init__(
@@ -50,6 +72,13 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
         self.converged: bool = False
         self.surge: dict[str, Any] = {}
         self.aborted: bool = False
+        # BFF-BUMP-1.29.1 D3/Rule B1 — the shared first-party image rows
+        # computed in :meth:`phase_settle`, and whether any of them is
+        # unequal. Stay empty/False on a dry run or an aborted run (D3 never
+        # reads the cluster there) — ``main()`` only returns
+        # ``FIRST_PARTY_MISMATCH_EXIT`` when this flips True.
+        self.first_party_rows: list[dict[str, Any]] = []
+        self.first_party_mismatch: bool = False
         # #456 — default KUBECONFIG to ~/.kube/config when unset and the file
         # exists. A bare k3s `kubectl` otherwise falls back to the root-only
         # /etc/rancher/k3s/k3s.yaml (permission denied) and false-aborts P0.
@@ -97,7 +126,7 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
                 PHASES[0],
                 "planned",
                 command=" ".join(cmd),
-                detail="would run deploy-preflight.sh",
+                detail=f"would run deploy-preflight.sh; {self._image_pin_freshness_note()}",
             )
             return
         started = _now_iso()
@@ -137,6 +166,98 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
         # into a mesh that cannot re-issue its workload cert (invariant I1). A
         # degraded mesh is auto-healed (bounded) or the deploy aborts fail-closed.
         self._mesh_gate()
+        # D6 (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-guard.md)
+        # — AFTER the mesh gate, BEFORE any P1+ network/mutation: a release
+        # cannot be deployed before its own per-tag re-pin PR lands.
+        self._check_image_pin_freshness()
+
+    def _image_pin_lag(self) -> dict[str, str]:
+        """Pure (no ``_record``, no mutation, no abort): ``{name: committed
+        tag}`` for every per-tag pin D6 tracks (``console.bff.image.tag``,
+        ``tests.image.tag``) whose committed tag does NOT equal
+        ``--target-version``. Empty when every known pin is already fresh,
+        or when ``--registry`` isn't ``hub`` (S3c — ``publish.yml`` only
+        ever builds a per-tag BFF/tests image for a hub release push)."""
+        if self.cfg.registry != "hub":
+            return {}
+        chart_values = _runner_pkg._read_chart_values(
+            values_files=self.cfg.values_files
+        )
+        target = self.cfg.image_tag
+        return {
+            name: tag
+            for name, tag in (
+                ("bff", _pinned_tag(chart_values, "console", "bff", "image", "tag")),
+                ("tests", _pinned_tag(chart_values, "tests", "image", "tag")),
+            )
+            if tag is not None and tag != target
+        }
+
+    def _image_pin_freshness_note(self) -> str:
+        """The dry-run plan string for D6 — folded into the SAME single P0
+        ``planned`` record ``phase_preflight`` already emits for the
+        preflight script, rather than a second phase entry (dry-run never
+        calls the cluster or mesh gate either, so a second P0 record here
+        would be the only phase the dry-run path ever doubles up)."""
+        if self.cfg.registry != "hub":
+            return f"image-pin freshness check skipped (registry={self.cfg.registry!r}, D6 applies to hub only)"
+        lagging = self._image_pin_lag()
+        if not lagging:
+            return f"image pins already match target {self.cfg.image_tag}"
+        pins = ", ".join(f"{name}={tag}" for name, tag in sorted(lagging.items()))
+        return (
+            f"would ABORT: chart per-tag pin lags target ({pins}, "
+            f"target={self.cfg.image_tag}) — land the re-pin first"
+        )
+
+    def _check_image_pin_freshness(self) -> None:
+        """D6 preflight abort (non-dry-run) — the chart's per-tag image
+        pins must equal the deploy's own target version BEFORE any
+        mutation or network call. Records its OWN P0 entry (mirroring the
+        mesh gate's own second P0 record, immediately above this call) and
+        raises on a lag.
+
+        Falsifiable: deploy a chart whose ``console.bff.image.tag`` is
+        still the PRIOR release while ``--target-version`` is the new one —
+        this method raises :class:`PreflightAbortError` with
+        :data:`IMAGE_PIN_LAG_EXIT` (evidence only; the PROCESS exit for
+        every ``PreflightAbortError`` stays 3, Addendum A §3 S2) BEFORE P1
+        resolves anything on the registry.
+        """
+        if self.cfg.registry != "hub":
+            self._record(
+                PHASES[0],
+                "skipped",
+                detail=(
+                    f"image-pin freshness check skipped (registry={self.cfg.registry!r}; "
+                    "D6 applies to hub only, S3c)"
+                ),
+            )
+            return
+        lagging = self._image_pin_lag()
+        if not lagging:
+            self._record(
+                PHASES[0],
+                "ok",
+                detail=f"chart per-tag image pins already match target {self.cfg.image_tag}",
+            )
+            return
+        pins = ", ".join(f"{name}={tag}" for name, tag in sorted(lagging.items()))
+        meaning = (
+            f"chart per-tag pin lags target ({pins}, target={self.cfg.image_tag}) — "
+            "land the re-pin first"
+        )
+        self._record(
+            PHASES[0],
+            "aborted",
+            detail=meaning,
+            evidence={
+                "exit_code": IMAGE_PIN_LAG_EXIT,
+                "lagging": lagging,
+                "target_version": self.cfg.image_tag,
+            },
+        )
+        raise PreflightAbortError(IMAGE_PIN_LAG_EXIT, meaning)
 
     def _mesh_gate(self) -> None:
         """Run the P0 mesh-health gate; ABORT before mutation when UNSAFE (#384)."""
@@ -291,28 +412,84 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
             return []
         return proc.stdout.split()
 
+    def _wait_rollout(self, kind: str, name: str) -> None:
+        """Bounded ``kubectl rollout status`` for one workload (not a
+        control-flow branch on wall-clock) — S1(a): every workload D3
+        compares gets its rollout awaited, not memory-server alone. A
+        timeout is recorded as a non-zero ``_run`` result and swallowed
+        here (never raised) — the live digest read right after this will
+        itself surface a stale pod as a row mismatch, which IS how a
+        timeout gets reported (``flagged``), not a crash."""
+        _runner_pkg._run(
+            [
+                "kubectl",
+                "rollout",
+                "status",
+                f"{kind.lower()}/{name}",
+                "-n",
+                self.cfg.namespace,
+                f"--timeout={self.cfg.timeout}s",
+            ]
+        )
+
+    def _first_party_workload_names(
+        self, manifest_docs: list[dict[str, Any]] | None
+    ) -> list[tuple[str, str]]:
+        """``(kind, name)`` for every Deployment/StatefulSet/DaemonSet in
+        the live manifest carrying at least one first-party container or
+        init container — the set S1(a) waits rollout for. Job/CronJob are
+        excluded: ``kubectl rollout status`` does not support them."""
+        names: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for doc in _manifest_workload_docs(manifest_docs):
+            kind = doc.get("kind")
+            if kind not in ("Deployment", "StatefulSet", "DaemonSet"):
+                continue
+            name = (doc.get("metadata") or {}).get("name")
+            pod_spec = _pod_spec_of(doc)
+            if not name or pod_spec is None or (kind, name) in seen:
+                continue
+            has_first_party = any(
+                isinstance(container, dict)
+                and container.get("image")
+                and any(
+                    _parse_image_ref(container["image"])[0].startswith(prefix)
+                    for prefix in FIRST_PARTY_PREFIXES
+                )
+                for key in ("containers", "initContainers")
+                for container in pod_spec.get(key) or []
+            )
+            if has_first_party:
+                seen.add((kind, name))
+                names.append((kind, name))
+        return names
+
     def phase_settle(self) -> None:
         if self.cfg.dry_run:
             self._record(
                 PHASES[4],
                 "planned",
                 command=f"kubectl rollout status deployment/{self.cfg.deployment} + sample pods x{self.cfg.settle_samples}",
-                detail=f"would assert peak concurrent Running <= spec.replicas ({_COMPONENT_SELECTOR})",
+                detail=(
+                    f"would assert peak concurrent Running <= spec.replicas ({_COMPONENT_SELECTOR}); "
+                    "would compare every first-party image row (rendered == chart == live)"
+                ),
             )
             return
         started = _now_iso()
-        # Bounded rollout wait (not a control-flow branch on wall-clock).
-        _runner_pkg._run(
-            [
-                "kubectl",
-                "rollout",
-                "status",
-                f"deployment/{self.cfg.deployment}",
-                "-n",
-                self.cfg.namespace,
-                f"--timeout={self.cfg.timeout}s",
-            ]
-        )
+        manifest_docs = self._live_manifest_docs()
+        # S1(a) — wait rollout for EVERY first-party workload D3 compares,
+        # not memory-server alone. Memory-server is waited UNCONDITIONALLY
+        # first (byte-identical to the pre-fix behaviour, even when the
+        # manifest is unreadable); any OTHER first-party workload found in
+        # the live manifest (console librechat/bff) is waited too.
+        self._wait_rollout("deployment", self.cfg.deployment)
+        waited = {("Deployment", self.cfg.deployment)}
+        for kind, name in self._first_party_workload_names(manifest_docs):
+            if (kind, name) in waited:
+                continue
+            waited.add((kind, name))
+            self._wait_rollout(kind, name)
         replicas = self._deployment_replicas()
         samples: list[list[str]] = []
         for i in range(self.cfg.settle_samples):
@@ -326,15 +503,29 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
             "within_bound": ok,
             "samples": samples,
         }
+        # D3 — the shared first-party image rows, re-read now that every
+        # compared workload's rollout has been awaited (so a Terminating
+        # old pod has had its bounded chance to actually finish). Runs on
+        # EVERY non-dry-run path, apply or noop (Addendum A Rule B1's
+        # "D3 runs on every non-dry-run path") — on noop the rows were
+        # already all-equal (that is why it no-op'd); recording them again
+        # here keeps P4's evidence symmetric across both paths.
+        rows = self._first_party_image_rows(manifest_docs=manifest_docs)
+        self.first_party_rows = rows
+        mismatched = mismatched_components(rows)
+        self.first_party_mismatch = bool(mismatched)
+        detail = (
+            f"rollout settled; peak concurrent Running={peak} <= replicas={replicas}"
+            if ok
+            else f"SURGE OBSERVED: peak Running={peak} EXCEEDED replicas={replicas} (WS1 violation)"
+        )
+        if mismatched:
+            detail += f"; first-party image mismatch: {', '.join(mismatched)}"
         self._record(
             PHASES[4],
-            "ok" if ok else "flagged",
-            detail=(
-                f"rollout settled; peak concurrent Running={peak} <= replicas={replicas}"
-                if ok
-                else f"SURGE OBSERVED: peak Running={peak} EXCEEDED replicas={replicas} (WS1 violation)"
-            ),
-            evidence=self.surge,
+            "ok" if ok and not mismatched else "flagged",
+            detail=detail,
+            evidence={**self.surge, "first_party_images": rows},
             started_at=started,
             ended_at=_now_iso(),
         )
@@ -355,6 +546,11 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
             "resolved_image": self.image_ref.as_dict() if self.image_ref else None,
             "helm_revision": self.helm_revision,
             "surge": self.surge,
+            # BFF-BUMP-1.29.1 D3 — the shared first-party image rows read in
+            # phase_settle (also mirrored under P4's own evidence); a
+            # top-level flag so main() can decide the exit code without
+            # re-deriving it from the phase list.
+            "first_party_mismatch": self.first_party_mismatch,
             "phases": [asdict(r) for r in self.records],
             # ── the non-self-certifying contract ──
             "certified": None,
@@ -393,6 +589,7 @@ class DeployRunner(ConvergenceMixin, HelmMixin):
             f"resolved image : {report['resolved_image']}",
             f"helm revision  : {report['helm_revision']}",
             f"surge          : {report['surge'] or 'n/a'}",
+            f"first-party mismatch : {report['first_party_mismatch']}",
             "",
             "phases:",
         ]
@@ -451,4 +648,10 @@ def main(argv: list[str] | None = None) -> int:
     print_plan(cfg, report)
     if report["aborted"]:
         return 3
+    # Addendum A §3 S2 — a report whose first-party image rows are NOT all
+    # equal (apply or noop path; never dry-run) gets its own exit so a
+    # caller can tell "flagged, stop and report the rows" apart from both
+    # "ok" (0) and an uncaught exception (1).
+    if report["first_party_mismatch"]:
+        return FIRST_PARTY_MISMATCH_EXIT
     return 0

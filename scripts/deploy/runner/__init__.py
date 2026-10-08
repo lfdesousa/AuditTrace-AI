@@ -38,6 +38,8 @@ each file <500 LOC:
 * ``values.py``         — chart-values read/merge + first-party image `--set`.
 * ``convergence.py``    — ``_is_converged`` + the live-cluster digest/config reads.
 * ``helm.py``           — the ``helm upgrade`` argv + the #456 adopt/retry flow.
+* ``images.py``         — the shared first-party image row predicate (BFF-BUMP-
+  1.29.1 Rule B1), used by BOTH convergence and the D3 post-apply check.
 * ``orchestrator.py``   — :class:`DeployRunner` (P0-P5) + ``main``/``print_plan``.
 
 This module (``__init__.py``) re-exports the full public + test-facing
@@ -61,6 +63,8 @@ from scripts.deploy.runner.config import (
     _CONSOLE_IMAGE_COMPONENTS,
     CHART_DIR,
     CHART_VALUES_FILE,
+    FIRST_PARTY_MISMATCH_EXIT,
+    IMAGE_PIN_LAG_EXIT,
     MEMORY_SERVER_COMPONENT,
     MEMORY_SERVER_CONTAINER,
     MESH_UNSAFE_EXIT,
@@ -92,6 +96,13 @@ from scripts.deploy.runner.helm import (
     _helm_apply_cmd,
     parse_ownership_conflicts,
 )
+from scripts.deploy.runner.images import (
+    FIRST_PARTY_PREFIXES,
+    FirstPartyImagesMixin,
+    _parse_image_ref,
+    committed_first_party_digests,
+    mismatched_components,
+)
 from scripts.deploy.runner.orchestrator import DeployRunner, main, print_plan
 from scripts.deploy.runner.values import (
     _deep_merge,
@@ -99,13 +110,15 @@ from scripts.deploy.runner.values import (
     _read_chart_values,
     _values_file_args,
     apply_image_tag,
-    console_image_digests,
     console_image_set_args,
 )
 
 __all__ = [
     "CHART_DIR",
     "CHART_VALUES_FILE",
+    "FIRST_PARTY_MISMATCH_EXIT",
+    "FIRST_PARTY_PREFIXES",
+    "IMAGE_PIN_LAG_EXIT",
     "MEMORY_SERVER_COMPONENT",
     "MEMORY_SERVER_CONTAINER",
     "MESH_UNSAFE_EXIT",
@@ -116,6 +129,7 @@ __all__ = [
     "ConvergenceCheck",
     "DeployConfig",
     "DeployRunner",
+    "FirstPartyImagesMixin",
     "MeshGateAbortError",
     "Path",
     "PhaseRecord",
@@ -133,6 +147,7 @@ __all__ = [
     "_normalize_env",
     "_normalize_resources",
     "_now_iso",
+    "_parse_image_ref",
     "_parse_values_file",
     "_read_chart_values",
     "_run",
@@ -140,13 +155,14 @@ __all__ = [
     "_values_file_args",
     "apply_image_tag",
     "build_parser",
+    "committed_first_party_digests",
     "config_from_args",
-    "console_image_digests",
     "console_image_set_args",
     "extract_digest",
     "logger",
     "main",
     "max_concurrent_running",
+    "mismatched_components",
     "normalize_version",
     "parse_ownership_conflicts",
     "print_plan",
