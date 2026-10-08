@@ -103,8 +103,19 @@ dependencies = [
     # major so a future SDK 2.x doesn't silently change message shapes
     # under us.
     "mcp>=1.9.0,<2.0.0",
-    "opentelemetry-api>=1.27.0",
-    "opentelemetry-sdk>=1.27.0",
+    # SEC-JWT-IN-LANGFUSE-SPAN S-C1 — bounded to the tested minor (not
+    # just a floor). ``ScrubbingSpanProcessor`` (telemetry.py) rewrites
+    # PRIVATE ReadableSpan/BoundedAttributes fields; a later SDK minor
+    # could rename them and the mechanism would fail OPEN, SILENTLY (no
+    # ``__slots__`` means a stale attribute name just creates a new,
+    # never-read one — nothing raises). An unbounded floor let the
+    # deployed image resolve a newer, untested minor than CI ever ran
+    # (the FINDING this spec traces to: langfuse 4.17 one day after
+    # release). Bump deliberately, together with requirements.txt, after
+    # re-running the startup self-test (telemetry._run_startup_scrub_self_test)
+    # against the new minor.
+    "opentelemetry-api>=1.45.0,<1.46.0",
+    "opentelemetry-sdk>=1.45.0,<1.46.0",
     "opentelemetry-exporter-otlp>=1.27.0",
     "opentelemetry-instrumentation-fastapi>=0.48b0",
     "opentelemetry-instrumentation-logging>=0.48b0",

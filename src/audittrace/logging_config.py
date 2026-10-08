@@ -7,6 +7,15 @@ The @log_call decorator is a unified observability aspect: for every
 decorated call it emits a DEBUG log line (INPUT/OUTPUT/DURATION), opens
 an OpenTelemetry span, and records a histogram metric. It works for
 both sync and async functions.
+
+SEC-JWT-IN-LANGFUSE-SPAN (2026-10-08): ``render_value``/``render_payload``/
+``scrub_text`` below are the ONE serialiser shared by every emission site
+(DEBUG log lines, span input/output, the structured-log formatter) that
+used to call ``json.dumps(..., default=str)`` or bare ``str(...)``. That
+escape hatch let a bearer JWT (or any object's ``__str__``) ride straight
+into Tempo/Langfuse and the DEBUG log line unredacted. The structural
+allowlist (D2) + request-credential registry (D3) + shape net (D4) are
+documented in full on ``render_value``.
 """
 
 from __future__ import annotations
@@ -16,11 +25,21 @@ import contextvars
 import itertools
 import json
 import logging
+import re
 import sys
 import time
-from collections.abc import Callable
+import traceback
+from collections.abc import Callable, Mapping
+from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
+from datetime import date, datetime
+from datetime import time as time_of_day
+from decimal import Decimal
+from enum import Enum
 from functools import wraps
+from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -43,6 +62,407 @@ def _is_expected_client_error(exc: BaseException) -> bool:
         isinstance(exc, StarletteHTTPException)
         and 400 <= getattr(exc, "status_code", 0) < 500
     )
+
+
+# ═══════════════════════ SEC-JWT-IN-LANGFUSE-SPAN redaction ═══════════════
+#
+# D4 — the shape net (secondary, enumeration-class layer). Matches a JWT's
+# three dot-separated base64url segments, or a ``Bearer``/``Basic`` auth
+# header value, wherever they appear in rendered text — even when the
+# value was never registered via D3 (a future ``HTTPBearer()``, a token
+# read from a header by hand, an ``alg:none`` token). This is enumeration
+# and is ruled secondary to D3's equality pin; its truth is measured by
+# the suite-wide net (tests/conftest.py), not asserted here.
+_JWT_SHAPE_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+_AUTHZ_SHAPE_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}")
+
+
+def scrub_text(value: str) -> str:
+    """Redact bearer-shaped secrets from a string leaf.
+
+    D3 (primary) — every value registered this request via
+    ``audittrace.identity.register_request_secret`` is replaced by exact
+    value equality, LONGEST FIRST (so a shorter registered value can never
+    leave a dangling, still-identifying suffix of a longer one
+    unredacted). D4 (secondary) — a JWT-shaped or ``Bearer``/``Basic``-
+    prefixed substring is replaced even when unregistered.
+
+    Never raises: ``request_secrets()`` degrades to "nothing registered"
+    on any import/lookup failure (mirrors ``_extract_user_id``'s defensive
+    local-import pattern below) so a telemetry-layer bug can never turn
+    into a request failure.
+    """
+    if not value:
+        return value
+    try:
+        from audittrace.identity import request_secrets
+
+        secrets = request_secrets()
+    except Exception:  # pragma: no cover - defensive
+        secrets = ()
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret and secret in value:
+            value = value.replace(secret, "[REDACTED:bearer]")
+    value = _JWT_SHAPE_RE.sub("[REDACTED:jwt]", value)
+    value = _AUTHZ_SHAPE_RE.sub("[REDACTED:authz]", value)
+    return value
+
+
+# D2/N3 — the structural allowlist. Everything NOT named here renders as
+# its bare type name (``<TypeName>``) — this is what closes the
+# ``default=str`` escape hatch (spec fact F5: a ``Settings`` object with 7
+# plain-``str`` secret fields rendered its secrets in full through
+# ``default=str``) and removes the old self-detection heuristic's
+# accidental dependency on it.
+#
+# Hand-maintained NAMES, not "every model found by walking a module" —
+# ``tests/test_log_call_redaction.py`` (G4c) independently re-derives the
+# true set via an AST walk of every ``@log_call`` target's parameter AND
+# return annotations (ADDENDUM B N3) plus import resolution, and asserts
+# equality against the sets below. A class added to a decorated signature
+# without being added here reddens THAT test, not this one — the
+# allowlist fails closed (unlisted => ``<TypeName>``) even while out of
+# sync, so the equality gap is an observability-quality bug, never a
+# redaction-safety one.
+_RENDER_MODEL_NAMES: tuple[str, ...] = (
+    "AssessmentIngestRequest",
+    "ConsoleAclBatchPermissionsRequest",
+    "ConsoleAclBatchPermissionsResponse",
+    "ConsoleAclBulkRequest",
+    "ConsoleAclBulkResponse",
+    "ConsoleAclEffectivePermissionsResponse",
+    "ConsoleAclEntryItem",
+    "ConsoleAclExpireRequest",
+    "ConsoleAclExpireResponse",
+    "ConsoleAclGrantRequest",
+    "ConsoleAclHasPermissionResponse",
+    "ConsoleAclModifyRequest",
+    "ConsoleAclResourceIdsResponse",
+    "ConsoleAgentBatchGetRequest",
+    "ConsoleAgentBatchGetResponse",
+    "ConsoleAgentItem",
+    "ConsoleAgentListResponse",
+    "ConsoleAgentUpsertRequest",
+    "ConsoleChatProjectItem",
+    "ConsoleChatProjectListResponse",
+    "ConsoleChatProjectUpsertRequest",
+    "ConsoleConversationItem",
+    "ConsoleConversationListResponse",
+    "ConsoleConversationTagItem",
+    "ConsoleConversationTagListResponse",
+    "ConsoleConversationTagUpsertRequest",
+    "ConsoleConversationTitleUpdateRequest",
+    "ConsoleConversationUpsertRequest",
+    "ConsoleFileBatchGetRequest",
+    "ConsoleFileBatchGetResponse",
+    "ConsoleFileItem",
+    "ConsoleFileListResponse",
+    "ConsoleFileUpsertRequest",
+    "ConsoleMessageEditRequest",
+    "ConsoleMessageItem",
+    "ConsoleMessageListResponse",
+    "ConsoleMessageUpsertRequest",
+    "ConsolePresetItem",
+    "ConsolePresetListResponse",
+    "ConsolePresetUpsertRequest",
+    "ConsolePromptGroupItem",
+    "ConsolePromptGroupListResponse",
+    "ConsolePromptGroupUpsertRequest",
+    "ConsolePromptGroupWithVersionsItem",
+    "ConsolePromptSetProductionRequest",
+    "ConsolePromptVersionItem",
+    "ConsolePromptVersionUpsertRequest",
+    "ConsoleToolFavoriteAddRequest",
+    "ConsoleToolFavoriteItem",
+    "ConsoleToolFavoriteListResponse",
+    "ContextBuildResponse",
+    "ContextRequest",
+    "HealthResponse",
+    # The pydantic AUDIT-RECORD schema in audittrace.models (distinct
+    # from the SQLAlchemy ORM class of the same name in
+    # audittrace.db.models, which has its own, separate entry in
+    # _RENDER_ORM_IMPORTS below) — both resolve against their own
+    # defining module, so the name collision is harmless.
+    "InteractionRecord",
+    "MetricsResponse",
+    "SessionSaveRequest",
+    "SessionSaveResponse",
+    "SessionSummaryRequest",
+    "SessionSummaryResponse",
+)
+
+# Pydantic models that live outside ``audittrace.models`` (importing their
+# defining module at this module's top level would be circular — see the
+# dataclass note below) — resolved lazily, same as everything else here.
+_RENDER_MODEL_EXTRA_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("audittrace.services.episodic", "Document"),
+)
+
+# Plain dataclasses (not pydantic) that appear as @log_call parameter or
+# return annotations. Imports are LOCAL/LAZY (never at this module's top
+# level): ``services/memory_manifest.py``, ``services/semantic.py`` and
+# ``services/trust_store.py`` all import ``log_call`` FROM this module, so
+# importing them back here at import time would be circular. By the time
+# any @log_call target actually runs, the whole app has finished
+# importing — a lazy, cached resolution (``_get_render_allowlists``) is
+# safe. Mirrors ``_extract_user_id``'s existing local-import pattern.
+_RENDER_DATACLASS_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("audittrace.services.console_acl", "AclGrantOp"),
+    ("audittrace.services.memory_manifest", "IndexStatusSummary"),
+    ("audittrace.services.memory_manifest", "ManifestEntry"),
+    ("audittrace.services.semantic", "SearchPage"),
+    ("audittrace.services.trust_store", "TrustStoreBundle"),
+    ("audittrace.services.trust_store", "TrustStoreMetadata"),
+)
+
+# SQLAlchemy ORM rows (not pydantic, not a stdlib dataclass) that appear as
+# a @log_call return annotation. Rendered via the mapper's column_attrs
+# (spec fact A8: ``_persist_interaction``'s 14 named fields carry no
+# token and no UserContext — safe to render in full).
+_RENDER_ORM_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("audittrace.db.models", "InteractionRecord"),
+)
+
+_render_allowlist_cache: dict[str, frozenset[type]] | None = None
+
+
+def _get_render_allowlists() -> tuple[
+    frozenset[type], frozenset[type], frozenset[type]
+]:
+    """Lazily resolve + cache the three structural-allowlist class sets.
+
+    Returns ``(models, dataclasses, orm_models)``. See the module import
+    comments above for why these imports must be lazy, not top-level.
+    """
+    global _render_allowlist_cache
+    if _render_allowlist_cache is not None:
+        return (
+            _render_allowlist_cache["models"],
+            _render_allowlist_cache["dataclasses"],
+            _render_allowlist_cache["orm"],
+        )
+
+    models: set[type] = set()
+    try:
+        from audittrace import models as _models_mod
+
+        for name in _RENDER_MODEL_NAMES:
+            cls = getattr(_models_mod, name, None)
+            if isinstance(cls, type):
+                models.add(cls)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    for module_name, cls_name in _RENDER_MODEL_EXTRA_IMPORTS:
+        try:
+            import importlib
+
+            cls = getattr(importlib.import_module(module_name), cls_name, None)
+            if isinstance(cls, type):
+                models.add(cls)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    dataclasses_set: set[type] = set()
+    for module_name, cls_name in _RENDER_DATACLASS_IMPORTS:
+        try:
+            import importlib
+
+            cls = getattr(importlib.import_module(module_name), cls_name, None)
+            if isinstance(cls, type):
+                dataclasses_set.add(cls)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    orm_set: set[type] = set()
+    for module_name, cls_name in _RENDER_ORM_IMPORTS:
+        try:
+            import importlib
+
+            cls = getattr(importlib.import_module(module_name), cls_name, None)
+            if isinstance(cls, type):
+                orm_set.add(cls)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    _render_allowlist_cache = {
+        "models": frozenset(models),
+        "dataclasses": frozenset(dataclasses_set),
+        "orm": frozenset(orm_set),
+    }
+    return (
+        _render_allowlist_cache["models"],
+        _render_allowlist_cache["dataclasses"],
+        _render_allowlist_cache["orm"],
+    )
+
+
+def _reset_render_allowlist_cache_for_tests() -> None:
+    """Drop the cached allowlist sets. Test-only."""
+    global _render_allowlist_cache
+    _render_allowlist_cache = None
+
+
+_RENDER_MAX_DEPTH = 6
+
+# Scalar types rendered by SHAPE, never by the ``default=str`` escape
+# hatch (ADDENDUM B N4). Checked as an isinstance tuple so subclasses
+# (e.g. a custom ``Enum``) are caught too.
+_SAFE_SCALAR_TYPES = (datetime, date, time_of_day, UUID, Decimal, Path, Enum)
+
+
+def _render_safe_scalar(value: Any) -> Any:
+    """Render one of ``_SAFE_SCALAR_TYPES`` to a JSON-safe value."""
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (datetime, date, time_of_day)):
+        return value.isoformat()
+    return str(value)  # UUID, Decimal, Path
+
+
+def render_value(value: Any, *, _depth: int = 0) -> Any:
+    """Recursively render a value for a span attribute / log field.
+
+    Structural allowlist (D2, N3): scalars render as themselves; ``str``
+    leaves pass through ``scrub_text``; containers (list/tuple/set/dict)
+    recurse; an allowlisted pydantic model / dataclass / ORM row renders
+    its fields (``model_dump()`` / its fields, then recursion so a nested
+    secret string still gets scrubbed); ``UserContext`` renders a FIXED
+    projection (``user_id``/``username``/``agent_type``/``scopes``/
+    ``token_id``/``is_admin`` — never ``extra``, which carries
+    claim-derived PII); ``starlette.requests.Request`` renders
+    ``method``+``path`` only (never headers/cookies/query params, which
+    is where the bearer itself and session cookies live).
+
+    **Everything else renders as its bare type name** (``<TypeName>``) —
+    this is the fail-closed default that replaces ``json.dumps(...,
+    default=str)``.
+
+    Never raises (N4): any failure anywhere in this function (an
+    unrenderable ``__repr__``, a surprising shape, an allowlist import
+    failure) degrades to ``f"<{type(value).__name__}>"`` so one odd value
+    can never break the logging/tracing path for the whole process — a
+    raising renderer would silently DROP the log line or span attribute
+    instead (fail-open), which is strictly worse than an opaque name.
+    """
+    try:
+        return _render_value_inner(value, _depth)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _render_value_inner(value: Any, depth: int) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, _SAFE_SCALAR_TYPES):
+        return _render_safe_scalar(value)
+
+    if depth >= _RENDER_MAX_DEPTH:
+        return f"<{type(value).__name__}>"
+
+    # UserContext — fixed projection. Checked before the generic dataclass
+    # branch below because UserContext IS a dataclass but gets a narrower,
+    # named shape rather than every field (``extra`` is PII, never a log
+    # leaf). Local import — avoids a circular dependency with
+    # ``audittrace.identity`` (which itself calls ``scrub_text`` from this
+    # module's registry lookup).
+    try:
+        from audittrace.identity import UserContext
+
+        if isinstance(value, UserContext):
+            return {
+                "user_id": value.user_id,
+                "username": scrub_text(value.username),
+                "agent_type": value.agent_type,
+                "scopes": list(value.scopes),
+                "token_id": value.token_id,
+                "is_admin": value.is_admin,
+            }
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    # starlette.requests.Request — method + path only.
+    try:
+        from starlette.requests import Request as StarletteRequest
+
+        if isinstance(value, StarletteRequest):
+            return {"method": value.method, "path": value.url.path}
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    if isinstance(value, Mapping):
+        return {
+            (scrub_text(k) if isinstance(k, str) else k): render_value(
+                v, _depth=depth + 1
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [render_value(v, _depth=depth + 1) for v in value]
+
+    render_models, render_dataclasses, render_orm = _get_render_allowlists()
+
+    try:
+        from pydantic import BaseModel
+
+        if isinstance(value, BaseModel):
+            if type(value) in render_models:
+                return render_value(value.model_dump(mode="json"), _depth=depth + 1)
+            return f"<{type(value).__name__}>"
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    if is_dataclass(value) and not isinstance(value, type):
+        if type(value) in render_dataclasses:
+            return render_value(
+                {f.name: getattr(value, f.name) for f in dataclass_fields(value)},
+                _depth=depth + 1,
+            )
+        return f"<{type(value).__name__}>"
+
+    if type(value) in render_orm:
+        try:
+            from sqlalchemy import inspect as sa_inspect
+
+            mapper = sa_inspect(type(value))
+            return render_value(
+                {
+                    attr.key: getattr(value, attr.key, None)
+                    for attr in mapper.column_attrs
+                },
+                _depth=depth + 1,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return f"<{type(value).__name__}>"
+
+    return f"<{type(value).__name__}>"
+
+
+def render_payload(value: Any, *, limit: int) -> str:
+    """Serialise a value for a span attribute / DEBUG log field.
+
+    D1 — the single serialiser that replaces every ``json.dumps(...,
+    default=str)`` / bare ``str(...)`` call site (spec fact F6: four emit
+    sites in this module plus the structured-log formatter's own
+    ``json.dumps``). No ``default=`` — ``render_value`` already made the
+    value JSON-safe, so a ``TypeError`` here would mean the allowlist
+    machinery itself is broken, not that some odd input needs rescuing.
+
+    Scrub happens INSIDE ``render_value`` (every ``str`` leaf); truncation
+    happens AFTER encoding. Order matters (G2f): scrub-before-truncate.
+    Truncating first can cut a token in half, leaving an unscrubbed prefix
+    that is no longer JWT-shaped and skips the registry match too (spec
+    fact A7 — the escape this ordering closes).
+    """
+    text = json.dumps(render_value(value), ensure_ascii=False)
+    if len(text) > limit:
+        text = text[:limit] + f"...[truncated {len(text)} chars]"
+    return text
 
 
 # Per-trace step counter (backlog #02). A process-global counter interleaved
@@ -123,11 +543,18 @@ class StructuredFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
+        # SEC-JWT-IN-LANGFUSE-SPAN: message/exception/stack_info pass through
+        # scrub_text (D3+D4); every extra= value passes through render_value
+        # so it is JSON-safe BEFORE the final json.dumps below runs with no
+        # ``default=`` — closing the same ``default=str`` escape hatch the
+        # span-attribute sites close (spec fact A2's last sentence: a
+        # ``Settings`` passed as a log ``extra`` used to render its secret
+        # through exactly this ``json.dumps(default=str)`` call).
         log_data: dict[str, Any] = {
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": scrub_text(record.getMessage()),
         }
         for src, dst in self._OTEL_FIELD_RENAMES.items():
             value = getattr(record, src, None)
@@ -135,16 +562,16 @@ class StructuredFormatter(logging.Formatter):
                 log_data[dst] = value
         for attr, value in record.__dict__.items():
             if attr not in _RESERVED_LOGRECORD_ATTRS and attr not in log_data:
-                log_data[attr] = value
+                log_data[attr] = render_value(value)
         # Preserve exception tracebacks. logger.exception()/exc_info=True sets
         # record.exc_info; without this the JSON line carried only the message
         # and the stack was lost — which masked the summariser poison-pill root
         # cause (a background worker whose only signal is its log).
         if record.exc_info:
-            log_data["exception"] = self.formatException(record.exc_info)
+            log_data["exception"] = scrub_text(self.formatException(record.exc_info))
         if record.stack_info:
-            log_data["stack_info"] = self.formatStack(record.stack_info)
-        return json.dumps(log_data, default=str)
+            log_data["stack_info"] = scrub_text(self.formatStack(record.stack_info))
+        return json.dumps(log_data, ensure_ascii=False)
 
 
 def setup_logging(
@@ -190,14 +617,12 @@ _SPAN_ATTR_MAX_LEN = 4000
 
 
 def _serialize_for_span(value: Any) -> str:
-    """Serialise call args/result for span attributes (truncated, str-safe)."""
-    try:
-        text = json.dumps(value, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):
-        text = str(value)
-    if len(text) > _SPAN_ATTR_MAX_LEN:
-        text = text[:_SPAN_ATTR_MAX_LEN] + f"...[truncated {len(text)} chars]"
-    return text
+    """Serialise call args/result for span attributes (truncated, redacted).
+
+    Delegates to ``render_payload`` (D1 — the one serialiser shared by
+    every emission site) rather than ``json.dumps(..., default=str)``.
+    """
+    return render_payload(value, limit=_SPAN_ATTR_MAX_LEN)
 
 
 # Map operation name patterns to logical components for Langfuse dashboards.
@@ -372,21 +797,56 @@ def _extract_user_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | Non
         return None
 
 
-def _record_span_error(span: Any, exc: Exception) -> None:
-    """Record an exception on the active span (OTel or Langfuse).
+# DEBUG log lines use a tighter cap than span attributes — readable in a
+# terminal, not a document viewer.
+_DEBUG_LOG_MAX_LEN = 500
 
-    OTel spans expose ``record_exception``; Langfuse spans do not — they
-    use ``update(level="ERROR", status_message=...)`` instead. Dispatch
-    based on what the span object supports so the error surfaces in both
-    backends without one masking the other.
+
+def _record_span_error(span: Any, exc: Exception) -> None:
+    """Record exactly ONE exception event on the active span (OTel or
+    Langfuse), with the message/stacktrace/status description scrubbed.
+
+    SEC-JWT-IN-LANGFUSE-SPAN (ADDENDUM A §3 B2) — this function becomes
+    the SINGLE exception recorder. ``telemetry.start_span`` disables
+    OTel's automatic ``record_exception``/``set_status_on_exception`` (it
+    would otherwise record the exception a SECOND time, unscrubbed, when
+    the ``with`` block re-raises past it — spec fact A2 measured exactly
+    that: 2 exception events per failing call). The event is built here,
+    scrubbed, via the public ``add_event``/``set_status`` API, which is
+    also what ADDENDUM C's ``ScrubbingSpanProcessor`` re-scrubs at
+    ``on_end`` as the export-time backstop — belt and suspenders, not a
+    single point of failure.
+
+    Langfuse-shaped spans (legacy — exposed ``update()`` instead of
+    ``add_event``/``set_status``; kept for test/back-compat coverage) use
+    the old ``update(level=..., status_message=...)`` call, also scrubbed.
     """
     if span is None:
         return
     try:
-        if hasattr(span, "record_exception"):
-            span.record_exception(exc)
+        if hasattr(span, "add_event") and hasattr(span, "set_status"):
+            from opentelemetry.trace import Status, StatusCode
+
+            stacktrace = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            span.add_event(
+                "exception",
+                {
+                    "exception.type": type(exc).__name__,
+                    "exception.message": scrub_text(str(exc)),
+                    "exception.stacktrace": scrub_text(stacktrace),
+                    "exception.escaped": "True",
+                },
+            )
+            span.set_status(
+                Status(StatusCode.ERROR, scrub_text(f"{type(exc).__name__}: {exc}"))
+            )
         elif hasattr(span, "update"):
-            span.update(level="ERROR", status_message=f"{type(exc).__name__}: {exc}")
+            span.update(
+                level="ERROR",
+                status_message=scrub_text(f"{type(exc).__name__}: {exc}"),
+            )
     except Exception:  # pragma: no cover - defensive
         pass
 
@@ -417,8 +877,11 @@ def log_call(
                     f"INPUT {op}",
                     extra={
                         "operation": op,
-                        "call_args": str(args[1:] if len(args) > 1 else ())[:500],
-                        "call_kwargs": str(kwargs)[:500],
+                        "call_args": render_payload(
+                            args[1:] if len(args) > 1 else (),
+                            limit=_DEBUG_LOG_MAX_LEN,
+                        ),
+                        "call_kwargs": render_payload(kwargs, limit=_DEBUG_LOG_MAX_LEN),
                     },
                 )
 
@@ -428,7 +891,11 @@ def log_call(
                     f"OUTPUT {op}",
                     extra={
                         "operation": op,
-                        "result": str(result)[:500] if result is not None else None,
+                        "result": (
+                            render_payload(result, limit=_DEBUG_LOG_MAX_LEN)
+                            if result is not None
+                            else None
+                        ),
                     },
                 )
 
@@ -582,6 +1049,7 @@ def log_call(
                     finally:
                         _record(op, time.perf_counter() - start, err)
 
+            async_wrapper.__audittrace_log_call__ = True  # type: ignore[attr-defined]
             return async_wrapper
 
         @wraps(func)
@@ -622,6 +1090,7 @@ def log_call(
                 finally:
                     _record(op, time.perf_counter() - start, err)
 
+        sync_wrapper.__audittrace_log_call__ = True  # type: ignore[attr-defined]
         return sync_wrapper
 
     # Allow bare @log_call usage

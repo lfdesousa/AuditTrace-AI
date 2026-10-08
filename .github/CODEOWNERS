@@ -16,3 +16,15 @@
 # Layer 3 — the mechanical drift guard, and its wiring.
 /scripts/check-agent-def-token-guard.py  @lfdesousa
 /.pre-commit-config.yaml                 @lfdesousa
+
+# SEC-JWT-IN-LANGFUSE-SPAN (2026-10-08) — the redaction seam + the net
+# that proves it. A PR that weakens either cannot self-approve: the net
+# runs from the same PR that could weaken it (ADDENDUM A ADV-2), so an
+# independent reviewer is a mechanical requirement, not a courtesy.
+# "Require review from Code Owners" on `main` is an OPERATOR setting
+# (GitHub repo settings → branch protection) — this file names the
+# reviewer; it does not itself enforce the review.
+/src/audittrace/logging_config.py        @lfdesousa
+/src/audittrace/telemetry.py             @lfdesousa
+/tests/conftest.py                       @lfdesousa
+/tests/test_log_call_redaction.py        @lfdesousa

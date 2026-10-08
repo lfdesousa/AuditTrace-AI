@@ -7,6 +7,7 @@ Logging and telemetry are configured once per test session so that the
 
 import logging
 import os
+import re
 import subprocess  # noqa: S404 — used only for chart-rendering test injection below
 
 import pytest
@@ -701,7 +702,7 @@ from audittrace.identity import (  # noqa: E402
     UserContext,
     sentinel_user_context,
 )
-from audittrace.logging_config import setup_logging  # noqa: E402
+from audittrace.logging_config import StructuredFormatter, setup_logging  # noqa: E402
 from audittrace.server import create_app  # noqa: E402
 from audittrace.services.memory import MockMemoryService  # noqa: E402
 
@@ -732,6 +733,192 @@ def _propagate_logs(caplog):
     """Make caplog see records from our module loggers at DEBUG level."""
     caplog.set_level(logging.DEBUG)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_secrets():
+    """Clear the SEC-JWT-IN-LANGFUSE-SPAN request-secret registry between
+    tests.
+
+    ``ContextVar.set()`` mutates the CURRENT context, which pytest does
+    not reset between tests by default (unlike a per-request async task,
+    which gets a fresh copied context). Without this, a secret
+    registered by one test (e.g. a minted JWT in ``test_auth.py``) would
+    still be registered — and therefore still get redacted — in the
+    NEXT test, which could mask a genuine regression in an unrelated
+    test by coincidentally scrubbing content it shouldn't have reason to
+    touch.
+    """
+    from audittrace.identity import reset_request_secrets
+
+    reset_request_secrets()
+    yield
+    reset_request_secrets()
+
+
+# ══════════════════ SEC-JWT-IN-LANGFUSE-SPAN — suite-wide redaction net ═════
+#
+# ADDENDUM B N1 / ADDENDUM C S-B3. One global SDK TracerProvider (built by
+# ``telemetry.init_telemetry`` — see ``configure_observability`` above) is
+# installed for the whole session; every module tracer (``chat.py``,
+# ``_memory_tool_loop.py``, ``session_summarizer.py``, ``decision/client.py``,
+# ``telemetry.py`` itself) is a ``ProxyTracer`` that delegates to it with NO
+# per-test monkeypatch needed (measured in ADDENDUM B fact B2). This fixture
+# attaches ONE additional, SNAPSHOT-AT-EXPORT span processor to whatever the
+# CURRENT global provider is (re-attaching only when the provider instance
+# actually changed — some tests in ``test_observability.py`` legitimately
+# tear down and reinstall a fresh provider to test ``init_telemetry`` itself;
+# this fixture must not assume the session's original provider survives
+# every test), plus a root-logger handler that captures every formatted
+# ``StructuredFormatter`` line. At teardown it scans everything the CURRENT
+# test emitted for a JWT-shaped or ``Bearer``/``Basic``-shaped substring —
+# the SAME shape net ``logging_config.scrub_text`` itself applies (D4) — and
+# fails the test BY NAME if one is found, reporting only (shape, length),
+# never the matched text (rule 10 — never print a secret).
+#
+# A hit here means production code emitted a secret-shaped string through a
+# path the redaction mechanism did not reach — this net exists to catch that
+# in ANY test, not just the ones that deliberately plant a secret (e.g.
+# ``tests/test_auth.py`` mints real RS256 JWTs and sends them through
+# ``require_user`` on every route test it has).
+
+_JWT_NET_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+_AUTHZ_NET_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}")
+
+
+class _NetSnapshotExporter:
+    """Span exporter for the net — snapshots (never retains a live
+    reference to) every span's attributes/events/status at export time.
+
+    ADDENDUM C S-C3: an exporter that only stores a REFERENCE to the
+    ``ReadableSpan`` can look "already scrubbed" purely because a LATER
+    processor mutated the SAME object before the test ever reads it back
+    — proving nothing about whether the scrubber actually ran first.
+    Converting to a plain string inside ``export()`` captures the truth
+    at the moment THIS processor's turn in the chain runs.
+    """
+
+    def __init__(self) -> None:
+        self.snapshots: list[str] = []
+
+    def export(self, spans):
+        import json as _json
+
+        for span in spans:
+            attrs = dict(getattr(span, "attributes", None) or {})
+            events = [
+                {"name": e.name, "attributes": dict(e.attributes or {})}
+                for e in (getattr(span, "events", None) or ())
+            ]
+            status_desc = getattr(getattr(span, "status", None), "description", None)
+            self.snapshots.append(
+                _json.dumps(
+                    {
+                        "name": span.name,
+                        "attributes": attrs,
+                        "events": events,
+                        "status": status_desc,
+                    },
+                    default=str,
+                )
+            )
+
+        from opentelemetry.sdk.trace.export import SpanExportResult
+
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:  # pragma: no cover - SpanExporter protocol
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:  # pragma: no cover
+        return True
+
+
+def scan_for_secret_shapes(texts: list[str]) -> list[str]:
+    """Return a hit description per JWT/``Bearer``/``Basic``-shaped
+    substring found across ``texts``. Reports shape + length ONLY — the
+    net must never print a secret, including a false-positive one.
+
+    Exposed as a module-level function (not buried in the fixture) so
+    the self-validation guard (G6d) can call it DIRECTLY with a
+    deliberately planted, unregistered secret and assert it fires — the
+    net cannot certify itself by construction otherwise.
+    """
+    hits: list[str] = []
+    for text in texts:
+        for match in _JWT_NET_RE.finditer(text):
+            hits.append(f"jwt-shaped, length={len(match.group(0))}")
+        for match in _AUTHZ_NET_RE.finditer(text):
+            hits.append(f"authz-shaped, length={len(match.group(0))}")
+    return hits
+
+
+_net_attached_provider: object | None = None
+_net_exporter: _NetSnapshotExporter | None = None
+
+
+def _ensure_net_attached():
+    """Attach the net's span processor to the CURRENT global provider,
+    exactly once per distinct provider instance (never once per test —
+    OTel has no public "remove a span processor" API, so re-attaching
+    on every one of 900+ tests would accumulate hundreds of redundant
+    listeners on a provider that, in the common case, several hundred
+    tests all share unchanged)."""
+    global _net_attached_provider, _net_exporter
+    from opentelemetry import trace as _otel_trace
+
+    provider = _otel_trace.get_tracer_provider()
+    if provider is _net_attached_provider:
+        return _net_exporter
+    if not hasattr(provider, "add_span_processor"):
+        _net_attached_provider = provider
+        _net_exporter = None
+        return None
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    exporter = _NetSnapshotExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    _net_attached_provider = provider
+    _net_exporter = exporter
+    return exporter
+
+
+@pytest.fixture(autouse=True)
+def _redaction_net(request):
+    exporter = _ensure_net_attached()
+    if exporter is not None:
+        exporter.snapshots.clear()
+
+    records: list[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                records.append(StructuredFormatter().format(record))
+            except (
+                Exception
+            ):  # pragma: no cover - never let the net itself crash a test
+                pass
+
+    handler = _CaptureHandler()
+    handler.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(handler)
+        texts = list(records)
+        if exporter is not None:
+            texts.extend(exporter.snapshots)
+        hits = scan_for_secret_shapes(texts)
+        if hits:
+            pytest.fail(
+                f"redaction net: {request.node.nodeid} emitted "
+                f"secret-shaped content: {hits}"
+            )
 
 
 @pytest.fixture
