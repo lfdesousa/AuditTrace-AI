@@ -522,7 +522,7 @@ class DeployRunner(ConvergenceMixin, HelmMixin, FirstPartyImagesMixin):
         # mismatch, that earlier verdict is overridden here — covers both
         # a genuinely stale pre-apply read and state that drifted between
         # the P2 check and this P4 recheck. Falsifiable: drop this line and
-        # `test_phase_settle_noop_path_clears_converged_on_mismatch` goes
+        # `test_noop_path_d3_recheck_clears_converged_and_exits_eight` goes
         # RED (`converged` stays True alongside `first_party_mismatch=True`).
         if mismatched:
             self.converged = False

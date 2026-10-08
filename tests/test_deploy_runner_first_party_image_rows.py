@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from scripts.deploy import registry, runner
 from scripts.deploy.runner import images
 from scripts.deploy.runner.images import (
@@ -95,16 +97,28 @@ _CHART_VALUES = {
 
 
 def _deployment_doc(
-    name, container, image, *, replicas=1, init_containers=None, selector_labels=None
+    name,
+    container,
+    image,
+    *,
+    replicas=1,
+    init_containers=None,
+    selector_labels=None,
+    kind="Deployment",
 ):
-    """A minimal Deployment manifest doc, including ``spec.selector.
-    matchLabels`` (fix-round B-1: the live read is now keyed on THIS,
-    never a component lookup table). Defaults to
+    """A minimal workload manifest doc (``kind="Deployment"`` by default),
+    including ``spec.selector.matchLabels`` (fix-round B-1: the live read
+    is now keyed on THIS, never a component lookup table). Defaults to
     ``{app.kubernetes.io/component: <name without the "audittrace-"
     prefix>}`` — e.g. ``audittrace-librechat-bff`` -> ``librechat-bff`` —
     which matches every existing ``component=...`` dispatch needle in this
     module; pass ``selector_labels`` explicitly to model a workload whose
-    selector does NOT follow that convention (the pod-reaper tests do)."""
+    selector does NOT follow that convention (the pod-reaper tests do).
+
+    Pass ``kind="Job"`` (or ``"CronJob"``) to model a workload Kubernetes
+    does NOT require a selector on (fix round 2, R2-2) — the only kinds a
+    missing/undetectable selector legitimately means ``render_only``
+    rather than ``unreadable``."""
     containers = [{"name": container, "image": image}]
     pod_spec = {"containers": containers}
     if init_containers:
@@ -114,7 +128,7 @@ def _deployment_doc(
             "app.kubernetes.io/component": name.removeprefix("audittrace-")
         }
     return {
-        "kind": "Deployment",
+        "kind": kind,
         "metadata": {"name": name},
         "spec": {
             "replicas": replicas,
@@ -434,17 +448,18 @@ def test_rows_unpinned_local_registry_tag_form_mismatch_is_unequal(
 
 
 def test_rows_render_only_when_no_selector_known(tmp_path, monkeypatch):
-    """A workload whose manifest doc carries NO `spec.selector` at all
-    (e.g. a Job, which Kubernetes defaults server-side — never present in
-    a `helm template`/`helm get manifest` render) has no selector this
-    runner can read live pods through — its row stays `render_only`;
-    equality is render-vs-chart alone."""
+    """A Job (the ONLY kind, with CronJob, a missing selector is
+    legitimate for — R2-2, fix round 2: Kubernetes does not require one,
+    and a Helm-test hook has no standing pods to compare live) has no
+    selector this runner can read live pods through — its row stays
+    `render_only`; equality is render-vs-chart alone."""
     manifest = _manifest_yaml(
         _deployment_doc(
             "audittrace-tests-hook",
             "tests",
             "docker.io/lfds/audittrace-tests:1.29.1@sha256:tests-chart",
             selector_labels={},
+            kind="Job",
         )
     )
     disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
@@ -456,16 +471,17 @@ def test_rows_render_only_when_no_selector_known(tmp_path, monkeypatch):
 
 
 def test_rows_render_only_mismatch_is_unequal(tmp_path, monkeypatch):
-    """V-5 (fix round 1): a `render_only` row (no selector known) is STILL
-    a real comparison — a rendered digest that disagrees with the chart
-    is unequal, never a silent pass just because live can't be checked.
-    Paired with the positive case above."""
+    """V-5 (fix round 1): a `render_only` row (a Job, no selector known) is
+    STILL a real comparison — a rendered digest that disagrees with the
+    chart is unequal, never a silent pass just because live can't be
+    checked. Paired with the positive case above."""
     manifest = _manifest_yaml(
         _deployment_doc(
             "audittrace-tests-hook",
             "tests",
             "docker.io/lfds/audittrace-tests:1.29.1@sha256:STALE-TESTS",
             selector_labels={},
+            kind="Job",
         )
     )
     disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
@@ -726,6 +742,83 @@ def test_rows_skips_malformed_container_entries(tmp_path, monkeypatch):
     assert r._first_party_image_rows(chart_values=_CHART_VALUES) == []
 
 
+# ── R2-2 (fix round 2): a long-lived kind with NO DERIVABLE selector ─────
+# must be `unreadable` (unequal), never `render_only` — Kubernetes
+# REQUIRES a selector on Deployment/StatefulSet/DaemonSet, so a selector
+# this runner cannot derive from the manifest means "cannot read", not
+# "nothing to read" (reviewer repro:
+# 2026-10-08-REVIEW-bff-bump-fix1-repro_selector_edges.py).
+
+
+@pytest.mark.parametrize("kind", ["Deployment", "StatefulSet", "DaemonSet"])
+@pytest.mark.parametrize(
+    "selector_labels",
+    [
+        {},  # no matchLabels at all (e.g. matchExpressions-only in the real doc)
+        {"app": "bff"},  # matchLabels present, but no component key
+    ],
+)
+def test_rows_long_lived_kind_without_derivable_selector_is_unreadable(
+    tmp_path, monkeypatch, kind, selector_labels
+):
+    """Deployment/StatefulSet/DaemonSet with a selector this runner
+    cannot derive a component from -> `unreadable`, equal=False, even
+    though the chart-vs-rendered comparison alone would otherwise say
+    equal (the live digest is STALE and must never be silently skipped).
+
+    Falsifiable: drop the ``kind in _LONG_LIVED_SELECTOR_KINDS`` branch in
+    `_live_row_digest` (treat every `None` selector as `render_only`) and
+    this goes RED — `equal` flips to `True` despite the stale live pod.
+    """
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:bff-chart",
+            selector_labels=selector_labels,
+            kind=kind,
+        )
+    )
+    # Live pods, if they were ever read, would be STALE — proving this is
+    # about the selector being undetectable, not about there being no
+    # live pods to find.
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest)),
+            ("get pods", _pods_json([_pod("bff", "sha256:STALE")])),
+        ]
+    )
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=_CHART_VALUES)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "unreadable"
+    assert rows[0]["equal"] is False
+    assert rows[0]["live"] is None
+
+
+def test_rows_job_without_selector_stays_render_only_not_unreadable(
+    tmp_path, monkeypatch
+):
+    """The CONTROL: a Job (never required to carry a selector) with no
+    `spec.selector` stays `render_only` — the R2-2 fix must not
+    over-correct into flagging every selector-less workload."""
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-tests-hook",
+            "tests",
+            "docker.io/lfds/audittrace-tests:1.29.1@sha256:tests-chart",
+            selector_labels={},
+            kind="Job",
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=_CHART_VALUES)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "render_only"
+    assert rows[0]["equal"] is True
+
+
 # ── S-F2: current-ReplicaSet selection by revision annotation ───────────
 
 
@@ -848,6 +941,107 @@ def test_b1_stale_stored_override_forces_apply_not_noop(tmp_path, monkeypatch):
 # is covered end-to-end through the full `_is_converged` + config-drift path
 # in tests/test_deploy_runner.py::test_is_converged_true_when_all_first_party_images_match
 # — not duplicated here; this module stays focused on `images.py` itself.
+
+
+# ── R2-1 (fix round 2): AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES + the
+# committed-repository gate — each closes a reviewer-named vacuous neuter
+# (E1/E2/E3) that stayed GREEN with zero tests in round 1.
+
+
+def test_env_prefix_is_additive_default_prefix_still_recognizes_images(
+    tmp_path, monkeypatch
+):
+    """E1: with AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES set to an UNRELATED
+    prefix, an image under the DEFAULT `docker.io/lfds/` prefix — NOT in
+    the committed map, so its recognition depends PURELY on the prefix
+    match, never on the `repository in committed` escape hatch — is still
+    recognised as first-party (an `unknown_first_party` row). The env var
+    must ADD to the defaults, never REPLACE them.
+
+    Falsifiable: `return extra or FIRST_PARTY_PREFIXES` (env narrows/
+    replaces the defaults whenever it is set) and this goes RED — the
+    image no longer matches ANY configured prefix (and is not committed
+    either), so it is read as third-party and produces NO row at all.
+    """
+    monkeypatch.setenv(images.FIRST_PARTY_PREFIXES_ENV_VAR, "x.example/")
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-llm-stub",
+            "llm-stub",
+            "docker.io/lfds/audittrace-llm-stub:1.29.1@sha256:unknown",
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values={})  # nothing committed
+    assert len(rows) == 1
+    assert rows[0]["status"] == "unknown_first_party"
+
+
+def test_env_prefix_extends_recognition_for_a_new_repository(tmp_path, monkeypatch):
+    """E2: with AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES set to
+    `ecr.example/ns/`, an image under that repository (NOT in the
+    committed map) is recognised as first-party — an `unknown_first_party`
+    row — proving the env var actually extends recognition rather than
+    existing unused.
+
+    Falsifiable: `return FIRST_PARTY_PREFIXES` (ignore the env var
+    entirely) and this goes RED — the image matches neither a default
+    prefix nor any committed repository, so it is read as third-party and
+    produces no row at all.
+    """
+    monkeypatch.setenv(images.FIRST_PARTY_PREFIXES_ENV_VAR, "ecr.example/ns/")
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "ecr-mirror-workload",
+            "foo",
+            "ecr.example/ns/foo:1.0@sha256:unknown",
+            selector_labels={"app.kubernetes.io/component": "ecr-mirror-workload"},
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=_CHART_VALUES)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "unknown_first_party"
+    assert rows[0]["equal"] is False
+
+
+def test_committed_repository_is_first_party_regardless_of_prefix(
+    tmp_path, monkeypatch
+):
+    """E3: a committed overlay repository (e.g. a mirror outside BOTH the
+    default prefixes and any configured env prefix) is STILL recognised
+    as first-party and compared — at a stale digest, unequal.
+
+    Falsifiable: drop `repository in committed or` from the gating check
+    and this goes RED — the row disappears (the mirror repository
+    matches no prefix at all, default or configured).
+    """
+    monkeypatch.delenv(images.FIRST_PARTY_PREFIXES_ENV_VAR, raising=False)
+    chart_values = {
+        "console": {
+            "bff": {
+                "image": {
+                    "repository": "mirror.example/audittrace-librechat-bff",
+                    "tag": "1.29.1",
+                    "digest": "sha256:bff-chart",
+                }
+            }
+        }
+    }
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "mirror.example/audittrace-librechat-bff:1.29.1@sha256:STALE",
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=chart_values)
+    assert len(rows) == 1
+    assert rows[0]["equal"] is False
 
 
 # ── FIRST_PARTY_PREFIXES sanity ──────────────────────────────────────────

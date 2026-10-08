@@ -1594,7 +1594,6 @@ class VerifyRunner:
         if len(digests) == 1:
             return next(iter(digests))
         return None
-        return None
 
     def probe_first_party_images_match_published(self) -> ProbeResult:
         """The BFF's live pod digest matches the published ``--target-version``

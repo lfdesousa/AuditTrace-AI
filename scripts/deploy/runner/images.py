@@ -125,6 +125,16 @@ _WORKLOAD_KINDS = frozenset(
     {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
 )
 
+# Kinds Kubernetes REQUIRES a selector on (R2-2, fix round 2): a None
+# selector for one of these three means it could not be DERIVED from the
+# manifest (e.g. ``matchExpressions`` instead of ``matchLabels``, or a
+# missing ``app.kubernetes.io/component`` key) — that is "cannot read",
+# never "nothing to read", so it must report ``unreadable`` (unequal), not
+# ``render_only``. Job/CronJob are the ONLY kinds a missing selector is
+# legitimate for (a Helm-test hook has no standing pods to compare at
+# all) — see :meth:`FirstPartyImagesMixin._live_row_digest`.
+_LONG_LIVED_SELECTOR_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet"})
+
 
 def _parse_image_ref(image: str) -> tuple[str, str | None, str | None]:
     """Split a rendered ``repo[:tag][@sha256:hex]`` image string.
@@ -395,24 +405,44 @@ class FirstPartyImagesMixin:
         (:func:`_selector_from_manifest_doc`) — never a component-keyed
         lookup table (B-1: the pod-reaper runs the memory-server image
         under its OWN, distinct selector; a table keyed by the image's
-        component would read memory-server's pods instead). ``None`` means
-        the manifest doc carries no selector at all (a Job/CronJob) — the
-        row stays ``render_only``.
+        component would read memory-server's pods instead).
+
+        A ``None`` selector means DIFFERENT things depending on ``kind``
+        (R2-2, fix round 2): Kubernetes REQUIRES every Deployment/
+        StatefulSet/DaemonSet to carry a selector, so a None here for one
+        of those three means the selector could not be DERIVED (e.g. a
+        future template edit switches to ``matchExpressions`` instead of
+        ``matchLabels``, or drops the ``app.kubernetes.io/component`` key)
+        — that is "cannot read", not "nothing to read", and reads as
+        ``"unreadable"`` (unequal), never a silent render-only pass. Only
+        a kind with NO standing pods at all (Job/CronJob — a Helm-test
+        hook has no selector to find live pods through in the first
+        place) gets ``"render_only"``.
 
         Excludes any pod with ``metadata.deletionTimestamp`` set (a
         Terminating old pod must never mask an already-Running new one);
         for a Deployment, restricts to the pods of the CURRENT ReplicaSet
         (:meth:`_current_pod_template_hash`, S-F2); requires every
         remaining pod to report the SAME digest. ``status`` is ``"ok"``
-        (single agreeing digest), ``"render_only"`` (no selector on this
-        workload — comparison is render-level only), or ``"unreadable"``
-        (zero matching pods, an unreadable kubectl call, or disagreement
+        (single agreeing digest), ``"render_only"`` (no selector AND no
+        standing pods to compare — Job/CronJob only), or ``"unreadable"``
+        (zero matching pods, an unreadable kubectl call, a Deployment/
+        StatefulSet/DaemonSet with no derivable selector, or disagreement
         among the matched pods — fail-safe: unknown state is never read as
         equal).
+
+        Falsifiable: drop the ``kind in _LONG_LIVED_SELECTOR_KINDS`` branch
+        (treat every ``None`` selector as ``render_only``) and a
+        Deployment/StatefulSet/DaemonSet with an undetectable selector —
+        running STALE pods — goes back to reporting ``equal=True`` — RED on
+        ``test_rows_long_lived_kind_without_derivable_selector_is_
+        unreadable``.
         """
         from scripts.deploy.runner.convergence import extract_digest
 
         if selector is None:
+            if kind in _LONG_LIVED_SELECTOR_KINDS:
+                return None, "unreadable"
             return None, "render_only"
         current_hash = (
             self._current_pod_template_hash(name, selector)
