@@ -94,15 +94,33 @@ _CHART_VALUES = {
 }
 
 
-def _deployment_doc(name, container, image, *, replicas=1, init_containers=None):
+def _deployment_doc(
+    name, container, image, *, replicas=1, init_containers=None, selector_labels=None
+):
+    """A minimal Deployment manifest doc, including ``spec.selector.
+    matchLabels`` (fix-round B-1: the live read is now keyed on THIS,
+    never a component lookup table). Defaults to
+    ``{app.kubernetes.io/component: <name without the "audittrace-"
+    prefix>}`` — e.g. ``audittrace-librechat-bff`` -> ``librechat-bff`` —
+    which matches every existing ``component=...`` dispatch needle in this
+    module; pass ``selector_labels`` explicitly to model a workload whose
+    selector does NOT follow that convention (the pod-reaper tests do)."""
     containers = [{"name": container, "image": image}]
     pod_spec = {"containers": containers}
     if init_containers:
         pod_spec["initContainers"] = init_containers
+    if selector_labels is None:
+        selector_labels = {
+            "app.kubernetes.io/component": name.removeprefix("audittrace-")
+        }
     return {
         "kind": "Deployment",
         "metadata": {"name": name},
-        "spec": {"replicas": replicas, "template": {"spec": pod_spec}},
+        "spec": {
+            "replicas": replicas,
+            "selector": {"matchLabels": selector_labels},
+            "template": {"spec": pod_spec},
+        },
     }
 
 
@@ -287,12 +305,23 @@ def _runner(tmp_path, monkeypatch, disp, *, image_ref=None, **cfg_kw):
     return r
 
 
-def test_rows_unreadable_manifest_yields_no_rows(tmp_path, monkeypatch):
-    """`helm get manifest` failing is fail-safe UNKNOWN, not a crash — no
-    rows means no mismatch is manufactured from nothing."""
+def test_rows_unreadable_manifest_is_an_unequal_sentinel(tmp_path, monkeypatch):
+    """B-2 (fix round 1): `helm get manifest` failing must NOT be read as
+    "nothing to compare" ([], trivially convergeable) — that let a stale
+    BFF ride through a transient helm hiccup with exit 0 (the rev-272
+    outcome reached through a new door, per the reviewer's repro). It is
+    its own unequal sentinel row instead.
+
+    Falsifiable: revert to returning `[]` here and this goes RED (the
+    sentinel row disappears, `mismatched_components` returns `[]`).
+    """
     disp = _Dispatcher(rules=[("helm get manifest", _proc(returncode=1))])
     r = _runner(tmp_path, monkeypatch, disp)
-    assert r._first_party_image_rows(chart_values=_CHART_VALUES) == []
+    rows = r._first_party_image_rows(chart_values=_CHART_VALUES)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "manifest_unreadable"
+    assert rows[0]["equal"] is False
+    assert mismatched_components(rows) == ["manifest"]
 
 
 def test_rows_unknown_first_party_image_is_flagged_s_f1(tmp_path, monkeypatch):
@@ -380,14 +409,42 @@ def test_rows_unpinned_local_registry_tag_form_s3a(tmp_path, monkeypatch):
     assert rows[0]["live"] is None
 
 
+def test_rows_unpinned_local_registry_tag_form_mismatch_is_unequal(
+    tmp_path, monkeypatch
+):
+    """V-4 (fix round 1): the unpinned tag-form comparison is a REAL
+    comparison, not a rubber stamp — a rendered tag that does NOT match
+    `image_ref.tag` is unequal. Paired with the positive case above so the
+    CONTRAST, not one isolated assertion, proves the comparator fires."""
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-memory-server",
+            "memory-server",
+            "localhost:5000/audittrace/memory-server:STALE-TAG",
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(
+        tmp_path, monkeypatch, disp, image_ref=_local_ref_unpinned(), registry="local"
+    )
+    rows = r._first_party_image_rows(chart_values={})
+    assert len(rows) == 1
+    assert rows[0]["unpinned"] is True
+    assert rows[0]["equal"] is False
+
+
 def test_rows_render_only_when_no_selector_known(tmp_path, monkeypatch):
-    """The `tests` component has no pod selector — its row stays
-    `render_only`; equality is render-vs-chart alone."""
+    """A workload whose manifest doc carries NO `spec.selector` at all
+    (e.g. a Job, which Kubernetes defaults server-side — never present in
+    a `helm template`/`helm get manifest` render) has no selector this
+    runner can read live pods through — its row stays `render_only`;
+    equality is render-vs-chart alone."""
     manifest = _manifest_yaml(
         _deployment_doc(
             "audittrace-tests-hook",
             "tests",
             "docker.io/lfds/audittrace-tests:1.29.1@sha256:tests-chart",
+            selector_labels={},
         )
     )
     disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
@@ -396,6 +453,27 @@ def test_rows_render_only_when_no_selector_known(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["status"] == "render_only"
     assert rows[0]["equal"] is True
+
+
+def test_rows_render_only_mismatch_is_unequal(tmp_path, monkeypatch):
+    """V-5 (fix round 1): a `render_only` row (no selector known) is STILL
+    a real comparison — a rendered digest that disagrees with the chart
+    is unequal, never a silent pass just because live can't be checked.
+    Paired with the positive case above."""
+    manifest = _manifest_yaml(
+        _deployment_doc(
+            "audittrace-tests-hook",
+            "tests",
+            "docker.io/lfds/audittrace-tests:1.29.1@sha256:STALE-TESTS",
+            selector_labels={},
+        )
+    )
+    disp = _Dispatcher(rules=[("helm get manifest", _proc(0, manifest))])
+    r = _runner(tmp_path, monkeypatch, disp)
+    rows = r._first_party_image_rows(chart_values=_CHART_VALUES)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "render_only"
+    assert rows[0]["equal"] is False
 
 
 # ── S1: live pod selection rule ──────────────────────────────────────────
@@ -671,17 +749,20 @@ def test_rows_current_rs_selected_by_revision_not_creation_time(tmp_path, monkey
         )
     )
     rs_list = {
+        # The STALE RS listed FIRST — a neuter that matches unconditionally
+        # (ignoring the revision annotation) would pick THIS one, proving the
+        # test is not order-dependent-vacuous.
         "items": [
-            {
-                "metadata": {
-                    "annotations": {"deployment.kubernetes.io/revision": "3"},
-                    "labels": {"pod-template-hash": "current-hash"},
-                }
-            },
             {
                 "metadata": {
                     "annotations": {"deployment.kubernetes.io/revision": "4"},
                     "labels": {"pod-template-hash": "stale-hash"},
+                }
+            },
+            {
+                "metadata": {
+                    "annotations": {"deployment.kubernetes.io/revision": "3"},
+                    "labels": {"pod-template-hash": "current-hash"},
                 }
             },
         ]
@@ -779,5 +860,40 @@ def test_first_party_prefixes_are_the_two_documented_ones():
     )
 
 
-def test_selector_for_component_unknown_returns_none():
-    assert images._selector_for_component("postgres") is None
+def test_selector_from_manifest_doc_uses_the_component_label_only():
+    """The EXTRA `name`/`instance` labels this chart's
+    `audittrace.selectorLabels` also sets are deliberately NOT included —
+    `app.kubernetes.io/component` alone is already unique per workload in
+    this chart, and a single-label selector stays simple to reason about
+    and to test against."""
+    doc = {
+        "spec": {
+            "selector": {
+                "matchLabels": {
+                    "app.kubernetes.io/component": "memory-server",
+                    "app.kubernetes.io/instance": "audittrace",
+                    "app.kubernetes.io/name": "audittrace",
+                }
+            }
+        }
+    }
+    assert (
+        images._selector_from_manifest_doc(doc)
+        == "app.kubernetes.io/component=memory-server"
+    )
+
+
+def test_selector_from_manifest_doc_none_when_absent_or_malformed():
+    assert images._selector_from_manifest_doc({}) is None
+    assert (
+        images._selector_from_manifest_doc(
+            {"spec": {"selector": {"matchLabels": {"other-key": "x"}}}}
+        )
+        is None
+    )
+    assert images._selector_from_manifest_doc({"spec": "not-a-dict"}) is None
+    assert images._selector_from_manifest_doc({"spec": {"selector": {}}}) is None
+    assert (
+        images._selector_from_manifest_doc({"spec": {"selector": {"matchLabels": {}}}})
+        is None
+    )

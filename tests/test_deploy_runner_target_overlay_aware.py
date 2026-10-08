@@ -372,58 +372,38 @@ def test_helm_apply_cmd_default_path_overlay_moves_only_the_dash_f_token():
 
 
 def _console_drift_manifest_yaml(librechat_digest, bff_digest, memory_server_digest):
+    def _doc(name, component, container, image):
+        return {
+            "kind": "Deployment",
+            "metadata": {"name": name},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app.kubernetes.io/component": component}},
+                "template": {
+                    "spec": {"containers": [{"name": container, "image": image}]}
+                },
+            },
+        }
+
     docs = [
-        {
-            "kind": "Deployment",
-            "metadata": {"name": "audittrace-memory-server"},
-            "spec": {
-                "replicas": 1,
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "memory-server",
-                                "image": f"docker.io/lfds/audittrace-memory-server:1.26.0@{memory_server_digest}",
-                            }
-                        ]
-                    }
-                },
-            },
-        },
-        {
-            "kind": "Deployment",
-            "metadata": {"name": "audittrace-librechat"},
-            "spec": {
-                "replicas": 1,
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "librechat",
-                                "image": f"docker.io/lfds/audittrace-librechat:768de61@{librechat_digest}",
-                            }
-                        ]
-                    }
-                },
-            },
-        },
-        {
-            "kind": "Deployment",
-            "metadata": {"name": "audittrace-librechat-bff"},
-            "spec": {
-                "replicas": 1,
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "bff",
-                                "image": f"docker.io/lfds/audittrace-librechat-bff:1.29.1@{bff_digest}",
-                            }
-                        ]
-                    }
-                },
-            },
-        },
+        _doc(
+            "audittrace-memory-server",
+            "memory-server",
+            "memory-server",
+            f"docker.io/lfds/audittrace-memory-server:1.26.0@{memory_server_digest}",
+        ),
+        _doc(
+            "audittrace-librechat",
+            "librechat",
+            "librechat",
+            f"docker.io/lfds/audittrace-librechat:768de61@{librechat_digest}",
+        ),
+        _doc(
+            "audittrace-librechat-bff",
+            "librechat-bff",
+            "bff",
+            f"docker.io/lfds/audittrace-librechat-bff:1.29.1@{bff_digest}",
+        ),
     ]
     return "\n---\n".join(json.dumps(d) for d in docs)
 
@@ -515,6 +495,32 @@ def test_chart_apply_end_to_end_reconciles_console_drift_with_overlay(
     assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in " ".join(
         upgrade
     )
+
+
+def test_chart_apply_end_to_end_without_overlay_still_emits_six_console_sets(
+    tmp_path, monkeypatch
+):
+    """B-1's third leg (review finding): file-side `console.enabled=false`
+    (base values.yaml, NO `-f` overlay) must STILL carry the six console
+    `--set` pins in the REAL `helm upgrade` argv once `phase_chart_apply`
+    actually applies (D2, unconditional) — not merely in a dry-run plan
+    line. Only `test_chart_apply_end_to_end_reconciles_console_drift_with_
+    overlay` above exercised this end to end, and only WITH the overlay —
+    this is its missing without-overlay counterpart.
+    """
+    disp = _Dispatcher(rules=[("helm upgrade", _proc(0, "deployed"))])
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(
+        _cfg(tmp_path)
+    )  # no values_files -> base only, console.enabled=false
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.records[0].status != "noop"
+    upgrade = next(c for c in disp.calls if "helm upgrade" in " ".join(c))
+    joined = " ".join(upgrade)
+    assert "-f" not in upgrade
+    assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in joined
+    assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in joined
 
 
 # ── (8) CLI surface: --values / -f, repeatable, ordered ─────────────────────

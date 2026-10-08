@@ -467,12 +467,20 @@ class ConvergenceMixin:
         is therefore never falsely seen as converged. Falls back to
         tag-string comparison only when the digest is unresolved (local
         registry, soft-fail); the Helm-status requirement still applies on
-        that path. This top-level memory-server check and the first-party
-        row set below independently agree on memory-server when both are
-        exercised against a real cluster (same inputs, two reads); kept
-        separate here only so the pre-existing ``digest_matched``/
+        that path. Kept separate from (never folded into) the first-party
+        row set below SOLELY so the pre-existing ``digest_matched``/
         ``reconcile_note`` bookkeeping (:mod:`scripts.deploy.runner.helm`)
-        is unaffected.
+        is unaffected — NOT because the two are claimed to agree: this
+        top-level check and the rows below can disagree on a real cluster
+        (the rows read the memory-server row too, via its own manifest
+        selector), and the disagreement is SAFE only in one direction —
+        this check says "match" while the rows say "mismatch" still yields
+        NOT converged (the rows win, per D3/exit-8); the reverse can never
+        happen because the rows are a strict superset check. No instrument
+        here asserts the two "agree on a real cluster" — fix-round finding:
+        that prose was unmeasured and, before B-1's selector fix, was
+        actually false (the old jsonpath check matched while a mis-selected
+        pod-reaper row mismatched).
 
         Only reads Helm status when the digest AND every first-party row
         already match — a mismatch runs ``helm upgrade`` unconditionally,

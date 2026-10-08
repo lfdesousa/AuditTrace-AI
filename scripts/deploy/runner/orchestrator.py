@@ -514,6 +514,18 @@ class DeployRunner(ConvergenceMixin, HelmMixin, FirstPartyImagesMixin):
         self.first_party_rows = rows
         mismatched = mismatched_components(rows)
         self.first_party_mismatch = bool(mismatched)
+        # B-3 (fix round 1): a report must never say `converged: true` AND
+        # `first_party_mismatch: true` at once (Addendum A Rule B1: "a
+        # report may say converged: true only when all rows are equal").
+        # P2 `noop` sets `self.converged = True` from the PRE-apply
+        # convergence check; if THIS (independent, re-read) check finds a
+        # mismatch, that earlier verdict is overridden here — covers both
+        # a genuinely stale pre-apply read and state that drifted between
+        # the P2 check and this P4 recheck. Falsifiable: drop this line and
+        # `test_phase_settle_noop_path_clears_converged_on_mismatch` goes
+        # RED (`converged` stays True alongside `first_party_mismatch=True`).
+        if mismatched:
+            self.converged = False
         detail = (
             f"rollout settled; peak concurrent Running={peak} <= replicas={replicas}"
             if ok

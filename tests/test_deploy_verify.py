@@ -2256,6 +2256,25 @@ def test_live_bff_digest_none_when_no_sha_token(tmp_path, monkeypatch):
     assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
 
 
+def test_live_bff_digest_requires_all_pods_to_agree(tmp_path, monkeypatch):
+    """Should-fix (fix round 1): two BFF pods, ONE stale — must be
+    unreadable (`None`), never the first (possibly stale) token. Paired
+    with the single-pod happy path already covered by the probe-level PASS
+    test above, so the CONTRAST proves the all-agree requirement, not just
+    "a digest was returned"."""
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:fresh repo@sha256:STALE")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_agrees_when_all_pods_match(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:same repo@sha256:same")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() == "sha256:same"
+
+
 def test_resolve_accepts_bff_repo_path_byte_identical_default_call(
     tmp_path, monkeypatch
 ):
@@ -2267,6 +2286,44 @@ def test_resolve_accepts_bff_repo_path_byte_identical_default_call(
     monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
     res = VerifyRunner(_cfg(tmp_path)).probe_digest_matches_published()
     assert res.status == PASS
+
+
+def test_bff_probe_calls_resolve_with_repo_path_bff_not_default(tmp_path, monkeypatch):
+    """V-2 (fix round 1, non-vacuous by construction): the `registry.resolve`
+    stub BRANCHES on `repo_path` — a DIFFERENT published digest for `"bff"`
+    than for the default (`"memory-server"`) — so dropping the
+    `repo_path="bff"` plumbing from the probe (comparing the live BFF
+    digest against the WRONG published digest) is caught by a genuine
+    PASS/FAIL flip, never by a stub that returns the same value either way.
+
+    Falsifiable: drop `repo_path="bff"` from the probe's `registry.resolve`
+    call and this goes RED — the probe would resolve the memory-server
+    digest instead, which the live BFF pod (correctly running the BFF
+    digest) does not match.
+    """
+    calls: list[str] = []
+
+    def _resolve_stub(v, reg, *, repo_path="memory-server"):
+        calls.append(repo_path)
+        digest = (
+            "sha256:bff-digest" if repo_path == "bff" else "sha256:memory-server-digest"
+        )
+        return registry.ImageRef(
+            "docker.io/lfds/audittrace-librechat-bff", v, digest, reg
+        )
+
+    monkeypatch.setattr(registry, "resolve", _resolve_stub)
+
+    def _run_stub(cmd):
+        joined = " ".join(cmd)
+        if "librechat-bff" in joined and "imageID" in joined:
+            return _proc(0, "repo@sha256:bff-digest")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert "bff" in calls
 
 
 # ── probe 10: run()-level, additive over the other nine ──────────────────────

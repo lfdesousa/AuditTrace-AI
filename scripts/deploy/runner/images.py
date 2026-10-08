@@ -17,46 +17,61 @@ replaces BOTH checks with ONE predicate, derived from the LIVE
 ``helm get manifest`` — never the file flag:
 
 * a row exists for a container/init-container IFF it is actually present in
-  the live manifest AND its image repository is first-party
-  (:data:`FIRST_PARTY_PREFIXES`);
+  the live manifest AND its image repository is first-party (a repository
+  already in the committed map, OR matching
+  :func:`_configured_first_party_prefixes` — portability fix-round
+  should-fix: a committed mirror repository is recognised without a code
+  change);
 * its ``chart`` side is the value :func:`committed_first_party_digests`
   derives from the committed chart values (or the resolved memory-server
   digest) — never re-resolved from the registry a second time;
-* its ``live`` side is the pod ``imageID`` actually running, selected per
-  the S1 pod-selection rule (:meth:`FirstPartyImagesMixin._live_row_digest`):
-  excluding any Terminating pod, restricted to the Deployment's CURRENT
-  ReplicaSet (matched by the ``deployment.kubernetes.io/revision``
-  annotation, never creation-timestamp order — S-F2), requiring every
-  remaining pod to agree;
+* its ``live`` side is the pod ``imageID`` actually running, read through
+  THIS WORKLOAD'S OWN ``spec.selector.matchLabels``
+  (:func:`_selector_from_manifest_doc`) — never a component-keyed lookup
+  table (fix-round B-1: the pod-reaper runs the memory-server IMAGE under
+  its own, DISTINCT selector; a table keyed by the image's component read
+  memory-server's pods for it and reported a false mismatch on every real
+  deploy). Selected per the S1 pod-selection rule
+  (:meth:`FirstPartyImagesMixin._live_row_digest`): excluding any
+  Terminating pod, restricted to the Deployment's CURRENT ReplicaSet
+  (matched by the ``deployment.kubernetes.io/revision`` annotation, never
+  creation-timestamp order — S-F2), requiring every remaining pod to agree;
 * a Deployment/StatefulSet scaled to zero replicas marks its row
   ``scaled_to_zero`` (live not compared, S-F3) rather than ``unreadable``;
-  a repository this runner cannot independently read a live digest for
-  (e.g. the ``tests`` Helm-test-hook Job, which never appears in a normal
-  release's manifest) marks its row ``render_only``;
+  a workload whose manifest doc carries no selector at all (a Job/CronJob,
+  e.g. the ``tests`` Helm-test-hook) marks its row ``render_only``;
 * a first-party repository present in the manifest but absent from the
   committed map is ``unknown_first_party`` — ALWAYS counted as a mismatch
   (S-F1's completeness pin: a newly-enabled first-party image the 4-key
-  enumeration forgot about is flagged, never silently skipped).
+  enumeration forgot about is flagged, never silently skipped);
+* an UNREADABLE manifest (``helm get manifest`` itself failed) is its OWN
+  unequal sentinel row (``status="manifest_unreadable"``) — never ``[]``
+  (fix-round B-2: ``[]`` read as "nothing to compare", which let a stale
+  BFF survive a transient `helm get manifest` failure with exit 0).
 
 Convergence and the post-apply settle check both call this SAME function on
 the SAME manifest read, so "should I apply" and "did it converge" can never
-disagree (``feedback_a_chokepoint_is_per_domain_never_inherited``).
+disagree (``feedback_a_chokepoint_is_per_domain_never_inherited``). The two
+CAN still disagree with the pre-existing, independent memory-server-only
+jsonpath check inside ``_is_converged`` — that disagreement is SAFE (it can
+only ever turn a would-be noop into an apply, never the reverse) and is
+measured per-case in this module's and ``convergence.py``'s own tests,
+never asserted as a blanket "they agree on a real cluster" (fix-round
+finding: that prose was unmeasured and, on the real chart before B-1's
+fix, actually false).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from scripts.deploy import registry
 from scripts.deploy import runner as _runner_pkg
-from scripts.deploy.runner.config import (
-    _COMPONENT_SELECTOR,
-    _CONSOLE_COMPONENT_SELECTORS,
-    MEMORY_SERVER_COMPONENT,
-)
+from scripts.deploy.runner.config import MEMORY_SERVER_COMPONENT
 
 if TYPE_CHECKING:
     from scripts.deploy.runner.orchestrator import DeployRunner
@@ -78,8 +93,30 @@ if TYPE_CHECKING:
 # lives in (publish.yml); localhost:5000/audittrace/* is the k3s dev
 # mirror (--registry local). Any other prefix (postgres/redis/rabbitmq/
 # vault subcharts, istio/proxyv2, ...) is third-party and out of scope by
-# construction — it can never match either prefix.
+# construction — it can never match either prefix. This is the LAPTOP
+# default; a target with a committed mirror repository (e.g. an ECR
+# namespace) is covered WITHOUT a code change two ways (portability
+# invariant, fix-round should-fix): (1) any repository already present in
+# ``committed_first_party_digests``'s map is first-party regardless of
+# prefix (see ``_first_party_image_rows``'s gating check) — a mirror
+# committed in a target's own overlay is never silently dropped; (2) the
+# prefix LIST itself is configurable via
+# :data:`FIRST_PARTY_PREFIXES_ENV_VAR` for a repository that is first-party
+# but not YET in the committed map (e.g. during a migration).
 FIRST_PARTY_PREFIXES = ("docker.io/lfds/", "localhost:5000/audittrace/")
+
+FIRST_PARTY_PREFIXES_ENV_VAR = "AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES"
+
+
+def _configured_first_party_prefixes() -> tuple[str, ...]:
+    """:data:`FIRST_PARTY_PREFIXES`, extended by a comma-separated
+    ``AUDITTRACE_FIRST_PARTY_IMAGE_PREFIXES`` override (additive — the
+    laptop defaults are never dropped, only ever extended) so a second
+    target's prefix is a config value, never a code change."""
+    raw = os.environ.get(FIRST_PARTY_PREFIXES_ENV_VAR, "")
+    extra = tuple(p.strip() for p in raw.split(",") if p.strip())
+    return FIRST_PARTY_PREFIXES + extra
+
 
 # The manifest kinds this module ever looks at. Secret docs are NEVER
 # parsed into a row — not filtered out of evidence after the fact, simply
@@ -187,15 +224,43 @@ def committed_first_party_digests(
     return committed
 
 
-def _selector_for_component(component: str) -> str | None:
-    """The pod label selector this runner can independently read a live
-    digest through for ``component``, or ``None`` when none is known (the
-    row then stays ``render_only`` — e.g. the ``tests`` Helm-test-hook Job,
-    which has no standing Deployment/pod selector at all)."""
-    if component == MEMORY_SERVER_COMPONENT:
-        return _COMPONENT_SELECTOR
-    mapping = _CONSOLE_COMPONENT_SELECTORS.get(component)
-    return mapping[0] if mapping else None
+def _selector_from_manifest_doc(doc: dict[str, Any]) -> str | None:
+    """The pod label selector for THIS workload, read straight off ITS OWN
+    ``spec.selector.matchLabels`` in the manifest — never a static
+    component -> selector table (fix-round B-1: the pod-reaper runs the
+    memory-server IMAGE in a container named ``pod-reaper``, but it is its
+    OWN Deployment with its OWN selector
+    (``app.kubernetes.io/component=pod-reaper``, distinct from
+    memory-server's ``...=memory-server``); a table keyed by the IMAGE's
+    component name reads the wrong pods for it.
+
+    Uses ONLY the ``app.kubernetes.io/component`` key out of
+    ``matchLabels`` — this chart's own
+    ``_helpers.tpl``/``audittrace.selectorLabels`` convention makes that
+    one key unique per workload, and a single-label selector is already a
+    fully valid ``kubectl -l`` filter (the extra ``name``/``instance``
+    labels every workload also sets add no further discrimination within
+    one release/namespace). Every Deployment/StatefulSet/DaemonSet this
+    chart renders sets ``spec.selector.matchLabels`` explicitly; a
+    Job/CronJob never carries one in a `helm template`/`helm get manifest`
+    render (Kubernetes defaults it server-side) — this returns ``None``
+    for those, and for any doc missing the component key, so the row
+    stays ``render_only``.
+
+    Falsifiable: key the selector off ``component`` (the image's identity)
+    instead of the workload's own manifest selector, and the pod-reaper
+    row goes back to reading memory-server's pods — RED on
+    ``test_neuter_component_selector_table_breaks_the_pod_reaper_row``.
+    """
+    spec = doc.get("spec")
+    selector = spec.get("selector") if isinstance(spec, dict) else None
+    match_labels = selector.get("matchLabels") if isinstance(selector, dict) else None
+    if not isinstance(match_labels, dict):
+        return None
+    component = match_labels.get("app.kubernetes.io/component")
+    if not component:
+        return None
+    return f"app.kubernetes.io/component={component}"
 
 
 def mismatched_components(rows: list[dict[str, Any]]) -> list[str]:
@@ -318,7 +383,7 @@ class FirstPartyImagesMixin:
     def _live_row_digest(
         self: DeployRunner,
         *,
-        component: str,
+        selector: str | None,
         kind: str,
         name: str,
         container: str,
@@ -326,20 +391,27 @@ class FirstPartyImagesMixin:
     ) -> tuple[str | None, str]:
         """``(digest, status)`` for one row's LIVE side (S1).
 
+        ``selector`` is THIS workload's own ``spec.selector.matchLabels``
+        (:func:`_selector_from_manifest_doc`) — never a component-keyed
+        lookup table (B-1: the pod-reaper runs the memory-server image
+        under its OWN, distinct selector; a table keyed by the image's
+        component would read memory-server's pods instead). ``None`` means
+        the manifest doc carries no selector at all (a Job/CronJob) — the
+        row stays ``render_only``.
+
         Excludes any pod with ``metadata.deletionTimestamp`` set (a
         Terminating old pod must never mask an already-Running new one);
         for a Deployment, restricts to the pods of the CURRENT ReplicaSet
         (:meth:`_current_pod_template_hash`, S-F2); requires every
         remaining pod to report the SAME digest. ``status`` is ``"ok"``
-        (single agreeing digest), ``"render_only"`` (no selector known for
-        this component — comparison is render-level only), or
-        ``"unreadable"`` (zero matching pods, an unreadable kubectl call, or
-        disagreement among the matched pods — fail-safe: unknown state is
-        never read as equal).
+        (single agreeing digest), ``"render_only"`` (no selector on this
+        workload — comparison is render-level only), or ``"unreadable"``
+        (zero matching pods, an unreadable kubectl call, or disagreement
+        among the matched pods — fail-safe: unknown state is never read as
+        equal).
         """
         from scripts.deploy.runner.convergence import extract_digest
 
-        selector = _selector_for_component(component)
         if selector is None:
             return None, "render_only"
         current_hash = (
@@ -389,6 +461,15 @@ class FirstPartyImagesMixin:
         ``chart_values``/``manifest_docs`` default to a fresh read (the
         production path); tests inject both so the derivation is exercised
         hermetically.
+
+        B-2 (fix round 1): an UNREADABLE manifest is its own sentinel row
+        (``status="manifest_unreadable"``, ``equal=False``) — never ``[]``.
+        ``[]`` meant "nothing to compare, trivially converged", which is
+        indistinguishable from "I could not even look" and let a stale
+        BFF ride through on an `helm get manifest` hiccup (the rev-272
+        outcome reached through a new door). Falsifiable: revert to
+        returning ``[]`` here and
+        ``test_rows_unreadable_manifest_is_an_unequal_sentinel`` goes RED.
         """
         if chart_values is None:
             chart_values = _runner_pkg._read_chart_values(
@@ -396,7 +477,25 @@ class FirstPartyImagesMixin:
             )
         if manifest_docs is None:
             manifest_docs = self._live_manifest_docs()
+        if manifest_docs is None:
+            return [
+                {
+                    "component": "manifest",
+                    "kind": None,
+                    "workload": None,
+                    "container": None,
+                    "is_init": False,
+                    "repository": None,
+                    "rendered": None,
+                    "chart": None,
+                    "live": None,
+                    "unpinned": False,
+                    "status": "manifest_unreadable",
+                    "equal": False,
+                }
+            ]
         committed = committed_first_party_digests(chart_values, self.image_ref)
+        prefixes = _configured_first_party_prefixes()
         rows: list[dict[str, Any]] = []
         for doc in _manifest_workload_docs(manifest_docs):
             kind = doc.get("kind")
@@ -404,6 +503,7 @@ class FirstPartyImagesMixin:
             pod_spec = _pod_spec_of(doc)
             if not name or pod_spec is None:
                 continue
+            selector = _selector_from_manifest_doc(doc)
             replicas = (
                 doc.get("spec", {}).get("replicas")
                 if isinstance(doc.get("spec"), dict)
@@ -419,9 +519,10 @@ class FirstPartyImagesMixin:
                     if not image or not container_name:
                         continue
                     repository, tag, digest = _parse_image_ref(image)
-                    if not any(
-                        repository.startswith(prefix) for prefix in FIRST_PARTY_PREFIXES
-                    ):
+                    is_first_party = repository in committed or any(
+                        repository.startswith(prefix) for prefix in prefixes
+                    )
+                    if not is_first_party:
                         continue
                     rendered = digest or (f"{repository}:{tag}" if tag else repository)
                     info = committed.get(repository)
@@ -485,7 +586,7 @@ class FirstPartyImagesMixin:
                         )
                         continue
                     live_digest, live_status = self._live_row_digest(
-                        component=component,
+                        selector=selector,
                         kind=kind,
                         name=name,
                         container=container_name,

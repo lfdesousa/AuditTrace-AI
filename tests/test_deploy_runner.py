@@ -774,12 +774,23 @@ _ROWS_CONSOLE_VALUES_ENABLED = {
 }
 
 
-def _manifest_deployment_doc(name, container, image, replicas=1):
+def _manifest_deployment_doc(name, container, image, replicas=1, selector_labels=None):
+    """Includes `spec.selector.matchLabels` (fix-round B-1: the live read
+    is keyed on THIS, never a component lookup table) — defaults to
+    `{app.kubernetes.io/component: <name without the "audittrace-"
+    prefix>}`, matching every `component=...` dispatch needle already in
+    this module; pass `selector_labels={}` to model a workload with NO
+    selector (the Job/render_only case)."""
+    if selector_labels is None:
+        selector_labels = {
+            "app.kubernetes.io/component": name.removeprefix("audittrace-")
+        }
     return {
         "kind": "Deployment",
         "metadata": {"name": name},
         "spec": {
             "replicas": replicas,
+            "selector": {"matchLabels": selector_labels},
             "template": {"spec": {"containers": [{"name": container, "image": image}]}},
         },
     }
@@ -2375,6 +2386,188 @@ def test_cli_returns_eight_on_first_party_mismatch(tmp_path, monkeypatch):
     rc = runner.main(
         ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
     )
+    assert rc == 8
+
+
+def test_noop_path_d3_recheck_clears_converged_and_exits_eight(tmp_path, monkeypatch):
+    """B-3 / V-1 (fix round 1): P2 reads an ALL-EQUAL manifest and records
+    `noop` (`self.converged = True`); P4 independently re-reads the
+    manifest (a SECOND, separate `helm get manifest` call) and finds the
+    BFF now STALE. The report must say `converged: False` (never
+    `converged: true` alongside `first_party_mismatch: true`) and
+    `main()` must return 8 — D3 runs on the noop path too, exactly as
+    Addendum A Rule B1 requires, and its OWN finding overrides the
+    earlier (now-stale) convergence verdict.
+
+    Falsifiable: skip D3 on the noop path (``rows = [] if self.converged
+    else self._first_party_image_rows(...)``, the reviewer's own named
+    neuter) and this goes RED — `first_party_mismatch` stays False and
+    `main()` returns 0. Or drop the ``self.converged = False`` clear in
+    `phase_settle` and this goes RED on the ``converged`` assertion alone
+    (exit stays 8, but the report lies about `converged`).
+    """
+    good_manifest = "\n---\n".join(
+        json.dumps(d)
+        for d in (
+            _manifest_deployment_doc(
+                "audittrace-memory-server",
+                "memory-server",
+                "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat-bff",
+                "bff",
+                "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:FRESH-CHART",
+            ),
+        )
+    )
+    stale_manifest = "\n---\n".join(
+        json.dumps(d)
+        for d in (
+            _manifest_deployment_doc(
+                "audittrace-memory-server",
+                "memory-server",
+                "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat-bff",
+                "bff",
+                "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:STALE",
+            ),
+        )
+    )
+    manifest_calls = {"n": 0}
+
+    def _run_stub(cmd, *, env=None):
+        joined = " ".join(cmd)
+        if cmd[:3] == ["helm", "get", "manifest"]:
+            manifest_calls["n"] += 1
+            text = good_manifest if manifest_calls["n"] == 1 else stale_manifest
+            return _proc(0, text)
+        if '"memory-server")].imageID' in joined:
+            return _proc(0, "repo@sha256:x")
+        if "jsonpath={.metadata.annotations" in joined:
+            return _proc(0, "")
+        if "component=librechat-bff" in joined and "get pods" in joined:
+            # The LIVE BFF pod already runs the FRESH digest — at P2 time
+            # (manifest #1, rendered=FRESH) this makes the row genuinely
+            # equal (true convergence, true noop). At P4 time (manifest
+            # #2, rendered=STALE) the row is unequal purely on
+            # render-vs-chart (the live digest is irrelevant once
+            # `render_match` is False) — exactly the "something changed in
+            # the STORED release between the two reads" shape this test
+            # means to prove D3 catches.
+            return _proc(
+                0,
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"labels": {}},
+                                "status": {
+                                    "containerStatuses": [
+                                        {
+                                            "name": "bff",
+                                            "imageID": "repo@sha256:FRESH-CHART",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        if "component=memory-server" in joined and "get pods" in joined:
+            return _proc(
+                0,
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"labels": {}},
+                                "status": {
+                                    "containerStatuses": [
+                                        {
+                                            "name": "memory-server",
+                                            "imageID": "repo@sha256:x",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        if "helm status" in joined:
+            return _proc(0, json.dumps({"version": 9, "info": {"status": "deployed"}}))
+        if "helm template" in joined:
+            # No config drift on EITHER workload the P2-time (good-manifest)
+            # rows name — the point of this test is the IMAGE mismatch D3
+            # finds on recheck, not a config-drift false positive.
+            return _proc(
+                0,
+                _render_manifest_yaml(
+                    _deployment_doc("audittrace-memory-server", "memory-server"),
+                    _deployment_doc("audittrace-librechat-bff", "bff"),
+                ),
+            )
+        if (
+            "get deployment audittrace-memory-server -n" in joined
+            and "-o json" in joined
+        ):
+            return _proc(
+                0,
+                json.dumps(
+                    _deployment_doc("audittrace-memory-server", "memory-server")
+                ),
+            )
+        if (
+            "get deployment audittrace-librechat-bff -n" in joined
+            and "-o json" in joined
+        ):
+            return _proc(
+                0, json.dumps(_deployment_doc("audittrace-librechat-bff", "bff"))
+            )
+        if "jsonpath={.spec.replicas}" in joined:
+            return _proc(0, "1")
+        if "status.phase" in joined:
+            return _proc(0, "Running")
+        return _proc(0, "")
+
+    monkeypatch.setattr(runner, "_run", _run_stub)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        runner,
+        "_read_chart_values",
+        lambda *a, **k: {
+            "console": {
+                "bff": {
+                    "image": {
+                        "repository": "docker.io/lfds/audittrace-librechat-bff",
+                        "tag": "9.9.9",  # D6: matches the synthetic target below
+                        "digest": "sha256:FRESH-CHART",
+                    }
+                }
+            },
+            "tests": {"image": {"tag": "9.9.9"}},
+        },
+    )
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:x"))
+
+    rc = runner.main(
+        ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
+    )
+
+    out = sorted((tmp_path / "runs").glob("*.json"))
+    report = json.loads(out[-1].read_text())
+    p2 = next(p for p in report["phases"] if p["name"] == "P2-chart-apply")
+    assert p2["status"] == "noop", (
+        "P2 must have been a true noop (manifest #1, all-equal)"
+    )
+    assert report["converged"] is False, (
+        "converged must NOT stay True once P4's independent recheck finds a mismatch"
+    )
+    assert report["first_party_mismatch"] is True
     assert rc == 8
 
 

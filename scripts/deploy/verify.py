@@ -1559,6 +1559,12 @@ class VerifyRunner:
         return None
 
     def _live_bff_digest(self) -> str | None:
+        """The live BFF digest, requiring EVERY matching pod to agree
+        (fix-round should-fix) — never just the first token. Two pods, one
+        stale, used to PASS on the first (possibly stale) one; now any
+        disagreement is ``None`` (unreadable), mirroring the deploy
+        runner's own S1 all-pods-agree rule
+        (``scripts.deploy.runner.images._live_row_digest``)."""
         jsonpath = (
             '{.items[*].status.containerStatuses[?(@.name=="'
             + BFF_CONTAINER
@@ -1579,10 +1585,15 @@ class VerifyRunner:
         )
         if proc.returncode != 0:
             return None
-        for token in proc.stdout.split():
-            digest = extract_digest(token)
-            if digest:
-                return digest
+        digests = {
+            digest
+            for token in proc.stdout.split()
+            for digest in (extract_digest(token),)
+            if digest
+        }
+        if len(digests) == 1:
+            return next(iter(digests))
+        return None
         return None
 
     def probe_first_party_images_match_published(self) -> ProbeResult:
