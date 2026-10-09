@@ -67,6 +67,19 @@ class _KubeDispatcher:
     """Routes verify._run calls to canned CompletedProcess by command-token match.
 
     (Command args, NOT URLs — token substring matching is fine here.)
+
+    Any unstubbed call naming ``librechat-bff`` (the D5 probe's Deployment
+    lookup / pod-list reads) defaults to ``returncode=1`` — "no BFF
+    Deployment in this namespace" — rather than this class's normal
+    default-success behaviour. Every pre-existing fixture in this module
+    predates D5 and models no console workloads at all, so without this
+    the BFF Deployment would look "present" by accident (the generic
+    default-success fallback) and the probe would go on to call
+    ``registry.resolve(..., repo_path="bff")`` — which most of those
+    fixtures' OWN ``registry.resolve`` stub (a 2-positional-arg lambda)
+    cannot accept, raising ``TypeError`` instead of exercising anything
+    about the test at hand. Tests that DO want to exercise the BFF probe
+    add their own ``librechat-bff`` rule, checked first.
     """
 
     def __init__(self, rules, default=None):
@@ -80,6 +93,11 @@ class _KubeDispatcher:
         for needle, result in self.rules:
             if needle in joined:
                 return result
+        if "librechat-bff" in joined:
+            return _proc(
+                returncode=1,
+                stderr='Error from server (NotFound): deployments.apps "...librechat-bff" not found',
+            )
         return self.default
 
 
@@ -845,15 +863,29 @@ def _istiod_ready_deployment():
 
 
 def _healthy_kube_rules():
-    """The full read-only cluster read set for an all-green deploy (all ten probes).
+    """The full read-only cluster read set for an all-green deploy (all
+    eleven probes).
 
-    The istiod-specific ``get deployment istiod`` rule MUST precede the generic
-    ``get deployment`` rule (first-match-wins), and ``imageID`` MUST precede
-    ``get pods`` (the digest read is also a ``get pods`` command).
+    The istiod-specific ``get deployment istiod`` AND the BFF-specific
+    ``get deployment ...librechat-bff`` rules MUST precede the generic
+    ``get deployment`` rule (first-match-wins), and ``imageID`` MUST
+    precede ``get pods`` (the digest read is also a ``get pods`` command).
+    No console workload is modelled here (consistent with the common
+    laptop ``console.enabled=false`` posture) — D5's probe reports PASS
+    with ``{"bff": "absent"}`` and never calls ``registry.resolve`` a
+    second time, so these fixtures' own single-arg ``registry.resolve``
+    stubs stay untouched.
     """
     return [
         ("imageID", _proc(0, "repo@sha256:pub")),
         ("get deployment istiod", _istiod_ready_deployment()),
+        (
+            "get deployment audittrace-librechat-bff",
+            _proc(
+                returncode=1,
+                stderr='Error from server (NotFound): deployments.apps "audittrace-librechat-bff" not found',
+            ),
+        ),
         ("get endpoints", _proc(0, "10.42.0.9")),
         ("get pods", _pods_json(_mesh_healthy_pods())),
         ("helm status", _proc(0, json.dumps({"info": {"status": "deployed"}}))),
@@ -2115,6 +2147,185 @@ def test_scan_dlq_depth_default_threshold_is_ten(tmp_path):
     assert _cfg(tmp_path).scan_dlq_threshold == 10
 
 
+# ── probe 11: first-party-images-match-published (D5) ───────────────────────
+
+
+def _bff_ref(digest="sha256:pub-bff"):
+    return registry.ImageRef(
+        "docker.io/lfds/audittrace-librechat-bff", "9.9.9", digest, "hub"
+    )
+
+
+def test_bff_probe_skipped_under_local_registry(tmp_path, monkeypatch):
+    res = VerifyRunner(
+        _cfg(tmp_path, registry="local")
+    ).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {"bff": "skipped", "reason": "registry local"}
+
+
+def test_bff_probe_pass_absent_when_deployment_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify,
+        "_run",
+        lambda cmd: _proc(
+            returncode=1,
+            stderr='Error from server (NotFound): deployments.apps "x" not found',
+        ),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {"bff": "absent"}
+
+
+def test_bff_probe_fail_unreadable_cluster_not_absent(tmp_path, monkeypatch):
+    """A kubectl failure that does NOT say NotFound (an unreachable
+    cluster, an RBAC error, ...) must FAIL fail-closed — never be silently
+    read as "absent" PASS. Falsifiable: drop the `None` branch (treat
+    anything non-zero as absent) and this goes RED (flips to PASS)."""
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1, stderr="boom"))
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL
+    assert res.evidence == {"bff": "unreadable"}
+
+
+def test_bff_probe_fail_digest_resolution_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "{}"))
+
+    def boom(v, reg, *, repo_path=None):
+        raise registry.DigestResolutionError("HTTP 404")
+
+    monkeypatch.setattr(registry, "resolve", boom)
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "could not resolve" in res.detail
+
+
+def test_bff_probe_fail_no_live_digest(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "{}"))
+    monkeypatch.setattr(
+        registry, "resolve", lambda v, reg, *, repo_path=None: _bff_ref()
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "no live pod digest" in res.detail
+
+
+def test_bff_probe_fail_digest_mismatch(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def _run_stub(cmd):
+        calls["n"] += 1
+        if "librechat-bff" in " ".join(cmd) and "imageID" in " ".join(cmd):
+            return _proc(0, "repo@sha256:LIVE")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    monkeypatch.setattr(
+        registry,
+        "resolve",
+        lambda v, reg, *, repo_path=None: _bff_ref("sha256:PUBLISHED"),
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == FAIL and "does NOT match" in res.detail
+
+
+def test_bff_probe_pass_digest_matches(tmp_path, monkeypatch):
+    def _run_stub(cmd):
+        if "librechat-bff" in " ".join(cmd) and "imageID" in " ".join(cmd):
+            return _proc(0, "repo@sha256:pub-bff")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    monkeypatch.setattr(
+        registry, "resolve", lambda v, reg, *, repo_path=None: _bff_ref()
+    )
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert res.evidence == {
+        "published_digest": "sha256:pub-bff",
+        "live_digest": "sha256:pub-bff",
+    }
+
+
+def test_live_bff_digest_none_on_kubectl_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(returncode=1))
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_none_when_no_sha_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "repo:tag"))
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_requires_all_pods_to_agree(tmp_path, monkeypatch):
+    """Should-fix (fix round 1): two BFF pods, ONE stale — must be
+    unreadable (`None`), never the first (possibly stale) token. Paired
+    with the single-pod happy path already covered by the probe-level PASS
+    test above, so the CONTRAST proves the all-agree requirement, not just
+    "a digest was returned"."""
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:fresh repo@sha256:STALE")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() is None
+
+
+def test_live_bff_digest_agrees_when_all_pods_match(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_run", lambda cmd: _proc(0, "repo@sha256:same repo@sha256:same")
+    )
+    assert VerifyRunner(_cfg(tmp_path))._live_bff_digest() == "sha256:same"
+
+
+def test_resolve_accepts_bff_repo_path_byte_identical_default_call(
+    tmp_path, monkeypatch
+):
+    """The pre-existing `registry.resolve(version, registry)` 2-positional
+    call shape stays BYTE-IDENTICAL — `repo_path` is keyword-only with a
+    default, so the memory-server probe (digest-matches-published) never
+    needed to change."""
+    monkeypatch.setattr(verify, "_run", lambda cmd: _proc(0, "repo@sha256:pub"))
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:pub"))
+    res = VerifyRunner(_cfg(tmp_path)).probe_digest_matches_published()
+    assert res.status == PASS
+
+
+def test_bff_probe_calls_resolve_with_repo_path_bff_not_default(tmp_path, monkeypatch):
+    """V-2 (fix round 1, non-vacuous by construction): the `registry.resolve`
+    stub BRANCHES on `repo_path` — a DIFFERENT published digest for `"bff"`
+    than for the default (`"memory-server"`) — so dropping the
+    `repo_path="bff"` plumbing from the probe (comparing the live BFF
+    digest against the WRONG published digest) is caught by a genuine
+    PASS/FAIL flip, never by a stub that returns the same value either way.
+
+    Falsifiable: drop `repo_path="bff"` from the probe's `registry.resolve`
+    call and this goes RED — the probe would resolve the memory-server
+    digest instead, which the live BFF pod (correctly running the BFF
+    digest) does not match.
+    """
+    calls: list[str] = []
+
+    def _resolve_stub(v, reg, *, repo_path="memory-server"):
+        calls.append(repo_path)
+        digest = (
+            "sha256:bff-digest" if repo_path == "bff" else "sha256:memory-server-digest"
+        )
+        return registry.ImageRef(
+            "docker.io/lfds/audittrace-librechat-bff", v, digest, reg
+        )
+
+    monkeypatch.setattr(registry, "resolve", _resolve_stub)
+
+    def _run_stub(cmd):
+        joined = " ".join(cmd)
+        if "librechat-bff" in joined and "imageID" in joined:
+            return _proc(0, "repo@sha256:bff-digest")
+        return _proc(0, "{}")
+
+    monkeypatch.setattr(verify, "_run", _run_stub)
+    res = VerifyRunner(_cfg(tmp_path)).probe_first_party_images_match_published()
+    assert res.status == PASS
+    assert "bff" in calls
+
+
 # ── probe 10: run()-level, additive over the other nine ──────────────────────
 
 
@@ -2309,12 +2520,12 @@ def test_degraded_mesh_flips_verdict_to_fail(
     r = _all_pass_runner(tmp_path, monkeypatch)
     rules = _healthy_kube_rules()
     if broken_probe == "istiod-api-reachable":
-        rules[2] = ("get endpoints", _proc(0, ""))  # istiod has no endpoints
+        rules[3] = ("get endpoints", _proc(0, ""))  # istiod has no endpoints
     elif broken_probe == "sidecars-have-certs":
         # memory-server proxy not ready → cert-starved data plane
         bad = _mesh_healthy_pods()
         bad[-1]["status"]["containerStatuses"][1]["ready"] = False
-        rules[3] = ("get pods", _pods_json(bad))
+        rules[4] = ("get pods", _pods_json(bad))
     elif broken_probe == "vault-secret-rendered":
         bad = _mesh_healthy_pods()
         bad[-1]["status"]["containerStatuses"][0]["lastState"] = {
@@ -2326,7 +2537,7 @@ def test_degraded_mesh_flips_verdict_to_fail(
             for c in bad[-1]["status"]["containerStatuses"]
             if c["name"] != "vault-agent"
         ]
-        rules[3] = ("get pods", _pods_json(bad))
+        rules[4] = ("get pods", _pods_json(bad))
     monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
     if broken_probe == "no-unhealthy-upstream":
         monkeypatch.setattr(
@@ -2340,7 +2551,7 @@ def test_degraded_mesh_flips_verdict_to_fail(
             ),
         )
         # override the memory-server log read to carry the 503 signature
-        rules[6] = ("logs", _proc(0, "no healthy upstream"))
+        rules[7] = ("logs", _proc(0, "no healthy upstream"))
         monkeypatch.setattr(verify, "_run", _KubeDispatcher(rules=rules))
 
     report = r.run()

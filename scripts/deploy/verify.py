@@ -13,10 +13,11 @@ the verdict. The deployer decides "it deployed"; this
 runner decides, separately and on evidence it gathered itself, "it works". FAIL
 blocks "done": *up* means complete AND working, not "helm exited 0".
 
-Ten deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
-AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) — each PASS/FAIL/SKIPPED
-with captured evidence (failures-are-findings, every check declares the
-evidence it stands on):
+Eleven deploy-health probes — five CORE + four MESH-HEALTH (#384 WS2) + one
+AUDIT-RELIABILITY (scan-DLQ depth, spec 2026-08-23) + one FIRST-PARTY-IMAGE
+(the BFF, D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+guard.md) — each PASS/FAIL/SKIPPED with captured evidence (failures-are-
+findings, every check declares the evidence it stands on):
 
 * **pods-ready**             — every expected app component has ≥1 Ready pod.
 * **digest-matches-published** — the LIVE memory-server pod digest == the intended
@@ -71,6 +72,14 @@ gate's result — the same independence contract the core probes hold):
   predating #387 P2b) or ``"unknown"`` (the health handler's own best-effort
   telemetry degraded, same pattern as ``async_persist_dlq_depth``) — certify must
   not be brittle against a telemetry-field hiccup.
+* **first-party-images-match-published** — the LIVE BFF pod digest == the
+  published digest for ``--target-version`` on the registry (D5). PASS
+  with ``{"bff": "absent"}`` when no BFF Deployment exists (the common
+  laptop posture); PASS with ``{"bff": "skipped", ...}`` under
+  ``--registry local`` (the BFF is hub-only, S3b). The deploy runner's own
+  D3 check (``scripts/deploy/runner/images.py``) compares render-vs-chart
+  and chart-vs-live; THIS probe is the only one that ties the BFF to what
+  was actually PUBLISHED, independently re-derived.
 
 **Method discipline:** front door + read-only ``kubectl``/``helm`` only. NO
 ``kubectl exec``, NO root creds, NO scope-skip. Deterministic: no wall-clock
@@ -315,9 +324,12 @@ E2E_TIMEOUT_ENV_VAR = "AUDITTRACE_VERIFY_E2E_TIMEOUT"
 # invariant), same posture as E2E_CHAT_TIMEOUT_DEFAULT above.
 SCAN_DLQ_DEFAULT_THRESHOLD = 10
 
-# The ten probe identifiers — fixed order (determinism contract). The four
-# mesh-health probes are APPENDED so the core five keep their indices;
-# scan-dlq-depth is APPENDED last (spec 2026-08-23) for the same reason.
+# The eleven probe identifiers — fixed order (determinism contract). The
+# four mesh-health probes are APPENDED so the core five keep their indices;
+# scan-dlq-depth is APPENDED after that (spec 2026-08-23); first-party-
+# images-match-published (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+# stale-override-guard.md) is APPENDED last for the same reason — every
+# earlier index stays stable.
 PROBES = (
     "pods-ready",
     "digest-matches-published",
@@ -329,7 +341,19 @@ PROBES = (
     "vault-secret-rendered",
     "no-unhealthy-upstream",
     "scan-dlq-depth",
+    "first-party-images-match-published",
 )
+
+# The BFF Deployment this probe reads — mirrors the chart's own naming
+# (``templates/console/deployment-bff.yaml``) and the deploy runner's
+# ``_CONSOLE_COMPONENT_SELECTORS["bff"]`` selector/container pair
+# (``scripts/deploy/runner/config.py``), duplicated here rather than
+# imported — this runner NEVER imports from the deploy runner package
+# (independence contract: two separately-derived readings of the same
+# cluster, not one shared code path).
+BFF_DEPLOYMENT_SUFFIX = "librechat-bff"
+BFF_CONTAINER = "bff"
+BFF_COMPONENT_SELECTOR = "app.kubernetes.io/component=librechat-bff"
 
 
 # ── external-effect indirections (monkeypatched in tests) ────────────────────
@@ -805,6 +829,11 @@ class VerifyRunner:
             "cluster-api:kubectl:istiod-deployment",
             "cluster-api:kubectl:istiod-endpoints",
             "cluster-api:kubectl:memory-server-logs",
+            # ── D5 (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+            # guard.md) ──
+            "cluster-api:kubectl:bff-deployment",
+            "cluster-api:kubectl:bff-pod-imageID",
+            f"registry:{self.cfg.registry}:bff-published-digest",
         ]
 
     @property
@@ -1493,6 +1522,153 @@ class VerifyRunner:
             evidence,
         )
 
+    # -- probe 11: first-party-images-match-published (D5) --
+
+    def _bff_deployment_name(self) -> str:
+        return f"{self.cfg.release}-{BFF_DEPLOYMENT_SUFFIX}"
+
+    def _bff_deployment_exists(self) -> bool | None:
+        """Whether the BFF Deployment is present in this namespace — the
+        PASS-with-``absent`` gate (D5): ``console.enabled=false`` is the
+        common laptop posture, and that must never FAIL this probe.
+
+        Returns ``True``/``False`` when determinable, or ``None`` when the
+        read failed for a reason OTHER than "not found" (a genuinely
+        unreachable cluster, an RBAC error, ...) — kept DISTINCT from
+        ``False`` so the probe FAILs fail-closed on an unreadable cluster
+        rather than silently reporting the unrelated-but-similar-looking
+        ``absent`` PASS (proven by
+        ``test_hostile_deploy_report_cannot_move_the_verdict``: EVERY probe
+        must FAIL when every cluster read fails, this one included)."""
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "deployment",
+                self._bff_deployment_name(),
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                "json",
+            ]
+        )
+        if proc.returncode == 0:
+            return True
+        if "NotFound" in proc.stderr:
+            return False
+        return None
+
+    def _live_bff_digest(self) -> str | None:
+        """The live BFF digest, requiring EVERY matching pod to agree
+        (fix-round should-fix) — never just the first token. Two pods, one
+        stale, used to PASS on the first (possibly stale) one; now any
+        disagreement is ``None`` (unreadable), mirroring the deploy
+        runner's own S1 all-pods-agree rule
+        (``scripts.deploy.runner.images._live_row_digest``)."""
+        jsonpath = (
+            '{.items[*].status.containerStatuses[?(@.name=="'
+            + BFF_CONTAINER
+            + '")].imageID}'
+        )
+        proc = _run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-l",
+                BFF_COMPONENT_SELECTOR,
+                "-n",
+                self.cfg.namespace,
+                "-o",
+                f"jsonpath={jsonpath}",
+            ]
+        )
+        if proc.returncode != 0:
+            return None
+        digests = {
+            digest
+            for token in proc.stdout.split()
+            for digest in (extract_digest(token),)
+            if digest
+        }
+        if len(digests) == 1:
+            return next(iter(digests))
+        return None
+
+    def probe_first_party_images_match_published(self) -> ProbeResult:
+        """The BFF's live pod digest matches the published ``--target-version``
+        digest on the registry (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-
+        stale-override-guard.md) — ties the console BFF to the registry, the
+        one check NEITHER the deploy runner's render-level D3 nor a chart-
+        file read can give: a wrong CHART pin would move both sides of D3
+        together (Addendum A A1) but can never fool a THIRD, independent
+        read of what was actually published.
+
+        Scoped to ``--registry hub`` (S3b): the BFF is published to Docker
+        Hub only (``publish.yml``, spec F8), so under ``--registry local``
+        this probe reports PASS with ``{"bff": "skipped", "reason":
+        "registry local"}`` rather than ever resolving or FAILing. PASS
+        with ``{"bff": "absent"}`` when no BFF Deployment exists in the
+        namespace (``console.enabled=false``, the common laptop posture) —
+        absence is not a finding. FAILs when the Deployment EXISTS but no
+        live pod digest is readable, when the registry cannot resolve the
+        published digest, or when the two digests disagree.
+        """
+        if self.cfg.registry != "hub":
+            return self._record(
+                PROBES[10],
+                PASS,
+                f"skipped (registry={self.cfg.registry!r}); the BFF is published to hub only",
+                {"bff": "skipped", "reason": "registry local"},
+            )
+        exists = self._bff_deployment_exists()
+        if exists is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "could not determine whether a BFF Deployment exists (unreadable cluster read)",
+                {"bff": "unreadable"},
+            )
+        if not exists:
+            return self._record(
+                PROBES[10],
+                PASS,
+                "no BFF Deployment in this namespace — nothing to certify",
+                {"bff": "absent"},
+            )
+        try:
+            ref = registry.resolve(
+                self.cfg.image_tag, self.cfg.registry, repo_path="bff"
+            )
+        except registry.DigestResolutionError as exc:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                f"could not resolve the published BFF digest for {self.cfg.image_tag}: {exc}",
+                {"error": str(exc)},
+            )
+        live = self._live_bff_digest()
+        if live is None:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "BFF Deployment exists but no live pod digest is readable",
+                {"published_digest": ref.digest, "live_digest": None},
+            )
+        if live != ref.digest:
+            return self._record(
+                PROBES[10],
+                FAIL,
+                "live BFF digest does NOT match the published digest (running an unpublished image)",
+                {"published_digest": ref.digest, "live_digest": live},
+            )
+        return self._record(
+            PROBES[10],
+            PASS,
+            "live BFF digest matches the published digest",
+            {"published_digest": ref.digest, "live_digest": live},
+        )
+
     # -- orchestration + verdict --
 
     @property
@@ -1525,6 +1701,8 @@ class VerifyRunner:
         self.probe_no_unhealthy_upstream()
         # ── scan-dlq-depth (spec 2026-08-23, closes the SCAN-URI-BUG loop gap) ──
         self.probe_scan_dlq_depth()
+        # ── first-party-images-match-published (D5) ──
+        self.probe_first_party_images_match_published()
         return self.write_report()
 
     def build_report(self) -> dict[str, Any]:

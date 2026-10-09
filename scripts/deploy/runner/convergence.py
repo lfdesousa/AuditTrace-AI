@@ -24,14 +24,13 @@ import yaml
 from scripts.deploy import runner as _runner_pkg
 from scripts.deploy.runner.config import (
     _COMPONENT_SELECTOR,
-    _CONSOLE_COMPONENT_SELECTORS,
-    _CONSOLE_DEPLOYMENT_SUFFIXES,
     _CONSOLE_IMAGE_COMPONENTS,
     CHART_DIR,
     MEMORY_SERVER_COMPONENT,
     MEMORY_SERVER_CONTAINER,
 )
-from scripts.deploy.runner.values import _values_file_args, console_image_digests
+from scripts.deploy.runner.images import mismatched_components
+from scripts.deploy.runner.values import _values_file_args
 
 if TYPE_CHECKING:
     from scripts.deploy.runner.orchestrator import DeployRunner
@@ -278,26 +277,15 @@ class ConvergenceMixin:
             _COMPONENT_SELECTOR, MEMORY_SERVER_CONTAINER
         )
 
-    def _mismatched_console_images(
-        self: DeployRunner, pinned: dict[str, str]
-    ) -> list[str]:
-        """Component names (of ``pinned``) whose live pod ``imageID`` differs
-        from the chart-pinned digest (spec 2026-09-10-SPEC-deploy-runner-
-        convergence-first-party-image-complete).
-
-        ``pinned`` is normally :func:`console_image_digests` applied to the
-        committed chart ``values.yaml`` — the exact digests
-        :func:`console_image_set_args` would ``--set``. An unreadable live
-        ``imageID`` (kubectl error, no matching pod, ...) counts as a
-        mismatch — fail-safe: unknown state must never be read as converged.
-        """
-        mismatched: list[str] = []
-        for component, digest in pinned.items():
-            selector, container = _CONSOLE_COMPONENT_SELECTORS[component]
-            running = self._running_component_digest(selector, container)
-            if running != digest:
-                mismatched.append(component)
-        return mismatched
+    # Console-image mismatch detection USED TO live here as
+    # ``_mismatched_console_images``, gated on the file-side
+    # ``console.enabled`` (via ``console_image_digests``) — removed per
+    # BFF-BUMP-1.29.1 Rule B1: that gate is exactly the mechanism that let a
+    # stale stored BFF override survive every deploy that never passed
+    # ``-f values-laptop.yaml``. Superseded by
+    # :meth:`~scripts.deploy.runner.images.FirstPartyImagesMixin.
+    # _first_party_image_rows`, gated on LIVE manifest presence instead —
+    # see :meth:`_is_converged` below.
 
     # -- config-drift (env / args / command / resources) convergence ----------
     # spec 2026-09-10-SPEC-deploy-runner-convergence-config-drift: a
@@ -310,22 +298,40 @@ class ConvergenceMixin:
     # container spec of every enabled first-party workload.
 
     def _first_party_config_workloads(
-        self: DeployRunner, chart_values: dict[str, Any]
+        self: DeployRunner, rows: list[dict[str, Any]]
     ) -> list[tuple[str, str, str]]:
         """``(component, deployment_name, container_name)`` triples to
-        config-drift-check: memory-server ALWAYS, plus the console
-        `librechat`/`bff` deployments when ``console.enabled`` (mirroring
-        :func:`console_image_digests`'s own enabled-gate exactly). Third-party
-        subcharts (postgres/redis/rabbitmq/vault) are out of scope, matching
-        :func:`console_image_set_args`."""
+        config-drift-check: memory-server ALWAYS, plus any console
+        `librechat`/`bff` Deployment actually PRESENT in ``rows`` — the
+        SAME manifest-derived first-party image rows
+        (:meth:`~scripts.deploy.runner.images.FirstPartyImagesMixin.
+        _first_party_image_rows`) the mismatch check above just computed.
+
+        BFF-BUMP-1.29.1 Rule B1 supersedes the prior file-side
+        ``console.enabled`` gate here too: presence is derived from the
+        LIVE manifest, never the chart flag. Init-container rows (the
+        librechat ``wait-for-oidc-discovery`` init container) are excluded
+        — config-drift compares a workload's OWN main container spec, not
+        an init container's. Falsifiable: derive this list from
+        ``chart_values``'s ``console.enabled`` instead of ``rows`` and the
+        neuter-proof test goes RED (a console Deployment absent from the
+        manifest but ``console.enabled: true`` on disk would wrongly be
+        config-drift-checked)."""
         workloads: list[tuple[str, str, str]] = [
             (MEMORY_SERVER_COMPONENT, self.cfg.deployment, MEMORY_SERVER_CONTAINER)
         ]
-        console = chart_values.get("console")
-        if isinstance(console, dict) and console.get("enabled"):
-            for component in _CONSOLE_IMAGE_COMPONENTS:
-                suffix = _CONSOLE_DEPLOYMENT_SUFFIXES[component]
-                workloads.append((component, f"{self.cfg.release}-{suffix}", component))
+        seen = {MEMORY_SERVER_COMPONENT}
+        for row in rows:
+            component = row.get("component")
+            if (
+                row.get("is_init")
+                or row.get("kind") != "Deployment"
+                or component not in _CONSOLE_IMAGE_COMPONENTS
+                or component in seen
+            ):
+                continue
+            seen.add(component)
+            workloads.append((component, row["workload"], row["container"]))
         return workloads
 
     def _render_chart_manifest(self: DeployRunner) -> list[dict[str, Any]] | None:
@@ -387,7 +393,7 @@ class ConvergenceMixin:
         return _container_spec_from_deployment_doc(parsed, container_name)
 
     def _config_drifted_workloads(
-        self: DeployRunner, chart_values: dict[str, Any]
+        self: DeployRunner, rows: list[dict[str, Any]]
     ) -> list[str]:
         """Component names whose INTENDED (rendered) container spec differs
         from the LIVE deployment's container spec (spec 2026-09-10-SPEC-
@@ -395,10 +401,13 @@ class ConvergenceMixin:
         command / resources — the fields a config-only change moves — never
         the image field itself (digest convergence already covers that,
         earlier in :meth:`_is_converged`). Fail-safe: an unreadable/
-        unparsable render or live read counts as drifted, exactly like
-        :meth:`_mismatched_console_images` — unknown state must never read
-        as converged."""
-        workloads = self._first_party_config_workloads(chart_values)
+        unparsable render or live read counts as drifted — unknown state
+        must never read as converged. ``rows`` is the SAME manifest-derived
+        first-party row set :meth:`_is_converged` computed for the image
+        check (BFF-BUMP-1.29.1 Rule B1): "should I apply" and "did it
+        converge" share one chokepoint for workload PRESENCE too, not just
+        image equality."""
+        workloads = self._first_party_config_workloads(rows)
         docs = self._render_chart_manifest()
         drifted: list[str] = []
         for component, deployment_name, container_name in workloads:
@@ -414,26 +423,33 @@ class ConvergenceMixin:
         self: DeployRunner, chart_values: dict[str, Any] | None = None
     ) -> ConvergenceCheck:
         """Converged when the LIVE digest equals the resolved digest, EVERY
-        enabled first-party console image also matches its chart pin, AND
-        the Helm release itself is ``deployed`` (#451 + spec 2026-09-10).
+        first-party image actually present in the LIVE manifest also
+        matches its chart pin, AND the Helm release itself is ``deployed``
+        (#451 + spec 2026-09-10 + BFF-BUMP-1.29.1 Rule B1).
 
-        **First-party-image-complete (2026-09-10).** Digest-keying the
-        memory-server image alone is not enough: at the v1.26.0 WU-6 Part
-        C.4 redeploy, memory-server was already converged while the
-        `librechat` console pod had silently drifted to a stale digest —
-        ``_is_converged()`` reported converged, P2 skipped ``helm upgrade``
-        entirely, and the already-merged console ``--set`` fix
-        (:func:`console_image_set_args`) never ran to correct the drift.
-        So after the memory-server digest matches, every ENABLED console
-        component's live pod ``imageID`` is compared against the digest
-        pinned in the committed chart ``values.yaml`` (:func:`console_image_digests`
-        — the SAME source :func:`console_image_set_args` reads; never
-        re-resolved from the registry). ANY first-party mismatch means NOT
-        converged, so ``helm upgrade`` runs and reasserts the correct
-        ``--set``. ``console.enabled=false`` skips the console checks
-        entirely (an absent, un-templated component is not a mismatch).
-        Third-party subchart images (postgres/redis/rabbitmq/vault) are
-        out of scope, matching :func:`console_image_set_args`.
+        **First-party-image-complete, gated on LIVE presence (BFF-BUMP-
+        1.29.1 Rule B1, superseding the 2026-09-10 ``console.enabled``
+        gate).** Digest-keying the memory-server image alone is not
+        enough: at the v1.26.0 WU-6 Part C.4 redeploy, memory-server was
+        already converged while the `librechat` console pod had silently
+        drifted to a stale digest, and P2 skipped ``helm upgrade``
+        entirely. The FIRST fix (2026-09-10) compared every console image
+        the FILE-side ``console.enabled`` flag said was enabled — but on
+        every deploy that actually ran (no ``-f values-laptop.yaml``, base
+        ``console.enabled: false``), that gate made the check a no-op too:
+        a stale STORED BFF override (``--reset-then-reuse-values``) then
+        survived every re-pin of this chart (gate B1, 2026-10-07). This
+        method now calls
+        :meth:`~scripts.deploy.runner.images.FirstPartyImagesMixin.
+        _first_party_image_rows`, which derives presence from the LIVE
+        ``helm get manifest`` — never the file flag — so a stale console
+        image is caught whether or not any overlay was passed. ANY
+        unequal row (:func:`~scripts.deploy.runner.images.
+        mismatched_components`) means NOT converged, so ``helm upgrade``
+        runs and reasserts the correct ``--set`` (:func:`console_image_set_args`
+        is now unconditional too — D2). Third-party subchart images
+        (postgres/redis/rabbitmq/vault) are out of scope by construction
+        (:data:`~scripts.deploy.runner.images.FIRST_PARTY_PREFIXES`).
 
         Digest match alone is NOT sufficient: a release stuck in ``failed`` /
         ``pending-install`` / ``pending-upgrade`` / ``pending-rollback`` — e.g.
@@ -446,36 +462,50 @@ class ConvergenceMixin:
         --install`` is idempotent, so a redundant upgrade is cheap and a false
         noop is not.
 
-        Keys the digest comparison on the digest (or live pod ``imageID``),
-        never the mutable ``repository:tag`` — a re-pushed tag is therefore
-        never falsely seen as converged. Falls back to tag-string comparison
-        only when the digest is unresolved (local registry, soft-fail); the
-        Helm-status requirement still applies on that path.
+        Keys the top-level digest comparison on the digest (or live pod
+        ``imageID``), never the mutable ``repository:tag`` — a re-pushed tag
+        is therefore never falsely seen as converged. Falls back to
+        tag-string comparison only when the digest is unresolved (local
+        registry, soft-fail); the Helm-status requirement still applies on
+        that path. Kept separate from (never folded into) the first-party
+        row set below SOLELY so the pre-existing ``digest_matched``/
+        ``reconcile_note`` bookkeeping (:mod:`scripts.deploy.runner.helm`)
+        is unaffected — NOT because the two are claimed to agree: this
+        top-level check and the rows below can disagree on a real cluster
+        (the rows read the memory-server row too, via its own manifest
+        selector), and the disagreement is SAFE only in one direction —
+        this check says "match" while the rows say "mismatch" still yields
+        NOT converged (the rows win, per D3/exit-8); the reverse can never
+        happen because the rows are a strict superset check. No instrument
+        here asserts the two "agree on a real cluster" — fix-round finding:
+        that prose was unmeasured and, before B-1's selector fix, was
+        actually false (the old jsonpath check matched while a mis-selected
+        pod-reaper row mismatched).
 
-        Only reads Helm status when the digest AND every console image
-        already match — a mismatch on any first-party image runs
-        ``helm upgrade`` unconditionally, so there is nothing to gain from an
-        extra ``helm status`` call in that case. ``basis`` records which
-        image(s) drove the verdict (memory-server digest always; the console
-        components too, whenever console is enabled).
+        Only reads Helm status when the digest AND every first-party row
+        already match — a mismatch runs ``helm upgrade`` unconditionally,
+        so there is nothing to gain from an extra ``helm status`` call in
+        that case.
 
-        **Config-drift-complete (2026-09-10).** Image-digest keying alone
-        cannot see a config-only chart change (env vars, args/command,
-        resource limits — no image moves): observed live 2026-09-10, the
-        WU-5 sources-trailer redeploy (``AUDITTRACE_RESPONSE_SOURCES:
-        off->trailer``, no image change) no-op'd because every first-party
-        digest already matched. So once Helm reports the release
-        ``deployed`` (i.e. there is otherwise nothing to reconcile), this
-        method ALSO compares the INTENDED container spec — env, args/
-        command, resources — of every enabled first-party workload
-        (memory-server + console `librechat`/`bff`) against its LIVE
-        Deployment container spec (:meth:`_config_drifted_workloads`). ANY
-        diff on ANY first-party workload means NOT converged, so ``helm
-        upgrade`` runs and reconciles it. This check runs LAST (after the
-        Helm-status read, not before) so the existing status-based re-
-        convergence paths above are unaffected — it only fires on the
-        otherwise-would-be-noop case, keeping the true no-op (nothing
-        changed at all) cheap and unchanged.
+        **Config-drift-complete (2026-09-10), workload presence now ALSO
+        gated on the manifest-derived rows (Rule B1).** Image-digest keying
+        alone cannot see a config-only chart change (env vars, args/
+        command, resource limits — no image moves): observed live
+        2026-09-10, the WU-5 sources-trailer redeploy (``AUDITTRACE_
+        RESPONSE_SOURCES: off->trailer``, no image change) no-op'd because
+        every first-party digest already matched. So once Helm reports the
+        release ``deployed`` (i.e. there is otherwise nothing to
+        reconcile), this method ALSO compares the INTENDED container spec
+        — env, args/command, resources — of every first-party workload
+        ACTUALLY PRESENT in ``rows`` (memory-server always; console
+        `librechat`/`bff` whenever present in the live manifest) against
+        its LIVE Deployment container spec (:meth:`_config_drifted_workloads`).
+        ANY diff means NOT converged, so ``helm upgrade`` runs and
+        reconciles it. This check runs LAST (after the Helm-status read,
+        not before) so the existing status-based re-convergence paths
+        above are unaffected — it only fires on the otherwise-would-be-noop
+        case, keeping the true no-op (nothing changed at all) cheap and
+        unchanged.
         """
         assert self.image_ref is not None
         if self.image_ref.digest:
@@ -494,20 +524,21 @@ class ConvergenceMixin:
             chart_values = _runner_pkg._read_chart_values(
                 values_files=self.cfg.values_files
             )
-        pinned = console_image_digests(chart_values)
-        if pinned:
-            mismatched = self._mismatched_console_images(pinned)
-            if mismatched:
-                basis = f"{basis}; console mismatch: {', '.join(sorted(mismatched))}"
-                return ConvergenceCheck(False, basis, None, False)
-            basis = f"{basis}; console matched: {', '.join(sorted(pinned))}"
+        rows = self._first_party_image_rows(chart_values=chart_values)
+        mismatched = mismatched_components(rows)
+        if mismatched:
+            basis = f"{basis}; first-party mismatch: {', '.join(mismatched)}"
+            return ConvergenceCheck(False, basis, None, False)
+        if rows:
+            matched = sorted({row["component"] for row in rows})
+            basis = f"{basis}; first-party matched: {', '.join(matched)}"
 
         revision, status = self._helm_status_info()
         self.helm_revision = revision
         if status != _HELM_DEPLOYED_STATUS:
             return ConvergenceCheck(False, basis, status, True)
 
-        drifted = self._config_drifted_workloads(chart_values)
+        drifted = self._config_drifted_workloads(rows)
         if drifted:
             basis = f"{basis}; config drift: {', '.join(sorted(drifted))}"
             return ConvergenceCheck(False, basis, status, False)

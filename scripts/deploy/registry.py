@@ -45,6 +45,11 @@ _MANIFEST_ACCEPT = ", ".join(
 )
 
 # Backend → (full repository reference, registry-API path, registry base URL).
+# Kept as the memory-server-only shape it always was — ``orchestrator.py``'s
+# P1 dry-run fallback reads ``_BACKENDS[registry][0]`` directly, so this name
+# and shape stay byte-identical. :data:`_EXTRA_REPO_PATHS` below is the
+# EXTENSION (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+# guard.md) that lets :func:`resolve` resolve a SECOND first-party image.
 _BACKENDS = {
     "hub": (
         "docker.io/lfds/audittrace-memory-server",
@@ -56,6 +61,23 @@ _BACKENDS = {
         "audittrace/memory-server",
         LOCAL_REGISTRY,
     ),
+}
+
+# Additional first-party images this module can resolve besides
+# memory-server, keyed by ``repo_path`` -> {backend -> (repository,
+# registry-API path, base URL)} (D5: the verify runner's BFF probe). Only a
+# ``hub`` entry exists for ``"bff"`` — the BFF is published to Docker Hub
+# only (``publish.yml``, spec F8); there is no local-registry counterpart,
+# so the verify probe reports ``skipped`` under ``--registry local`` rather
+# than ever calling :func:`resolve` with ``repo_path="bff"`` there.
+_EXTRA_REPO_PATHS: dict[str, dict[str, tuple[str, str, str]]] = {
+    "bff": {
+        "hub": (
+            "docker.io/lfds/audittrace-librechat-bff",
+            "lfds/audittrace-librechat-bff",
+            HUB_REGISTRY,
+        ),
+    },
 }
 
 
@@ -163,26 +185,41 @@ def _manifest_digest(base: str, repo_path: str, tag: str, token: str | None) -> 
     return digest
 
 
-def resolve(version: str, registry: str = "hub") -> ImageRef:
+def resolve(
+    version: str, registry: str = "hub", *, repo_path: str = "memory-server"
+) -> ImageRef:
     """Resolve ``version`` to an :class:`ImageRef` for the given backend.
 
     ``hub`` failures are hard (a published deploy must pin its digest).
     ``local`` failures are soft: an unreachable local registry yields an
     unpinned ref rather than aborting the whole run, since the k3s mirror may
     not be reachable from the runner host.
+
+    ``repo_path`` (D5, spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-
+    override-guard.md) selects WHICH first-party image to resolve —
+    ``"memory-server"`` (the default, :data:`_BACKENDS`) for every existing
+    caller, byte-identical; any other value looks up
+    :data:`_EXTRA_REPO_PATHS` instead (today: ``"bff"``, the verify runner's
+    BFF probe). An unknown ``(repo_path, registry)`` pair raises the SAME
+    :class:`ValueError` shape as an unknown backend — fail loud either way.
     """
-    if registry not in _BACKENDS:
+    backends = (
+        _BACKENDS
+        if repo_path == "memory-server"
+        else _EXTRA_REPO_PATHS.get(repo_path, {})
+    )
+    if registry not in backends:
         raise ValueError(f"unknown registry backend: {registry!r}")
-    repository, repo_path, base = _BACKENDS[registry]
+    repository, api_path, base = backends[registry]
 
     if registry == "hub":
-        token = _get_hub_token(repo_path)
-        digest = _manifest_digest(base, repo_path, version, token)
+        token = _get_hub_token(api_path)
+        digest = _manifest_digest(base, api_path, version, token)
         return ImageRef(repository, version, digest, registry)
 
     # local
     try:
-        digest = _manifest_digest(base, repo_path, version, token=None)
+        digest = _manifest_digest(base, api_path, version, token=None)
     except (DigestResolutionError, OSError) as exc:
         # OSError subsumes HTTPError/URLError/TimeoutError/ConnectionError; a local
         # registry that is unreachable OR times out is a SOFT failure here (the

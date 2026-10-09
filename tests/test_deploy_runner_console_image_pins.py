@@ -305,16 +305,31 @@ def test_helm_apply_cmd_end_to_end_outranks_stale_override(stale_values_file):
 # ── console.enabled=false path (spec §2) ────────────────────────────────────
 
 
-def test_console_disabled_renders_no_console_deployments_and_no_spurious_sets():
-    """`console.enabled=false` must still render/deploy cleanly: no console
-    Deployment at all, and `console_image_set_args` emits nothing spurious
-    for the runner to `--set` in the first place."""
+def test_console_disabled_still_emits_the_six_sets():
+    """BFF-BUMP-1.29.1 D2 supersedes the old assertion here ("no console
+    Deployment at all, and no spurious `--set`"): `console.enabled=false`
+    still renders no console Deployment (the TEMPLATE's own
+    `{{- if .Values.console.enabled }}` guard, untouched by this WU) —
+    but `console_image_set_args` now emits the SAME six `--set` args
+    whatever the file-side flag says (D2, unconditional). A `--set` on an
+    un-templated component is inert; live presence (never this flag) is
+    what the deploy runner's convergence/post-apply checks key on
+    (`scripts/deploy/runner/images.py`).
+
+    Falsifiable: restore the removed `console.enabled` gate in
+    `console_image_set_args` and the six-sets assertion below goes RED
+    (back to `[]`)."""
     real_values = _real_chart_values()
     disabled_console = dict(real_values["console"])
     disabled_console["enabled"] = False
     disabled_values = {**real_values, "console": disabled_console}
 
-    assert runner.console_image_set_args(disabled_values) == []
+    args = runner.console_image_set_args(disabled_values)
+    assert len(args) == 12, f"expected 6 --set pairs (12 tokens), got {args!r}"
+    pins = _console_image_pins(real_values)
+    joined = " ".join(args)
+    assert f"console.librechat.image.digest={pins['librechat']['digest']}" in joined
+    assert f"console.bff.image.digest={pins['bff']['digest']}" in joined
 
     cmd = [
         "helm",

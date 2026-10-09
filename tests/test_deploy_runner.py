@@ -40,6 +40,26 @@ def _isolate_kubeconfig():
         os.environ["KUBECONFIG"] = saved
 
 
+# D6 (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-guard.md)
+# aborts P0 whenever the chart's committed `console.bff.image.tag` /
+# `tests.image.tag` don't equal `--target-version`. Every test in this
+# module that exercises `phase_preflight()`/`run()` end-to-end uses the
+# synthetic `_cfg()` default `target_version="v9.9.9"` — which will never
+# equal the real committed chart — so each such test stubs
+# `_read_chart_values` to report pins that already equal "9.9.9" via this
+# shared helper, making D6 a no-op for every test that isn't specifically
+# about it (D6's own tests in the "image-pin freshness (D6)" section below
+# use their own values instead).
+_PINS_MATCH_9_9_9 = {
+    "console": {"bff": {"image": {"tag": "9.9.9"}}},
+    "tests": {"image": {"tag": "9.9.9"}},
+}
+
+
+def _stub_fresh_image_pins(monkeypatch):
+    monkeypatch.setattr(runner, "_read_chart_values", lambda *a, **k: _PINS_MATCH_9_9_9)
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -283,12 +303,15 @@ def test_preflight_aborts_on_nonzero(tmp_path, monkeypatch, code, needle):
 
 def test_preflight_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    _stub_fresh_image_pins(monkeypatch)
     r = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
     r.phase_preflight()
-    # P0 now emits two records: the preflight-script gate AND the mesh gate.
+    # P0 now emits THREE records: the preflight-script gate, the mesh gate,
+    # and D6's image-pin freshness check.
     assert r.records[0].status == "ok"
     assert r.records[1].status == "ok"
     assert "mesh healthy" in r.records[1].detail
+    assert r.records[2].status == "ok"
 
 
 # ── P0 mesh-health gate wiring (#384 WS1) ────────────────────────────────────
@@ -296,21 +319,24 @@ def test_preflight_ok(tmp_path, monkeypatch):
 
 def test_preflight_records_mesh_gate_when_healthy(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    _stub_fresh_image_pins(monkeypatch)
     gate = _healthy_gate()
     r = DeployRunner(_cfg(tmp_path), mesh_gate=gate)
     r.phase_preflight()
     assert gate.calls == 1
-    assert [rec.status for rec in r.records] == ["ok", "ok"]
+    assert [rec.status for rec in r.records] == ["ok", "ok", "ok"]
     assert r.records[1].evidence["outcome"] == mesh.HEALTHY
 
 
 def test_preflight_proceeds_when_mesh_auto_healed(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    _stub_fresh_image_pins(monkeypatch)
     r = DeployRunner(_cfg(tmp_path), mesh_gate=_healed_gate())
     r.phase_preflight()  # HEALED is safe → no abort
     assert r.records[1].status == "ok"
     assert "auto-healed" in r.records[1].detail
     assert r.records[1].evidence["outcome"] == mesh.HEALED
+    assert r.records[2].status == "ok"
 
 
 def test_preflight_aborts_when_mesh_unsafe(tmp_path, monkeypatch):
@@ -425,6 +451,7 @@ def test_resolve_failure_records_failed_and_reraises(tmp_path, monkeypatch):
 def test_run_still_emits_report_on_resolve_failure(tmp_path, monkeypatch):
     # preflight ok, resolve raises -> run() catches, later phases skipped, report emitted.
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    _stub_fresh_image_pins(monkeypatch)
 
     def boom(v, reg):
         raise registry.DigestResolutionError("429 rate limited")
@@ -433,14 +460,16 @@ def test_run_still_emits_report_on_resolve_failure(tmp_path, monkeypatch):
     report = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate()).run()
     assert report["aborted"] is True
     names = [p["name"] for p in report["phases"]]
-    # P0 twice (preflight-script + mesh gate), P1 failed, then P5 report.
+    # P0 three times (preflight-script + mesh gate + D6 image-pin check),
+    # P1 failed, then P5 report.
     assert names == [
+        runner.PHASES[0],
         runner.PHASES[0],
         runner.PHASES[0],
         runner.PHASES[1],
         runner.PHASES[5],
     ]  # P2..P4 not run
-    assert report["phases"][2]["status"] == "failed"  # P1 resolve failed
+    assert report["phases"][3]["status"] == "failed"  # P1 resolve failed
     assert report["certified"] is None
 
 
@@ -452,6 +481,7 @@ def test_run_still_emits_report_on_registry_read_timeout(tmp_path, monkeypatch):
     raises TimeoutError instead of producing an aborted report."""
     # preflight ok (subprocess), but the registry egress seam TIMES OUT.
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    _stub_fresh_image_pins(monkeypatch)
 
     def _timeout(url, headers=None):
         raise TimeoutError("read timed out")
@@ -459,10 +489,10 @@ def test_run_still_emits_report_on_registry_read_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, "_http_get", _timeout)
     report = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate()).run()  # no raise
     assert report["aborted"] is True
-    # phases[2] is P1 resolve (phases[0]/[1] are the two P0 records).
-    assert report["phases"][2]["name"] == runner.PHASES[1]
-    assert report["phases"][2]["status"] == "failed"
-    assert "read timed out" in report["phases"][2]["detail"]
+    # phases[3] is P1 resolve (phases[0]/[1]/[2] are the three P0 records).
+    assert report["phases"][3]["name"] == runner.PHASES[1]
+    assert report["phases"][3]["status"] == "failed"
+    assert "read timed out" in report["phases"][3]["detail"]
     assert report["certified"] is None
 
 
@@ -714,27 +744,166 @@ def _console_dispatch_rules(
     ]
 
 
-def test_is_converged_false_when_console_image_mismatches(tmp_path, monkeypatch):
-    """Memory-server digest matches + helm `deployed`, but the live
-    `librechat` pod imageID != the chart-pinned digest -> NOT converged.
+# ── manifest-derived first-party rows (BFF-BUMP-1.29.1 Rule B1) ────────────
+# Supersedes the file-side `console.enabled` gate above for the
+# `_is_converged` mismatch decision: presence is now derived from a LIVE
+# `helm get manifest` read, never the chart flag. Real first-party
+# repository prefixes are required here (unlike `_CONSOLE_VALUES_ENABLED`'s
+# synthetic `r1`/`r2`) — the row builder skips any repository that doesn't
+# start with `docker.io/lfds/`/`localhost:5000/audittrace/` before it ever
+# consults the committed map.
 
-    Falsifiable / neuter: revert `_is_converged()` to memory-server-only
-    convergence (drop the console check) and this test goes RED —
-    `check.converged` flips to True, exactly the v1.26.0 WU-6 Part C.4 defect
-    reproduced hermetically (guard name matches behaviour,
+_ROWS_CONSOLE_VALUES_ENABLED = {
+    "console": {
+        "enabled": True,
+        "librechat": {
+            "image": {
+                "repository": "docker.io/lfds/audittrace-librechat",
+                "tag": "768de61",
+                "digest": "sha256:d1",
+            }
+        },
+        "bff": {
+            "image": {
+                "repository": "docker.io/lfds/audittrace-librechat-bff",
+                "tag": "1.29.1",
+                "digest": "sha256:d2",
+            }
+        },
+    }
+}
+
+
+def _manifest_deployment_doc(name, container, image, replicas=1, selector_labels=None):
+    """Includes `spec.selector.matchLabels` (fix-round B-1: the live read
+    is keyed on THIS, never a component lookup table) — defaults to
+    `{app.kubernetes.io/component: <name without the "audittrace-"
+    prefix>}`, matching every `component=...` dispatch needle already in
+    this module; pass `selector_labels={}` to model a workload with NO
+    selector (the Job/render_only case)."""
+    if selector_labels is None:
+        selector_labels = {
+            "app.kubernetes.io/component": name.removeprefix("audittrace-")
+        }
+    return {
+        "kind": "Deployment",
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": replicas,
+            "selector": {"matchLabels": selector_labels},
+            "template": {"spec": {"containers": [{"name": container, "image": image}]}},
+        },
+    }
+
+
+def _pods_json_proc(container, digest):
+    """A `kubectl get pods ... -o json` reply: one Running pod carrying
+    ``digest`` on ``container`` — the shape
+    :meth:`FirstPartyImagesMixin._live_row_digest` reads."""
+    return _proc(
+        0,
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"labels": {}},
+                        "status": {
+                            "containerStatuses": [
+                                {"name": container, "imageID": f"repo@{digest}"}
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+
+
+def _rows_dispatch_rules(
+    *,
+    librechat_rendered="sha256:d1",
+    librechat_live="sha256:d1",
+    bff_rendered="sha256:d2",
+    bff_live="sha256:d2",
+    memory_server_digest="sha256:x",
+    helm_status="deployed",
+):
+    """Shared dispatcher rules for the manifest-derived row tests: a
+    ``helm get manifest`` reply carrying all three Deployments, plus the
+    per-component live pod-list reads the row builder issues.
+
+    The memory-server TOP-LEVEL jsonpath-based digest check
+    (``_running_image_digest``, kept for #451/reconcile-note back-compat)
+    shares its selector with the NEW json-list row read — disambiguated by
+    a marker (``"memory-server")].imageID``) unique to the OLD call's
+    jsonpath EXPRESSION text, checked FIRST so it can never be shadowed by
+    the generic ``component=memory-server`` rule the new json-list read
+    needs (the new command has no jsonpath expression at all, so it never
+    contains that marker).
+    """
+    manifest_yaml = "\n---\n".join(
+        json.dumps(d)
+        for d in (
+            _manifest_deployment_doc(
+                "audittrace-memory-server",
+                "memory-server",
+                f"docker.io/lfds/audittrace-memory-server:9.9.9@{memory_server_digest}",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat",
+                "librechat",
+                f"docker.io/lfds/audittrace-librechat:768de61@{librechat_rendered}",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat-bff",
+                "bff",
+                f"docker.io/lfds/audittrace-librechat-bff:1.29.1@{bff_rendered}",
+            ),
+        )
+    )
+    return [
+        ("helm get manifest", _proc(0, manifest_yaml)),
+        (
+            '"memory-server")].imageID',
+            _proc(0, f"docker.io/lfds/audittrace-memory-server@{memory_server_digest}"),
+        ),
+        ("component=librechat-bff", _pods_json_proc("bff", bff_live)),
+        ("component=librechat", _pods_json_proc("librechat", librechat_live)),
+        (
+            "component=memory-server",
+            _pods_json_proc("memory-server", memory_server_digest),
+        ),
+        (
+            "helm status",
+            _proc(0, json.dumps({"version": 265, "info": {"status": helm_status}})),
+        ),
+        ("helm upgrade", _proc(0, "deployed")),
+    ]
+
+
+def test_is_converged_false_when_console_image_mismatches(tmp_path, monkeypatch):
+    """The rev-272 shape, reproduced hermetically: the LIVE manifest already
+    renders a STALE librechat digest (a stale STORED override shadowing the
+    chart, Rule B1) while the chart commits a FRESH one -> NOT converged.
+
+    Falsifiable / neuter: revert `_is_converged()` to the pre-Rule-B1
+    `console.enabled`-gated check (or derive presence from
+    `_read_chart_values` instead of the manifest) and this test goes RED —
+    `check.converged` flips to True, exactly the rev-272 defect reproduced
+    hermetically (guard name matches behaviour,
     `feedback_vacuous_neuter_test_antipattern`).
     """
-    disp = _Dispatcher(rules=_console_dispatch_rules(librechat_digest="sha256:STALE"))
+    disp = _Dispatcher(rules=_rows_dispatch_rules(librechat_rendered="sha256:STALE"))
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
     r.image_ref = _hub_ref("sha256:x")
-    check = r._is_converged(chart_values=_CONSOLE_VALUES_ENABLED)
+    check = r._is_converged(chart_values=_ROWS_CONSOLE_VALUES_ENABLED)
     assert check.converged is False
-    assert "console mismatch: librechat" in check.basis
+    assert "first-party mismatch: librechat" in check.basis
     # bff matched -> only librechat is named as the mismatch.
-    assert "bff" not in check.basis.split("console mismatch:")[1]
-    # No `helm status` read once a console mismatch is found — mirrors the
-    # existing "digest mismatch skips helm status" efficiency (#451).
+    assert "bff" not in check.basis.split("first-party mismatch:")[1]
+    # No `helm status` read once a first-party mismatch is found — mirrors
+    # the existing "digest mismatch skips helm status" efficiency (#451).
     assert not any("helm status" in " ".join(c) for c in disp.calls)
 
 
@@ -757,11 +926,13 @@ def test_chart_apply_runs_upgrade_when_console_image_mismatches(tmp_path, monkey
 
 def test_is_converged_true_when_all_first_party_images_match(tmp_path, monkeypatch):
     """All first-party images (memory-server + both console images) match
-    their pins, helm `deployed` -> converged (the true no-op case is
-    preserved, not just any mismatch making everything NOT-converged)."""
+    their pins, helm `deployed`, no config drift -> converged (the true
+    no-op case is preserved, not just any mismatch making everything
+    NOT-converged) — AC3d, the control that must stay GREEN under every
+    other neuter in this module."""
     disp = _Dispatcher(
         rules=[
-            *_console_dispatch_rules(),
+            *_rows_dispatch_rules(),
             *_no_config_drift_rules(
                 ("audittrace-memory-server", "memory-server"),
                 ("audittrace-librechat", "librechat"),
@@ -772,9 +943,9 @@ def test_is_converged_true_when_all_first_party_images_match(tmp_path, monkeypat
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
     r.image_ref = _hub_ref("sha256:x")
-    check = r._is_converged(chart_values=_CONSOLE_VALUES_ENABLED)
+    check = r._is_converged(chart_values=_ROWS_CONSOLE_VALUES_ENABLED)
     assert check.converged is True
-    assert "console matched: bff, librechat" in check.basis
+    assert "first-party matched: bff, librechat, memory-server" in check.basis
 
 
 def test_chart_apply_noop_when_all_first_party_images_match(tmp_path, monkeypatch):
@@ -1075,10 +1246,24 @@ def test_config_drift_check_skipped_when_helm_status_not_deployed(
     assert not any("get deployment" in " ".join(c) for c in disp.calls)
 
 
+def _row(component, workload, container, *, kind="Deployment", is_init=False):
+    """A minimal manifest-derived first-party row — only the keys
+    `_first_party_config_workloads`/`_config_drifted_workloads` actually
+    read (`component`, `kind`, `workload`, `container`, `is_init`); the
+    image-equality keys are irrelevant to THESE tests (config-drift, never
+    image digests) so they are omitted."""
+    return {
+        "component": component,
+        "kind": kind,
+        "workload": workload,
+        "container": container,
+        "is_init": is_init,
+    }
+
+
 def test_config_drifted_workloads_fail_safe_on_unreadable_render(tmp_path, monkeypatch):
     """An unreadable `helm template` (non-zero exit) counts as drift, never a
-    silent match — fail-safe, mirrors `_mismatched_console_images`'s own
-    unknown-state handling."""
+    silent match — fail-safe."""
     disp = _Dispatcher(
         rules=[
             ("helm template", _proc(returncode=1, stderr="boom")),
@@ -1090,7 +1275,7 @@ def test_config_drifted_workloads_fail_safe_on_unreadable_render(tmp_path, monke
     )
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
-    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_DISABLED)
+    drifted = r._config_drifted_workloads([])
     assert drifted == ["memory-server"]
 
 
@@ -1106,13 +1291,17 @@ def test_config_drifted_workloads_fail_safe_on_unreadable_live(tmp_path, monkeyp
     )
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
-    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_DISABLED)
+    drifted = r._config_drifted_workloads([])
     assert drifted == ["memory-server"]
 
 
 def test_config_drifted_workloads_multi_workload_partial_drift(tmp_path, monkeypatch):
     """Only the drifted component is named — a match on one first-party
-    workload does not mask a drift on another."""
+    workload does not mask a drift on another. `rows` carries ONLY the
+    `bff` console row (as a manifest-derived row would — librechat here is
+    NOT in `rows`, mirroring "absent from the manifest"), yet drift is
+    still asserted against it via the LIVE read below — proving the
+    workload list, not `rows`'s image fields, drives this check."""
     disp = _Dispatcher(
         rules=[
             *_no_config_drift_rules(
@@ -1131,7 +1320,11 @@ def test_config_drifted_workloads_multi_workload_partial_drift(tmp_path, monkeyp
     )
     monkeypatch.setattr(runner, "_run", disp)
     r = DeployRunner(_cfg(tmp_path))
-    drifted = r._config_drifted_workloads(_CONSOLE_VALUES_ENABLED)
+    rows = [
+        _row("librechat", "audittrace-librechat", "librechat"),
+        _row("bff", "audittrace-librechat-bff", "bff"),
+    ]
+    drifted = r._config_drifted_workloads(rows)
     assert drifted == ["librechat"]
 
 
@@ -1170,21 +1363,48 @@ def test_live_deployment_container_spec_none_on_unparsable_json(tmp_path, monkey
     assert r._live_deployment_container_spec("audittrace-memory-server", "x") is None
 
 
-def test_first_party_config_workloads_memory_server_only_when_console_disabled(
+def test_first_party_config_workloads_memory_server_only_when_absent_from_rows(
     tmp_path,
 ):
+    """BFF-BUMP-1.29.1 Rule B1: presence is derived from `rows` (manifest-
+    derived), never a file-side `console.enabled` flag — an empty `rows`
+    (console absent from the live manifest) yields memory-server alone."""
     r = DeployRunner(_cfg(tmp_path))
-    workloads = r._first_party_config_workloads(_CONSOLE_VALUES_DISABLED)
+    workloads = r._first_party_config_workloads([])
     assert workloads == [("memory-server", "audittrace-memory-server", "memory-server")]
 
 
-def test_first_party_config_workloads_includes_console_when_enabled(tmp_path):
+def test_first_party_config_workloads_includes_console_when_present_in_rows(tmp_path):
     r = DeployRunner(_cfg(tmp_path))
-    workloads = r._first_party_config_workloads(_CONSOLE_VALUES_ENABLED)
+    rows = [
+        _row("librechat", "audittrace-librechat", "librechat"),
+        _row("bff", "audittrace-librechat-bff", "bff"),
+    ]
+    workloads = r._first_party_config_workloads(rows)
     assert workloads == [
         ("memory-server", "audittrace-memory-server", "memory-server"),
         ("librechat", "audittrace-librechat", "librechat"),
         ("bff", "audittrace-librechat-bff", "bff"),
+    ]
+
+
+def test_first_party_config_workloads_excludes_init_containers_and_dedupes(tmp_path):
+    """An init-container row (e.g. librechat's `wait-for-oidc-discovery`) is
+    excluded — config-drift compares a workload's own main container, never
+    an init container's — and a component is never listed twice even if
+    `rows` carries two containers for it."""
+    r = DeployRunner(_cfg(tmp_path))
+    rows = [
+        _row(
+            "librechat", "audittrace-librechat", "wait-for-oidc-discovery", is_init=True
+        ),
+        _row("librechat", "audittrace-librechat", "librechat"),
+        _row("librechat", "audittrace-librechat", "librechat"),  # duplicate component
+    ]
+    workloads = r._first_party_config_workloads(rows)
+    assert workloads == [
+        ("memory-server", "audittrace-memory-server", "memory-server"),
+        ("librechat", "audittrace-librechat", "librechat"),
     ]
 
 
@@ -1270,28 +1490,11 @@ def test_find_deployment_doc_matches_by_kind_and_name():
     assert runner._find_deployment_doc([], "x") is None
 
 
-def test_console_image_digests_empty_when_disabled_or_malformed():
-    assert runner.console_image_digests({"console": {"enabled": False}}) == {}
-    assert runner.console_image_digests({}) == {}
-    assert runner.console_image_digests({"console": "not-a-dict"}) == {}
-
-
-def test_console_image_digests_full_shape():
-    assert runner.console_image_digests(_CONSOLE_VALUES_ENABLED) == {
-        "librechat": "sha256:d1",
-        "bff": "sha256:d2",
-    }
-
-
-def test_console_image_digests_omits_component_missing_digest():
-    values = {
-        "console": {
-            "enabled": True,
-            "librechat": {"image": {"repository": "repo/lc", "tag": "t"}},
-            "bff": "not-a-dict",
-        }
-    }
-    assert runner.console_image_digests(values) == {}
+# `console_image_digests` was REMOVED (BFF-BUMP-1.29.1 Rule B1) —
+# superseded by `scripts.deploy.runner.images.committed_first_party_digests`,
+# which drops the `console.enabled` gate entirely (presence is now derived
+# from the LIVE manifest, never the file flag). Its tests live in
+# tests/test_deploy_runner_first_party_image_rows.py.
 
 
 def test_running_component_digest_generalizes_memory_server(tmp_path, monkeypatch):
@@ -1850,6 +2053,144 @@ def test_settle_dry_run(tmp_path):
     assert r.records[0].status == "planned"
 
 
+# ── S1(a): settle waits rollout for EVERY first-party workload, flags a
+# post-apply row mismatch (D3 runs on every non-dry-run path) ──────────────
+
+
+def test_first_party_workload_names_filters_kind_and_first_party_and_dedupes(tmp_path):
+    bff_doc = _manifest_deployment_doc(
+        "audittrace-librechat-bff",
+        "bff",
+        "docker.io/lfds/audittrace-librechat-bff:1.29.1",
+    )
+    third_party_doc = _manifest_deployment_doc(
+        "postgres", "postgres", "docker.io/bitnami/postgresql:16"
+    )
+    job_doc = {
+        "kind": "Job",
+        "metadata": {"name": "audittrace-tests-hook"},
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "tests",
+                            "image": "docker.io/lfds/audittrace-tests:1.29.1",
+                        }
+                    ]
+                }
+            }
+        },
+    }
+    r = DeployRunner(_cfg(tmp_path))
+    names = r._first_party_workload_names([bff_doc, third_party_doc, job_doc, bff_doc])
+    # third-party (no first-party image) and Job (unsupported kind) excluded;
+    # the duplicate bff doc is de-duplicated to a single entry.
+    assert names == [("Deployment", "audittrace-librechat-bff")]
+
+
+def test_first_party_workload_names_none_manifest_returns_empty(tmp_path):
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._first_party_workload_names(None) == []
+
+
+def test_settle_waits_rollout_for_console_bff_and_dedupes_memory_server(
+    tmp_path, monkeypatch
+):
+    """S1(a): a BFF Deployment present in the live manifest gets its OWN
+    `kubectl rollout status` wait — not just memory-server. A manifest
+    entry reusing memory-server's OWN deployment name is skipped (already
+    waited unconditionally first), proving the de-dup branch."""
+    manifest_docs = [
+        _manifest_deployment_doc(
+            "audittrace-memory-server",
+            "memory-server",
+            "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+        ),
+        _manifest_deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:bff-ok",
+        ),
+    ]
+    manifest_yaml = "\n---\n".join(json.dumps(d) for d in manifest_docs)
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest_yaml)),
+            ("jsonpath={.spec.replicas}", _proc(0, "1")),
+            ("status.phase", _proc(0, "Running")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    r = DeployRunner(_cfg(tmp_path, settle_samples=1))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_settle()
+    rollout_calls = [c for c in disp.calls if "rollout" in " ".join(c)]
+    assert any(
+        "deployment/audittrace-memory-server" in " ".join(c) for c in rollout_calls
+    )
+    assert any(
+        "deployment/audittrace-librechat-bff" in " ".join(c) for c in rollout_calls
+    )
+    # exactly 2 rollout waits — memory-server is never waited twice.
+    assert len(rollout_calls) == 2
+
+
+def test_settle_flags_first_party_mismatch_in_detail_and_evidence(
+    tmp_path, monkeypatch
+):
+    """D3 on the APPLY path: a stale BFF digest in the live manifest makes
+    P4 `flagged`, names the mismatch in `detail`, and carries the full row
+    set in `evidence["first_party_images"]` — the post-apply equality
+    check running on every non-dry-run path (Rule B1)."""
+    manifest_docs = [
+        _manifest_deployment_doc(
+            "audittrace-memory-server",
+            "memory-server",
+            "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+        ),
+        _manifest_deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:STALE",
+        ),
+    ]
+    manifest_yaml = "\n---\n".join(json.dumps(d) for d in manifest_docs)
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest_yaml)),
+            ("jsonpath={.spec.replicas}", _proc(0, "1")),
+            ("status.phase", _proc(0, "Running")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        runner,
+        "_read_chart_values",
+        lambda *a, **k: {
+            "console": {
+                "bff": {
+                    "image": {
+                        "repository": "docker.io/lfds/audittrace-librechat-bff",
+                        "tag": "1.29.1",
+                        "digest": "sha256:FRESH-CHART",
+                    }
+                }
+            }
+        },
+    )
+    r = DeployRunner(_cfg(tmp_path, settle_samples=1))
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_settle()
+    assert r.records[0].status == "flagged"
+    assert "first-party image mismatch: bff" in r.records[0].detail
+    assert r.first_party_mismatch is True
+    rows = r.records[0].evidence["first_party_images"]
+    assert any(row["component"] == "bff" and not row["equal"] for row in rows)
+
+
 def test_deployment_replicas_fallbacks(tmp_path, monkeypatch):
     r = DeployRunner(_cfg(tmp_path))
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0, "3"))
@@ -1904,6 +2245,330 @@ def test_cli_abort_returns_three(tmp_path, monkeypatch):
         ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
     )
     assert rc == 3
+
+
+# ── D6: image-pin freshness preflight check ──────────────────────────────
+
+_LAGGING_CHART_VALUES = {
+    "console": {"bff": {"image": {"tag": "1.28.0"}}},
+    "tests": {"image": {"tag": "1.28.0"}},
+}
+
+
+def test_image_pin_lag_skips_under_local_registry(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path, registry="local"))
+    assert r._image_pin_lag() == {}
+
+
+def test_check_image_pin_freshness_skipped_record_under_local_registry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path, registry="local"))
+    r._check_image_pin_freshness()
+    assert r.records[0].status == "skipped"
+    assert "D6 applies to hub only" in r.records[0].detail
+
+
+def test_image_pin_freshness_note_dry_run_lagging_shows_would_abort(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    note = r._image_pin_freshness_note()
+    assert "would ABORT" in note
+    assert "bff=1.28.0" in note
+    assert "tests=1.28.0" in note
+
+
+def test_image_pin_freshness_note_dry_run_local_registry_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path, registry="local"))
+    assert "D6 applies to hub only" in r._image_pin_freshness_note()
+
+
+def test_image_pin_freshness_note_dry_run_fresh_pins(tmp_path, monkeypatch):
+    _stub_fresh_image_pins(monkeypatch)
+    r = DeployRunner(_cfg(tmp_path))
+    assert r._image_pin_freshness_note() == "image pins already match target 9.9.9"
+
+
+def test_check_image_pin_freshness_aborts_on_real_lag(tmp_path, monkeypatch):
+    """The real (non-dry-run) D6 abort: a lagging chart pin raises
+    `PreflightAbortError(IMAGE_PIN_LAG_EXIT, ...)` BEFORE any mutation.
+
+    Falsifiable: drop this check (or widen the tag-equality comparison)
+    and a release could deploy before its own re-pin lands — this test
+    goes RED (no raise).
+    """
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path))
+    with pytest.raises(PreflightAbortError) as exc:
+        r._check_image_pin_freshness()
+    assert exc.value.exit_code == 7
+    assert r.records[0].status == "aborted"
+    assert r.records[0].evidence["lagging"] == {"bff": "1.28.0", "tests": "1.28.0"}
+
+
+def test_phase_preflight_aborts_end_to_end_on_image_pin_lag(tmp_path, monkeypatch):
+    """End-to-end through `phase_preflight`: preflight script ok, mesh
+    healthy, but the chart lags the target -> abort exit 7 (evidence),
+    process exit 3 (Addendum A S2) — BEFORE P1 ever resolves anything."""
+    monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc(0))
+    monkeypatch.setattr(
+        runner, "_read_chart_values", lambda *a, **k: _LAGGING_CHART_VALUES
+    )
+    r = DeployRunner(_cfg(tmp_path), mesh_gate=_healthy_gate())
+    with pytest.raises(PreflightAbortError) as exc:
+        r.phase_preflight()
+    assert exc.value.exit_code == 7
+    assert r.records[2].status == "aborted"
+
+
+def test_cli_returns_eight_on_first_party_mismatch(tmp_path, monkeypatch):
+    """Addendum A §3 S2: `main()` returns FIRST_PARTY_MISMATCH_EXIT (8) —
+    distinct from 0/1/3 — when the settled report carries an unequal
+    first-party row."""
+    manifest_docs = [
+        _manifest_deployment_doc(
+            "audittrace-librechat-bff",
+            "bff",
+            "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:STALE",
+        )
+    ]
+    manifest_yaml = "\n---\n".join(json.dumps(d) for d in manifest_docs)
+    disp = _Dispatcher(
+        rules=[
+            ("helm get manifest", _proc(0, manifest_yaml)),
+            ("helm upgrade", _proc(0, "deployed")),
+            (
+                "helm status",
+                _proc(0, json.dumps({"version": 9, "info": {"status": "deployed"}})),
+            ),
+            ("jsonpath={.spec.replicas}", _proc(0, "1")),
+            ("status.phase", _proc(0, "Running")),
+        ]
+    )
+    monkeypatch.setattr(runner, "_run", disp)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _pinned_ref())
+    monkeypatch.setattr(
+        runner,
+        "_read_chart_values",
+        lambda *a, **k: {
+            "console": {
+                "bff": {
+                    "image": {
+                        "repository": "docker.io/lfds/audittrace-librechat-bff",
+                        # D6 compares this TAG to --target-version ("9.9.9")
+                        # — keep it fresh so D6 passes and the run reaches
+                        # P4, where the DIGEST mismatch below is what this
+                        # test is actually about.
+                        "tag": "9.9.9",
+                        "digest": "sha256:FRESH-CHART",
+                    }
+                }
+            },
+            "tests": {"image": {"tag": "9.9.9"}},
+        },
+    )
+    rc = runner.main(
+        ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
+    )
+    assert rc == 8
+
+
+def test_noop_path_d3_recheck_clears_converged_and_exits_eight(tmp_path, monkeypatch):
+    """B-3 / V-1 (fix round 1): P2 reads an ALL-EQUAL manifest and records
+    `noop` (`self.converged = True`); P4 independently re-reads the
+    manifest (a SECOND, separate `helm get manifest` call) and finds the
+    BFF now STALE. The report must say `converged: False` (never
+    `converged: true` alongside `first_party_mismatch: true`) and
+    `main()` must return 8 — D3 runs on the noop path too, exactly as
+    Addendum A Rule B1 requires, and its OWN finding overrides the
+    earlier (now-stale) convergence verdict.
+
+    Falsifiable: skip D3 on the noop path (``rows = [] if self.converged
+    else self._first_party_image_rows(...)``, the reviewer's own named
+    neuter) and this goes RED — `first_party_mismatch` stays False and
+    `main()` returns 0. Or drop the ``self.converged = False`` clear in
+    `phase_settle` and this goes RED on the ``converged`` assertion alone
+    (exit stays 8, but the report lies about `converged`).
+    """
+    good_manifest = "\n---\n".join(
+        json.dumps(d)
+        for d in (
+            _manifest_deployment_doc(
+                "audittrace-memory-server",
+                "memory-server",
+                "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat-bff",
+                "bff",
+                "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:FRESH-CHART",
+            ),
+        )
+    )
+    stale_manifest = "\n---\n".join(
+        json.dumps(d)
+        for d in (
+            _manifest_deployment_doc(
+                "audittrace-memory-server",
+                "memory-server",
+                "docker.io/lfds/audittrace-memory-server:9.9.9@sha256:x",
+            ),
+            _manifest_deployment_doc(
+                "audittrace-librechat-bff",
+                "bff",
+                "docker.io/lfds/audittrace-librechat-bff:1.29.1@sha256:STALE",
+            ),
+        )
+    )
+    manifest_calls = {"n": 0}
+
+    def _run_stub(cmd, *, env=None):
+        joined = " ".join(cmd)
+        if cmd[:3] == ["helm", "get", "manifest"]:
+            manifest_calls["n"] += 1
+            text = good_manifest if manifest_calls["n"] == 1 else stale_manifest
+            return _proc(0, text)
+        if '"memory-server")].imageID' in joined:
+            return _proc(0, "repo@sha256:x")
+        if "jsonpath={.metadata.annotations" in joined:
+            return _proc(0, "")
+        if "component=librechat-bff" in joined and "get pods" in joined:
+            # The LIVE BFF pod already runs the FRESH digest — at P2 time
+            # (manifest #1, rendered=FRESH) this makes the row genuinely
+            # equal (true convergence, true noop). At P4 time (manifest
+            # #2, rendered=STALE) the row is unequal purely on
+            # render-vs-chart (the live digest is irrelevant once
+            # `render_match` is False) — exactly the "something changed in
+            # the STORED release between the two reads" shape this test
+            # means to prove D3 catches.
+            return _proc(
+                0,
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"labels": {}},
+                                "status": {
+                                    "containerStatuses": [
+                                        {
+                                            "name": "bff",
+                                            "imageID": "repo@sha256:FRESH-CHART",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        if "component=memory-server" in joined and "get pods" in joined:
+            return _proc(
+                0,
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"labels": {}},
+                                "status": {
+                                    "containerStatuses": [
+                                        {
+                                            "name": "memory-server",
+                                            "imageID": "repo@sha256:x",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        if "helm status" in joined:
+            return _proc(0, json.dumps({"version": 9, "info": {"status": "deployed"}}))
+        if "helm template" in joined:
+            # No config drift on EITHER workload the P2-time (good-manifest)
+            # rows name — the point of this test is the IMAGE mismatch D3
+            # finds on recheck, not a config-drift false positive.
+            return _proc(
+                0,
+                _render_manifest_yaml(
+                    _deployment_doc("audittrace-memory-server", "memory-server"),
+                    _deployment_doc("audittrace-librechat-bff", "bff"),
+                ),
+            )
+        if (
+            "get deployment audittrace-memory-server -n" in joined
+            and "-o json" in joined
+        ):
+            return _proc(
+                0,
+                json.dumps(
+                    _deployment_doc("audittrace-memory-server", "memory-server")
+                ),
+            )
+        if (
+            "get deployment audittrace-librechat-bff -n" in joined
+            and "-o json" in joined
+        ):
+            return _proc(
+                0, json.dumps(_deployment_doc("audittrace-librechat-bff", "bff"))
+            )
+        if "jsonpath={.spec.replicas}" in joined:
+            return _proc(0, "1")
+        if "status.phase" in joined:
+            return _proc(0, "Running")
+        return _proc(0, "")
+
+    monkeypatch.setattr(runner, "_run", _run_stub)
+    monkeypatch.setattr(runner, "_sleep", lambda s: None)
+    monkeypatch.setattr(
+        runner,
+        "_read_chart_values",
+        lambda *a, **k: {
+            "console": {
+                "bff": {
+                    "image": {
+                        "repository": "docker.io/lfds/audittrace-librechat-bff",
+                        "tag": "9.9.9",  # D6: matches the synthetic target below
+                        "digest": "sha256:FRESH-CHART",
+                    }
+                }
+            },
+            "tests": {"image": {"tag": "9.9.9"}},
+        },
+    )
+    monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:x"))
+
+    rc = runner.main(
+        ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
+    )
+
+    out = sorted((tmp_path / "runs").glob("*.json"))
+    report = json.loads(out[-1].read_text())
+    p2 = next(p for p in report["phases"] if p["name"] == "P2-chart-apply")
+    assert p2["status"] == "noop", (
+        "P2 must have been a true noop (manifest #1, all-equal)"
+    )
+    assert report["converged"] is False, (
+        "converged must NOT stay True once P4's independent recheck finds a mismatch"
+    )
+    assert report["first_party_mismatch"] is True
+    assert rc == 8
 
 
 def test_config_from_args_maps_fields(tmp_path):
