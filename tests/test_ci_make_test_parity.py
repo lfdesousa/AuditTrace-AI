@@ -1,46 +1,27 @@
 """R2 equality guard: the ONLY pytest invocation over the whole `tests/`
-directory, across EVERY ci.yml job and EVERY Makefile target, is in
+directory, across EVERY workflow job and EVERY Makefile target, is in
 `scripts/ci/run-tests.sh` (SPEC 2026-10-11-SPEC-test-parity-scripted-
-enforcement.md R1/R2 + ADDENDUM A1-3).
+enforcement.md R1/R2, redesigned by ADDENDUM A2/A3/A4/A7 after an
+independent review REJECTed the first two rebuilds for being argv/wrapper
+PATTERN-MATCHING heuristics with new bypasses each round).
 
-ADDENDUM A1-3 (2026-10-11, review REJECT of f72cdd7, B3): the first cut
-only scanned the `test` job's steps and the `test:` target's recipe, and
-its fingerprint was the `--cov-fail-under` flag rather than "a pytest
-invocation over `tests/`". Both were evadable exactly as B3 demonstrated:
-a second CI step/job, or a second Makefile target, running bare
-`pytest tests/ ...` with no `--cov-fail-under` flag (E1/E6/E7); masking the
-real step with `|| true` / `continue-on-error` / `if:` (E4/E5/E8); or
-hiding the real call behind `; echo` so grep-for-the-string-anywhere
-checks pass without the script ever actually running.
-
-This version:
-  * scans every `run:` step in every ci.yml job, and every recipe line of
-    every Makefile target (not just `test`/`test:`);
-  * treats a bare `pytest tests/` (or `tests`) invocation ANYWHERE outside
-    scripts/ci/run-tests.sh as a violation, unconditionally;
-  * treats a SCOPED run (a specific file or node id) as a violation too,
-    UNLESS it is listed in SCOPED_PYTEST_EXEMPTIONS below;
-  * splits each run-text/recipe into shell STATEMENTS (on `;`, `&&`,
-    `||`, `|`, newlines) before classifying, so `pytest tests/ -q; echo
-    bash scripts/ci/run-tests.sh` is seen as two statements — the first a
-    real, unexempted whole-directory invocation (violation), the second a
-    mere `echo` that does NOT count as "the script was called";
-  * requires a GENUINE invocation of the script (as the executed command,
-    not merely a string appearing in an echoed/commented line) before a
-    job/target is considered to "call the script";
-  * rejects `continue-on-error`, an `if:` key, `|| true`, `|| :` and
-    `; true` on the step/line that genuinely calls the script.
-
-Reads the shipped files; types no constants describing their content
-beyond the canonical script path, the exemption list (each entry is a
-real, pre-existing, legitimate single-file test run), and the masking
-tokens named above.
+This round changes the instrument for the WIRING checks too: instead of
+pattern-matching every job/target to decide "did this genuinely call the
+script, masked how", the things that matter are pinned by EXACT GOLDENS
+— the whole ci.yml `test` job mapping (so adding `continue-on-error`,
+`if:`, or any other key is a diff against a reviewed golden, not
+something a scanner has to notice), the workflow-level `on`/`env`/
+`defaults`/`permissions` keys, the Makefile `test`/`test-unit` recipe
+lines, and the `[tool.pytest.ini_options]` table. A SEPARATE, explicitly
+heuristic scan then looks for any OTHER job/target anywhere that
+mentions `pytest`/`py.test` as a word — it can miss calls (accepted),
+and anything it does find must be in an exact exemption list.
 """
 
 from __future__ import annotations
 
 import re
-import shlex
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -50,376 +31,461 @@ from tests.test_ci_make_targets_resolve_tools import parse_makefile
 ROOT = Path(__file__).resolve().parent.parent
 MAKEFILE = ROOT / "Makefile"
 CI = ROOT / ".github/workflows/ci.yml"
+WORKFLOWS_DIR = ROOT / ".github/workflows"
+PYPROJECT = ROOT / "pyproject.toml"
 
 #: the ONE script every pytest invocation over `tests/` must go through.
 SCRIPT = "scripts/ci/run-tests.sh"
 
-#: SCOPED (single-file or node-id) pytest invocations outside the script,
-#: each pre-existing and legitimate — keyed by "<location>:<target name>"
-#: -> the exact `tests/...` argument it runs. Anything NOT listed here,
-#: and any BARE `tests/`/`tests` (whole-directory) invocation regardless
-#: of whether it's listed, is a violation.
-SCOPED_PYTEST_EXEMPTIONS: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("Makefile:test-rls-local", "tests/test_rls_isolation.py"),
-        ("Makefile:openapi-export", "tests/test_openapi_drift.py"),
-        ("Makefile:release", "tests/test_openapi_drift.py"),
-        ("Makefile:release", "tests/test_version_drift.py"),
-    }
-)
+# ─────────────────────────── exact goldens (R2, A2-6/A2-7/A3-4/A3-10) ───────
 
-#: statement separators (A1-3's own "; echo" evasion needs each statement
-#: checked independently, not the whole line as one blob).
-_STATEMENT_SPLIT = re.compile(r"&&|\|\||;|\||\n")
-
-#: exit-code/condition maskers forbidden on the step/line that calls the
-#: script (B3 E4/E5/E8).
-_MASKING_TOKENS = ("|| true", "|| :", "; true")
-
-
-def _statements(text: str) -> list[str]:
-    return [s.strip() for s in _STATEMENT_SPLIT.split(text) if s.strip()]
-
-
-def _tokenize(statement: str) -> list[str]:
-    try:
-        return shlex.split(statement)
-    except ValueError:
-        return statement.split()
-
-
-def _pytest_tests_targets(statement: str) -> list[str]:
-    """`tests` / `tests/...` tokens in `statement`, but ONLY if the
-    statement actually invokes something named/containing "pytest"
-    (case-insensitively — catches both a literal `pytest` binary/module
-    invocation AND an indirect one through a resolved shell variable like
-    `"$$PYTEST"`)."""
-    if not re.search(r"pytest", statement, re.IGNORECASE):
-        return []
-    tokens = _tokenize(statement)
-    return [t for t in tokens if t == "tests" or t.startswith("tests/")]
-
-
-def _is_whole_directory(target: str) -> bool:
-    return target in ("tests", "tests/")
-
-
-def _genuinely_calls_script(statement: str) -> bool:
-    """True only if `statement`'s EXECUTED command is the script — never
-    merely because the script's path string appears somewhere in the
-    statement (an `echo` of it, a comment, part of another word)."""
-    tokens = _tokenize(statement)
-    if not tokens:
-        return False
-    tokens[0] = tokens[0].lstrip(
-        "@-"
-    )  # Makefile's @ (quiet) / - (ignore-error) prefixes
-    if tokens[0] == "":
-        tokens = tokens[1:]
-    if not tokens:
-        return False
-    # Local wrappers (e.g. `make test`'s `scripts.neuter.runner hold-shared
-    # -- bash scripts/ci/run-tests.sh`) may stay around the script call
-    # (R1's own text says so) — the REAL command is whatever follows the
-    # LAST bare `--` token, if there is one.
-    if "--" in tokens:
-        idx = len(tokens) - 1 - tokens[::-1].index("--")
-        tokens = tokens[idx + 1 :]
-        if not tokens:
-            return False
-    if tokens[0] in ("bash", "sh", ".", "source") and len(tokens) > 1:
-        return tokens[1] == SCRIPT
-    return tokens[0] == SCRIPT
-
-
-def _masking_violations_in_text(text: str, *, where: str) -> list[str]:
-    """Checked on the WHOLE, unsplit run-text/recipe (never on an already
-    `;`/`&&`/`||`-split statement — splitting on `||` itself would cut a
-    `|| true` suffix away from the statement that calls the script before
-    this ever saw it). Flags any LINE that both calls the script and
-    carries a masking token."""
-    bad = []
-    for line in text.splitlines():
-        if SCRIPT not in line:
-            continue
-        for token in _MASKING_TOKENS:
-            if token in line:
-                bad.append(
-                    f"{where}: the line calling {SCRIPT} masks its exit "
-                    f"code with {token!r}: {line.strip()!r}"
-                )
-    return bad
-
-
-def _scan_statements(
-    statements: list[str], *, where: str, exemption_prefix: str
-) -> tuple[list[str], bool]:
-    bad: list[str] = []
-    script_called = False
-    for statement in statements:
-        if _genuinely_calls_script(statement):
-            script_called = True
-        for target in _pytest_tests_targets(statement):
-            if _is_whole_directory(target):
-                bad.append(
-                    f"{where}: whole-tests/-directory pytest invocation "
-                    f"outside {SCRIPT}: {statement!r}"
-                )
-            elif (exemption_prefix, target) not in SCOPED_PYTEST_EXEMPTIONS:
-                bad.append(
-                    f"{where}: unexempted scoped pytest invocation "
-                    f"{target!r} outside {SCRIPT}: {statement!r}"
-                )
-    return bad, script_called
-
-
-def violations(ci_text: str, makefile_text: str) -> list[str]:
-    bad: list[str] = []
-
-    # ── every ci.yml job's every run: step ──
-    data = yaml.safe_load(ci_text)
-    for job_name, job in (data.get("jobs") or {}).items():
-        for step_index, step in enumerate(job.get("steps") or []):
-            run_text = step.get("run")
-            if not run_text:
-                continue
-            statements = _statements(run_text)
-            step_bad, step_called = _scan_statements(
-                statements,
-                where=f"ci.yml job {job_name!r} step {step_index}",
-                exemption_prefix=f"ci.yml:{job_name}",
-            )
-            bad.extend(step_bad)
-            if step_called:
-                bad.extend(
-                    _masking_violations_in_text(
-                        run_text, where=f"ci.yml job {job_name!r} step {step_index}"
-                    )
-                )
-                if step.get("continue-on-error"):
-                    bad.append(
-                        f"ci.yml job {job_name!r} step {step_index}: the "
-                        f"step calling {SCRIPT} carries continue-on-error"
-                    )
-                if "if" in step:
-                    bad.append(
-                        f"ci.yml job {job_name!r} step {step_index}: the "
-                        f"step calling {SCRIPT} carries an `if:` condition"
-                    )
-
-    # ── every Makefile target's every recipe line ──
-    all_targets = parse_makefile(makefile_text)
-    for target_name, (_deps, recipe) in all_targets.items():
-        statements = _statements(recipe)
-        target_bad, target_called = _scan_statements(
-            statements,
-            where=f"Makefile target {target_name!r}",
-            exemption_prefix=f"Makefile:{target_name}",
+#: the ENTIRE ci.yml `test` job mapping — every job-level key, every key
+#: of every step. Any drift (a new step, a reordered one, a masking key
+#: like `continue-on-error`/`if` added to the script-calling step, a
+#: changed `run:`) is a reviewed golden diff, not something a scanner has
+#: to infer.
+CI_TEST_JOB_GOLDEN: dict = {
+    "runs-on": "ubuntu-latest",
+    "services": {
+        "postgres": {
+            "image": "postgres:16",
+            "env": {
+                "POSTGRES_USER": "postgres",
+                "POSTGRES_PASSWORD": "postgres",
+                "POSTGRES_DB": "audittrace",
+            },
+            "ports": ["5432:5432"],
+            "options": (
+                '--health-cmd "pg_isready -U postgres" --health-interval 10s '
+                "--health-timeout 5s --health-retries 5"
+            ),
+        }
+    },
+    "env": {
+        "AUDITTRACE_TEST_POSTGRES_URL": (
+            "postgresql+psycopg2://postgres:postgres@localhost:5432/audittrace"
         )
-        if target_called:
-            target_bad = target_bad + _masking_violations_in_text(
-                recipe, where=f"Makefile target {target_name!r}"
-            )
-        bad.extend(target_bad)
+    },
+    "steps": [
+        {"uses": "actions/checkout@v6", "with": {"fetch-depth": 0}},
+        {
+            "name": "Set up Python 3.12",
+            "uses": "actions/setup-python@v6",
+            "with": {"python-version": "3.12"},
+        },
+        {
+            "name": "Cache pip dependencies",
+            "uses": "actions/cache@v5",
+            "with": {
+                "path": "~/.cache/pip",
+                "key": "${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}",
+                "restore-keys": "${{ runner.os }}-pip-\n",
+            },
+        },
+        {
+            "name": "Install dependencies",
+            "run": 'python -m pip install --upgrade pip\npip install -e ".[dev]"\n',
+        },
+        {
+            "name": (
+                "Install CI-Agent gate tooling (semgrep — ISOLATED gatekeeper, "
+                "never in the app/test venv)"
+            ),
+            "run": (
+                'pipx install "semgrep==1.171.0"\n'
+                'echo "$HOME/.local/bin" >> "$GITHUB_PATH"\n'
+            ),
+        },
+        {"name": "Lint", "run": "ruff check src/ tests/"},
+        {"name": "Format check", "run": "ruff format --check src/ tests/"},
+        {
+            "name": "Type check (make typecheck — same target as local;",
+            "run": "make typecheck",
+        },
+        {
+            "name": (
+                "Security-lint (offline semgrep gate — same make target as "
+                "local + pre-commit;"
+            ),
+            "run": "make security-lint",
+        },
+        {
+            "name": "Assert RLS integration tests are actually runnable",
+            "run": (
+                "python - <<'PY'\n"
+                "import socket\n"
+                'with socket.create_connection(("localhost", 5432), timeout=10):\n'
+                '    print("postgres reachable on :5432 — RLS tests will run")\n'
+                "PY\n"
+            ),
+        },
+        {
+            "name": (
+                "Tests + coverage + skip + per-file gate (scripts/ci/run-tests.sh "
+                "— same script `make test` calls; SPEC "
+                "2026-10-11-test-parity-scripted-enforcement + ADDENDUM A1)"
+            ),
+            "run": f"bash {SCRIPT}",
+        },
+        {
+            "name": "Upload coverage XML",
+            "if": "always()",
+            "uses": "actions/upload-artifact@v7",
+            "with": {
+                "name": "coverage-xml",
+                "path": "coverage.xml",
+                "retention-days": 30,
+            },
+        },
+        {
+            "name": "Upload coverage HTML report",
+            "if": "always()",
+            "uses": "actions/upload-artifact@v7",
+            "with": {
+                "name": "coverage-html",
+                "path": "htmlcov/",
+                "retention-days": 30,
+            },
+        },
+    ],
+}
 
-    # ── R1: `make test` and the ci.yml `test` job must EACH genuinely
-    # call the script at least once (the positive half R2 always had). ──
-    ci_test_job = (data.get("jobs") or {}).get("test") or {}
-    ci_test_calls = any(
-        _genuinely_calls_script(s)
-        for step in (ci_test_job.get("steps") or [])
-        for s in _statements(step.get("run") or "")
-    )
-    if not ci_test_calls:
-        bad.append(f"ci.yml `test` job never genuinely calls {SCRIPT}")
-    mk_test_recipe = (all_targets.get("test") or ((), ""))[1]
-    mk_test_calls = any(_genuinely_calls_script(s) for s in _statements(mk_test_recipe))
-    if not mk_test_calls:
-        bad.append(f"Makefile `test` target never genuinely calls {SCRIPT}")
+#: workflow-level keys. A4-9: PyYAML loads the bare `on:` key as the
+#: BOOLEAN `True` — read it under that key (never the string `"on"`,
+#: which is absent from the parsed mapping) and assert it's non-empty.
+CI_WORKFLOW_ON_GOLDEN: dict = {
+    "push": {"branches": ["main", "feat/**", "fix/**"], "tags": ["v*"]},
+    "pull_request": {"branches": ["main", "feat/**"]},
+}
+CI_WORKFLOW_ENV_GOLDEN: dict | None = None
+CI_WORKFLOW_DEFAULTS_GOLDEN: dict | None = None
+CI_WORKFLOW_PERMISSIONS_GOLDEN: dict = {"contents": "read"}
 
-    return bad
+#: the Makefile `test`/`test-unit` recipes, WITH their line prefixes
+#: (`@`/`-@`/tabs) — exact text, not reconstructed from parts.
+MAKEFILE_TEST_RECIPE_GOLDEN = (
+    f"\t@.venv/bin/python -m scripts.neuter.runner hold-shared -- bash {SCRIPT}\n"
+)
+MAKEFILE_TEST_UNIT_RECIPE_GOLDEN = f'\t@bash {SCRIPT} --subset "not integration"\n'
+
+#: pyproject.toml's `[tool.pytest.ini_options]` table, verbatim.
+PYPROJECT_PYTEST_INI_OPTIONS_GOLDEN: dict = {
+    "testpaths": ["tests"],
+    "python_files": ["test_*.py"],
+    "python_functions": ["test_*"],
+    "asyncio_mode": "auto",
+    "addopts": "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90",
+    "filterwarnings": ["ignore::DeprecationWarning"],
+    "markers": [
+        "allow_cluster_tool(tool, reason): opt-in half of the hermetic "
+        "cluster-tool guard (tests/conftest.py, SPEC "
+        "2026-10-11-SPEC-test-parity-scripted-enforcement.md R3) — must be "
+        "paired with a matching entry in tests/hermetic_allowlist.py or the "
+        "guard still fails the test."
+    ],
+}
 
 
-def test_make_test_and_ci_both_call_the_canonical_script_with_no_drift() -> None:
-    assert violations(CI.read_text(), MAKEFILE.read_text()) == []
+def _load_ci() -> dict:
+    return yaml.safe_load(CI.read_text())
 
 
-def test_the_canonical_script_itself_exists_and_is_executable() -> None:
+def test_ci_test_job_matches_exact_golden():
+    data = _load_ci()
+    assert data["jobs"]["test"] == CI_TEST_JOB_GOLDEN
+
+
+def test_ci_workflow_level_keys_match_exact_golden():
+    data = _load_ci()
+    assert data.get(True) == CI_WORKFLOW_ON_GOLDEN, "the `on:` block (PyYAML key True)"
+    assert data.get(True), "the `on:` block must be non-empty"
+    assert data.get("env") == CI_WORKFLOW_ENV_GOLDEN
+    assert data.get("defaults") == CI_WORKFLOW_DEFAULTS_GOLDEN
+    assert data.get("permissions") == CI_WORKFLOW_PERMISSIONS_GOLDEN
+
+
+def test_makefile_test_and_test_unit_recipes_match_exact_golden():
+    targets = parse_makefile(MAKEFILE.read_text())
+    assert targets["test"][1] == MAKEFILE_TEST_RECIPE_GOLDEN
+    assert targets["test-unit"][1] == MAKEFILE_TEST_UNIT_RECIPE_GOLDEN
+
+
+def test_pyproject_pytest_ini_options_match_exact_golden():
+    data = tomllib.loads(PYPROJECT.read_text())
+    assert data["tool"]["pytest"]["ini_options"] == PYPROJECT_PYTEST_INI_OPTIONS_GOLDEN
+
+
+def test_the_canonical_script_itself_exists_and_is_executable():
     script = ROOT / SCRIPT
     assert script.is_file(), f"{SCRIPT} is missing"
     assert script.stat().st_mode & 0o111, f"{SCRIPT} is not executable"
 
 
-def test_exemption_list_entries_are_all_genuinely_present() -> None:
-    """The exemption list must describe REALITY, never aspiration — every
-    entry must correspond to an actual, still-present scoped pytest
-    invocation in the shipped Makefile (a stale entry nobody needs
-    anymore should be deleted, which this also catches)."""
-    makefile_text = MAKEFILE.read_text()
-    all_targets = parse_makefile(makefile_text)
-    seen: set[tuple[str, str]] = set()
-    for target_name, (_deps, recipe) in all_targets.items():
-        for statement in _statements(recipe):
-            for target in _pytest_tests_targets(statement):
-                if not _is_whole_directory(target):
-                    seen.add((f"Makefile:{target_name}", target))
-    assert SCOPED_PYTEST_EXEMPTIONS <= seen, SCOPED_PYTEST_EXEMPTIONS - seen
+# ── neuters: each independently proves a golden fires ───────────────────────
 
 
-# ── neuters: each independently proves the guard fires ──────────────────────
-
-
-def test_neuter_e1_second_ci_step_bare_pytest_goes_red() -> None:
-    """B3 E1: a second ci.yml step in the `test` job, `run: pytest tests/
-    -q`, alongside the real script call."""
-    ci_text = CI.read_text()
-    mutated = ci_text.replace(
-        f"run: bash {SCRIPT}",
-        f"run: bash {SCRIPT}\n      - name: evasion E1\n        run: pytest tests/ -q",
-    )
-    assert mutated != ci_text
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("whole-tests/-directory" in v and "job 'test'" in v for v in found), (
-        found
-    )
-
-
-def test_neuter_e4_masked_with_or_true_goes_red() -> None:
-    ci_text = CI.read_text()
-    mutated = ci_text.replace(f"run: bash {SCRIPT}", f"run: bash {SCRIPT} || true")
-    assert mutated != ci_text
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("masks its exit code with '|| true'" in v for v in found), found
-
-
-def test_neuter_e4b_masked_with_or_colon_goes_red() -> None:
-    # Structural mutation (not a raw string .replace()): appending a bare
-    # trailing `:` to a plain YAML scalar via text-splicing produces
-    # invalid YAML ("mapping values are not allowed here") — mutate the
-    # PARSED structure instead, exactly like the e5/e8 neuters below.
-    ci_text = CI.read_text()
-    data = yaml.safe_load(ci_text)
-    for step in data["jobs"]["test"]["steps"]:
-        if step.get("run") == f"bash {SCRIPT}":
-            step["run"] = f"bash {SCRIPT} || :"
-            break
-    else:
-        raise AssertionError("could not find the script-calling step")
-    mutated = yaml.safe_dump(data, sort_keys=False)
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("masks its exit code with '|| :'" in v for v in found), found
-
-
-def test_neuter_e5_continue_on_error_goes_red() -> None:
-    ci_text = CI.read_text()
-    data = yaml.safe_load(ci_text)
+def test_neuter_masking_the_script_step_breaks_the_ci_golden():
+    data = _load_ci()
     for step in data["jobs"]["test"]["steps"]:
         if step.get("run") == f"bash {SCRIPT}":
             step["continue-on-error"] = True
             break
     else:
         raise AssertionError("could not find the script-calling step")
-    mutated = yaml.safe_dump(data, sort_keys=False)
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("continue-on-error" in v for v in found), found
+    assert data["jobs"]["test"] != CI_TEST_JOB_GOLDEN
 
 
-def test_neuter_e8_if_condition_goes_red() -> None:
-    ci_text = CI.read_text()
-    data = yaml.safe_load(ci_text)
+def test_neuter_if_condition_on_script_step_breaks_the_ci_golden():
+    data = _load_ci()
     for step in data["jobs"]["test"]["steps"]:
         if step.get("run") == f"bash {SCRIPT}":
             step["if"] = "false"
             break
     else:
         raise AssertionError("could not find the script-calling step")
-    mutated = yaml.safe_dump(data, sort_keys=False)
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("`if:` condition" in v for v in found), found
+    assert data["jobs"]["test"] != CI_TEST_JOB_GOLDEN
 
 
-def test_neuter_e6_new_ci_job_bare_pytest_goes_red() -> None:
-    """B3 E6: a brand-new ci.yml job running `pytest tests/
-    --cov-fail-under=90` — must be caught even though it is not the
-    `test` job and carries no fingerprint this guard relies on beyond
-    "runs pytest over tests/"."""
-    ci_text = CI.read_text()
-    data = yaml.safe_load(ci_text)
-    data["jobs"]["evasion-e6"] = {
-        "runs-on": "ubuntu-latest",
-        "steps": [{"run": "pytest tests/ --cov-fail-under=90"}],
-    }
-    mutated = yaml.safe_dump(data, sort_keys=False)
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any(
-        "job 'evasion-e6'" in v and "whole-tests/-directory" in v for v in found
-    ), found
+def test_neuter_or_true_on_script_step_breaks_the_ci_golden():
+    data = _load_ci()
+    for step in data["jobs"]["test"]["steps"]:
+        if step.get("run") == f"bash {SCRIPT}":
+            step["run"] = f"bash {SCRIPT} || true"
+            break
+    else:
+        raise AssertionError("could not find the script-calling step")
+    assert data["jobs"]["test"] != CI_TEST_JOB_GOLDEN
 
 
-def test_neuter_e7_new_makefile_target_bare_pytest_goes_red() -> None:
-    """B3 E7: a brand-new Makefile target `test-fast` running `pytest
-    tests/ --cov-fail-under=90`."""
+def test_neuter_dropped_on_trigger_breaks_the_workflow_golden():
+    data = _load_ci()
+    data[True] = {}
+    assert not (data.get(True) == CI_WORKFLOW_ON_GOLDEN and data.get(True))
+
+
+def test_neuter_makefile_test_target_reverted_to_bare_pytest_breaks_golden():
     mk_text = MAKEFILE.read_text()
-    mutated = mk_text + "\ntest-fast:\n\t@.venv/bin/pytest tests/ --cov-fail-under=90\n"
-    found = violations(CI.read_text(), mutated)
-    assert any(
-        "target 'test-fast'" in v and "whole-tests/-directory" in v for v in found
-    ), found
-
-
-def test_neuter_e_semicolon_echo_decoy_goes_red() -> None:
-    """The reviewer's own ``pytest tests/ -q; echo bash
-    scripts/ci/run-tests.sh`` decoy: the ECHO must not count as "the
-    script was called", and the real `pytest tests/` statement must still
-    be flagged as a whole-directory violation."""
-    ci_text = CI.read_text()
-    mutated = ci_text.replace(
-        f"run: bash {SCRIPT}",
-        f"run: pytest tests/ -q; echo bash {SCRIPT}",
-    )
-    assert mutated != ci_text
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("whole-tests/-directory" in v and "job 'test'" in v for v in found), (
-        found
-    )
-    # AND the positive "test job calls the script" check must now fail,
-    # since echoing the path is not calling it.
-    assert any("never genuinely calls" in v and "ci.yml" in v for v in found), found
-
-
-def test_neuter_dropping_the_script_call_from_ci_goes_red() -> None:
-    ci_text = CI.read_text()
-    mutated = ci_text.replace(f"run: bash {SCRIPT}", "run: echo noop")
-    assert mutated != ci_text
-    found = violations(mutated, MAKEFILE.read_text())
-    assert any("ci.yml `test` job never genuinely calls" in v for v in found), found
-    assert not any(v.startswith("Makefile") for v in found), found
-
-
-def test_neuter_dropping_the_script_call_from_makefile_goes_red() -> None:
-    mk_text = MAKEFILE.read_text()
-    mutated = mk_text.replace(f"bash {SCRIPT}", "/bin/true", 1)
-    assert mutated != mk_text
-    found = violations(CI.read_text(), mutated)
-    assert any("Makefile `test` target never genuinely calls" in v for v in found), (
-        found
-    )
-
-
-def test_neuter_test_unit_as_raw_bare_pytest_goes_red() -> None:
-    """A1-3: `test-unit` must never be a raw, unexempted bare pytest
-    invocation — if it ever reverts to one (exactly what it was before
-    ADDENDUM A1), this must catch it."""
-    mk_text = MAKEFILE.read_text()
-    assert "test-unit:" in mk_text
     mutated = re.sub(
-        r"test-unit:[^\n]*\n(?:\t[^\n]*\n)*",
-        'test-unit: ## reverted\n\t@.venv/bin/pytest tests/ -v -k "not integration"\n',
+        r"test:[^\n]*\n(?:\t[^\n]*\n)*",
+        "test: ## reverted\n\t@.venv/bin/pytest tests/ -v --cov=src --cov-fail-under=90\n",
         mk_text,
         count=1,
     )
     assert mutated != mk_text
-    found = violations(CI.read_text(), mutated)
-    assert any(
-        "target 'test-unit'" in v and "whole-tests/-directory" in v for v in found
-    ), found
+    targets = parse_makefile(mutated)
+    assert targets["test"][1] != MAKEFILE_TEST_RECIPE_GOLDEN
+
+
+def test_neuter_pyproject_addopts_drift_breaks_golden():
+    data = dict(PYPROJECT_PYTEST_INI_OPTIONS_GOLDEN)
+    data["addopts"] = data["addopts"] + " -x"
+    assert data != PYPROJECT_PYTEST_INI_OPTIONS_GOLDEN
+
+
+# ─────────────────── heuristic cross-job/cross-workflow/all-target scan ─────
+#
+# A2-6/A3-4/A3-11: ANY `run:` step in ANY workflow under .github/workflows/,
+# and ANY Makefile recipe (continuation-joined first), whose words contain
+# `pytest` or `py.test` (case-insensitive — so an indirection like
+# `"$$PYTEST"` is also caught) must be in an EXACT exemption list keyed by
+# (workflow file, job, step index, exact run string) or (target, exact
+# recipe text). This is explicitly a HEURISTIC: it can miss calls that
+# never spell the word at all (e.g. a doubly-indirected variable built
+# from characters), and that is ACCEPTED — the golden checks above, plus
+# the process-layer shim in scripts/ci/run-tests.sh, are the controls.
+
+_PYTEST_WORD_RE = re.compile(r"\bpytest\b|\bpy\.test\b", re.IGNORECASE)
+
+
+def _join_backslash_continuations(text: str) -> str:
+    return re.sub(r"\\\n", " ", text)
+
+
+#: (workflow filename, job name, step index) -> the EXACT `run:` string of
+#: that one, already-vetted step.
+WORKFLOW_PYTEST_EXEMPTIONS: frozenset[tuple[str, str, int, str]] = frozenset(
+    {
+        (
+            "test-count-badge.yml",
+            "badge",
+            3,
+            "set -euo pipefail\n"
+            'output="$(pytest tests --collect-only -q -p no:cacheprovider -o addopts= 2>&1)"\n'
+            'echo "${output}"\n'
+            'count="$(grep -oP \'\\d+(?= tests? collected)\' <<<"${output}" | tail -n1)"\n'
+            'if [ -z "${count}" ]; then\n'
+            "  echo \"::error::could not parse '(\\\\d+) tests? collected' from --collect-only output\"\n"
+            "  exit 1\n"
+            "fi\n"
+            'echo "Parsed live test count: ${count}"\n'
+            'echo "count=${count}" >> "$GITHUB_OUTPUT"\n',
+        ),
+    }
+)
+
+#: target name -> the EXACT (pre-join) recipe text of that one, already-
+#: vetted target.
+MAKEFILE_PYTEST_EXEMPTIONS: dict[str, str] = {
+    "test-rls-local": (
+        "\t# Runs tests/test_rls_isolation.py against a throwaway postgres:16\n"
+        "\t# container on localhost:15432. CRITICALLY: does NOT port-forward the\n"
+        "\t# k3s production Postgres — the test file includes a positive test\n"
+        "\t# (test_alice_cannot_insert_as_bob) that deliberately provokes an RLS\n"
+        "\t# violation to prove WITH CHECK works. That violation gets logged as\n"
+        "\t# an ERROR by Postgres unconditionally, which would pollute production\n"
+        "\t# logs. An ephemeral container keeps the noise scoped.\n"
+        '\t@echo "🐳 Spinning up ephemeral test Postgres on :15432 ..."\n'
+        "\t@docker rm -f audittrace-test-pg >/dev/null 2>&1 || true\n"
+        "\t@docker run -d --rm --name audittrace-test-pg \\\n"
+        "\t  -e POSTGRES_USER=postgres \\\n"
+        "\t  -e POSTGRES_PASSWORD=test \\\n"
+        "\t  -e POSTGRES_DB=audittrace \\\n"
+        "\t  -p 15432:5432 \\\n"
+        "\t  postgres:16 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null\n"
+        '\t@echo "⏳ Waiting for Postgres to accept connections ..."\n'
+        "\t@for i in 1 2 3 4 5 6 7 8; do \\\n"
+        "\t  docker exec audittrace-test-pg pg_isready -U postgres >/dev/null 2>&1 && break ; \\\n"
+        "\t  sleep 1 ; \\\n"
+        "\tdone\n"
+        '\t@AUDITTRACE_TEST_POSTGRES_URL="postgresql+psycopg2://postgres:test@localhost:15432/audittrace" \\\n'
+        "\t  .venv/bin/pytest tests/test_rls_isolation.py -v --no-cov ; \\\n"
+        "\t  status=$$? ; \\\n"
+        '\t  echo "🧹 Tearing down ephemeral test Postgres ..." ; \\\n'
+        "\t  docker rm -f audittrace-test-pg >/dev/null 2>&1 ; \\\n"
+        "\t  [ $$status -eq 0 ] || exit $$status\n"
+        '\t@echo "✅ RLS integration tests passed (ephemeral Postgres, no production pollution)"\n'
+    ),
+    "openapi-export": (
+        "\t@OPENAPI_SNAPSHOT_UPDATE=1 .venv/bin/pytest tests/test_openapi_drift.py -q --no-cov\n"
+        '\t@echo "✅ Regenerated:"\n'
+        '\t@echo "   tests/fixtures/openapi.snapshot.yaml"\n'
+        '\t@echo "   docs/reference/audittrace/openapi.yaml"\n'
+        '\t@echo "Commit both alongside the API change so reviewers see the diff."\n'
+    ),
+    "release": (
+        '\t@if [ -z "$(VERSION)" ]; then \\\n'
+        '\t\techo "❌ usage: make release VERSION=1.0.14"; \\\n'
+        '\t\techo "Bumps the two single-source-of-truth pin sites + regenerates"; \\\n'
+        '\t\techo "the OpenAPI snapshot. Stops short of committing or tagging —"; \\\n'
+        '\t\techo "review the diff, then commit + tag manually."; \\\n'
+        "\t\texit 1; \\\n"
+        "\tfi\n"
+        '\t@echo "🔖 bumping pyproject.toml::version → $(VERSION)"\n'
+        '\t@sed -i \'s/^version = ".*"/version = "$(VERSION)"/\' pyproject.toml\n'
+        '\t@echo "🔖 bumping charts/audittrace/Chart.yaml::version + appVersion → $(VERSION)"\n'
+        "\t@sed -i 's/^version: .*/version: $(VERSION)/' charts/audittrace/Chart.yaml\n"
+        '\t@sed -i \'s/^appVersion: ".*"/appVersion: "$(VERSION)"/\' charts/audittrace/Chart.yaml\n'
+        '\t@echo "🔖 bumping docker-compose.yml demo default → $(VERSION)"\n'
+        "\t@sed -i 's/$${AUDITTRACE_IMAGE_TAG:-[^}]*}/$${AUDITTRACE_IMAGE_TAG:-$(VERSION)}/g' docker-compose.yml\n"
+        '\t@echo "🔖 bumping .env.ci + .env.dev-real-llm.example AUDITTRACE_IMAGE_TAG → $(VERSION)"\n'
+        "\t@sed -i 's/^AUDITTRACE_IMAGE_TAG=.*/AUDITTRACE_IMAGE_TAG=$(VERSION)/' .env.ci .env.dev-real-llm.example\n"
+        '\t@PYTEST="$$( [ -x .venv/bin/pytest ] && echo .venv/bin/pytest || command -v pytest )"; \\\n'
+        '\techo "📝 regenerating OpenAPI snapshot (defensive — no version string embedded today, so this is normally a no-op diff) ..."; \\\n'
+        '\tOPENAPI_SNAPSHOT_UPDATE=1 "$$PYTEST" tests/test_openapi_drift.py -q --no-cov >/dev/null; \\\n'
+        '\techo "🚦 running drift gate ..."; \\\n'
+        '\t"$$PYTEST" tests/test_version_drift.py -q --no-cov\n'
+        "\t@echo\n"
+        '\t@echo "✅ release-prep done for v$(VERSION). Diff:"\n'
+        "\t@git diff --stat $$($(MAKE) --no-print-directory release-bump-files)\n"
+        "\t@echo\n"
+        '\t@echo "Next steps:"\n'
+        '\t@echo "  1. git add $$($(MAKE) --no-print-directory release-bump-files)"\n'
+        "\t@echo \"  2. git commit -m 'chore(release): v$(VERSION)'\"\n"
+        '\t@echo "  3. open release PR; after merge, tag v$(VERSION) on main"\n'
+        '\t@echo "  4. docker build/push localhost:5000/audittrace/memory-server:v$(VERSION)"\n'
+        '\t@echo "  5. helm upgrade --reset-then-reuse-values --set memoryServer.image.tag=v$(VERSION)"\n'
+    ),
+}
+
+
+def workflow_pytest_violations(workflows_dir: Path) -> list[str]:
+    """HEURISTIC (see module docstring). Returns one entry per unexempted
+    `run:` step, across every workflow file, whose text mentions
+    `pytest`/`py.test` as a word."""
+    bad: list[str] = []
+    for wf_path in sorted(workflows_dir.glob("*.yml")):
+        data = yaml.safe_load(wf_path.read_text())
+        for job_name, job in (data.get("jobs") or {}).items():
+            for idx, step in enumerate(job.get("steps") or []):
+                run_text = step.get("run")
+                if not run_text:
+                    continue
+                joined = _join_backslash_continuations(run_text)
+                if not _PYTEST_WORD_RE.search(joined):
+                    continue
+                key = (wf_path.name, job_name, idx, run_text)
+                if key not in WORKFLOW_PYTEST_EXEMPTIONS:
+                    bad.append(
+                        f"{wf_path.name} job {job_name!r} step {idx} mentions "
+                        f"pytest/py.test and is not exempted: {run_text!r}"
+                    )
+    return bad
+
+
+def makefile_pytest_violations(makefile_text: str) -> list[str]:
+    """HEURISTIC (see module docstring). Returns one entry per unexempted
+    Makefile target whose continuation-joined recipe mentions
+    `pytest`/`py.test` as a word."""
+    bad: list[str] = []
+    for target_name, (_deps, recipe) in parse_makefile(makefile_text).items():
+        joined = _join_backslash_continuations(recipe)
+        if not _PYTEST_WORD_RE.search(joined):
+            continue
+        if MAKEFILE_PYTEST_EXEMPTIONS.get(target_name) != recipe:
+            bad.append(
+                f"Makefile target {target_name!r} mentions pytest/py.test and "
+                f"is not exempted (or the exemption text is stale): {recipe!r}"
+            )
+    return bad
+
+
+def test_no_unexempted_pytest_mentions_across_all_workflows():
+    assert workflow_pytest_violations(WORKFLOWS_DIR) == []
+
+
+def test_no_unexempted_pytest_mentions_across_all_makefile_targets():
+    assert makefile_pytest_violations(MAKEFILE.read_text()) == []
+
+
+def test_neuter_new_workflow_job_bare_pytest_is_caught(tmp_path: Path):
+    """A new workflow file running bare pytest, with no exemption, must be
+    flagged by the heuristic."""
+    scratch_dir = tmp_path / "workflows"
+    scratch_dir.mkdir()
+    (scratch_dir / "evasion.yml").write_text(
+        "name: evasion\njobs:\n  e:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: pytest tests/ --cov-fail-under=90\n"
+    )
+    found = workflow_pytest_violations(scratch_dir)
+    assert any("evasion.yml" in v for v in found), found
+
+
+def test_neuter_new_makefile_target_bare_pytest_is_caught():
+    mutated = (
+        MAKEFILE.read_text()
+        + "\ntest-fast:\n\t@.venv/bin/pytest tests/ --cov-fail-under=90\n"
+    )
+    found = makefile_pytest_violations(mutated)
+    assert any("test-fast" in v for v in found), found
+
+
+def test_exemption_entries_are_all_genuinely_present_and_exact():
+    """Every exemption must describe REALITY — a stale entry (text that no
+    longer matches the shipped file) is itself a finding, not a free
+    pass."""
+    data = _load_ci()
+    for wf_name, job_name, idx, run_text in WORKFLOW_PYTEST_EXEMPTIONS:
+        wf_path = WORKFLOWS_DIR / wf_name
+        assert wf_path.is_file(), f"{wf_name} no longer exists"
+        wf_data = yaml.safe_load(wf_path.read_text()) if wf_name != CI.name else data
+        actual = (wf_data["jobs"][job_name]["steps"][idx]).get("run")
+        assert actual == run_text, f"{wf_name}/{job_name}[{idx}] run text drifted"
+
+    targets = parse_makefile(MAKEFILE.read_text())
+    for target_name, exempted_text in MAKEFILE_PYTEST_EXEMPTIONS.items():
+        assert target_name in targets, (
+            f"Makefile target {target_name!r} no longer exists"
+        )
+        assert targets[target_name][1] == exempted_text, (
+            f"Makefile target {target_name!r} recipe drifted from its exemption text"
+        )
