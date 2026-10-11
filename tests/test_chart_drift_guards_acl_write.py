@@ -33,6 +33,7 @@ import functools
 import json
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
@@ -84,6 +85,105 @@ PINNED_MAPPER = {
     },
 }
 COMPARED_KEYS = ("clientId", *PINNED_FLAGS, "attributes")
+
+# ── shared extraction helpers for the F/F1/F2/F3 diagnostics (reused by
+# tests/test_acl_e2e_provisioner_script.py and
+# tests/test_acl_e2e_failure_diagnostics.py — kept here so both import
+# from ONE place and never duplicate the extraction logic) ────────────
+
+_PREAMBLE_START = "# Duplicate the REAL stdout/stderr to fd 3/4 BEFORE"
+_PREAMBLE_END = "set -E\n"
+_WRAPPER_BEGIN = "# acl-e2e-kc-begin"
+_WRAPPER_END = "# acl-e2e-kc-end\n"
+
+
+def _dedent_lines(text: str) -> str:
+    """Strip each line's OWN leading whitespace — not a common prefix —
+    so the ConfigMap's extra 4-space YAML-block-scalar indentation never
+    counts as a difference from the plain script's indentation, while a
+    REAL content difference (a token, an extra line) still shows."""
+    return "\n".join(line.lstrip() for line in text.splitlines())
+
+
+def _preamble_text(path) -> str:
+    """The script-wide trap/emit/report/fail diagnostics block, verbatim
+    from the real source (never re-typed — this is what makes the new
+    failure-line tests exercise the EMITTED artefact, not a re-
+    implementation of it)."""
+    text = path.read_text(encoding="utf-8")
+    start = text.index(_PREAMBLE_START)
+    end = text.index(_PREAMBLE_END, start) + len(_PREAMBLE_END)
+    return text[start:end]
+
+
+def _wrapper_block(path) -> str:
+    """The ``acl_e2e_kc()`` wrapper, marker-delimited, verbatim."""
+    text = path.read_text(encoding="utf-8")
+    start = text.index(_WRAPPER_BEGIN)
+    end = text.index(_WRAPPER_END, start) + len(_WRAPPER_END)
+    return text[start:end]
+
+
+def _strip_wrapper_blocks(text: str) -> str:
+    out = text
+    while _WRAPPER_BEGIN in out:
+        start = out.index(_WRAPPER_BEGIN)
+        end = out.index(_WRAPPER_END, start) + len(_WRAPPER_END)
+        out = out[:start] + out[end:]
+    return out
+
+
+def _real_function_text(path, name: str) -> str:
+    """The REAL, verbatim body of a top-level ``name() { ... }``
+    function from source — never a stub, never re-typed (F1 SF-3:
+    ``bind_scope`` must be the real production function in a test
+    harness, not a bare-call stand-in that would silently defeat the
+    dynamic marker proof)."""
+    text = path.read_text(encoding="utf-8")
+    marker = f"{name}() {{"
+    start = text.index(marker)
+    line_start = text.rfind("\n", 0, start) + 1
+    indent = text[line_start:start]
+    closer = "\n" + indent + "}\n"
+    end = text.index(closer, start) + len(closer)
+    return text[start:end]
+
+
+class TestPreambleAndWrapperMirror:
+    """F §1.4 / F2 S-c: both sites stay byte-mirrored — the trap/stage
+    machinery is identical, and the ``acl_e2e_kc`` wrapper differs ONLY
+    in the executable prefix."""
+
+    def test_preamble_byte_identical_after_dedent(self) -> None:
+        script_pre = _dedent_lines(_preamble_text(SCRIPT))
+        cm_pre = _dedent_lines(_preamble_text(CONFIGMAP))
+        assert script_pre == cm_pre
+
+    def test_wrapper_blocks_differ_only_by_exec_prefix(self) -> None:
+        script_wrap = _dedent_lines(_wrapper_block(SCRIPT))
+        cm_wrap = _dedent_lines(_wrapper_block(CONFIGMAP))
+        # The ONLY site-5-specific text is the kubectl-exec prefix in
+        # front of the real kcadm.sh path; stripping it must make the
+        # two blocks identical.
+        kubectl_prefix = 'kubectl -n "${NAMESPACE}" exec -i "${KC_POD}" -c keycloak -- '
+        assert kubectl_prefix in script_wrap
+        normalised = script_wrap.replace(kubectl_prefix, "")
+        assert normalised == cm_wrap, (
+            "the two acl_e2e_kc() blocks diverge beyond the exec prefix"
+        )
+
+    def test_no_bare_kcadm_invocation_survives_outside_the_wrapper(self) -> None:
+        """Quick sanity check (the SHAPE-COMPLETE static pin lives in
+        ``tests/test_acl_e2e_failure_diagnostics.py``): after stripping
+        the marker block, neither site has a real ``"${KCADM}"`` token
+        or a ``kcadm <subcommand> `` invocation left outside it — every
+        call goes through ``acl_e2e_kc`` (F2 BF1-a)."""
+        for path in (SCRIPT, CONFIGMAP):
+            stripped = _strip_wrapper_blocks(path.read_text(encoding="utf-8"))
+            assert "${KCADM}" not in stripped, path.name
+            assert not re.search(
+                r"\bkcadm (get|create|update|delete|config) ", stripped
+            ), path.name
 
 
 def _render_with(*extra: str) -> list[dict]:
@@ -337,6 +437,179 @@ def _holders_of_client(realm: dict, cid: str) -> set[str]:
     )
 
 
+# ── WU 2c-A0 provisioner diagnostics: the Job's deadline/backoff/grace
+# values (Addendum F §4, superseded by F1 §6 / F2 §4 / F3 S2-2 / S2-3)
+# ────────────────────────────────────────────────────────────────────────
+
+
+_RUNNER_CONFIG = REPO_ROOT / "scripts" / "deploy" / "runner" / "config.py"
+# F3 S2-2: unmeasured — Steps 1-6's own processing time, never bounded
+# by a named budget variable in source; AC-F12 closes this live. This
+# ONE number stays a disclosed estimate, never claimed as sourced.
+_ACL_E2E_POST_AUTH_BUDGET_S = 50
+
+
+class TestAclE2eProvisionerDiagnosticsJobValues:
+    """AC-F4 (superseded 240→280→**290**, F3 S2-2), AC-F9, AC-F8
+    (superseded ``20 < 30`` → ``20 + 5 < 30``, F2 §3 / F3 S2-3) — every
+    value READ FROM SOURCE (review R5), never typed as a Python
+    constant, so a revert in the source reddens this test instead of
+    the two numbers silently drifting apart."""
+
+    @staticmethod
+    def _job_spec() -> dict:
+        text = JOB.read_text(encoding="utf-8")
+        m = re.search(r"backoffLimit:\s*(\d+)", text)
+        assert m is not None
+        backoff = int(m.group(1))
+        m = re.search(r"activeDeadlineSeconds:\s*(\d+)", text)
+        assert m is not None
+        deadline = int(m.group(1))
+        m = re.search(r"restartPolicy:\s*(\w+)", text)
+        assert m is not None
+        restart = m.group(1)
+        m = re.search(r"terminationGracePeriodSeconds:\s*(\d+)", text)
+        assert m is not None
+        grace = int(m.group(1))
+        return {
+            "backoffLimit": backoff,
+            "activeDeadlineSeconds": deadline,
+            "restartPolicy": restart,
+            "terminationGracePeriodSeconds": grace,
+        }
+
+    @staticmethod
+    def _runner_helm_timeout_s() -> int:
+        text = _RUNNER_CONFIG.read_text(encoding="utf-8")
+        m = re.search(r"\btimeout:\s*int\s*=\s*(\d+)", text)
+        assert m is not None, _RUNNER_CONFIG
+        return int(m.group(1))
+
+    @staticmethod
+    def _pre_step_budgets_s(path: Path) -> dict[str, int]:
+        """ConfigMap-only (the host-run script has no retry loop at
+        all — SF3-3): the TCP and auth budgets' own `:-<default>`
+        values, and the loop's own `sleep <n>` literal, read straight
+        from the text rather than retyped."""
+        text = path.read_text(encoding="utf-8")
+        m = re.search(r'ACL_E2E_TCP_BUDGET_S:-(\d+)\}"', text)
+        assert m is not None, path.name
+        tcp_budget = int(m.group(1))
+        m = re.search(r'ACL_E2E_AUTH_BUDGET_S:-(\d+)\}"', text)
+        assert m is not None, path.name
+        auth_budget = int(m.group(1))
+        start = text.index("pre-step:tcp-wait")
+        end = text.index("pre-step:init", start)
+        pre_step_text = text[start:end]
+        sleeps = {int(n) for n in re.findall(r"\n\s*sleep (\d+)\n", pre_step_text)}
+        assert sleeps == {2}, (
+            f"expected exactly one distinct retry-sleep literal (2s) in "
+            f"the tcp-wait/auth pre-step block, found {sleeps}"
+        )
+        m = re.search(r'timeout (\d+) bash -c "exec 3<>/dev/tcp', pre_step_text)
+        assert m is not None, path.name
+        tcp_connect_bound = int(m.group(1))
+        return {
+            "tcp_budget": tcp_budget,
+            "auth_budget": auth_budget,
+            "retry_sleep": sleeps.pop(),
+            "tcp_connect_bound": tcp_connect_bound,
+        }
+
+    @staticmethod
+    def _kcadm_timeout_and_kill_after_s(path: Path) -> tuple[int, int]:
+        text = _wrapper_block(path)
+        m = re.search(r'timeout -k (\d+) "\$\{ACL_E2E_KCADM_TIMEOUT:-(\d+)\}"', text)
+        assert m is not None, path.name
+        kill_after, default_timeout = int(m.group(1)), int(m.group(2))
+        return kill_after, default_timeout
+
+    def test_backoff_and_restart_policy(self) -> None:
+        spec = self._job_spec()
+        assert spec["backoffLimit"] == 2
+        assert spec["restartPolicy"] == "Never"
+
+    def test_grace_period_is_explicit(self) -> None:
+        assert self._job_spec()["terminationGracePeriodSeconds"] == 30
+
+    def test_deadline_is_290_and_fits_the_runner_timeout(self) -> None:
+        deadline = self._job_spec()["activeDeadlineSeconds"]
+        assert deadline == 290
+        assert deadline < self._runner_helm_timeout_s()
+
+    def test_deadline_closes_on_the_measured_worst_case(self) -> None:
+        """F3 S2-2, deadline arithmetic corrected (review R5/should-fix
+        — the review measured ~284s): 120 (TCP budget) + 5 (one
+        in-flight ``timeout 5`` connect attempt) + 2 (ONE tcp-wait
+        retry sleep before the reachable attempt) + 80 (auth budget) +
+        20 + 5 (one in-flight kcadm call, timeout + kill-after) + 2
+        (ONE auth retry sleep) + 50 (post-auth, unmeasured — AC-F12
+        closes it) = 284 <= 290. Both retry sleeps, AND the tcp
+        connect attempt's own bound, were missing from the original
+        arithmetic (should-fix item)."""
+        deadline = self._job_spec()["activeDeadlineSeconds"]
+        budgets = self._pre_step_budgets_s(CONFIGMAP)
+        kill_after, default_timeout = self._kcadm_timeout_and_kill_after_s(SCRIPT)
+        worst_case = (
+            budgets["tcp_budget"]
+            + budgets["tcp_connect_bound"]
+            + budgets["retry_sleep"]
+            + budgets["auth_budget"]
+            + default_timeout
+            + kill_after
+            + budgets["retry_sleep"]
+            + _ACL_E2E_POST_AUTH_BUDGET_S
+        )
+        assert worst_case == 284
+        assert worst_case <= deadline < self._runner_helm_timeout_s()
+
+    @pytest.mark.parametrize("path", [SCRIPT, CONFIGMAP], ids=["script", "configmap"])
+    def test_kcadm_timeout_and_kill_after_beat_the_grace_period(self, path) -> None:
+        """F2 S-b / F3 S2-3: ``ACL_E2E_KCADM_TIMEOUT`` default 20 +
+        ``timeout -k 5`` kill-after must sit strictly below the pod's
+        (now explicit) 30s grace period — the ONLY mechanism for a
+        kcadm call nested inside a ``$(...)`` substitution, where a
+        trapped signal is deferred until that subshell returns."""
+        kill_after, default_timeout = self._kcadm_timeout_and_kill_after_s(path)
+        grace = self._job_spec()["terminationGracePeriodSeconds"]
+        assert kill_after + default_timeout < grace
+
+    @pytest.mark.parametrize("path", [SCRIPT, CONFIGMAP], ids=["script", "configmap"])
+    def test_tool_checks_precede_any_mktemp_or_timeout_use(self, path) -> None:
+        """AC-F11 / F3 S2-1: ``command -v timeout``/``command -v mktemp``
+        are checked, named, and precede the state that depends on them."""
+        text = path.read_text(encoding="utf-8")
+        assert "command -v timeout" in text
+        assert "command -v mktemp" in text
+        assert "code=timeout-missing" in text
+        assert "code=mktemp-missing" in text
+        assert text.index("command -v timeout") < text.index(
+            'ACL_E2E_REPORT_FILE="$(mktemp)"'
+        )
+
+    def test_shape_capture_flag_defaults_off_and_is_wired(self) -> None:
+        values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+        assert values["keycloak"]["aclE2eClient"]["shapeCapture"] is False
+        job_text = JOB.read_text(encoding="utf-8")
+        assert "AUDITTRACE_ACL_E2E_SHAPE_CAPTURE" in job_text
+        assert ".Values.keycloak.aclE2eClient.shapeCapture" in job_text
+        for flag, expect in ((True, "1"), (False, "0")):
+            docs = _render_with(
+                f"keycloak.aclE2eClient.shapeCapture={str(flag).lower()}"
+            )
+            job = next(
+                d
+                for d in docs
+                if d["kind"] == "Job"
+                and "ensure-memory-scopes" in d["metadata"]["name"]
+            )
+            env = {
+                e["name"]: e.get("value")
+                for e in job["spec"]["template"]["spec"]["containers"][0]["env"]
+            }
+            assert env["AUDITTRACE_ACL_E2E_SHAPE_CAPTURE"] == expect
+
+
 # ── the sunset mechanism ───────────────────────────────────────────────────
 
 
@@ -355,7 +628,10 @@ class TestAclE2eClientFlag:
 
     def test_values_default_is_enabled_in_2c_a(self) -> None:
         values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
-        assert values["keycloak"]["aclE2eClient"] == {"enabled": True}
+        assert values["keycloak"]["aclE2eClient"] == {
+            "enabled": True,
+            "shapeCapture": False,
+        }
 
     def test_hook_job_passes_the_flag_to_the_script(self) -> None:
         text = JOB.read_text()
