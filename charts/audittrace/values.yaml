@@ -932,24 +932,21 @@ console:
       # pinned to THIS specific published version, so tag and digest must
       # move together on every bump (mirrors console.librechat.image
       # below, not memoryServer).
-      tag: "1.29.1"
-      # BFF-BUMP-1.29.1 re-pin (2026-10-08, spec 2026-10-07-SPEC-bff-bump-
-      # 1.29.1-and-stale-override-guard.md) — the published INDEX digest for
-      # docker.io/lfds/audittrace-librechat-bff:1.29.1, HEAD-confirmed live
-      # on Docker Hub 2026-10-07/08 (anonymous pull token, OCI-index Accept
-      # header; media type `application/vnd.oci.image.index.v1+json` — the
-      # index digest, never a child-manifest digest — never fabricated or
-      # copied on trust; re-resolved independently by the spec-gate too).
-      # Bumped from `1.28.0` so the BFF tracks the released version — this
-      # WU also closes the mechanism that let a stale STORED Helm override
-      # shadow this pin forever on `--reset-then-reuse-values`, gated on
-      # live manifest presence rather than `console.enabled`'s file-side
-      # value (`scripts/deploy/runner/images.py`). Mirrors the
-      # console.librechat.image digest-pin pattern below. Tag and digest
-      # move together on every bump, never hand-edited without re-verifying
-      # against the registry. When set, the rendered image ref becomes
-      # `<repository>:<tag>@<digest>` (deployment-bff.yaml).
-      digest: "sha256:b6e907c06d4a603ce524284fefc37be9c008a38a4f9680a82356abfa66fe7212"
+      tag: "1.29.2"
+      # Phase-E re-pin (2026-10-11, release v1.29.2) — the published INDEX
+      # digest for docker.io/lfds/audittrace-librechat-bff:1.29.2, confirmed
+      # live on Docker Hub 2026-10-11 via TWO independent manifest reads
+      # (registry-1.docker.io HEAD with an OCI-index Accept header, and
+      # `docker buildx imagetools inspect`; both returned this digest with
+      # media type `application/vnd.oci.image.index.v1+json` — the index
+      # digest, never a child-manifest digest — never fabricated or copied
+      # on trust). Bumped from `1.29.1` so the BFF tracks the released
+      # version. Mirrors the console.librechat.image digest-pin pattern
+      # below. Tag and digest move together on every bump, never
+      # hand-edited without re-verifying against the registry. When set,
+      # the rendered image ref becomes `<repository>:<tag>@<digest>`
+      # (deployment-bff.yaml).
+      digest: "sha256:fac5d3e92024f5f90c24614ec23b6e2a58d9e8ef41a520da29f9757025f87b5a"
       pullPolicy: IfNotPresent
     replicaCount: 1
     port: 8766
@@ -1138,13 +1135,14 @@ tests:
     # Explicit release version, tag+digest move together on every bump —
     # mirrors console.bff.image / console.librechat.image above, not
     # memoryServer's AppVersion-tracking empty-string convenience.
-    tag: "1.29.1"
-    # BFF-BUMP-1.29.1 re-pin (2026-10-08): the published INDEX digest for
-    # docker.io/lfds/audittrace-tests:1.29.1, HEAD-confirmed live on Docker
-    # Hub 2026-10-07/08 (anonymous pull token, OCI-index Accept header),
-    # never fabricated; re-resolved independently by the spec-gate too.
-    # Bumped from `1.28.0`. Tag+digest move together on every bump.
-    digest: "sha256:b07cc17a5c6b4f2f117fa755f1ab1f386ff72ffc6262b84cd35729cb6383e419"
+    tag: "1.29.2"
+    # Phase-E re-pin (2026-10-11, release v1.29.2): the published INDEX
+    # digest for docker.io/lfds/audittrace-tests:1.29.2, confirmed live on
+    # Docker Hub 2026-10-11 via TWO independent manifest reads (registry
+    # HEAD with an OCI-index Accept header, and `docker buildx imagetools
+    # inspect`), never fabricated. Bumped from `1.29.1`. Tag+digest move
+    # together on every bump.
+    digest: "sha256:f01ffa6357d21eee2a5f721b4c8f82ca8fb5db4bd85eb50a00a9a845a7b421a5"
     pullPolicy: IfNotPresent
   resources:
     requests:
