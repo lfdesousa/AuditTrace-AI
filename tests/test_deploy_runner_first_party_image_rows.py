@@ -746,8 +746,7 @@ def test_rows_skips_malformed_container_entries(tmp_path, monkeypatch):
 # must be `unreadable` (unequal), never `render_only` — Kubernetes
 # REQUIRES a selector on Deployment/StatefulSet/DaemonSet, so a selector
 # this runner cannot derive from the manifest means "cannot read", not
-# "nothing to read" (reviewer repro:
-# 2026-10-08-REVIEW-bff-bump-fix1-repro_selector_edges.py).
+# "nothing to read" (per an independent review's own reproduction).
 
 
 @pytest.mark.parametrize("kind", ["Deployment", "StatefulSet", "DaemonSet"])

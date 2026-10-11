@@ -1,5 +1,5 @@
-"""B-1 converged-control, permanent test (fix round 1, review verdict
-2026-10-08-REVIEW-bff-bump-stale-override.md).
+"""B-1 converged-control, permanent test (fix round 1, an independent
+review's verdict).
 
 The pod-reaper (`charts/audittrace/templates/reaper/deployment.yaml`) runs
 the MEMORY-SERVER image in a container named `pod-reaper`, under its OWN
@@ -10,10 +10,10 @@ LOOKUP TABLE (the component identity of the IMAGE, not the workload's own
 manifest selector) reads the wrong pods for the reaper's row: zero pods
 match `component=memory-server` filtered for a `pod-reaper` container, so
 the row comes back `unreadable` — mismatched — and EVERY real deploy exits
-8, even when the cluster is perfectly converged. This is the reviewer's
-`repro_converged.py`, ported to a permanent pytest assertion against the
-REAL `helm template` render of this commit's chart — no synthetic
-stand-in for the manifest shape.
+8, even when the cluster is perfectly converged. This is the independent
+review's own reproduction script, ported to a permanent pytest assertion
+against the REAL `helm template` render of this commit's chart — no
+synthetic stand-in for the manifest shape.
 
 Falsifiable: key the live read off `_selector_for_component(component)`
 (a component->selector table) instead of
