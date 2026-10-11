@@ -26,6 +26,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._hermetic_env import hermetic_env
+
 ROOT = Path(__file__).resolve().parent.parent
 MAKEFILE = ROOT / "Makefile"
 CI = ROOT / ".github/workflows/ci.yml"
@@ -123,7 +125,7 @@ def _run_typecheck(
     shim = tmp_path / "shim"
     shim.mkdir(exist_ok=True)
     (shim / "make").symlink_to(make)
-    env = {"PATH": os.pathsep.join([str(shim), *map(str, path_dirs)])}
+    env = hermetic_env({"PATH": os.pathsep.join([str(shim), *map(str, path_dirs)])})
     return subprocess.run(  # noqa: S603 - fixed argv
         [str(shim / "make"), "typecheck"],
         cwd=tmp_path,

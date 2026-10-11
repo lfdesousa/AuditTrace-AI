@@ -95,75 +95,125 @@ def _patched_subprocess_run(*args, **kwargs):
 
 subprocess.run = _patched_subprocess_run
 
-# ─────────── R3 hermetic cluster-tool guard (PR #380, CI run 37878027812) ────
-# Two tests in tests/test_deploy_runner.py called `runner.main(...)` without
-# stubbing the mesh gate. The mesh gate's OWN `_run` seam (scripts/deploy/
-# mesh.py) shells to a REAL `kubectl`. On the laptop (a live k3s cluster)
-# that silently "worked"; in CI (no cluster) P0 aborted MESH UNSAFE and both
-# tests flipped from pass to `assert 3 == 8` / `StopIteration`. Nothing
-# detected the leak mechanically — SPEC 2026-10-11-SPEC-test-parity-
-# scripted-enforcement.md R3, tightened by ADDENDUM A1 (A1-1/A1-2) after an
-# independent review REJECT (decisions-in/2026-10-11-REVIEW-bff-bump-ci-fix.md,
-# B1/B2) found the first cut both VACUOUS (no committed test exercised it —
-# deleting it changed nothing) and EVADABLE (bytes argv, `executable=`, `env`/
-# `sh -c`/`shell=True` wrapper forms, and the raw `os.exec*`/`posix_spawn*`/
-# `spawn*`/`pty.spawn` families all slipped through unpatched).
+# ─────────── Hermetic cluster-tool guard: process layer + in-process diagnostic ────
+# PR #380, CI run 37878027812: two tests in tests/test_deploy_runner.py called
+# runner.main(...) without stubbing the mesh gate. The mesh gate's own `_run`
+# seam (scripts/deploy/mesh.py) shelled to a REAL kubectl. On the laptop (a
+# live k3s cluster) that silently "worked"; in CI (no cluster) P0 aborted
+# MESH UNSAFE and both tests flipped from pass to failure. Nothing detected
+# the leak mechanically.
 #
-# What is ACTUALLY patched, and what is proven by a committed test in
-# tests/test_hermetic_cluster_tool_guard.py (B4 — this paragraph states only
-# what that file measures, never "every" or "any" seam in the abstract):
-#   * subprocess.Popen.__init__ (so run/call/check_call/check_output, which
-#     all construct a Popen internally, are covered too) — tested with list
-#     argv, bytes argv, and the `executable=` kwarg.
-#   * os.system (a shell string) — tested with a kubectl-containing string.
-#   * asyncio.create_subprocess_exec / create_subprocess_shell — tested with
-#     a kubectl list argv and a kubectl shell string respectively.
-#   * os.execv / os.execve / os.execvp / os.execl (one test per distinct
-#     calling convention: list-style path-first, list-style PATH-searched,
-#     *args-style) via a fork-isolated harness (os.exec* REPLACES the
-#     calling process on success, so the harness runs the call in a forked
-#     CHILD and inspects its exit status — a guard bug can only take down
-#     the throwaway child, never the test runner).
-#   * os.posix_spawn / os.posix_spawnp, and os.spawnv (representative of the
-#     os.spawn* family — all of them fork+exec or posix_spawn internally).
-#   * pty.spawn.
-#   * The `env [VAR=val ...] <tool> ...` wrapper, `sh -c "<string>"` / `bash
-#     -c "<string>"`, and a `shell=True` string split on `;`, `&&`, `||`,
-#     `|` and newlines with EVERY segment checked (not just the first) — an
-#     unparseable segment that still contains the word `kubectl` or `helm`
-#     fails closed rather than being silently skipped.
-#   * The two-sided allowlist opt-in (`_opt_in_allows`), proven for all four
-#     combinations (marker only, entry only, both matching, tool mismatch)
-#     against the REAL dict object and the REAL enforcement function.
+# SPEC 2026-10-11-SPEC-test-parity-scripted-enforcement.md R3, carried
+# through ADDENDUM A1 (committed tests), then rebuilt twice more after the
+# independent review found new bypasses each round it was asked to parse
+# argv forms and enumerate wrappers (env/sh -c/shell=True/...). ADDENDUM A2
+# through A7 changed the INSTRUMENT instead of adding more forms:
+#
+#   * The PROCESS layer is now the control (scripts/ci/run-tests.sh): a
+#     shim dir placed first on PATH ships BOTH a `kubectl` and a `helm`
+#     that reject anything the chart-rendering/linting subset doesn't need,
+#     logging every call to a reject log the script fails on if non-empty.
+#     This catches any child that resolves the tool through PATH — shell
+#     constructs, child interpreters, every wrapper — without parsing
+#     anything.
+#   * The code below is the IN-PROCESS layer: a DIAGNOSTIC, not the
+#     control. It is a fail-closed WORD check (collect every string a
+#     spawn call carries, split into words, raise if `kubectl` appears
+#     anywhere, or if `helm` appears without the call being one of the
+#     explicitly positional-safe chart-only invocations) PLUS an env
+#     equality check that runs on EVERY spawn regardless of which tool it
+#     names (a rebuilt child environment could run any program that then
+#     shells to a cluster tool). What it can MISS (`kube""ctl`, a
+#     versioned binary name, a child interpreter, ...) is accepted and
+#     owned by the shim — tests/test_hermetic_cluster_tool_guard.py
+#     measures both halves separately.
+#
+# Every raise is also RECORDED (per-test, or session-level when no test
+# node is active) before it propagates, so a test whose own code swallows
+# the exception still fails at teardown — tests/_hermetic_env.py's
+# `expect_hermetic_violation` context manager is the one sanctioned way
+# to consume a deliberately-triggered record entry; a bare `pytest.raises`
+# on the guard's error type is banned in tests/ (a static test enforces
+# it).
 import asyncio  # noqa: E402
 import pty  # noqa: E402
 import re  # noqa: E402
-import shlex  # noqa: E402
+import sys  # noqa: E402
+import warnings  # noqa: E402
 
 from tests.hermetic_allowlist import ALLOWED_CLUSTER_TOOL_TESTS  # noqa: E402
 
 #: helm subcommands that never touch a live cluster (chart rendering /
-#: static linting / vendoring only) — see the spec's R3 text verbatim.
+#: static linting / vendoring only) — the spec's positional ALLOW rule.
 _HELM_SAFE_SUBCOMMANDS = frozenset(
     {"template", "lint", "dependency", "version", "show"}
 )
+#: `dependency` is restricted to `list` — `build`/`update` touch the
+#: network and rewrite Chart.lock / charts/*.tgz; no test needs them.
+_HELM_DEPENDENCY_SAFE_ARGS = frozenset({"list"})
+_HELM_UNSAFE_ARG_PREFIXES = ("--validate", "--dry-run", "--kube")
 
-#: Set by the autouse fixture below for the duration of each test; read by
-#: every patched spawn point so the violation message can name the test.
-_current_test_node: list[object] = [None]
+#: word-split boundary: any character outside [A-Za-z0-9_.-].
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
-#: shell metacharacters a `shell=True` string / a `sh -c`/`bash -c` argument
-#: is split on before each segment is checked independently (A1-2).
-_SHELL_OPERATOR_SPLIT = re.compile(r"&&|\|\||;|\||\n")
-
-#: fail-closed fallback (A1-2): a segment that cannot be tokenized (shlex
-#: raises, e.g. an unbalanced quote) is still treated as a violation if it
-#: contains either word, rather than silently passing.
-_DANGEROUS_WORD_RE = re.compile(r"\b(kubectl|helm)\b")
+_HELM_KUBE_ENV_PREFIX = "HELM_KUBE"
+#: a PREFIX, not an exact two-name list — real in-cluster pods also get
+#: `KUBERNETES_SERVICE_PORT_HTTPS` (and potentially other
+#: `KUBERNETES_SERVICE_*` variants) from Kubernetes' own service-env
+#: injection; an exact-name list misses them (measured: the independent
+#: review's probe found `KUBERNETES_SERVICE_PORT_HTTPS` surviving the
+#: exact-list check).
+_KUBERNETES_ENV_PREFIX = "KUBERNETES_SERVICE_"
 
 
 class HermeticClusterToolError(AssertionError):
-    """Raised the instant a test reaches a real cluster-touching command."""
+    """Raised the instant a test spawn names a forbidden cluster tool as a
+    word, or would hand its child a non-hermetic environment."""
+
+
+class _SentinelHolder:
+    """The frozen hermetic sentinel values this pytest session started
+    with. ``tests/_hermetic_env.py::override_sentinel()`` is the only
+    sanctioned way to change these once frozen — a static test in
+    ``tests/test_hermetic_cluster_tool_guard.py`` asserts no other file
+    under ``tests/`` references this holder by name."""
+
+    __slots__ = ("shim_dir", "kubeconfig", "required")
+
+    def __init__(self) -> None:
+        self.shim_dir: str | None = None
+        self.kubeconfig: str | None = None
+        self.required: bool = False
+
+    def freeze_from_environ(self) -> None:
+        self.shim_dir = os.environ.get("HERMETIC_SHIM_DIR") or None
+        self.kubeconfig = os.environ.get("HERMETIC_KUBECONFIG") or None
+        self.required = os.environ.get("HERMETIC_REQUIRED") == "1"
+
+
+#: Frozen the instant this module is imported — deliberately textually
+#: ABOVE the AUDITTRACE_* wipe block below, as defence in depth (untested
+#: by design: this ordering has no committed test of its own; the
+#: `AUDITTRACE_` prefix neuter below is what proves the NAMES must avoid
+#: the wipe, which is the part that IS tested).
+HERMETIC_SENTINELS = _SentinelHolder()
+HERMETIC_SENTINELS.freeze_from_environ()
+
+#: Per-test violation record. Every in-process raise appends here FIRST,
+#: then raises — so code under test that swallows the exception
+#: (`except Exception: pass`) still leaves evidence the autouse fixture's
+#: teardown checks. Allowlisted calls never reach this.
+PER_TEST_VIOLATIONS: list[str] = []
+
+#: Violations recorded while no test node is active (import time,
+#: collection, or session-scoped fixture setup) — checked at session end.
+_SESSION_VIOLATIONS: list[str] = []
+
+#: Set by the autouse fixture below for the duration of each test.
+_current_test_node: list[object] = [None]
+
+#: Fires at most once per session (A4-2(h): "exactly ONE warning").
+_sentinel_absent_warned: list[bool] = [False]
 
 
 def _decode(token: object) -> str:
@@ -179,68 +229,64 @@ def _basename(token: object) -> str:
         return str(token)
 
 
-def _is_cluster_touching(tool: str, subcommand: str | None) -> bool:
-    if tool == "kubectl":
-        return True
-    if tool == "helm":
-        return subcommand not in _HELM_SAFE_SUBCOMMANDS
-    return False
+def _collect_words(*sources: object) -> set[str]:
+    """Every word any of ``sources`` carries: each list/tuple element
+    decoded, or the source itself if it's a single string/bytes value,
+    split on any character outside [A-Za-z0-9_.-], basenamed."""
+    words: set[str] = set()
+    for source in sources:
+        if source is None:
+            continue
+        strings = (
+            [_decode(x) for x in source]
+            if isinstance(source, (list, tuple))
+            else [_decode(source)]
+        )
+        for s in strings:
+            for raw in _WORD_SPLIT_RE.split(s):
+                if raw:
+                    words.add(os.path.basename(raw))
+    return words
 
 
-def _shell_segments(s: str) -> list[str]:
-    return [seg for seg in _SHELL_OPERATOR_SPLIT.split(s) if seg.strip()]
-
-
-def _segment_tool_subcommand(segment: str) -> tuple[str, str | None] | None:
-    """Tokenizes one shell segment. Returns ``None`` (never a false "safe")
-    when the segment cannot be tokenized at all — the caller fails closed
-    on that, per A1-2."""
-    try:
-        tokens = shlex.split(segment)
-    except ValueError:
-        return None
-    if not tokens:
-        return "", None
-    return _basename(tokens[0]), (tokens[1] if len(tokens) > 1 else None)
-
-
-def _raise_if_cluster_touching(
-    tool: str, subcommand: str | None, *, display: str
-) -> None:
-    if not _is_cluster_touching(tool, subcommand):
-        return
-    node = _current_test_node[0]
-    nodeid = node.nodeid if node is not None else "<no active test>"
-    marker = node.get_closest_marker("allow_cluster_tool") if node is not None else None
-    marker_tool = marker.kwargs.get("tool") if marker is not None else None
-    if _opt_in_allows(nodeid, tool, marker_tool, ALLOWED_CLUSTER_TOOL_TESTS):
-        return
-    raise HermeticClusterToolError(
-        f"hermetic guard: {nodeid!r} reached a REAL cluster-touching "
-        f"command ({display}) without stubbing it. `kubectl` and any "
-        f"cluster-mutating/-reading `helm` subcommand are forbidden in the "
-        f"test suite (SPEC 2026-10-11-SPEC-test-parity-scripted-"
-        f"enforcement.md R3 + ADDENDUM A1) — stub the seam instead (e.g. "
-        f"inject a `mesh_gate=_healthy_gate()` the way the sibling "
-        f"DeployRunner tests do). A deliberate exception needs BOTH "
-        f"@pytest.mark.allow_cluster_tool(tool={tool!r}) AND a matching "
-        f"entry in tests/hermetic_allowlist.py — it does not have either."
-    )
+def _helm_call_is_allowed(
+    cmd: object, *, shell: bool, executable: object | None
+) -> bool:
+    """The positional ALLOW rule: a list-form (never shell=True) helm
+    invocation whose argv[1] is one of the safe subcommands, whose
+    `dependency` (if any) is followed only by `list`, none of whose
+    arguments start with --validate/--dry-run/--kube(config), and whose
+    `executable=` (if given) is itself helm."""
+    if shell or not isinstance(cmd, (list, tuple)) or not cmd:
+        return False
+    tokens = [_decode(t) for t in cmd]
+    if _basename(tokens[0]) != "helm":
+        return False
+    if len(tokens) < 2 or tokens[1] not in _HELM_SAFE_SUBCOMMANDS:
+        return False
+    if tokens[1] == "dependency" and (
+        len(tokens) < 3 or tokens[2] not in _HELM_DEPENDENCY_SAFE_ARGS
+    ):
+        return False
+    if any(t.startswith(_HELM_UNSAFE_ARG_PREFIXES) for t in tokens[1:]):
+        return False
+    if executable is not None and _basename(executable) != "helm":
+        return False
+    return True
 
 
 def _opt_in_allows(
-    nodeid: str,
+    nodeid: str | None,
     tool: str,
     marker_tool: str | None,
     allowlist: dict[str, str],
 ) -> bool:
-    """The two-sided opt-in (A1-1's four cases): the marker's declared tool,
-    the allowlist entry's tool, AND the tool actually being invoked must
-    ALL three agree, or the guard still denies (a marker/allowlist pair
-    that agrees with each other but not with what is actually running is
-    the "tool mismatch" case — it must deny too). A pure function so
-    tests/test_hermetic_cluster_tool_guard.py can exercise all four
-    combinations directly against this exact logic."""
+    """The two-sided opt-in: the marker's declared tool, the allowlist
+    entry's tool, AND the tool actually being invoked must ALL three
+    agree, or the guard still denies. Waives only the word-rule check
+    below — never the env check (no opt-in at the process layer)."""
+    if nodeid is None:
+        return False
     allowed_tool = allowlist.get(nodeid)
     return (
         marker_tool is not None
@@ -249,107 +295,183 @@ def _opt_in_allows(
     )
 
 
-def _check_segment_or_fail_closed(segment: str, *, display: str) -> None:
-    parsed = _segment_tool_subcommand(segment)
-    if parsed is None:
-        if _DANGEROUS_WORD_RE.search(segment):
-            raise HermeticClusterToolError(
-                f"hermetic guard: {display} — shell segment {segment!r} could "
-                f"not be tokenized but contains a forbidden word; failing "
-                f"closed (SPEC ... ADDENDUM A1-2)."
+def _node_marker_tool() -> tuple[str | None, str | None]:
+    node = _current_test_node[0]
+    if node is None:
+        return None, None
+    marker = node.get_closest_marker("allow_cluster_tool")
+    return node.nodeid, (marker.kwargs.get("tool") if marker is not None else None)
+
+
+def _record_violation(message: str) -> None:
+    if _current_test_node[0] is not None:
+        PER_TEST_VIOLATIONS.append(message)
+    else:
+        _SESSION_VIOLATIONS.append(message)
+
+
+def _raise_violation(message: str) -> None:
+    _record_violation(message)
+    raise HermeticClusterToolError(message)
+
+
+def _enforce_word_rule(
+    cmd: object, *, executable: object | None, shell: bool, display: str
+) -> None:
+    words = _collect_words(cmd, executable)
+    nodeid, marker_tool = _node_marker_tool()
+    if "kubectl" in words:
+        if _opt_in_allows(nodeid, "kubectl", marker_tool, ALLOWED_CLUSTER_TOOL_TESTS):
+            return
+        _raise_violation(
+            f"hermetic guard: {nodeid!r} names kubectl ({display}) — forbidden "
+            f"in the test suite (SPEC 2026-10-11-SPEC-test-parity-scripted-"
+            f"enforcement.md R3, ADDENDUM A2+). Stub the seam instead (e.g. "
+            f"inject a `mesh_gate=_healthy_gate()` the way the sibling "
+            f"DeployRunner tests do). A deliberate exception needs BOTH "
+            f"@pytest.mark.allow_cluster_tool(tool='kubectl') AND a matching "
+            f"entry in tests/hermetic_allowlist.py — the kubectl allowlist "
+            f"stays empty."
+        )
+        return
+    if "helm" in words and not _helm_call_is_allowed(
+        cmd, shell=shell, executable=executable
+    ):
+        if _opt_in_allows(nodeid, "helm", marker_tool, ALLOWED_CLUSTER_TOOL_TESTS):
+            return
+        _raise_violation(
+            f"hermetic guard: {nodeid!r} names helm outside the safe "
+            f"chart-only subcommand set {{{', '.join(sorted(_HELM_SAFE_SUBCOMMANDS))}}} "
+            f"({display}). Stub the seam, or opt in with BOTH "
+            f"@pytest.mark.allow_cluster_tool(tool='helm') AND a matching "
+            f"tests/hermetic_allowlist.py entry."
+        )
+
+
+def _resolve_child_env(env: dict | None) -> dict:
+    return dict(env) if env is not None else dict(os.environ)
+
+
+def _env_violations(env: dict) -> list[str]:
+    problems: list[str] = []
+    if env.get("KUBECONFIG") != HERMETIC_SENTINELS.kubeconfig:
+        problems.append(
+            f"KUBECONFIG={env.get('KUBECONFIG')!r} (expected sentinel "
+            f"{HERMETIC_SENTINELS.kubeconfig!r})"
+        )
+    path_value = env.get("PATH") or ""
+    path_first = path_value.split(os.pathsep)[0] if path_value else ""
+    if path_first != HERMETIC_SENTINELS.shim_dir:
+        problems.append(
+            f"PATH[0]={path_first!r} (expected shim dir {HERMETIC_SENTINELS.shim_dir!r})"
+        )
+    for name in env:
+        if name.startswith(_KUBERNETES_ENV_PREFIX) or name.startswith(
+            _HELM_KUBE_ENV_PREFIX
+        ):
+            problems.append(f"{name} is set")
+    return problems
+
+
+def _enforce_env_rule(env: dict | None, *, display: str) -> None:
+    """Runs on EVERY spawn, regardless of which tool (if any) it names —
+    a rebuilt child env could run a program that itself shells to a
+    cluster tool. Fails closed only when HERMETIC_REQUIRED=1; otherwise,
+    if the sentinel is simply absent, this emits ONE session warning and
+    does not raise (a developer running bare pytest is not CI-shaped, but
+    the word check and the rest of the suite must still run)."""
+    if HERMETIC_SENTINELS.shim_dir and HERMETIC_SENTINELS.kubeconfig:
+        problems = _env_violations(_resolve_child_env(env))
+        if problems:
+            _raise_violation(
+                f"hermetic guard: {display} would receive a non-hermetic "
+                f"child environment: {'; '.join(problems)}."
             )
         return
-    tool, subcommand = parsed
-    _raise_if_cluster_touching(
-        tool, subcommand, display=f"{display} (segment {segment!r})"
-    )
-
-
-def _check_shell_string(s: str, *, display: str) -> None:
-    for segment in _shell_segments(s):
-        _check_segment_or_fail_closed(segment, display=display)
-
-
-def _env_and_sh_unwrapped(tokens: list[str]) -> list[str]:
-    """Peels a leading ``env [VAR=val ...]`` wrapper off an argv token
-    list (A1-2). Returns the tokens unchanged if there is no such wrapper."""
-    if not tokens or _basename(tokens[0]) != "env":
-        return tokens
-    i = 1
-    while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
-        i += 1
-    return tokens[i:]
-
-
-def _enforce_hermetic_argv(argv: list[object], *, display_prefix: str = "") -> None:
-    """The list/tuple-argv path (Popen-style AND the exec/spawn families,
-    which all hand us a full argv including argv[0]). Unwraps `env` and
-    `sh|bash -c "<string>"` wrappers (A1-2) before checking."""
-    tokens = [_decode(t) for t in argv]
-    tokens = _env_and_sh_unwrapped(tokens)
-    if not tokens:
+    if HERMETIC_SENTINELS.required:
+        _raise_violation(
+            f"hermetic guard: {display} — HERMETIC_REQUIRED=1 but "
+            f"HERMETIC_SHIM_DIR/HERMETIC_KUBECONFIG are absent."
+        )
         return
-    tool = _basename(tokens[0])
-    if tool in ("sh", "bash") and len(tokens) >= 3 and tokens[1] == "-c":
-        _check_shell_string(tokens[2], display=f"{display_prefix}{tool} -c")
-        return
-    subcommand = tokens[1] if len(tokens) > 1 else None
-    _raise_if_cluster_touching(
-        tool, subcommand, display=f"{display_prefix}{' '.join(tokens)!r}"
-    )
+    if not _sentinel_absent_warned[0]:
+        _sentinel_absent_warned[0] = True
+        warnings.warn(
+            "hermetic guard: HERMETIC_SHIM_DIR/HERMETIC_KUBECONFIG are not "
+            "set — this run is not CI-shaped (scripts/ci/run-tests.sh sets "
+            "them). The kubectl/helm word check still applies; the child-"
+            "environment equality check does not.",
+            stacklevel=3,
+        )
 
 
-def _enforce_hermetic(cmd: object, *, executable: object | None = None) -> None:
-    """The Popen/os.system/asyncio entry point. ``cmd`` is an argv
-    list/tuple (possibly bytes elements), or a shell string (``shell=True``
-    / ``os.system`` / ``create_subprocess_shell``). ``executable=`` (A1-2),
-    when given, is the REAL program invoked — argv[0] is then just a
-    display name the program sees as its own, not what actually runs."""
+def _enforce_hermetic(
+    cmd: object,
+    *,
+    executable: object | None = None,
+    shell: bool = False,
+    env: dict | None = None,
+    display_prefix: str = "",
+) -> None:
+    display = f"{display_prefix}{cmd!r}"
     if executable is not None:
-        tool = _basename(executable)
-        rest = [_decode(t) for t in cmd] if isinstance(cmd, (list, tuple)) else []
-        subcommand = rest[1] if len(rest) > 1 else None
-        _raise_if_cluster_touching(
-            tool, subcommand, display=f"executable={executable!r} args={cmd!r}"
+        display += f" executable={executable!r}"
+    _enforce_word_rule(cmd, executable=executable, shell=shell, display=display)
+    _enforce_env_rule(env, display=display)
+
+
+def _violation_teardown_message(nodeid: str, violations: list[str]) -> str:
+    return (
+        f"hermetic guard: {len(violations)} violation(s) were recorded "
+        f"during {nodeid!r} even though the test's own code did not "
+        f"propagate the error (e.g. a swallowed except Exception): "
+        + "; ".join(violations)
+    )
+
+
+def _teardown_check_and_clear(node: object) -> None:
+    violations = list(PER_TEST_VIOLATIONS)
+    PER_TEST_VIOLATIONS.clear()
+    if violations:
+        pytest.fail(_violation_teardown_message(node.nodeid, violations), pytrace=False)
+
+
+def pytest_sessionfinish(session: object, exitstatus: int) -> None:
+    """A6-7/A7-4: violations recorded with no active test node (import,
+    collection, or session-scoped fixture setup) are checked here."""
+    if _SESSION_VIOLATIONS:
+        violations = list(_SESSION_VIOLATIONS)
+        print(
+            f"\nhermetic guard: {len(violations)} violation(s) were recorded "
+            f"outside any active test node: {violations!r}",
+            file=sys.stderr,
         )
-        return
-    if isinstance(cmd, (list, tuple)):
-        _enforce_hermetic_argv(list(cmd))
-        return
-    if isinstance(cmd, bytes):
-        cmd = _decode(cmd)
-    if isinstance(cmd, str):
-        _check_shell_string(cmd, display=f"shell string {cmd!r}")
-        return
-    # Anything else (an unrecognised command shape): best-effort, fail
-    # closed only if its text form names a forbidden tool outright.
-    if _DANGEROUS_WORD_RE.search(repr(cmd)):
-        raise HermeticClusterToolError(
-            f"hermetic guard: unrecognised command shape {cmd!r} names a "
-            f"forbidden tool; failing closed."
-        )
+        session.exitstatus = 1
 
 
 @pytest.fixture(autouse=True)
 def _hermetic_cluster_tool_guard(request):
-    """Stash the running test's node so the patched spawn points below can
-    name it in a violation message, and can look up its marker."""
+    """Stashes the running test's node (so patched spawn points can name
+    it and look up its marker), resets the per-test violation record, and
+    at teardown fails the test if anything was recorded even though the
+    test's own code swallowed the raise."""
     _current_test_node[0] = request.node
-    try:
-        yield
-    finally:
-        _current_test_node[0] = None
+    PER_TEST_VIOLATIONS.clear()
+    yield
+    _current_test_node[0] = None
+    _teardown_check_and_clear(request.node)
 
 
 _orig_popen_init = subprocess.Popen.__init__
 
 
-def _patched_popen_init(self, args=(), *a, executable=None, shell=False, **kw):
-    if shell and isinstance(args, (list, tuple)) and args:
-        _enforce_hermetic(args[0], executable=executable)
-    else:
-        _enforce_hermetic(args, executable=executable)
-    return _orig_popen_init(self, args, *a, executable=executable, shell=shell, **kw)
+def _patched_popen_init(
+    self, args=(), *a, executable=None, shell=False, env=None, **kw
+):
+    _enforce_hermetic(args, executable=executable, shell=shell, env=env)
+    return _orig_popen_init(
+        self, args, *a, executable=executable, shell=shell, env=env, **kw
+    )
 
 
 subprocess.Popen.__init__ = _patched_popen_init
@@ -358,7 +480,7 @@ _orig_os_system = os.system
 
 
 def _patched_os_system(command):
-    _enforce_hermetic(command)
+    _enforce_hermetic(command, shell=True)
     return _orig_os_system(command)
 
 
@@ -369,12 +491,14 @@ _orig_create_subprocess_shell = asyncio.create_subprocess_shell
 
 
 async def _patched_create_subprocess_exec(program, *args, **kw):
-    _enforce_hermetic([program, *args], executable=kw.get("executable"))
+    _enforce_hermetic(
+        [program, *args], executable=kw.get("executable"), env=kw.get("env")
+    )
     return await _orig_create_subprocess_exec(program, *args, **kw)
 
 
 async def _patched_create_subprocess_shell(cmd, *args, **kw):
-    _enforce_hermetic(cmd)
+    _enforce_hermetic(cmd, shell=True, env=kw.get("env"))
     return await _orig_create_subprocess_shell(cmd, *args, **kw)
 
 
@@ -383,14 +507,12 @@ asyncio.create_subprocess_shell = _patched_create_subprocess_shell
 asyncio.subprocess.create_subprocess_exec = _patched_create_subprocess_exec
 asyncio.subprocess.create_subprocess_shell = _patched_create_subprocess_shell
 
-# ── the raw os.exec*/os.posix_spawn*/os.spawn* families + pty.spawn (A1-2) ──
-# These never go through subprocess.Popen. os.execv/execve/execl/execlp (and
-# every other exec* variant, which CPython's os.py funnels through these
-# two at the C level) REPLACE the calling process image on success, so a
-# guard bug here could kill more than the one test — see the fork-isolated
-# harness in tests/test_hermetic_cluster_tool_guard.py, which is what
-# actually proves these are covered (B4: this comment claims coverage of
-# exactly these named functions, nothing broader).
+# ── the raw os.exec*/os.posix_spawn*/os.spawn* families + pty.spawn ──
+# os.execv/execve/execl/... (and every other exec* variant CPython funnels
+# through these at the C level) REPLACE the calling process image on
+# success, so a guard bug here could kill more than the one test — see the
+# fork-isolated harness in tests/test_hermetic_cluster_tool_guard.py, which
+# is what proves these are covered (identity-pinned by A4-1's test too).
 
 _orig_execv = os.execv
 _orig_execve = os.execve
@@ -413,11 +535,10 @@ _orig_spawnlpe = os.spawnlpe
 _orig_pty_spawn = pty.spawn
 
 
-def _check_path_and_argv(path_like: object, argv: list[object]) -> None:
-    tool = _basename(path_like)
-    decoded = [_decode(a) for a in argv]
-    subcommand = decoded[1] if len(decoded) > 1 else None
-    _raise_if_cluster_touching(tool, subcommand, display=f"{path_like!r} argv={argv!r}")
+def _check_path_and_argv(
+    path_like: object, argv: list[object], env: dict | None = None
+) -> None:
+    _enforce_hermetic(list(argv), executable=path_like, env=env)
 
 
 def _patched_execv(path, args):
@@ -426,7 +547,7 @@ def _patched_execv(path, args):
 
 
 def _patched_execve(path, args, env):
-    _check_path_and_argv(path, list(args))
+    _check_path_and_argv(path, list(args), env=env)
     return _orig_execve(path, args, env)
 
 
@@ -436,7 +557,7 @@ def _patched_execvp(file, args):
 
 
 def _patched_execvpe(file, args, env):
-    _check_path_and_argv(file, list(args))
+    _check_path_and_argv(file, list(args), env=env)
     return _orig_execvpe(file, args, env)
 
 
@@ -461,12 +582,12 @@ def _patched_execlpe(file, *args):
 
 
 def _patched_posix_spawn(path, argv, env, **kw):
-    _check_path_and_argv(path, list(argv))
+    _check_path_and_argv(path, list(argv), env=env)
     return _orig_posix_spawn(path, argv, env, **kw)
 
 
 def _patched_posix_spawnp(file, argv, env, **kw):
-    _check_path_and_argv(file, list(argv))
+    _check_path_and_argv(file, list(argv), env=env)
     return _orig_posix_spawnp(file, argv, env, **kw)
 
 
@@ -476,7 +597,7 @@ def _patched_spawnv(mode, path, args):
 
 
 def _patched_spawnve(mode, path, args, env):
-    _check_path_and_argv(path, list(args))
+    _check_path_and_argv(path, list(args), env=env)
     return _orig_spawnve(mode, path, args, env)
 
 
@@ -486,7 +607,7 @@ def _patched_spawnvp(mode, file, args):
 
 
 def _patched_spawnvpe(mode, file, args, env):
-    _check_path_and_argv(file, list(args))
+    _check_path_and_argv(file, list(args), env=env)
     return _orig_spawnvpe(mode, file, args, env)
 
 

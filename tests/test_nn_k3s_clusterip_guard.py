@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._hermetic_env import hermetic_env
+
 WRAPPER = (
     Path(__file__).resolve().parents[1]
     / "scripts"
@@ -95,11 +97,13 @@ def _run_wrapper(
     installed = _install_wrapper_copy(tmp_path)
     _install_stub_repo(tmp_path, exit_code=exit_code)
     marker = tmp_path / "marker.json"
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "TEST_MARKER_FILE": str(marker),
-        "TEST_STUB_EXIT_CODE": str(exit_code),
-    }
+    env = hermetic_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "TEST_MARKER_FILE": str(marker),
+            "TEST_STUB_EXIT_CODE": str(exit_code),
+        }
+    )
     if repo_dir is not None:
         env["AUDITTRACE_REPO_DIR"] = str(repo_dir)
     proc = subprocess.run(
@@ -198,11 +202,13 @@ def test_wrapper_tolerates_missing_positional_args(
     marker = tmp_path / "marker.json"
     proc = subprocess.run(
         ["bash", str(installed), *argv],
-        env={
-            "PATH": "/usr/bin:/bin",
-            "TEST_MARKER_FILE": str(marker),
-            "AUDITTRACE_REPO_DIR": str(fake_repo),
-        },
+        env=hermetic_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "TEST_MARKER_FILE": str(marker),
+                "AUDITTRACE_REPO_DIR": str(fake_repo),
+            }
+        ),
         capture_output=True,
         text=True,
         check=False,

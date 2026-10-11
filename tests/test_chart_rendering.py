@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._hermetic_env import hermetic_env
+
 CHART_DIR = Path(__file__).resolve().parent.parent / "charts" / "audittrace"
 
 # Throwaway secret values to satisfy the chart's productionMode hygiene
@@ -392,7 +394,7 @@ class TestEntrypointScriptSafety:
         result = subprocess.run(
             ["bash", "scripts/entrypoint.sh"],
             cwd=str(Path(__file__).resolve().parent.parent),
-            env={"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"},
+            env=hermetic_env({"VAULT_AGENT_REQUIRED": "true", "PATH": "/usr/bin:/bin"}),
             capture_output=True,
             text=True,
             timeout=10,
@@ -423,7 +425,7 @@ class TestEntrypointScriptSafety:
                 "fi; "
                 'echo "would-skip-guard"',
             ],
-            env={"PATH": "/usr/bin:/bin"},  # no VAULT_AGENT_REQUIRED
+            env=hermetic_env({"PATH": "/usr/bin:/bin"}),  # no VAULT_AGENT_REQUIRED
             capture_output=True,
             text=True,
             timeout=5,

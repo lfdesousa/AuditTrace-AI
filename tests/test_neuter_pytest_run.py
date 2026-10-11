@@ -29,6 +29,7 @@ import pytest
 
 from scripts.neuter import lock as lockmod
 from scripts.neuter.pytest_run import PytestRunResult, chokepoint_scope, run_pytest
+from tests._hermetic_env import hermetic_env
 
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
 if _DOCKER_AVAILABLE:
@@ -379,7 +380,9 @@ def test_slow_docker_events_attach_yields_watch_unproven_not_silent_clean(
         f'exec {real_docker} "$@"\n'
     )
     shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv(
+        "PATH", hermetic_env({"PATH": f"{shim_dir}:{os.environ['PATH']}"})["PATH"]
+    )
 
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -25,6 +25,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from tests._hermetic_env import hermetic_env
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "audittrace-login"
 
 # Not a real JWT (no valid signature) but shaped like one — starts with the
@@ -55,11 +57,13 @@ def _write_tokens_file(tokens_dir: Path, *, expires_in: int = 3600) -> None:
 def _run(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     tokens_dir = tmp_path / "tokens-dir"
     _write_tokens_file(tokens_dir)
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
-    }
+    env = hermetic_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
+        }
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         env=env,
@@ -99,11 +103,13 @@ class TestShowIsRedactedByDefault:
     def test_show_exp_matches_access_expires_at(self, tmp_path: Path) -> None:
         tokens_dir = tmp_path / "tokens-dir"
         _write_tokens_file(tokens_dir, expires_in=7200)
-        env = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(tmp_path),
-            "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
-        }
+        env = hermetic_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
+            }
+        )
         proc = subprocess.run(
             ["bash", str(SCRIPT), "--show"],
             env=env,
@@ -128,12 +134,14 @@ class TestShowUnsafeEscapeHatch:
     def test_env_var_escape_hatch_also_prints_raw_token(self, tmp_path: Path) -> None:
         tokens_dir = tmp_path / "tokens-dir"
         _write_tokens_file(tokens_dir)
-        env = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(tmp_path),
-            "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
-            "AUDITTRACE_SHOW_RAW": "1",
-        }
+        env = hermetic_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
+                "AUDITTRACE_SHOW_RAW": "1",
+            }
+        )
         proc = subprocess.run(
             ["bash", str(SCRIPT), "--show"],
             env=env,
@@ -169,11 +177,13 @@ class TestEnsureAndLogoutUnaffected:
     def test_logout_deletes_tokens_file(self, tmp_path: Path) -> None:
         tokens_dir = tmp_path / "tokens-dir"
         _write_tokens_file(tokens_dir)
-        env = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(tmp_path),
-            "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
-        }
+        env = hermetic_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
+            }
+        )
         proc = subprocess.run(
             ["bash", str(SCRIPT), "--logout"],
             env=env,
@@ -190,7 +200,7 @@ class TestHelpTextAdvertisesShowUnsafe:
     def test_help_mentions_show_unsafe_and_env_var(self, tmp_path: Path) -> None:
         proc = subprocess.run(
             ["bash", str(SCRIPT), "--help"],
-            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+            env=hermetic_env({"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}),
             capture_output=True,
             text=True,
             check=False,

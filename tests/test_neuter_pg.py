@@ -25,6 +25,7 @@ from scripts.neuter.pg import (
     start_container,
     stop_container,
 )
+from tests._hermetic_env import hermetic_env
 
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
 if _DOCKER_AVAILABLE:
@@ -205,7 +206,7 @@ def test_start_container_docker_binary_missing_raises_typed_error(
     every time."""
     empty_path = tmp_path / "empty-path"
     empty_path.mkdir()
-    monkeypatch.setenv("PATH", str(empty_path))
+    monkeypatch.setenv("PATH", hermetic_env({"PATH": str(empty_path)})["PATH"])
     with pytest.raises(DockerUnavailableError, match="docker binary not found"):
         start_container("test-missing-docker", 0)
 
@@ -223,6 +224,8 @@ def test_start_container_fake_docker_nonzero_exit_raises_typed_error(
         "#!/bin/bash\necho 'fake docker: daemon not reachable' >&2\nexit 125\n"
     )
     fake_docker.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    monkeypatch.setenv(
+        "PATH", hermetic_env({"PATH": f"{fake_bin}:{os.environ['PATH']}"})["PATH"]
+    )
     with pytest.raises(DockerUnavailableError, match="docker run.*failed"):
         start_container("test-fake-docker-fail", 0)
