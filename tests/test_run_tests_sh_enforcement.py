@@ -26,6 +26,7 @@ from tests._hermetic_env import override_sentinel
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_SCRIPT = REPO_ROOT / "scripts" / "ci" / "run-tests.sh"
 REAL_SKIP_CHECK = REPO_ROOT / "scripts" / "check-no-skipped-tests.py"
+REAL_COVERAGE_CHECK = REPO_ROOT / "scripts" / "check-per-file-coverage.py"
 HELM_RULE_CASES = json.loads(
     (REPO_ROOT / "tests" / "data" / "helm_rule_cases.json").read_text()
 )["cases"]
@@ -39,6 +40,7 @@ def _scratch_script_root(tmp_path: Path) -> Path:
     (root / "scripts" / "ci").mkdir(parents=True)
     shutil.copy(REAL_SCRIPT, root / "scripts" / "ci" / "run-tests.sh")
     shutil.copy(REAL_SKIP_CHECK, root / "scripts" / "check-no-skipped-tests.py")
+    shutil.copy(REAL_COVERAGE_CHECK, root / "scripts" / "check-per-file-coverage.py")
     return root
 
 
@@ -47,12 +49,29 @@ def _write_exec(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _fake_pytest(bin_dir: Path, *, body: str) -> Path:
+def _fake_pytest(
+    bin_dir: Path,
+    *,
+    body: str = "",
+    junit_testcase: str = '<testcase classname="fake" name="test_fake" time="0.0"/>',
+    junit_skipped_attr: str = "0",
+    record_argv_to: Path | None = None,
+    write_coverage_xml: str | None = None,
+) -> Path:
     """Stands in for the real `pytest` binary resolve_tool() finds on
-    PATH. `body` is the shell to run before writing a clean junit.xml and
-    exiting 0 — a test suite that "passed" while doing whatever `body`
-    says (e.g. leaking to a real cluster tool)."""
+    PATH. `body` is extra shell to run before writing the junit.xml
+    (`junit_testcase`/`junit_skipped_attr` control its content, so a
+    caller can simulate a skipped test) and optionally a coverage.xml
+    (`write_coverage_xml`), then exits 0 — a test suite that "passed"
+    while doing whatever `body` says (e.g. leaking to a real cluster
+    tool, or reporting a skip / a low-coverage file)."""
     tool = bin_dir / "pytest"
+    record_line = f'echo "$@" > "{record_argv_to}"\n' if record_argv_to else ""
+    coverage_line = (
+        f"cat > coverage.xml <<COVXML\n{write_coverage_xml}\nCOVXML\n"
+        if write_coverage_xml
+        else ""
+    )
     _write_exec(
         tool,
         "#!/usr/bin/env bash\n"
@@ -62,11 +81,13 @@ def _fake_pytest(bin_dir: Path, *, body: str) -> Path:
         '    --junit-xml=*) junit_path="${arg#--junit-xml=}" ;;\n'
         "  esac\n"
         "done\n"
+        f"{record_line}"
+        f"{coverage_line}"
         f"{body}\n"
         'cat > "$junit_path" <<XML\n'
         '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<testsuites><testsuite name="fake" tests="1" failures="0" errors="0" skipped="0">\n'
-        '<testcase classname="fake" name="test_fake" time="0.0"/>\n'
+        f'<testsuites><testsuite name="fake" tests="1" failures="0" errors="0" skipped="{junit_skipped_attr}">\n'
+        f"{junit_testcase}\n"
         "</testsuite></testsuites>\n"
         "XML\n"
         "exit 0\n",
@@ -330,3 +351,112 @@ def test_helm_rule_case_table_through_bash_shim_list_rows_only(tmp_path_factory)
                 (case["id"], case["expect"], "raise" if rejected else "allow")
             )
     assert mismatches == []
+
+
+# ──────────────── A2-9: each script gate fires on its own ───────────────────
+
+
+def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _fake_pytest(
+        bin_dir,
+        junit_testcase='<testcase classname="fake" name="test_fake" time="0.0"><skipped/></testcase>',
+        junit_skipped_attr="1",
+    )
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir, subset=False)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "skip" in (result.stdout + result.stderr).lower()
+
+
+def test_a2_9_zero_skip_gate_fires_on_subset_run(tmp_path: Path):
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _fake_pytest(
+        bin_dir,
+        junit_testcase='<testcase classname="fake" name="test_fake" time="0.0"><skipped/></testcase>',
+        junit_skipped_attr="1",
+    )
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir, subset=True)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "skip" in (result.stdout + result.stderr).lower()
+
+
+def test_a2_9_per_file_coverage_gate_fires(tmp_path: Path):
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    low_coverage_xml = (
+        '<?xml version="1.0" ?>\n'
+        '<coverage line-rate="0.5" branch-rate="0.5">\n'
+        '<packages><package name="src">\n'
+        '<classes><class filename="src/audittrace/example.py" line-rate="0.5" branch-rate="0.5">\n'
+        '<lines><line number="1" hits="1"/><line number="2" hits="0"/></lines>\n'
+        "</class></classes>\n"
+        "</package></packages>\n"
+        "</coverage>"
+    )
+    _fake_pytest(bin_dir, write_coverage_xml=low_coverage_xml)
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir, subset=False)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "coverage" in (result.stdout + result.stderr).lower()
+
+
+def test_a2_9_pytest_argument_set_matches_golden(tmp_path: Path):
+    """The `--cov` set and `--cov-fail-under=90` handed to pytest, as
+    CAPTURED by a fake pytest that records its own argv, compared against
+    a golden list."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    argv_dump = tmp_path / "argv.txt"
+    passing_coverage_xml = (
+        '<?xml version="1.0" ?>\n'
+        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
+    )
+    _fake_pytest(
+        bin_dir, record_argv_to=argv_dump, write_coverage_xml=passing_coverage_xml
+    )
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir, subset=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = argv_dump.read_text().split()
+    golden = [
+        "tests/",
+        "-v",
+        "--cov=src",
+        "--cov=bff",
+        "--cov=scripts/deploy",
+        "--cov=scripts/hooks",
+        "--cov=scripts/release",
+        "--cov=scripts/migrate",
+        "--cov=scripts/curator",
+        "--cov=scripts/network",
+        "--cov=scripts/neuter",
+        "--cov=scripts.replay_dead_lettered_index",
+        "--cov=scripts.backfill_pdf_signature_status",
+        "--cov=scripts.integration_gate",
+        "--cov-report=term-missing",
+        "--cov-report=xml",
+        "--cov-report=html:htmlcov",
+        "--cov-fail-under=90",
+        "--junit-xml=junit.xml",
+    ]
+    assert recorded == golden
