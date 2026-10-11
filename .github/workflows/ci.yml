@@ -128,7 +128,7 @@ jobs:
               print("postgres reachable on :5432 — RLS tests will run")
           PY
 
-      - name: Tests + coverage + skip + per-file gate (scripts/ci/run-tests.sh — same script `make test` calls; SPEC 2026-10-11-test-parity-scripted-enforcement)
+      - name: Tests + coverage + skip + per-file gate (scripts/ci/run-tests.sh — same script `make test` calls; SPEC 2026-10-11-test-parity-scripted-enforcement + ADDENDUM A1)
         # One script now owns the pytest invocation (the --cov set, the
         # reports, --cov-fail-under, --junit-xml), the zero-skip check, and
         # the per-file coverage gate, so CI and `make test` run IDENTICAL
@@ -136,9 +136,15 @@ jobs:
         # did — PR #380 / CI run 37878027812) drift apart. It also forces
         # the CI shape (no reachable kubectl, bogus KUBECONFIG) even here,
         # where that's already true, so the SAME invariant holds in both
-        # places — tests/test_ci_make_test_parity.py (R2) asserts this step
-        # calls the script and that no second main-suite `pytest tests/`
-        # invocation exists anywhere in this file or the Makefile.
+        # places. tests/test_ci_make_test_parity.py (R2/A1-3) scans EVERY
+        # job's `run:` steps in this file and EVERY Makefile target's
+        # recipe, and asserts: this step genuinely calls the script (not
+        # merely mentions its path); no OTHER `pytest tests/` invocation
+        # (whole-directory, in any job or target) exists outside it; no
+        # scoped (single-file/node-id) one exists unless it is in that
+        # test's own exemption list; and this step carries none of
+        # `continue-on-error`, an `if:` condition, `|| true`, `|| :` or
+        # `; true`.
         run: bash scripts/ci/run-tests.sh
 
       - name: Upload coverage XML

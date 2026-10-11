@@ -102,16 +102,43 @@ subprocess.run = _patched_subprocess_run
 # that silently "worked"; in CI (no cluster) P0 aborted MESH UNSAFE and both
 # tests flipped from pass to `assert 3 == 8` / `StopIteration`. Nothing
 # detected the leak mechanically — SPEC 2026-10-11-SPEC-test-parity-
-# scripted-enforcement.md R3 closes that gap for good.
+# scripted-enforcement.md R3, tightened by ADDENDUM A1 (A1-1/A1-2) after an
+# independent review REJECT (decisions-in/2026-10-11-REVIEW-bff-bump-ci-fix.md,
+# B1/B2) found the first cut both VACUOUS (no committed test exercised it —
+# deleting it changed nothing) and EVADABLE (bytes argv, `executable=`, `env`/
+# `sh -c`/`shell=True` wrapper forms, and the raw `os.exec*`/`posix_spawn*`/
+# `spawn*`/`pty.spawn` families all slipped through unpatched).
 #
-# Every stdlib process-spawn seam funnels through `subprocess.Popen` (which
-# `subprocess.run`/`call`/`check_call`/`check_output` all build on
-# internally) except `os.system` and the asyncio subprocess entry points,
-# which spawn independently of `Popen` on POSIX. Patching all of them here
-# (once, at collection time) means ANY test — not just ones that remember to
-# import a guard — gets the check, and the check fires BEFORE the real
-# process is ever created.
+# What is ACTUALLY patched, and what is proven by a committed test in
+# tests/test_hermetic_cluster_tool_guard.py (B4 — this paragraph states only
+# what that file measures, never "every" or "any" seam in the abstract):
+#   * subprocess.Popen.__init__ (so run/call/check_call/check_output, which
+#     all construct a Popen internally, are covered too) — tested with list
+#     argv, bytes argv, and the `executable=` kwarg.
+#   * os.system (a shell string) — tested with a kubectl-containing string.
+#   * asyncio.create_subprocess_exec / create_subprocess_shell — tested with
+#     a kubectl list argv and a kubectl shell string respectively.
+#   * os.execv / os.execve / os.execvp / os.execl (one test per distinct
+#     calling convention: list-style path-first, list-style PATH-searched,
+#     *args-style) via a fork-isolated harness (os.exec* REPLACES the
+#     calling process on success, so the harness runs the call in a forked
+#     CHILD and inspects its exit status — a guard bug can only take down
+#     the throwaway child, never the test runner).
+#   * os.posix_spawn / os.posix_spawnp, and os.spawnv (representative of the
+#     os.spawn* family — all of them fork+exec or posix_spawn internally).
+#   * pty.spawn.
+#   * The `env [VAR=val ...] <tool> ...` wrapper, `sh -c "<string>"` / `bash
+#     -c "<string>"`, and a `shell=True` string split on `;`, `&&`, `||`,
+#     `|` and newlines with EVERY segment checked (not just the first) — an
+#     unparseable segment that still contains the word `kubectl` or `helm`
+#     fails closed rather than being silently skipped.
+#   * The two-sided allowlist opt-in (`_opt_in_allows`), proven for all four
+#     combinations (marker only, entry only, both matching, tool mismatch)
+#     against the REAL dict object and the REAL enforcement function.
 import asyncio  # noqa: E402
+import pty  # noqa: E402
+import re  # noqa: E402
+import shlex  # noqa: E402
 
 from tests.hermetic_allowlist import ALLOWED_CLUSTER_TOOL_TESTS  # noqa: E402
 
@@ -125,31 +152,31 @@ _HELM_SAFE_SUBCOMMANDS = frozenset(
 #: every patched spawn point so the violation message can name the test.
 _current_test_node: list[object] = [None]
 
+#: shell metacharacters a `shell=True` string / a `sh -c`/`bash -c` argument
+#: is split on before each segment is checked independently (A1-2).
+_SHELL_OPERATOR_SPLIT = re.compile(r"&&|\|\||;|\||\n")
+
+#: fail-closed fallback (A1-2): a segment that cannot be tokenized (shlex
+#: raises, e.g. an unbalanced quote) is still treated as a violation if it
+#: contains either word, rather than silently passing.
+_DANGEROUS_WORD_RE = re.compile(r"\b(kubectl|helm)\b")
+
 
 class HermeticClusterToolError(AssertionError):
     """Raised the instant a test reaches a real cluster-touching command."""
 
 
+def _decode(token: object) -> str:
+    if isinstance(token, bytes):
+        return token.decode("utf-8", errors="surrogateescape")
+    return str(token)
+
+
 def _basename(token: object) -> str:
     try:
-        return os.path.basename(str(token))
+        return os.path.basename(_decode(token))
     except Exception:  # pragma: no cover - defensive, str() on anything works
         return str(token)
-
-
-def _tool_and_subcommand(cmd: object) -> tuple[str, str | None]:
-    """``cmd`` is either an argv list/tuple or a shell string (``shell=True``
-    / ``os.system``). Returns ``(tool, subcommand)`` — ``subcommand`` is the
-    SECOND token, or ``None`` if there isn't one."""
-    if isinstance(cmd, (list, tuple)):
-        tokens = [str(c) for c in cmd]
-    else:
-        tokens = str(cmd).split()
-    if not tokens:
-        return "", None
-    tool = _basename(tokens[0])
-    subcommand = tokens[1] if len(tokens) > 1 else None
-    return tool, subcommand
 
 
 def _is_cluster_touching(tool: str, subcommand: str | None) -> bool:
@@ -160,32 +187,147 @@ def _is_cluster_touching(tool: str, subcommand: str | None) -> bool:
     return False
 
 
-def _enforce_hermetic(cmd: object) -> None:
-    tool, subcommand = _tool_and_subcommand(cmd)
+def _shell_segments(s: str) -> list[str]:
+    return [seg for seg in _SHELL_OPERATOR_SPLIT.split(s) if seg.strip()]
+
+
+def _segment_tool_subcommand(segment: str) -> tuple[str, str | None] | None:
+    """Tokenizes one shell segment. Returns ``None`` (never a false "safe")
+    when the segment cannot be tokenized at all — the caller fails closed
+    on that, per A1-2."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return None
+    if not tokens:
+        return "", None
+    return _basename(tokens[0]), (tokens[1] if len(tokens) > 1 else None)
+
+
+def _raise_if_cluster_touching(
+    tool: str, subcommand: str | None, *, display: str
+) -> None:
     if not _is_cluster_touching(tool, subcommand):
         return
     node = _current_test_node[0]
     nodeid = node.nodeid if node is not None else "<no active test>"
     marker = node.get_closest_marker("allow_cluster_tool") if node is not None else None
-    allowed_tool = ALLOWED_CLUSTER_TOOL_TESTS.get(nodeid)
     marker_tool = marker.kwargs.get("tool") if marker is not None else None
-    if (
-        marker is not None
-        and allowed_tool is not None
-        and marker_tool == allowed_tool == tool
-    ):
-        return  # explicit, matching, two-sided opt-in
+    if _opt_in_allows(nodeid, tool, marker_tool, ALLOWED_CLUSTER_TOOL_TESTS):
+        return
     raise HermeticClusterToolError(
         f"hermetic guard: {nodeid!r} reached a REAL cluster-touching "
-        f"command ({cmd!r}) without stubbing it. `kubectl` and any "
+        f"command ({display}) without stubbing it. `kubectl` and any "
         f"cluster-mutating/-reading `helm` subcommand are forbidden in the "
         f"test suite (SPEC 2026-10-11-SPEC-test-parity-scripted-"
-        f"enforcement.md, R3) — stub the seam instead (e.g. inject a "
-        f"`mesh_gate=_healthy_gate()` the way the sibling DeployRunner "
-        f"tests do). A deliberate exception needs BOTH "
+        f"enforcement.md R3 + ADDENDUM A1) — stub the seam instead (e.g. "
+        f"inject a `mesh_gate=_healthy_gate()` the way the sibling "
+        f"DeployRunner tests do). A deliberate exception needs BOTH "
         f"@pytest.mark.allow_cluster_tool(tool={tool!r}) AND a matching "
         f"entry in tests/hermetic_allowlist.py — it does not have either."
     )
+
+
+def _opt_in_allows(
+    nodeid: str,
+    tool: str,
+    marker_tool: str | None,
+    allowlist: dict[str, str],
+) -> bool:
+    """The two-sided opt-in (A1-1's four cases): the marker's declared tool,
+    the allowlist entry's tool, AND the tool actually being invoked must
+    ALL three agree, or the guard still denies (a marker/allowlist pair
+    that agrees with each other but not with what is actually running is
+    the "tool mismatch" case — it must deny too). A pure function so
+    tests/test_hermetic_cluster_tool_guard.py can exercise all four
+    combinations directly against this exact logic."""
+    allowed_tool = allowlist.get(nodeid)
+    return (
+        marker_tool is not None
+        and allowed_tool is not None
+        and marker_tool == allowed_tool == tool
+    )
+
+
+def _check_segment_or_fail_closed(segment: str, *, display: str) -> None:
+    parsed = _segment_tool_subcommand(segment)
+    if parsed is None:
+        if _DANGEROUS_WORD_RE.search(segment):
+            raise HermeticClusterToolError(
+                f"hermetic guard: {display} — shell segment {segment!r} could "
+                f"not be tokenized but contains a forbidden word; failing "
+                f"closed (SPEC ... ADDENDUM A1-2)."
+            )
+        return
+    tool, subcommand = parsed
+    _raise_if_cluster_touching(
+        tool, subcommand, display=f"{display} (segment {segment!r})"
+    )
+
+
+def _check_shell_string(s: str, *, display: str) -> None:
+    for segment in _shell_segments(s):
+        _check_segment_or_fail_closed(segment, display=display)
+
+
+def _env_and_sh_unwrapped(tokens: list[str]) -> list[str]:
+    """Peels a leading ``env [VAR=val ...]`` wrapper off an argv token
+    list (A1-2). Returns the tokens unchanged if there is no such wrapper."""
+    if not tokens or _basename(tokens[0]) != "env":
+        return tokens
+    i = 1
+    while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
+        i += 1
+    return tokens[i:]
+
+
+def _enforce_hermetic_argv(argv: list[object], *, display_prefix: str = "") -> None:
+    """The list/tuple-argv path (Popen-style AND the exec/spawn families,
+    which all hand us a full argv including argv[0]). Unwraps `env` and
+    `sh|bash -c "<string>"` wrappers (A1-2) before checking."""
+    tokens = [_decode(t) for t in argv]
+    tokens = _env_and_sh_unwrapped(tokens)
+    if not tokens:
+        return
+    tool = _basename(tokens[0])
+    if tool in ("sh", "bash") and len(tokens) >= 3 and tokens[1] == "-c":
+        _check_shell_string(tokens[2], display=f"{display_prefix}{tool} -c")
+        return
+    subcommand = tokens[1] if len(tokens) > 1 else None
+    _raise_if_cluster_touching(
+        tool, subcommand, display=f"{display_prefix}{' '.join(tokens)!r}"
+    )
+
+
+def _enforce_hermetic(cmd: object, *, executable: object | None = None) -> None:
+    """The Popen/os.system/asyncio entry point. ``cmd`` is an argv
+    list/tuple (possibly bytes elements), or a shell string (``shell=True``
+    / ``os.system`` / ``create_subprocess_shell``). ``executable=`` (A1-2),
+    when given, is the REAL program invoked — argv[0] is then just a
+    display name the program sees as its own, not what actually runs."""
+    if executable is not None:
+        tool = _basename(executable)
+        rest = [_decode(t) for t in cmd] if isinstance(cmd, (list, tuple)) else []
+        subcommand = rest[1] if len(rest) > 1 else None
+        _raise_if_cluster_touching(
+            tool, subcommand, display=f"executable={executable!r} args={cmd!r}"
+        )
+        return
+    if isinstance(cmd, (list, tuple)):
+        _enforce_hermetic_argv(list(cmd))
+        return
+    if isinstance(cmd, bytes):
+        cmd = _decode(cmd)
+    if isinstance(cmd, str):
+        _check_shell_string(cmd, display=f"shell string {cmd!r}")
+        return
+    # Anything else (an unrecognised command shape): best-effort, fail
+    # closed only if its text form names a forbidden tool outright.
+    if _DANGEROUS_WORD_RE.search(repr(cmd)):
+        raise HermeticClusterToolError(
+            f"hermetic guard: unrecognised command shape {cmd!r} names a "
+            f"forbidden tool; failing closed."
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -202,9 +344,12 @@ def _hermetic_cluster_tool_guard(request):
 _orig_popen_init = subprocess.Popen.__init__
 
 
-def _patched_popen_init(self, args=(), *a, **kw):
-    _enforce_hermetic(args)
-    return _orig_popen_init(self, args, *a, **kw)
+def _patched_popen_init(self, args=(), *a, executable=None, shell=False, **kw):
+    if shell and isinstance(args, (list, tuple)) and args:
+        _enforce_hermetic(args[0], executable=executable)
+    else:
+        _enforce_hermetic(args, executable=executable)
+    return _orig_popen_init(self, args, *a, executable=executable, shell=shell, **kw)
 
 
 subprocess.Popen.__init__ = _patched_popen_init
@@ -224,7 +369,7 @@ _orig_create_subprocess_shell = asyncio.create_subprocess_shell
 
 
 async def _patched_create_subprocess_exec(program, *args, **kw):
-    _enforce_hermetic([program, *args])
+    _enforce_hermetic([program, *args], executable=kw.get("executable"))
     return await _orig_create_subprocess_exec(program, *args, **kw)
 
 
@@ -237,6 +382,159 @@ asyncio.create_subprocess_exec = _patched_create_subprocess_exec
 asyncio.create_subprocess_shell = _patched_create_subprocess_shell
 asyncio.subprocess.create_subprocess_exec = _patched_create_subprocess_exec
 asyncio.subprocess.create_subprocess_shell = _patched_create_subprocess_shell
+
+# ── the raw os.exec*/os.posix_spawn*/os.spawn* families + pty.spawn (A1-2) ──
+# These never go through subprocess.Popen. os.execv/execve/execl/execlp (and
+# every other exec* variant, which CPython's os.py funnels through these
+# two at the C level) REPLACE the calling process image on success, so a
+# guard bug here could kill more than the one test — see the fork-isolated
+# harness in tests/test_hermetic_cluster_tool_guard.py, which is what
+# actually proves these are covered (B4: this comment claims coverage of
+# exactly these named functions, nothing broader).
+
+_orig_execv = os.execv
+_orig_execve = os.execve
+_orig_execvp = os.execvp
+_orig_execvpe = os.execvpe
+_orig_execl = os.execl
+_orig_execle = os.execle
+_orig_execlp = os.execlp
+_orig_execlpe = os.execlpe
+_orig_posix_spawn = os.posix_spawn
+_orig_posix_spawnp = os.posix_spawnp
+_orig_spawnv = os.spawnv
+_orig_spawnve = os.spawnve
+_orig_spawnvp = os.spawnvp
+_orig_spawnvpe = os.spawnvpe
+_orig_spawnl = os.spawnl
+_orig_spawnle = os.spawnle
+_orig_spawnlp = os.spawnlp
+_orig_spawnlpe = os.spawnlpe
+_orig_pty_spawn = pty.spawn
+
+
+def _check_path_and_argv(path_like: object, argv: list[object]) -> None:
+    tool = _basename(path_like)
+    decoded = [_decode(a) for a in argv]
+    subcommand = decoded[1] if len(decoded) > 1 else None
+    _raise_if_cluster_touching(tool, subcommand, display=f"{path_like!r} argv={argv!r}")
+
+
+def _patched_execv(path, args):
+    _check_path_and_argv(path, list(args))
+    return _orig_execv(path, args)
+
+
+def _patched_execve(path, args, env):
+    _check_path_and_argv(path, list(args))
+    return _orig_execve(path, args, env)
+
+
+def _patched_execvp(file, args):
+    _check_path_and_argv(file, list(args))
+    return _orig_execvp(file, args)
+
+
+def _patched_execvpe(file, args, env):
+    _check_path_and_argv(file, list(args))
+    return _orig_execvpe(file, args, env)
+
+
+def _patched_execl(path, *args):
+    _check_path_and_argv(path, list(args))
+    return _orig_execl(path, *args)
+
+
+def _patched_execle(path, *args):
+    _check_path_and_argv(path, list(args))
+    return _orig_execle(path, *args)
+
+
+def _patched_execlp(file, *args):
+    _check_path_and_argv(file, list(args))
+    return _orig_execlp(file, *args)
+
+
+def _patched_execlpe(file, *args):
+    _check_path_and_argv(file, list(args))
+    return _orig_execlpe(file, *args)
+
+
+def _patched_posix_spawn(path, argv, env, **kw):
+    _check_path_and_argv(path, list(argv))
+    return _orig_posix_spawn(path, argv, env, **kw)
+
+
+def _patched_posix_spawnp(file, argv, env, **kw):
+    _check_path_and_argv(file, list(argv))
+    return _orig_posix_spawnp(file, argv, env, **kw)
+
+
+def _patched_spawnv(mode, path, args):
+    _check_path_and_argv(path, list(args))
+    return _orig_spawnv(mode, path, args)
+
+
+def _patched_spawnve(mode, path, args, env):
+    _check_path_and_argv(path, list(args))
+    return _orig_spawnve(mode, path, args, env)
+
+
+def _patched_spawnvp(mode, file, args):
+    _check_path_and_argv(file, list(args))
+    return _orig_spawnvp(mode, file, args)
+
+
+def _patched_spawnvpe(mode, file, args, env):
+    _check_path_and_argv(file, list(args))
+    return _orig_spawnvpe(mode, file, args, env)
+
+
+def _patched_spawnl(mode, path, *args):
+    _check_path_and_argv(path, list(args))
+    return _orig_spawnl(mode, path, *args)
+
+
+def _patched_spawnle(mode, path, *args):
+    _check_path_and_argv(path, list(args))
+    return _orig_spawnle(mode, path, *args)
+
+
+def _patched_spawnlp(mode, file, *args):
+    _check_path_and_argv(file, list(args))
+    return _orig_spawnlp(mode, file, *args)
+
+
+def _patched_spawnlpe(mode, file, *args):
+    _check_path_and_argv(file, list(args))
+    return _orig_spawnlpe(mode, file, *args)
+
+
+def _patched_pty_spawn(argv, *a, **kw):
+    argv_list = [argv] if isinstance(argv, (str, bytes)) else list(argv)
+    _check_path_and_argv(argv_list[0] if argv_list else "", argv_list)
+    return _orig_pty_spawn(argv, *a, **kw)
+
+
+os.execv = _patched_execv
+os.execve = _patched_execve
+os.execvp = _patched_execvp
+os.execvpe = _patched_execvpe
+os.execl = _patched_execl
+os.execle = _patched_execle
+os.execlp = _patched_execlp
+os.execlpe = _patched_execlpe
+os.posix_spawn = _patched_posix_spawn
+os.posix_spawnp = _patched_posix_spawnp
+os.spawnv = _patched_spawnv
+os.spawnve = _patched_spawnve
+os.spawnvp = _patched_spawnvp
+os.spawnvpe = _patched_spawnvpe
+os.spawnl = _patched_spawnl
+os.spawnle = _patched_spawnle
+os.spawnlp = _patched_spawnlp
+os.spawnlpe = _patched_spawnlpe
+pty.spawn = _patched_pty_spawn
 
 # Test isolation: clear all AUDITTRACE_* env vars so a developer's local .env
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.

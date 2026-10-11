@@ -123,10 +123,8 @@ test-cov: test ## Alias of `test` — scripts/ci/run-tests.sh already writes htm
 
 test-coverage: test-cov ## Alias for test-cov
 
-test-unit: ## Run unit tests only (fast)
-	@echo "🧪 Running unit tests..."
-	@.venv/bin/pytest tests/ -v -k "not integration" --cov=src --cov-report=term-missing
-	@echo "✅ Unit tests passed"
+test-unit: ## Run unit tests only (fast; ADDENDUM A1-3 subset mode of scripts/ci/run-tests.sh — same CI shape + its own zero-skip check, never raw pytest)
+	@bash scripts/ci/run-tests.sh --subset "not integration"
 
 test-watch: ## Run tests in watch mode
 	@echo "🧪 Running tests in watch mode..."
