@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._hermetic_env import hermetic_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "audittrace-login"
 FAKE_TOKEN = "FAKE.dummy-jwt-value.doNotLeakMe-0123456789"  # noqa: S105 (test fixture)
@@ -58,13 +60,15 @@ def _write_tokens(tokens_dir: Path) -> None:
 def _run_sync(
     tokens_dir: Path, env_file: Path, **extra_env: str
 ) -> subprocess.CompletedProcess[str]:
-    env = {
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
-        "HOME": str(tokens_dir.parent),
-        "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
-        "AUDITTRACE_BRUNO_ENV": str(env_file),
-        **extra_env,
-    }
+    env = hermetic_env(
+        {
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "HOME": str(tokens_dir.parent),
+            "AUDITTRACE_TOKENS_DIR": str(tokens_dir),
+            "AUDITTRACE_BRUNO_ENV": str(env_file),
+            **extra_env,
+        }
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), "--sync-env"],
         capture_output=True,
