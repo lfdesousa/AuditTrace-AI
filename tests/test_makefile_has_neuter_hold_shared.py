@@ -46,6 +46,18 @@ _HOLD_SHARED_PREFIX = (
 )
 _ASSERT_IDLE = "python -m scripts.neuter.runner assert-idle"
 
+# SPEC 2026-10-11-SPEC-test-parity-scripted-enforcement.md (R1): `test` and
+# `test-cov` no longer type their own pytest invocation at all -- both now
+# delegate to ONE script, scripts/ci/run-tests.sh (tests/test_ci_make_test_
+# parity.py (R2) is the guard for THAT). `make -n` still must show this
+# delegation wrapped by hold-shared, with no trailing argv that could sneak
+# a second, unwrapped invocation past it -- and the delegated-to script
+# must itself actually invoke pytest, so this guard's protection of the
+# heavy cap (FNH2-BL-1) still holds end-to-end.
+_HOLD_SHARED_SCRIPT_PREFIX = ".venv/bin/python -m scripts.neuter.runner hold-shared -- "
+_CANONICAL_SCRIPT_CALL = "bash scripts/ci/run-tests.sh"
+_RUN_TESTS_SCRIPT = REPO_ROOT / "scripts" / "ci" / "run-tests.sh"
+
 #: Matches the direct binary (``.venv/bin/pytest``, ``pytest``), the module
 #: form (``python -m pytest`` / ``python3 -m pytest``), OR the legacy
 #: ``py.test`` launcher name -- a Makefile recipe that switches to any of
@@ -74,7 +86,25 @@ def _dry_run(target: str) -> list[str]:
 def _assert_every_pytest_invocation_is_wrapped(target: str) -> None:
     lines = _dry_run(target)
     pytest_lines = [line for line in lines if _PYTEST_INVOCATION_RE.search(line)]
-    assert pytest_lines, f"`make -n {target}` never invokes pytest at all"
+    script_lines = [line for line in lines if _CANONICAL_SCRIPT_CALL in line]
+    assert pytest_lines or script_lines, (
+        f"`make -n {target}` neither invokes pytest directly nor delegates "
+        f"to {_CANONICAL_SCRIPT_CALL}"
+    )
+    for line in script_lines:
+        assert (
+            line.strip() == f"{_HOLD_SHARED_SCRIPT_PREFIX}{_CANONICAL_SCRIPT_CALL}"
+        ), (
+            f"`make -n {target}`'s delegation to {_CANONICAL_SCRIPT_CALL} is "
+            f"not EXACTLY hold-shared-wrapped with no trailing argv that "
+            f"could sneak a second invocation past it: {line!r}"
+        )
+    if script_lines:
+        script_text = _RUN_TESTS_SCRIPT.read_text()
+        assert _PYTEST_INVOCATION_RE.search(script_text), (
+            f"{_RUN_TESTS_SCRIPT} is delegated to by `make {target}` but "
+            f"contains no pytest invocation of its own"
+        )
     for line in pytest_lines:
         assert line.strip().startswith(_HOLD_SHARED_PREFIX), (
             f"unwrapped pytest invocation in `make -n {target}`: {line!r}"

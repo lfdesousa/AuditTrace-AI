@@ -2383,6 +2383,14 @@ def test_cli_returns_eight_on_first_party_mismatch(tmp_path, monkeypatch):
             "tests": {"image": {"tag": "9.9.9"}},
         },
     )
+    # Hermeticity fix (CI run 37878027812 / SPEC 2026-10-11-test-parity-
+    # scripted-enforcement, R3): `main()` builds its OWN `DeployRunner(cfg)`
+    # with no injected `mesh_gate`, so the default real `mesh.MeshGate(...)`
+    # would shell to REAL kubectl. On the laptop (a live k3s cluster) that
+    # silently passed; in CI (no cluster) P0 aborted MESH UNSAFE and `rc`
+    # came back 3, not 8. Stub the gate the same way the sibling
+    # `DeployRunner(..., mesh_gate=_healthy_gate())` tests do.
+    monkeypatch.setattr(mesh, "MeshGate", lambda *a, **k: _healthy_gate())
     rc = runner.main(
         ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]
     )
@@ -2553,6 +2561,14 @@ def test_noop_path_d3_recheck_clears_converged_and_exits_eight(tmp_path, monkeyp
         },
     )
     monkeypatch.setattr(registry, "resolve", lambda v, reg: _hub_ref("sha256:x"))
+    # Hermeticity fix (CI run 37878027812 / SPEC 2026-10-11-test-parity-
+    # scripted-enforcement, R3): same leak as
+    # `test_cli_returns_eight_on_first_party_mismatch` above — `main()`'s
+    # default `mesh.MeshGate(...)` shells to REAL kubectl, which only
+    # "worked" because the laptop has a live cluster. Without this stub P0
+    # aborts MESH UNSAFE in CI and `report["phases"]` never reaches
+    # P2-chart-apply (`next(...)` below raises `StopIteration`).
+    monkeypatch.setattr(mesh, "MeshGate", lambda *a, **k: _healthy_gate())
 
     rc = runner.main(
         ["--target-version", "v9.9.9", "--out-dir", str(tmp_path / "runs")]

@@ -95,6 +95,149 @@ def _patched_subprocess_run(*args, **kwargs):
 
 subprocess.run = _patched_subprocess_run
 
+# ─────────── R3 hermetic cluster-tool guard (PR #380, CI run 37878027812) ────
+# Two tests in tests/test_deploy_runner.py called `runner.main(...)` without
+# stubbing the mesh gate. The mesh gate's OWN `_run` seam (scripts/deploy/
+# mesh.py) shells to a REAL `kubectl`. On the laptop (a live k3s cluster)
+# that silently "worked"; in CI (no cluster) P0 aborted MESH UNSAFE and both
+# tests flipped from pass to `assert 3 == 8` / `StopIteration`. Nothing
+# detected the leak mechanically — SPEC 2026-10-11-SPEC-test-parity-
+# scripted-enforcement.md R3 closes that gap for good.
+#
+# Every stdlib process-spawn seam funnels through `subprocess.Popen` (which
+# `subprocess.run`/`call`/`check_call`/`check_output` all build on
+# internally) except `os.system` and the asyncio subprocess entry points,
+# which spawn independently of `Popen` on POSIX. Patching all of them here
+# (once, at collection time) means ANY test — not just ones that remember to
+# import a guard — gets the check, and the check fires BEFORE the real
+# process is ever created.
+import asyncio  # noqa: E402
+
+from tests.hermetic_allowlist import ALLOWED_CLUSTER_TOOL_TESTS  # noqa: E402
+
+#: helm subcommands that never touch a live cluster (chart rendering /
+#: static linting / vendoring only) — see the spec's R3 text verbatim.
+_HELM_SAFE_SUBCOMMANDS = frozenset(
+    {"template", "lint", "dependency", "version", "show"}
+)
+
+#: Set by the autouse fixture below for the duration of each test; read by
+#: every patched spawn point so the violation message can name the test.
+_current_test_node: list[object] = [None]
+
+
+class HermeticClusterToolError(AssertionError):
+    """Raised the instant a test reaches a real cluster-touching command."""
+
+
+def _basename(token: object) -> str:
+    try:
+        return os.path.basename(str(token))
+    except Exception:  # pragma: no cover - defensive, str() on anything works
+        return str(token)
+
+
+def _tool_and_subcommand(cmd: object) -> tuple[str, str | None]:
+    """``cmd`` is either an argv list/tuple or a shell string (``shell=True``
+    / ``os.system``). Returns ``(tool, subcommand)`` — ``subcommand`` is the
+    SECOND token, or ``None`` if there isn't one."""
+    if isinstance(cmd, (list, tuple)):
+        tokens = [str(c) for c in cmd]
+    else:
+        tokens = str(cmd).split()
+    if not tokens:
+        return "", None
+    tool = _basename(tokens[0])
+    subcommand = tokens[1] if len(tokens) > 1 else None
+    return tool, subcommand
+
+
+def _is_cluster_touching(tool: str, subcommand: str | None) -> bool:
+    if tool == "kubectl":
+        return True
+    if tool == "helm":
+        return subcommand not in _HELM_SAFE_SUBCOMMANDS
+    return False
+
+
+def _enforce_hermetic(cmd: object) -> None:
+    tool, subcommand = _tool_and_subcommand(cmd)
+    if not _is_cluster_touching(tool, subcommand):
+        return
+    node = _current_test_node[0]
+    nodeid = node.nodeid if node is not None else "<no active test>"
+    marker = node.get_closest_marker("allow_cluster_tool") if node is not None else None
+    allowed_tool = ALLOWED_CLUSTER_TOOL_TESTS.get(nodeid)
+    marker_tool = marker.kwargs.get("tool") if marker is not None else None
+    if (
+        marker is not None
+        and allowed_tool is not None
+        and marker_tool == allowed_tool == tool
+    ):
+        return  # explicit, matching, two-sided opt-in
+    raise HermeticClusterToolError(
+        f"hermetic guard: {nodeid!r} reached a REAL cluster-touching "
+        f"command ({cmd!r}) without stubbing it. `kubectl` and any "
+        f"cluster-mutating/-reading `helm` subcommand are forbidden in the "
+        f"test suite (SPEC 2026-10-11-SPEC-test-parity-scripted-"
+        f"enforcement.md, R3) — stub the seam instead (e.g. inject a "
+        f"`mesh_gate=_healthy_gate()` the way the sibling DeployRunner "
+        f"tests do). A deliberate exception needs BOTH "
+        f"@pytest.mark.allow_cluster_tool(tool={tool!r}) AND a matching "
+        f"entry in tests/hermetic_allowlist.py — it does not have either."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cluster_tool_guard(request):
+    """Stash the running test's node so the patched spawn points below can
+    name it in a violation message, and can look up its marker."""
+    _current_test_node[0] = request.node
+    try:
+        yield
+    finally:
+        _current_test_node[0] = None
+
+
+_orig_popen_init = subprocess.Popen.__init__
+
+
+def _patched_popen_init(self, args=(), *a, **kw):
+    _enforce_hermetic(args)
+    return _orig_popen_init(self, args, *a, **kw)
+
+
+subprocess.Popen.__init__ = _patched_popen_init
+
+_orig_os_system = os.system
+
+
+def _patched_os_system(command):
+    _enforce_hermetic(command)
+    return _orig_os_system(command)
+
+
+os.system = _patched_os_system
+
+_orig_create_subprocess_exec = asyncio.create_subprocess_exec
+_orig_create_subprocess_shell = asyncio.create_subprocess_shell
+
+
+async def _patched_create_subprocess_exec(program, *args, **kw):
+    _enforce_hermetic([program, *args])
+    return await _orig_create_subprocess_exec(program, *args, **kw)
+
+
+async def _patched_create_subprocess_shell(cmd, *args, **kw):
+    _enforce_hermetic(cmd)
+    return await _orig_create_subprocess_shell(cmd, *args, **kw)
+
+
+asyncio.create_subprocess_exec = _patched_create_subprocess_exec
+asyncio.create_subprocess_shell = _patched_create_subprocess_shell
+asyncio.subprocess.create_subprocess_exec = _patched_create_subprocess_exec
+asyncio.subprocess.create_subprocess_shell = _patched_create_subprocess_shell
+
 # Test isolation: clear all AUDITTRACE_* env vars so a developer's local .env
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.
 # This must run BEFORE importing audittrace.config so the .env-skip

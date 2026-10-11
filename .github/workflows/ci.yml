@@ -128,58 +128,18 @@ jobs:
               print("postgres reachable on :5432 — RLS tests will run")
           PY
 
-      - name: Tests + project-wide coverage gate (with junit-xml for skip audit)
-        run: |
-          pytest tests/ -v \
-            --cov=src \
-            --cov=scripts/deploy \
-            --cov=scripts/hooks \
-            --cov=scripts/release \
-            --cov=scripts/migrate \
-            --cov=scripts/curator \
-            --cov=scripts.replay_dead_lettered_index \
-            --cov=scripts.backfill_pdf_signature_status \
-            --cov-report=term-missing \
-            --cov-report=xml \
-            --cov-report=html:htmlcov \
-            --cov-fail-under=90 \
-            --junit-xml=junit.xml
-
-      - name: Fail if any test was silently skipped
-        # Zero-tolerance on skips in CI (directive 2026-04-18): a skip is
-        # a missing assertion in disguise. If a test depends on an
-        # environmental resource, CI provisions it (see the postgres
-        # service above). Otherwise the test is broken and should be
-        # fixed or deleted — never skipped.
-        run: |
-          python - <<'PY'
-          import xml.etree.ElementTree as ET, sys
-          root = ET.parse("junit.xml").getroot()
-          # junit's <testsuite> carries skipped="N"; roll them up.
-          total = 0
-          skipped = []
-          for ts in root.iter("testsuite"):
-              total += int(ts.get("skipped", "0"))
-          # For names + reasons, inspect <skipped> children on testcases.
-          for tc in root.iter("testcase"):
-              for skip in tc.findall("skipped"):
-                  skipped.append(
-                      f"{tc.get('classname')}.{tc.get('name')} — "
-                      f"{skip.get('message','<no reason>')}"
-                  )
-          if total:
-              print("::error::%d skipped test(s) — skips are forbidden in CI." % total)
-              for s in skipped[:20]:
-                  print(f"  - {s}")
-              sys.exit(1)
-          print("No skipped tests. Good.")
-          PY
-
-      - name: Per-file coverage gate (each component >= 90%)
-        # Mirrors `make test` locally: project-wide --cov-fail-under hides
-        # individual file regressions. This step parses coverage.xml and
-        # fails if ANY non-trivial source file is below 90%.
-        run: python scripts/check-per-file-coverage.py
+      - name: Tests + coverage + skip + per-file gate (scripts/ci/run-tests.sh — same script `make test` calls; SPEC 2026-10-11-test-parity-scripted-enforcement)
+        # One script now owns the pytest invocation (the --cov set, the
+        # reports, --cov-fail-under, --junit-xml), the zero-skip check, and
+        # the per-file coverage gate, so CI and `make test` run IDENTICAL
+        # gates instead of two hand-typed command lines that could (and
+        # did — PR #380 / CI run 37878027812) drift apart. It also forces
+        # the CI shape (no reachable kubectl, bogus KUBECONFIG) even here,
+        # where that's already true, so the SAME invariant holds in both
+        # places — tests/test_ci_make_test_parity.py (R2) asserts this step
+        # calls the script and that no second main-suite `pytest tests/`
+        # invocation exists anywhere in this file or the Makefile.
+        run: bash scripts/ci/run-tests.sh
 
       - name: Upload coverage XML
         if: always()
