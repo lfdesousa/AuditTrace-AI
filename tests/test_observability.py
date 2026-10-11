@@ -1199,3 +1199,28 @@ def test_telemetry_start_span_returns_none_when_uninitialised():
         assert span is None
     # Re-init so downstream tests keep working
     telemetry.init_telemetry(service_name="audittrace-server-tests", otlp_endpoint="")
+
+
+def test_g6_canary_registered_value_leg_is_scanned(_canary_registered_value_leg):
+    """Dedicated per-test canary for the net's registered-value-leg
+    category (gate REJECT round 4, R1) — registers a real, >=16-char
+    secret so ``scan_for_registered_secret_values`` (called
+    unconditionally on ``texts`` every test, in
+    ``tests/conftest.py::_redaction_net``) actually scans a NON-EMPTY
+    registry rather than returning early. Deliberately does not emit
+    the secret anywhere — a positive "the leg ran" canary must not
+    also BE a leak, which would additionally trip the net's ``hits``
+    check.
+
+    Lives HERE, not in ``test_log_call_redaction.py``: that module has
+    its OWN local autouse ``_clean_registry`` fixture (same function
+    scope, closer to the test than any conftest.py fixture), which
+    pytest tears down BEFORE ``_redaction_net``'s finally block runs —
+    clearing the registry before this canary's assertion could ever
+    see it, regardless of ``_redaction_net``'s own explicit dependency
+    on ``_reset_request_secrets``. This module carries no such
+    colliding local fixture, so the registration genuinely survives to
+    the net's own teardown check."""
+    from audittrace.identity import register_request_secret
+
+    register_request_secret("s3cr3t-canary-" + "A" * 20)

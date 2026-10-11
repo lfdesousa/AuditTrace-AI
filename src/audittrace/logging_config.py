@@ -78,6 +78,142 @@ _JWT_SHAPE_RE = re.compile(
 )
 _AUTHZ_SHAPE_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}")
 
+# ADDENDUM C, gate REJECT round 1 BLOCKER 1 — a third party can TRUNCATE a
+# registered secret before it ever reaches ``scrub_text`` (measured case:
+# SQLAlchemy's ``StatementError`` repr elides the middle of a long bound
+# parameter: "<head> ... (N characters truncated) ... <tail>"). Both <head>
+# and <tail> are genuine, UNALTERED substrings of the secret — the exact-
+# match branch below misses them (the full string is never present as one
+# run) and the D4 shape net also misses them (a bare fragment is no longer
+# JWT-shaped: no second ``.``). The window length below matches
+# ``audittrace.identity._MIN_REGISTERED_SECRET_LEN``.
+#
+# Gate REJECT round 2 BLOCKER L1 — the fragment scan used to run only as
+# the ``else`` of the exact-match check in ``scrub_text``, so a string
+# carrying BOTH the full secret AND a separately-truncated fragment of it
+# (e.g. a log line interpolating the full value, glued to a SQLAlchemy
+# param repr of the same secret) left the fragment unredacted. The scan
+# now always runs after the exact replace too — measured by
+# ``test_l1_full_value_and_truncated_fragment_in_one_string_both_redacted``
+# below, over a single-pass sink (no second, independent scrub pass).
+_FRAGMENT_WINDOW_LEN = 16
+
+
+def _secret_window_index(secret: str) -> dict[str, list[int]]:
+    """Map every ``_FRAGMENT_WINDOW_LEN``-char window of ``secret`` to the
+    list of start offsets within ``secret`` where that window occurs
+    (handles a secret with internal repeats)."""
+    index: dict[str, list[int]] = {}
+    for i in range(0, len(secret) - _FRAGMENT_WINDOW_LEN + 1):
+        index.setdefault(secret[i : i + _FRAGMENT_WINDOW_LEN], []).append(i)
+    return index
+
+
+def _extend_match(
+    text: str, text_pos: int, secret: str, secret_pos: int
+) -> tuple[int, int]:
+    """Given ``text[text_pos:text_pos+W] == secret[secret_pos:secret_pos+W]``
+    (``W`` = ``_FRAGMENT_WINDOW_LEN``), extend FORWARD while the
+    characters keep matching. Returns the maximal matching run's
+    ``(start, end)`` bounds in ``text`` (``start`` is always ``text_pos``
+    — see below for why).
+
+    Forward-only is not a simplification taken on faith: ``_scrub_secret_fragments``
+    below always calls this at the LEFTMOST ``text_pos`` where any window
+    matches, scanning strictly left to right from the start of ``text``
+    (or from the end of the previous replacement). If a matching run of
+    length >= ``_FRAGMENT_WINDOW_LEN`` started earlier than ``text_pos``,
+    the window AT that earlier position would itself be a slice of the
+    same run and would therefore already have matched — so the scan
+    would have stopped there instead. A backward-extension loop here
+    could never fire given that calling convention; keeping it would be
+    dead code asserting a guarantee nothing exercises.
+    """
+    end = text_pos + _FRAGMENT_WINDOW_LEN
+    s_end = secret_pos + _FRAGMENT_WINDOW_LEN
+    while end < len(text) and s_end < len(secret) and text[end] == secret[s_end]:
+        end += 1
+        s_end += 1
+    return text_pos, end
+
+
+def _scrub_secret_fragments(text: str, secret: str) -> str:
+    """Redact every maximal run in ``text`` that matches a contiguous
+    fragment of ``secret``, even when a third party truncated the middle
+    out of the full value before it ever reached this function.
+
+    O(len(text)) for a realistic secret: the scan advances one character
+    at a time with a single dict lookup per position
+    (``_FRAGMENT_WINDOW_LEN``-char slice, constant cost for a secret with
+    few internal repeats); each match's extension costs at most
+    O(len(secret)), but the scan pointer jumps to the end of each
+    replaced run, so matches are never re-scanned.
+    ``test_d3_fragment_scrub_terminates_promptly_on_large_text`` is the
+    committed guard for this: a 50KB-noise / realistic-bearer-fragment
+    text must scrub in under 2.0s — the only timing bound this module
+    claims (gate REJECT round 2, rule 7 — prose may state only what a
+    committed test measures; no specific millisecond figure here is
+    backed by a committed assertion).
+
+    Gate REJECT round 1 fix1 re-review (should-fix) — this bound is NOT
+    universal: a PATHOLOGICALLY repetitive secret (every character the
+    same, e.g. ``"A" * 900``) makes every window collide in the index,
+    so a non-matching scan degrades toward O(len(text) * len(secret)).
+    A real bearer JWT/opaque token has no such internal repeat
+    structure, so this is a theoretical worst case, not a shape this
+    module expects to see in practice — documented rather than hidden,
+    not independently timed here.
+    """
+    if len(secret) < _FRAGMENT_WINDOW_LEN:
+        return text
+    index = _secret_window_index(secret)
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    last = 0
+    while i <= n - _FRAGMENT_WINDOW_LEN:
+        offsets = index.get(text[i : i + _FRAGMENT_WINDOW_LEN])
+        if not offsets:
+            i += 1
+            continue
+        best_start, best_end = i, i + _FRAGMENT_WINDOW_LEN
+        for off in offsets:
+            start, end = _extend_match(text, i, secret, off)
+            if end - start > best_end - best_start:
+                best_start, best_end = start, end
+        out.append(text[last:best_start])
+        out.append("[REDACTED:bearer]")
+        last = best_end
+        i = best_end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def secret_leaks_into(text: str, secret: str) -> bool:
+    """True if ``text`` contains ``secret`` verbatim OR a
+    ``_FRAGMENT_WINDOW_LEN``-char-or-longer truncation-surviving fragment
+    of it.
+
+    Exposed for the suite-wide redaction net's registered-VALUE leg
+    (``tests/conftest.py``) — a DIFFERENT check from the net's shape leg,
+    which is blind to a fragment that is no longer JWT-shaped (gate REJECT
+    round 1 BLOCKER 1). Shares the same windowed-match logic ``scrub_text``
+    uses so the net's oracle and the production redaction agree on what
+    counts as "still identifying."
+    """
+    if not secret or not text:
+        return False
+    if secret in text:
+        return True
+    if len(secret) < _FRAGMENT_WINDOW_LEN:
+        return False
+    index = _secret_window_index(secret)
+    n = len(text)
+    for i in range(0, n - _FRAGMENT_WINDOW_LEN + 1):
+        if text[i : i + _FRAGMENT_WINDOW_LEN] in index:
+            return True
+    return False
+
 
 def scrub_text(value: str) -> str:
     """Redact bearer-shaped secrets from a string leaf.
@@ -86,8 +222,24 @@ def scrub_text(value: str) -> str:
     ``audittrace.identity.register_request_secret`` is replaced by exact
     value equality, LONGEST FIRST (so a shorter registered value can never
     leave a dangling, still-identifying suffix of a longer one
-    unredacted). D4 (secondary) — a JWT-shaped or ``Bearer``/``Basic``-
-    prefixed substring is replaced even when unregistered.
+    unredacted). The exact-match replace and the fragment scan are NOT
+    either/or (gate REJECT round 2, BLOCKER L1 — orchestrator ruling
+    2026-10-11): the fragment scan ALWAYS runs afterwards too, because a
+    single string can carry BOTH the full value (e.g. in an f-string
+    message) AND a separately-truncated fragment of the SAME secret
+    (e.g. a SQLAlchemy param repr glued onto that message, or a head/tail
+    pair from ``str(kwargs)[:100]`` alongside the full value elsewhere in
+    the same text). Running the fragment scan only when the exact match
+    missed left that second, co-occurring fragment completely unredacted
+    — the exact-match branch "wins" and the text is returned without ever
+    reaching ``_scrub_secret_fragments``. Running the fragment scan
+    unconditionally after the exact replace is safe and idempotent: the
+    text already has the full value replaced by the literal
+    ``[REDACTED:bearer]`` marker, which contains no 16-char run of the
+    secret, so re-scanning it for fragments of that SAME secret can only
+    ever match genuine, still-present fragments elsewhere in the string.
+    D4 (secondary) — a JWT-shaped or ``Bearer``/``Basic``-prefixed
+    substring is replaced even when unregistered.
 
     Never raises: ``request_secrets()`` degrades to "nothing registered"
     on any import/lookup failure (mirrors ``_extract_user_id``'s defensive
@@ -103,8 +255,15 @@ def scrub_text(value: str) -> str:
     except Exception:  # pragma: no cover - defensive
         secrets = ()
     for secret in sorted(secrets, key=len, reverse=True):
-        if secret and secret in value:
+        if not secret:
+            continue
+        if secret in value:
             value = value.replace(secret, "[REDACTED:bearer]")
+        # ALWAYS run the fragment scan too (BLOCKER L1) — not an ``else``
+        # branch of the exact-match check above. A truncated fragment of
+        # THIS secret may still be present even after the full value was
+        # just replaced (full value + fragment co-occurring in one text).
+        value = _scrub_secret_fragments(value, secret)
     value = _JWT_SHAPE_RE.sub("[REDACTED:jwt]", value)
     value = _AUTHZ_SHAPE_RE.sub("[REDACTED:authz]", value)
     return value
@@ -396,12 +555,28 @@ def _render_value_inner(value: Any, depth: int) -> Any:
         pass
 
     if isinstance(value, Mapping):
-        return {
-            (scrub_text(k) if isinstance(k, str) else k): render_value(
-                v, _depth=depth + 1
+        # F1 (gate REJECT round 1) — a non-str key (e.g. a UUID or a tuple,
+        # both valid dict keys in Python but not in JSON) used to pass
+        # through unchanged here, so the final ``json.dumps`` downstream
+        # raised ``TypeError: keys must be str...`` and the WHOLE emission
+        # — not just this one field — was lost (N4's fail-closed promise
+        # broken for dict-keyed payloads). Route every key through
+        # ``render_value`` too, then stringify the rendered result so it
+        # is always JSON-key-safe: a UUID key's render is already a
+        # scrubbed ``str``; a tuple key's render is a JSON-safe list,
+        # stringified for use as a key (JSON itself has no tuple-as-key
+        # concept either).
+        rendered: dict[str, Any] = {}
+        for k, v in value.items():
+            rendered_key = (
+                scrub_text(k)
+                if isinstance(k, str)
+                else render_value(k, _depth=depth + 1)
             )
-            for k, v in value.items()
-        }
+            if not isinstance(rendered_key, str):
+                rendered_key = json.dumps(rendered_key, default=str)
+            rendered[rendered_key] = render_value(v, _depth=depth + 1)
+        return rendered
     if isinstance(value, (list, tuple, set, frozenset)):
         return [render_value(v, _depth=depth + 1) for v in value]
 

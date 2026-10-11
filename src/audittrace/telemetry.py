@@ -346,10 +346,19 @@ def _run_startup_scrub_self_test(tracer_provider: TracerProvider) -> None:
     marker = "audittrace-startup-self-test-" + uuid.uuid4().hex
     register_request_secret(marker)
     try:
+        from opentelemetry.trace import Status, StatusCode
+
         tracer = tracer_provider.get_tracer("audittrace-startup-self-test")
         with tracer.start_as_current_span("startup-self-test") as span:
             span.set_attribute("input.value", f"planted {marker} planted")
             span.add_event("probe-event", {"detail": f"carries {marker}"})
+            # Gate REJECT round 1 BLOCKER 2 — the probe span used to plant
+            # the marker ONLY in an attribute and an event, so a later SDK
+            # renaming the private field the scrubber reads for the
+            # STATUS description (``_status``/``_description``) failed
+            # OPEN: nothing in this self-test ever exercised that code
+            # path. Plant it in the status too.
+            span.set_status(Status(StatusCode.ERROR, f"status carries {marker}"))
     finally:
         reset_request_secrets()
 
@@ -360,23 +369,60 @@ def _run_startup_scrub_self_test(tracer_provider: TracerProvider) -> None:
                 "probe span — refusing to start (the scrubbing mechanism "
                 "could not be verified)"
             )
-        snapshot = probe_exporter.snapshots[-1]
-        if marker in snapshot:
-            raise RuntimeError(
-                "SEC-JWT-IN-LANGFUSE-SPAN startup self-test FAILED: a "
-                "planted secret reached a probe span processor "
-                "unscrubbed — refusing to start. This guards against an "
-                "SDK upgrade silently renaming the private fields the "
-                "scrubber rewrites (S-C1)."
-            )
-        if "[REDACTED:bearer]" not in snapshot:
-            raise RuntimeError(
-                "SEC-JWT-IN-LANGFUSE-SPAN startup self-test FAILED: the "
-                "redaction marker never appeared in the probe span — "
-                "refusing to start."
-            )
+        _check_self_test_result(marker, probe_exporter.snapshots)
     finally:
         probe_exporter.disable()
+
+
+def _check_self_test_result(marker: str, snapshots: list[str]) -> None:
+    """The startup self-test's two pass/fail checks, extracted so each is
+    independently unit-testable (gate REJECT round 1 BLOCKER 2 — the
+    reviewer's neuter table showed BOTH checks vacuous when they lived
+    only inline inside ``_run_startup_scrub_self_test``: a neuter of
+    ``if marker in snapshot:`` alone stayed GREEN because, with the
+    scrubber still functioning normally, the marker was never present
+    either way — the check's OWN removal was unobservable from the full
+    flow. Calling this function directly, with a hand-built snapshot,
+    isolates each check from whether the scrubber happens to work.
+    """
+    snapshot = snapshots[-1]
+    if marker in snapshot:
+        raise RuntimeError(
+            "SEC-JWT-IN-LANGFUSE-SPAN startup self-test FAILED: a "
+            "planted secret reached a probe span processor "
+            "unscrubbed — refusing to start. This guards against an "
+            "SDK upgrade silently renaming the private fields the "
+            "scrubber rewrites (S-C1)."
+        )
+    if "[REDACTED:bearer]" not in snapshot:
+        raise RuntimeError(
+            "SEC-JWT-IN-LANGFUSE-SPAN startup self-test FAILED: the "
+            "redaction marker never appeared in the probe span — "
+            "refusing to start."
+        )
+
+
+def _assert_scrubber_is_first(tracer_provider: TracerProvider) -> None:
+    """S-C1(a) read-only pin: the scrubber must be the first span
+    processor on the provider's chain. No private-list WRITE — this only
+    asserts what the public-API construction order (S-C2) already
+    guarantees.
+
+    Extracted (gate REJECT round 1 BLOCKER 2) so a neuter of this check's
+    own ``if`` condition reddens a DEDICATED unit test, independent of
+    whether ``init_telemetry``'s broader flow happens to also exercise it.
+    """
+    processors = getattr(
+        getattr(tracer_provider, "_active_span_processor", None),
+        "_span_processors",
+        (),
+    )
+    if not processors or not isinstance(processors[0], ScrubbingSpanProcessor):
+        raise RuntimeError(
+            "SEC-JWT-IN-LANGFUSE-SPAN: the scrubbing span processor is "
+            "not first in the provider's processor chain — refusing "
+            "to start (S-C1a)"
+        )
 
 
 def _init_langfuse_client(tracer_provider: TracerProvider | None = None) -> None:
@@ -617,17 +663,7 @@ def init_telemetry(
         # after everything else has registered. No private-list WRITE
         # happens here (S-C2) — this only asserts what the public-API
         # construction order above already guarantees.
-        processors = getattr(
-            getattr(tracer_provider, "_active_span_processor", None),
-            "_span_processors",
-            (),
-        )
-        if not processors or not isinstance(processors[0], ScrubbingSpanProcessor):
-            raise RuntimeError(
-                "SEC-JWT-IN-LANGFUSE-SPAN: the scrubbing span processor is "
-                "not first in the provider's processor chain — refusing "
-                "to start (S-C1a)"
-            )
+        _assert_scrubber_is_first(tracer_provider)
 
     _initialized = True
     logger.info(
