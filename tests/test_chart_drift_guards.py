@@ -5788,7 +5788,9 @@ class TestD25DConsoleRedirectReconcile:
         self,
     ) -> None:
         block = self._rendered_block()
-        assert '"${KCADM}" update "clients/${LIBRECHAT_CLIENT_UUID}"' in block, (
+        # ACL WU-2c-A0: every kcadm invocation now goes through the
+        # acl_e2e_kc() wrapper (F2 BF1-a), not the bare "${KCADM}" var.
+        assert 'acl_e2e_kc update "clients/${LIBRECHAT_CLIENT_UUID}"' in block, (
             "D2-5D: Step 6 must PUT to the resolved client UUID path "
             "(clients/${LIBRECHAT_CLIENT_UUID}), never a hardcoded/"
             "literal client-id path."
@@ -6349,7 +6351,9 @@ class TestKeycloakTokenExchangePermission:
             "      return 1 ;;\n"
             "  esac\n"
             "}\n"
-            "KCADM=fake_kcadm\n"
+            # ACL WU-2c-A0: Step 4's kcadm calls now go through the
+            # acl_e2e_kc() wrapper (F2 BF1-a), not a bare "${KCADM}" var.
+            'acl_e2e_kc() { fake_kcadm "$@"; }\n'
             'TOKEN_EXCHANGE_TARGET_CLIENT="audittrace-librechat"\n'
             'TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"\n'
             'TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"\n'

@@ -822,6 +822,11 @@ keycloak:
   # two-realm parity guards redden until it is.
   aclE2eClient:
     enabled: true
+    # ACL WU-2c-A0 (Addendum F §3 / F1 §5): read-only, GET-only shape
+    # capture of the live client's representation into the hook Job's
+    # log — off by default, flipped on for one deploy by the re-enable
+    # runbook so the real Keycloak layout lands in the evidence.
+    shapeCapture: false
   resources:
     requests:
       cpu: 500m
