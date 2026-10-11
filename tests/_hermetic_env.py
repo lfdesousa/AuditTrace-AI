@@ -59,14 +59,25 @@ def hermetic_env(
         env["PATH"] = os.pathsep.join([sentinels.shim_dir, *existing])
     if sentinels.kubeconfig:
         env["KUBECONFIG"] = sentinels.kubeconfig
-    for name in list(env):
-        if name in (
-            "KUBERNETES_SERVICE_HOST",
-            "KUBERNETES_SERVICE_PORT",
-        ) or name.startswith("HELM_KUBE"):
-            del env[name]
+    _strip_k8s_and_helm_kube_prefixed(env)
     env.update(overrides)
     return env
+
+
+def _strip_k8s_and_helm_kube_prefixed(env: dict[str, str]) -> None:
+    """Deletes every ``KUBERNETES_SERVICE_*``/``HELM_KUBE*`` name from
+    ``env``, in place — a PREFIX match (imported from ``tests.conftest``,
+    the single source of truth the in-process guard itself checks
+    against), never a fixed name list. Shared by `hermetic_env()` and
+    `build_fresh_sentinel_env()` so the two helpers cannot drift apart
+    from each other or from the guard they exist to satisfy."""
+    from tests import conftest
+
+    for name in list(env):
+        if name.startswith(conftest._KUBERNETES_ENV_PREFIX) or name.startswith(
+            conftest._HELM_KUBE_ENV_PREFIX
+        ):
+            del env[name]
 
 
 _UNSET = object()
@@ -167,12 +178,7 @@ def build_fresh_sentinel_env(tmp_path: Path) -> dict[str, str]:
     env["KUBECONFIG"] = str(kubeconfig)
     existing = [p for p in env.get("PATH", "").split(os.pathsep) if p]
     env["PATH"] = os.pathsep.join([str(shim_dir), *existing])
-    for name in list(env):
-        if name in (
-            "KUBERNETES_SERVICE_HOST",
-            "KUBERNETES_SERVICE_PORT",
-        ) or name.startswith("HELM_KUBE"):
-            del env[name]
+    _strip_k8s_and_helm_kube_prefixed(env)
     return env
 
 

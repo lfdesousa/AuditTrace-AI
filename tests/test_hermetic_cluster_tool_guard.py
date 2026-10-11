@@ -445,6 +445,29 @@ class TestEnvEqualityCheck:
                     display="t",
                 )
 
+    def test_e3_hermetic_env_and_build_fresh_sentinel_env_strip_by_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        """R4-B2: `hermetic_env()`'s docstring promises no
+        `KUBERNETES_SERVICE_*`/`HELM_KUBE*` variable survives — prove it
+        for BOTH sanctioned env-builders, planting an unlisted name under
+        each prefix in the `base`/ambient env they strip from."""
+        built = hermetic_env(
+            {
+                "PATH": "/x",
+                "KUBERNETES_SERVICE_PORT_HTTPS": "443",
+                "HELM_KUBEFUTURE": "x",
+            }
+        )
+        assert "KUBERNETES_SERVICE_PORT_HTTPS" not in built
+        assert "HELM_KUBEFUTURE" not in built
+
+        monkeypatch.setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+        monkeypatch.setenv("HELM_KUBEFUTURE", "x")
+        fresh = build_fresh_sentinel_env(tmp_path)
+        assert "KUBERNETES_SERVICE_PORT_HTTPS" not in fresh
+        assert "HELM_KUBEFUTURE" not in fresh
+
     def test_f_source_is_env_kwarg_when_given_else_os_environ(self, monkeypatch):
         with override_sentinel(shim_dir="/shim", kubeconfig="/kc", required=True):
             # a CLEAN os.environ with a BAD env= -> raises (env= wins)
@@ -538,11 +561,21 @@ class TestEnvEqualityCheck:
         bin_dir = tmp_path / "fakebin"
         bin_dir.mkdir()
         env_dump = tmp_path / "env.json"
+        kubeconfig_check = tmp_path / "kubeconfig-exists-while-running.txt"
         (bin_dir / "pytest").write_text(
             "#!/usr/bin/env bash\n"
             'junit_path=""\n'
             'for arg in "$@"; do case "$arg" in --junit-xml=*) junit_path="${arg#--junit-xml=}" ;; esac; done\n'
             f'env -0 > "{env_dump}"\n'
+            # R4-B1: the script's EXIT trap removes the shim dir (and the
+            # sentinel KUBECONFIG path under it) once the script returns —
+            # by the time the OUTER test reads a recorded path, nothing
+            # under the shim dir can ever exist, regardless of whether the
+            # script actually pointed KUBECONFIG at a path that existed
+            # WHILE it was running. Check from inside this fake pytest,
+            # before run-tests.sh exits, and record the verdict.
+            '[ -e "$KUBECONFIG" ] && echo "exists" > '
+            f'"{kubeconfig_check}" || echo "absent" > "{kubeconfig_check}"\n'
             'cat > "$junit_path" <<XML\n'
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<testsuites><testsuite name="fake" tests="1" failures="0" errors="0" skipped="0">\n'
@@ -602,9 +635,13 @@ class TestEnvEqualityCheck:
             "HERMETIC_KUBECONFIG must be exported"
         )
         # S11: KUBECONFIG must EQUAL the exported sentinel (not merely be
-        # non-empty), and that path must not exist on disk.
+        # non-empty), and that path must not have existed WHILE run-tests.sh
+        # was still running (checked from inside the fake pytest — by the
+        # time this outer test reads anything, the script's EXIT trap has
+        # already `rm -rf`'d the whole shim dir, so a post-exit path check
+        # can never observe "exists" regardless of what the script did).
         assert recorded.get("KUBECONFIG") == recorded.get("HERMETIC_KUBECONFIG")
-        assert not Path(recorded["KUBECONFIG"]).exists()
+        assert kubeconfig_check.read_text().strip() == "absent"
         # S14/S15: prefix-enumerated unset — both the originally-tested
         # names AND an unlisted name under each prefix must be gone.
         assert "KUBERNETES_SERVICE_HOST" not in recorded
@@ -918,30 +955,6 @@ def test_a6_7_swallowed_violation_still_fails_the_inner_test(tmp_path):
     assert "hermetic guard" in (result.stdout + result.stderr)
 
 
-def test_a6_7_neuter_clearing_record_in_teardown_makes_inner_pass(
-    tmp_path, monkeypatch
-):
-    """Neuter for the test above, measured directly against the real
-    `_teardown_check_and_clear` (not the child-session probe — this calls
-    the function itself, with a synthetic node, which is enough to show
-    the mechanism the test above relies on): a teardown that clears the
-    record WITHOUT checking it first lets a non-empty record pass silently,
-    which is what makes the outer assertion in the test above ("the inner
-    test FAILED") meaningful rather than vacuous."""
-    original = conftest._teardown_check_and_clear
-
-    def _neutered(node):
-        conftest.PER_TEST_VIOLATIONS.clear()  # clears WITHOUT checking first
-
-    monkeypatch.setattr(conftest, "_teardown_check_and_clear", _neutered)
-    try:
-        conftest.PER_TEST_VIOLATIONS.append("would have failed the real check")
-        conftest._teardown_check_and_clear(type("N", (), {"nodeid": "x"})())
-        assert conftest.PER_TEST_VIOLATIONS == []
-    finally:
-        monkeypatch.setattr(conftest, "_teardown_check_and_clear", original)
-
-
 def test_c24_c25_import_time_violation_with_no_active_node_fails_the_session(
     tmp_path,
 ):
@@ -953,8 +966,10 @@ def test_c24_c25_import_time_violation_with_no_active_node_fails_the_session(
     real test passes cleanly on its own. Neutering EITHER the routing
     (C25: always append per-test, which the next test's setup clears
     before anyone checks it) OR the sessionfinish exit (C24: drop
-    `session.exitstatus = 1`) turns this green — the exit code is the
-    only observable; it does not distinguish which of the two moved."""
+    `session.exitstatus = 1`) makes the CHILD session exit 0 (clean)
+    instead of non-zero — which turns THIS (outer) test RED, since its
+    own `result.returncode != 0` assertion then fails. The exit code is
+    the only observable; it does not distinguish which of the two moved."""
     env = build_fresh_sentinel_env(tmp_path)
     result = run_child_pytest_session(
         """

@@ -156,6 +156,29 @@ def test_a_leaking_fake_pytest_makes_run_tests_sh_exit_nonzero(tmp_path: Path):
     assert "kubectl get nodes" in result.stderr
 
 
+def test_kubectl_shim_itself_exits_17(tmp_path: Path):
+    """Non-blocking item carried from round 3: the overall script's exit
+    code and the reject log are what A1-4 checks, and those stay the same
+    regardless of the shim's OWN per-call exit status to its caller (the
+    reject-log check never reads it) — so this needs its own assertion on
+    the shim's actual exit code, not merely "the script exits non-zero
+    somewhere"."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    rc_file = tmp_path / "kubectl-rc.txt"
+    _fake_pytest(
+        bin_dir,
+        body=f'kubectl get nodes; echo "$?" > "{rc_file}"',
+    )
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    _run_script(root, bin_dir)
+
+    assert rc_file.read_text().strip() == "17"
+
+
 def test_a_clean_fake_pytest_leaves_run_tests_sh_exit_zero(tmp_path: Path):
     """Negative control: without the leak, the same harness must pass —
     proves the failure above is caused by the leak, not by the scratch
@@ -310,6 +333,25 @@ def test_a4_10_probes_do_not_abort_the_script_under_pipefail(tmp_path: Path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "probe localhost:8080 rc=" in result.stdout
+
+
+def test_a4_10_command_dash_v_helm_probe_prints(tmp_path: Path):
+    """Non-blocking item carried from round 3: removing the `command -v
+    helm` probe line leaves the script green (it is diagnostic-only, per
+    the digest), so it needs its own behavioural assertion that the probe
+    line actually prints — otherwise a silent deletion goes unnoticed by
+    every OTHER test in this file."""
+    root = _scratch_script_root(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _fake_pytest(bin_dir, body=": # no leak")
+    _fake_python_passthrough(bin_dir)
+    _fake_real_helm(bin_dir)
+
+    result = _run_script(root, bin_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command -v helm ->" in result.stdout
 
 
 # ──────────────── A4-5/A5-3: the shared helm case table, bash side ──────────
