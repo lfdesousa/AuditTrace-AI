@@ -12,7 +12,9 @@ Logging and telemetry are configured once per test session so that the
 # time.
 import logging
 import os
+import stat
 import subprocess  # noqa: S404 — used only for chart-rendering test injection below
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -662,6 +664,104 @@ os.spawnle = _patched_spawnle
 os.spawnlp = _patched_spawnlp
 os.spawnlpe = _patched_spawnlpe
 pty.spawn = _patched_pty_spawn
+
+# ───────── ACL WU-2c-A0 tracked-file write lock (re-review #8, 2026-10-08) ─────────
+# Orchestrator ruling: static enumeration of "no test writes a tracked
+# path" (an AST walk over write_text/write_bytes/open shapes) lost
+# round after round — the real round-6 defect was a write through a
+# FUNCTION PARAMETER fed `run.site` by a caller, which no shape-list
+# ever anticipated, and open(path, "w")/write_bytes beat it too. This
+# adds a RUNTIME check alongside that static one: `chmod a-w` the two
+# ACL WU-2c-A0 shipped, tracked files for the WHOLE SESSION, restoring
+# their original mode at teardown (SIGKILL residue measured below).
+# MEASURED (re-review #9, 2026-10-11): this stops every IN-PLACE
+# open-for-write shape — `open(path, "w"/"a"/"r+")`, `.write_text(...)`,
+# `.write_bytes(...)`, a shell `>`/`>>` — with `PermissionError`,
+# because each of those opens the EXISTING directory entry for
+# writing. It does NOT stop a write that replaces or recreates the
+# directory entry instead: `os.replace(tmp, path)`/`shutil.move(tmp,
+# path)` (rename/replace onto the path), a `sed -i` subprocess,
+# unlink-and-recreate (`path.unlink(); path.write_bytes(...)`), or
+# chmod-then-write (`path.chmod(0o755); path.write_bytes(...)`) all
+# succeed under this lock, because the DIRECTORY stays writable —
+# re-review #9 measured all four. Guard A (below) does not close that
+# gap either: it only compares the restored bytes, so a rename/unlink
+# helper with a `finally` restore is invisible to it, exactly like the
+# original round-6 hazard. Review remains the gate for those shapes.
+_ACL_WU2C_TRACKED_FILES = (
+    Path(__file__).resolve().parent.parent / "scripts" / "setup-memory-scopes.sh",
+    Path(__file__).resolve().parent.parent
+    / "charts"
+    / "audittrace"
+    / "templates"
+    / "keycloak"
+    / "configmap-memory-scopes-script.yaml",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _acl_wu2c_tracked_files_are_read_only_for_the_whole_session():  # type: ignore[no-untyped-def]
+    """Make `scripts/setup-memory-scopes.sh` and the chart's
+    ConfigMap-mirrored copy READ-ONLY (write bits stripped for owner,
+    group, and other — the executable bit, which git tracks via the
+    `+x` mode, is PRESERVED) for the duration of the whole pytest
+    session, restoring each file's recorded mode at teardown (a
+    normal, non-killed session restores the exact mode it observed at
+    the start of ITS OWN session — see the SIGKILL caveat below for
+    when that recorded mode is itself already locked).
+
+    `root` ignores file-permission bits entirely, which would make
+    this fixture a silent, dangerous no-op — fail loudly instead of
+    letting that happen quietly.
+
+    Restoration is wrapped in `try`/`finally` around BOTH halves —
+    the lock loop and the yield — so a failure anywhere (a `chmod`
+    that raises partway through locking, a test raising past the
+    `yield`, or a `chmod` that raises partway through restoring)
+    still restores every file this fixture already recorded the
+    original mode for, best-effort, rather than leaving an earlier
+    file permanently locked because a later step raised. Any
+    restoration failures are collected and raised together at the
+    end (never swallowed silently) so a reviewer sees exactly which
+    file(s) did not come back to their original mode.
+
+    MEASURED (re-review #9, 2026-10-11): a SIGKILLed session (`finally`
+    does not run) leaves both files at 555/444 — read-only residue,
+    not a mutation; content stays safe and `git status` stays clean,
+    because git tracks only the executable bit. The NEXT session then
+    records 555/444 as "the" original mode and restores to that, so
+    the read-only state is STICKY across a crash: it does not
+    self-heal, and a developer edit is refused until an operator runs
+    `chmod u+w` on the two files by hand."""
+    assert os.geteuid() != 0, (
+        "refusing to run the test session as root: chmod-based "
+        "tracked-file write protection (ACL WU-2c-A0) is a no-op for "
+        "root, which ignores file permission bits entirely"
+    )
+    original_modes: dict[Path, int] = {}
+    try:
+        for path in _ACL_WU2C_TRACKED_FILES:
+            if not path.exists():
+                continue
+            original_modes[path] = stat.S_IMODE(path.stat().st_mode)
+            read_and_exec_only = original_modes[path] & ~(
+                stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+            )
+            path.chmod(read_and_exec_only)
+        yield
+    finally:
+        restore_errors: list[str] = []
+        for path, mode in original_modes.items():
+            try:
+                path.chmod(mode)
+            except OSError as exc:
+                restore_errors.append(f"{path}: {exc}")
+        if restore_errors:
+            raise RuntimeError(
+                "ACL WU-2c-A0 tracked-file mode restoration failed for: "
+                + "; ".join(restore_errors)
+            )
+
 
 # Test isolation: clear all AUDITTRACE_* env vars so a developer's local .env
 # (with real PostgreSQL credentials etc.) doesn't leak into tests.

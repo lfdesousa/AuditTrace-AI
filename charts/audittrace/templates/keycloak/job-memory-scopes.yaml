@@ -28,11 +28,21 @@ metadata:
     "helm.sh/hook-weight": "20"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  # Same back-off shape as the summariser-role Job — Keycloak may
-  # still be rolling when the hook fires.
-  backoffLimit: 12
-  # Hard cap. Realistic runtime <30s on a healthy cluster.
-  activeDeadlineSeconds: 600
+  # ACL WU-2c-A0 (Addendum F §4 / F1 S2-2 / F2 §4 / F3 S2-2): a Job
+  # that silently retried a deterministic script failure 12x inside
+  # helm's 300s --wait window surfaced only as "timed out waiting for
+  # the condition" (the 2026-10-06 finding this WU closes). backoffLimit
+  # 2 + restartPolicy Never means every attempt keeps its OWN Pod (and
+  # log) until the next hook-creation deletes them (hook-delete-policy
+  # above is hook-succeeded only), so a failure is captured, not erased.
+  # activeDeadlineSeconds 290 closes on MEASURED worst-case pre-step
+  # waits (TCP budget 120s + one bounded connect 5s + auth budget 80s +
+  # one in-flight kcadm call 20s timeout + 5s kill-after + a 50s
+  # post-auth step budget = 280s ≤ 290 < the runner's --timeout 300s
+  # default, config.py). A deadline kill is now a NAMED `signal-term`
+  # line (the script's script-wide TERM trap), never silent.
+  backoffLimit: 2
+  activeDeadlineSeconds: 290
   template:
     metadata:
       labels:
@@ -48,7 +58,15 @@ spec:
         {{- include "audittrace.vaultAnnotations.memoryScopesJob" . | nindent 8 }}
         {{- end }}
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
+      # Explicit (the template set none before — the K8s default of 30s
+      # was implicit): the script's `acl_e2e_kc` wrapper's default
+      # per-call timeout (20s) + `timeout -k 5` kill-after must stay
+      # below this value (pinned, F1 AC-F8 superseded by F2 S2-3:
+      # 20 + 5 < 30) so a hung kcadm call is always reaped by the
+      # script itself before kubelet's SIGKILL would otherwise land on
+      # a process with no chance left to print the named line.
+      terminationGracePeriodSeconds: 30
       serviceAccountName: {{ .Release.Name }}-memory-scopes-job
       containers:
         - name: kcadm
@@ -65,6 +83,14 @@ spec:
             # verify-then-delete.
             - name: AUDITTRACE_ACL_E2E_CLIENT_ENABLED
               value: {{ .Values.keycloak.aclE2eClient.enabled | quote }}
+            # ACL WU-2c-A0 (Addendum F §3 / F1 §5): read-only, GET-only
+            # shape capture of the E2E client's live Keycloak
+            # representation (key names + typed, redacted values —
+            # never a value) — default off; the re-enable deploy flips
+            # it on so the real layout lands in the evidence without
+            # ever printing a secret.
+            - name: AUDITTRACE_ACL_E2E_SHAPE_CAPTURE
+              value: {{ ternary "1" "0" .Values.keycloak.aclE2eClient.shapeCapture | quote }}
             {{- if not .Values.vault.enabled }}
             # vault.enabled=false branch — K8s Secret. When
             # vault.enabled=true KEYCLOAK_ADMIN_PASSWORD lands at
