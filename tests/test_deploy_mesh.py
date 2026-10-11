@@ -37,6 +37,7 @@ from scripts.deploy.mesh import (
     evaluate_nodes,
     is_host_resettle_allowed,
 )
+from tests._hermetic_env import hermetic_env
 
 SCRIPTS_DIR = Path(mesh.__file__).resolve().parents[1]
 RESETTLE_SCRIPT = SCRIPTS_DIR / "audittrace-mesh-resettle.sh"
@@ -1126,11 +1127,13 @@ def _run_executor(heal_dir: Path, signal: str | None, *, raw: str | None = None)
         req.write_text(json.dumps({"request_id": "req-test-0001", "signal": signal}))
     proc = subprocess.run(
         ["bash", str(RESETTLE_SCRIPT)],
-        env={
-            "MESH_HEAL_DIR": str(heal_dir),
-            "MESH_RESETTLE_DRY_RUN": "1",
-            "PATH": "/usr/bin:/bin",
-        },
+        env=hermetic_env(
+            {
+                "MESH_HEAL_DIR": str(heal_dir),
+                "MESH_RESETTLE_DRY_RUN": "1",
+                "PATH": "/usr/bin:/bin",
+            }
+        ),
         capture_output=True,
         text=True,
         check=False,
@@ -1179,7 +1182,7 @@ def test_executor_noop_when_no_requests(tmp_path):
     (tmp_path / "requests").mkdir(parents=True)
     proc = subprocess.run(
         ["bash", str(RESETTLE_SCRIPT)],
-        env={"MESH_HEAL_DIR": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        env=hermetic_env({"MESH_HEAL_DIR": str(tmp_path), "PATH": "/usr/bin:/bin"}),
         capture_output=True,
         text=True,
         check=False,
@@ -1289,11 +1292,13 @@ def test_g2_end_to_end_via_real_watched_dir_and_real_executor(monkeypatch, tmp_p
     def fake_sleep(_seconds):
         proc = subprocess.run(
             ["bash", str(RESETTLE_SCRIPT)],
-            env={
-                "MESH_HEAL_DIR": str(tmp_path),
-                "MESH_RESETTLE_DRY_RUN": "1",
-                "PATH": "/usr/bin:/bin",
-            },
+            env=hermetic_env(
+                {
+                    "MESH_HEAL_DIR": str(tmp_path),
+                    "MESH_RESETTLE_DRY_RUN": "1",
+                    "PATH": "/usr/bin:/bin",
+                }
+            ),
             capture_output=True,
             text=True,
             check=False,
