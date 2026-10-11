@@ -33,6 +33,170 @@
 
 set -euo pipefail
 
+# Duplicate the REAL stdout/stderr to fd 3/4 BEFORE any later command
+# in this script redirects fd 1/2 of its own invocation (e.g. every
+# `acl_e2e_kc ... >/dev/null` call). Without this, a TERM/timeout that
+# strikes WHILE such a redirected call is in flight would have the
+# trap's own `acl-e2e:` line inherit that call's CURRENT fd 1 (the
+# `/dev/null` it was redirected to), silently losing the stdout half
+# of "exactly once on both streams" — found by this WU's own SIGTERM
+# test against the sunset-delete call. fd 3/4 are independent
+# duplicates of the ORIGINAL pipe/terminal and are never themselves
+# redirected, so acl_e2e_emit always reaches the real streams.
+exec 3>&1 4>&2
+
+# ----- ACL WU-2c-A0: named-failure-line diagnostics (F/F1/F2/F3) -----
+# Every exit path of this script — an explicit refusal, an implicit
+# `set -e`/`-u`/`pipefail` exit, a Job SIGTERM/SIGKILL landing on a
+# stuck kcadm call, or a kcadm call that times out — prints exactly
+# one line of the form
+#   acl-e2e: code=<code> stage=<stage> rc=<rc> line=<n|?> cmd=<masked|-> detail=<non-secret>
+# to BOTH stdout and stderr before the process exits (ACL WU-2c
+# Addendum F/F1/F2/F3). `cmd=` is `$BASH_COMMAND`
+# (source text, never an expanded value) with every password token
+# masked; `detail=` is always a closed-set reason/count/path — never a
+# kcadm response body (which may carry `registrationAccessToken`) and
+# never a raw credential.
+#
+# Bootstrap tool checks run with NO trap installed yet (nothing would
+# catch their own failure) — each prints the line itself and exits.
+if ! command -v timeout >/dev/null 2>&1; then
+  printf 'acl-e2e: code=timeout-missing stage=pre-step:init rc=127 line=? cmd=- detail=coreutils-timeout-not-on-PATH\n' >&3
+  printf 'acl-e2e: code=timeout-missing stage=pre-step:init rc=127 line=? cmd=- detail=coreutils-timeout-not-on-PATH\n' >&4
+  exit 1
+fi
+if ! command -v mktemp >/dev/null 2>&1; then
+  printf 'acl-e2e: code=mktemp-missing stage=pre-step:init rc=127 line=? cmd=- detail=coreutils-mktemp-not-on-PATH\n' >&3
+  printf 'acl-e2e: code=mktemp-missing stage=pre-step:init rc=127 line=? cmd=- detail=coreutils-mktemp-not-on-PATH\n' >&4
+  exit 1
+fi
+
+ACL_E2E_REPORTED=0
+ACL_E2E_CHILD=""
+ACL_E2E_STAGE="pre-step:init"
+ACL_E2E_ERR_LINE="?"
+ACL_E2E_ERR_CMD="-"
+ACL_E2E_REPORT_FILE="$(mktemp)"
+unset ACL_E2E_VIA_KC ACL_E2E_CALL_LINE || true
+
+# `$BASH_COMMAND` is source text, never an expanded value — masking the
+# variable NAME here is defence in depth only; the real leak vectors
+# (`set -x`, `printenv`, `declare -p`, `cat <<<"$KEYCLOAK_ADMIN_PASSWORD"`)
+# are forbidden outright by the secret-hygiene test (AC-F2, F3 SF3-5).
+acl_e2e_mask() {
+  local s="$1"
+  s="${s//KEYCLOAK_ADMIN_PASSWORD/<redacted-var>}"
+  # Collapse any embedded CR/LF (a malformed multi-line kcadm response
+  # read naively into a value) so it can never split the one-line
+  # emission across terminal lines, THEN fail closed on anything
+  # token-shaped (>=3 dot-separated base64url segments, >=15 chars
+  # each) that might have ridden in via a response-derived value (F
+  # section 1.2: "detail= never carries a kcadm response body"; R4).
+  s="${s//$'\r'/ }"
+  s="${s//$'\n'/ }"
+  while [[ "${s}" =~ ([A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}) ]]; do
+    s="${s/${BASH_REMATCH[1]}/<redacted-token>}"
+  done
+  printf '%s' "${s}"
+}
+
+# The ONE line, both streams, one shape (F2 SF-1).
+acl_e2e_emit() {
+  local code="$1" rc="$2" line="$3" cmd="$4" detail="$5" msg
+  msg="acl-e2e: code=${code} stage=${ACL_E2E_STAGE} rc=${rc} line=${line} cmd=$(acl_e2e_mask "${cmd}") detail=$(acl_e2e_mask "${detail}")"
+  printf '%s\n' "${msg}" >&3
+  printf '%s\n' "${msg}" >&4
+}
+
+# Preferred-cause resolver shared by the ERR/EXIT/TERM/INT paths: an
+# inner, more specific cause recorded by a nested subshell's
+# `acl_e2e_fail` always wins over a generic fallback (F2 BF1-b).
+acl_e2e_report() {
+  local fallback_code="$1" rc="$2" fallback_detail="$3"
+  [[ "${ACL_E2E_REPORTED}" -eq 1 ]] && return 0
+  if [[ -s "${ACL_E2E_REPORT_FILE}" ]]; then
+    local inner icode irc idetail
+    inner="$(cat "${ACL_E2E_REPORT_FILE}" 2>/dev/null || true)"
+    icode="${inner#code=}"; icode="${icode%% stage=*}"
+    irc="${inner#*rc=}"; irc="${irc%% detail=*}"
+    idetail="${inner#*detail=}"
+    acl_e2e_emit "${icode}" "${irc}" "${ACL_E2E_ERR_LINE}" "${ACL_E2E_ERR_CMD}" "${idetail}"
+  else
+    acl_e2e_emit "${fallback_code}" "${rc}" "${ACL_E2E_ERR_LINE}" "${ACL_E2E_ERR_CMD}" "${fallback_detail}"
+  fi
+  ACL_E2E_REPORTED=1
+}
+
+# Explicit refusal — every `|| acl_e2e_fail <code> "<detail>"` site in
+# this script. Inside a subshell ($( ), a pipeline element, `( )`) this
+# cannot set this shell's ACL_E2E_REPORTED, so it records into the
+# parent-owned report file instead (an EXIT trap does NOT itself run
+# inside a `$( )`/`( )`/pipeline subshell on bash 5.1/5.2 — measured;
+# no `trap - EXIT` is needed to suppress a second print there) so the
+# one real top-level `|| acl_e2e_fail` prints the ONE line (F2 BF1-b;
+# AC-F14 pins that every call site sits where this holds).
+#
+# The real rc of the FAILING command the `||` just reacted to is still
+# live in $? when this function is entered — captured as the FIRST
+# statement, before any other command (even `local`) would overwrite
+# it. A timeout (124) or a delivered signal's own exit status (143/130,
+# on the rare top-level call where the trap itself never got to run
+# first) always overrides the caller's generic code, so a guard can
+# never collapse a `kcadm-timeout`/`signal-term`/`signal-int` into its
+# own more general refusal code (R3).
+acl_e2e_fail() {
+  local __acl_rc=$?
+  local code="$1"
+  shift
+  local detail="$*"
+  case "${__acl_rc}" in
+    124) code="kcadm-timeout" ;;
+    143) code="signal-term" ;;
+    130) code="signal-int" ;;
+    97) code="unwrapped-call" ;;
+    *) __acl_rc=1 ;;
+  esac
+  if [[ "${BASH_SUBSHELL}" -gt 0 ]]; then
+    printf 'code=%s stage=%s rc=%s detail=%s' "${code}" "${ACL_E2E_STAGE}" "${__acl_rc}" "${detail}" > "${ACL_E2E_REPORT_FILE}"
+    exit "${__acl_rc}"
+  fi
+  acl_e2e_report "${code}" "${__acl_rc}" "${detail}"
+  exit "${__acl_rc}"
+}
+
+acl_e2e_on_err() {
+  ACL_E2E_ERR_LINE="${BASH_LINENO[0]}"
+  ACL_E2E_ERR_CMD="${BASH_COMMAND}"
+}
+
+acl_e2e_on_exit() {
+  local rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    local code="unguarded-failure"
+    case "${rc}" in
+      124) code="kcadm-timeout" ;;
+      97) code="unwrapped-call" ;;
+    esac
+    acl_e2e_report "${code}" "${rc}" "unreported-exit"
+  fi
+  rm -f "${ACL_E2E_REPORT_FILE}" 2>/dev/null || true
+}
+
+acl_e2e_on_signal() {
+  local sig="$1" rc=143
+  [[ "${sig}" == "INT" ]] && rc=130
+  [[ -n "${ACL_E2E_CHILD}" ]] && kill "${ACL_E2E_CHILD}" 2>/dev/null || true
+  acl_e2e_report "signal-${sig,,}" "${rc}" "killed-by-SIG${sig}"
+  rm -f "${ACL_E2E_REPORT_FILE}" 2>/dev/null || true
+  exit "${rc}"
+}
+
+trap 'acl_e2e_on_err' ERR
+trap 'acl_e2e_on_exit' EXIT
+trap 'acl_e2e_on_signal TERM' TERM
+trap 'acl_e2e_on_signal INT' INT
+set -E
+
 NAMESPACE="${AUDITTRACE_NAMESPACE:-audittrace}"
 RELEASE="${AUDITTRACE_RELEASE:-audittrace}"
 REALM="${REALM:-audittrace}"
@@ -99,19 +263,41 @@ fi
 echo "🔐 setup-memory-scopes.sh — reconciling memory:*:write scopes"
 echo "   namespace=${NAMESPACE} release=${RELEASE} realm=${REALM} pod=${KC_POD}"
 
-kcadm() {
-  kubectl -n "${NAMESPACE}" exec -i "${KC_POD}" -c keycloak -- \
-    /opt/keycloak/bin/kcadm.sh "$@"
+# acl-e2e-kc-begin
+# Every kcadm invocation in this script goes through this wrapper
+# (F2 BF1-a) — nothing else in either site calls kcadm.sh directly.
+# Interruptible (background + `wait` — a trapped signal interrupts
+# `wait`, F1 §1.2) and bounded (`timeout -k 5 <default 20>`, F2 S-b:
+# for the many invocations nested inside a `$(...)` command
+# substitution this per-call timeout is the ONLY mechanism, since a
+# signal to the main process is deferred until that foreground
+# subshell returns). The `ACL_E2E_VIA_KC`/`ACL_E2E_CALL_LINE`
+# environment prefix on this one command (never `export`) is the
+# dynamic primary proof that every call on an exercised path goes
+# through here (F3 §1.1): a harness fake invoked without the marker
+# fails loudly instead of passing silently.
+acl_e2e_kc() {
+  local rc
+  ACL_E2E_VIA_KC=1 ACL_E2E_CALL_LINE="${BASH_LINENO[0]}" \
+    timeout -k 5 "${ACL_E2E_KCADM_TIMEOUT:-20}" kubectl -n "${NAMESPACE}" exec -i "${KC_POD}" -c keycloak -- /opt/keycloak/bin/kcadm.sh "$@" &
+  ACL_E2E_CHILD=$!
+  wait "${ACL_E2E_CHILD}"
+  rc=$?
+  ACL_E2E_CHILD=""
+  return "${rc}"
 }
+# acl-e2e-kc-end
 
 # ----- Authenticate -----
+ACL_E2E_STAGE="pre-step:auth"
 echo "▶ authenticating to Keycloak admin..."
-kcadm config credentials \
+acl_e2e_kc config credentials \
   --server http://localhost:8080 \
   --realm master \
   --user admin \
   --password "${KEYCLOAK_ADMIN_PASSWORD}" >/dev/null
 echo "  ✓ authenticated"
+ACL_E2E_STAGE="pre-step:init"
 
 # #370 RATIFIED 2026-08-11 — this array (bound to `admin-client` as a
 # DEFAULT scope below, via CLIENT_KIND) is WHY the live realm's
@@ -332,19 +518,20 @@ MEMORY_ACL_WRITE_SCOPES=(
 
 # ----- Ensure each scope exists -----
 declare -A SCOPE_ID
+ACL_E2E_STAGE="scope-ensure"
 for SCOPE in "${SCOPES[@]}" "${CORPUS_SCOPES[@]}" "${MEMORY_SESSION_WRITE_SCOPES[@]}" "${MEMORY_SESSION_READ_SCOPES[@]}" "${MEMORY_CONVERSATIONS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATIONS_READ_SCOPES[@]}" "${MEMORY_PRESETS_WRITE_SCOPES[@]}" "${MEMORY_PRESETS_READ_SCOPES[@]}" "${MEMORY_PROMPTS_WRITE_SCOPES[@]}" "${MEMORY_PROMPTS_READ_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_WRITE_SCOPES[@]}" "${MEMORY_CHAT_PROJECTS_READ_SCOPES[@]}" "${MEMORY_FILES_WRITE_SCOPES[@]}" "${MEMORY_FILES_READ_SCOPES[@]}" "${MEMORY_AGENTS_WRITE_SCOPES[@]}" "${MEMORY_AGENTS_READ_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_WRITE_SCOPES[@]}" "${MEMORY_CONVERSATION_TAGS_READ_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_WRITE_SCOPES[@]}" "${MEMORY_TOOL_FAVORITES_READ_SCOPES[@]}" "${MEMORY_ACL_READ_SCOPES[@]}" "${MEMORY_ACL_WRITE_SCOPES[@]}"; do
-  EXISTING=$(kcadm get client-scopes -r "${REALM}" \
+  EXISTING=$(acl_e2e_kc get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes 2>/dev/null \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
   if [[ -n "${EXISTING}" ]]; then
     echo "  ⊝ scope ${SCOPE}: exists (${EXISTING})"
     SCOPE_ID["${SCOPE}"]="${EXISTING}"
   else
-    kcadm create client-scopes -r "${REALM}" \
+    acl_e2e_kc create client-scopes -r "${REALM}" \
       -s "name=${SCOPE}" \
       -s protocol=openid-connect \
       -s 'attributes."include.in.token.scope"=true' >/dev/null
-    NEW_ID=$(kcadm get client-scopes -r "${REALM}" \
+    NEW_ID=$(acl_e2e_kc get client-scopes -r "${REALM}" \
                --fields id,name --format csv --noquotes \
              | awk -F, -v n="${SCOPE}" '$2 == n {print $1; exit}')
     echo "  ✓ scope ${SCOPE}: created (${NEW_ID})"
@@ -361,8 +548,9 @@ CLIENT_KIND["audittrace-webui"]="optional"
 bind_scope() {
   local CLIENT_ID="$1" SCOPE="$2" KIND="$3"
   local CLIENT_UUID SCOPE_UUID PATH_SUFFIX
+  ACL_E2E_STAGE="bind"
 
-  CLIENT_UUID=$(kcadm get clients -r "${REALM}" \
+  CLIENT_UUID=$(acl_e2e_kc get clients -r "${REALM}" \
                   -q "clientId=${CLIENT_ID}" \
                   --fields id --format csv --noquotes 2>/dev/null \
                 | tr -d '"' | head -1)
@@ -385,7 +573,7 @@ bind_scope() {
   # `-b '{}'` not `-s ''` — see configmap-memory-scopes-script.yaml
   # for the 2026-05-03 lesson on why the kcadm binding command needs
   # an explicit empty JSON body rather than an empty -s argument.
-  if ! kcadm update \
+  if ! acl_e2e_kc update \
          "clients/${CLIENT_UUID}/${PATH_SUFFIX}/${SCOPE_UUID}" \
          -r "${REALM}" -b '{}' >/dev/null 2>&1; then
     echo "  ✗ ${CLIENT_ID} ${KIND} ← ${SCOPE} (kcadm rejected the bind)" >&2
@@ -591,25 +779,21 @@ ACL_E2E_CLIENT_ID="audittrace-acl-e2e"
 ACL_E2E_ENABLED="${AUDITTRACE_ACL_E2E_CLIENT_ENABLED:-true}"
 ACL_E2E_CLIENT_JSON='{"clientId":"audittrace-acl-e2e","description":"ACL WU-2c E2E-only device-flow client (sunset: WU-4 merge, keycloak.aclE2eClient.enabled=false). Holds ONLY memory:acl:read-own + memory:acl:write; no offline_access, no refresh, consent required.","enabled":true,"protocol":"openid-connect","publicClient":true,"standardFlowEnabled":false,"directAccessGrantsEnabled":false,"implicitFlowEnabled":false,"serviceAccountsEnabled":false,"consentRequired":true,"redirectUris":["urn:ietf:wg:oauth:2.0:oob"],"webOrigins":[],"attributes":{"oauth2.device.authorization.grant.enabled":"true","oauth2.device.polling.interval":"5","oauth2.device.code.lifespan":"120","use.refresh.tokens":"false","access.token.lifespan":"900"},"defaultClientScopes":["memory:acl:read-own","memory:acl:write"],"optionalClientScopes":[],"protocolMappers":[{"name":"aud-audittrace-server","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.custom.audience":"audittrace-server","id.token.claim":"false","access.token.claim":"true"}}]}'
 ACL_E2E_DEFAULT_SCOPES=("memory:acl:read-own" "memory:acl:write")
-
-acl_e2e_fail() {
-  echo "❌ ${ACL_E2E_CLIENT_ID}: $*" >&2
-  exit 1
-}
+ACL_E2E_STAGE="pre-step:init"
 
 # Whitespace-stripped JSON of one kcadm GET (so `"k" : "v"` -> `"k":"v"`).
 acl_e2e_compact() {
   local raw
-  raw=$(kcadm get "$1" -r "${REALM}") || acl_e2e_fail "cannot read $1"
+  raw=$(acl_e2e_kc get "$1" -r "${REALM}") || acl_e2e_fail read-failed "cannot read the client"
   echo "${raw//[[:space:]]/}"
 }
 
 # Names of a client's default|optional scopes, one per line.
 acl_e2e_scope_names() {
   local out line
-  out=$(kcadm get "clients/$1/$2-client-scopes" -r "${REALM}" \
+  out=$(acl_e2e_kc get "clients/$1/$2-client-scopes" -r "${REALM}" \
           --fields name --format csv --noquotes) \
-    || acl_e2e_fail "cannot read $2 scopes"
+    || acl_e2e_fail read-failed "cannot read $2 scopes"
   while IFS= read -r line; do
     line="${line//\"/}"
     [[ -n "${line}" ]] && echo "${line}"
@@ -630,10 +814,11 @@ acl_e2e_in_default_set() {
 # optional keeps none.
 acl_e2e_strip_scopes() {
   local uuid="$1" kind out sid sname keep
+  ACL_E2E_STAGE="strip"
   for kind in default optional; do
-    out=$(kcadm get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
+    out=$(acl_e2e_kc get "clients/${uuid}/${kind}-client-scopes" -r "${REALM}" \
             --fields id,name --format csv --noquotes) \
-      || acl_e2e_fail "cannot list ${kind} scopes"
+      || acl_e2e_fail strip-list-failed "cannot list ${kind} scopes"
     while IFS=, read -r sid sname; do
       sid="${sid//\"/}"; sname="${sname//\"/}"
       [[ -z "${sid}" ]] && continue
@@ -642,9 +827,9 @@ acl_e2e_strip_scopes() {
         keep=1
       fi
       if [[ "${keep}" -eq 0 ]]; then
-        kcadm delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
+        acl_e2e_kc delete "clients/${uuid}/${kind}-client-scopes/${sid}" \
           -r "${REALM}" >/dev/null \
-          || acl_e2e_fail "could not strip ${kind} scope ${sname}"
+          || acl_e2e_fail strip-delete-failed "could not strip unpinned ${kind} scope"
         echo "  ✓ ${ACL_E2E_CLIENT_ID}: stripped unpinned ${kind} scope ${sname}"
       fi
     done <<< "${out}"
@@ -657,8 +842,10 @@ acl_e2e_strip_scopes() {
 # config pinned). Any difference -> exit non-zero with the diff.
 acl_e2e_verify() {
   local uuid="$1" diffs="" compact item name names raw line incfg cfgblocks pmok n=0
+  local unexpected_default=0 unexpected_optional=0 unexpected_mapper=0 unexpected_config=0
+  ACL_E2E_STAGE="verify-client"
   compact=$(acl_e2e_compact "clients/${uuid}") \
-    || acl_e2e_fail "cannot read the client"
+    || acl_e2e_fail read-failed "cannot read the client"
   for item in \
       '"clientId":"audittrace-acl-e2e"' '"publicClient":true' \
       '"standardFlowEnabled":false' '"directAccessGrantsEnabled":false' \
@@ -672,37 +859,55 @@ acl_e2e_verify() {
   done
   # default scopes: exact set (read FIRST, so a failed read is fatal and
   # can never look like an empty/equal set)
+  ACL_E2E_STAGE="verify-default-scopes"
   names=$(acl_e2e_scope_names "${uuid}" default) \
-    || acl_e2e_fail "cannot read default scopes"
+    || acl_e2e_fail read-failed "cannot read default scopes"
   n=0
+  unexpected_default=0
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
     n=$((n + 1))
-    acl_e2e_in_default_set "${name}" || diffs+=" unexpected-default-scope:${name}"
+    acl_e2e_in_default_set "${name}" || unexpected_default=$((unexpected_default + 1))
   done <<< "${names}"
+  # F4 §5 / R4: detail= is a CLOSED VOCABULARY built from PROPERTIES
+  # (counts, shapes) — NEVER a byte of the response itself. A deny-list
+  # mask on specific secret SHAPES (the prior round's fix) is beatable by
+  # any shape it doesn't name; omitting response-derived text entirely is
+  # the only fail-closed form.
+  [[ "${unexpected_default}" -eq 0 ]] \
+    || diffs+=" unexpected-default-scope:count=${unexpected_default}"
   [[ "${n}" -eq "${#ACL_E2E_DEFAULT_SCOPES[@]}" ]] \
     || diffs+=" default-scope-count:${n}"
   # optional scopes: exact empty set
+  ACL_E2E_STAGE="verify-optional-scopes"
   names=$(acl_e2e_scope_names "${uuid}" optional) \
-    || acl_e2e_fail "cannot read optional scopes"
+    || acl_e2e_fail read-failed "cannot read optional scopes"
+  unexpected_optional=0
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
-    diffs+=" unexpected-optional-scope:${name}"
+    unexpected_optional=$((unexpected_optional + 1))
   done <<< "${names}"
+  [[ "${unexpected_optional}" -eq 0 ]] \
+    || diffs+=" unexpected-optional-scope:count=${unexpected_optional}"
   # protocol mappers: exact name set + pinned protocolMapper/config
-  names=$(kcadm get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
+  ACL_E2E_STAGE="verify-mappers"
+  names=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}" \
             --fields name --format csv --noquotes) \
-    || acl_e2e_fail "cannot read protocol mappers"
+    || acl_e2e_fail read-failed "cannot read protocol mappers"
   n=0
+  unexpected_mapper=0
   while IFS= read -r name; do
     name="${name//\"/}"
     [[ -z "${name}" ]] && continue
     n=$((n + 1))
-    [[ "${name}" == "aud-audittrace-server" ]] || diffs+=" unexpected-mapper:${name}"
+    [[ "${name}" == "aud-audittrace-server" ]] || unexpected_mapper=$((unexpected_mapper + 1))
   done <<< "${names}"
+  [[ "${unexpected_mapper}" -eq 0 ]] \
+    || diffs+=" unexpected-mapper:count=${unexpected_mapper}"
   [[ "${n}" -eq 1 ]] || diffs+=" mapper-count:${n}"
-  raw=$(kcadm get "clients/${uuid}/protocol-mappers/models" -r "${REALM}") \
-    || acl_e2e_fail "cannot read the mapper config"
+  ACL_E2E_STAGE="verify-mapper-config"
+  raw=$(acl_e2e_kc get "clients/${uuid}/protocol-mappers/models" -r "${REALM}") \
+    || acl_e2e_fail read-failed "cannot read the mapper config"
   # SC-1, EXACT: the mapper's name and protocolMapper equal the pinned
   # values and its `config` map holds EXACTLY the pinned three pairs - no
   # extra key (an audience widening or a hardcoded-claim `scope` writer
@@ -733,7 +938,7 @@ acl_e2e_verify() {
       n=$((n + 1))
       case "${line}" in
         '"included.custom.audience":"audittrace-server"' | '"id.token.claim":"false"' | '"access.token.claim":"true"') ;;
-        *) diffs+=" unexpected-mapper-config:${line}" ;;
+        *) unexpected_config=$((unexpected_config + 1)) ;;
       esac
     elif [[ "${line}" == '"config":{' ]]; then
       incfg=1
@@ -742,6 +947,8 @@ acl_e2e_verify() {
       pmok=1
     fi
   done <<< "${raw}"
+  [[ "${unexpected_config}" -eq 0 ]] \
+    || diffs+=" unexpected-mapper-config:count=${unexpected_config}"
   [[ "${pmok}" -eq 1 ]] || diffs+=" missing-mapper-field:protocolMapper"
   if [[ "${cfgblocks}" -ne 1 ]]; then
     diffs+=" mapper-config-absent"
@@ -749,55 +956,138 @@ acl_e2e_verify() {
     [[ "${n}" -eq 3 ]] || diffs+=" mapper-config-count:${n}"
   fi
   if [[ -n "${diffs}" ]]; then
-    acl_e2e_fail "drift from the pinned client (fail closed, no kcadm update):${diffs}"
+    acl_e2e_fail drift "drift from the pinned client (fail closed, no kcadm update):${diffs}"
   fi
   echo "  ✓ ${ACL_E2E_CLIENT_ID}: verified equal to the pinned block"
 }
 
 # Matching clients as csv `id,clientId` lines; query failure is fatal.
+# Read-only shape capture (F §3 / F1 §5 / F2 §5 / F3 S2-6): default off
+# (AUDITTRACE_ACL_E2E_SHAPE_CAPTURE); prints key names with VALUES typed
+# and redacted — never a value — between `acl-e2e: shape-begin <what>` /
+# `acl-e2e: shape-end` markers; issues GETs only, changes no control
+# flow. Pure bash (the image has no jq/awk/curl). Any line not matching
+# an allowlisted shape is `<line:redacted len=n>` (fail closed) — a
+# public client's representation may carry `registrationAccessToken`,
+# and the rule must not depend on where it sits.
+acl_e2e_shape_line() {
+  local line="$1" trimmed key rest trail=""
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  case "${trimmed}" in
+    '{' | '[' | '},' | '],' | '}' | ']')
+      printf '%s\n' "${trimmed}"
+      return
+      ;;
+  esac
+  if [[ "${trimmed}" == *, ]]; then
+    trail=","
+    trimmed="${trimmed%,}"
+  fi
+  if [[ "${trimmed}" =~ ^\"([^\"]*)\"\ :\ (.*)$ ]]; then
+    key="\"${BASH_REMATCH[1]}\""
+    rest="${BASH_REMATCH[2]}"
+    if [[ "${rest}" =~ ^\"(.*)\"$ ]]; then
+      printf '%s: <string:%d>%s\n' "${key}" "${#rest}" "${trail}"
+    elif [[ "${rest}" == "true" || "${rest}" == "false" ]]; then
+      printf '%s: <bool>%s\n' "${key}" "${trail}"
+    elif [[ "${rest}" == "null" ]]; then
+      printf '%s: <null>%s\n' "${key}" "${trail}"
+    elif [[ "${rest}" == "{" || "${rest}" == "{}" ]]; then
+      printf '%s: %s%s\n' "${key}" "${rest}" "${trail}"
+    elif [[ "${rest}" == "[" || "${rest}" == "[]" ]]; then
+      printf '%s: %s%s\n' "${key}" "${rest}" "${trail}"
+    elif [[ "${rest}" =~ ^\[(.*)\]$ ]]; then
+      local inner="${BASH_REMATCH[1]}" count=0 i
+      if [[ -n "${inner//[[:space:]]/}" ]]; then
+        count=1
+        for ((i = 0; i < ${#inner}; i++)); do
+          [[ "${inner:i:1}" == "," ]] && count=$((count + 1))
+        done
+      fi
+      printf '%s: <array:%d>%s\n' "${key}" "${count}" "${trail}"
+    elif [[ "${rest}" =~ ^[0-9]+$ ]]; then
+      printf '%s: <number>%s\n' "${key}" "${trail}"
+    else
+      printf '<line:redacted len=%d>\n' "${#line}"
+    fi
+    return
+  fi
+  if [[ "${trimmed}" =~ ^\"(.*)\"$ ]]; then
+    printf '<string:%d>%s\n' "${#trimmed}" "${trail}"
+    return
+  fi
+  printf '<line:redacted len=%d>\n' "${#line}"
+}
+
+acl_e2e_shape_capture() {
+  local what="$1" uuid="$2" raw line
+  [[ "${AUDITTRACE_ACL_E2E_SHAPE_CAPTURE:-0}" == "1" ]] || return 0
+  echo "acl-e2e: shape-begin ${what}"
+  for path in "clients/${uuid}" "clients/${uuid}/default-client-scopes" \
+              "clients/${uuid}/optional-client-scopes" \
+              "clients/${uuid}/protocol-mappers/models"; do
+    raw=$(acl_e2e_kc get "${path}" -r "${REALM}") || continue
+    while IFS= read -r line; do
+      acl_e2e_shape_line "${line}"
+    done <<< "${raw}"
+  done
+  echo "acl-e2e: shape-end"
+}
+
 acl_e2e_lookup() {
   local out
-  out=$(kcadm get clients -r "${REALM}" -q "clientId=${ACL_E2E_CLIENT_ID}" \
+  out=$(acl_e2e_kc get clients -r "${REALM}" -q "clientId=${ACL_E2E_CLIENT_ID}" \
           --fields id,clientId --format csv --noquotes) \
-    || acl_e2e_fail "client lookup failed"
+    || acl_e2e_fail lookup-failed "client lookup failed"
   echo "${out//\"/}"
 }
 
 if [[ "${ACL_E2E_ENABLED}" == "true" ]]; then
   echo "▶ ensuring the dedicated E2E client ${ACL_E2E_CLIENT_ID} (enabled)..."
-  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+  ACL_E2E_STAGE="lookup"
+  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed"
   if [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]]; then
-    printf '%s' "${ACL_E2E_CLIENT_JSON}" | kcadm create clients -r "${REALM}" -f - >/dev/null \
-      || acl_e2e_fail "create failed"
+    ACL_E2E_STAGE="create"
+    printf '%s' "${ACL_E2E_CLIENT_JSON}" | acl_e2e_kc create clients -r "${REALM}" -f - >/dev/null \
+      || acl_e2e_fail create-failed "create failed"
     echo "  ✓ ${ACL_E2E_CLIENT_ID}: created"
-    ACL_E2E_UUID=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+    ACL_E2E_STAGE="lookup"
+    ACL_E2E_UUID=$(acl_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed"
     ACL_E2E_UUID="${ACL_E2E_UUID%%,*}"
-    [[ -n "${ACL_E2E_UUID}" ]] || acl_e2e_fail "created but id not resolvable"
+    [[ -n "${ACL_E2E_UUID}" ]] || acl_e2e_fail id-unresolvable "created but id not resolvable"
     acl_e2e_strip_scopes "${ACL_E2E_UUID}"
+    ACL_E2E_STAGE="bind"
     for SCOPE in "${ACL_E2E_DEFAULT_SCOPES[@]}"; do
       bind_scope "${ACL_E2E_CLIENT_ID}" "${SCOPE}" "default"
     done
+    acl_e2e_shape_capture after-create "${ACL_E2E_UUID}"
   else
     [[ "$(echo "${ACL_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
-      || acl_e2e_fail "more than one client matches (refusing)"
+      || acl_e2e_fail ambiguous-match "more than one client matches (refusing)"
     ACL_E2E_UUID="${ACL_E2E_FOUND%%,*}"
+    acl_e2e_shape_capture after-lookup "${ACL_E2E_UUID}"
   fi
   acl_e2e_verify "${ACL_E2E_UUID}"
 else
   echo "▶ removing the dedicated E2E client ${ACL_E2E_CLIENT_ID} (disabled — sunset)..."
-  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "client lookup failed"
+  ACL_E2E_STAGE="sunset-lookup"
+  ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail lookup-failed "client lookup failed"
   if [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]]; then
     echo "  ⊝ ${ACL_E2E_CLIENT_ID}: absent (empty query result)"
   else
     [[ "$(echo "${ACL_E2E_FOUND}" | grep -c .)" -eq 1 ]] \
-      || acl_e2e_fail "refusing to delete: query did not return exactly one client"
+      || acl_e2e_fail ambiguous-match "refusing to delete: query did not return exactly one client"
     [[ "${ACL_E2E_FOUND#*,}" == "${ACL_E2E_CLIENT_ID}" ]] \
-      || acl_e2e_fail "refusing to delete: returned clientId is not ${ACL_E2E_CLIENT_ID}"
-    kcadm delete "clients/${ACL_E2E_FOUND%%,*}" -r "${REALM}" >/dev/null \
-      || acl_e2e_fail "delete failed"
-    ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail "read-back lookup failed"
+      || acl_e2e_fail sunset-wrong-client-id "refusing to delete: returned clientId is not ${ACL_E2E_CLIENT_ID}"
+    acl_e2e_shape_capture after-lookup "${ACL_E2E_FOUND%%,*}"
+    ACL_E2E_STAGE="sunset-delete"
+    acl_e2e_kc delete "clients/${ACL_E2E_FOUND%%,*}" -r "${REALM}" >/dev/null \
+      || acl_e2e_fail sunset-delete-failed "delete failed"
+    ACL_E2E_STAGE="sunset-readback"
+    ACL_E2E_FOUND=$(acl_e2e_lookup) || acl_e2e_fail lookup-failed "read-back lookup failed"
     [[ -z "${ACL_E2E_FOUND//[[:space:]]/}" ]] \
-      || acl_e2e_fail "read-back after delete is not empty"
+      || acl_e2e_fail sunset-readback-nonempty "read-back after delete is not empty"
     echo "  ✓ ${ACL_E2E_CLIENT_ID}: deleted (read-back empty)"
   fi
 fi
@@ -812,7 +1102,8 @@ fi
 ensure_mapper() {
   local CLIENT_ID="$1" MAPPER_NAME="$2" USER_ATTR="$3" CLAIM_NAME="$4"
   local CLIENT_UUID
-  CLIENT_UUID=$(kcadm get clients -r "${REALM}" \
+  ACL_E2E_STAGE="mapper-ensure"
+  CLIENT_UUID=$(acl_e2e_kc get clients -r "${REALM}" \
                   -q "clientId=${CLIENT_ID}" \
                   --fields id --format csv --noquotes 2>/dev/null \
                 | tr -d '"' | head -1)
@@ -821,7 +1112,7 @@ ensure_mapper() {
     return 0
   fi
   local existing
-  existing=$(kcadm get \
+  existing=$(acl_e2e_kc get \
                "clients/${CLIENT_UUID}/protocol-mappers/models" \
                -r "${REALM}" --fields name --format csv --noquotes \
                2>/dev/null | grep -Fx "${MAPPER_NAME}" || true)
@@ -835,7 +1126,7 @@ ensure_mapper() {
   local body
   body=$(printf '{"name":"%s","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"%s","claim.name":"%s","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}' \
     "${MAPPER_NAME}" "${USER_ATTR}" "${CLAIM_NAME}")
-  printf '%s' "${body}" | kcadm create \
+  printf '%s' "${body}" | acl_e2e_kc create \
     "clients/${CLIENT_UUID}/protocol-mappers/models" \
     -r "${REALM}" -f - >/dev/null
   echo "  ✓ ${CLIENT_ID} mapper ${MAPPER_NAME}: created"
@@ -862,7 +1153,7 @@ TOKEN_EXCHANGE_SOURCE_CLIENT="audittrace-librechat-bff"
 TOKEN_EXCHANGE_POLICY_NAME="allow-${TOKEN_EXCHANGE_SOURCE_CLIENT}-token-exchange"
 
 find_client_id() {
-  kcadm get clients -r "${REALM}" \
+  acl_e2e_kc get clients -r "${REALM}" \
     -q "clientId=$1" \
     --fields id --format csv --noquotes 2>/dev/null \
   | tr -d '"' | head -1
@@ -870,12 +1161,13 @@ find_client_id() {
 
 find_policy_id() {
   local target="$1" client_uuid="$2"
-  kcadm get "clients/${client_uuid}/authz/resource-server/policy" \
+  acl_e2e_kc get "clients/${client_uuid}/authz/resource-server/policy" \
     -r "${REALM}" --fields id,name --format csv --noquotes 2>/dev/null \
   | awk -F, -v n="${target}" '$2 == n {print $1; exit}'
 }
 
 echo "▶ authorizing ${TOKEN_EXCHANGE_SOURCE_CLIENT} to exchange for ${TOKEN_EXCHANGE_TARGET_CLIENT}..."
+ACL_E2E_STAGE="token-exchange"
 TARGET_UUID=$(find_client_id "${TOKEN_EXCHANGE_TARGET_CLIENT}")
 SOURCE_UUID=$(find_client_id "${TOKEN_EXCHANGE_SOURCE_CLIENT}")
 REALM_MGMT_UUID=$(find_client_id "realm-management")
@@ -884,9 +1176,9 @@ if [[ -z "${TARGET_UUID}" || -z "${SOURCE_UUID}" || -z "${REALM_MGMT_UUID}" ]]; 
   exit 1
 fi
 
-kcadm update "clients/${TARGET_UUID}/management/permissions" \
+acl_e2e_kc update "clients/${TARGET_UUID}/management/permissions" \
   -r "${REALM}" -s enabled=true >/dev/null
-TOKEN_EXCHANGE_PERM_ID=$(kcadm get "clients/${TARGET_UUID}/management/permissions" -r "${REALM}" \
+TOKEN_EXCHANGE_PERM_ID=$(acl_e2e_kc get "clients/${TARGET_UUID}/management/permissions" -r "${REALM}" \
   | grep '"token-exchange"' | sed -E 's/.*"token-exchange" *: *"([^"]+)".*/\1/')
 if [[ -z "${TOKEN_EXCHANGE_PERM_ID}" ]]; then
   echo "❌ could not resolve the token-exchange scope-permission id for ${TOKEN_EXCHANGE_TARGET_CLIENT}." >&2
@@ -898,7 +1190,7 @@ TOKEN_EXCHANGE_POLICY_ID=$(find_policy_id "${TOKEN_EXCHANGE_POLICY_NAME}" "${REA
 if [[ -n "${TOKEN_EXCHANGE_POLICY_ID}" ]]; then
   echo "  ⊝ policy ${TOKEN_EXCHANGE_POLICY_NAME}: exists (${TOKEN_EXCHANGE_POLICY_ID})"
 else
-  kcadm create "clients/${REALM_MGMT_UUID}/authz/resource-server/policy/client" \
+  acl_e2e_kc create "clients/${REALM_MGMT_UUID}/authz/resource-server/policy/client" \
     -r "${REALM}" \
     -s "name=${TOKEN_EXCHANGE_POLICY_NAME}" \
     -s "clients=[\"${SOURCE_UUID}\"]" >/dev/null
@@ -910,7 +1202,7 @@ else
   echo "  ✓ policy ${TOKEN_EXCHANGE_POLICY_NAME}: created (${TOKEN_EXCHANGE_POLICY_ID})"
 fi
 
-kcadm update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_PERM_ID}" \
+acl_e2e_kc update "clients/${REALM_MGMT_UUID}/authz/resource-server/permission/scope/${TOKEN_EXCHANGE_PERM_ID}" \
   -r "${REALM}" -s "policies=[\"${TOKEN_EXCHANGE_POLICY_ID}\"]" >/dev/null
 echo "  ✓ ${TOKEN_EXCHANGE_SOURCE_CLIENT} authorized to exchange for ${TOKEN_EXCHANGE_TARGET_CLIENT}"
 
