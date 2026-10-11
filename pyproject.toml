@@ -184,6 +184,9 @@ python_functions = ["test_*"]
 asyncio_mode = "auto"
 addopts = "-v --cov=src --cov-report=term --cov-report=xml --cov-fail-under=90"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "allow_cluster_tool(tool, reason): opt-in half of the hermetic cluster-tool guard (tests/conftest.py, SPEC 2026-10-11-SPEC-test-parity-scripted-enforcement.md R3) — must be paired with a matching entry in tests/hermetic_allowlist.py or the guard still fails the test.",
+]
 
 [tool.coverage.run]
 # `scripts/deploy` (the WS2 deterministic deploy runner) is measured alongside

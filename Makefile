@@ -86,14 +86,8 @@ typecheck: ## Run type checking (resolves mypy as .venv/bin/mypy, else mypy on P
 	echo "🔎 Running type checker via $$MYPY ..."; \
 	"$$MYPY" src/ && echo "✅ Type checking passed"
 
-test: ## Run all tests with per-file coverage gate
-	@echo "🧪 Running tests..."
-	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/migrate --cov=scripts/curator --cov=scripts/network --cov=scripts/neuter --cov=scripts.replay_dead_lettered_index --cov=scripts.backfill_pdf_signature_status --cov=scripts.integration_gate --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --junit-xml=junit.xml
-	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
-	@.venv/bin/python scripts/check-per-file-coverage.py
-	@echo "🚫 Enforcing zero-skip policy..."
-	@.venv/bin/python scripts/check-no-skipped-tests.py
-	@echo "✅ Tests passed"
+test: ## Run all tests with per-file coverage gate (scripts/ci/run-tests.sh owns the pytest invocation — the SAME script the CI `test` job calls; SPEC 2026-10-11-test-parity-scripted-enforcement)
+	@.venv/bin/python -m scripts.neuter.runner hold-shared -- bash scripts/ci/run-tests.sh
 
 test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgres (NEVER production)
 	# Runs tests/test_rls_isolation.py against a throwaway postgres:16
@@ -124,20 +118,13 @@ test-rls-local: ## Run RLS integration tests against an ephemeral Docker Postgre
 	  [ $$status -eq 0 ] || exit $$status
 	@echo "✅ RLS integration tests passed (ephemeral Postgres, no production pollution)"
 
-test-cov: ## Run tests with HTML coverage report + per-file gate
-	@echo "🧪 Running tests with coverage..."
-	@.venv/bin/python -m scripts.neuter.runner hold-shared -- .venv/bin/pytest tests/ -v --cov=src --cov=bff --cov=scripts/deploy --cov=scripts/hooks --cov=scripts/release --cov=scripts/network --cov=scripts/neuter --cov-report=html --cov-report=term-missing --cov-report=xml --cov-fail-under=90
-	@echo "🔒 Enforcing per-file coverage gate (each component >= 90%)..."
-	@.venv/bin/python scripts/check-per-file-coverage.py
-	@echo "✅ Tests passed"
+test-cov: test ## Alias of `test` — scripts/ci/run-tests.sh already writes htmlcov/ (no second pytest invocation; R2 forbids one)
 	@echo "📊 Open htmlcov/index.html to view coverage report"
 
 test-coverage: test-cov ## Alias for test-cov
 
-test-unit: ## Run unit tests only (fast)
-	@echo "🧪 Running unit tests..."
-	@.venv/bin/pytest tests/ -v -k "not integration" --cov=src --cov-report=term-missing
-	@echo "✅ Unit tests passed"
+test-unit: ## Run unit tests only (fast; ADDENDUM A1-3 subset mode of scripts/ci/run-tests.sh — same CI shape + its own zero-skip check, never raw pytest)
+	@bash scripts/ci/run-tests.sh --subset "not integration"
 
 test-watch: ## Run tests in watch mode
 	@echo "🧪 Running tests in watch mode..."

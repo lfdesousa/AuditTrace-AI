@@ -57,10 +57,13 @@ _CONSOLE_COMPONENT_SELECTORS: dict[str, tuple[str, str]] = {
 
 # component -> the `{{ .Release.Name }}-<suffix>` Deployment name suffix,
 # mirroring the `metadata.name` in deployment-{librechat,bff}.yaml exactly.
-# Feeds the config-drift convergence check (spec 2026-09-10-SPEC-deploy-
-# runner-convergence-config-drift): `_is_converged()` reads the SAME
-# Deployment objects console_image_digests keys its digest pins on, never a
-# third-party subchart.
+# UNUSED since BFF-BUMP-1.29.1 Rule B1: `_first_party_config_workloads`
+# (convergence.py) now derives the Deployment name straight off the
+# manifest-derived row (`row["workload"]`) instead of reconstructing it
+# from this suffix map — kept here as the authoritative name-mapping
+# reference (`scripts.deploy.runner.images` duplicates neither the
+# selectors above nor these suffixes; it reads names off the live
+# manifest directly).
 _CONSOLE_DEPLOYMENT_SUFFIXES: dict[str, str] = {
     "librechat": "librechat",
     "bff": "librechat-bff",
@@ -86,6 +89,25 @@ class PreflightAbortError(RuntimeError):
 # Exit code for a P0 abort caused by the mesh-health gate (#384 WS1) — distinct
 # from the preflight-script codes 1–5 so a mesh abort is legible in the report.
 MESH_UNSAFE_EXIT = 6
+
+# D6 preflight abort (spec 2026-10-07-SPEC-bff-bump-1.29.1-and-stale-override-
+# guard.md): the chart's per-tag image pins (console.bff.image.tag,
+# tests.image.tag) must equal the deploy's own target version before ANY
+# mutation — a release cannot be deployed before its own re-pin PR lands.
+# This is the EVIDENCE-level code recorded on the PreflightAbortError /
+# PhaseRecord; the PROCESS exit for every PreflightAbortError (including
+# this one) stays 3 (Addendum A §3 S2 — ``main()`` never branches on the
+# evidence code, only on ``aborted``).
+IMAGE_PIN_LAG_EXIT = 7
+
+# Addendum A §3 S2 — the deploy runner's ``main()`` process exit for a report
+# whose first-party image rows (``scripts.deploy.runner.images``) are NOT
+# all equal, on ANY non-aborted path (apply or noop) — the D3 post-apply
+# equality check. Deliberately distinct from 0 (ok), 1 (an uncaught Python
+# exception — unchanged, never repurposed), 3 (aborted) and the P0
+# evidence-level codes 1-7, so a caller (``make k8s-rolling-image``, a CD
+# agent) can tell "flagged, stop and report the rows" apart from "crashed".
+FIRST_PARTY_MISMATCH_EXIT = 8
 
 
 class MeshGateAbortError(PreflightAbortError):

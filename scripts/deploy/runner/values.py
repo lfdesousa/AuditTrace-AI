@@ -1,8 +1,10 @@
-"""Chart-values reading, deep-merge, and first-party image `--set`/digest helpers.
+"""Chart-values reading, deep-merge, and first-party image `--set` helpers.
 
 These are the SSOT the P2 chart-apply argv (:mod:`scripts.deploy.runner.helm`)
-and the convergence check (:mod:`scripts.deploy.runner.convergence`) both read
-the first-party console image pins from — see :func:`_read_chart_values`.
+and the manifest-derived first-party image rows
+(:mod:`scripts.deploy.runner.images`, shared by convergence and the D3
+post-apply check) both read the console image pins from — see
+:func:`_read_chart_values`.
 """
 
 from __future__ import annotations
@@ -82,13 +84,14 @@ def _read_chart_values(
     ``--values``/``-f`` overlay file, in order, later files winning (spec
     2026-09-10-SPEC-deploy-runner-target-overlay-aware).
 
-    This is the SSOT :func:`console_image_set_args`, :func:`console_image_digests`
-    and :meth:`DeployRunner._is_converged` read the first-party console image
-    pins from. Before this fix the runner read ONLY base ``values.yaml``
+    This is the SSOT :func:`console_image_set_args` and
+    :meth:`~scripts.deploy.runner.images.FirstPartyImagesMixin.
+    _first_party_image_rows` read the first-party console image pins from.
+    Before this fix the runner read ONLY base ``values.yaml``
     (``console.enabled: false`` there), so on the laptop target — where the
     console is enabled via the ``values-laptop.yaml`` overlay passed to
-    ``helm upgrade`` but never read back by the runner — those three
-    functions were permanently blind to the console, silently no-opping the
+    ``helm upgrade`` but never read back by the runner — those functions
+    were permanently blind to the console, silently no-opping the
     apply-side console pin and the console-digest convergence check (origin
     finding ``finding-deploy-runner-not-overlay-aware-console-inert-20260910.md``).
 
@@ -131,22 +134,41 @@ def console_image_set_args(chart_values: dict[str, Any]) -> list[str]:
     ``finding-deploy-runner-stale-setoverride-shadows-chart-20260910.md``,
     observed live at the v1.26.0 WU-6 Part C deploy).
 
-    Returns ``[]`` when ``console.enabled`` is falsy in ``chart_values`` —
-    the console isn't even templated in that case
-    (``{{- if .Values.console.enabled }}``), so emitting a ``--set`` for it
-    would be spurious. Also returns ``[]`` per-component when that
-    component's ``image`` block isn't a mapping (defensive: a malformed
-    values.yaml degrades to "no console pins asserted", never a crash), and
-    skips any of ``repository``/``tag``/``digest`` that is empty/absent so a
-    partially-specified block never emits a broken ``--set``.
+    **Unconditional (BFF-BUMP-1.29.1 D2, spec 2026-10-07-SPEC-bff-bump-
+    1.29.1-and-stale-override-guard.md).** Emits a component's pins
+    whenever its ``image`` block is a mapping, REGARDLESS of
+    ``console.enabled``'s file-side value. Before this fix the function
+    returned ``[]`` whenever ``console.enabled`` was falsy — on the
+    deploys that actually ran (no ``-f values-laptop.yaml``, base
+    ``console.enabled: false``), these six ``--set`` args were never sent
+    at all, so a stale STORED per-image override from a prior deploy
+    (``--reset-then-reuse-values``) was the only thing Helm ever rendered
+    (rev 272: BFF stuck at the stale ``1.27.0``/``b9cc31e7…`` while the
+    chart already committed ``1.28.0``). A ``--set`` on an un-templated
+    component is inert (``templates/console/deployment-{bff,librechat}.yaml``
+    each guard the WHOLE template on ``{{- if .Values.console.enabled }}``),
+    so emitting it when the console is actually disabled costs nothing and
+    is never spurious. Live presence (in ``helm get manifest``) is the gate
+    the deploy runner's convergence/post-apply checks key on
+    (:mod:`scripts.deploy.runner.images`), never this file-side flag.
+
+    Returns ``[]`` per-component when that component's ``image`` block
+    isn't a mapping (defensive: a malformed values.yaml degrades to "no
+    console pins asserted", never a crash), and skips any of
+    ``repository``/``tag``/``digest`` that is empty/absent so a
+    partially-specified block never emits a broken ``--set``. Returns
+    ``[]`` entirely when ``console`` itself isn't a mapping.
 
     Falsifiable: drop this function's output from :func:`_helm_apply_cmd`
     (the pre-fix behaviour) and a stale stored console-image override once
     again silently shadows the chart default — proven by the neuter-proof
-    test in ``tests/test_deploy_runner_console_image_pins.py``.
+    test in ``tests/test_deploy_runner_console_image_pins.py``. Restoring
+    the removed ``console.enabled`` gate makes
+    ``tests/test_deploy_runner_console_image_pins.py::
+    test_console_disabled_still_emits_the_six_sets`` go RED.
     """
     console = chart_values.get("console")
-    if not isinstance(console, dict) or not console.get("enabled"):
+    if not isinstance(console, dict):
         return []
     args: list[str] = []
     for component in _CONSOLE_IMAGE_COMPONENTS:
@@ -164,38 +186,6 @@ def console_image_set_args(chart_values: dict[str, Any]) -> list[str]:
         if digest:
             args += ["--set", f"console.{component}.image.digest={digest}"]
     return args
-
-
-def console_image_digests(chart_values: dict[str, Any]) -> dict[str, str]:
-    """The chart-pinned digest for each ENABLED console component (spec
-    2026-09-10-SPEC-deploy-runner-convergence-first-party-image-complete).
-
-    Reads the identical source :func:`console_image_set_args` parses
-    (``console.<component>.image.digest`` off the given, already-parsed
-    chart values — normally the committed ``values.yaml`` via
-    :func:`_read_chart_values`) — never re-resolved from the registry, so
-    convergence and the apply-side `--set` args can never disagree about
-    what "the intended console digest" is.
-
-    Returns ``{}`` when ``console.enabled`` is falsy (the console isn't
-    even templated, so there is nothing to converge on) or the top-level
-    ``console`` block isn't a mapping. A component is OMITTED (not
-    reported as a mismatch candidate) when its ``image`` block isn't a
-    mapping or its ``digest`` is empty/absent — there is nothing pinned to
-    compare a live pod against in that case, mirroring
-    :func:`console_image_set_args`'s own per-field skip.
-    """
-    console = chart_values.get("console")
-    if not isinstance(console, dict) or not console.get("enabled"):
-        return {}
-    digests: dict[str, str] = {}
-    for component in _CONSOLE_IMAGE_COMPONENTS:
-        block = console.get(component)
-        image = block.get("image") if isinstance(block, dict) else None
-        digest = image.get("digest") if isinstance(image, dict) else None
-        if digest:
-            digests[component] = digest
-    return digests
 
 
 def _values_file_args(values_files: Sequence[Path]) -> list[str]:

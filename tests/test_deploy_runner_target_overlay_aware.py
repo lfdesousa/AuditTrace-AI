@@ -72,8 +72,9 @@ LAPTOP_VALUES_FILE = CHART_DIR / "values-laptop.yaml"
 _REAL_LIBRECHAT_DIGEST = (
     "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
 )
+# BFF-BUMP-1.29.1 re-pin (2026-10-08).
 _REAL_BFF_DIGEST = (
-    "sha256:ddba3c72b1f3b31d0d62fede8bf88aee83986c66cfedfac08cc389ef8145d8cc"
+    "sha256:b6e907c06d4a603ce524284fefc37be9c008a38a4f9680a82356abfa66fe7212"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
@@ -279,13 +280,20 @@ def test_console_image_set_args_with_laptop_overlay_emits_real_pins():
     assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in joined
 
 
-def test_console_image_set_args_without_overlay_stays_empty():
-    """The CONTROL case: base values.yaml alone (no `-f`) -> console
-    disabled -> no console `--set` args. Paired with the overlay test above
-    so the contrast — not just one isolated assertion — is what proves the
-    fix."""
+def test_console_image_set_args_without_overlay_still_emits_real_pins():
+    """BFF-BUMP-1.29.1 D2 supersedes the old CONTROL here: base
+    values.yaml alone (no `-f`, `console.enabled: false` on disk) still
+    emits the SAME six `--set` args as the laptop-overlay case above —
+    the console's `--set` pins are now UNCONDITIONAL (presence on the
+    cluster is decided by the template's own `console.enabled` guard, not
+    by whether the runner asserts the pins). Falsifiable: restore the
+    removed `console.enabled` gate in `console_image_set_args` and this
+    goes RED (back to `[]`)."""
     base_only = runner._read_chart_values(CHART_VALUES_FILE)
-    assert runner.console_image_set_args(base_only) == []
+    args = runner.console_image_set_args(base_only)
+    joined = " ".join(args)
+    assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in joined
+    assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in joined
 
 
 # ── (5) the -f argv itself, in order, positioned before --set ──────────────
@@ -313,17 +321,21 @@ def test_helm_apply_cmd_carries_dash_f_for_each_overlay_in_order():
 # ── (6) THE core neuter proof: production default path, with vs without ───
 
 
-def test_helm_apply_cmd_default_path_console_sets_appear_only_with_overlay():
-    """The critical falsifiable pair, through the REAL production default
-    path (``chart_values=None`` — never test-injected): with the laptop
-    overlay wired into ``cfg.values_files``, the SAME ``_helm_apply_cmd``
-    call that used to be permanently blind now emits the console `--set`
-    args; without it, the argv is exactly what it was before this fix.
+def test_helm_apply_cmd_default_path_overlay_moves_only_the_dash_f_token():
+    """Through the REAL production default path (``chart_values=None`` —
+    never test-injected): with the laptop overlay wired into
+    ``cfg.values_files``, the SAME ``_helm_apply_cmd`` call carries the
+    ``-f`` token AND the console `--set` pins; without it, the console
+    `--set` pins are STILL present (D2, unconditional) but the ``-f``
+    token is gone. The overlay-sensitive falsifiable surface is `-f`
+    alone now — see
+    ``test_read_chart_values_with_laptop_overlay_reports_console_enabled``
+    for the ``console.enabled`` flip itself.
 
     Falsifiable: neuter ``_read_chart_values`` to ignore ``values_files``
-    (or drop it from ``_helm_apply_cmd``'s default read) and the "with
-    overlay" argv collapses to the "without overlay" argv — this test goes
-    RED because the `console.` assertions below stop matching.
+    (or drop it from ``_helm_apply_cmd``'s default read) and the ``-f``
+    token disappears from the "with overlay" argv too — this test goes RED
+    on the ``-f`` assertion.
     """
     ref = _hub_ref("sha256:x")
 
@@ -341,72 +353,124 @@ def test_helm_apply_cmd_default_path_console_sets_appear_only_with_overlay():
     assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in with_joined
     assert "-f " + str(LAPTOP_VALUES_FILE) in with_joined
 
-    assert "console." not in without_joined
+    # D2: the console pins are unconditional, present EITHER way now.
+    assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in without_joined
+    assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in without_joined
     assert "-f" not in without_overlay
 
 
-# ── (7) convergence: overlay-aware vs blind, same live cluster state ───────
+# ── (7) convergence: manifest-derived, overlay NEVER matters (Rule B1) ─────
+# BFF-BUMP-1.29.1 Rule B1 supersedes this section's old with/without-overlay
+# split. `_is_converged()` used to read console presence off the FILE-side
+# `console.enabled` flag — blind without `-f values-laptop.yaml` (the exact
+# live defect: rev 272 no-op'd a stale BFF override straight past the
+# re-pinned chart). This file's former
+# `test_is_converged_blind_to_same_console_drift_without_overlay` pinned
+# that blindness as CORRECT behaviour — DELETED per Rule B1; the single
+# test below is its inverse, covering both the overlay and no-overlay case
+# with the SAME (now overlay-independent) outcome.
 
 
-def test_is_converged_detects_console_drift_with_overlay(tmp_path, monkeypatch):
-    """With the laptop overlay wired in, a live console pod running a STALE
-    digest (memory-server itself already converged) is correctly detected
-    as NOT converged — exactly the fix the v1.26.0 Part C.4 finding demands.
-    """
-    disp = _Dispatcher(
-        rules=_console_dispatch_rules(
-            librechat_digest="sha256:STALE-ON-CLUSTER", bff_digest=_REAL_BFF_DIGEST
-        )
+def _console_drift_manifest_yaml(librechat_digest, bff_digest, memory_server_digest):
+    def _doc(name, component, container, image):
+        return {
+            "kind": "Deployment",
+            "metadata": {"name": name},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app.kubernetes.io/component": component}},
+                "template": {
+                    "spec": {"containers": [{"name": container, "image": image}]}
+                },
+            },
+        }
+
+    docs = [
+        _doc(
+            "audittrace-memory-server",
+            "memory-server",
+            "memory-server",
+            f"docker.io/lfds/audittrace-memory-server:1.26.0@{memory_server_digest}",
+        ),
+        _doc(
+            "audittrace-librechat",
+            "librechat",
+            "librechat",
+            f"docker.io/lfds/audittrace-librechat:768de61@{librechat_digest}",
+        ),
+        _doc(
+            "audittrace-librechat-bff",
+            "librechat-bff",
+            "bff",
+            f"docker.io/lfds/audittrace-librechat-bff:1.29.1@{bff_digest}",
+        ),
+    ]
+    return "\n---\n".join(json.dumps(d) for d in docs)
+
+
+def _pods_json_proc(container, digest):
+    return _proc(
+        0,
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"labels": {}},
+                        "status": {
+                            "containerStatuses": [
+                                {"name": container, "imageID": f"repo@{digest}"}
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
     )
-    monkeypatch.setattr(runner, "_run", disp)
-    r = DeployRunner(_cfg(tmp_path, values_files=(LAPTOP_VALUES_FILE,)))
-    r.image_ref = _hub_ref("sha256:x")
-    check = r._is_converged()
-    assert check.converged is False
-    assert "console mismatch: librechat" in check.basis
 
 
-def test_is_converged_blind_to_same_console_drift_without_overlay(
+def test_is_converged_detects_console_drift_regardless_of_overlay(
     tmp_path, monkeypatch
 ):
-    """The CONTROL case reproducing the live defect hermetically: the
-    IDENTICAL stale-console cluster state as the test above, but with no
-    `--values` overlay wired in (``cfg.values_files`` defaults to ``()``) —
-    convergence reads base ``console.enabled=False``, never even looks at
-    the console pods, and wrongly reports converged. This is the exact
-    v1.26.0 Part C.4 symptom (helm revision stayed at 265) reproduced
-    without a cluster."""
-    memory_server_doc = {
-        "kind": "Deployment",
-        "metadata": {"name": "audittrace-memory-server"},
-        "spec": {
-            "template": {"spec": {"containers": [{"name": "memory-server", "env": []}]}}
-        },
-    }
-    disp = _Dispatcher(
-        rules=[
-            *_console_dispatch_rules(
-                librechat_digest="sha256:STALE-ON-CLUSTER", bff_digest=_REAL_BFF_DIGEST
-            ),
-            # config-drift check (spec 2026-09-10-SPEC-deploy-runner-
-            # convergence-config-drift): memory-server only, since base
-            # console.enabled=False skips the console workloads here too —
-            # matching intended + live specs so this stays the TRUE no-op
-            # control case the test name promises.
-            ("helm template", _proc(0, json.dumps(memory_server_doc))),
-            (
-                "get deployment audittrace-memory-server -n",
-                _proc(0, json.dumps(memory_server_doc)),
-            ),
-        ]
+    """A stale STORED BFF/librechat override already visible in the LIVE
+    manifest (the rev-272 shape) is detected as NOT converged whether or
+    not `-f values-laptop.yaml` is passed — presence is derived from
+    `helm get manifest`, never the file-side `console.enabled` flag.
+
+    Falsifiable / neuter: re-gate the console rows on file-side
+    `console.enabled` (restore the old mechanism) and the ``values_files=()``
+    iteration goes RED — `check.converged` flips to True, reproducing the
+    rev-272 defect exactly as it ran live.
+    """
+    manifest_yaml = _console_drift_manifest_yaml(
+        "sha256:STALE-ON-CLUSTER", _REAL_BFF_DIGEST, "sha256:x"
     )
-    monkeypatch.setattr(runner, "_run", disp)
-    r = DeployRunner(_cfg(tmp_path))  # no values_files -> base only
-    r.image_ref = _hub_ref("sha256:x")
-    check = r._is_converged()
-    assert check.converged is True
-    assert "console" not in check.basis
-    assert not any("librechat" in " ".join(c) for c in disp.calls)
+    for values_files in ((LAPTOP_VALUES_FILE,), ()):
+        disp = _Dispatcher(
+            rules=[
+                ("helm get manifest", _proc(0, manifest_yaml)),
+                (
+                    '"memory-server")].imageID',
+                    _proc(0, "docker.io/lfds/audittrace-memory-server@sha256:x"),
+                ),
+                ("component=librechat-bff", _pods_json_proc("bff", _REAL_BFF_DIGEST)),
+                (
+                    "component=librechat",
+                    _pods_json_proc("librechat", "sha256:STALE-ON-CLUSTER"),
+                ),
+                (
+                    "component=memory-server",
+                    _pods_json_proc("memory-server", "sha256:x"),
+                ),
+            ]
+        )
+        monkeypatch.setattr(runner, "_run", disp)
+        r = DeployRunner(_cfg(tmp_path, values_files=values_files))
+        r.image_ref = _hub_ref("sha256:x")
+        check = r._is_converged()
+        assert check.converged is False, (
+            f"expected NOT converged for values_files={values_files!r}"
+        )
+        assert "first-party mismatch: librechat" in check.basis
 
 
 def test_chart_apply_end_to_end_reconciles_console_drift_with_overlay(
@@ -431,6 +495,32 @@ def test_chart_apply_end_to_end_reconciles_console_drift_with_overlay(
     assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in " ".join(
         upgrade
     )
+
+
+def test_chart_apply_end_to_end_without_overlay_still_emits_six_console_sets(
+    tmp_path, monkeypatch
+):
+    """B-1's third leg (review finding): file-side `console.enabled=false`
+    (base values.yaml, NO `-f` overlay) must STILL carry the six console
+    `--set` pins in the REAL `helm upgrade` argv once `phase_chart_apply`
+    actually applies (D2, unconditional) — not merely in a dry-run plan
+    line. Only `test_chart_apply_end_to_end_reconciles_console_drift_with_
+    overlay` above exercised this end to end, and only WITH the overlay —
+    this is its missing without-overlay counterpart.
+    """
+    disp = _Dispatcher(rules=[("helm upgrade", _proc(0, "deployed"))])
+    monkeypatch.setattr(runner, "_run", disp)
+    r = DeployRunner(
+        _cfg(tmp_path)
+    )  # no values_files -> base only, console.enabled=false
+    r.image_ref = _hub_ref("sha256:x")
+    r.phase_chart_apply()
+    assert r.records[0].status != "noop"
+    upgrade = next(c for c in disp.calls if "helm upgrade" in " ".join(c))
+    joined = " ".join(upgrade)
+    assert "-f" not in upgrade
+    assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in joined
+    assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in joined
 
 
 # ── (8) CLI surface: --values / -f, repeatable, ordered ─────────────────────
@@ -492,10 +582,12 @@ def test_cli_dry_run_shows_dash_f_and_console_sets_for_laptop_overlay(
     assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in out
 
 
-def test_cli_dry_run_without_values_flag_no_console_sets(tmp_path, monkeypatch, capsys):
-    """Backward-compat CONTROL: the exact same CLI invocation minus `-f`
-    reproduces today's (pre-overlay) behaviour — no console `--set`, no
-    `-f` token."""
+def test_cli_dry_run_without_values_flag_still_shows_console_sets_but_no_dash_f(
+    tmp_path, monkeypatch, capsys
+):
+    """BFF-BUMP-1.29.1 D2 supersedes the old "no console `--set`" CONTROL:
+    the exact same CLI invocation minus `-f` still shows the console
+    `--set` pins (unconditional now) — only the `-f` token is gone."""
     monkeypatch.setattr(runner, "_run", lambda *a, **k: _proc())
     monkeypatch.setattr(
         registry,
@@ -515,7 +607,8 @@ def test_cli_dry_run_without_values_flag_no_console_sets(tmp_path, monkeypatch, 
     )
     assert rc == 0
     out = capsys.readouterr().out
-    assert "console." not in out
+    assert f"console.librechat.image.digest={_REAL_LIBRECHAT_DIGEST}" in out
+    assert f"console.bff.image.digest={_REAL_BFF_DIGEST}" in out
     assert " -f " not in out
 
 
