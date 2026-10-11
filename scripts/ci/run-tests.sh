@@ -139,11 +139,13 @@ chmod +x "$SHIM_DIR/helm"
 # script, whether it runs locally or in CI. ----
 export KUBECONFIG="$SHIM_DIR/nonexistent-kubeconfig"
 export PATH="$SHIM_DIR:$PATH"
-unset KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT 2>/dev/null || true
-for _helm_kube_var in HELM_KUBEAPISERVER HELM_KUBECAFILE HELM_KUBEASGROUPS \
-  HELM_KUBEASUSER HELM_KUBECONTEXT HELM_KUBEINSECURE_SKIP_TLS_VERIFY \
-  HELM_KUBETLS_SERVER_NAME HELM_KUBETOKEN; do
-  unset "$_helm_kube_var" 2>/dev/null || true
+# Prefix-enumerated, not a fixed name list: real in-cluster pods also get
+# KUBERNETES_SERVICE_PORT_HTTPS (and potentially other KUBERNETES_SERVICE_*
+# variants), and helm's own env vars are not limited to the 8 named ones
+# `helm env` happens to print today. `compgen -e` lists every exported env
+# var name; unset any matching either prefix.
+for _prefixed_var in $(compgen -e | grep -E '^(KUBERNETES_SERVICE_|HELM_KUBE)'); do
+  unset "$_prefixed_var" 2>/dev/null || true
 done
 
 # ---- the three sentinels tests/conftest.py's in-process diagnostic reads

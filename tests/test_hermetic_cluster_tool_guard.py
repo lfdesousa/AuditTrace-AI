@@ -21,6 +21,7 @@ import os
 import pty
 import stat
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
@@ -354,6 +355,17 @@ def test_helm_with_kube_context_flag_before_cluster_subcommand_still_raises():
         )
 
 
+def test_c03_shell_true_list_form_helm_template_still_raises():
+    """A3-2's "list-form, never shell=True" requirement, isolated: a
+    `shell=True` call whose `cmd` happens to be a LIST shaped exactly
+    like a safe `helm template` invocation must still raise — `shell=True`
+    disqualifies it regardless of what the list contains."""
+    with expect_hermetic_violation():
+        conftest._enforce_word_rule(
+            ["helm", "template", "x"], executable=None, shell=True, display="t"
+        )
+
+
 def test_helm_rule_case_table_is_exhaustive_over_allow_and_raise():
     """Regression guard on the table itself: it must exercise both
     verdicts, or the parametrised test above could trivially pass by
@@ -418,6 +430,21 @@ class TestEnvEqualityCheck:
                     display="t",
                 )
 
+    def test_e2_unlisted_kubernetes_service_prefixed_name_raises(self):
+        """B2: KUBERNETES_SERVICE_* is also a PREFIX, not the exact
+        two-name list (`_HOST`/`_PORT`) — a real in-cluster pod also gets
+        `KUBERNETES_SERVICE_PORT_HTTPS`."""
+        with override_sentinel(shim_dir="/shim", kubeconfig="/kc", required=True):
+            with expect_hermetic_violation():
+                conftest._enforce_env_rule(
+                    {
+                        "PATH": "/shim",
+                        "KUBECONFIG": "/kc",
+                        "KUBERNETES_SERVICE_PORT_HTTPS": "443",
+                    },
+                    display="t",
+                )
+
     def test_f_source_is_env_kwarg_when_given_else_os_environ(self, monkeypatch):
         with override_sentinel(shim_dir="/shim", kubeconfig="/kc", required=True):
             # a CLEAN os.environ with a BAD env= -> raises (env= wins)
@@ -453,6 +480,26 @@ class TestEnvEqualityCheck:
                 w for w in recwarn.list if "not CI-shaped" in str(w.message)
             ]
             assert len(warnings_seen) == 1, "expected exactly ONE warning per session"
+
+    def test_h_warning_count_is_falsifiable_outside_recwarn_dedup(self):
+        """C20: `recwarn`/pytest's warnings-summary footer both DE-DUPLICATE
+        identical (message, location) warnings regardless of how many
+        times `warnings.warn()` actually ran — so `test_h_...` above stays
+        green even with the guard-flag line deleted entirely (measured by
+        the independent review: 2 real `warn()` calls still showed as "1
+        warning" there). This test counts via `warnings.catch_warnings
+        (record=True)` + `simplefilter("always")`, called DIRECTLY (never
+        through `recwarn` or the session's own warnings aggregation),
+        which does not de-duplicate: 2 raw calls on unguarded code give 2
+        entries here (measured), so the flag's absence IS observable."""
+        with override_sentinel(shim_dir=None, kubeconfig=None, required=False):
+            conftest._sentinel_absent_warned[0] = False
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                conftest._enforce_env_rule({"PATH": "/x"}, display="t1")
+                conftest._enforce_env_rule({"PATH": "/x"}, display="t2")
+            matching = [w for w in caught if "not CI-shaped" in str(w.message)]
+            assert len(matching) == 1
 
     def test_i_prime_required_set_sentinel_absent_raises(self):
         """A6-4 (A4-2(i')): HERMETIC_REQUIRED=1 with the sentinel absent
@@ -518,7 +565,11 @@ class TestEnvEqualityCheck:
             "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
             "HOME": os.environ.get("HOME", "/tmp"),
             "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            # an UNLISTED name under each prefix — proves the unset is
+            # prefix-enumerated (compgen -e), not a fixed name list.
+            "KUBERNETES_SERVICE_PORT_HTTPS": "443",
             "HELM_KUBECONTEXT": "ctx",
+            "HELM_KUBEFUTURE": "x",
         }
         # This call itself is a spawn the OUTER guard's env check sees; it
         # deliberately hands the child a from-scratch env (no ambient
@@ -550,8 +601,16 @@ class TestEnvEqualityCheck:
         assert recorded.get("HERMETIC_KUBECONFIG"), (
             "HERMETIC_KUBECONFIG must be exported"
         )
+        # S11: KUBECONFIG must EQUAL the exported sentinel (not merely be
+        # non-empty), and that path must not exist on disk.
+        assert recorded.get("KUBECONFIG") == recorded.get("HERMETIC_KUBECONFIG")
+        assert not Path(recorded["KUBECONFIG"]).exists()
+        # S14/S15: prefix-enumerated unset — both the originally-tested
+        # names AND an unlisted name under each prefix must be gone.
         assert "KUBERNETES_SERVICE_HOST" not in recorded
+        assert "KUBERNETES_SERVICE_PORT_HTTPS" not in recorded
         assert "HELM_KUBECONTEXT" not in recorded
+        assert "HELM_KUBEFUTURE" not in recorded
 
 
 # ───────────────────────── the allowlist's four halves ──────────────────────
@@ -595,6 +654,14 @@ class TestAllowlistTwoSidedOptIn:
 
     def test_pure_tool_mismatch_denies(self):
         assert not conftest._opt_in_allows("n", "kubectl", "helm", {"n": "kubectl"})
+
+    def test_pure_marker_and_entry_agree_but_not_with_the_actual_tool_denies(self):
+        """The THIRD mismatch leg (round-2 Required #2 / C09): the marker
+        and the allowlist entry agree WITH EACH OTHER (both 'kubectl'),
+        but the tool actually being invoked is 'helm' — still denied.
+        Distinct from `test_pure_tool_mismatch_denies`, where the marker
+        and the entry disagree with EACH OTHER."""
+        assert not conftest._opt_in_allows("n", "helm", "kubectl", {"n": "kubectl"})
 
     def test_pure_none_nodeid_denies(self):
         assert not conftest._opt_in_allows(None, "kubectl", "kubectl", {"n": "kubectl"})
@@ -685,24 +752,32 @@ class TestExpectHermeticViolation:
             conftest._raise_violation("outer")
         assert not conftest.PER_TEST_VIOLATIONS
 
-    def test_neuter_n1_cm_that_removes_whole_record_goes_red(self):
-        """Neuter (n1): a broken CM that clears the ENTIRE record (not
-        just entries added inside its own block) must be caught by test
-        (b)'s own assertion that entries OUTSIDE the block survive."""
+    def test_h01_cm_preserves_entries_recorded_before_the_block(self):
+        """A7-1 (n1), driven through the REAL CM (not a stand-in): an
+        entry recorded BEFORE the block must survive it — the CM may
+        remove ONLY the entries it added during its own block. A neuter
+        that clears the WHOLE record (`record.clear()`) instead of the
+        precise slice (`del record[start:start+recorded_inside]`) makes
+        this assertion fail: the pre-existing entry would be gone too."""
         record = conftest.PER_TEST_VIOLATIONS
         record.append("pre-existing, must survive")
         try:
-            try:
-                conftest._raise_violation("inside")
-            except HermeticClusterToolError:
-                pass
-            # broken behaviour under test: clears everything, not just [start:]
-            record.clear()
-            assert record == [], (
-                "neuter proof: a whole-record clear is observably different"
-            )
+            with expect_hermetic_violation():
+                conftest._raise_violation("inside the block")
+            assert record == ["pre-existing, must survive"]
         finally:
             record.clear()
+
+    def test_h03_raise_without_recording_fails_the_cm(self):
+        """A7-1's second clause, isolated: `HermeticClusterToolError`
+        raised inside the block WITHOUT being recorded (bypassing
+        `_raise_violation`, which both records and raises) must make the
+        CM itself fail — "raised" alone is not sufficient."""
+        with pytest.raises(AssertionError, match="no violation was recorded"):
+            with expect_hermetic_violation():
+                raise conftest.HermeticClusterToolError(
+                    "manually raised, deliberately never recorded"
+                )
 
     def test_neuter_n2_cm_that_always_passes_goes_red(self):
         """Neuter (n2): a CM that never checks `raised` would let test (a)
@@ -846,11 +921,13 @@ def test_a6_7_swallowed_violation_still_fails_the_inner_test(tmp_path):
 def test_a6_7_neuter_clearing_record_in_teardown_makes_inner_pass(
     tmp_path, monkeypatch
 ):
-    """Neuter for the test above: if teardown cleared the record WITHOUT
-    checking it first, the inner test would pass instead of failing — so
-    driving the same probe against a neutered teardown must show the
-    inner test PASS, which is what makes the outer assertion in the real
-    test above meaningful."""
+    """Neuter for the test above, measured directly against the real
+    `_teardown_check_and_clear` (not the child-session probe — this calls
+    the function itself, with a synthetic node, which is enough to show
+    the mechanism the test above relies on): a teardown that clears the
+    record WITHOUT checking it first lets a non-empty record pass silently,
+    which is what makes the outer assertion in the test above ("the inner
+    test FAILED") meaningful rather than vacuous."""
     original = conftest._teardown_check_and_clear
 
     def _neutered(node):
@@ -863,3 +940,36 @@ def test_a6_7_neuter_clearing_record_in_teardown_makes_inner_pass(
         assert conftest.PER_TEST_VIOLATIONS == []
     finally:
         monkeypatch.setattr(conftest, "_teardown_check_and_clear", original)
+
+
+def test_c24_c25_import_time_violation_with_no_active_node_fails_the_session(
+    tmp_path,
+):
+    """C24/C25: a spawn with NO active test node (at import time here,
+    before any test's autouse fixture has run) is recorded in the
+    SESSION record, not the per-test one — and `pytest_sessionfinish`
+    turns a non-empty session record into a non-zero exit, even though
+    the violation was swallowed at import time and the session's one
+    real test passes cleanly on its own. Neutering EITHER the routing
+    (C25: always append per-test, which the next test's setup clears
+    before anyone checks it) OR the sessionfinish exit (C24: drop
+    `session.exitstatus = 1`) turns this green — the exit code is the
+    only observable; it does not distinguish which of the two moved."""
+    env = build_fresh_sentinel_env(tmp_path)
+    result = run_child_pytest_session(
+        """
+        import subprocess
+
+        try:
+            subprocess.run(["kubectl", "version"])
+        except Exception:
+            pass
+
+        def test_dummy_passes():
+            assert True
+        """,
+        env=env,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "1 passed" in (result.stdout + result.stderr)
+    assert "hermetic guard" in (result.stdout + result.stderr)

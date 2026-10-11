@@ -357,13 +357,26 @@ def test_helm_rule_case_table_through_bash_shim_list_rows_only(tmp_path_factory)
 
 
 def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
+    """S20 (round-2 Required #4, re-REJECTed in round 3): the fake pytest
+    must ALSO write a PASSING coverage.xml, so that ONLY the skip gate can
+    fail here — otherwise `check-per-file-coverage.py`'s own "coverage.xml
+    not found" abort (which also happens to contain the substring "skip"
+    in the script's unconditional banner echo) makes this pass for the
+    wrong reason. The assertion matches the skip-check script's OWN
+    specific failure text, never the banner echo lines every run prints
+    regardless of outcome."""
     root = _scratch_script_root(tmp_path)
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
+    passing_coverage_xml = (
+        '<?xml version="1.0" ?>\n'
+        '<coverage line-rate="1.0" branch-rate="1.0"><packages/></coverage>'
+    )
     _fake_pytest(
         bin_dir,
         junit_testcase='<testcase classname="fake" name="test_fake" time="0.0"><skipped/></testcase>',
         junit_skipped_attr="1",
+        write_coverage_xml=passing_coverage_xml,
     )
     _fake_python_passthrough(bin_dir)
     _fake_real_helm(bin_dir)
@@ -371,7 +384,12 @@ def test_a2_9_zero_skip_gate_fires_on_full_run(tmp_path: Path):
     result = _run_script(root, bin_dir, subset=False)
 
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "skip" in (result.stdout + result.stderr).lower()
+    combined = result.stdout + result.stderr
+    assert "coverage.xml not found" not in combined, (
+        "the per-file gate must not be what failed here"
+    )
+    assert "skipped testcase(s)" in combined
+    assert "skips are forbidden" in combined
 
 
 def test_a2_9_zero_skip_gate_fires_on_subset_run(tmp_path: Path):

@@ -157,7 +157,13 @@ _HELM_UNSAFE_ARG_PREFIXES = ("--validate", "--dry-run", "--kube")
 _WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 _HELM_KUBE_ENV_PREFIX = "HELM_KUBE"
-_KUBERNETES_ENV_NAMES = ("KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT")
+#: a PREFIX, not an exact two-name list — real in-cluster pods also get
+#: `KUBERNETES_SERVICE_PORT_HTTPS` (and potentially other
+#: `KUBERNETES_SERVICE_*` variants) from Kubernetes' own service-env
+#: injection; an exact-name list misses them (measured: the independent
+#: review's probe found `KUBERNETES_SERVICE_PORT_HTTPS` surviving the
+#: exact-list check).
+_KUBERNETES_ENV_PREFIX = "KUBERNETES_SERVICE_"
 
 
 class HermeticClusterToolError(AssertionError):
@@ -359,11 +365,10 @@ def _env_violations(env: dict) -> list[str]:
         problems.append(
             f"PATH[0]={path_first!r} (expected shim dir {HERMETIC_SENTINELS.shim_dir!r})"
         )
-    for name in _KUBERNETES_ENV_NAMES:
-        if name in env:
-            problems.append(f"{name} is set")
     for name in env:
-        if name.startswith(_HELM_KUBE_ENV_PREFIX):
+        if name.startswith(_KUBERNETES_ENV_PREFIX) or name.startswith(
+            _HELM_KUBE_ENV_PREFIX
+        ):
             problems.append(f"{name} is set")
     return problems
 
