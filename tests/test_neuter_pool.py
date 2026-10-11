@@ -47,6 +47,7 @@ from scripts.neuter.spec import (
     NeuterSpecFile,
     load_neuter_spec,
 )
+from tests._hermetic_env import hermetic_env
 from tests._neuter_test_evidence import evidence_dir_for as _ev
 
 FIXTURE_DIR = Path(__file__).parent / "neuter_fixture"
@@ -675,7 +676,9 @@ def test_run_pool_fails_closed_when_every_worker_crashes(tmp_path, monkeypatch):
         spec_path, repo_dir=repo, python=PYTHON, lock_path=tmp_path / "collect.lock"
     )
 
-    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    monkeypatch.setenv(
+        "PATH", hermetic_env({"PATH": f"{fake_bin}:{os.environ['PATH']}"})["PATH"]
+    )
     evidence = _ev(tmp_path)
     exit_code = run_pool(
         spec,
