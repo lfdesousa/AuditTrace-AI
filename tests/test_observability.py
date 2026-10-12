@@ -387,15 +387,30 @@ def test_init_telemetry_tags_tracer_with_langfuse_scope(monkeypatch):
     other scope (see ``_should_export_span``). Getting this wrong empties the
     Langfuse trace tree without a single error log — the failure mode is a
     dashboard that looks fine but has no observations to filter by user.
+
+    SEC-JWT-IN-LANGFUSE-SPAN: ``init_telemetry`` now ALWAYS builds and owns
+    its own real ``TracerProvider`` (S-C2 — the scrubber must be attached
+    first, via the public API, before anything else touches it) rather
+    than reading back whatever ``trace.get_tracer_provider()`` happens to
+    return. A real provider is required for the startup self-test (S-C1)
+    to run at all, so this test SPIES on ``TracerProvider.get_tracer``
+    instead of replacing the provider wholesale with a MagicMock — the
+    probe span must actually fire.
     """
     telemetry._reset_for_tests()
     monkeypatch.setattr(telemetry, "_langfuse_client", MagicMock())
     monkeypatch.setenv("AUDITTRACE_LANGFUSE_PUBLIC_KEY", "pk-scope-test")
 
-    import opentelemetry.trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
 
-    fake_provider = MagicMock()
-    monkeypatch.setattr(otel_trace, "get_tracer_provider", lambda: fake_provider)
+    calls: list[tuple[tuple, dict]] = []
+    original_get_tracer = TracerProvider.get_tracer
+
+    def _spy_get_tracer(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return original_get_tracer(self, *args, **kwargs)
+
+    monkeypatch.setattr(TracerProvider, "get_tracer", _spy_get_tracer)
 
     try:
         telemetry.init_telemetry(
@@ -404,11 +419,11 @@ def test_init_telemetry_tags_tracer_with_langfuse_scope(monkeypatch):
             tracing_enabled=True,
             metrics_enabled=False,
         )
-        fake_provider.get_tracer.assert_called_once_with(
-            "langfuse-sdk", attributes={"public_key": "pk-scope-test"}
-        )
-        # And that scoped tracer is what @log_call will emit through.
-        assert telemetry._tracer is fake_provider.get_tracer.return_value
+        scoped_calls = [
+            (args, kwargs) for args, kwargs in calls if args == ("langfuse-sdk",)
+        ]
+        assert scoped_calls, f"no 'langfuse-sdk'-scoped get_tracer call seen: {calls}"
+        assert scoped_calls[0][1] == {"attributes": {"public_key": "pk-scope-test"}}
     finally:
         monkeypatch.setattr(telemetry, "_langfuse_client", None)
         _restore_suite_telemetry()
@@ -649,7 +664,14 @@ def test_start_span_uses_otel_tracer(monkeypatch):
     with telemetry.start_span("test-op", metadata={"node": "foo", "step": 1}) as span:
         assert span is fake_span
 
-    fake_tracer.start_as_current_span.assert_called_once_with("test-op")
+    # record_exception/set_status_on_exception are disabled here because
+    # SEC-JWT-IN-LANGFUSE-SPAN makes ``_record_span_error`` the single
+    # exception recorder (ADDENDUM A §3 B2) — letting OTel's own
+    # automatic recording run too double-recorded every failing call
+    # (spec fact A2), the second time via the raw, unscrubbed path.
+    fake_tracer.start_as_current_span.assert_called_once_with(
+        "test-op", record_exception=False, set_status_on_exception=False
+    )
     stamped = {
         call.args[0]: call.args[1] for call in fake_span.set_attribute.call_args_list
     }
@@ -1032,8 +1054,14 @@ def test_structured_formatter_excludes_reserved_logrecord_attrs():
 def test_structured_formatter_degrades_unserializable_extra_to_str():
     """A non-JSON-serializable ``extra=`` value must not crash the log call.
 
-    It degrades to its ``str()`` via ``json.dumps(..., default=str)`` so one
-    odd value can never break the logging path for the whole process.
+    SEC-JWT-IN-LANGFUSE-SPAN (2026-10-08): it degrades to ITS BARE TYPE
+    NAME via ``render_value``, not to ``str(value)`` via
+    ``json.dumps(..., default=str)`` any more — that escape hatch is
+    exactly what let a ``Settings`` object with plain-``str`` secret
+    fields render its secrets in full through an unknown object's
+    ``__str__`` (spec fact F5). One odd value still can never break the
+    logging path for the whole process; it now degrades to
+    ``<TypeName>`` instead of an arbitrary, unvetted ``str()``.
     """
     import json as _json
 
@@ -1057,7 +1085,7 @@ def test_structured_formatter_degrades_unserializable_extra_to_str():
     record.odd = _Opaque()
 
     data = _json.loads(fmt.format(record))
-    assert data["odd"] == "opaque-value"
+    assert data["odd"] == "<_Opaque>"
 
 
 def test_structured_formatter_preserves_exception_traceback():
@@ -1094,19 +1122,45 @@ def test_structured_formatter_preserves_exception_traceback():
 
 
 class TestRecordSpanError:
-    """Tests for _record_span_error — dispatches to OTel or Langfuse APIs."""
+    """Tests for _record_span_error — dispatches to OTel or Langfuse APIs.
 
-    def test_otel_span_calls_record_exception(self):
-        """OTel spans expose record_exception; it must be called."""
+    SEC-JWT-IN-LANGFUSE-SPAN (ADDENDUM A §3 B2): ``_record_span_error``
+    is now the SINGLE exception recorder for OTel spans — it builds the
+    ``exception`` event + ERROR status itself (via the public
+    ``add_event``/``set_status`` API, scrubbed), rather than delegating
+    to ``span.record_exception()`` (which OTel's own ``start_span``
+    disabled via ``record_exception=False`` precisely so this path is
+    the only one that runs — spec fact A2 measured a DOUBLE exception
+    event when both ran).
+    """
+
+    def test_otel_span_calls_add_event_and_set_status(self):
+        """OTel spans expose add_event/set_status; both must be called,
+        with the exception text + status description scrubbed."""
         from audittrace.logging_config import _record_span_error
 
-        span = MagicMock(spec=["record_exception"])
-        exc = ValueError("boom")
+        span = MagicMock(spec=["add_event", "set_status"])
+        secret = "eyJ" + "a" * 20 + "." + "b" * 20 + "." + "c" * 20
+        exc = ValueError(f"boom {secret}")
         _record_span_error(span, exc)
-        span.record_exception.assert_called_once_with(exc)
+
+        span.add_event.assert_called_once()
+        event_name, event_attrs = span.add_event.call_args.args
+        assert event_name == "exception"
+        assert event_attrs["exception.type"] == "ValueError"
+        assert secret not in event_attrs["exception.message"]
+        assert "[REDACTED:jwt]" in event_attrs["exception.message"]
+        assert secret not in event_attrs["exception.stacktrace"]
+        assert event_attrs["exception.escaped"] == "True"
+
+        span.set_status.assert_called_once()
+        (status_obj,) = span.set_status.call_args.args
+        assert secret not in status_obj.description
+        assert "[REDACTED:jwt]" in status_obj.description
 
     def test_langfuse_span_calls_update_with_error_level(self):
-        """Langfuse spans have update() but not record_exception()."""
+        """Langfuse-shaped spans (legacy — update() but no add_event/
+        set_status) still get a scrubbed status_message."""
         from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=["update"])
@@ -1123,18 +1177,18 @@ class TestRecordSpanError:
         _record_span_error(None, ValueError("ignored"))
 
     def test_span_with_neither_method_is_noop(self):
-        """A span that has neither record_exception nor update must not raise."""
+        """A span with neither add_event/set_status nor update must not raise."""
         from audittrace.logging_config import _record_span_error
 
         span = MagicMock(spec=[])
         _record_span_error(span, ValueError("ignored"))
 
-    def test_failing_record_exception_is_swallowed(self):
-        """If record_exception itself raises, the error must be swallowed."""
+    def test_failing_add_event_is_swallowed(self):
+        """If add_event itself raises, the error must be swallowed."""
         from audittrace.logging_config import _record_span_error
 
-        span = MagicMock(spec=["record_exception"])
-        span.record_exception.side_effect = RuntimeError("telemetry broken")
+        span = MagicMock(spec=["add_event", "set_status"])
+        span.add_event.side_effect = RuntimeError("telemetry broken")
         # Must not raise
         _record_span_error(span, ValueError("original"))
 
@@ -1145,3 +1199,28 @@ def test_telemetry_start_span_returns_none_when_uninitialised():
         assert span is None
     # Re-init so downstream tests keep working
     telemetry.init_telemetry(service_name="audittrace-server-tests", otlp_endpoint="")
+
+
+def test_g6_canary_registered_value_leg_is_scanned(_canary_registered_value_leg):
+    """Dedicated per-test canary for the net's registered-value-leg
+    category (gate REJECT round 4, R1) — registers a real, >=16-char
+    secret so ``scan_for_registered_secret_values`` (called
+    unconditionally on ``texts`` every test, in
+    ``tests/conftest.py::_redaction_net``) actually scans a NON-EMPTY
+    registry rather than returning early. Deliberately does not emit
+    the secret anywhere — a positive "the leg ran" canary must not
+    also BE a leak, which would additionally trip the net's ``hits``
+    check.
+
+    Lives HERE, not in ``test_log_call_redaction.py``: that module has
+    its OWN local autouse ``_clean_registry`` fixture (same function
+    scope, closer to the test than any conftest.py fixture), which
+    pytest tears down BEFORE ``_redaction_net``'s finally block runs —
+    clearing the registry before this canary's assertion could ever
+    see it, regardless of ``_redaction_net``'s own explicit dependency
+    on ``_reset_request_secrets``. This module carries no such
+    colliding local fixture, so the registration genuinely survives to
+    the net's own teardown check."""
+    from audittrace.identity import register_request_secret
+
+    register_request_secret("s3cr3t-canary-" + "A" * 20)

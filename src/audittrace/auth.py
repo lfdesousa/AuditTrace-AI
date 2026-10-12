@@ -40,6 +40,7 @@ from audittrace.identity import (
     get_token_cache,
     hash_token,
     is_admin_scope,
+    register_request_secret,
     sentinel_user_context,
 )
 from audittrace.logging_config import log_call
@@ -318,10 +319,37 @@ ALL_SCOPES: dict[str, str] = {
 # resolvable at import time in normal env-var setups; tests that
 # override Settings can patch ``audittrace.auth.oauth2_scheme`` if
 # they need a different issuer URL in the spec.
-def _build_oauth2_scheme() -> OAuth2AuthorizationCodeBearer:
+class _RegisteringOAuth2Scheme(OAuth2AuthorizationCodeBearer):
+    """OAuth2 scheme that registers the bearer value before returning it.
+
+    SEC-JWT-IN-LANGFUSE-SPAN D3 — the request-credential registry's single
+    entry point. ``OAuth2AuthorizationCodeBearer.__call__`` is async and
+    extracts the raw bearer value from the ``Authorization`` header; this
+    subclass registers that value in the request-scoped ContextVar
+    (``audittrace.identity.register_request_secret``) BEFORE returning it
+    to the caller. Because ``Depends(oauth2_scheme)`` resolution happens
+    before the dependant function body runs, the value is registered
+    strictly earlier than any ``@log_call`` target — including
+    ``require_user`` itself — can observe it in the same task, so
+    ``logging_config.scrub_text`` can redact it by value equality from
+    every argument, return value, nested structure and exception message
+    for the rest of the request (G3).
+
+    No new header-reading path is introduced: this only renames the
+    existing extraction already performed by the base class's ``__call__``.
+    """
+
+    async def __call__(self, request: Request) -> str | None:
+        token = await super().__call__(request)
+        if token:
+            register_request_secret(token)
+        return token
+
+
+def _build_oauth2_scheme() -> _RegisteringOAuth2Scheme:
     settings = get_settings()
     base = settings.keycloak_issuer
-    return OAuth2AuthorizationCodeBearer(
+    return _RegisteringOAuth2Scheme(
         authorizationUrl=f"{base}/protocol/openid-connect/auth",
         tokenUrl=f"{base}/protocol/openid-connect/token",
         scopes=ALL_SCOPES,

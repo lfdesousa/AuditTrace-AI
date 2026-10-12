@@ -40,6 +40,7 @@ with other users of the same Redis instance.
 
 from __future__ import annotations
 
+import contextvars
 import fnmatch
 import hashlib
 import json
@@ -52,6 +53,70 @@ if TYPE_CHECKING:
     from redis import Redis
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────── Request-credential registry (SEC-JWT-IN-LANGFUSE-SPAN) ──
+#
+# D3 — the equality pin. The bearer token has exactly one process entry
+# point: the OAuth2 scheme's ``__call__`` (``audittrace.auth`` — see
+# ``_RegisteringOAuth2Scheme``). It registers the raw value here, in a
+# request-scoped ContextVar, BEFORE returning it to any ``Depends(...)``
+# consumer — so the value is visible to every ``@log_call`` target that
+# might observe it in the same task, including ``require_user`` itself.
+# ``logging_config.scrub_text`` reads this registry by VALUE EQUALITY
+# (longest-first, so a shorter registered value can never leave a
+# dangling suffix of a longer one unredacted) and is the primary
+# redaction mechanism; the shape net (JWT/Bearer/Basic regexes) is the
+# secondary, enumeration-class layer for whatever bypasses this path.
+#
+# A ContextVar, not a module global: concurrent requests (threadpool +
+# asyncio tasks) must never see each other's secrets, and a value must
+# never leak across requests. ``contextvars.copy_context()`` semantics
+# mean a child task spawned from a context that already registered a
+# secret inherits a COPY of the registry — mutating it there does not
+# leak back to the parent, which is the same precedent as
+# ``db.rls.set_current_user_id``.
+_REQUEST_SECRETS: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "audittrace_request_secrets", default=()
+)
+
+# Never register a value shorter than this — avoids an accidental scrub of
+# a common short string (a one-word query, a short id) that happens to
+# equal some unrelated registered value. The shape net (D4) covers short
+# or malformed credentials this floor excludes.
+_MIN_REGISTERED_SECRET_LEN = 16
+
+
+def register_request_secret(value: str) -> None:
+    """Register ``value`` as a secret to redact for the rest of this request.
+
+    Idempotent (registering the same value twice is a no-op beyond the
+    dedup) and additive — multiple secrets (e.g. a bearer token AND a
+    downstream-minted token) can be registered in the same request. Values
+    shorter than ``_MIN_REGISTERED_SECRET_LEN`` are silently ignored (D3).
+    """
+    if not value or len(value) < _MIN_REGISTERED_SECRET_LEN:
+        return
+    current = _REQUEST_SECRETS.get()
+    if value in current:
+        return
+    _REQUEST_SECRETS.set((*current, value))
+
+
+def request_secrets() -> tuple[str, ...]:
+    """Return every secret registered so far in the current request context.
+
+    Empty tuple when nothing has been registered (unauthenticated routes,
+    bypass mode, unit tests without a request scope) — callers must treat
+    that as "nothing to scrub by equality", not an error.
+    """
+    return _REQUEST_SECRETS.get()
+
+
+def reset_request_secrets() -> None:
+    """Clear the registry. Test-only — production requests get a fresh
+    ContextVar value for free because each request runs in its own task."""
+    _REQUEST_SECRETS.set(())
 
 
 # ─────────────────────────── Sentinel for bypass mode ────────────────────────
