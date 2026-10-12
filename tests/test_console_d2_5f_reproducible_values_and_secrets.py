@@ -209,8 +209,8 @@ class TestZeroLocalhost5000InRenderedChart:
             c for c in hook_pod["spec"]["containers"] if c["name"] == "tests"
         )
         assert tests_container["image"] == (
-            "docker.io/lfds/audittrace-tests:1.29.2"
-            "@sha256:f01ffa6357d21eee2a5f721b4c8f82ca8fb5db4bd85eb50a00a9a845a7b421a5"
+            "docker.io/lfds/audittrace-tests:1.29.3"
+            "@sha256:699a8fe997c7db9da678056f8dbf55894f3c543c56cd78b14fccb96a7ed1534e"
         )
 
     def test_tests_image_renders_as_repository_tag_digest(self) -> None:
