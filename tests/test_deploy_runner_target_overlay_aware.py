@@ -72,9 +72,9 @@ LAPTOP_VALUES_FILE = CHART_DIR / "values-laptop.yaml"
 _REAL_LIBRECHAT_DIGEST = (
     "sha256:4db01e94ee7b321f37475261b5d66c73f5aa88144bfbbd3eff7e6922b24f905a"
 )
-# Phase-E re-pin (2026-10-11, release v1.29.2).
+# Phase-E re-pin (2026-10-12, release v1.29.3).
 _REAL_BFF_DIGEST = (
-    "sha256:fac5d3e92024f5f90c24614ec23b6e2a58d9e8ef41a520da29f9757025f87b5a"
+    "sha256:c60b5311255521da91a17e7e2c1e2d5798ca42f873f6e73f02b1e0a2ec6fcdc5"
 )
 
 # Mirrors the Makefile helm-lint / tests/test_deploy_runner_console_image_pins.py
