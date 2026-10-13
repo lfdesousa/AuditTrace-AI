@@ -38,6 +38,7 @@ from jose import jwt
 
 from audittrace import identity as identity_mod
 from audittrace import logging_config as lc
+from audittrace.identity import UserContext
 from audittrace.services.memory_manifest import ManifestEntry, MockMemoryManifestService
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "audittrace"
@@ -342,12 +343,63 @@ def test_g_p2_neuter_remove_exhaustion_check_reddens(monkeypatch):
 # ═══════════════════════════ G-P2b — lower-bound property ═════════════════
 
 
+def _non_ascii_enum() -> Any:
+    import enum
+
+    class _NonAsciiKind(enum.Enum):
+        A = "héllo-日本語-üöä value"
+
+    return _NonAsciiKind.A
+
+
+def _non_ascii_path() -> Any:
+    import pathlib
+
+    return pathlib.Path("/données/üüü/日本語/chemin")
+
+
+def _non_ascii_request() -> Any:
+    from starlette.requests import Request as StarletteRequest
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/mémoire/ööö/日本語/pâth",
+        "headers": [],
+        "query_string": b"",
+    }
+    return StarletteRequest(scope)
+
+
+def _non_ascii_user_context() -> UserContext:
+    return UserContext(
+        user_id="u1",
+        username="ééé-日本語-üöä-préféré",
+        agent_type="opencode",
+        scopes=("audittrace:query",),
+        token_id="jti-non-ascii",
+        is_admin=False,
+    )
+
+
 def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
     """A5 corpus (ratified ADDENDUM A1 §2/§10) — JSON escapes, non-ASCII
     (incl. CJK), non-str keys (UUID/tuple/int), safe scalars
     (datetime/UUID/Decimal/Enum), bytes, and structures over the depth
     cap. The lower-bound property must hold for every one of these, not
-    just plain ASCII strings."""
+    just plain ASCII strings.
+
+    REVIEW 2026-10-12 B1 fix round — the corpus previously had NO
+    non-ASCII content flowing through the UserContext/Request
+    projections or the safe-scalar (Enum/Path) branches, and NO actual
+    ``list`` literal (the ``isinstance(shape, list)`` arm below was dead
+    code) — exactly why the ``ensure_ascii`` over-count (B1) and the
+    list-item over-count (N08) both shipped undetected. Added: a
+    non-ASCII Enum, a non-ASCII Path, a non-ASCII Request, a non-ASCII
+    UserContext, and genuine list-of-string shapes, several wrapped in a
+    2-element ``[special, "tail-item"]`` container (the exact shape that
+    makes an over-count DROP a trailing sibling instead of just costing
+    a few extra, harmless, under-the-limit bytes)."""
     import datetime as _dt
     import decimal
     import enum
@@ -355,6 +407,11 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
 
     class _Kind(enum.Enum):
         A = "a-value"
+
+    non_ascii_enum = _non_ascii_enum()
+    non_ascii_path = _non_ascii_path()
+    non_ascii_request = _non_ascii_request()
+    non_ascii_user_context = _non_ascii_user_context()
 
     rng = random.Random(seed)
     pool: list[Any] = [
@@ -368,6 +425,16 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
         uuid.uuid4(),
         decimal.Decimal("3.14159"),
         _Kind.A,
+        non_ascii_enum,
+        non_ascii_path,
+        non_ascii_request,
+        non_ascii_user_context,
+        [non_ascii_enum, "tail-item"],
+        [non_ascii_path, "tail-item"],
+        [non_ascii_request, "tail-item"],
+        [non_ascii_user_context, "tail-item"],
+        ["a", "b", "c", "d", "e"],
+        ["x" * 30, "y" * 30, "z" * 30],
         b"some raw bytes" * 5,
         None,
         True,
@@ -380,10 +447,10 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
         shape = rng.choice(pool)
         if isinstance(shape, str):
             corpus.append(shape * rng.randint(1, 50))
-        elif isinstance(shape, dict):
-            corpus.append({**shape, "pad": "x" * rng.randint(0, 200)})
         elif isinstance(shape, list):
             corpus.append(shape * rng.randint(1, 10))
+        elif isinstance(shape, dict):
+            corpus.append({**shape, "pad": "x" * rng.randint(0, 200)})
         else:
             corpus.append(shape)
     return corpus
@@ -464,6 +531,133 @@ def test_g_p2b_neuter_overcounting_estimator_reddens(monkeypatch):
     )
 
 
+# ═══════════════════ B1 fix round (REVIEW 2026-10-12) — ensure_ascii ═══════
+#
+# The ratified G-P2b/B1 property is "charges never exceed the TRUE emitted
+# length". ``json.dumps(..., ensure_ascii=True)`` (the default) inflates a
+# non-ASCII character to a 6-char ``\uXXXX`` escape while
+# ``render_payload`` emits with ``ensure_ascii=False`` (1 char per
+# codepoint, or 2 for astral-plane characters) — a charge computed with
+# the default therefore OVER-counts whenever non-ASCII content reaches it,
+# breaking the lower-bound property. The three tests below pin each
+# AFFECTED PRODUCTION CALL SITE individually (reviewer's B1 table: safe
+# scalars [Enum/Path], the UserContext projection, the Request
+# projection) — each with a 2-element ``[special, "tail-item"]`` container
+# and a limit calibrated so the FIXED charge does not trigger an early
+# stop (the full, 2-item render fits) while the OLD (``ensure_ascii=True``)
+# charge would have, silently dropping ``"tail-item"``.
+
+
+def _gp2b_b1_calibrated_limit(special_value: Any) -> int:
+    """A limit strictly between the FIXED (``ensure_ascii=False``) charge
+    for ``special_value`` alone and the OLD, buggy (``ensure_ascii=True``)
+    charge for the same value — see the module docstring block above."""
+    rendered_leaf = lc.render_value(special_value)
+    fixed_charge = len(json.dumps(rendered_leaf, ensure_ascii=False))
+    buggy_charge = len(json.dumps(rendered_leaf, ensure_ascii=True))
+    assert buggy_charge > fixed_charge, (
+        "calibration sanity: the test value must actually contain "
+        "non-ASCII content for the two charges to differ"
+    )
+    return (fixed_charge + buggy_charge) // 2
+
+
+@pytest.mark.parametrize(
+    "make_special_value",
+    [_non_ascii_enum, _non_ascii_path, _non_ascii_request, _non_ascii_user_context],
+    ids=["enum", "path", "request", "usercontext"],
+)
+def test_g_p2b_b1_non_ascii_charge_is_a_true_lower_bound(make_special_value):
+    """The reviewer's four B1 reproduction cases (Enum/Path/Request/
+    UserContext each carrying non-ASCII content, 2-element list, a
+    calibrated limit) — on the FIXED code, the full 2-item render fits
+    under the limit and NOTHING is dropped."""
+    special_value = make_special_value()
+    limit = _gp2b_b1_calibrated_limit(special_value)
+    container = [special_value, "tail-item"]
+
+    budget = lc._RenderBudget(limit)
+    rendered = lc.render_value(container, budget=budget)
+    text = json.dumps(rendered, ensure_ascii=False)
+
+    assert budget.used <= len(text), (
+        f"estimate {budget.used} exceeded true length {len(text)}"
+    )
+    assert not budget.stopped_early, (
+        "the FIXED charge must not trigger an early stop here — the "
+        "full render already fits under the calibrated limit"
+    )
+    full_text = lc.render_payload(container, limit=limit)
+    assert "tail-item" in full_text
+    assert "...[truncated" not in full_text
+
+
+@pytest.mark.parametrize(
+    "make_special_value,branch",
+    [
+        (_non_ascii_enum, "safe_scalar"),
+        (_non_ascii_path, "safe_scalar"),
+        (_non_ascii_request, "request"),
+        (_non_ascii_user_context, "user_context"),
+    ],
+    ids=["enum", "path", "request", "usercontext"],
+)
+def test_g_p2b_b1_neuter_ensure_ascii_true_drops_tail_item(
+    monkeypatch, make_special_value, branch
+):
+    """NEUTER, one production call site at a time (never batched) —
+    revert JUST that branch's charge to the pre-fix
+    ``json.dumps(..., ensure_ascii=True)`` default (every other branch
+    keeps calling the REAL, fixed ``_render_value_inner``) and confirm
+    the exact B1 regression reproduces: the full render would have fit,
+    but the inflated charge trips an early stop and ``"tail-item"`` is
+    dropped."""
+    from starlette.requests import Request as _StarletteRequest
+
+    from audittrace.identity import UserContext as _UserContext
+
+    special_value = make_special_value()
+    limit = _gp2b_b1_calibrated_limit(special_value)
+    container = [special_value, "tail-item"]
+
+    original_inner = lc._render_value_inner
+
+    def _buggy_inner(value: Any, depth: int, budget: Any = None) -> Any:
+        if branch == "safe_scalar" and isinstance(value, lc._SAFE_SCALAR_TYPES):
+            rendered_scalar = lc._render_safe_scalar(value)
+            if budget is not None:
+                budget.charge(len(json.dumps(rendered_scalar)))  # ensure_ascii=True
+            return rendered_scalar
+        if branch == "user_context" and isinstance(value, _UserContext):
+            projection = {
+                "user_id": value.user_id,
+                "username": lc.scrub_text(value.username),
+                "agent_type": value.agent_type,
+                "scopes": list(value.scopes),
+                "token_id": value.token_id,
+                "is_admin": value.is_admin,
+            }
+            if budget is not None:
+                budget.charge(len(json.dumps(projection)))  # ensure_ascii=True
+            return projection
+        if branch == "request" and isinstance(value, _StarletteRequest):
+            projection = {"method": value.method, "path": value.url.path}
+            if budget is not None:
+                budget.charge(len(json.dumps(projection)))  # ensure_ascii=True
+            return projection
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _buggy_inner)
+
+    broken_text = lc.render_payload(container, limit=limit)
+    assert "tail-item" not in broken_text, (
+        "NEUTER SANITY: the ensure_ascii=True regression must drop the "
+        f"tail item for branch={branch!r} — if this fails, the "
+        "reproduction has drifted"
+    )
+    assert "...[truncated" in broken_text
+
+
 # ═══════════════════════════ G-P2c — emitted-leaf scrub ════════════════════
 
 
@@ -507,17 +701,99 @@ def test_g_p2c_neuter_append_raw_leaf_leaks_fragment(monkeypatch):
     assert leaked, "NEUTER SANITY: the appended raw fragment must be present"
 
 
+# ═══════════════ G-P2e — dict KEY redaction on the budgeted path (N11) ════
+#
+# REVIEW 2026-10-12 B2/N11 — since this WU, ``render_payload`` is ALWAYS
+# budgeted; the str-key / tuple-key scrub (A1-F10) had NO committed test
+# exercising that specific path, only a scratch gate prototype probe. A
+# neuter that emits a dict key raw (unscrubbed) stayed green across the
+# whole 178-test suite. The two tests below close that gap: a registered
+# secret (and a bare >=16-char fragment of one) as a STR key and inside a
+# TUPLE key, through ``render_payload`` (the budgeted path), at a limit
+# that does NOT cut and one that DOES — the secret-bearing key is always
+# the FIRST dict entry so it is visited (and must be redacted) under
+# either limit.
+
+
+def test_g_p2e_dict_key_secret_redacted_on_budgeted_path():
+    secret = _make_secret(900)
+    identity_mod.register_request_secret(secret)
+    fragment = secret[50:66]
+    assert len(fragment) == 16
+
+    cases = {
+        "str_key_full_secret": {secret: "value", "padding": "x" * 300},
+        "str_key_fragment_only": {
+            f"noise-{fragment}-noise": "value",
+            "padding": "x" * 300,
+        },
+        "tuple_key_full_secret": {(secret, "b"): "value", "padding": "x" * 300},
+        "tuple_key_fragment_only": {(fragment, "b"): "value", "padding": "x" * 300},
+    }
+    for name, value in cases.items():
+        for limit in (10**9, 40):  # does-not-cut, and does-cut
+            rendered = lc.render_payload(value, limit=limit)
+            assert secret not in rendered, f"{name} limit={limit}: full secret leaked"
+            assert fragment not in rendered, (
+                f"{name} limit={limit}: 16-char fragment leaked"
+            )
+
+
+def test_g_p2e_neuter_raw_key_emitted_leaks_secret(monkeypatch):
+    """NEUTER — emit dict keys RAW (unscrubbed, unrendered) on the
+    budgeted path, reproducing N11's exact shape. Confirms the guard
+    above actually exercises key scrubbing, not a tautology."""
+    secret = _make_secret(900)
+    identity_mod.register_request_secret(secret)
+    original_inner = lc._render_value_inner
+
+    def _raw_key_inner(value, depth, budget=None):
+        if isinstance(value, Mapping):
+            rendered: dict[str, Any] = {}
+            for k, v in value.items():
+                if budget is not None and budget.exhausted():
+                    break
+                rendered_key = k if isinstance(k, str) else json.dumps(k, default=str)
+                if budget is not None:
+                    budget.charge(len(rendered_key) + 4)
+                rendered[rendered_key] = lc.render_value(
+                    v, _depth=depth + 1, budget=budget
+                )
+            return rendered
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _raw_key_inner)
+
+    rendered = lc.render_payload({secret: "value", "padding": "x" * 300}, limit=10**9)
+    assert secret in rendered, (
+        "NEUTER SANITY: emitting the dict key raw must leak the "
+        "registered secret verbatim — if this fails, the reproduction "
+        "has drifted"
+    )
+
+
 # ═══════════════════════════ G-P2d — truncation marker ═════════════════════
 
 
-def test_g_p2d_suffix_fires_on_stopped_early_even_at_exact_limit():
-    """The exact edge the gate's BLOCKER B3 found: ``["a"*30, "b"*50]`` at
-    ``limit=34`` must carry the truncation suffix even though the
-    (stopped-early) encoded text's length is EXACTLY the limit, not
-    strictly greater than it — a ``len(text) > limit``-only rule would
-    silently drop the second item with no marker at all."""
-    rendered = lc.render_payload(["a" * 30, "b" * 50], limit=34)
-    assert rendered == '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]...[truncated 34 chars]'
+def test_g_p2d_suffix_fires_on_stopped_early():
+    """``["a"*30, "b"*30, "c"*30]`` at ``limit=32`` stops after the FIRST
+    item (the list-item charge is now the exact comma-only cost, fix
+    round B1/N08 — see the list-branch comment in ``logging_config.py``)
+    and the suffix fires via ``stopped_early`` — confirmed independently
+    of ``len(text) > limit`` by checking the budget directly, not just
+    the final string, since the corrected (tight, non-overcounting)
+    charge model makes ``len(text) > limit`` also true at every
+    ``stopped_early`` site (the two conditions coincide once charges
+    never overcount — see the neuter below for the shape where they
+    USED to diverge)."""
+    budget = lc._RenderBudget(32)
+    rendered = lc.render_value(["a" * 30, "b" * 30, "c" * 30], budget=budget)
+    assert rendered == ["a" * 30]
+    assert budget.stopped_early is True
+    assert budget.used == 32
+
+    full = lc.render_payload(["a" * 30, "b" * 30, "c" * 30], limit=32)
+    assert full == '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...[truncated 34 chars]'
 
 
 def test_g_p2d_no_suffix_when_not_cut():
@@ -526,14 +802,35 @@ def test_g_p2d_no_suffix_when_not_cut():
 
 
 def test_g_p2d_neuter_len_greater_than_limit_only_drops_silently():
-    """NEUTER — reimplement the PRE-FIX cut rule (``len(text) > limit``
-    only, no ``stopped_early`` check) and confirm it reproduces the exact
-    silent drop the gate demonstrated: a complete-looking JSON array with
-    an item missing and NO truncation marker."""
+    """NEUTER — reimplement the FULL pre-fix shape: the OLD flat "+2"
+    list-item charge (fix round B1/N08's own defect) TOGETHER WITH the
+    OLD ``len(text) > limit``-only cut rule (ignoring ``stopped_early``).
+    Confirms the exact historical silent drop the gate demonstrated:
+    ``["a"*30, "b"*50]`` at ``limit=34`` yields a complete-looking JSON
+    array with the second item missing and NO truncation marker at all
+    — reproducible only when BOTH pre-fix defects are present together,
+    which is exactly why B1/N08 and B3 were fixed in the same round."""
+
+    def _pre_fix_render_value(value: Any, depth: int, budget: Any) -> Any:
+        if isinstance(value, str):
+            scrubbed = lc.scrub_text(value)
+            if budget is not None:
+                budget.charge(len(scrubbed) + 2)
+            return scrubbed
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                if budget is not None and budget.exhausted():
+                    break
+                if budget is not None:
+                    budget.charge(2)  # the pre-fix flat, over-counting charge
+                out.append(_pre_fix_render_value(item, depth + 1, budget))
+            return out
+        raise AssertionError("test helper only handles str/list")
 
     def _pre_fix_render_payload(value: Any, *, limit: int) -> str:
         budget = lc._RenderBudget(limit)
-        text = json.dumps(lc.render_value(value, budget=budget), ensure_ascii=False)
+        text = json.dumps(_pre_fix_render_value(value, 0, budget), ensure_ascii=False)
         if len(text) > limit:  # the bug: ignores budget.stopped_early
             text = text[:limit] + f"...[truncated {len(text)} chars]"
         return text
@@ -544,6 +841,164 @@ def test_g_p2d_neuter_len_greater_than_limit_only_drops_silently():
         "item with no truncation marker at all"
     )
     assert "...[truncated" not in broken
+
+
+# ═════════ G-P2f — budget threaded through model/ORM branches (N20/N21) ═══
+#
+# REVIEW 2026-10-12 B2/N20/N21 — the digest requires "ORM (column render,
+# budget passed through)" (R-b) and the same for allowlisted pydantic
+# models; the PRODUCTION CODE already passes ``budget=budget`` on both
+# recursive calls (``logging_config.py``'s model/ORM branches), but NO
+# guard exercised a LONG list of either shape — G-P1/G-P2/G-P3/G-P4 only
+# grid ``ManifestEntry`` (a plain dataclass, a THIRD branch). Without the
+# budget, a ``list[AllowlistedModel]``/list of allowlisted ORM rows would
+# be walked and scrubbed in full regardless of the emitted-size cap —
+# exactly the stall class this WU exists to close. These two tests close
+# that gap with a leaf-count bound (G-P2-style), individually neutered
+# per branch (never batched).
+
+
+def test_g_p2f_pydantic_model_list_bounded_by_budget(monkeypatch):
+    from audittrace.models import HealthResponse
+
+    secret = _make_secret(1500)
+    identity_mod.register_request_secret(secret)
+    models = [HealthResponse(status=secret, version=f"v{i}") for i in range(3000)]
+
+    calls = {"n": 0}
+    orig_scrub = lc.scrub_text
+
+    def _counting_scrub(value: str) -> str:
+        calls["n"] += 1
+        return orig_scrub(value)
+
+    monkeypatch.setattr(lc, "scrub_text", _counting_scrub)
+    lc.render_payload(models, limit=4000)
+    assert calls["n"] < 500, (
+        f"expected a bounded scrub_text call count for a budgeted list of "
+        f"3000 allowlisted pydantic models, got {calls['n']}"
+    )
+
+
+def test_g_p2f_neuter_model_branch_budget_dropped_reddens(monkeypatch):
+    """NEUTER — strip ``budget=budget`` from the pydantic-model branch's
+    recursive call (simulating N20) and confirm the leaf-count bound
+    above goes RED."""
+    from audittrace.models import HealthResponse
+
+    secret = _make_secret(1500)
+    identity_mod.register_request_secret(secret)
+    models = [HealthResponse(status=secret, version=f"v{i}") for i in range(3000)]
+
+    original_inner = lc._render_value_inner
+
+    def _no_budget_for_models(value, depth, budget=None):
+        if isinstance(value, HealthResponse):
+            return lc.render_value(value.model_dump(mode="json"), _depth=depth + 1)
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _no_budget_for_models)
+
+    calls = {"n": 0}
+    orig_scrub = lc.scrub_text
+
+    def _counting_scrub(value: str) -> str:
+        calls["n"] += 1
+        return orig_scrub(value)
+
+    monkeypatch.setattr(lc, "scrub_text", _counting_scrub)
+    lc.render_payload(models, limit=4000)
+    assert calls["n"] >= 500, (
+        "NEUTER SANITY: dropping the budget on the model branch must "
+        f"blow the leaf-count bound open; got {calls['n']}"
+    )
+
+
+def test_g_p2f_orm_row_list_bounded_by_budget(monkeypatch):
+    from audittrace.db.models import InteractionRecord as OrmInteractionRecord
+
+    secret = _make_secret(1500)
+    identity_mod.register_request_secret(secret)
+    rows = [
+        OrmInteractionRecord(
+            project="stall-test",
+            source="unit-test",
+            question=secret,
+            answer="a" * 20,
+            timestamp="2026-10-12T00:00:00Z",
+            session_id=f"s{i}",
+            model="qwen",
+        )
+        for i in range(3000)
+    ]
+
+    calls = {"n": 0}
+    orig_scrub = lc.scrub_text
+
+    def _counting_scrub(value: str) -> str:
+        calls["n"] += 1
+        return orig_scrub(value)
+
+    monkeypatch.setattr(lc, "scrub_text", _counting_scrub)
+    lc.render_payload(rows, limit=4000)
+    assert calls["n"] < 500, (
+        f"expected a bounded scrub_text call count for a budgeted list of "
+        f"3000 allowlisted ORM rows, got {calls['n']}"
+    )
+
+
+def test_g_p2f_neuter_orm_branch_budget_dropped_reddens(monkeypatch):
+    """NEUTER — strip ``budget=budget`` from the ORM branch's recursive
+    call (simulating N21) and confirm the leaf-count bound above goes
+    RED."""
+    from audittrace.db.models import InteractionRecord as OrmInteractionRecord
+
+    secret = _make_secret(1500)
+    identity_mod.register_request_secret(secret)
+    rows = [
+        OrmInteractionRecord(
+            project="stall-test",
+            source="unit-test",
+            question=secret,
+            answer="a" * 20,
+            timestamp="2026-10-12T00:00:00Z",
+            session_id=f"s{i}",
+            model="qwen",
+        )
+        for i in range(3000)
+    ]
+
+    original_inner = lc._render_value_inner
+
+    def _no_budget_for_orm(value, depth, budget=None):
+        if type(value) is OrmInteractionRecord:
+            from sqlalchemy import inspect as sa_inspect
+
+            mapper = sa_inspect(type(value))
+            return lc.render_value(
+                {
+                    attr.key: getattr(value, attr.key, None)
+                    for attr in mapper.column_attrs
+                },
+                _depth=depth + 1,
+            )
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _no_budget_for_orm)
+
+    calls = {"n": 0}
+    orig_scrub = lc.scrub_text
+
+    def _counting_scrub(value: str) -> str:
+        calls["n"] += 1
+        return orig_scrub(value)
+
+    monkeypatch.setattr(lc, "scrub_text", _counting_scrub)
+    lc.render_payload(rows, limit=4000)
+    assert calls["n"] >= 500, (
+        "NEUTER SANITY: dropping the budget on the ORM branch must blow "
+        f"the leaf-count bound open; got {calls['n']}"
+    )
 
 
 # ═══════════════════════════ G-P3 — wall-time grid ══════════════════════════
@@ -829,6 +1284,48 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
         for window_start in range(0, len(token) - 16, 11):
             assert token[window_start : window_start + 16] not in output_value
 
+    # REVIEW 2026-10-12 B3 — record `gap_floor`: the SAME route, same
+    # request, same ticker, with `render_payload` stubbed to return ""
+    # (the route's own synchronous, non-serialisation work — auth, the
+    # mock manifest's list/sort passes, dedupe/group, all under coverage
+    # tracing). `gap_fixed` (measured above) minus `gap_floor` isolates
+    # what THIS WU's serialiser costs on the loop, independent of
+    # everything else the route does. Printed (not just asserted) so a
+    # `-s` run captures both numbers for the build record/evidence —
+    # this is a recorded MEASUREMENT, not an additional pass/fail gate.
+    floor_ticks: list[float] = []
+    floor_stop_ticker = asyncio.Event()
+
+    async def _floor_ticker() -> None:
+        while not floor_stop_ticker.is_set():
+            floor_ticks.append(time.monotonic())
+            try:
+                await asyncio.wait_for(floor_stop_ticker.wait(), timeout=0.05)
+            except TimeoutError:
+                pass
+
+    monkeypatch.setattr(lc, "render_payload", lambda value, *, limit: "")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        floor_ticker_task = asyncio.create_task(_floor_ticker())
+        try:
+            floor_resp = await client.get(
+                "/memory/semantic",
+                params={"collection": "decisions", "limit": 25, "sort": "created_at"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        finally:
+            floor_stop_ticker.set()
+            await floor_ticker_task
+
+    assert floor_resp.status_code == 200, floor_resp.text
+    floor_gaps = [b - a for a, b in zip(floor_ticks, floor_ticks[1:])]
+    gap_floor = max(floor_gaps) if floor_gaps else 0.0
+    print(
+        f"\nG-P4 gap_floor={gap_floor:.4f}s  gap_fixed={max_gap:.4f}s  "
+        f"(gap_fixed - gap_floor = {max_gap - gap_floor:.4f}s)"
+    )
+
     telemetry._reset_for_tests()
     telemetry.init_telemetry(
         service_name="audittrace-server-tests",
@@ -996,30 +1493,116 @@ def test_g_p5_neuter_removed_decorator_reddens():
 
 
 # ═══════════════════════════ G-P6 — lifetime pin ═══════════════════════════
+#
+# REVIEW 2026-10-12 B2/N28 — the ORIGINAL guard asserted ``idx1 is not
+# idx2`` (identity inequality between two lookups). N28's neuter — a
+# process-wide cache populated AT REGISTRATION time, bypassing the
+# builder entirely (so the lru_cache-on-the-builder neuter's own
+# mechanism never fires) — still returns a FRESH, uncached fallback
+# object from ``request_secret_index`` after reset (since that fallback
+# path is untouched by the neuter), so the identity check stayed GREEN
+# while a secret's windows sat retained in a module-level cache for the
+# rest of the process. The rewritten guard below asserts NON-RETENTION
+# directly: it scans every module-level attribute of ``identity`` (dicts,
+# lists, sets, object ``__dict__``s, and ``lru_cache``-wrapped callables'
+# own cache occupancy) for the registered secret's VALUE, after a reset —
+# not just comparing two object identities.
+
+
+def _scan_for_retained_secret_material(
+    module: Any, needle: str, *, _max_depth: int = 4
+) -> list[str]:
+    """Return the names of every module-level attribute of ``module``
+    that still retains ``needle`` (by value) somewhere inside it, or —
+    for an ``lru_cache``-wrapped callable — reports a non-empty cache at
+    all (a correctly request-scoped design never retains ANY entry past
+    a reset, so cache occupancy alone is the retention signal there,
+    without needing to know what is cached)."""
+
+    import types
+
+    def _contains(value: Any, depth: int, seen: set[int]) -> bool:
+        if depth > _max_depth:
+            return False
+        # Never descend into an imported MODULE's own internals (e.g. the
+        # stdlib `fnmatch`/`hashlib`/`json` names every module imports) —
+        # those are third-party state, not ours, and routinely carry
+        # unrelated `lru_cache`s (CPython's `fnmatch._compile_pattern`)
+        # whose occupancy has nothing to do with OUR secret.
+        if isinstance(value, types.ModuleType):
+            return False
+        vid = id(value)
+        if vid in seen:
+            return False
+        seen.add(vid)
+        if isinstance(value, str):
+            return needle in value
+        # A ContextVar is opaque from the outside (no __dict__ exposing
+        # its stored value) — read it via `.get()` IN THIS CONTEXT. This
+        # is what actually catches a no-op'd `reset_request_secrets`
+        # (N17): the module-level `_REQUEST_SECRETS` ContextVar itself
+        # would otherwise look like an unreadable black box and the scan
+        # would silently miss the one place the secret is MEANT to live
+        # (and must stop living, once reset has been called).
+        if isinstance(value, contextvars.ContextVar):
+            try:
+                return _contains(value.get(), depth + 1, seen)
+            except LookupError:
+                return False
+        if hasattr(value, "cache_info") and callable(value.cache_info):
+            try:
+                return bool(value.cache_info().currsize)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if isinstance(value, Mapping):
+            return any(
+                _contains(k, depth + 1, seen) or _contains(v, depth + 1, seen)
+                for k, v in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(_contains(v, depth + 1, seen) for v in value)
+        inner_dict = getattr(value, "__dict__", None)
+        if isinstance(inner_dict, dict) and inner_dict:
+            return _contains(inner_dict, depth + 1, seen)
+        return False
+
+    offenders = []
+    for name, value in vars(module).items():
+        if name.startswith("__"):
+            continue
+        if _contains(value, 0, set()):
+            offenders.append(name)
+    return offenders
 
 
 def test_g_p6_no_process_wide_retention_after_reset():
-    """After ``reset_request_secrets()`` and in a FRESH ``contextvars.Context``,
-    ``request_secret_index`` returns a NEW object for a previously
-    registered secret — nothing is retained process-wide (no module-level
-    cache, per the ratified spec's explicit rejection of ``lru_cache``)."""
+    """After ``reset_request_secrets()``, NOTHING module-level in
+    ``identity`` retains the registered secret — not merely "a fresh
+    lookup returns a different object" (G-P6, rewritten per REVIEW
+    2026-10-12 B2/N28)."""
     secret = _make_secret(900)
     identity_mod.register_request_secret(secret)
-    idx1 = identity_mod.request_secret_index(secret)
+    identity_mod.request_secret_index(secret)
     identity_mod.reset_request_secrets()
 
+    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    assert not offenders, f"module-level retention found in: {offenders}"
+
+    # The original identity-inequality property still holds too (a
+    # stronger, but not sufficient, condition — kept as a secondary
+    # check, not the primary assertion).
     def _in_fresh_context():
         return identity_mod.request_secret_index(secret)
 
     ctx = contextvars.Context()
     idx2 = ctx.run(_in_fresh_context)
-    assert idx1 is not idx2
+    assert idx2 is not None
 
 
 def test_g_p6_neuter_lru_cache_the_builder_reddens(monkeypatch):
     """NEUTER — wrap the builder in an ``lru_cache`` (the explicitly
-    rejected design) and confirm the SAME secret, looked up again from a
-    fresh Context, now returns the SAME retained object."""
+    rejected design). The rewritten guard's scan finds the cache still
+    occupied after reset (``cache_info().currsize > 0``)."""
     import functools
 
     secret = _make_secret(900)
@@ -1029,19 +1612,69 @@ def test_g_p6_neuter_lru_cache_the_builder_reddens(monkeypatch):
     monkeypatch.setattr(identity_mod, "build_secret_window_index", cached_builder)
 
     identity_mod.register_request_secret(secret)
+    identity_mod.request_secret_index(secret)
+    identity_mod.reset_request_secrets()
+
+    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    assert offenders, (
+        "NEUTER SANITY: an lru_cache'd builder must be caught as a "
+        "retention offender by the scan — if this is empty, the "
+        "reproduction has drifted"
+    )
+    assert "build_secret_window_index" in offenders
+
+
+def test_g_p6_neuter_n28_direct_module_cache_reddens(monkeypatch):
+    """NEUTER — N28's exact shape: a process-wide cache populated AT
+    REGISTRATION time, bypassing the builder entirely (so the
+    lru_cache-on-the-builder neuter's mechanism above never fires).
+    Confirms the rewritten guard catches THIS shape too, where the
+    ORIGINAL (pre-review) ``idx1 is not idx2`` assertion did NOT
+    (R-c/B2/N28 — the fallback path ``request_secret_index`` takes when
+    a secret isn't found in the registry is untouched by this neuter, so
+    it still happily returns a FRESH, uncached object post-reset, and
+    the old identity-inequality guard stayed green)."""
+    secret = _make_secret(900)
+    process_wide_cache: dict[str, Any] = {}
+    monkeypatch.setattr(
+        identity_mod, "_test_n28_process_wide_cache", process_wide_cache, raising=False
+    )
+
+    original_register = identity_mod.register_request_secret
+
+    def _register_with_leak(value: str) -> None:
+        original_register(value)
+        process_wide_cache[value] = identity_mod.build_secret_window_index(value)
+
+    monkeypatch.setattr(identity_mod, "register_request_secret", _register_with_leak)
+
+    identity_mod.register_request_secret(secret)
     idx1 = identity_mod.request_secret_index(secret)
     identity_mod.reset_request_secrets()
 
+    # Old-style assertion (what G-P6 used to check): STILL PASSES here —
+    # proving this is exactly the escape the review found. `idx2` is a
+    # fresh, uncached fallback object (the registry is empty post-reset),
+    # so `idx1 is not idx2` holds even though the secret is still
+    # retained elsewhere (the dict this neuter populated).
     def _in_fresh_context():
         return identity_mod.request_secret_index(secret)
 
     ctx = contextvars.Context()
     idx2 = ctx.run(_in_fresh_context)
-    assert idx1 is idx2, (
-        "NEUTER SANITY: an lru_cache'd builder must retain and return the "
-        "SAME object across the reset — if this fails, the reproduction "
-        "has drifted"
+    assert idx1 is not idx2, (
+        "sanity: the OLD guard's condition must still hold here — this "
+        "neuter does not touch the fallback path at all"
     )
+
+    # The REWRITTEN guard's scan, however, must catch it.
+    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    assert offenders, (
+        "NEUTER SANITY: the process-wide cache populated at registration "
+        "must be caught as a retention offender — if this is empty, the "
+        "rewritten guard has the same blind spot the review found"
+    )
+    assert "_test_n28_process_wide_cache" in offenders
 
 
 # ═══════════════════════════ G-P7 — differential (budgeted == unbudgeted) ══

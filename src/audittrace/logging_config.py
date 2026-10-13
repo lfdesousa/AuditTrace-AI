@@ -588,7 +588,7 @@ def render_value(
     except Exception:
         fallback = f"<{type(value).__name__}>"
         if budget is not None:
-            budget.charge(len(json.dumps(fallback)))
+            budget.charge(len(json.dumps(fallback, ensure_ascii=False)))
         return fallback
 
 
@@ -597,7 +597,7 @@ def _render_value_inner(
 ) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         if budget is not None:
-            budget.charge(len(json.dumps(value)))
+            budget.charge(len(json.dumps(value, ensure_ascii=False)))
         return value
     if isinstance(value, str):
         scrubbed = scrub_text(value)
@@ -608,18 +608,18 @@ def _render_value_inner(
     if isinstance(value, bytes):
         rendered_bytes = f"<bytes:{len(value)}>"
         if budget is not None:
-            budget.charge(len(json.dumps(rendered_bytes)))
+            budget.charge(len(json.dumps(rendered_bytes, ensure_ascii=False)))
         return rendered_bytes
     if isinstance(value, _SAFE_SCALAR_TYPES):
         rendered_scalar = _render_safe_scalar(value)
         if budget is not None:
-            budget.charge(len(json.dumps(rendered_scalar)))
+            budget.charge(len(json.dumps(rendered_scalar, ensure_ascii=False)))
         return rendered_scalar
 
     if depth >= _RENDER_MAX_DEPTH:
         rendered_depth_cap = f"<{type(value).__name__}>"
         if budget is not None:
-            budget.charge(len(json.dumps(rendered_depth_cap)))
+            budget.charge(len(json.dumps(rendered_depth_cap, ensure_ascii=False)))
         return rendered_depth_cap
 
     # UserContext — fixed projection. Checked before the generic dataclass
@@ -641,7 +641,7 @@ def _render_value_inner(
                 "is_admin": value.is_admin,
             }
             if budget is not None:
-                budget.charge(len(json.dumps(projection)))
+                budget.charge(len(json.dumps(projection, ensure_ascii=False)))
             return projection
     except Exception:  # pragma: no cover - defensive
         pass
@@ -661,7 +661,7 @@ def _render_value_inner(
         if isinstance(value, StarletteRequest):
             projection = {"method": value.method, "path": value.url.path}
             if budget is not None:
-                budget.charge(len(json.dumps(projection)))
+                budget.charge(len(json.dumps(projection, ensure_ascii=False)))
             return projection
     except Exception:  # pragma: no cover - defensive
         pass
@@ -698,18 +698,31 @@ def _render_value_inner(
             else:
                 rendered_key = render_value(k, _depth=depth + 1)
                 if not isinstance(rendered_key, str):
-                    rendered_key = json.dumps(rendered_key, default=str)
+                    rendered_key = json.dumps(
+                        rendered_key, default=str, ensure_ascii=False
+                    )
             if budget is not None:
                 budget.charge(len(rendered_key) + 4)
             rendered[rendered_key] = render_value(v, _depth=depth + 1, budget=budget)
         return rendered
     if isinstance(value, (list, tuple, set, frozenset)):
+        # SCRUB-EVENT-LOOP-STALL fix-round B1/N08 (ratified REVIEW
+        # 2026-10-12, reviewer probe `['a']*40` at limit=100: a flat "+2"
+        # per item double-counted the leaf charge's own quote overhead,
+        # over-estimating the true JSON length and triggering an early
+        # stop on output that was already under the limit — a real
+        # G-P2b (lower-bound) violation, not just a test gap. Charge
+        # EXACTLY the separator: "+1" for the comma before every item
+        # except the first (which has none). The leaf/recursive charge
+        # already accounts for the item's own content (and, for a str
+        # leaf, its own quotes) — the only structural cost left for the
+        # list branch to own is the comma between siblings.
         rendered_list: list[Any] = []
-        for item in value:
+        for i, item in enumerate(value):
             if budget is not None and budget.exhausted():
                 break
-            if budget is not None:
-                budget.charge(2)  # separator/bracket overhead per item
+            if budget is not None and i > 0:
+                budget.charge(1)  # comma separator; the first item has none
             rendered_list.append(render_value(item, _depth=depth + 1, budget=budget))
         return rendered_list
 
@@ -725,7 +738,7 @@ def _render_value_inner(
                 )
             rendered_model = f"<{type(value).__name__}>"
             if budget is not None:
-                budget.charge(len(json.dumps(rendered_model)))
+                budget.charge(len(json.dumps(rendered_model, ensure_ascii=False)))
             return rendered_model
     except Exception:  # pragma: no cover - defensive
         pass
@@ -739,7 +752,7 @@ def _render_value_inner(
             )
         rendered_dc = f"<{type(value).__name__}>"
         if budget is not None:
-            budget.charge(len(json.dumps(rendered_dc)))
+            budget.charge(len(json.dumps(rendered_dc, ensure_ascii=False)))
         return rendered_dc
 
     if type(value) in render_orm:
@@ -758,12 +771,12 @@ def _render_value_inner(
         except Exception:  # pragma: no cover - defensive
             rendered_orm = f"<{type(value).__name__}>"
             if budget is not None:
-                budget.charge(len(json.dumps(rendered_orm)))
+                budget.charge(len(json.dumps(rendered_orm, ensure_ascii=False)))
             return rendered_orm
 
     rendered_fallback = f"<{type(value).__name__}>"
     if budget is not None:
-        budget.charge(len(json.dumps(rendered_fallback)))
+        budget.charge(len(json.dumps(rendered_fallback, ensure_ascii=False)))
     return rendered_fallback
 
 
