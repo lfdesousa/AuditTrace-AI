@@ -86,6 +86,25 @@ def _mock_summariser_client(
     return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
 
 
+# v1.29.5 — ownership-scoping security fix. Deliberately its own,
+# independently-sorted import group, placed AFTER the helper above (same
+# convention ``test_acl_ownership_rls.py`` uses, ADDENDUM-A1 §8): merging
+# these into the top-of-file block would make ruff's import-sort check
+# want to reorder/re-wrap the EXISTING lines there, which would show as
+# removed lines in a diff whose production-side intent is additions-only.
+import inspect  # noqa: E402
+import logging  # noqa: E402
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from sqlalchemy.exc import IntegrityError  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
+
+from audittrace.services.session_summarizer import (  # noqa: E402
+    _is_foreign_owner,
+    _is_sessions_pk_violation,
+)
+
 # ──────────────────────────── Fixtures ───────────────────────────────
 
 
@@ -1490,3 +1509,834 @@ class TestUnlabelledCodeFence:
         assert _parse_llm_response(
             '```JSON\n{"summary": "upper", "key_points": []}\n```'
         ) == {"summary": "upper", "key_points": []}
+
+
+# ──────────── v1.29.5 — ownership-scoping security fix (G1–G9, G7a–e) ────────
+#
+# Guard numbering follows the ratified build digest (A1 > spec). Each test
+# below is the PERMANENT regression guard; the per-guard RED/GREEN neuter
+# table (production code reverted one mechanism at a time, test run,
+# restored) lives in the build record, not in this file.
+
+
+class _SpyCounter:
+    """Records every ``add(amount, attributes)`` call verbatim, so a test
+    can assert exactly what the production code emitted without standing
+    up a real OTel MeterProvider (which is a process-global, set-once
+    singleton — see the build record for why that rules out
+    InMemoryMetricReader for a shared test process). Same idiom as
+    ``test_memory_tool_handlers.py``'s ``_SpyInstrument``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, dict]] = []
+
+    def add(self, amount: float, attributes: dict | None = None) -> None:
+        self.calls.append((amount, dict(attributes or {})))
+
+
+class _SpyGauge:
+    """Records every ``set(amount, attributes)`` call verbatim."""
+
+    def __init__(self) -> None:
+        self.values: list[tuple[float, dict]] = []
+
+    def set(self, amount: float, attributes: dict | None = None) -> None:
+        self.values.append((amount, dict(attributes or {})))
+
+
+@pytest.fixture
+def collision_spies(monkeypatch):
+    """Swap the module-level collision counter/gauge for spies so tests
+    assert on exactly what the production code calls, not a duplicated
+    instrument."""
+    counter = _SpyCounter()
+    gauge = _SpyGauge()
+    monkeypatch.setattr(ss_mod, "_session_collisions_counter", counter)
+    monkeypatch.setattr(ss_mod, "_session_collisions_gauge", gauge)
+    return counter, gauge
+
+
+@pytest_asyncio.fixture
+async def colliding_group(pg_factory):
+    """A owns 'shared-sid' (already summarised, 89m ago); B's turns land
+    under the SAME session_id 40 minutes ago — both idle. The classic
+    cross-user collision shape (spec §2 P1)."""
+    async with pg_factory.get_session_factory()() as db:
+        db.add_all(
+            [
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="a-q",
+                    answer="a-a",
+                    timestamp=_iso_minutes_ago(90),
+                    session_id="shared-sid",
+                    user_id="user-A",
+                ),
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="b-q",
+                    answer="b-a",
+                    timestamp=_iso_minutes_ago(40),
+                    session_id="shared-sid",
+                    user_id="user-B",
+                ),
+                SessionRecord(
+                    id="shared-sid",
+                    project="P",
+                    date=_iso_minutes_ago(85),
+                    summary="A-ORIGINAL summary",
+                    key_points=json.dumps(["a-point"]),
+                    model="mistral-7b-summarizer",
+                    user_id="user-A",
+                    summarized_at=datetime.now() - timedelta(minutes=89),
+                ),
+            ]
+        )
+        await db.commit()
+    return pg_factory
+
+
+class TestIsForeignOwner:
+    """R1 — the one place the ownership rule is written."""
+
+    def test_none_owner_is_foreign(self):
+        assert _is_foreign_owner(None, "user-1") is True
+
+    def test_different_owner_is_foreign(self):
+        assert _is_foreign_owner("user-2", "user-1") is True
+
+    def test_same_owner_is_not_foreign(self):
+        assert _is_foreign_owner("user-1", "user-1") is False
+
+
+class TestIsSessionsPkViolation:
+    """S2 / A1-F3 — the narrowed catch, as a pure-function unit."""
+
+    def test_sqlite_sessions_id_message_is_pk_violation(self):
+        exc = IntegrityError(
+            "x", params=None, orig=Exception("UNIQUE constraint failed: sessions.id")
+        )
+        assert _is_sessions_pk_violation(exc) is True
+
+    def test_sqlite_other_unique_message_is_not_pk_violation(self):
+        exc = IntegrityError(
+            "x",
+            params=None,
+            orig=Exception("UNIQUE constraint failed: sessions.trace_id"),
+        )
+        assert _is_sessions_pk_violation(exc) is False
+
+    def test_non_integrity_error_is_not_pk_violation(self):
+        assert _is_sessions_pk_violation(ValueError("nope")) is False
+
+    def test_postgres_shaped_exception_is_pk_violation(self):
+        class _FakeAsyncpgOrigError(Exception):
+            sqlstate = "23505"
+            constraint_name = "sessions_pkey"
+
+        exc = IntegrityError("x", params=None, orig=_FakeAsyncpgOrigError("dup"))
+        assert _is_sessions_pk_violation(exc) is True
+
+    def test_postgres_shaped_exception_wrong_constraint_is_not_pk_violation(self):
+        class _FakeAsyncpgOrigError(Exception):
+            sqlstate = "23505"
+            constraint_name = "some_other_pkey"
+
+        exc = IntegrityError("x", params=None, orig=_FakeAsyncpgOrigError("dup"))
+        assert _is_sessions_pk_violation(exc) is False
+
+
+class TestOwnershipScopingG1toG3:
+    """G1 (owner row intact), G2 (zero LLM calls), G3 (no slot
+    displacement)."""
+
+    @pytest.mark.asyncio
+    async def test_g1_owner_row_intact_structurally(self, colliding_group):
+        """The whole cycle, end to end: B's group never becomes a
+        candidate at all, so A's row cannot be touched and no LLM call
+        is spent on it."""
+        llm_calls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(str(request.url))
+            return httpx.Response(200, json={"choices": []})
+
+        async with colliding_group.get_session_factory()() as db:
+            before = (
+                await db.execute(select(SessionRecord).filter_by(id="shared-sid"))
+            ).scalar_one()
+            before_snapshot = (
+                before.summary,
+                before.key_points,
+                before.date,
+                before.model,
+                before.user_id,
+                before.summarized_at,
+                before.trace_id,
+            )
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        count = await summariser.run_once()
+
+        assert count == 0
+        assert llm_calls == []
+        async with colliding_group.get_session_factory()() as db:
+            after = (
+                await db.execute(select(SessionRecord).filter_by(id="shared-sid"))
+            ).scalar_one()
+            after_snapshot = (
+                after.summary,
+                after.key_points,
+                after.date,
+                after.model,
+                after.user_id,
+                after.summarized_at,
+                after.trace_id,
+            )
+        assert after_snapshot == before_snapshot
+
+    @pytest.mark.asyncio
+    async def test_g1_persist_direct_call_cannot_touch_foreign_row(
+        self, colliding_group
+    ):
+        """R3 in isolation — even if ``_persist`` is reached directly for
+        B's ``EligibleSession`` (as if R2's SQL exclusion had not fired),
+        the owner-scoped loader means it still cannot UPDATE A's row: the
+        write attempts to INSERT its own row under the same id, which
+        collides with A's PK and is swallowed as a foreign-owner race
+        (G5), leaving A's row untouched."""
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        es = EligibleSession(
+            session_id="shared-sid",
+            user_id="user-B",
+            project="P",
+            last_ts=_iso_minutes_ago(40),
+        )
+
+        await summariser._persist(es, {"summary": "B-DIRECT", "key_points": []})
+
+        async with colliding_group.get_session_factory()() as db:
+            rows = (
+                (await db.execute(select(SessionRecord).filter_by(id="shared-sid")))
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 1
+        assert rows[0].summary == "A-ORIGINAL summary"
+        assert rows[0].user_id == "user-A"
+
+    @pytest.mark.asyncio
+    async def test_g2_zero_llm_calls_for_colliding_group_two_cycles(
+        self, colliding_group
+    ):
+        llm_calls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(str(request.url))
+            return httpx.Response(200, json={"choices": []})
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        count1 = await summariser.run_once()
+        count2 = await summariser.run_once()
+
+        assert count1 == 0
+        assert count2 == 0
+        assert llm_calls == []
+
+    @pytest.mark.asyncio
+    async def test_g3_clean_group_not_displaced_by_colliding_group(self, pg_factory):
+        """max_per_cycle=1: the colliding group must never consume the
+        one slot — it is excluded before slot assignment, so the clean
+        session gets summarised instead of being starved.
+
+        B's turn is seeded OLDER than D's (80m vs 50m ago) deliberately:
+        the eligibility ordering is ``(summarized_at IS NULL) DESC,
+        last_ts ASC`` (oldest-idle-first), so if R2(iii)'s exclusion were
+        removed, B's (older, never-summarised) group would win the ONE
+        slot ahead of D's — making the neuter observable. With B and D's
+        ages reversed (B newer than D) the neuter would be invisible here
+        because D would win the slot on age alone regardless of whether B
+        is excluded.
+        """
+        async with pg_factory.get_session_factory()() as db:
+            db.add_all(
+                [
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="a-q",
+                        answer="a-a",
+                        timestamp=_iso_minutes_ago(90),
+                        session_id="shared-sid3",
+                        user_id="user-A",
+                    ),
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="b-q",
+                        answer="b-a",
+                        timestamp=_iso_minutes_ago(80),
+                        session_id="shared-sid3",
+                        user_id="user-B",
+                    ),
+                    SessionRecord(
+                        id="shared-sid3",
+                        project="P",
+                        date=_iso_minutes_ago(85),
+                        summary="A-ORIGINAL",
+                        key_points="[]",
+                        model="m",
+                        user_id="user-A",
+                        summarized_at=datetime.now() - timedelta(minutes=89),
+                    ),
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="d-q",
+                        answer="d-a",
+                        timestamp=_iso_minutes_ago(50),
+                        session_id="clean-sid",
+                        user_id="user-D",
+                    ),
+                ]
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(summarizer_max_per_cycle=1),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(summary="D-NEW"),
+        )
+        count = await summariser.run_once()
+
+        assert count == 1
+        async with pg_factory.get_session_factory()() as db:
+            d_row = (
+                await db.execute(select(SessionRecord).filter_by(id="clean-sid"))
+            ).scalar_one()
+            assert d_row.summary == "D-NEW"
+
+
+class TestOwnershipScopingG4:
+    """G4 — the eligibility→LLM-call race window (R4)."""
+
+    @pytest.mark.asyncio
+    async def test_g4_pre_llm_race_blocks_before_any_llm_call(
+        self, pg_factory, collision_spies
+    ):
+        """A foreign row appears for this id AFTER eligibility (a separate
+        read) but BEFORE the LLM call — ``_summarise_one``'s pre-flight
+        check must catch it without spending an LLM call."""
+        counter, _ = collision_spies
+        async with pg_factory.get_session_factory()() as db:
+            db.add(
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="c-q",
+                    answer="c-a",
+                    timestamp=_iso_minutes_ago(40),
+                    session_id="race-sid",
+                    user_id="user-C",
+                )
+            )
+            db.add(
+                SessionRecord(
+                    id="race-sid",
+                    project="P",
+                    date=_iso_minutes_ago(1),
+                    summary="LATE-FOREIGN",
+                    key_points="[]",
+                    model="m",
+                    user_id="user-LATE",
+                    summarized_at=datetime.now() - timedelta(minutes=1),
+                )
+            )
+            await db.commit()
+
+        llm_calls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(str(request.url))
+            return httpx.Response(200, json={"choices": []})
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        es = EligibleSession(
+            session_id="race-sid",
+            user_id="user-C",
+            project="P",
+            last_ts=_iso_minutes_ago(40),
+        )
+        await summariser._summarise_one(es)
+
+        assert llm_calls == []
+        assert counter.calls == [(1, {"stage": "pre_llm"})]
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="race-sid"))
+            ).scalar_one()
+            assert row.summary == "LATE-FOREIGN"
+
+    @pytest.mark.asyncio
+    async def test_g4_never_summarised_session_is_not_blocked(
+        self, pg_factory, collision_spies
+    ):
+        """Regression guard for the lookup's own ambiguity (R4/F4 fix):
+        a session with NO sessions row at all (the ordinary
+        never-summarised case) must NOT be treated as foreign — only a
+        row that actually EXISTS under a different owner counts."""
+        counter, _ = collision_spies
+        async with pg_factory.get_session_factory()() as db:
+            db.add(
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="f-q",
+                    answer="f-a",
+                    timestamp=_iso_minutes_ago(40),
+                    session_id="fresh-sid",
+                    user_id="user-F",
+                )
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(summary="F-OK"),
+        )
+        count = await summariser.run_once()
+
+        assert count == 1
+        assert counter.calls == []
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="fresh-sid"))
+            ).scalar_one()
+            assert row.summary == "F-OK"
+            assert row.user_id == "user-F"
+
+
+class TestOwnershipScopingG5WriteConflicts:
+    """G5 — the sessions-PK race, classified by current owner (R3/S2/S3)."""
+
+    @pytest.mark.asyncio
+    async def test_g5a_foreign_pk_race_counted_and_warned(
+        self, pg_factory, collision_spies, caplog
+    ):
+        counter, _ = collision_spies
+        async with pg_factory.get_session_factory()() as db:
+            db.add(
+                SessionRecord(
+                    id="race2-sid",
+                    project="P",
+                    date="d",
+                    summary="OTHER-OWNED",
+                    key_points="[]",
+                    model="m",
+                    user_id="user-OTHER",
+                    summarized_at=datetime.now(),
+                )
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        es = EligibleSession(
+            session_id="race2-sid",
+            user_id="user-C",
+            project="P",
+            last_ts=_iso_minutes_ago(40),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await summariser._persist(es, {"summary": "C-ATTEMPT", "key_points": []})
+
+        assert counter.calls == [(1, {"stage": "persist_pk"})]
+        assert "persist race, foreign owner" in caplog.text
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="race2-sid"))
+            ).scalar_one()
+            assert row.summary == "OTHER-OWNED"
+
+    @pytest.mark.asyncio
+    async def test_g5b_non_pk_integrity_error_escapes(
+        self, seed_session_turns, monkeypatch, collision_spies
+    ):
+        """Only the ``sessions`` PK violation is swallowed. A NOT NULL
+        violation (or any other integrity error) must propagate so it
+        surfaces via ``run_once``'s own per-session ``logger.exception``
+        instead of being silently miscounted as an ownership race."""
+        counter, _ = collision_spies
+
+        class _FakeNotNullOrigError(Exception):
+            pass
+
+        async def _raise_not_null(self, *a, **kw):
+            raise IntegrityError(
+                "NOT NULL constraint failed: sessions.summary",
+                params=None,
+                orig=_FakeNotNullOrigError(
+                    "NOT NULL constraint failed: sessions.summary"
+                ),
+            )
+
+        monkeypatch.setattr(AsyncSession, "commit", _raise_not_null)
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=seed_session_turns.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        count = await summariser.run_once()
+
+        # The attempt failed and was logged by run_once's own per-session
+        # try/except — it must NOT be swallowed/counted as a race.
+        assert count == 0
+        assert counter.calls == []
+        async with seed_session_turns.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="sess-idle"))
+            ).scalar_one_or_none()
+            assert row is None
+
+    @pytest.mark.asyncio
+    async def test_g5c_same_owner_pk_race_logs_info_no_count(
+        self, pg_factory, collision_spies, caplog, monkeypatch
+    ):
+        """A replica that committed the SAME owner's row between this
+        call's (simulated-stale) lookup and its INSERT must be an INFO,
+        uncounted no-op — not a security event."""
+        counter, _ = collision_spies
+        async with pg_factory.get_session_factory()() as db:
+            db.add(
+                SessionRecord(
+                    id="replica-sid",
+                    project="P",
+                    date="d",
+                    summary="REPLICA-WON",
+                    key_points="[]",
+                    model="m",
+                    user_id="user-D",
+                    summarized_at=datetime.now(),
+                )
+            )
+            await db.commit()
+
+        # Simulate the race window: the loader's read happened BEFORE the
+        # replica's row landed, so it (falsely, for this one call) saw no
+        # existing row.
+        monkeypatch.setattr(ss_mod, "_load_own_row", AsyncMock(return_value=None))
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        es = EligibleSession(
+            session_id="replica-sid",
+            user_id="user-D",
+            project="P",
+            last_ts=_iso_minutes_ago(40),
+        )
+
+        with caplog.at_level(logging.INFO):
+            await summariser._persist(es, {"summary": "D-LATE", "key_points": []})
+
+        assert counter.calls == []
+        assert "persist race, same-owner replica" in caplog.text
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="replica-sid"))
+            ).scalar_one()
+            assert row.summary == "REPLICA-WON"
+
+
+class TestOwnershipScopingG6:
+    """G6 — a legacy NULL-owner sessions row is never adopted (R1/R2(iii))."""
+
+    @pytest.mark.asyncio
+    async def test_g6_null_owner_row_never_adopted(self, pg_factory, collision_spies):
+        counter, gauge = collision_spies
+        async with pg_factory.get_session_factory()() as db:
+            db.add_all(
+                [
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="e-q",
+                        answer="e-a",
+                        timestamp=_iso_minutes_ago(40),
+                        session_id="legacy-sid",
+                        user_id="user-E",
+                    ),
+                    SessionRecord(
+                        id="legacy-sid",
+                        project="P",
+                        date=_iso_minutes_ago(100),
+                        summary="LEGACY-NULL-OWNER",
+                        key_points="[]",
+                        model="m",
+                        user_id=None,
+                        summarized_at=datetime.now() - timedelta(minutes=200),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        llm_calls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(str(request.url))
+            return httpx.Response(200, json={"choices": []})
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        count = await summariser.run_once()
+
+        assert count == 0
+        assert llm_calls == []
+        assert counter.calls == [(1, {"stage": "eligibility"})]
+        assert gauge.values[-1] == (1, {})
+        async with pg_factory.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="legacy-sid"))
+            ).scalar_one()
+            assert row.summary == "LEGACY-NULL-OWNER"
+            assert row.user_id is None
+
+
+class TestOwnershipScopingG7Metrics:
+    """G7a–e — the first-sighting counter, the per-cycle gauge, the
+    once-only WARNING, the per-stage event points, and the restart
+    re-count (R5′, ADDENDUM A1 §3)."""
+
+    @pytest.mark.asyncio
+    async def test_g7a_first_sighting_counter_counts_once_across_cycles(
+        self, colliding_group, collision_spies
+    ):
+        counter, _ = collision_spies
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        for _ in range(3):
+            await summariser.run_once()
+
+        eligibility_adds = [
+            c for c in counter.calls if c[1].get("stage") == "eligibility"
+        ]
+        assert eligibility_adds == [(1, {"stage": "eligibility"})]
+
+    @pytest.mark.asyncio
+    async def test_g7b_gauge_tracks_excluded_groups_per_cycle(
+        self, colliding_group, collision_spies
+    ):
+        _, gauge = collision_spies
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        for _ in range(3):
+            await summariser.run_once()
+        assert [v for v, _ in gauge.values] == [1, 1, 1]
+
+        async with colliding_group.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="shared-sid"))
+            ).scalar_one()
+            await db.delete(row)
+            await db.commit()
+        await summariser.run_once()
+        assert gauge.values[-1] == (0, {})
+
+    @pytest.mark.asyncio
+    async def test_g7c_warning_logged_once_not_per_cycle(self, colliding_group, caplog):
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                await summariser.run_once()
+
+        collision_warnings = [
+            r
+            for r in caplog.records
+            if "ownership collision" in r.getMessage()
+            and "shared-sid" in r.getMessage()
+        ]
+        assert len(collision_warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_g7e_restart_re_counts_once_then_silent(
+        self, colliding_group, collision_spies
+    ):
+        """A fresh ``SessionSummarizer`` instance (the restart shape) has
+        its OWN seen-set, so it re-counts a still-standing collision
+        exactly once, then goes silent again — the seen-set must be
+        per-instance, never module-global."""
+        counter, _ = collision_spies
+
+        def _eligibility_count() -> int:
+            return len([c for c in counter.calls if c[1].get("stage") == "eligibility"])
+
+        s1 = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        await s1.run_once()
+        assert _eligibility_count() == 1
+
+        s2 = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        await s2.run_once()
+        assert _eligibility_count() == 2  # the restart's one re-count
+
+        await s2.run_once()
+        assert _eligibility_count() == 2  # silent again
+
+
+class TestOwnershipScopingG8StructuralInvariants:
+    """G8 — one predicate, three readers; the loader consolidation."""
+
+    @staticmethod
+    def _source() -> str:
+        return inspect.getsource(ss_mod)
+
+    def test_g8_is_foreign_owner_has_exactly_three_call_sites(self):
+        """``_is_foreign_owner`` is the ONE place the ownership rule is
+        written in Python; it must be called from exactly the three
+        sites R1/G8 name: the eligibility collision pass, the pre-LLM
+        check, and the persist-PK-conflict handler. A fourth call site
+        (or a comparison inlined elsewhere instead of calling it) is the
+        exact drift this guard exists to catch."""
+        src = self._source()
+        calls = re.findall(r"(?<!def )_is_foreign_owner\(", src)
+        assert len(calls) == 3
+
+    def test_g8_select_sessionrecord_confined_to_the_two_loaders(self):
+        """Every raw ``select(SessionRecord`` in the module must live
+        inside ``_load_own_row`` or ``_owner_of`` — the two sanctioned,
+        owner-aware readers. A third site would bypass R3's loader
+        consolidation."""
+        src = self._source()
+        sites = [m.start() for m in re.finditer(r"select\(SessionRecord", src)]
+        assert len(sites) == 2
+
+
+class TestOwnershipScopingG9:
+    """G9 — a user's own group is still re-summarised after a new turn,
+    even when a FOREIGN collision for the same id also exists (R2(ii)'s
+    scoped join).
+
+    **Build-record finding, not a deviation from the fix:** R2(ii)'s join
+    condition (``AND s.user_id = sub.user_id``) is NOT independently
+    single-kill-provable once R2(iii)'s ``NOT EXISTS`` exclusion is in
+    place — verified empirically. ``sessions.id`` is the table's sole
+    PRIMARY KEY, so at most one row can exist per id; whenever R2(iii)
+    has not already excluded a group, that group's owner is, by
+    construction, either absent or the one existing row's owner — so an
+    id-only join and an id+owner-scoped join resolve to the identical
+    row either way. Reverting R2(ii) ALONE left this test GREEN (the
+    neuter was silently absorbed by R2(iii)). Reverting R2(ii) AND
+    R2(iii) TOGETHER (the literal pre-fix query shape) turns it RED via
+    ``count`` going from 1 to 2 — B's structurally-foreign group becomes
+    a candidate again, is attempted (and correctly blocked by R4 at the
+    pre-LLM check), but still counts as an attempted session in
+    ``run_once``'s return (F10's established semantics). R2(ii) is kept
+    in the code as defence-in-depth / self-documentation (it states
+    explicitly, at the SQL level, "this row must belong to this group"),
+    not because it is load-bearing on its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_g9_owners_own_group_still_summarised_after_new_turn(
+        self, colliding_group
+    ):
+        async with colliding_group.get_session_factory()() as db:
+            db.add(
+                InteractionRecord(
+                    project="P",
+                    source="chat",
+                    question="a-q2",
+                    answer="a-a2",
+                    timestamp=_iso_minutes_ago(20),
+                    session_id="shared-sid",
+                    user_id="user-A",
+                )
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(summary="A-REFRESHED"),
+        )
+        count = await summariser.run_once()
+
+        assert count == 1
+        async with colliding_group.get_session_factory()() as db:
+            row = (
+                await db.execute(select(SessionRecord).filter_by(id="shared-sid"))
+            ).scalar_one()
+            assert row.summary == "A-REFRESHED"
+            assert row.user_id == "user-A"
+
+
+class TestOwnershipScopingG10DiffPin:
+    """G10 — the fleet contract. Not a behavioural test: a build-record
+    field, pinned here so CI itself also fails if the invariant breaks."""
+
+    def test_g10_chat_py_untouched_since_v1_29_3(self):
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--quiet",
+                "v1.29.3",
+                "HEAD",
+                "--",
+                "src/audittrace/routes/chat.py",
+            ],
+            cwd=Path(__file__).resolve().parent.parent,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            "routes/chat.py changed since v1.29.3 — out of scope for the "
+            "v1.29.5 summariser ownership-scoping fix"
+        )
