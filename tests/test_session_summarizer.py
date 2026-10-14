@@ -92,10 +92,10 @@ def _mock_summariser_client(
 # these into the top-of-file block would make ruff's import-sort check
 # want to reorder/re-wrap the EXISTING lines there, which would show as
 # removed lines in a diff whose production-side intent is additions-only.
+import ast  # noqa: E402
 import inspect  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
@@ -1831,6 +1831,53 @@ class TestOwnershipScopingG1toG3:
             assert d_row.summary == "D-NEW"
 
 
+class TestOwnershipScopingG1SentinelWriter:
+    """F1 — R3's owner-scoped loader is shared by BOTH writers
+    (``_persist`` and ``_persist_sentinel_overflow``); this class proves
+    the SENTINEL writer's half directly, which previously had no
+    behavioural guard at all (G8's old regex-count check asserted
+    nothing about *where* the ``select(SessionRecord...)`` sites were,
+    so reverting just this one writer to the base, id-only shape left
+    every existing test green)."""
+
+    @pytest.mark.asyncio
+    async def test_g1_sentinel_writer_direct_call_cannot_touch_foreign_row(
+        self, colliding_group
+    ):
+        """A direct call to ``_persist_sentinel_overflow`` for B, against
+        an id A already owns, must never touch A's row. On the current
+        (owner-scoped) code this raises — the owner-scoped loader finds
+        no row for (id, B), so the writer attempts an INSERT that
+        collides with A's existing PK; ``_persist_sentinel_overflow``'s
+        own exception handling is unchanged (deliberately, per the
+        build record) and lets that propagate rather than silently
+        falling through to an UPDATE of a row it does not own."""
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=colliding_group.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        es = EligibleSession(
+            session_id="shared-sid",
+            user_id="user-B",
+            project="P",
+            last_ts=_iso_minutes_ago(40),
+        )
+
+        with pytest.raises(Exception):
+            await summariser._persist_sentinel_overflow(es, turn_count=5, trace_id=None)
+
+        async with colliding_group.get_session_factory()() as db:
+            rows = (
+                (await db.execute(select(SessionRecord).filter_by(id="shared-sid")))
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 1
+        assert rows[0].summary == "A-ORIGINAL summary"
+        assert rows[0].user_id == "user-A"
+
+
 class TestOwnershipScopingG4:
     """G4 — the eligibility→LLM-call race window (R4)."""
 
@@ -2131,6 +2178,49 @@ class TestOwnershipScopingG6:
             assert row.user_id is None
 
 
+class TestMetricNamesPinned:
+    """F3 — the counter/gauge NAMES are the artefact AC5's alert queries
+    and the K2/R5' dashboards actually read by name
+    (``audittrace_summariser_session_collisions_total`` /
+    ``_current``). The spy doubles used throughout the G7 tests above
+    assert CALL SEMANTICS (when, how often, with what ``stage``
+    attribute) — they say nothing about whether the instrument's own
+    NAME matches what the alert query names, because the spy fixture
+    (``collision_spies``) replaces the real instrument wholesale:
+    renaming either real instrument left every spy-based test green.
+
+    This reads the REAL, as-shipped module-level instrument objects
+    directly (not a spy, not a duplicate instrument) via the attributes
+    the OTel SDK itself stores the name/description under. Deliberately
+    NOT a real ``InMemoryMetricReader``/``MeterProvider`` (see the build
+    record: ``metrics.set_meter_provider`` is a process-global, set-once
+    singleton that would permanently affect every other test file in
+    the same ``make test`` run) — reading the instrument's own stored
+    name is the narrower, safer equivalent the independent review
+    accepted as sufficient for this specific gap.
+    """
+
+    def test_collision_counter_name_matches_the_ac5_alert_query(self):
+        assert ss_mod._session_collisions_counter._name == (
+            "audittrace.summariser.session_collisions"
+        )
+        # OTel's Prometheus exporter convention: dots -> underscores,
+        # "_total" appended for counters. This is the literal name
+        # R5'(c)'s alert query reads:
+        # increase(audittrace_summariser_session_collisions_total{stage="eligibility"}[15m]) > 0
+        prom_name = (
+            ss_mod._session_collisions_counter._name.replace(".", "_") + "_total"
+        )
+        assert prom_name == "audittrace_summariser_session_collisions_total"
+
+    def test_collision_gauge_name_matches_the_ac5_alert_query(self):
+        assert ss_mod._session_collisions_gauge._name == (
+            "audittrace.summariser.session_collisions_current"
+        )
+        prom_name = ss_mod._session_collisions_gauge._name.replace(".", "_")
+        assert prom_name == "audittrace_summariser_session_collisions_current"
+
+
 class TestOwnershipScopingG7Metrics:
     """G7a–e — the first-sighting counter, the per-cycle gauge, the
     once-only WARNING, the per-stage event points, and the restart
@@ -2179,6 +2269,14 @@ class TestOwnershipScopingG7Metrics:
 
     @pytest.mark.asyncio
     async def test_g7c_warning_logged_once_not_per_cycle(self, colliding_group, caplog):
+        """F2 (ADDENDUM A1 §3 G7c / §8 A2): the single WARNING must carry
+        ``repr(session_id)``, not ``str()`` — ``X-Session-Id`` is an
+        unvalidated caller string. Checking only a bare substring of the
+        id (``"shared-sid" in message``) is vacuous: that substring is
+        present whether the format spec is ``%r`` (which also adds the
+        surrounding quotes) or ``%s`` (which does not) — an independent
+        review's neuter of ``%r`` → ``%s`` stayed GREEN under the old
+        assertion. Checking for the QUOTED form closes that gap."""
         summariser = SessionSummarizer(
             settings=_settings(),
             session_factory=colliding_group.get_session_factory(),
@@ -2192,9 +2290,76 @@ class TestOwnershipScopingG7Metrics:
             r
             for r in caplog.records
             if "ownership collision" in r.getMessage()
-            and "shared-sid" in r.getMessage()
+            and repr("shared-sid") in r.getMessage()
         ]
         assert len(collision_warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_g7c_warning_carries_repr_not_str_on_a_control_character(
+        self, pg_factory, caplog
+    ):
+        """F2, stronger form: a session id containing a newline makes
+        ``%r`` vs ``%s`` unmistakably different (``%r`` escapes it to the
+        two characters ``\\n``; ``%s`` inserts a literal newline, splitting
+        the log line). This closes the residual gap a quote-only check
+        would still have against a hand-rolled ``f"session='{sid}'"``
+        that never actually calls ``repr``."""
+        weird_id = "weird\nsid"
+        async with pg_factory.get_session_factory()() as db:
+            db.add_all(
+                [
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="a-q",
+                        answer="a-a",
+                        timestamp=_iso_minutes_ago(90),
+                        session_id=weird_id,
+                        user_id="user-A",
+                    ),
+                    InteractionRecord(
+                        project="P",
+                        source="chat",
+                        question="b-q",
+                        answer="b-a",
+                        timestamp=_iso_minutes_ago(40),
+                        session_id=weird_id,
+                        user_id="user-B",
+                    ),
+                    SessionRecord(
+                        id=weird_id,
+                        project="P",
+                        date=_iso_minutes_ago(85),
+                        summary="A-ORIGINAL summary",
+                        key_points="[]",
+                        model="m",
+                        user_id="user-A",
+                        summarized_at=datetime.now() - timedelta(minutes=89),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        summariser = SessionSummarizer(
+            settings=_settings(),
+            session_factory=pg_factory.get_session_factory(),
+            http_client=_mock_summariser_client(),
+        )
+        with caplog.at_level(logging.WARNING):
+            await summariser.run_once()
+
+        # Scoped to the specific collision WARNING record, not the whole
+        # `caplog.text` buffer: aiosqlite's own DEBUG logging of bind
+        # parameters (SQLAlchemy echoes the INSERT with its parameter
+        # tuple, whose repr naturally contains repr(weird_id) too) made
+        # a whole-buffer check pass even when the production log line
+        # itself used %s — caught by hand-tracing this exact test before
+        # trusting its own RED/GREEN cycle.
+        collision_warnings = [
+            r for r in caplog.records if "ownership collision" in r.getMessage()
+        ]
+        assert len(collision_warnings) == 1
+        assert repr(weird_id) in collision_warnings[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_g7e_restart_re_counts_once_then_silent(
@@ -2229,6 +2394,67 @@ class TestOwnershipScopingG7Metrics:
         assert _eligibility_count() == 2  # silent again
 
 
+def _references_session_record(node: ast.expr) -> bool:
+    """True if ``node`` is ``SessionRecord`` itself or an attribute
+    access rooted at it (``SessionRecord.id``, ``SessionRecord.user_id``,
+    …) — recognised regardless of how the surrounding call is
+    line-wrapped or whitespace-formatted."""
+    if isinstance(node, ast.Name):
+        return node.id == "SessionRecord"
+    if isinstance(node, ast.Attribute):
+        return _references_session_record(node.value)
+    return False
+
+
+def _select_sessionrecord_call_sites(tree: ast.AST) -> list[tuple[int, str | None]]:
+    """Return ``(lineno, enclosing_function_name)`` for every
+    ``select(...)`` call in ``tree`` whose first positional argument
+    references ``SessionRecord``.
+
+    AST-based, not a text regex over the raw source: a regex counting
+    occurrences of the substring ``"select(SessionRecord"`` can be
+    defeated purely by reformatting — moving a column-select's
+    arguments onto their own line changes the literal text without
+    changing what the code does. The AST sees through that: a `Call`
+    node's structure (and its position inside the enclosing
+    `FunctionDef`/`AsyncFunctionDef`) is identical either way.
+    """
+    sites: list[tuple[int, str | None]] = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self._function_stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._descend(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._descend(node)
+
+        def _descend(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self._function_stack.append(node.name)
+            self.generic_visit(node)
+            self._function_stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "select"
+                and node.args
+                and _references_session_record(node.args[0])
+            ):
+                sites.append(
+                    (
+                        node.lineno,
+                        self._function_stack[-1] if self._function_stack else None,
+                    )
+                )
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return sites
+
+
 class TestOwnershipScopingG8StructuralInvariants:
     """G8 — one predicate, three readers; the loader consolidation."""
 
@@ -2248,13 +2474,58 @@ class TestOwnershipScopingG8StructuralInvariants:
         assert len(calls) == 3
 
     def test_g8_select_sessionrecord_confined_to_the_two_loaders(self):
-        """Every raw ``select(SessionRecord`` in the module must live
-        inside ``_load_own_row`` or ``_owner_of`` — the two sanctioned,
-        owner-aware readers. A third site would bypass R3's loader
-        consolidation."""
-        src = self._source()
-        sites = [m.start() for m in re.finditer(r"select\(SessionRecord", src)]
-        assert len(sites) == 2
+        """F1 — AST-based, not a text-count regex. Every
+        ``select(SessionRecord...)`` call site, wherever it is lexically
+        written, must resolve to living inside ``_load_own_row`` or
+        ``_owner_of`` — the two sanctioned, owner-aware readers. An
+        independent review's neuter reverted the sentinel writer
+        (``_persist_sentinel_overflow``) to its own raw, id-only
+        ``select(SessionRecord).filter(SessionRecord.id == es.session_id)``
+        call while simultaneously reflowing ``_owner_of``'s own call
+        across a line break — the OLD regex-count assertion (``==2``)
+        stayed GREEN throughout, because the text substring
+        ``"select(SessionRecord"`` still matched twice. This AST form is
+        immune to that: it resolves each call to its ENCLOSING function
+        regardless of formatting, so a third site anywhere is caught no
+        matter how it is written."""
+        tree = ast.parse(self._source())
+        sites = _select_sessionrecord_call_sites(tree)
+        assert sites, "the detector found zero sites — it cannot have fired"
+        offenders = [
+            (lineno, fn)
+            for lineno, fn in sites
+            if fn not in ("_load_own_row", "_owner_of")
+        ]
+        assert not offenders, (
+            "select(SessionRecord...) call site(s) outside the two "
+            f"sanctioned loaders: {offenders}"
+        )
+
+    def test_g8_detector_flags_a_synthetic_offending_site(self):
+        """The detector must be able to fail, or it is decoration."""
+        synthetic = (
+            "async def _rogue(db, es):\n"
+            "    return (await db.execute(\n"
+            "        select(SessionRecord).filter(SessionRecord.id == es.session_id)\n"
+            "    )).scalar_one_or_none()\n"
+        )
+        sites = _select_sessionrecord_call_sites(ast.parse(synthetic))
+        assert sites and all(fn == "_rogue" for _, fn in sites)
+
+    def test_g8_detector_is_immune_to_line_wrapping(self):
+        """The exact adversarial case an independent review found: a
+        column-select's arguments wrapped across a line break must not
+        change where the AST says the call lives."""
+        wrapped = (
+            "async def _owner_of(db, session_id):\n"
+            "    row = (await db.execute(\n"
+            "        select(\n"
+            "            SessionRecord.id, SessionRecord.user_id\n"
+            "        ).filter(SessionRecord.id == session_id)\n"
+            "    )).first()\n"
+        )
+        sites = _select_sessionrecord_call_sites(ast.parse(wrapped))
+        assert sites and all(fn == "_owner_of" for _, fn in sites)
 
 
 class TestOwnershipScopingG9:
@@ -2286,6 +2557,18 @@ class TestOwnershipScopingG9:
     async def test_g9_owners_own_group_still_summarised_after_new_turn(
         self, colliding_group
     ):
+        """F4 — asserts the LLM call COUNT and the TRANSCRIPT CONTENT
+        directly, never ``run_once``'s return value. The spec's own G9
+        wording requires "1 LLM call, transcript contains only A's
+        turns" — the prior assertion (``count == 1``) reads
+        ``run_once``'s attempt-counter (F10/R6: it counts every attempt,
+        including skips, and is NOT a proxy for "exactly one group was
+        summarised using only its own content"). An independent review
+        found that removing ``_fetch_turns``' ``user_id`` filter — which
+        would feed B's turns into A's refreshed summary, the cross-user
+        CONTENT leak in the other direction from the one this WU closes
+        — stayed green under the old assertion because ``count`` does
+        not change shape either way."""
         async with colliding_group.get_session_factory()() as db:
             db.add(
                 InteractionRecord(
@@ -2300,14 +2583,53 @@ class TestOwnershipScopingG9:
             )
             await db.commit()
 
+        llm_requests: list[dict] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            # Route by path: only /chat/completions is "the LLM call" this
+            # test counts. /props and /tokenize are the ctx-guard's own
+            # preflight traffic (_resolve_ctx_tokens / _safe_count_tokens)
+            # and must not be mistaken for it — an earlier draft of this
+            # test did not branch on path and miscounted (captured the
+            # /tokenize calls' bodies too, since those also decode as
+            # JSON, while the path-less handler's generic response body
+            # made /props's GET silently fail-soft through the existing
+            # fallback instead of raising).
+            if request.url.path.endswith("/tokenize"):
+                return httpx.Response(200, json={"tokens": [1, 2, 3]})
+            if request.url.path.endswith("/props"):
+                return httpx.Response(200, json={})
+            llm_requests.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {"summary": "A-REFRESHED", "key_points": []}
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+            )
+
         summariser = SessionSummarizer(
             settings=_settings(),
             session_factory=colliding_group.get_session_factory(),
-            http_client=_mock_summariser_client(summary="A-REFRESHED"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
         )
-        count = await summariser.run_once()
+        await summariser.run_once()
 
-        assert count == 1
+        assert len(llm_requests) == 1
+        transcript = llm_requests[0]["messages"][1]["content"]
+        assert "a-q" in transcript and "a-a" in transcript
+        assert "a-q2" in transcript and "a-a2" in transcript
+        assert "b-q" not in transcript and "b-a" not in transcript
+
         async with colliding_group.get_session_factory()() as db:
             row = (
                 await db.execute(select(SessionRecord).filter_by(id="shared-sid"))
@@ -2316,27 +2638,14 @@ class TestOwnershipScopingG9:
             assert row.user_id == "user-A"
 
 
-class TestOwnershipScopingG10DiffPin:
-    """G10 — the fleet contract. Not a behavioural test: a build-record
-    field, pinned here so CI itself also fails if the invariant breaks."""
-
-    def test_g10_chat_py_untouched_since_v1_29_3(self):
-        import subprocess
-
-        result = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--quiet",
-                "v1.29.3",
-                "HEAD",
-                "--",
-                "src/audittrace/routes/chat.py",
-            ],
-            cwd=Path(__file__).resolve().parent.parent,
-            check=False,
-        )
-        assert result.returncode == 0, (
-            "routes/chat.py changed since v1.29.3 — out of scope for the "
-            "v1.29.5 summariser ownership-scoping fix"
-        )
+# F5 — G10 (the chat.py frozen-file pin) is deliberately NOT a permanent
+# suite test. The spec calls it "a build-record field" (not a test), and
+# an independent review found the prior permanent test
+# (`git diff --quiet v1.29.3 HEAD -- src/audittrace/routes/chat.py`)
+# would break the moment EITHER this branch OR any other in-flight branch
+# that legitimately touches chat.py (e.g. M3 WU-4's
+# `fix/llama-endpoint-isolation-locks`) merges after the other — a false
+# failure unrelated to this fix regressing. The frozen-file claim is
+# recorded instead in the build record / PR body as a one-time diff
+# check against the commit this WU actually lands on, which is the
+# correct scope for a build-time invariant, not a standing CI gate.

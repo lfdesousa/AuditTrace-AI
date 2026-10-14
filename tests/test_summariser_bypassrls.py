@@ -222,6 +222,27 @@ def _drop_schema(schema: str) -> None:
     admin.dispose()
 
 
+def _drop_roles() -> None:
+    """F8 / A1 §2 — the throwaway role is "dropped at teardown". The
+    schema itself was already dropped (``_drop_schema``, above); this
+    drops the two roles themselves so neither ``summariser_wu_bypass``
+    (BYPASSRLS) nor ``summariser_wu_nobypass`` persists on any
+    non-ephemeral ``AUDITTRACE_TEST_POSTGRES_URL`` target. Called after
+    the schema is gone and every engine using these roles has been
+    disposed (the ``schema`` fixture's dependents — ``bypass_factory``/
+    ``nobypass_factory`` — tear down before ``schema`` itself, per
+    pytest's fixture-teardown ordering), so no connection holds
+    ``SET ROLE`` to either name when this runs. ``DROP ROLE IF EXISTS``
+    is idempotent — safe even if a concurrent test run already dropped
+    it, and safe to re-create on the next test's ``_build_schema()``."""
+    assert _ADMIN_URL is not None
+    admin = create_engine(_ADMIN_URL, pool_pre_ping=True)
+    with admin.begin() as conn:
+        for role in (_BYPASS_ROLE, _NOBYPASS_ROLE):
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+    admin.dispose()
+
+
 def _role_session_factory(
     schema: str, role: str
 ) -> tuple[async_sessionmaker[Any], Any]:
@@ -253,6 +274,7 @@ async def schema() -> Any:
         yield name
     finally:
         _drop_schema(name)
+        _drop_roles()
 
 
 @pytest_asyncio.fixture
