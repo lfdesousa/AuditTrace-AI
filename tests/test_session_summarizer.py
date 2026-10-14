@@ -2559,16 +2559,15 @@ class TestOwnershipScopingG9:
     ):
         """F4 — asserts the LLM call COUNT and the TRANSCRIPT CONTENT
         directly, never ``run_once``'s return value. The spec's own G9
-        wording requires "1 LLM call, transcript contains only A's
-        turns" — the prior assertion (``count == 1``) reads
+        wording requires "1 LLM call, transcript contains only the
+        owner's own turns" — the prior assertion (``count == 1``) reads
         ``run_once``'s attempt-counter (F10/R6: it counts every attempt,
         including skips, and is NOT a proxy for "exactly one group was
         summarised using only its own content"). An independent review
-        found that removing ``_fetch_turns``' ``user_id`` filter — which
-        would feed B's turns into A's refreshed summary, the cross-user
-        CONTENT leak in the other direction from the one this WU closes
-        — stayed green under the old assertion because ``count`` does
-        not change shape either way."""
+        found that removing ``_fetch_turns``'s ``user_id`` filter stayed
+        green under the old assertion, because ``count`` does not change
+        shape either way; the rewritten assertion reads the transcript
+        content directly instead, so that specific change is caught."""
         async with colliding_group.get_session_factory()() as db:
             db.add(
                 InteractionRecord(

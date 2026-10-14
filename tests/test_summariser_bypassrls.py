@@ -31,10 +31,11 @@ synchronous style, which the spike confirmed: a session opened through the
 resulting factory reports ``current_user = <bypass role>`` and
 ``rolbypassrls = true``.
 
-(i) The PRE-FIX control is a TEST-FILE-ONLY copy of the exact shape
-``8dd98d2`` shipped (an ``id``-only lookup, upsert in place) — never
-production code, used only to prove AC4 is non-vacuous (K1's requirement
-that the pre-fix control reproduces the unscoped write, or AC4 "is not met").
+(i) The PRE-FIX control is a TEST-FILE-ONLY copy of an id-only
+lookup/upsert shape — never production code, used only to prove AC4 is
+non-vacuous (K1's requirement: the control must produce a non-owner
+write under this role, else the harness is not discriminating and AC4
+"is not met").
 (ii) The FIX itself is exercised through the REAL
 ``audittrace.services.session_summarizer`` module, driven exactly like the
 SQLite suite, with the session factory swapped for the real-Postgres
@@ -421,12 +422,11 @@ async def _assert_rolbypassrls(factory: Any, *, expected: bool) -> None:
 async def _pre_fix_unscoped_persist(
     factory: Any, *, session_id: str, user_id: str, summary: str
 ) -> None:
-    """TEST-FILE-ONLY copy of the EXACT shape ``8dd98d2`` shipped before
-    this WU: lookup by ``id`` alone, update in place. NOT production code
-    — exists only to prove AC4's non-vacuity (K1): the pre-fix control
-    MUST write across ownership into A's row under the BYPASSRLS role, or
-    this harness has
-    not reproduced the defect and AC4 is not met."""
+    """TEST-FILE-ONLY copy of an id-only lookup/upsert shape: lookup by
+    ``id`` alone, update in place. NOT production code — exists only to
+    prove AC4's non-vacuity (K1): under the BYPASSRLS role, this control
+    MUST produce a non-owner write into the existing row, or this
+    harness is not discriminating and AC4 is not met."""
     async with factory() as db:
         await db.execute(
             text("SELECT set_config('app.current_user_id', :uid, true)"),
@@ -478,13 +478,13 @@ class TestAC4RealPostgresBypassRls:
         await _assert_rolbypassrls(nobypass_factory, expected=False)
 
     @pytest.mark.asyncio
-    async def test_i_pre_fix_control_writes_across_ownership(
+    async def test_i_pre_fix_control_produces_a_non_owner_write(
         self, schema, bypass_factory
     ):
-        """K1 non-vacuity: the OLD (8dd98d2) id-only shape, run under the
-        BYPASSRLS role, MUST write across ownership into A's row —
-        otherwise this harness
-        has not reproduced the defect and AC4 is not met."""
+        """K1 non-vacuity: the id-only lookup/upsert control, run under
+        the BYPASSRLS role, MUST produce a non-owner write into the
+        existing row — otherwise this harness is not discriminating and
+        AC4 is not met."""
         await _seed_collision(schema)
 
         await _pre_fix_unscoped_persist(
@@ -503,9 +503,8 @@ class TestAC4RealPostgresBypassRls:
                 )
             ).one()
         assert row[0] == "B-SHAPE", (
-            "AC4 NOT MET: the pre-fix control did not write across "
-            "ownership into A's row — "
-            "this harness has not reproduced the defect"
+            "AC4 NOT MET: the pre-fix control did not produce a "
+            "non-owner write — this harness is not discriminating"
         )
         assert (
             row[1] == _OWNER_A
