@@ -26,6 +26,7 @@ import contextvars
 import json
 import random
 import string
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -382,6 +383,19 @@ def _non_ascii_user_context() -> UserContext:
     )
 
 
+def _unallowlisted_object(class_name: str) -> Any:
+    """A bare, non-allowlisted instance that falls all the way through
+    to the FINAL ``rendered_fallback`` branch in ``_render_value_inner``
+    (not a dataclass, not a pydantic model, not an ORM row, not past the
+    depth cap) — RE-REVIEW 2026-10-14 R2: the corpus previously had NO
+    row reaching that branch at all, which is why N31 (fallback charge
+    +20) and N34 (fallback ``ensure_ascii=True``) stayed GREEN. PEP 3131
+    allows non-ASCII identifiers, so a non-ASCII class name is a real,
+    constructible Python shape, not a hypothetical."""
+    cls = type(class_name, (), {})
+    return cls()
+
+
 def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
     """A5 corpus (ratified ADDENDUM A1 §2/§10) — JSON escapes, non-ASCII
     (incl. CJK), non-str keys (UUID/tuple/int), safe scalars
@@ -393,8 +407,11 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
     non-ASCII content flowing through the UserContext/Request
     projections or the safe-scalar (Enum/Path) branches, and NO actual
     ``list`` literal (the ``isinstance(shape, list)`` arm below was dead
-    code) — exactly why the ``ensure_ascii`` over-count (B1) and the
-    list-item over-count (N08) both shipped undetected. Added: a
+    code) — exactly why the ``ensure_ascii`` over-count (B1) shipped
+    undetected, and why a GENUINE list-item over-count (N08 — an
+    increase over the ratified "+2", not the "+2" itself: see RE-REVIEW
+    2026-10-14 R4, which retracted fix round 1's claim that the ratified
+    charge double-counted) would also have shipped undetected. Added: a
     non-ASCII Enum, a non-ASCII Path, a non-ASCII Request, a non-ASCII
     UserContext, and genuine list-of-string shapes, several wrapped in a
     2-element ``[special, "tail-item"]`` container (the exact shape that
@@ -412,6 +429,8 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
     non_ascii_path = _non_ascii_path()
     non_ascii_request = _non_ascii_request()
     non_ascii_user_context = _non_ascii_user_context()
+    ascii_fallback_obj = _unallowlisted_object("PlainUnlistedObject")
+    non_ascii_fallback_obj = _unallowlisted_object("Clé_日本語_Üñlïstéd")
 
     rng = random.Random(seed)
     pool: list[Any] = [
@@ -429,10 +448,14 @@ def _random_corpus(seed: int = 20261012, n: int = 300) -> list[Any]:
         non_ascii_path,
         non_ascii_request,
         non_ascii_user_context,
+        ascii_fallback_obj,
+        non_ascii_fallback_obj,
         [non_ascii_enum, "tail-item"],
         [non_ascii_path, "tail-item"],
         [non_ascii_request, "tail-item"],
         [non_ascii_user_context, "tail-item"],
+        [ascii_fallback_obj, "tail-item"],
+        [non_ascii_fallback_obj, "tail-item"],
         ["a", "b", "c", "d", "e"],
         ["x" * 30, "y" * 30, "z" * 30],
         b"some raw bytes" * 5,
@@ -775,25 +798,17 @@ def test_g_p2e_neuter_raw_key_emitted_leaks_secret(monkeypatch):
 # ═══════════════════════════ G-P2d — truncation marker ═════════════════════
 
 
-def test_g_p2d_suffix_fires_on_stopped_early():
-    """``["a"*30, "b"*30, "c"*30]`` at ``limit=32`` stops after the FIRST
-    item (the list-item charge is now the exact comma-only cost, fix
-    round B1/N08 — see the list-branch comment in ``logging_config.py``)
-    and the suffix fires via ``stopped_early`` — confirmed independently
-    of ``len(text) > limit`` by checking the budget directly, not just
-    the final string, since the corrected (tight, non-overcounting)
-    charge model makes ``len(text) > limit`` also true at every
-    ``stopped_early`` site (the two conditions coincide once charges
-    never overcount — see the neuter below for the shape where they
-    USED to diverge)."""
-    budget = lc._RenderBudget(32)
-    rendered = lc.render_value(["a" * 30, "b" * 30, "c" * 30], budget=budget)
-    assert rendered == ["a" * 30]
-    assert budget.stopped_early is True
-    assert budget.used == 32
-
-    full = lc.render_payload(["a" * 30, "b" * 30, "c" * 30], limit=32)
-    assert full == '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...[truncated 34 chars]'
+def test_g_p2d_suffix_fires_on_stopped_early_even_at_exact_limit():
+    """RE-REVIEW 2026-10-14 R4 (orchestrator ruling) — restores the
+    ADDENDUM A1-ratified fixture fix round 1 replaced: ``["a"*30,
+    "b"*50]`` at ``limit=34`` must carry the truncation suffix even
+    though the (stopped-early) encoded text's length is EXACTLY the
+    limit, not strictly greater than it — a ``len(text) > limit``-only
+    rule would silently drop the second item with no marker at all.
+    Valid again now that the list-item charge is back to the ratified
+    flat "+2" (see the list-branch comment in ``logging_config.py``)."""
+    rendered = lc.render_payload(["a" * 30, "b" * 50], limit=34)
+    assert rendered == '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]...[truncated 34 chars]'
 
 
 def test_g_p2d_no_suffix_when_not_cut():
@@ -802,35 +817,15 @@ def test_g_p2d_no_suffix_when_not_cut():
 
 
 def test_g_p2d_neuter_len_greater_than_limit_only_drops_silently():
-    """NEUTER — reimplement the FULL pre-fix shape: the OLD flat "+2"
-    list-item charge (fix round B1/N08's own defect) TOGETHER WITH the
-    OLD ``len(text) > limit``-only cut rule (ignoring ``stopped_early``).
-    Confirms the exact historical silent drop the gate demonstrated:
-    ``["a"*30, "b"*50]`` at ``limit=34`` yields a complete-looking JSON
-    array with the second item missing and NO truncation marker at all
-    — reproducible only when BOTH pre-fix defects are present together,
-    which is exactly why B1/N08 and B3 were fixed in the same round."""
-
-    def _pre_fix_render_value(value: Any, depth: int, budget: Any) -> Any:
-        if isinstance(value, str):
-            scrubbed = lc.scrub_text(value)
-            if budget is not None:
-                budget.charge(len(scrubbed) + 2)
-            return scrubbed
-        if isinstance(value, list):
-            out = []
-            for item in value:
-                if budget is not None and budget.exhausted():
-                    break
-                if budget is not None:
-                    budget.charge(2)  # the pre-fix flat, over-counting charge
-                out.append(_pre_fix_render_value(item, depth + 1, budget))
-            return out
-        raise AssertionError("test helper only handles str/list")
+    """NEUTER — reimplement the PRE-FIX cut rule (``len(text) > limit``
+    only, no ``stopped_early`` check) against the REAL (ratified "+2")
+    production charge model, and confirm it reproduces the exact silent
+    drop the gate demonstrated: a complete-looking JSON array with an
+    item missing and NO truncation marker at all."""
 
     def _pre_fix_render_payload(value: Any, *, limit: int) -> str:
         budget = lc._RenderBudget(limit)
-        text = json.dumps(_pre_fix_render_value(value, 0, budget), ensure_ascii=False)
+        text = json.dumps(lc.render_value(value, budget=budget), ensure_ascii=False)
         if len(text) > limit:  # the bug: ignores budget.stopped_early
             text = text[:limit] + f"...[truncated {len(text)} chars]"
         return text
@@ -841,6 +836,152 @@ def test_g_p2d_neuter_len_greater_than_limit_only_drops_silently():
         "item with no truncation marker at all"
     )
     assert "...[truncated" not in broken
+
+
+def test_g_p2b_n08_neuter_increasing_the_list_charge_reddens(monkeypatch):
+    """N08 re-expression (RE-REVIEW 2026-10-14 R4) — the ratified "+2"
+    list-item charge is correct (see the production comment), but a
+    GENUINE increase over it (e.g. to "+3") still over-counts and must
+    be caught. Bump the flat charge by one and confirm the extended
+    G-P2b corpus (now with live list-of-string shapes) reddens."""
+    original_inner = lc._render_value_inner
+
+    def _over_by_one_inner(value, depth, budget=None):
+        if isinstance(value, (list, tuple, set, frozenset)) and not isinstance(
+            value, (str, bytes)
+        ):
+            rendered_list = []
+            for item in value:
+                if budget is not None and budget.exhausted():
+                    break
+                if budget is not None:
+                    budget.charge(3)  # +1 over the ratified "+2" — the bug
+                rendered_list.append(
+                    lc.render_value(item, _depth=depth + 1, budget=budget)
+                )
+            return rendered_list
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _over_by_one_inner)
+
+    corpus = _random_corpus()
+    violation_found = False
+    for limit in (5, 50, 500, 4000):
+        for value in corpus:
+            budget = lc._RenderBudget(limit)
+            rendered = lc.render_value(value, budget=budget)
+            text = json.dumps(rendered, ensure_ascii=False)
+            if budget.used > len(text):
+                violation_found = True
+                break
+        if violation_found:
+            break
+    assert violation_found, (
+        "NEUTER SANITY: bumping the list-item charge by 1 over the "
+        "ratified +2 must produce at least one lower-bound violation "
+        "over this corpus"
+    )
+
+
+# ═══════ G-P2g — final-`<TypeName>`-fallback charge (RE-REVIEW R2, N31/N34) ═
+#
+# The final fallback branch (an unallowlisted object: not a dataclass,
+# not a pydantic model, not an ORM row, not past the depth cap) is
+# charged like every other leaf — ``len(json.dumps(rendered,
+# ensure_ascii=False))``. Dedicated, individually-neutered pins beyond
+# the generic corpus property test above (N31: a flat over-count added
+# to this one charge; N34: this one charge reverted to the
+# ``ensure_ascii`` default) — both ASCII and non-ASCII class names,
+# each inside a 2-element ``[obj, "tail-item"]`` container so an
+# over-count drops the sibling instead of only costing a few harmless
+# bytes.
+
+
+@pytest.mark.parametrize(
+    "class_name",
+    ["PlainUnlistedObject", "Clé_日本語_Üñlïstéd"],
+    ids=["ascii", "non_ascii"],
+)
+def test_g_p2g_fallback_charge_is_a_true_lower_bound(class_name):
+    obj = _unallowlisted_object(class_name)
+    container = [obj, "tail-item"]
+    budget = lc._RenderBudget(10**9)
+    rendered = lc.render_value(container, budget=budget)
+    text = json.dumps(rendered, ensure_ascii=False)
+    assert rendered == [f"<{class_name}>", "tail-item"]
+    assert budget.used <= len(text)
+    assert not budget.stopped_early
+
+
+@pytest.mark.parametrize(
+    "class_name",
+    ["PlainUnlistedObject", "Clé_日本語_Üñlïstéd"],
+    ids=["ascii", "non_ascii"],
+)
+def test_g_p2g_neuter_n31_fallback_charge_plus_20_reddens(monkeypatch, class_name):
+    """N31 — the final-fallback charge gets a flat +20 over-count."""
+    obj = _unallowlisted_object(class_name)
+    original_inner = lc._render_value_inner
+
+    def _plus_20_inner(value, depth, budget=None):
+        if type(value) is type(obj):
+            rendered_fallback = f"<{type(value).__name__}>"
+            if budget is not None:
+                budget.charge(
+                    len(json.dumps(rendered_fallback, ensure_ascii=False)) + 20
+                )
+            return rendered_fallback
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _plus_20_inner)
+
+    # A limit calibrated between the true (uncharged-extra) size and the
+    # inflated (+20) one, so the fixed code would NOT cut but the
+    # neutered one does.
+    true_len = len(json.dumps([f"<{class_name}>", "tail-item"], ensure_ascii=False))
+    limit = true_len + 5
+    rendered = lc.render_payload([obj, "tail-item"], limit=limit)
+    assert "tail-item" not in rendered, (
+        "NEUTER SANITY: the +20 fallback over-count must drop the "
+        "tail item at this calibrated limit"
+    )
+
+
+@pytest.mark.parametrize(
+    "class_name",
+    ["PlainUnlistedObject", "Clé_日本語_Üñlïstéd"],
+    ids=["ascii", "non_ascii"],
+)
+def test_g_p2g_neuter_n34_fallback_ensure_ascii_true_reddens(monkeypatch, class_name):
+    """N34 — the final-fallback charge reverts to ``json.dumps``'s
+    ``ensure_ascii=True`` default, inflating a non-ASCII class name's
+    charge (a no-op neuter for the ASCII case, included for symmetry
+    with the guard above)."""
+    obj = _unallowlisted_object(class_name)
+    original_inner = lc._render_value_inner
+
+    def _ascii_true_inner(value, depth, budget=None):
+        if type(value) is type(obj):
+            rendered_fallback = f"<{type(value).__name__}>"
+            if budget is not None:
+                budget.charge(len(json.dumps(rendered_fallback)))  # ensure_ascii=True
+            return rendered_fallback
+        return original_inner(value, depth, budget)
+
+    monkeypatch.setattr(lc, "_render_value_inner", _ascii_true_inner)
+
+    true_len = len(json.dumps([f"<{class_name}>", "tail-item"], ensure_ascii=False))
+    limit = true_len + 2
+    budget = lc._RenderBudget(limit)
+    rendered = lc.render_value([obj, "tail-item"], budget=budget)
+    text = json.dumps(rendered, ensure_ascii=False)
+    if class_name == "Clé_日本語_Üñlïstéd":
+        assert budget.used > len(text), (
+            "NEUTER SANITY: ensure_ascii=True on a non-ASCII class name "
+            "must overcount relative to the true emitted length"
+        )
+    else:
+        assert budget.used <= len(text)  # ASCII class name: no-op neuter, sanity only
 
 
 # ═════════ G-P2f — budget threaded through model/ORM branches (N20/N21) ═══
@@ -1088,6 +1229,79 @@ _GP4_ISSUER = "http://keycloak:8080/realms/audittrace"
 _GP4_AUDIENCE = "audittrace-server"
 
 
+class _LoopWatchdog:
+    """Observes event-loop responsiveness from a REAL OS thread, not an
+    asyncio task scheduled on the loop it is watching.
+
+    RE-REVIEW 2026-10-14 R1/N35 (BLOCKER) — the previous instrument was
+    an ``asyncio.create_task`` ticker that ``await``ed itself every
+    0.05s. That is COOPERATIVE scheduling: a SYNCHRONOUS blocking call
+    inside the request handler (``time.sleep`` planted directly in
+    ``render_payload`` — N35) never yields back to the loop, so the
+    ticker task is never given a chance to run at all. Its tick list
+    stayed empty (or held a single pre-request tick), ``gaps`` was
+    computed as ``[]``, and ``max(gaps) if gaps else 0.0`` reported
+    "no stall" — the guard was fail-OPEN on exactly the failure mode
+    the WU exists to catch; the test passed after 208s with `gap=0.0`.
+
+    This watchdog submits a trivial callback to the loop via
+    ``call_soon_threadsafe`` from an independent thread every
+    ``interval`` seconds, and records the wall-clock time at which each
+    callback ACTUALLY RUNS. ``call_soon_threadsafe`` only queues the
+    callback — if the loop is busy executing a synchronous blocking
+    call, the queued callback simply waits, so the GAP between two
+    callback executions is a true, externally-observed measurement of
+    loop responsiveness, unaffected by whether the blocking code inside
+    the loop ever cooperates.
+    """
+
+    def __init__(self, loop: Any, interval: float = 0.05) -> None:
+        self._loop = loop
+        self._interval = interval
+        self._ticks: list[float] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _heartbeat(self) -> None:
+        with self._lock:
+            self._ticks.append(time.monotonic())
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._loop.call_soon_threadsafe(self._heartbeat)
+            except RuntimeError:  # pragma: no cover - loop closing race
+                return
+            self._stop.wait(self._interval)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> list[float]:
+        self._stop.set()
+        self._thread.join(timeout=10)
+        with self._lock:
+            return list(self._ticks)
+
+
+def _max_gap_fail_closed(ticks: list[float], *, min_ticks: int = 3) -> float:
+    """The lower-bound-respecting companion to a naive
+    ``max(gaps) if gaps else 0.0`` — RE-REVIEW 2026-10-14 R1: an EMPTY or
+    too-sparse tick list is ITSELF a failure (the watchdog could not
+    observe the loop enough to compute a meaningful gap — exactly N35's
+    failure mode), never silently treated as "0.0 = no stall"."""
+    if len(ticks) < min_ticks:
+        raise AssertionError(
+            f"event-loop watchdog recorded only {len(ticks)} tick(s) "
+            f"(need >= {min_ticks} to compute a meaningful gap) — the "
+            f"loop was unresponsive for the whole observation window, "
+            f"or the watchdog never ran"
+        )
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    return max(gaps)
+
+
 def _mint_padded_jwt(min_len: int = 1500) -> str:
     """An RS256 JWT, scoped for ``/memory/semantic`` reads, padded with an
     extra claim so the ENCODED TOKEN STRING itself is >= ``min_len`` chars
@@ -1177,10 +1391,15 @@ def _build_gp4_app_and_manifest(monkeypatch):
 @pytest.mark.asyncio
 async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_env):
     """Through the real public route (``httpx.ASGITransport`` — the whole
-    FastAPI stack, no ``kubectl exec``, no mocked serializer): a 50ms
-    ticker task running on the SAME event loop as the request must never
-    see a gap wider than 1.0s (the liveness kill sits at ~60s; this is
-    liveness-facing, not a tight micro-bound — ratified ADDENDUM A1 §6).
+    FastAPI stack, no ``kubectl exec``, no mocked serializer): a
+    thread-based watchdog (``_LoopWatchdog`` — RE-REVIEW 2026-10-14 R1,
+    not an asyncio-task ticker, which fails to observe a SYNCHRONOUS
+    blocking call: see N35 below) observing the SAME loop as the
+    request must never see a gap wider than 1.0s (the liveness kill
+    sits at ~60s; this is liveness-facing, not a tight micro-bound —
+    ratified ADDENDUM A1 §6), and must record enough ticks to make that
+    measurement meaningful at all (``_max_gap_fail_closed`` — an empty
+    or too-sparse tick list is itself a failure, never silently 0.0).
     A phase-free companion check sums the CPU time spent INSIDE
     ``render_payload`` during the request and requires it stay <= 0.05s.
     Positive control: >= 2 ``list_for_layer`` seam spans are exported,
@@ -1236,39 +1455,36 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
     monkeypatch.setattr(lc, "render_payload", _spying_render_payload)
 
     transport = httpx.ASGITransport(app=app)
-    ticks: list[float] = []
-    stop_ticker = asyncio.Event()
-
-    async def _ticker() -> None:
-        while not stop_ticker.is_set():
-            ticks.append(time.monotonic())
-            try:
-                await asyncio.wait_for(stop_ticker.wait(), timeout=0.05)
-            except TimeoutError:
-                pass
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        ticker_task = asyncio.create_task(_ticker())
-        try:
+    loop = asyncio.get_running_loop()
+    watchdog = _LoopWatchdog(loop)
+    watchdog.start()
+    try:
+        # Settle windows before/after the request so the watchdog has
+        # accumulated ticks even when the request itself is sub-ms —
+        # "guaranteed to record many ticks" (R1), not dependent on the
+        # request's own duration.
+        await asyncio.sleep(0.15)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
             resp = await client.get(
                 "/memory/semantic",
                 params={"collection": "decisions", "limit": 25, "sort": "created_at"},
                 headers={"Authorization": f"Bearer {token}"},
             )
-        finally:
-            stop_ticker.set()
-            await ticker_task
+        await asyncio.sleep(0.15)
+    finally:
+        ticks = watchdog.stop()
 
     assert resp.status_code == 200, resp.text
 
-    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
-    max_gap = max(gaps) if gaps else 0.0
+    max_gap = _max_gap_fail_closed(ticks)
     assert max_gap <= 1.0, f"event loop stalled for {max_gap:.3f}s during the request"
 
     summed_render_cpu = sum(render_payload_cpu_seconds)
     assert summed_render_cpu <= 0.05, (
         f"render_payload summed CPU time {summed_render_cpu:.4f}s exceeds "
-        f"the 0.05s bound (phase-free companion to the ticker-gap check)"
+        f"the 0.05s bound (phase-free companion to the watchdog-gap check)"
     )
 
     seam_spans = [
@@ -1284,46 +1500,40 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
         for window_start in range(0, len(token) - 16, 11):
             assert token[window_start : window_start + 16] not in output_value
 
-    # REVIEW 2026-10-12 B3 — record `gap_floor`: the SAME route, same
-    # request, same ticker, with `render_payload` stubbed to return ""
-    # (the route's own synchronous, non-serialisation work — auth, the
-    # mock manifest's list/sort passes, dedupe/group, all under coverage
-    # tracing). `gap_fixed` (measured above) minus `gap_floor` isolates
-    # what THIS WU's serialiser costs on the loop, independent of
-    # everything else the route does. Printed (not just asserted) so a
-    # `-s` run captures both numbers for the build record/evidence —
-    # this is a recorded MEASUREMENT, not an additional pass/fail gate.
-    floor_ticks: list[float] = []
-    floor_stop_ticker = asyncio.Event()
-
-    async def _floor_ticker() -> None:
-        while not floor_stop_ticker.is_set():
-            floor_ticks.append(time.monotonic())
-            try:
-                await asyncio.wait_for(floor_stop_ticker.wait(), timeout=0.05)
-            except TimeoutError:
-                pass
-
+    # REVIEW 2026-10-12 B3 / RE-REVIEW 2026-10-14 R1 — record `gap_floor`:
+    # the SAME route, same request, same watchdog, with `render_payload`
+    # stubbed to return "" (the route's own synchronous, non-serialisation
+    # work — auth, the mock manifest's list/sort passes, dedupe/group, all
+    # under coverage tracing). `gap_fixed` (measured above) minus
+    # `gap_floor` isolates what THIS WU's serialiser costs on the loop,
+    # independent of everything else the route does. Printed (not just
+    # asserted) so a `-s` run captures both numbers for the build
+    # record/evidence — this is a recorded MEASUREMENT, not an additional
+    # pass/fail gate.
     monkeypatch.setattr(lc, "render_payload", lambda value, *, limit: "")
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        floor_ticker_task = asyncio.create_task(_floor_ticker())
-        try:
+    floor_watchdog = _LoopWatchdog(loop)
+    floor_watchdog.start()
+    try:
+        await asyncio.sleep(0.15)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
             floor_resp = await client.get(
                 "/memory/semantic",
                 params={"collection": "decisions", "limit": 25, "sort": "created_at"},
                 headers={"Authorization": f"Bearer {token}"},
             )
-        finally:
-            floor_stop_ticker.set()
-            await floor_ticker_task
+        await asyncio.sleep(0.15)
+    finally:
+        floor_ticks = floor_watchdog.stop()
 
     assert floor_resp.status_code == 200, floor_resp.text
-    floor_gaps = [b - a for a, b in zip(floor_ticks, floor_ticks[1:])]
-    gap_floor = max(floor_gaps) if floor_gaps else 0.0
+    gap_floor = _max_gap_fail_closed(floor_ticks)
     print(
         f"\nG-P4 gap_floor={gap_floor:.4f}s  gap_fixed={max_gap:.4f}s  "
-        f"(gap_fixed - gap_floor = {max_gap - gap_floor:.4f}s)"
+        f"(gap_fixed - gap_floor = {max_gap - gap_floor:.4f}s)  "
+        f"ticks={len(ticks)} floor_ticks={len(floor_ticks)}"
     )
 
     telemetry._reset_for_tests()
@@ -1332,6 +1542,65 @@ async def test_g_p4_real_route_does_not_stall_the_event_loop(monkeypatch, _gp4_e
         otlp_endpoint="",
         tracing_enabled=True,
         metrics_enabled=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_g_p4_neuter_n35_sleep_in_render_payload_blocks_the_loop_and_reddens(
+    monkeypatch, _gp4_env
+):
+    """NEUTER N35 (RE-REVIEW 2026-10-14 R1, BLOCKER) — plant a
+    SYNCHRONOUS ``time.sleep`` directly inside ``render_payload`` (no
+    CPU cost, no ``await`` — exactly the liveness failure mode the WU
+    exists for) and confirm the watchdog-based guard goes RED. Sleeps
+    only on the FIRST call (not every one) so the reproduction stays
+    fast (~1.5s) while still being an unambiguous, correctly-attributed
+    stall — the gap it produces (>=1.5s) is already far past the 1.0s
+    bound regardless of how many further calls would have added to it."""
+    import asyncio
+
+    import httpx
+
+    token = _mint_padded_jwt(min_len=1500)
+    app, manifest = _build_gp4_app_and_manifest(monkeypatch)
+
+    orig_render_payload = lc.render_payload
+    slept = {"done": False}
+
+    def _blocking_render_payload(value, *, limit):
+        if not slept["done"]:
+            slept["done"] = True
+            time.sleep(1.5)  # N35 — a synchronous block, no await
+        return orig_render_payload(value, limit=limit)
+
+    monkeypatch.setattr(lc, "render_payload", _blocking_render_payload)
+
+    transport = httpx.ASGITransport(app=app)
+    loop = asyncio.get_running_loop()
+    watchdog = _LoopWatchdog(loop)
+    watchdog.start()
+    try:
+        await asyncio.sleep(0.15)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/memory/semantic",
+                params={"collection": "decisions", "limit": 25, "sort": "created_at"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        await asyncio.sleep(0.15)
+    finally:
+        ticks = watchdog.stop()
+
+    assert resp.status_code == 200, resp.text
+    assert slept["done"], "NEUTER SANITY: the planted sleep must have fired"
+
+    max_gap = _max_gap_fail_closed(ticks)
+    assert max_gap > 1.0, (
+        "NEUTER SANITY: a 1.5s synchronous sleep inside render_payload "
+        f"must blow the 1.0s gap bound open; got max_gap={max_gap:.3f}s "
+        f"over {len(ticks)} ticks"
     )
 
 
@@ -1502,24 +1771,49 @@ def test_g_p5_neuter_removed_decorator_reddens():
 # object from ``request_secret_index`` after reset (since that fallback
 # path is untouched by the neuter), so the identity check stayed GREEN
 # while a secret's windows sat retained in a module-level cache for the
-# rest of the process. The rewritten guard below asserts NON-RETENTION
-# directly: it scans every module-level attribute of ``identity`` (dicts,
-# lists, sets, object ``__dict__``s, and ``lru_cache``-wrapped callables'
-# own cache occupancy) for the registered secret's VALUE, after a reset —
-# not just comparing two object identities.
+# rest of the process. The REWRITTEN (fix round 1) guard asserted
+# NON-RETENTION directly: it scanned every module-level attribute of
+# ``identity`` for the registered secret's VALUE, after a reset.
+#
+# RE-REVIEW 2026-10-14 R3 — that rewrite was still wrong on two axes:
+#   - N16: a module dict cache placed in ``request_secret_index``'s
+#     FALLBACK branch (the one taken for a secret NOT in the registry)
+#     only gets populated once that fallback path actually RUNS. The
+#     guard scanned BEFORE ever exercising it, so the cache was always
+#     still empty at scan time. Fixed: exercise the fallback path (a
+#     fresh-context lookup, same as the conftest net's registered-value
+#     leg does for an unregistered secret) BEFORE scanning, not after.
+#   - N28b: a retained INDEX OBJECT (the ``dict[str, tuple[int, ...]]``
+#     window map) is not a verbatim copy of the secret string — its
+#     keys are 16-char WINDOWS of it. ``needle in value`` (substring)
+#     never matches a dict KEY against the whole secret. Fixed: also
+#     check whether a Mapping's keys intersect the secret's OWN set of
+#     16-char windows (computed once, matching the real builder) — this
+#     catches a retained index object by its STRUCTURE, not by hoping
+#     the secret happens to appear as a literal substring somewhere.
+#   - Also scans ``logging_config`` as well as ``identity`` (the digest
+#     calls this "module state", not "one module").
 
 
 def _scan_for_retained_secret_material(
-    module: Any, needle: str, *, _max_depth: int = 4
+    modules: tuple[Any, ...], needle: str, *, _max_depth: int = 4
 ) -> list[str]:
-    """Return the names of every module-level attribute of ``module``
-    that still retains ``needle`` (by value) somewhere inside it, or —
-    for an ``lru_cache``-wrapped callable — reports a non-empty cache at
-    all (a correctly request-scoped design never retains ANY entry past
-    a reset, so cache occupancy alone is the retention signal there,
-    without needing to know what is cached)."""
+    """Return ``"<module>.<attr>"`` for every module-level attribute,
+    across ``modules``, that still retains ``needle`` (by value, OR by
+    holding a dict whose keys overlap ``needle``'s own 16-char windows —
+    a retained window-index object), or — for an ``lru_cache``-wrapped
+    callable — reports a non-empty cache at all (a correctly
+    request-scoped design never retains ANY entry past a reset, so cache
+    occupancy alone is the retention signal there, without needing to
+    know what is cached)."""
 
     import types
+
+    known_windows = (
+        set(identity_mod.build_secret_window_index(needle).keys())
+        if len(needle) >= identity_mod._FRAGMENT_WINDOW_LEN
+        else set()
+    )
 
     def _contains(value: Any, depth: int, seen: set[int]) -> bool:
         if depth > _max_depth:
@@ -1536,7 +1830,11 @@ def _scan_for_retained_secret_material(
             return False
         seen.add(vid)
         if isinstance(value, str):
-            return needle in value
+            if needle in value:
+                return True
+            # A bare retained WINDOW (one 16-char key, held on its own
+            # rather than inside the index dict) is also retention.
+            return value in known_windows
         # A ContextVar is opaque from the outside (no __dict__ exposing
         # its stored value) — read it via `.get()` IN THIS CONTEXT. This
         # is what actually catches a no-op'd `reset_request_secrets`
@@ -1555,6 +1853,13 @@ def _scan_for_retained_secret_material(
             except Exception:  # pragma: no cover - defensive
                 pass
         if isinstance(value, Mapping):
+            # N28b — a retained window-index object's KEYS are the
+            # secret's own 16-char windows; a substring/equality check
+            # on the VALUES alone would never see this (the values are
+            # offset tuples, not text). Checking the key set directly
+            # catches the index object by its structure.
+            if known_windows and any(k in known_windows for k in value.keys()):
+                return True
             return any(
                 _contains(k, depth + 1, seen) or _contains(v, depth + 1, seen)
                 for k, v in value.items()
@@ -1567,35 +1872,51 @@ def _scan_for_retained_secret_material(
         return False
 
     offenders = []
-    for name, value in vars(module).items():
-        if name.startswith("__"):
-            continue
-        if _contains(value, 0, set()):
-            offenders.append(name)
+    for module in modules:
+        for name, value in vars(module).items():
+            if name.startswith("__"):
+                continue
+            if _contains(value, 0, set()):
+                offenders.append(f"{module.__name__}.{name}")
     return offenders
 
 
+def _exercise_fallback_path_in_fresh_context(secret: str) -> Any:
+    """Call ``request_secret_index`` for ``secret`` from a FRESH
+    ``contextvars.Context`` where it is NOT registered — the exact
+    fallback branch the conftest net's registered-value leg takes for
+    an unregistered secret, and the one N16's neuter targets. MUST be
+    called before the retention scan (R3) — a cache populated only by
+    this path stays invisible to the scan otherwise."""
+
+    def _call():
+        return identity_mod.request_secret_index(secret)
+
+    ctx = contextvars.Context()
+    return ctx.run(_call)
+
+
 def test_g_p6_no_process_wide_retention_after_reset():
-    """After ``reset_request_secrets()``, NOTHING module-level in
-    ``identity`` retains the registered secret — not merely "a fresh
-    lookup returns a different object" (G-P6, rewritten per REVIEW
-    2026-10-12 B2/N28)."""
+    """After ``reset_request_secrets()`` AND exercising the fallback
+    lookup path, NOTHING module-level in ``identity`` OR
+    ``logging_config`` retains the registered secret — not merely "a
+    fresh lookup returns a different object" (G-P6, rewritten per
+    REVIEW 2026-10-12 B2/N28 and RE-REVIEW 2026-10-14 R3)."""
     secret = _make_secret(900)
     identity_mod.register_request_secret(secret)
-    identity_mod.request_secret_index(secret)
+    idx1 = identity_mod.request_secret_index(secret)
     identity_mod.reset_request_secrets()
 
-    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    # R3 — exercise the fallback path BEFORE scanning, not after.
+    idx2 = _exercise_fallback_path_in_fresh_context(secret)
+
+    offenders = _scan_for_retained_secret_material((identity_mod, lc), secret)
     assert not offenders, f"module-level retention found in: {offenders}"
 
     # The original identity-inequality property still holds too (a
     # stronger, but not sufficient, condition — kept as a secondary
     # check, not the primary assertion).
-    def _in_fresh_context():
-        return identity_mod.request_secret_index(secret)
-
-    ctx = contextvars.Context()
-    idx2 = ctx.run(_in_fresh_context)
+    assert idx1 is not idx2
     assert idx2 is not None
 
 
@@ -1614,26 +1935,111 @@ def test_g_p6_neuter_lru_cache_the_builder_reddens(monkeypatch):
     identity_mod.register_request_secret(secret)
     identity_mod.request_secret_index(secret)
     identity_mod.reset_request_secrets()
+    _exercise_fallback_path_in_fresh_context(secret)
 
-    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    offenders = _scan_for_retained_secret_material((identity_mod, lc), secret)
     assert offenders, (
         "NEUTER SANITY: an lru_cache'd builder must be caught as a "
         "retention offender by the scan — if this is empty, the "
         "reproduction has drifted"
     )
-    assert "build_secret_window_index" in offenders
+    assert any("build_secret_window_index" in o for o in offenders)
+
+
+def test_g_p6_neuter_n16_fallback_path_cache_reddens(monkeypatch):
+    """NEUTER — N16's exact shape: a module-level dict cache populated
+    INSIDE ``request_secret_index``'s FALLBACK branch (the one taken for
+    a secret that is NOT in the registry). Confirms the guard catches
+    this only because it now exercises the fallback path BEFORE
+    scanning (R3) — scanning first, as fix round 1 did, would see an
+    empty cache and stay GREEN."""
+    secret = _make_secret(900)
+    fallback_cache: dict[str, Any] = {}
+    monkeypatch.setattr(
+        identity_mod, "_test_n16_fallback_cache", fallback_cache, raising=False
+    )
+
+    original_request_index = identity_mod.request_secret_index
+
+    def _request_index_with_fallback_cache(secret_arg: str) -> Any:
+        for value, index in identity_mod._REQUEST_SECRETS.get():
+            if value == secret_arg:
+                return index
+        # Fallback branch (secret not registered) — the neuter: cache it.
+        built = identity_mod.build_secret_window_index(secret_arg)
+        fallback_cache[secret_arg] = built
+        return built
+
+    monkeypatch.setattr(
+        identity_mod, "request_secret_index", _request_index_with_fallback_cache
+    )
+
+    identity_mod.reset_request_secrets()
+    # Exercise the (neutered) fallback path directly — secret never registered.
+    identity_mod.request_secret_index(secret)
+
+    offenders = _scan_for_retained_secret_material((identity_mod, lc), secret)
+    assert offenders, (
+        "NEUTER SANITY: a fallback-path cache populated only once the "
+        "fallback branch runs must be caught — if empty, the scan is "
+        "still running before the fallback path is exercised"
+    )
+    assert any("_test_n16_fallback_cache" in o for o in offenders)
+    monkeypatch.setattr(identity_mod, "request_secret_index", original_request_index)
+
+
+def test_g_p6_neuter_n28b_retained_window_index_object_reddens(monkeypatch):
+    """NEUTER — N28b's exact shape: registration keeps the BUILT INDEX
+    OBJECT (not the secret string) in a module-level list. A scan that
+    only checks for the whole secret as a substring never matches a
+    dict whose keys are 16-char windows of it — the structural
+    (key-set) check is what catches this."""
+    secret = _make_secret(900)
+    retained_indexes: list[Any] = []
+    monkeypatch.setattr(
+        identity_mod, "_test_n28b_retained_indexes", retained_indexes, raising=False
+    )
+
+    original_register = identity_mod.register_request_secret
+
+    def _register_keeping_index(value: str) -> None:
+        original_register(value)
+        retained_indexes.append(identity_mod.build_secret_window_index(value))
+
+    monkeypatch.setattr(
+        identity_mod, "register_request_secret", _register_keeping_index
+    )
+
+    identity_mod.register_request_secret(secret)
+    identity_mod.reset_request_secrets()
+    _exercise_fallback_path_in_fresh_context(secret)
+
+    # Sanity: the whole secret is NOT present as a substring anywhere in
+    # the retained list (it holds offset tuples, not text) — proves the
+    # OLD substring-only check would have missed this.
+    assert not any(secret in str(k) for idx in retained_indexes for k in idx)
+
+    offenders = _scan_for_retained_secret_material((identity_mod, lc), secret)
+    assert offenders, (
+        "NEUTER SANITY: an index object kept by VALUE (not by the "
+        "secret string) must still be caught, via its key-set "
+        "structure — if this is empty, the scan is still blind to a "
+        "retained index object the way the review found (N28b)"
+    )
+    assert any("_test_n28b_retained_indexes" in o for o in offenders)
+    monkeypatch.setattr(identity_mod, "register_request_secret", original_register)
 
 
 def test_g_p6_neuter_n28_direct_module_cache_reddens(monkeypatch):
-    """NEUTER — N28's exact shape: a process-wide cache populated AT
-    REGISTRATION time, bypassing the builder entirely (so the
-    lru_cache-on-the-builder neuter's mechanism above never fires).
-    Confirms the rewritten guard catches THIS shape too, where the
-    ORIGINAL (pre-review) ``idx1 is not idx2`` assertion did NOT
-    (R-c/B2/N28 — the fallback path ``request_secret_index`` takes when
-    a secret isn't found in the registry is untouched by this neuter, so
-    it still happily returns a FRESH, uncached object post-reset, and
-    the old identity-inequality guard stayed green)."""
+    """NEUTER — N28's original shape: a process-wide cache populated AT
+    REGISTRATION time, keyed by the secret VALUE (bypassing the builder
+    entirely, so the lru_cache-on-the-builder neuter's mechanism never
+    fires). Confirms the guard still catches THIS shape too, where the
+    original (pre-rewrite) ``idx1 is not idx2`` assertion did NOT (the
+    fallback path ``request_secret_index`` takes when a secret isn't
+    registered is untouched by this neuter, so it still happily returns
+    a FRESH, uncached object post-reset, and the old identity-inequality
+    guard stayed green)."""
     secret = _make_secret(900)
     process_wide_cache: dict[str, Any] = {}
     monkeypatch.setattr(
@@ -1651,30 +2057,27 @@ def test_g_p6_neuter_n28_direct_module_cache_reddens(monkeypatch):
     identity_mod.register_request_secret(secret)
     idx1 = identity_mod.request_secret_index(secret)
     identity_mod.reset_request_secrets()
+    idx2 = _exercise_fallback_path_in_fresh_context(secret)
 
     # Old-style assertion (what G-P6 used to check): STILL PASSES here —
     # proving this is exactly the escape the review found. `idx2` is a
     # fresh, uncached fallback object (the registry is empty post-reset),
     # so `idx1 is not idx2` holds even though the secret is still
     # retained elsewhere (the dict this neuter populated).
-    def _in_fresh_context():
-        return identity_mod.request_secret_index(secret)
-
-    ctx = contextvars.Context()
-    idx2 = ctx.run(_in_fresh_context)
     assert idx1 is not idx2, (
         "sanity: the OLD guard's condition must still hold here — this "
         "neuter does not touch the fallback path at all"
     )
 
     # The REWRITTEN guard's scan, however, must catch it.
-    offenders = _scan_for_retained_secret_material(identity_mod, secret)
+    offenders = _scan_for_retained_secret_material((identity_mod, lc), secret)
     assert offenders, (
         "NEUTER SANITY: the process-wide cache populated at registration "
         "must be caught as a retention offender — if this is empty, the "
         "rewritten guard has the same blind spot the review found"
     )
-    assert "_test_n28_process_wide_cache" in offenders
+    assert any("_test_n28_process_wide_cache" in o for o in offenders)
+    monkeypatch.setattr(identity_mod, "register_request_secret", original_register)
 
 
 # ═══════════════════════════ G-P7 — differential (budgeted == unbudgeted) ══
