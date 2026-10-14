@@ -45,6 +45,23 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from audittrace import telemetry
 
+# SCRUB-EVENT-LOOP-STALL (v1.29.4, R1 — ratified ADDENDUM A1 §9) —
+# ``_FRAGMENT_WINDOW_LEN`` and the window-index builder moved to
+# ``audittrace.identity`` (pure string code, no imports there) so
+# ``register_request_secret`` can build the index ONCE, at registration,
+# instead of ``_scrub_secret_fragments``/``secret_leaks_into`` rebuilding it
+# on every scrubbed string leaf (the v1.29.3 event-loop stall). Both names
+# are re-exported here UNCHANGED — this module's own code below and every
+# existing test import keep working against the ORIGINAL names.
+# ``_secret_window_index`` is not called from this module's own production
+# code any more (the hot path reads ``request_secret_index`` instead) — it
+# stays imported/re-exported anyway (G-P1, build contract) because it is
+# one of the TWO bindings a regression could rebuild through.
+from audittrace.identity import _FRAGMENT_WINDOW_LEN, request_secret_index
+from audittrace.identity import (
+    build_secret_window_index as _secret_window_index,  # noqa: F401
+)
+
 
 def _is_expected_client_error(exc: BaseException) -> bool:
     """True for an ``HTTPException`` carrying a 4xx status — an *expected*
@@ -96,17 +113,10 @@ _AUTHZ_SHAPE_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}"
 # now always runs after the exact replace too — measured by
 # ``test_l1_full_value_and_truncated_fragment_in_one_string_both_redacted``
 # below, over a single-pass sink (no second, independent scrub pass).
-_FRAGMENT_WINDOW_LEN = 16
-
-
-def _secret_window_index(secret: str) -> dict[str, list[int]]:
-    """Map every ``_FRAGMENT_WINDOW_LEN``-char window of ``secret`` to the
-    list of start offsets within ``secret`` where that window occurs
-    (handles a secret with internal repeats)."""
-    index: dict[str, list[int]] = {}
-    for i in range(0, len(secret) - _FRAGMENT_WINDOW_LEN + 1):
-        index.setdefault(secret[i : i + _FRAGMENT_WINDOW_LEN], []).append(i)
-    return index
+#
+# ``_FRAGMENT_WINDOW_LEN`` and ``_secret_window_index`` are imported from
+# ``audittrace.identity`` at the top of this module (SCRUB-EVENT-LOOP-STALL
+# v1.29.4 R1) — kept here only as this comment anchor; see that import.
 
 
 def _extend_match(
@@ -137,7 +147,9 @@ def _extend_match(
     return text_pos, end
 
 
-def _scrub_secret_fragments(text: str, secret: str) -> str:
+def _scrub_secret_fragments(
+    text: str, secret: str, *, index: Mapping[str, tuple[int, ...]] | None = None
+) -> str:
     """Redact every maximal run in ``text`` that matches a contiguous
     fragment of ``secret``, even when a third party truncated the middle
     out of the full value before it ever reached this function.
@@ -163,10 +175,19 @@ def _scrub_secret_fragments(text: str, secret: str) -> str:
     structure, so this is a theoretical worst case, not a shape this
     module expects to see in practice — documented rather than hidden,
     not independently timed here.
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R1/B2 — ratified ADDENDUM A1 §3) —
+    ``index`` is keyword-only and optional so the pre-fix 2-positional-arg
+    call (``tests/test_log_call_redaction.py:706``, unmodified) keeps
+    working unchanged: when omitted, the window index is resolved via
+    ``audittrace.identity.request_secret_index`` (O(1) for a registered
+    secret — built once at registration — or an uncached build for an
+    unregistered one), rather than rebuilt here on every call as before.
     """
     if len(secret) < _FRAGMENT_WINDOW_LEN:
         return text
-    index = _secret_window_index(secret)
+    if index is None:
+        index = request_secret_index(secret)
     out: list[str] = []
     n = len(text)
     i = 0
@@ -200,6 +221,11 @@ def secret_leaks_into(text: str, secret: str) -> bool:
     round 1 BLOCKER 1). Shares the same windowed-match logic ``scrub_text``
     uses so the net's oracle and the production redaction agree on what
     counts as "still identifying."
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R1/B2) — keeps its original 2-argument
+    public signature unchanged (the conftest net calls it that way,
+    ``tests/conftest.py:1010``); the window index is resolved via
+    ``audittrace.identity.request_secret_index`` rather than rebuilt here.
     """
     if not secret or not text:
         return False
@@ -207,7 +233,7 @@ def secret_leaks_into(text: str, secret: str) -> bool:
         return True
     if len(secret) < _FRAGMENT_WINDOW_LEN:
         return False
-    index = _secret_window_index(secret)
+    index = request_secret_index(secret)
     n = len(text)
     for i in range(0, n - _FRAGMENT_WINDOW_LEN + 1):
         if text[i : i + _FRAGMENT_WINDOW_LEN] in index:
@@ -480,7 +506,46 @@ def _render_safe_scalar(value: Any) -> Any:
     return str(value)  # UUID, Decimal, Path
 
 
-def render_value(value: Any, *, _depth: int = 0) -> Any:
+class _RenderBudget:
+    """SCRUB-EVENT-LOOP-STALL (v1.29.4, R2/B1 — ratified ADDENDUM A1 §2).
+
+    Bounds the work ``_render_value_inner`` does by a running LOWER BOUND
+    on the JSON length of what has been rendered so far, rather than by a
+    count of entries/leaves — a shape-agnostic budget. ``used`` only ever
+    UNDER-counts the true rendered length (G-P2b: ``used <= true length``
+    always), so stopping early can only ever happen once the TRUE text is
+    already at or past ``limit`` — the cut in ``render_payload`` then
+    always lands inside text that was already fully, individually
+    scrubbed (scrub-before-truncate, #385 A7/G2f — unchanged by this WU).
+
+    ``stopped_early`` is a FLAG, read by callers after the walk, never an
+    exception (R-d, ratified ADDENDUM A1 advisory): a budget stop must
+    never look like the per-node ``try/except`` catching a real rendering
+    failure (N4) — those two situations stay distinguishable.
+    """
+
+    __slots__ = ("limit", "used", "stopped_early")
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+        self.stopped_early = False
+
+    def exhausted(self) -> bool:
+        """True once ``used`` has reached ``limit`` — also flips
+        ``stopped_early`` for the caller to read after the whole walk."""
+        if self.used >= self.limit:
+            self.stopped_early = True
+            return True
+        return False
+
+    def charge(self, n: int) -> None:
+        self.used += n
+
+
+def render_value(
+    value: Any, *, _depth: int = 0, budget: _RenderBudget | None = None
+) -> Any:
     """Recursively render a value for a span attribute / log field.
 
     Structural allowlist (D2, N3): scalars render as themselves; ``str``
@@ -504,25 +569,58 @@ def render_value(value: Any, *, _depth: int = 0) -> Any:
     can never break the logging/tracing path for the whole process — a
     raising renderer would silently DROP the log line or span attribute
     instead (fail-open), which is strictly worse than an opaque name.
+
+    ``budget`` (SCRUB-EVENT-LOOP-STALL v1.29.4, R2/B1 — ratified ADDENDUM
+    A1 §2): ``None`` (the default) is the ORIGINAL, unbudgeted contract —
+    every node is visited, nothing is skipped — used by the ``extra=``
+    formatter path (``StructuredFormatter.format``) and by anything that
+    calls this function directly. When a ``_RenderBudget`` is supplied
+    (``render_payload`` below), the SAME walker — one walker, not a
+    second one (gate REJECT round 1 BLOCKER B1) — stops visiting further
+    children once the budget is exhausted; every node visited before that
+    point is rendered and scrubbed exactly as it would be unbudgeted
+    (G-P7: the two must agree byte-for-byte up to the cut).
     """
     try:
-        return _render_value_inner(value, _depth)
+        if budget is None:
+            return _render_value_inner(value, _depth)
+        return _render_value_inner(value, _depth, budget)
     except Exception:
-        return f"<{type(value).__name__}>"
+        fallback = f"<{type(value).__name__}>"
+        if budget is not None:
+            budget.charge(len(json.dumps(fallback, ensure_ascii=False)))
+        return fallback
 
 
-def _render_value_inner(value: Any, depth: int) -> Any:
+def _render_value_inner(
+    value: Any, depth: int, budget: _RenderBudget | None = None
+) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
+        if budget is not None:
+            budget.charge(len(json.dumps(value, ensure_ascii=False)))
         return value
     if isinstance(value, str):
-        return scrub_text(value)
+        scrubbed = scrub_text(value)
+        if budget is not None:
+            # +2 — the JSON string's surrounding quotes.
+            budget.charge(len(scrubbed) + 2)
+        return scrubbed
     if isinstance(value, bytes):
-        return f"<bytes:{len(value)}>"
+        rendered_bytes = f"<bytes:{len(value)}>"
+        if budget is not None:
+            budget.charge(len(json.dumps(rendered_bytes, ensure_ascii=False)))
+        return rendered_bytes
     if isinstance(value, _SAFE_SCALAR_TYPES):
-        return _render_safe_scalar(value)
+        rendered_scalar = _render_safe_scalar(value)
+        if budget is not None:
+            budget.charge(len(json.dumps(rendered_scalar, ensure_ascii=False)))
+        return rendered_scalar
 
     if depth >= _RENDER_MAX_DEPTH:
-        return f"<{type(value).__name__}>"
+        rendered_depth_cap = f"<{type(value).__name__}>"
+        if budget is not None:
+            budget.charge(len(json.dumps(rendered_depth_cap, ensure_ascii=False)))
+        return rendered_depth_cap
 
     # UserContext — fixed projection. Checked before the generic dataclass
     # branch below because UserContext IS a dataclass but gets a narrower,
@@ -534,7 +632,7 @@ def _render_value_inner(value: Any, depth: int) -> Any:
         from audittrace.identity import UserContext
 
         if isinstance(value, UserContext):
-            return {
+            projection = {
                 "user_id": value.user_id,
                 "username": scrub_text(value.username),
                 "agent_type": value.agent_type,
@@ -542,15 +640,29 @@ def _render_value_inner(value: Any, depth: int) -> Any:
                 "token_id": value.token_id,
                 "is_admin": value.is_admin,
             }
+            if budget is not None:
+                budget.charge(len(json.dumps(projection, ensure_ascii=False)))
+            return projection
     except Exception:  # pragma: no cover - defensive
         pass
 
-    # starlette.requests.Request — method + path only.
+    # starlette.requests.Request — method + path only. Checked BEFORE the
+    # Mapping branch below (gate REJECT round 1 BLOCKER B1, ratified
+    # ADDENDUM A1 §2): ``starlette.requests.Request`` IS a
+    # ``collections.abc.Mapping`` (it implements the ASGI scope mapping
+    # protocol), so a budgeted walker that checked ``Mapping`` first would
+    # render the raw ASGI scope — client IP, path params, headers —
+    # instead of this fixed, PII-free projection. The branch ORDER here is
+    # exactly the export's pre-fix order; G-P7 pins it with a differential
+    # test against the unbudgeted path.
     try:
         from starlette.requests import Request as StarletteRequest
 
         if isinstance(value, StarletteRequest):
-            return {"method": value.method, "path": value.url.path}
+            projection = {"method": value.method, "path": value.url.path}
+            if budget is not None:
+                budget.charge(len(json.dumps(projection, ensure_ascii=False)))
+            return projection
     except Exception:  # pragma: no cover - defensive
         pass
 
@@ -566,19 +678,71 @@ def _render_value_inner(value: Any, depth: int) -> Any:
         # scrubbed ``str``; a tuple key's render is a JSON-safe list,
         # stringified for use as a key (JSON itself has no tuple-as-key
         # concept either).
+        #
+        # SCRUB-EVENT-LOOP-STALL (v1.29.4, R2 — ratified ADDENDUM A1 §2,
+        # A1-F10) — a non-str key is rendered UNBUDGETED (``budget=None``)
+        # so it is still fully scrubbed, then charged ONCE as
+        # ``len(rendered_key) + 4``; a str key is scrubbed directly and
+        # charged the same way. Charging it twice (once inside an
+        # unbudgeted-but-still-counted recursive call, once again here)
+        # would overcount — not a safety problem (G-P2b only requires the
+        # estimate never EXCEED the true length) but was a real bug this
+        # WU's own corpus caught (A1-F10) before this fix: charging a
+        # non-str key's render AND its own `len + 4` both.
         rendered: dict[str, Any] = {}
         for k, v in value.items():
-            rendered_key = (
-                scrub_text(k)
-                if isinstance(k, str)
-                else render_value(k, _depth=depth + 1)
-            )
-            if not isinstance(rendered_key, str):
-                rendered_key = json.dumps(rendered_key, default=str)
-            rendered[rendered_key] = render_value(v, _depth=depth + 1)
+            if budget is not None and budget.exhausted():
+                break
+            if isinstance(k, str):
+                rendered_key = scrub_text(k)
+            else:
+                rendered_key = render_value(k, _depth=depth + 1)
+                if not isinstance(rendered_key, str):
+                    # RE-REVIEW 2026-10-14 advisory — ``ensure_ascii=False``
+                    # here is not only a CHARGE-accuracy change: it also
+                    # changes the EMITTED text for a non-ASCII tuple or
+                    # UUID key (e.g. a tuple containing a non-ASCII
+                    # string), which now renders with the literal
+                    # character instead of a ``\uXXXX`` escape. Stated
+                    # explicitly because it is an observable output
+                    # change, not merely an internal estimate change.
+                    rendered_key = json.dumps(
+                        rendered_key, default=str, ensure_ascii=False
+                    )
+            if budget is not None:
+                budget.charge(len(rendered_key) + 4)
+            rendered[rendered_key] = render_value(v, _depth=depth + 1, budget=budget)
         return rendered
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [render_value(v, _depth=depth + 1) for v in value]
+        # R2/B1 estimator (ratified ADDENDUM A1 §2): "+2 per sequence
+        # item" — one `", "` separator (2 chars) plus the closing
+        # bracket's own contribution, charged per item rather than
+        # tracked by position. RE-REVIEW 2026-10-14 R4 (orchestrator
+        # ruling) — fix round 1 replaced this with a position-aware
+        # "+1 for every item but the first", on the theory that the
+        # flat "+2" double-counted against the leaf charge's own quote
+        # overhead and was a real G-P2b violation. That theory was
+        # WRONG and is retracted here: measured over a 20,000-value
+        # random grid (nested str/list/dict, escapes, non-ASCII,
+        # limits 1-300), BOTH "+2" (0 violations, 9603 early stops) and
+        # "+1 non-first" (0 violations, 9593 early stops) are valid
+        # lower bounds. `json.dumps`'s real item separator is `", "` —
+        # 2 chars, not 1 — and the closing bracket is still charged
+        # even on an early stop, so "+2" was never an over-count.
+        # Reverted to the ratified "+2"; see
+        # ``test_g_p2d_suffix_fires_on_stopped_early_even_at_exact_limit``
+        # for the ADDENDUM A1 fixture this restores and
+        # ``test_g_p2b_n08_neuter_increasing_the_list_charge_reddens``
+        # for the guard that still catches a GENUINE increase (e.g. to
+        # "+3") over this baseline.
+        rendered_list: list[Any] = []
+        for item in value:
+            if budget is not None and budget.exhausted():
+                break
+            if budget is not None:
+                budget.charge(2)  # separator/bracket overhead per item
+            rendered_list.append(render_value(item, _depth=depth + 1, budget=budget))
+        return rendered_list
 
     render_models, render_dataclasses, render_orm = _get_render_allowlists()
 
@@ -587,8 +751,13 @@ def _render_value_inner(value: Any, depth: int) -> Any:
 
         if isinstance(value, BaseModel):
             if type(value) in render_models:
-                return render_value(value.model_dump(mode="json"), _depth=depth + 1)
-            return f"<{type(value).__name__}>"
+                return render_value(
+                    value.model_dump(mode="json"), _depth=depth + 1, budget=budget
+                )
+            rendered_model = f"<{type(value).__name__}>"
+            if budget is not None:
+                budget.charge(len(json.dumps(rendered_model, ensure_ascii=False)))
+            return rendered_model
     except Exception:  # pragma: no cover - defensive
         pass
 
@@ -597,8 +766,12 @@ def _render_value_inner(value: Any, depth: int) -> Any:
             return render_value(
                 {f.name: getattr(value, f.name) for f in dataclass_fields(value)},
                 _depth=depth + 1,
+                budget=budget,
             )
-        return f"<{type(value).__name__}>"
+        rendered_dc = f"<{type(value).__name__}>"
+        if budget is not None:
+            budget.charge(len(json.dumps(rendered_dc, ensure_ascii=False)))
+        return rendered_dc
 
     if type(value) in render_orm:
         try:
@@ -611,11 +784,18 @@ def _render_value_inner(value: Any, depth: int) -> Any:
                     for attr in mapper.column_attrs
                 },
                 _depth=depth + 1,
+                budget=budget,
             )
         except Exception:  # pragma: no cover - defensive
-            return f"<{type(value).__name__}>"
+            rendered_orm = f"<{type(value).__name__}>"
+            if budget is not None:
+                budget.charge(len(json.dumps(rendered_orm, ensure_ascii=False)))
+            return rendered_orm
 
-    return f"<{type(value).__name__}>"
+    rendered_fallback = f"<{type(value).__name__}>"
+    if budget is not None:
+        budget.charge(len(json.dumps(rendered_fallback, ensure_ascii=False)))
+    return rendered_fallback
 
 
 def render_payload(value: Any, *, limit: int) -> str:
@@ -628,14 +808,36 @@ def render_payload(value: Any, *, limit: int) -> str:
     value JSON-safe, so a ``TypeError`` here would mean the allowlist
     machinery itself is broken, not that some odd input needs rescuing.
 
-    Scrub happens INSIDE ``render_value`` (every ``str`` leaf); truncation
+    Scrub happens INSIDE ``render_value`` (every ``str`` leaf, even one
+    discovered deep inside a budgeted walk — see below); truncation
     happens AFTER encoding. Order matters (G2f): scrub-before-truncate.
     Truncating first can cut a token in half, leaving an unscrubbed prefix
     that is no longer JWT-shaped and skips the registry match too (spec
     fact A7 — the escape this ordering closes).
+
+    SCRUB-EVENT-LOOP-STALL (v1.29.4, R2/B3 — ratified ADDENDUM A1 §4) —
+    ``render_value`` is called with a ``_RenderBudget(limit)`` so the walk
+    stops visiting further children once the running (lower-bound)
+    estimate of the rendered length reaches ``limit`` — independent of how
+    many entries/leaves the value contains (the v1.29.3 event-loop stall:
+    a ``list[ManifestEntry]`` of 3000 rows cost seconds because every leaf
+    was scrubbed AND its secret-window index rebuilt from scratch, even
+    though only the first few entries ever survive the cut below). Every
+    leaf that IS visited is still scrubbed in full before the cut — the
+    budget bounds leaf COUNT, not leaf SIZE (named residual JWT-RESID-S8).
+
+    The truncation suffix fires when the walk stopped early OR the
+    encoded text is over ``limit`` — NOT only the latter (gate REJECT
+    round 1 BLOCKER B3): the budget's estimate is a LOWER bound, so a walk
+    that stopped early can, for sufficiently simple values (plain ASCII
+    leaves, no escaping), produce text whose exact length equals ``limit``
+    — ``len(text) > limit`` alone would then be False and an item would be
+    silently dropped from the JSON with no marker showing anything was
+    cut. Checking ``stopped_early`` as well closes that edge.
     """
-    text = json.dumps(render_value(value), ensure_ascii=False)
-    if len(text) > limit:
+    budget = _RenderBudget(limit)
+    text = json.dumps(render_value(value, budget=budget), ensure_ascii=False)
+    if budget.stopped_early or len(text) > limit:
         text = text[:limit] + f"...[truncated {len(text)} chars]"
     return text
 

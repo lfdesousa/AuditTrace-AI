@@ -1106,6 +1106,7 @@ class MockMemoryManifestService(MemoryManifestService):
             existing["deleted_by_user_id"] = user_id
         return self._to_entry(existing)
 
+    @log_call(logger=logger)
     async def list_for_layer(
         self,
         layer: str,
@@ -1113,6 +1114,15 @@ class MockMemoryManifestService(MemoryManifestService):
         include_deleted: bool = False,
         caller: UserContext | None = None,
     ) -> list[ManifestEntry]:
+        """SCRUB-EVENT-LOOP-STALL (v1.29.4, R5/F11 — ratified ADDENDUM A1,
+        spec fact F11) — carries the IDENTICAL ``@log_call`` decorator as
+        ``MemoryManifestService.list_for_layer`` above (G-P5 pins
+        ``ast.dump`` equality between the two). Before this fix the mock
+        — which the test container wires for every route test
+        (``dependencies.py``) — had NO decorator, so no existing route
+        test ever exercised the seam that stalled the event loop in
+        v1.29.3; only a real-route test through the real decorator can
+        catch a regression here."""
         _validate_layer(layer)
         rows = [row for (row_layer, _), row in self._rows.items() if row_layer == layer]
         if not include_deleted:
