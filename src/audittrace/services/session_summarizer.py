@@ -27,6 +27,19 @@ Two transaction boundaries per eligible session:
 
 On SQLite (tests), the ``row_security`` / ``set_config`` calls are
 no-ops because SQLite has no GUCs and no RLS.
+
+**Ownership scoping (security).** Step 1 above bypasses RLS by design
+(it must see every user's idle sessions), which means it must never
+hand a ``sessions`` row to a group that does not own it. Every lookup
+and write in this module is scoped by ``(session_id, user_id)``, not
+``id`` alone: ``_is_foreign_owner`` is the single predicate for "this
+row is not this group's own", the eligibility query excludes any
+group whose id collides with a foreign-owned row *before* any slot or
+LLM call is spent on it, and a pre-LLM re-check closes the window
+between eligibility and the model call. A primary-key race from a
+different writer is only ever swallowed when it is the ``sessions``
+PK itself; every other integrity error propagates. See the build
+record for v1.29.5 for the guard-by-guard proof.
 """
 
 from __future__ import annotations
@@ -43,6 +56,7 @@ from typing import Any
 import httpx
 from opentelemetry import metrics, trace
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from audittrace.config import Settings
@@ -72,6 +86,36 @@ _ctx_overflow_counter = _meter.create_counter(
     ),
 )
 
+# Ownership-scoping security fix (v1.29.5). ``stage`` is one of
+# eligibility | pre_llm | persist_pk — see ``_record_collisions`` /
+# ``_foreign_owner_blocks`` / ``_handle_persist_pk_conflict``.
+# ``stage=eligibility`` counts a colliding (session_id, user_id) group
+# only on its FIRST sighting in this process: the groups are built from
+# append-only ``interactions`` rows, so they never clear on their own,
+# and counting every cycle would make the 15-minute-increase alert fire
+# forever once a single collision exists. A restart's fresh seen-set
+# re-counts every still-standing collision once — an expected single
+# blip, not a new incident. Multi-replica dashboards must aggregate the
+# gauge with max(), never sum() (each replica sets its own point).
+_session_collisions_counter = _meter.create_counter(
+    name="audittrace.summariser.session_collisions",
+    description=(
+        "Session/user ownership collisions the summariser refused to "
+        "write across. stage=eligibility counts first sightings per "
+        "process; stage=pre_llm / stage=persist_pk count per blocked "
+        "event. No summary text in the label set."
+    ),
+)
+_session_collisions_gauge = _meter.create_gauge(
+    name="audittrace.summariser.session_collisions_current",
+    description=(
+        "Distinct (session_id, user_id) groups excluded this cycle "
+        "because the existing sessions row belongs to a different user "
+        "(or none). Set every cycle. Aggregate across replicas with "
+        "max(), never sum()."
+    ),
+)
+
 
 # ─────────────────────────── Data structures ──────────────────────────────
 
@@ -94,6 +138,15 @@ class EligibleSession:
 # schema), ``sessions.summarized_at`` is a DateTime — comparing them
 # in SQL is dialect-fragile. We over-fetch by ``max_per_cycle * 3``
 # so we rarely need more than one cycle to work through the idle set.
+#
+# Ownership scoping (v1.29.5, security): the join on ``sessions`` is
+# scoped by ``user_id`` too, not ``id`` alone, and a group whose id
+# already carries a FOREIGN owner (someone else's row, or an
+# explicitly ownerless one) is excluded entirely by the trailing
+# ``NOT EXISTS`` — before any slot or LLM call is spent on it. This is
+# the SQL transcription of ``_is_foreign_owner`` (the one place the
+# ownership rule is written); portable across both dialects, no
+# ``IS DISTINCT FROM``.
 _ELIGIBILITY_SQL = text(
     """
     SELECT sub.session_id    AS session_id,
@@ -108,10 +161,16 @@ _ELIGIBILITY_SQL = text(
                MAX(i.timestamp) AS last_ts
         FROM interactions i
         WHERE i.session_id IS NOT NULL
+          AND i.user_id IS NOT NULL
         GROUP BY i.session_id, i.user_id, i.project
     ) sub
-    LEFT JOIN sessions s ON s.id = sub.session_id
+    LEFT JOIN sessions s ON s.id = sub.session_id AND s.user_id = sub.user_id
     WHERE sub.last_ts < :threshold
+      AND NOT EXISTS (
+          SELECT 1 FROM sessions x
+          WHERE x.id = sub.session_id
+            AND (x.user_id IS NULL OR x.user_id <> sub.user_id)
+      )
     -- Never-summarised rows first (summarized_at IS NULL sorts before
     -- NOT NULL when we order by the IS NULL expression DESC). Within
     -- each group, oldest idle first so we drain legacy backlogs
@@ -120,6 +179,31 @@ _ELIGIBILITY_SQL = text(
     -- of the ASC-by-last_ts list starves the never-summarised ones.
     ORDER BY (s.summarized_at IS NULL) DESC, sub.last_ts ASC
     LIMIT :fetch_limit
+    """
+)
+
+# Lists every idle (session_id, user_id) group that has an EXISTING
+# sessions row of any ownership, including its owner, so the caller can
+# apply ``_is_foreign_owner`` in Python to find the groups the query
+# above structurally excludes. A group with NO sessions row at all is
+# not a collision (it is simply never-summarised) and is deliberately
+# left out by the INNER JOIN.
+_COLLISION_CANDIDATES_SQL = text(
+    """
+    SELECT sub.session_id    AS session_id,
+           sub.user_id       AS user_id,
+           x.user_id         AS owner_user_id
+    FROM (
+        SELECT i.session_id,
+               i.user_id,
+               MAX(i.timestamp) AS last_ts
+        FROM interactions i
+        WHERE i.session_id IS NOT NULL
+          AND i.user_id IS NOT NULL
+        GROUP BY i.session_id, i.user_id
+    ) sub
+    JOIN sessions x ON x.id = sub.session_id
+    WHERE sub.last_ts < :threshold
     """
 )
 
@@ -170,6 +254,12 @@ class SessionSummarizer:
         # server's /props (single source of truth) and cached. None until
         # the first resolution. See `_resolve_ctx_tokens`.
         self._ctx_tokens: int | None = None
+        # First-sighting memory for the collision counter (R5′/G7e) —
+        # per-INSTANCE, not module-global, so a fresh process (restart)
+        # re-counts every still-standing collision exactly once rather
+        # than staying silent forever. Never persisted: a durable mark
+        # would need a migration on a frozen table (rejected, see R2).
+        self._seen_collisions: set[tuple[str, str]] = set()
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -287,7 +377,105 @@ class SessionSummarizer:
                 )
                 if len(eligible) >= max_per_cycle:
                     break
+
+            candidates = (
+                await db.execute(_COLLISION_CANDIDATES_SQL, {"threshold": threshold})
+            ).all()
+            self._record_collisions(
+                [
+                    (row.session_id, row.user_id, row.owner_user_id)
+                    for row in candidates
+                    if _is_foreign_owner(row.owner_user_id, row.user_id)
+                ]
+            )
             return eligible
+
+    def _record_collisions(
+        self, collisions: Sequence[tuple[str, str, str | None]]
+    ) -> None:
+        """R5′ — gauge = groups excluded THIS cycle; counter + one
+        WARNING only on a group's FIRST sighting in this process (see
+        the module-level counter's docstring for why)."""
+        _session_collisions_gauge.set(len(collisions))
+        for session_id, user_id, owner_user_id in collisions:
+            key = (session_id, user_id)
+            if key in self._seen_collisions:
+                continue
+            self._seen_collisions.add(key)
+            _session_collisions_counter.add(1, {"stage": "eligibility"})
+            logger.warning(
+                "session summariser: session/user ownership collision "
+                "session=%r user=%r owner=%r",
+                session_id,
+                user_id,
+                owner_user_id,
+            )
+
+    async def _foreign_owner_blocks(self, es: EligibleSession) -> bool:
+        """R4 — re-check ownership immediately before the LLM call,
+        closing the eligibility→LLM-call race window. Returns True (and
+        counts/logs) when ``es`` must NOT be summarised.
+
+        #364 session-scope discipline: ``owner`` is consumed entirely
+        inside the ``async with`` block, never read after the session
+        closes — even though it is already a plain ``str | None`` (not
+        an ORM instance) by the time ``_owner_of`` returns it. The
+        repo's structural guard conservatively treats any value a
+        session-handed helper returns as session-bound, specifically so
+        a FUTURE change to that helper cannot silently reintroduce #364
+        without this function's shape also having to change; following
+        that discipline here costs nothing and keeps the guard
+        meaningful.
+        """
+        async with self._session_factory() as db:
+            await self._disable_rls_if_postgres(db)
+            exists, owner = await _owner_of(db, es.session_id)
+            if not (exists and _is_foreign_owner(owner, es.user_id)):
+                return False
+            logger.warning(
+                "session summariser: pre-LLM ownership mismatch "
+                "session=%r user=%r owner=%r",
+                es.session_id,
+                es.user_id,
+                owner,
+            )
+        _session_collisions_counter.add(1, {"stage": "pre_llm"})
+        return True
+
+    async def _handle_persist_pk_conflict(self, es: EligibleSession) -> None:
+        """After a ``sessions``-PK race, classify it (A1-F4): a
+        same-owner replica racing this one is the expected multi-pod
+        shape and gets an INFO log with no count; a foreign owner
+        winning the race is the security-relevant case and gets a
+        counted, logged skip.
+
+        #364 session-scope discipline: see ``_foreign_owner_blocks``'s
+        docstring — ``owner`` stays inside the ``async with`` block.
+        """
+        async with self._session_factory() as db:
+            await self._disable_rls_if_postgres(db)
+            # A PK violation means a row for this id now exists (the
+            # writer we raced); ``exists`` is discarded because a
+            # missing row would make ``owner`` None too, which
+            # ``_is_foreign_owner`` already treats as foreign (the safe
+            # default for an otherwise-impossible state).
+            _, owner = await _owner_of(db, es.session_id)
+            if _is_foreign_owner(owner, es.user_id):
+                _session_collisions_counter.add(1, {"stage": "persist_pk"})
+                logger.warning(
+                    "session summariser: persist race, foreign owner "
+                    "session=%r user=%r owner=%r",
+                    es.session_id,
+                    es.user_id,
+                    owner,
+                )
+            else:
+                logger.info(
+                    "session summariser: persist race, same-owner replica "
+                    "session=%r user=%r",
+                    es.session_id,
+                    es.user_id,
+                )
 
     # ── per-session work ───────────────────────────────────────────────
 
@@ -304,6 +492,9 @@ class SessionSummarizer:
             span.set_attribute("audittrace.project", es.project)
             span.set_attribute("langfuse.observation.type", "generation")
             trace_id = _span_trace_id_hex(span)
+
+            if await self._foreign_owner_blocks(es):
+                return
 
             turns = await self._fetch_turns(es)
             if not turns:
@@ -516,11 +707,7 @@ class SessionSummarizer:
                     f"({self._settings.summarizer_ctx_tokens} tokens). "
                     "No automated summary produced. Manual review recommended."
                 )
-                existing = (
-                    await db.execute(
-                        select(SessionRecord).filter(SessionRecord.id == es.session_id)
-                    )
-                ).scalar_one_or_none()
+                existing = await _load_own_row(db, es)
                 if existing is None:
                     db.add(
                         SessionRecord(
@@ -577,7 +764,16 @@ class SessionSummarizer:
         parsed: dict[str, Any],
         trace_id: str | None = None,
     ) -> None:
-        """Upsert SessionRecord under the session's user's GUC."""
+        """Upsert SessionRecord under the session's user's GUC.
+
+        R3 — the lookup is owner-scoped (``_load_own_row``), so this
+        write can only ever touch a row ``es.user_id`` already owns, or
+        create a brand-new one under that user. A PK race with a
+        DIFFERENT writer for the same ``id`` surfaces as the
+        ``sessions`` primary-key violation — the only exception this
+        method swallows (see ``_handle_persist_pk_conflict``); every
+        other integrity error propagates (A1-F3).
+        """
         async with self._session_factory() as db:
             try:
                 # set_config('app.current_user_id', ...) so the RLS WITH
@@ -593,11 +789,7 @@ class SessionSummarizer:
                     str(k)[:120] for k in key_points[:8] if isinstance(k, str)
                 ]
 
-                existing = (
-                    await db.execute(
-                        select(SessionRecord).filter(SessionRecord.id == es.session_id)
-                    )
-                ).scalar_one_or_none()
+                existing = await _load_own_row(db, es)
                 if existing is None:
                     db.add(
                         SessionRecord(
@@ -626,9 +818,11 @@ class SessionSummarizer:
                     es.user_id,
                     len(kp_clean),
                 )
-            except Exception:
+            except Exception as exc:
                 await db.rollback()
-                raise
+                if not _is_sessions_pk_violation(exc):
+                    raise
+                await self._handle_persist_pk_conflict(es)
 
     # ── LLM call ───────────────────────────────────────────────────────
 
@@ -697,6 +891,101 @@ class SessionSummarizer:
                 text("SELECT set_config('app.current_user_id', :uid, true)"),
                 {"uid": user_id},
             )
+
+
+# ──────────────── Ownership-scoping helpers (v1.29.5, security) ──────────
+
+
+def _is_foreign_owner(owner_user_id: str | None, user_id: str) -> bool:
+    """R1 — the ONE place the ownership rule is written. A ``sessions``
+    row this group cannot prove is its own — no row at all, or a row
+    whose owner is explicitly NULL or someone else — is foreign. The
+    SQL in ``_ELIGIBILITY_SQL`` is this predicate's transcription; every
+    other call site in this module calls this function directly."""
+    return owner_user_id is None or owner_user_id != user_id
+
+
+async def _owner_of(db: AsyncSession, session_id: str) -> tuple[bool, str | None]:
+    """Read the current owner of ``sessions.id == session_id`` without
+    filtering by any particular user. The caller must already have
+    disabled RLS on this transaction (``_disable_rls_if_postgres``) or
+    hold a role that bypasses it, so the read sees the row regardless of
+    who owns it.
+
+    Returns ``(row_exists, owner_user_id)``. The pair is deliberate: a
+    bare ``owner_user_id`` alone cannot distinguish "no sessions row at
+    all" (the common, benign case — never summarised yet) from "a row
+    exists whose ``user_id`` column is NULL" (F12's legacy-ownerless
+    row — genuinely foreign). Both would read back as Python ``None``
+    from a single-column select, which is exactly the ambiguity that
+    made an early draft of this check block every never-summarised
+    session. Callers must test ``row_exists`` before applying the
+    ownership predicate (R4: "if a row exists AND the group cannot
+    prove it owns it").
+    """
+    row = (
+        await db.execute(
+            select(SessionRecord.id, SessionRecord.user_id).filter(
+                SessionRecord.id == session_id
+            )
+        )
+    ).first()
+    if row is None:
+        return False, None
+    return True, row.user_id
+
+
+async def _load_own_row(db: AsyncSession, es: EligibleSession) -> SessionRecord | None:
+    """R3 — the ONE owner-scoped loader both writers (``_persist`` and
+    ``_persist_sentinel_overflow``) use. Filtering by BOTH ``id`` and
+    ``user_id`` means a write can only ever touch a row ``es.user_id``
+    already owns, or create a brand-new one under that user — never a
+    row belonging to someone else."""
+    return (
+        await db.execute(
+            select(SessionRecord).filter(
+                SessionRecord.id == es.session_id,
+                SessionRecord.user_id == es.user_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+def _is_sessions_pk_violation(exc: BaseException) -> bool:
+    """S2 / A1-F3 — narrowly recognise the ``sessions`` table's own
+    primary-key violation so every OTHER integrity error (a NOT NULL
+    violation, a foreign-key violation, …) escapes ``_persist`` /
+    ``_persist_sentinel_overflow`` instead of being silently swallowed
+    and miscounted as a benign ownership race.
+
+    Postgres (asyncpg, the resolved production driver): SQLSTATE
+    ``23505`` *and* the constraint named ``sessions_pkey``. SQLite
+    (aiosqlite/sqlite3, the test driver): sqlite3 exposes no structured
+    constraint name, only the message text, which names the table and
+    column verbatim.
+
+    Reads ``exc.driver_exception`` (SQLAlchemy 2.1+, pinned by
+    ``pyproject.toml``'s ``sqlalchemy[asyncio]>=2.1.1,<3``), not
+    ``exc.orig`` directly: SQLAlchemy's asyncpg dialect wraps the real
+    ``asyncpg.exceptions.UniqueViolationError`` in an
+    ``EmulatedDBAPIException`` whose own ``sqlstate`` is present but
+    whose ``constraint_name`` is NOT — that attribute lives only on the
+    nested real driver exception. ``driver_exception`` is exactly
+    SQLAlchemy's documented unwrap for this (and degrades to ``exc.orig``
+    itself for non-emulated DBAPIs such as sqlite3) — measured against a
+    real Postgres PK violation during the AC4 build: the first draft of
+    this function, reading ``exc.orig`` directly, let the violation
+    escape instead of classifying it.
+    """
+    if not isinstance(exc, IntegrityError):
+        return False
+    driver_exc = exc.driver_exception
+    sqlstate = getattr(driver_exc, "sqlstate", None)
+    if sqlstate is not None:
+        return sqlstate == "23505" and getattr(driver_exc, "constraint_name", None) == (
+            "sessions_pkey"
+        )
+    return "UNIQUE constraint failed: sessions.id" in str(driver_exc)
 
 
 # ──────────────────────────── Pure helpers ───────────────────────────────
