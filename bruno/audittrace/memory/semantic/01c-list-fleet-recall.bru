@@ -1,0 +1,47 @@
+meta {
+  name: GET /memory/semantic — fleet recall (attributed, paged)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/memory/semantic?include_deleted=false&collection={{exampleCollection}}&limit={{listLimit}}&offset={{listOffset}}&sort=created_at&order=desc
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+headers {
+  X-Agent-Role: {{agentRole}}
+  X-Source: {{agentSource}}
+}
+
+query {
+  include_deleted: false
+  collection: {{exampleCollection}}
+  limit: {{listLimit}}
+  offset: {{listOffset}}
+  sort: created_at
+  order: desc
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("body has items + total", function() {
+    const body = res.getBody();
+    expect(body.items).to.be.an("array");
+    expect(body.total).to.be.a("number");
+  });
+}
+
+docs {
+  Same as 01b-list-paged.bru plus the fleet attribution
+  headers that scripts/deploy/memory.py::_fleet_headers used to send, so
+  audittrace_recall_total{source="fleet"} keeps counting fleet recalls after
+  the move to Bruno. Pass limit=300 (limit counts DOCUMENTS).
+}
